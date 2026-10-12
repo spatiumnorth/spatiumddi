@@ -39,14 +39,18 @@ TRIGGER="${SPATIUM_SLOT_TRIGGER:-/var/lib/spatiumddi/release-state/slot-upgrade-
 PROGRESS="${SPATIUM_SLOT_PROGRESS:-/var/lib/spatiumddi/release-state/slot-upgrade.progress}"
 
 # The supervisor container runs unprivileged (``su-exec spatium``) while
-# these sidecars are written by THIS script as root, into a mode-1777
-# (sticky) directory. A non-owner therefore gets EACCES overwriting a
-# root-owned 0644 file and EPERM unlinking it — so every supervisor-side
-# reset of a failed upgrade silently no-op'd (#786). Publish them 0666 so
-# an in-place overwrite works. Content is non-secret state the api already
-# republishes to the operator; the sticky bit still stops unlink-by-others.
+# these sidecars are written by THIS script as root, into a sticky
+# directory. A non-owner therefore gets EACCES overwriting a root-owned
+# 0644 file and EPERM unlinking it — so every supervisor-side reset of a
+# failed upgrade silently no-op'd (#786). Publish them group-writable to
+# the spatium-host gid the supervisor and api carry, so an in-place
+# overwrite works; the sticky bit still stops unlink-by-others. They were
+# 0666 until GHSA-h2j9-qrg7-grfw, which let any local account forge the
+# upgrade status the Fleet UI shows.
+SIDECAR_GID="${SPATIUM_HOST_GID:-2770}"
 publish_sidecar() {  # $1 = path
-    chmod 0666 "$1" 2>/dev/null || true
+    chgrp "$SIDECAR_GID" "$1" 2>/dev/null || true
+    chmod 0660 "$1" 2>/dev/null || true
 }
 LOG_DIR="${SPATIUM_SLOT_LOG_DIR:-/var/log/spatiumddi}"
 LOG="$LOG_DIR/slot-upgrade.log"

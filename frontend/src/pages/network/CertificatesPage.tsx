@@ -805,7 +805,7 @@ export function CertificatesPage() {
     return (
       <div className="flex h-full items-center justify-center p-6 text-sm text-muted-foreground">
         TLS certificate monitoring is disabled. An administrator can enable the
-        "security.tls_certs" feature module in Settings → Features.
+        "security.tls_certs" feature module on the Features & Integrations page.
       </div>
     );
   }

@@ -41,7 +41,13 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.proxmox import ProxmoxNode
-from app.services.integration_ownership import owned_by_other_integration, owning_integration
+from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.integration_ownership import (
+    address_taken,
+    owned_by_other_integration,
+    owning_integration,
+    subnet_has_surviving_addresses,
+)
 from app.services.proxmox.client import (
     ProxmoxClient,
     ProxmoxClientError,
@@ -84,6 +90,9 @@ class _DesiredAddress:
     hostname: str
     description: str
     mac: str | None = None
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass
@@ -569,6 +578,14 @@ async def _apply_blocks_and_subnets(
             if vnet_name in extant_vnet_names:
                 used_wrapper_cidrs.add(net_str)
                 continue
+        # #1558: a blind delete cascades to every address in the subnet,
+        # including operator / foreign / operator-edited rows. Hand the
+        # subnet back (un-claim) when any such survivor exists, like the
+        # OPNsense reconciler does.
+        if await subnet_has_surviving_addresses(db, row.id, "proxmox_node_id"):
+            row.proxmox_node_id = None
+            summary.subnets_updated += 1
+            continue
         await db.delete(row)
         summary.subnets_deleted += 1
 
@@ -670,18 +687,6 @@ async def _apply_blocks_and_subnets(
 # ── Apply: addresses ──────────────────────────────────────────────────
 
 
-async def _address_taken(
-    db: AsyncSession, subnet_id: Any, address: str, *, exclude_id: Any = None
-) -> bool:
-    """True if a row already holds ``address`` in ``subnet_id``."""
-    stmt = select(IPAddress.id).where(
-        IPAddress.subnet_id == subnet_id, IPAddress.address == address
-    )
-    if exclude_id is not None:
-        stmt = stmt.where(IPAddress.id != exclude_id)
-    return (await db.execute(stmt.limit(1))).scalar_one_or_none() is not None
-
-
 async def _apply_addresses(
     db: AsyncSession,
     node: ProxmoxNode,
@@ -775,7 +780,7 @@ async def _apply_addresses(
                 # may already sit at the target (subnet, address); the
                 # move would hit ``uq_ip_address_subnet_address`` and
                 # roll back the whole sweep. Leave our row where it is.
-                if await _address_taken(db, subnet.id, d.address, exclude_id=row.id):
+                if await address_taken(db, subnet.id, d.address, exclude_id=row.id):
                     summary.warnings.append(
                         f"address {addr}: subnet {subnet.network} already has a row "
                         f"for it; not moving"
@@ -808,7 +813,7 @@ async def _apply_addresses(
             # at this (subnet, address) is owned by another integration
             # or Proxmox endpoint (warned there). Inserting next to it
             # would hit ``uq_ip_address_subnet_address``.
-            if await _address_taken(db, subnet.id, d.address):
+            if await address_taken(db, subnet.id, d.address):
                 continue
             db.add(
                 IPAddress(

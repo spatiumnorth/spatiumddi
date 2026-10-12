@@ -8,7 +8,8 @@ its ``.service`` ExecStart hit ``203/EXEC``). This stdlib-only linter runs
 in CI (Backend Lint job) and asserts the invariants that would have caught
 that class of bug:
 
-  1. Every ``ExecStart=/usr/local/bin/<runner>`` referenced by a shipped
+  1. Every ``ExecStart=/usr/local/bin/<runner>`` (or ``ExecStartPre=``,
+     ``ExecStartPost=``, ``ExecCondition=``) referenced by a shipped
      systemd unit resolves to a runner that will be executable in the
      built image — i.e. it is EITHER already executable in the git
      checkout OR it is chmod'd 0755 in ``mkosi.postinst``.
@@ -36,7 +37,7 @@ _CHMOD_RE = re.compile(
     r'chmod\s+0?755\s+"\$BUILDROOT/usr/local/bin/([A-Za-z0-9._-]+)"'
 )
 _EXECSTART_RE = re.compile(
-    r"^\s*ExecStart(?:Pre|Post)?=-?(/usr/local/bin/[A-Za-z0-9._-]+)",
+    r"^\s*(?:ExecStart(?:Pre|Post)?|ExecCondition)=-?(/usr/local/bin/[A-Za-z0-9._-]+)",
     re.MULTILINE,
 )
 

@@ -581,3 +581,74 @@ def test_capabilities_shape() -> None:
     assert "CAA" in caps["record_types"]
     assert "SVCB" not in caps["record_types"]
     assert "HTTPS" not in caps["record_types"]
+
+
+# ── SRV split-form contract (#1526) ─────────────────────────────────────────
+
+
+async def test_apply_record_create_srv_sends_weight_and_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": 42, "domain": "example.com"}]))],
+            "post": [_FakeResponse(200, {"id": 501})],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=3600,
+            priority=10,
+            weight=20,
+            port=5060,
+        ),
+        target_serial=1,
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert post["json"]["priority"] == 10
+    assert post["json"]["weight"] == 20
+    assert post["json"]["port"] == 5060
+    assert post["json"]["target"] == "sip.example.com"
+
+
+async def test_list_zone_records_srv_weight_and_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    domain_lookup = _env([{"id": 42, "domain": "example.com"}])
+    records = _env(
+        [
+            {
+                "id": 103,
+                "name": "_sip._tcp",
+                "type": "SRV",
+                "target": "sip.example.com",
+                "ttl_sec": 3600,
+                "priority": 10,
+                "weight": 20,
+                "port": 5060,
+            }
+        ]
+    )
+    fake = _FakeClient({"get": [_FakeResponse(200, domain_lookup), _FakeResponse(200, records)]})
+    driver = _patch_client(monkeypatch, fake)
+
+    recs = await driver._list_zone_records(_Server(), _CREDS, "example.com.")
+
+    assert recs == [
+        RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=3600,
+            priority=10,
+            weight=20,
+            port=5060,
+        )
+    ]

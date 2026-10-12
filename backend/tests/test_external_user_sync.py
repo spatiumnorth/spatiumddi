@@ -698,7 +698,6 @@ def _consume_with_nameid_format(
         idp_x509_cert="",
         sp_entity_id="sp",
         sp_acs_url="https://sp.example.com/acs",
-        sp_slo_url="https://sp.example.com/slo",
         sp_x509_cert=None,
         sp_private_key=None,
         attr_username="uid",

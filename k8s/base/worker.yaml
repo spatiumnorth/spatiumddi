@@ -38,7 +38,19 @@ spec:
                   matchLabels:
                     app: spatiumddi-worker
                 topologyKey: kubernetes.io/hostname
-      terminationGracePeriodSeconds: 60
+      # #1754 — 90 s: a warm shutdown mid-result-write inside a Redis
+      # no-master window was measured at 54.5 s and 59.2 s. Keep above
+      # WORKER_TERMINATION_GRACE_S in backend/app/celery_app.py.
+      terminationGracePeriodSeconds: 90
+      # #1754 — bound getaddrinfo (socket timeouts do not): a stalled cluster
+      # DNS endpoint costs ~8 s per lookup instead of ~20 s. ndots untouched.
+      # Trade-off and arithmetic: DNS_LOOKUP_STALL_S in backend/app/celery_app.py.
+      dnsConfig:
+        options:
+          - name: timeout
+            value: "2"
+          - name: attempts
+            value: "2"
       containers:
         - name: worker
           image: ghcr.io/spatiumnorth/spatiumddi-api:latest
@@ -61,6 +73,20 @@ spec:
             - worker
             - --loglevel=info
             - --concurrency=4
+            # --without-mingle (#1669): mingle's startup handshake syncs revoked-task
+            # lists between workers, and SpatiumDDI never revokes a task. On a
+            # reconnect mid-failover it can hit a dead Sentinel, and celery treats
+            # that OperationalError as unrecoverable and exits the worker.
+            - --without-mingle
+            # --without-heartbeat --without-gossip (#1669): the heartbeat publishes
+            # every 2 s from the worker's event loop, and with no Redis master it
+            # sits in kombu's reconnect for as long as the outage lasts, so a
+            # SIGTERM is never acted on and the pod runs out its grace period.
+            # Nothing reads worker heartbeats or events (no flower, no event
+            # receiver), gossip only consumes those heartbeats, and the liveness
+            # probe's ``inspect ping`` is a remote-control call that needs neither.
+            - --without-heartbeat
+            - --without-gossip
             - -Q
             - ipam,dns,dhcp,default,bundles
           env:
@@ -75,22 +101,33 @@ spec:
                   name: spatiumddi-secrets
                   key: secret-key
             - name: DATABASE_URL
-              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-primary:5432/spatiumddi"
+              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
+            # #1547 — Redis password from the Secret, interpolated
+            # into the sentinel:// URLs (env `value` only — a
+            # ConfigMap cannot interpolate and must never carry a
+            # credential). Same wiring as the umbrella chart's
+            # commonEnv; see k8s/base/api.yaml for the URL shapes.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: redis-password
+            - name: REDIS_SENTINEL_MASTER
+              valueFrom:
+                configMapKeyRef:
+                  name: spatiumddi-config
+                  key: REDIS_SENTINEL_MASTER
+            - name: REDIS_SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: redis-password
             - name: REDIS_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: REDIS_URL
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-0.redis-headless.spatiumddi.svc.cluster.local:26379,redis-1.redis-headless.spatiumddi.svc.cluster.local:26379,redis-2.redis-headless.spatiumddi.svc.cluster.local:26379/0"
             - name: CELERY_BROKER_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: CELERY_BROKER_URL
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-sentinel:26379/1"
             - name: CELERY_RESULT_BACKEND
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: CELERY_RESULT_BACKEND
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-sentinel:26379/2"
           resources:
             requests:
               cpu: 200m
@@ -112,7 +149,13 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 10
-            failureThreshold: 3
+            # 5 x 30 s (was 3): the ping is a broker round trip, so it fails
+            # after a Redis master is lost with its node until Sentinel has
+            # promoted a replica AND the worker has noticed its dead sockets
+            # (kernel keepalive, ~25 s; celery_app.py) and reconnected: about
+            # 30-60 s in a blackholed-master test (#1669). 3 misses (60-90 s)
+            # left little margin; 150 s still catches a wedged worker.
+            failureThreshold: 5
 ---
 # Beat runs as a singleton — only 1 replica allowed
 apiVersion: apps/v1
@@ -166,22 +209,33 @@ spec:
                   name: spatiumddi-secrets
                   key: secret-key
             - name: DATABASE_URL
-              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-primary:5432/spatiumddi"
+              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
+            # #1547 — Redis password from the Secret, interpolated
+            # into the sentinel:// URLs (env `value` only — a
+            # ConfigMap cannot interpolate and must never carry a
+            # credential). Same wiring as the umbrella chart's
+            # commonEnv; see k8s/base/api.yaml for the URL shapes.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: redis-password
+            - name: REDIS_SENTINEL_MASTER
+              valueFrom:
+                configMapKeyRef:
+                  name: spatiumddi-config
+                  key: REDIS_SENTINEL_MASTER
+            - name: REDIS_SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: redis-password
             - name: REDIS_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: REDIS_URL
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-0.redis-headless.spatiumddi.svc.cluster.local:26379,redis-1.redis-headless.spatiumddi.svc.cluster.local:26379,redis-2.redis-headless.spatiumddi.svc.cluster.local:26379/0"
             - name: CELERY_BROKER_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: CELERY_BROKER_URL
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-sentinel:26379/1"
             - name: CELERY_RESULT_BACKEND
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: CELERY_RESULT_BACKEND
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-sentinel:26379/2"
           resources:
             requests:
               cpu: 50m

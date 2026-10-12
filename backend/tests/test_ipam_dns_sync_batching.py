@@ -13,6 +13,7 @@ the singular ``enqueue_record_op``.
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -172,3 +173,92 @@ async def test_batched_dns_ops_groups_and_flushes(
         await _enqueue_dns_op(db_session, zone_a, "create", "h3", "A", "10.50.0.11", None)
 
     assert batch_calls == [(zone_a.id, 2), (zone_b.id, 1)]
+
+
+async def test_batched_failed_op_unstamps_dns_record_id(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1536 — in batch mode ``_enqueue_dns_op`` returns None, so the #428
+    # guard in ``_sync_dns_record`` never fired: a failed agentless create
+    # left ``dns_record_id`` stamped (DDNS would never retry) and the sync
+    # counted the IP as created. The flush must un-stamp and the sync must
+    # count the failure as an error instead.
+    _subnet, zone, ips = await _fixture(db_session)
+    await db_session.commit()
+
+    async def fake_batch(db: Any, z: Any, ops: list[dict[str, Any]]) -> list[Any]:
+        return [SimpleNamespace(state="failed", last_error="provider boom") for _ in ops]
+
+    monkeypatch.setattr("app.services.dns.record_ops.enqueue_record_ops_batch", fake_batch)
+
+    async with _batched_dns_ops(db_session) as results:
+        ip = ips[0]
+        stamped = uuid.uuid4()
+        ip.dns_record_id = stamped
+        await _enqueue_dns_op(
+            db_session,
+            zone,
+            "create",
+            "host10",
+            "A",
+            "10.50.0.10",
+            None,
+            ip=ip,
+            stamped_record_id=stamped,
+        )
+
+    assert ip.dns_record_id is None, "failed batched op must un-stamp (#428)"
+    assert len(results) == 1
+    assert results[0]["op_row"].state == "failed"
+    assert results[0]["ip"] is ip
+
+
+async def test_apply_dns_sync_counts_batched_failures_as_errors(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subnet, zone, ips = await _fixture(db_session)
+    await db_session.commit()
+
+    async def fake_batch(db: Any, z: Any, ops: list[dict[str, Any]]) -> list[Any]:
+        return [SimpleNamespace(state="failed", last_error="provider boom") for _ in ops]
+
+    monkeypatch.setattr("app.services.dns.record_ops.enqueue_record_ops_batch", fake_batch)
+
+    body = DnsSyncCommitRequest(create_for_ip_ids=[ip.id for ip in ips])
+    created, _updated, _deleted, errors = await _apply_dns_sync(db_session, body)
+
+    assert created == 0, errors
+    assert any("DNS create failed" in e for e in errors), errors
+    assert all(ip.dns_record_id is None for ip in ips)
+
+
+async def test_batched_applied_op_keeps_stamp(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The un-stamp must only fire on ``failed`` — an applied op keeps the
+    # stamp (and agent ``pending`` ops keep it too: they self-heal).
+    _subnet, zone, ips = await _fixture(db_session)
+    await db_session.commit()
+
+    async def fake_batch(db: Any, z: Any, ops: list[dict[str, Any]]) -> list[Any]:
+        return [SimpleNamespace(state="applied", last_error=None) for _ in ops]
+
+    monkeypatch.setattr("app.services.dns.record_ops.enqueue_record_ops_batch", fake_batch)
+
+    ip = ips[0]
+    stamped = uuid.uuid4()
+    ip.dns_record_id = stamped
+    async with _batched_dns_ops(db_session):
+        await _enqueue_dns_op(
+            db_session,
+            zone,
+            "create",
+            "host10",
+            "A",
+            "10.50.0.10",
+            None,
+            ip=ip,
+            stamped_record_id=stamped,
+        )
+
+    assert ip.dns_record_id == stamped

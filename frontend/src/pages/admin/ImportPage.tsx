@@ -106,7 +106,8 @@ export function ImportPage({ initialTab }: { initialTab?: ImportTab }) {
           ))}
           {visible.length === 0 && (
             <p className="px-3 py-2 text-xs text-muted-foreground">
-              No importers are enabled. Turn them on under Settings → Features.
+              No importers are enabled. Turn them on under Features &
+              Integrations.
             </p>
           )}
         </nav>

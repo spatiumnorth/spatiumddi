@@ -565,7 +565,9 @@ async def test_reservations_dnsmasq_requires_a_mac() -> None:
     result = await _run(client, "list_reservations")
     assert len(result.reservations) == 1
     assert result.reservations[0].address == "172.20.1.20"
-    assert result.reservations[0].hostname == "nas.lan"
+    # #1557: host label only — the domain is not appended (IPAM
+    # publishing appends the zone itself).
+    assert result.reservations[0].hostname == "nas"
 
 
 @pytest.mark.asyncio

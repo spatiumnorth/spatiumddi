@@ -593,7 +593,7 @@ function FlowModal({
             {ready && !multicastEnabled ? (
               <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
                 The Multicast feature module is disabled, so there are no groups
-                to stamp. Enable it under Settings → Features first.
+                to stamp. Enable it under Features & Integrations first.
               </p>
             ) : (
               <>

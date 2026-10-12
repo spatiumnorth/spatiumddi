@@ -244,6 +244,22 @@ class FtpDestination(BackupDestination):
                     pass
                 client.rename(tmp, remote)
             except Exception as exc:  # noqa: BLE001
+                # Best-effort cleanup of the staged file (#1570),
+                # mirroring the NFS driver: listing and retention only
+                # match ``*.zip``, so a leftover ``.tmp`` is invisible
+                # and is never pruned — every failed run on a full
+                # destination would leave another orphan behind.
+                try:
+                    client.delete(tmp)
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    # A 550 just means the failure happened before the
+                    # staged file existed — nothing to clean up.
+                    if not str(cleanup_exc).startswith("550"):
+                        logger.warning(
+                            "ftp_partial_cleanup_failed",
+                            path=tmp,
+                            error=str(cleanup_exc),
+                        )
                 raise BackupDestinationError(f"FTP write failed: {exc}") from exc
             finally:
                 self._close(client)

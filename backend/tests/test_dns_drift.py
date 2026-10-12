@@ -259,3 +259,91 @@ async def test_ns_glue_the_db_really_holds_is_compared_like_any_record(
 
     (s,) = report.servers
     assert (s.drift_count, s.in_sync) == (0, 1)
+
+
+# ── MX / SRV structured fields are part of the identity (#1525) ─────────────
+#
+# MX priority and SRV priority/weight/port live in their own columns, not
+# in the value, so a (name, type, value) key treated an out-of-band
+# priority edit on the server as "in sync" — drift never reported it and
+# sync never corrected it.
+
+
+async def test_zone_drift_reports_mx_priority_only_difference(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    group, _server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="mxdrift.example.com."
+    )
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            name="@",
+            record_type="MX",
+            value="mail.example.com.",
+            ttl=300,
+            priority=10,
+        )
+    )
+    await db_session.commit()
+
+    # Same name, type and target on the wire — only the preference changed.
+    live = [RecordData(name="@", record_type="MX", value="mail.example.com.", ttl=300, priority=20)]
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver(live))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    (s,) = report.servers
+    assert s.status == "ok"
+    assert s.in_sync == 0
+    assert [(r.record_type, r.priority) for r in s.extra_on_server] == [("MX", 20)]
+    assert [(r.record_type, r.priority) for r in s.missing_on_server] == [("MX", 10)]
+    assert s.drift_count == 2
+
+
+async def test_zone_drift_reports_srv_port_only_difference(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    group, _server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="srvdrift.example.com."
+    )
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com.",
+            ttl=300,
+            priority=10,
+            weight=20,
+            port=5060,
+        )
+    )
+    await db_session.commit()
+
+    live = [
+        RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com.",
+            ttl=300,
+            priority=10,
+            weight=20,
+            port=5061,
+        )
+    ]
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver(live))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    (s,) = report.servers
+    assert s.in_sync == 0
+    assert [(r.record_type, r.port) for r in s.extra_on_server] == [("SRV", 5061)]
+    assert [(r.record_type, r.port) for r in s.missing_on_server] == [("SRV", 5060)]
+
+
+def test_key_ignores_struct_fields_for_other_types() -> None:
+    from app.services.dns.pull_from_server import _key
+
+    a = RecordData(name="www", record_type="A", value="10.0.0.1")
+    assert _key(a, "example.com.") == ("www", "A", "10.0.0.1", None, None, None)
+    mx = RecordData(name="@", record_type="MX", value="mail.example.com.", priority=10)
+    assert _key(mx, "example.com.") == ("@", "MX", "mail.example.com.", 10, None, None)

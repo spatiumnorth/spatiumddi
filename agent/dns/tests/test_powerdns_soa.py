@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self
 
+import httpx
 import pytest
 
 from spatium_dns_agent.config import AgentConfig
@@ -140,6 +141,10 @@ class _Resp:
     def json(self) -> Any:
         return self._body
 
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPError(f"HTTP {self.status_code}")
+
 
 class _FakeClient:
     def __init__(self, calls: list, existing: Any) -> None:
@@ -154,7 +159,10 @@ class _FakeClient:
 
     def get(self, url: str, headers: Any = None) -> _Resp:
         self._calls.append(("GET", url, None))
-        return _Resp(200, self._existing)
+        if url.endswith("/zones"):
+            return _Resp(200, self._existing)
+        # GET /zones/{zone}: the read-back the absent-rrset sweep (#1380) uses.
+        return _Resp(200, {"rrsets": []})
 
     def post(self, url: str, headers: Any = None, json: Any = None) -> _Resp:
         self._calls.append(("POST", url, json))
@@ -180,7 +188,9 @@ def _install_fake_client(
     monkeypatch.setattr(
         powerdns_mod,
         "httpx",
-        SimpleNamespace(Client=lambda **kw: _FakeClient(calls, existing)),
+        SimpleNamespace(
+            Client=lambda **kw: _FakeClient(calls, existing), HTTPError=httpx.HTTPError
+        ),
     )
     return calls
 
@@ -294,3 +304,45 @@ def test_zone_state_without_hook_reports_bundle_serials(
     assert posts and posts[0][1] == {
         "zones": [{"zone_name": "example.com", "serial": 9999}]
     }
+
+
+def test_zone_state_matches_served_serials_case_insensitively(
+    agent_cfg: AgentConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PowerDNS stores zone names lowercased; a bundle zone spelled
+    ``Case.Test`` is still the zone pdns serves, and is still reported."""
+    _install_fake_client(monkeypatch, existing=[{"name": "case.test.", "serial": 77}])
+    served = PowerDNSDriver(state_dir=tmp_path).served_zone_serials({})
+    assert served == {"case.test": 77}
+    posts = _report(
+        agent_cfg,
+        monkeypatch,
+        _HookDriver(served),
+        {"zones": [{"name": "Case.Test", "serial": 9999}]},
+    )
+    assert posts and posts[0][1] == {"zones": [{"zone_name": "Case.Test", "serial": 77}]}
+
+
+def test_zone_state_skips_a_held_back_zone_even_when_pdns_serves_it(
+    agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zone the apply held back (#1403) is not reported, whatever serial
+    pdns serves for it: that serial is the OLD copy, not the bundle's."""
+    posts: list = []
+    monkeypatch.setattr(SyncLoop, "_client", lambda self: _CPClient(posts))
+    loop = SyncLoop(
+        agent_cfg,
+        ["tok"],
+        _HookDriver({"example.com": 1234, "held.example.com": 5}),
+        SimpleNamespace(),
+    )
+    loop._report_zone_state(
+        {
+            "zones": [
+                {"name": "example.com", "serial": 9999},
+                {"name": "held.example.com", "serial": 9999},
+            ]
+        },
+        skip={"held.example.com"},
+    )
+    assert posts and posts[0][1] == {"zones": [{"zone_name": "example.com", "serial": 1234}]}

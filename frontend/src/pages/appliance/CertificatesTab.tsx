@@ -1041,6 +1041,12 @@ function AcmeStatusBlock() {
       {latest.status === "invalid" && latest.last_error && (
         <p className="mt-2 break-words text-destructive">{latest.last_error}</p>
       )}
+      {latest.status === "processing" && latest.last_error && (
+        // #1686 — why a processing order waits: "retrying: <network error>".
+        <p className="mt-2 break-words text-amber-600 dark:text-amber-400">
+          {latest.last_error}
+        </p>
+      )}
       {spinning && !awaitingManual && (
         <p className="mt-2 text-muted-foreground">
           Solving the
@@ -1572,6 +1578,11 @@ function AcmeIssueModal({
                                 <span className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-400">
                                   <AlertCircle className="h-3 w-3" />
                                   Manual TXT required
+                                </span>
+                              )}
+                              {r.note && (
+                                <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                                  {r.note}
                                 </span>
                               )}
                             </td>

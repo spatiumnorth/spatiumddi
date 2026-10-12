@@ -55,6 +55,9 @@ async def _run_sweep() -> dict[str, Any]:
                 .scalars()
                 .all()
             )
+            # A per-controller rollback (below) expires every ORM object on the
+            # shared session, so walk ids and re-fetch each controller (#333).
+            controller_ids = [controller.id for controller in rows]
 
             now = datetime.now(UTC)
             ran = 0
@@ -63,21 +66,28 @@ async def _run_sweep() -> dict[str, Any]:
             err_count = 0
             errors: list[str] = []
 
-            for controller in rows:
+            for controller_id in controller_ids:
+                controller = await db.get(UnifiController, controller_id)
+                if controller is None:
+                    continue
                 interval = _effective_interval(controller)
                 if controller.last_synced_at is not None:
                     elapsed = now - controller.last_synced_at
                     if elapsed < timedelta(seconds=interval):
                         skipped_interval += 1
                         continue
+                controller_name = controller.name  # a failed flush expires controller
                 try:
                     summary = await reconcile_controller(db, controller)
                 except Exception as exc:  # noqa: BLE001
                     err_count += 1
-                    errors.append(f"{controller.name}: {exc}")
+                    # A crash leaves the shared session in a failed
+                    # transaction; roll back so the next controller still syncs.
+                    await db.rollback()
+                    errors.append(f"{controller_name}: {exc}")
                     logger.warning(
                         "unifi_reconcile_crash",
-                        controller=str(controller.id),
+                        controller=str(controller_id),
                         error=str(exc),
                     )
                     continue

@@ -121,7 +121,7 @@ async def _reapply_ddns_for_active_leases(db: Any, subnet: Subnet) -> tuple[int,
     swallowed inline ``apply_ddns_for_lease`` failure missed — including a
     generated ``dhcp-<x-y>`` name the hostname-driven drift check can't
     see — gets regenerated. Idempotent: ``apply_ddns_for_lease`` skips a
-    row whose hostname is unchanged and already has a linked record.
+    row whose hostname is unchanged and already published under that name.
     Returns (records_fired, errors)."""
     from app.services.dns.ddns import apply_ddns_for_lease  # noqa: PLC0415
 

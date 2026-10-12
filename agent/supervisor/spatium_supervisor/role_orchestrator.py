@@ -58,12 +58,22 @@ _SERVICE_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium", "dhcp", "lookin
 # match.
 #
 # Patterns are intentionally tight:
-#   * Agent keys (long hex bootstrap PSK): 32–128 lowercase hex digits.
+#   * Agent keys (bootstrap PSK): #1566 — the key's *shape* is not part
+#     of the contract. The control plane stores it as a plain string
+#     and standalone Compose/Kubernetes agents accept any non-empty
+#     value, so the old hex-only rule (32–128 lowercase hex) silently
+#     dropped operator-chosen keys and the appliance's agents never
+#     registered. This pattern's real job is env-file injection
+#     defence (#237): forbid whitespace (incl. newlines), quotes,
+#     backtick, ``$`` and ``\`` — the characters that could break out
+#     of the ``KEY=VALUE`` line or be reinterpreted downstream — and
+#     accept everything else, 1–512 chars. ``openssl rand -hex 32``
+#     remains the recommended way to generate a key.
 #   * Server group names / engine names: alphanumeric + hyphen / dot /
 #     underscore, 1–128 chars. The control plane validates these on
 #     create but defense-in-depth here keeps a compromised control
 #     plane from injecting env lines through the supervisor.
-_AGENT_KEY_RE = re.compile(r"^[a-f0-9]{32,128}$")
+_AGENT_KEY_RE = re.compile(r"""^[^\s"'`$\\]{1,512}$""")
 _GROUP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 

@@ -30,15 +30,22 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dns import get_driver
+from app.drivers.dns._txt import quote_txt, txt_value
 from app.drivers.dns.base import RecordChange, RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSZone
-from app.services.dns.record_ops import resolve_primary_server
+from app.services.dns.record_ops import resolve_primary_server, rrset_from_payload
+from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.tsig import (
     pull_zone_records_signed,
     resolve_group_transfer_key,
     resolve_view_transfer_key,
     transfer_needs_tsig,
+)
+from app.services.technitium.rdata import (
+    canonical_ip,
+    strip_bare_authority_slash,
+    svcb_canonical,
 )
 
 logger = structlog.get_logger(__name__)
@@ -88,13 +95,76 @@ _IMPORTABLE_TYPES = {
     "TLSA",
 }
 
+# Every record type the DB/API layer can model (mirrors ``VALID_RECORD_TYPES``
+# in the DNS router; kept local so this service doesn't import the router).
+# A driver's advertised types are intersected with this set before sync
+# uses them — a driver may advertise zone metadata (SOA) that has no
+# ``DNSRecord`` representation.
+_DB_MODELLED_TYPES = frozenset(
+    {
+        "A",
+        "AAAA",
+        "ALIAS",
+        "CNAME",
+        "MX",
+        "TXT",
+        "NS",
+        "PTR",
+        "SRV",
+        "CAA",
+        "TLSA",
+        "SSHFP",
+        "NAPTR",
+        "LOC",
+        "LUA",
+        "SVCB",
+        "HTTPS",
+        "DNAME",
+    }
+)
+
+
+def _driver_record_types(driver: Any) -> frozenset[str] | None:
+    """Record types ``driver`` advertises via ``capabilities()``, or None.
+
+    None means the driver published no usable ``record_types`` list, in
+    which case the caller falls back to its legacy hardcoded set rather
+    than syncing nothing (or everything).
+    """
+    try:
+        caps = driver.capabilities()
+    except Exception:  # noqa: BLE001 — a broken caps probe must not break sync
+        return None
+    if not isinstance(caps, dict):
+        return None
+    raw = caps.get("record_types")
+    if not raw:
+        return None
+    return frozenset(str(t).upper() for t in raw)
+
+
+def _syncable_types(driver: Any, fallback: frozenset[str] | set[str]) -> frozenset[str]:
+    """#1533 — the type filter for one sync phase, taken from the server's
+    driver capabilities intersected with what the DB models.
+
+    The old hardcoded sets omitted CAA entirely, so CAA drift could never
+    be repaired through sync even though every cloud driver advertises
+    CAA. Deriving the set per driver also keeps the push phase honest:
+    the Windows driver's advertised set is exactly the old push set, so
+    Windows pushes gain nothing it cannot serve.
+    """
+    advertised = _driver_record_types(driver)
+    if advertised is None:
+        return frozenset(fallback)
+    return advertised & _DB_MODELLED_TYPES
+
 
 # Record types whose value is a DNS name. Same-zone targets are sometimes
 # stored relative ("aaa") and sometimes absolute ("aaa.zone.example."). A
 # naive string compare would treat those as distinct and import a duplicate.
 # ``_normalize_value`` folds both forms into a single canonical shape before
 # we key on them.
-_NAME_VALUED_TYPES = frozenset({"CNAME", "NS", "PTR", "MX", "SRV"})
+_NAME_VALUED_TYPES = frozenset({"CNAME", "DNAME", "NS", "PTR", "MX", "SRV"})
 
 
 def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
@@ -107,9 +177,44 @@ def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
     * Everything else: stripped + lowercased (fine for A/AAAA/IP literals
       where case doesn't matter either).
     """
+    if rtype == "TXT":
+        # #1760: a stored value may be bare (``v=spf1 -all``) or quoted, and
+        # a server reads back whichever ``txt_value`` picks. Compare the
+        # character-strings both stand for, as one canonical presentation
+        # form, case kept: TXT content is case-sensitive (DKIM keys,
+        # tokens). Not stripped: the renderers serve surrounding spaces.
+        return quote_txt(value or "")
     v = (value or "").strip().lower()
+    if rtype in ("A", "AAAA"):
+        # Canonical form (#1513): an expanded/upper-case address as
+        # typed must key the same as the canonical form on the wire.
+        return canonical_ip(v)
+    if rtype in ("SVCB", "HTTPS"):
+        # #1513: quoting, param order, key case and an in-zone target
+        # written relative / absolute are all one record. Given the value
+        # as stored, not ``v``: ``ech`` base64 is case-sensitive, and the
+        # canonical form already folds what is case-insensitive.
+        return svcb_canonical((value or "").strip(), zone_name)
+    if rtype == "NAPTR":
+        # #1759: the replacement is the last token and a name like any
+        # other, so ``web`` / ``web.`` / ``web.<zone>.`` are one record. The
+        # other fields compare as the lower-cased text they are.
+        head, sep, replacement = v.rpartition(" ")
+        if not sep:
+            return v
+        return f"{head} {_normalize_name(replacement, zone_name)}"
+    if rtype == "URI":
+        # #1513: fold away the bare-authority trailing slash a server
+        # may append when storing the record; a path's slash stays.
+        return strip_bare_authority_slash(v)
     if rtype not in _NAME_VALUED_TYPES:
         return v
+    return _normalize_name(v, zone_name)
+
+
+def _normalize_name(v: str, zone_name: str) -> str:
+    """A lower-cased name target in its one comparison form: absolute, with
+    its trailing dot. ``@`` and the empty string are the zone."""
     # "@" means the zone apex.
     if v == "@" or v == "":
         return zone_name.lower()
@@ -123,13 +228,35 @@ def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
     return f"{v}.".lower()
 
 
-def _key(r: RecordData | DNSRecord, zone_name: str) -> tuple[str, str, str]:
-    """Identity key for dedup: (name, type, canonical-value). TTL-only
-    differences don't count — neither does relative-vs-FQDN storage for
-    name-valued records."""
+#: Identity key for pull/sync dedup: (name, type, canonical value,
+#: priority, weight, port) — see :func:`_key`. The structured fields are
+#: only non-None for MX / SRV, whose priority (and weight/port) live in
+#: their own columns rather than in the value (#1525).
+RecordKey = tuple[str, str, str, int | None, int | None, int | None]
+
+
+def _key(r: RecordData | DNSRecord, zone_name: str) -> RecordKey:
+    """Identity key for dedup: (name, type, canonical-value, priority,
+    weight, port). TTL-only differences don't count — neither does
+    relative-vs-FQDN storage for name-valued records.
+
+    The structured fields only participate for MX / SRV (#1525): those
+    types carry priority (and, for SRV, weight + port) in their own
+    columns, not in the value, so a priority-only edit made directly on
+    the server used to compare equal to the DB row and drift / sync
+    reported the record as in sync. Every other type keys them as None.
+    """
     name = (r.name or "").strip().lower()
     rtype = r.record_type.upper()
-    return (name, rtype, _normalize_value(rtype, r.value, zone_name))
+    if rtype in ("MX", "SRV"):
+        struct: tuple[int | None, int | None, int | None] = (
+            getattr(r, "priority", None),
+            getattr(r, "weight", None),
+            getattr(r, "port", None),
+        )
+    else:
+        struct = (None, None, None)
+    return (name, rtype, _normalize_value(rtype, r.value, zone_name), *struct)
 
 
 #: The address record the BIND9 agent writes into every primary zone file,
@@ -143,7 +270,7 @@ def without_agent_ns_glue(
     on_wire: list[RecordData],
     server: Any,
     zone_name: str,
-    db_keys: set[tuple[str, str, str]],
+    db_keys: set[RecordKey],
 ) -> list[RecordData]:
     """``on_wire`` minus the agent's own NS glue, when ``server`` is agent-managed BIND9.
 
@@ -217,15 +344,49 @@ async def _resolve_primary_and_driver(
     return primary, driver, [view_key, tsig], view_name
 
 
+def _legacy_technitium_txt_keys(db_rows: list[DNSRecord], zone_name: str) -> set[RecordKey]:
+    """What a ``technitium_api`` server holds for each DB TXT row written
+    before #1760, keyed like the wire.
+
+    The old write sent the stored value, trailing dot stripped, as
+    Technitium's ``text`` param, which takes it as content cut every 255
+    octets: ``"v=spf1 -all"`` was served with its quotes, ``"a" "b"`` as one
+    string, ``Hello.`` as ``Hello``. Such a record is the DB row served
+    wrong, not a record the operator added on the server, so Sync and pull
+    must not import it as a new row: a push (``overwrite=true`` on the
+    RRset) replaces it. A row the old write served correctly keys the same
+    as the wire and is never in this set.
+    """
+    out: set[RecordKey] = set()
+    for row in db_rows:
+        if row.record_type.upper() != "TXT":
+            continue
+        raw = (row.value or "").rstrip(".").encode("utf-8")
+        served = txt_value([raw[i : i + 255] for i in range(0, len(raw), 255)])
+        legacy = _key(RecordData(name=row.name, record_type="TXT", value=served), zone_name)
+        if legacy != _key(row, zone_name):
+            out.add(legacy)
+    return out
+
+
 def _additive_import(
     db: AsyncSession,
     zone: DNSZone,
     on_wire: list[RecordData],
-    db_keys: set[tuple[str, str, str]],
+    db_keys: set[RecordKey],
     *,
     apply: bool,
+    importable_types: frozenset[str] | None = None,
+    not_importable: set[RecordKey] | None = None,
 ) -> PullResult:
-    """Create DNSRecord rows for on-wire entries that are missing from DB."""
+    """Create DNSRecord rows for on-wire entries that are missing from DB.
+
+    ``not_importable`` names on-wire records that are a DB row served wrong
+    (``_legacy_technitium_txt_keys``): neither existing nor new, so they are
+    skipped and left for the push to replace.
+    """
+    if importable_types is None:
+        importable_types = frozenset(_IMPORTABLE_TYPES)
     zone_name = zone.name
     zone_name_no_dot = zone.name.rstrip(".")
     imported_records: list[dict[str, Any]] = []
@@ -235,11 +396,14 @@ def _additive_import(
 
     for rec in on_wire:
         rtype = rec.record_type.upper()
-        if rtype not in _IMPORTABLE_TYPES:
+        if rtype not in importable_types:
             skipped_unsupported += 1
             continue
-        if _key(rec, zone_name) in db_keys:
+        key = _key(rec, zone_name)
+        if key in db_keys:
             existing += 1
+            continue
+        if not_importable and key in not_importable:
             continue
 
         fqdn = zone_name_no_dot if rec.name == "@" else f"{rec.name}.{zone_name_no_dot}"
@@ -278,6 +442,14 @@ def _additive_import(
     )
 
 
+def _not_importable(primary: Any, db_rows: list[DNSRecord], zone_name: str) -> set[RecordKey]:
+    """On-wire keys the import must skip for ``primary``'s driver. Only the
+    agentless Technitium driver ever wrote the pre-#1760 TXT form."""
+    if getattr(primary, "driver", None) != "technitium_api":
+        return set()
+    return _legacy_technitium_txt_keys(db_rows, zone_name)
+
+
 async def pull_zone_from_server(
     db: AsyncSession,
     zone: DNSZone,
@@ -300,7 +472,15 @@ async def pull_zone_from_server(
     db_keys = {_key(r, zone.name) for r in db_rows}
     on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
 
-    result = _additive_import(db, zone, on_wire, db_keys, apply=apply)
+    result = _additive_import(
+        db,
+        zone,
+        on_wire,
+        db_keys,
+        apply=apply,
+        importable_types=_syncable_types(driver, _IMPORTABLE_TYPES),
+        not_importable=_not_importable(primary, db_rows, zone.name),
+    )
     if apply and result.imported:
         await db.flush()
 
@@ -319,9 +499,11 @@ async def pull_zone_from_server(
 
 
 # Record types the push phase will send to the server via apply_record_change.
-# Mirrors the Windows driver's _SUPPORTED_RECORD_TYPES but importing that
-# would couple us to the driver module — keep a copy here and let drivers
-# raise if they really don't support something at call time.
+# Legacy fallback only (#1533): the live filter is derived per server from
+# the driver's advertised ``capabilities()["record_types"]`` — see
+# ``_syncable_types``. This set mirrors the Windows driver's
+# _SUPPORTED_RECORD_TYPES, which is what the derivation yields for Windows
+# anyway; it survives solely for a driver that publishes no record_types.
 _PUSHABLE_TYPES = frozenset({"A", "AAAA", "CNAME", "MX", "TXT", "PTR", "SRV", "NS", "TLSA"})
 
 
@@ -356,10 +538,11 @@ async def _additive_push(
     # already on the wire. Keeping this as a list (not a generator) so we
     # can zip the driver's per-op results back onto the source rows by
     # index after dispatch.
+    pushable_types = _syncable_types(driver, _PUSHABLE_TYPES)
     candidate_rows: list[DNSRecord] = []
     for row in db_rows:
         rtype = row.record_type.upper()
-        if rtype not in _PUSHABLE_TYPES:
+        if rtype not in pushable_types:
             continue
         if _key(row, zone.name) in on_wire_keys:
             continue
@@ -385,6 +568,29 @@ async def _additive_push(
             push_errors=push_errors,
         )
 
+    # Each op carries the complete DB set at its (name, type), as the record
+    # op path does (#783). Without it a driver that writes a whole RRset
+    # (technitium_api ``overwrite=true``, Windows) replaces the set with the
+    # one pushed value, so pushing a TXT that is missing or served wrong
+    # (#1760) retires its in-sync siblings, and the next Sync pushes those
+    # back over it. The pulled rows were flushed above, so the set includes
+    # them.
+    payloads: list[dict[str, Any]] = [
+        {
+            "op": "create",
+            "record": {
+                "name": row.name,
+                "type": row.record_type.upper(),
+                "value": row.value,
+                "ttl": row.ttl,
+                "priority": row.priority,
+                "weight": row.weight,
+                "port": row.port,
+            },
+        }
+        for row in candidate_rows
+    ]
+    await stamp_rrsets_for_ops(db, zone, payloads)
     changes: list[RecordChange] = [
         RecordChange(
             op="create",
@@ -399,8 +605,9 @@ async def _additive_push(
                 port=row.port,
             ),
             target_serial=target_serial,
+            rrset=rrset_from_payload(payload["record"]),
         )
-        for row in candidate_rows
+        for row, payload in zip(candidate_rows, payloads, strict=True)
     ]
 
     if not changes:
@@ -460,6 +667,48 @@ async def _additive_push(
     )
 
 
+async def restore_zone_records_to_server(
+    db: AsyncSession, server: Any, driver: Any, zone: DNSZone
+) -> PushResult:
+    """Push ``zone``'s records back to one agentless ``server`` (#1613).
+
+    Used when a zone delete is rolled back on a server where the delete
+    had already succeeded: re-creating the zone there gives back an empty
+    zone, and an empty zone that answers is worse than either outcome the
+    operator asked for. So the records go back too, through the same
+    additive push Sync with Servers uses — the zone is read first and only
+    what is missing is sent, so whatever the provider created with the zone
+    (apex NS / SOA) is not pushed a second time.
+
+    A zone already in the trash (the purge sweep) carries records that were
+    soft-deleted with it; they are part of what the server was serving, so
+    those are restored rather than none. A record trashed separately before
+    the zone keeps its own batch and stays gone.
+
+    Never raises for a record-level failure: the caller reports what the
+    result says, which is the whole point of not claiming a clean rollback.
+    """
+    stmt = select(DNSRecord).where(DNSRecord.zone_id == zone.id)
+    if zone.deleted_at is not None and zone.deletion_batch_id is not None:
+        stmt = stmt.where(DNSRecord.deletion_batch_id == zone.deletion_batch_id).execution_options(
+            include_deleted=True
+        )
+    rows = list((await db.execute(stmt)).scalars().all())
+
+    on_wire: list[RecordData] = []
+    if hasattr(driver, "pull_zone_records"):
+        try:
+            on_wire = await driver.pull_zone_records(server, zone.name, tsig=None)
+        except Exception as exc:  # noqa: BLE001 — push everything rather than nothing
+            logger.warning(
+                "dns.zone_restore_records_pull_failed",
+                zone=zone.name,
+                server=str(server.id),
+                error=str(exc) or type(exc).__name__,
+            )
+    return await _additive_push(db, server, driver, zone, on_wire, rows, apply=True)
+
+
 async def sync_zone_with_server(
     db: AsyncSession,
     zone: DNSZone,
@@ -491,7 +740,15 @@ async def sync_zone_with_server(
     db_keys = {_key(r, zone.name) for r in db_rows}
     on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
 
-    pull_result = _additive_import(db, zone, on_wire, db_keys, apply=apply)
+    pull_result = _additive_import(
+        db,
+        zone,
+        on_wire,
+        db_keys,
+        apply=apply,
+        importable_types=_syncable_types(driver, _IMPORTABLE_TYPES),
+        not_importable=_not_importable(primary, db_rows, zone.name),
+    )
     if apply and pull_result.imported:
         await db.flush()
 

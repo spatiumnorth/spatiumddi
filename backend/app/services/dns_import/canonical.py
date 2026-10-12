@@ -12,6 +12,7 @@ preview.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -137,3 +138,7 @@ class ImportPreview:
     warnings: list[str]
     total_records: int
     record_type_histogram: dict[str, int]
+    # The server the records were live-pulled from (cloud / Windows DNS),
+    # ``None`` for file-based and API-endpoint sources. The commit uses it
+    # to not push the records back to the server they came from (#1456).
+    source_server_id: uuid.UUID | None = None

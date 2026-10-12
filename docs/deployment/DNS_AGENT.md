@@ -425,7 +425,7 @@ the recovery. BIND renders and validates into `rendered.new`, so a
 state a revert would produce, and re-rendering the previous bundle there would
 bounce a healthy server for nothing. Only a swap/reload failure, where the
 live config directory has already been replaced, re-renders the previous
-bundle. Kea is the mirror image — `config-test` rejects without disturbing the
+bundle. Kea is the mirror image — `kea-dhcp4 -t` rejects without disturbing the
 running server, but the refused document has already been written to
 `kea_config_path`, and that file is what Kea reads on its next start, so a
 rejection there always rewrites the files even though the daemon is fine.
@@ -577,6 +577,27 @@ during the maintenance window?".
   "zone_serials": {"example.com.": 2026041407}
 }
 ```
+
+### What the agent renders (`X-Spatium-Agent-Features`, #1171)
+
+Every agent request carries `X-Spatium-Agent-Features`, a comma list of what
+the agent renders. A header rather than a heartbeat field, because the
+heartbeat body is strict and an agent can be upgraded before its control plane.
+
+- `soa-timers`: the BIND9 driver writes each zone's own refresh / retry /
+  expire / minimum into its SOA. Agents before #1171 send no header and write
+  `3600 600 86400 300` for every zone.
+- Register and heartbeat store it as `dns_server.agent_renders_soa_timers`.
+  A group's bundles carry each zone's own timers only while every BIND9 server
+  of the group (run by an agent, enabled, approved) says `soa-timers`
+  (`dns_server_group.serves_soa_timers`). Until then they carry the literal,
+  so agents old and new serve one SOA under each serial.
+- When the group switches, either way, the serial of each of its zones whose
+  timers differ from the literal moves in the same transaction. The changed
+  SOA then goes out under a serial no agent served with the other one, and
+  NOTIFY sends secondaries to transfer it. During an upgrade the switch is the
+  heartbeat of the group's last replaced DNS pod. Nothing else is held back
+  meanwhile: a stalled roll delays the timers, not a record.
 
 ### Endpoints
 
@@ -889,6 +910,14 @@ dns-bind9-ns1:
 > [`DNS.md` §1](../features/DNS.md)). Naming a group that does not exist
 > still auto-creates an empty one, so a stale value here is untidy rather
 > than harmful.
+>
+> On an appliance, changing the DNS or DHCP group in **Fleet** is that move:
+> it moves the appliance's own registered DNS / DHCP server into the new
+> group in the same request, and refuses the change (409 / 422, naming the
+> server) when the move itself is refused — a name clash or a mixed-driver
+> group (#1565). Before, Fleet moved only the appliance's pointer, so its
+> env and firewall followed the new group while the server kept serving the
+> old one.
 
 ---
 

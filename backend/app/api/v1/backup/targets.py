@@ -32,6 +32,7 @@ from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
+from app.services.backup.archive import MAX_ARCHIVE_BYTES
 from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
 from app.services.backup.runner import (
     BackupRunBusyError,
@@ -62,6 +63,26 @@ from app.services.backup.targets import (
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
+
+
+def _enforce_download_size(size_bytes: int, *, filename: str) -> None:
+    """Refuse a destination download past the archive size cap (#1568).
+
+    The 2 GB ceiling used to apply only to archives uploaded TO the
+    api; an archive fetched FROM a destination had no cap, so a
+    shared or compromised destination could serve an unbounded
+    payload into api memory (and into restore). Callers with a
+    listing check the declared size before downloading and the
+    actual length after.
+    """
+    if size_bytes > MAX_ARCHIVE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"archive {filename!r} is {size_bytes} bytes, which exceeds the "
+                f"{MAX_ARCHIVE_BYTES}-byte cap for destination downloads"
+            ),
+        )
 
 
 # Pulled from the driver registry rather than hardcoded so new
@@ -791,10 +812,12 @@ async def download_latest_target_archive(
                 "Cache-Control": "private, no-cache",
             },
         )
+    _enforce_download_size(newest.size_bytes, filename=newest.filename)
     try:
         archive_bytes = await driver.download(config=plain_config, filename=newest.filename)
     except BackupDestinationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    _enforce_download_size(len(archive_bytes), filename=newest.filename)
 
     def _iter():
         yield archive_bytes
@@ -834,8 +857,8 @@ async def download_target_archive(
     the driver's ``download(filename)`` method does the heavy
     lifting; we wrap the bytes in a ``StreamingResponse`` with
     ``Content-Disposition: attachment``. For large archives this
-    fetches into memory before streaming; the existing 2 GB hard
-    cap on the api process catches anything pathological.
+    fetches into memory before streaming; downloads past the
+    archive size cap are refused (#1568).
     """
     from fastapi.responses import StreamingResponse  # noqa: PLC0415
 
@@ -870,6 +893,7 @@ async def download_target_archive(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    _enforce_download_size(len(archive_bytes), filename=safe_name)
 
     # The archive exists and is readable — only now is a precondition
     # meaningful.
@@ -942,6 +966,7 @@ async def restore_from_archive(
             status_code=502,
             detail=f"archive {body.filename!r} fetched empty from destination",
         )
+    _enforce_download_size(len(archive_bytes), filename=body.filename)
 
     # Reuse the Phase 1a restore path so the safety dump +
     # passphrase verify + psql replay + post-replay audit row all

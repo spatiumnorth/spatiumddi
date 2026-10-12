@@ -56,6 +56,9 @@ async def _run_sweep() -> dict[str, Any]:
                 .scalars()
                 .all()
             )
+            # A per-cluster rollback (below) expires every ORM object on the
+            # shared session, so walk ids and re-fetch each cluster (#333).
+            cluster_ids = [cluster.id for cluster in rows]
 
             now = datetime.now(UTC)
             ran = 0
@@ -64,20 +67,27 @@ async def _run_sweep() -> dict[str, Any]:
             err_count = 0
             errors: list[str] = []
 
-            for cluster in rows:
+            for cluster_id in cluster_ids:
+                cluster = await db.get(KubernetesCluster, cluster_id)
+                if cluster is None:
+                    continue
                 if cluster.last_synced_at is not None:
                     elapsed = now - cluster.last_synced_at
                     if elapsed < timedelta(seconds=cluster.sync_interval_seconds):
                         skipped_interval += 1
                         continue
+                cluster_name = cluster.name  # a failed flush expires cluster
                 try:
                     summary = await reconcile_cluster(db, cluster)
                 except Exception as exc:  # noqa: BLE001 — one cluster shouldn't poison the sweep
                     err_count += 1
-                    errors.append(f"{cluster.name}: {exc}")
+                    # A crash leaves the shared session in a failed
+                    # transaction; roll back so the next cluster still syncs.
+                    await db.rollback()
+                    errors.append(f"{cluster_name}: {exc}")
                     logger.warning(
                         "k8s_reconcile_crash",
-                        cluster=str(cluster.id),
+                        cluster=str(cluster_id),
                         error=str(exc),
                     )
                     continue

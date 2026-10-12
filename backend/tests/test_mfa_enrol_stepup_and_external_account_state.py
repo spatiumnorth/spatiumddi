@@ -340,6 +340,7 @@ async def test_wrong_step_up_answers_are_counted_and_then_refused(
     hijacked session it exists to stop — so each wrong answer counts toward
     a per-account budget, and a spent budget is refused BEFORE the password
     is checked, so a blocked guess reveals nothing."""
+    import app.api.stepup as stepup_mod
     import app.api.v1.auth.router as auth_router
 
     failures: list[object] = []
@@ -352,7 +353,7 @@ async def test_wrong_step_up_answers_are_counted_and_then_refused(
         return blocked["now"]
 
     monkeypatch.setattr(auth_router, "record_stepup_password_failure", _record)
-    monkeypatch.setattr(auth_router, "stepup_password_blocked", _blocked)
+    monkeypatch.setattr(stepup_mod, "stepup_password_blocked", _blocked)
 
     user, _, headers = await _session_user(
         db_session, auth_source="local", signed_in_ago=timedelta(0), password="pw-123456"
@@ -392,6 +393,7 @@ async def test_an_unreadable_budget_raises_instead_of_reading_as_unblocked(
 
 
 def _throttle_down(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    import app.api.stepup as stepup_mod
     import app.api.v1.auth.router as auth_router
     import app.core.auth_throttle as throttle
 
@@ -403,7 +405,7 @@ def _throttle_down(monkeypatch: pytest.MonkeyPatch) -> list[object]:
     async def _record(user_id: object) -> None:
         failures.append(user_id)
 
-    monkeypatch.setattr(auth_router, "stepup_password_blocked", _blocked)
+    monkeypatch.setattr(stepup_mod, "stepup_password_blocked", _blocked)
     monkeypatch.setattr(auth_router, "record_stepup_password_failure", _record)
     return failures
 

@@ -54,6 +54,7 @@ class FindSavedViewsArgs(BaseModel):
 
 @register_tool(
     name="find_saved_views",
+    permission="self",
     description=(
         "List the current user's saved views — named filter/sort/column "
         "presets for list pages. Each row carries the page key, the view "
@@ -93,6 +94,7 @@ class CountSavedViewsArgs(BaseModel):
 
 @register_tool(
     name="count_saved_views",
+    permission="self",
     description=(
         "Count the current user's saved views, optionally for one page "
         "key. Personal-only and read-only."

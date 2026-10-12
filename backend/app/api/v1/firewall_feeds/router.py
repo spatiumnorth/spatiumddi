@@ -23,6 +23,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.stepup import require_operator_stepup
 from app.core.crypto import encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
@@ -36,7 +37,6 @@ from app.services.firewall_feeds.service import (
     render_blocklist,
     verify_feed_token,
 )
-from app.services.reauth import ReauthOutcome, reverify_operator
 
 router = APIRouter(
     tags=["firewall-feeds"],
@@ -210,18 +210,18 @@ async def reveal_token(
     f = await db.get(FirewallFeed, feed_id)
     if f is None:
         raise HTTPException(status_code=404, detail="Firewall feed not found")
-    outcome = reverify_operator(user, password=body.password, totp_code=body.totp_code)
-    if outcome is not ReauthOutcome.OK:
-        _audit(
-            db,
-            user=user,
-            action="firewall_feed_reveal_denied",
-            feed_id=f.id,
-            feed_name=f.name,
-            result="forbidden",
-        )
-        await db.commit()
-        raise HTTPException(status_code=403, detail="Password or TOTP code is incorrect")
+    # #1413 — through the shared step-up, so a wrong answer spends the
+    # per-account budget like every other step-up.
+    await require_operator_stepup(
+        db,
+        user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="firewall_feed_reveal_denied",
+        resource_type="firewall_feed",
+        resource_id=str(f.id),
+        resource_display=f.name,
+    )
     token = feed_token(f)
     _audit(db, user=user, action="firewall_feed_reveal", feed_id=f.id, feed_name=f.name)
     await db.commit()

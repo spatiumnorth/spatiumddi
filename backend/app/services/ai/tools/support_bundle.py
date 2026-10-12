@@ -18,6 +18,7 @@ class SupportBundlePreviewArgs(BaseModel):
 
 @register_tool(
     name="get_support_bundle_preview",
+    permission="superadmin",
     description=(
         "Describe what a support bundle generated right now would "
         "contain: the file list with sizes, how many IPs / hostnames / "

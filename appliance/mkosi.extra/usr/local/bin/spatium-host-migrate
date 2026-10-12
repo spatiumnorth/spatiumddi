@@ -85,7 +85,7 @@ if [ ! -d "$PATCH_DIR" ]; then
 fi
 
 # ── State dir ─────────────────────────────────────────────────────────────────
-# firstboot already mkdir -p's this with chmod 1777, but we guard here too
+# firstboot already mkdir -p's this (1770 root:2770), but we guard here too
 # so the script can be run standalone in recovery (e.g. from a rescue shell).
 mkdir -p "$STATE_DIR"
 

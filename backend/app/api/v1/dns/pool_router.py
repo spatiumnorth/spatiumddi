@@ -25,12 +25,29 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.dns_names import validate_record_owner
 from app.core.permissions import require_resource_permission
+from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
 from app.models.dns import DNSPool, DNSPoolMember, DNSZone
 from app.models.ownership import Site
+from app.services.dns import technitium_api_scope
 from app.services.dns.pool_apply import apply_pool_state
 
 logger = structlog.get_logger(__name__)
+
+
+async def _refuse_on_technitium_api(db: DB, group_id: uuid.UUID) -> None:
+    """422 pool create / membership on an experimental technitium_api group (#1784).
+
+    The driver writes an A/AAAA rrset one record per call; a pool's members
+    collapse to one of them. Existing pools on such a group keep serving and
+    show a warning on the group; only NEW pools and members are refused.
+    """
+    if await technitium_api_scope.group_is_technitium_api(db, group_id):
+        raise technitium_api_scope.refusal(
+            "DNS pools are not supported; the members of a pool collapse to a "
+            "single record on the Technitium server (#1769)."
+        )
+
 
 router = APIRouter(
     tags=["dns-pools"],
@@ -377,6 +394,7 @@ async def create_pool(
     zone = await db.get(DNSZone, zone_id)
     if zone is None or zone.group_id != group_id:
         raise HTTPException(status_code=404, detail="Zone not found")
+    await _refuse_on_technitium_api(db, group_id)
     if zone.zone_type == "forward":
         raise HTTPException(status_code=400, detail="Pools are not supported on forward zones")
     # Pools render A/AAAA records, which only belong in a forward zone.
@@ -437,7 +455,27 @@ async def update_pool(
     pool = await db.get(DNSPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
-    payload = body.model_dump(exclude_none=True)
+    # #1563 — explicit null clears hc_target_port; null for a NOT NULL
+    # column is a 422.
+    payload = resolve_update_changes(
+        body,
+        clearable={"hc_target_port"},
+        non_nullable={
+            "name",
+            "description",
+            "ttl",
+            "enabled",
+            "hc_type",
+            "hc_path",
+            "hc_method",
+            "hc_verify_tls",
+            "hc_expected_status_codes",
+            "hc_interval_seconds",
+            "hc_timeout_seconds",
+            "hc_unhealthy_threshold",
+            "hc_healthy_threshold",
+        },
+    )
     for k, v in payload.items():
         setattr(pool, k, v)
     db.add(
@@ -532,6 +570,7 @@ async def add_member(
     pool = await db.get(DNSPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
+    await _refuse_on_technitium_api(db, pool.group_id)
     clash = await db.execute(
         select(DNSPoolMember).where(
             DNSPoolMember.pool_id == pool_id,

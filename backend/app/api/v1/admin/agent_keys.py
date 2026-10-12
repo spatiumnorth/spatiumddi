@@ -35,10 +35,10 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.deps import DB, CurrentUser
+from app.api.stepup import require_operator_stepup
 from app.config import settings
 from app.core.permissions import is_effective_superadmin
 from app.models.audit import AuditLog
-from app.services.reauth import ReauthOutcome, reverify_operator
 
 logger = structlog.get_logger(__name__)
 
@@ -105,33 +105,18 @@ async def reveal_agent_keys(
     # RADIUS / TACACS+ — no local password) with a TOTP code. MFA enrolment
     # is now open to all auth sources, so an SSO superadmin can enrol + use
     # TOTP here instead of the old hard "log in as a local admin" dead-end.
-    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
-    if outcome is not ReauthOutcome.OK:
-        reason = "mfa_required" if outcome is ReauthOutcome.MFA_REQUIRED else "bad_credential"
-        db.add(
-            AuditLog(
-                user_id=current_user.id,
-                user_display_name=current_user.display_name,
-                auth_source=current_user.auth_source,
-                action="agent_keys_reveal_denied",
-                resource_type="platform",
-                resource_id="agent-keys",
-                resource_display="agent bootstrap keys",
-                result="forbidden",
-                new_value={"reason": reason},
-            )
-        )
-        await db.commit()
-        if outcome is ReauthOutcome.MFA_REQUIRED:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Re-confirmation requires MFA. Your account has no local "
-                "password — enrol TOTP under Settings → Security, then retry.",
-            )
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Password or TOTP code is incorrect",
-        )
+    # #1413 — through the shared step-up, so a wrong answer spends the
+    # per-account budget like every other step-up.
+    await require_operator_stepup(
+        db,
+        current_user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="agent_keys_reveal_denied",
+        resource_type="platform",
+        resource_id="agent-keys",
+        resource_display="agent bootstrap keys",
+    )
 
     # Success — emit an audit row carrying NOTHING about the key
     # values themselves (audit rows are themselves operator-visible

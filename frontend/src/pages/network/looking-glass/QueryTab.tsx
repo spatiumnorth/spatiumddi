@@ -284,7 +284,8 @@ export function QueryTab({ collectors }: { collectors: BGPLGCollector[] }) {
         ) : (
           <p className="text-xs text-muted-foreground">
             Vantage tools need the "tools.network" feature module, which is
-            disabled. An administrator can enable it in Settings → Features.
+            disabled. An administrator can enable it on the Features &
+            Integrations page.
           </p>
         )}
       </div>

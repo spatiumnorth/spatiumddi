@@ -142,6 +142,9 @@ class ChainBreakResponse(BaseModel):
     expected_hash: str
     actual_hash: str
     reason: str
+    action: str
+    resource_type: str
+    resource_id: str
 
 
 class IntegrityResponse(BaseModel):
@@ -187,6 +190,9 @@ async def get_audit_integrity(
                 expected_hash=b.expected_hash,
                 actual_hash=b.actual_hash,
                 reason=b.reason,
+                action=b.action,
+                resource_type=b.resource_type,
+                resource_id=b.resource_id,
             )
             for b in result.breaks
         ],

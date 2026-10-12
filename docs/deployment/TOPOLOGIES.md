@@ -351,7 +351,7 @@ the appliance internals are in [`APPLIANCE.md`](APPLIANCE.md#control-plane-high-
 
 ## PowerDNS-primary + BIND-secondary hybrid (driver crossover)
 
-SpatiumDDI ships three agent-managed authoritative DNS drivers: BIND9 (default), PowerDNS and Technitium. Each `DNSServerGroup` is single-driver — but **multiple groups, each on a different driver, can serve overlapping namespaces** via plain AXFR or RFC 9432 catalog zones. The two shapes below use PowerDNS + BIND9 as the worked example; a Technitium group substitutes for either side, since it does catalog zones as both producer and consumer and transfers over TSIG the same way.
+SpatiumDDI ships three agent-managed authoritative DNS drivers: BIND9 (default), PowerDNS and Technitium. Each `DNSServerGroup` is single-driver — but **multiple groups, each on a different driver, can serve overlapping namespaces** via plain AXFR or RFC 9432 catalog zones. The two shapes below use PowerDNS + BIND9 as the worked example; a Technitium group substitutes for either side over plain AXFR, which it transfers over TSIG the same way. It does not do catalog zones: both roles are broken and refused until [#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766) ([#1782](https://github.com/spatiumnorth/spatiumddi/issues/1782)), so a catalog-zone shape needs BIND9 (or PowerDNS as producer) on both sides.
 
 **Shape A — PowerDNS-primary + BIND-secondary on the same zones.** PowerDNS handles writes (online DNSSEC signing, ALIAS records, LUA records); BIND fans the zones out to a battle-tested edge. Catalog-zone-driven AXFR keeps both drivers in sync because the producer-side catalog renderer emits identical wire bytes from either driver (issue #127 Phase 3d).
 

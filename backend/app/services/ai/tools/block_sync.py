@@ -53,6 +53,7 @@ class FindNetworkBlocksArgs(BaseModel):
 
 @register_tool(
     name="find_network_blocks",
+    permission=("read", "manage_block_sync"),
     description=(
         "List SpatiumDDI-owned active network blocks (blocked IPs / MACs) "
         "and where each has been pushed — the enforcement half of the "
@@ -132,6 +133,7 @@ class CountNetworkBlocksArgs(BaseModel):
 
 @register_tool(
     name="count_network_blocks",
+    permission=("read", "manage_block_sync"),
     description=(
         "Count active network blocks (#601) grouped by kind (ip / mac) and "
         "enabled state, plus push-status totals across all armed targets. "
@@ -177,6 +179,7 @@ async def count_network_blocks(
 
 @register_tool(
     name="propose_create_network_block",
+    permission=("admin", "manage_block_sync"),
     description=(
         "Prepare a proposal to create/arm an active network block (#601) — a "
         "blocked IP (pushed to armed OPNsense firewall aliases) or MAC "

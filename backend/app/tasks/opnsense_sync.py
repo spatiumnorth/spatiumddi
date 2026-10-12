@@ -65,17 +65,20 @@ async def _run_sweep() -> dict[str, Any]:
                     if elapsed < timedelta(seconds=router.sync_interval_seconds):
                         skipped_interval += 1
                         continue
+                router_name = router.name  # a failed flush expires router
                 try:
                     summary = await reconcile_router(db, router)
                 except Exception as exc:  # noqa: BLE001 — one router shouldn't poison the sweep
                     err_count += 1
-                    errors.append(f"{router.name}: {exc}")
+                    # A crash leaves the shared session in a failed
+                    # transaction; roll back so the next router still syncs.
+                    await db.rollback()
+                    errors.append(f"{router_name}: {exc}")
                     logger.warning(
                         "opnsense_reconcile_crash",
-                        router=str(router.id),
+                        router=str(router_id),
                         error=str(exc),
                     )
-                    await db.rollback()
                     continue
                 ran += 1
                 if summary.ok:

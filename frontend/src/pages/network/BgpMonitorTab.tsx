@@ -158,9 +158,10 @@ export function BgpMonitorTab({
             </div>
           ) : hijacks.length === 0 ? (
             <div className="p-8 text-center text-sm text-muted-foreground">
-              No hijack detections. If BGP monitoring is enabled in Settings,
-              the poll opens a row here when an unexpected origin announces a
-              tracked prefix.
+              No hijack detections. While BGP monitoring is on, the poll opens a
+              row here when an unexpected origin announces a tracked prefix. It
+              is switched on by the bgp_monitoring_enabled platform setting,
+              through the settings API; the console has no control for it.
             </div>
           ) : (
             <table className="w-full text-xs">

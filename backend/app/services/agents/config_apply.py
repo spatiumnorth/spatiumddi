@@ -32,6 +32,19 @@ VALID_STATUSES = frozenset({STATUS_OK, STATUS_REVERTED, STATUS_REVERT_FAILED, ST
 #: filters on this set rather than re-listing the strings.
 FAILED_STATUSES = frozenset({STATUS_REVERTED, STATUS_REVERT_FAILED, STATUS_NO_PREVIOUS})
 
+# An agent that applied a bundle but had some zones refused by its daemon
+# (PowerDNS takes zones one at a time) reports ``reverted`` with an error that
+# starts with this prefix, since there is no "partial" status. Nothing was
+# rolled back and every other zone is served, so the alert must not say it
+# was. Mirrors the DNS agent's ``sync.PARTIAL_APPLY_PREFIX``.
+PARTIAL_APPLY_PREFIX = "partial apply: "
+
+
+def is_partial_apply(status: str | None, error: str | None) -> bool:
+    """True for a ``reverted`` verdict that is really a partial apply."""
+    return status == STATUS_REVERTED and (error or "").startswith(PARTIAL_APPLY_PREFIX)
+
+
 #: Severity per status. A revert is a warning: the daemon is healthy and
 #: serving, just not what was asked for. The other two are critical —
 #: ``revert_failed`` means the fallback ALSO failed, and ``no_previous``

@@ -116,6 +116,32 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     # Base64 TSIG secrets are indistinguishable from any other base64, so
     # they are excluded by key name at the collector instead; see
     # ``SECRET_KEY_NAME_RE``.
+    #
+    # Chat incoming-webhook URLs (#1502): the path IS the credential, so
+    # whoever reads it can post into the channel. The audit-forward sender
+    # keeps them out of httpx's request log; these catch whatever else
+    # prints one. Only the secret part is replaced, so the host survives
+    # (it is pseudonymised separately), and no replacement can match the
+    # pattern that produced it. A generic collector URL has no shape to
+    # recognise and relies on the sender's redaction alone.
+    (
+        "chat-webhook-url",
+        re.compile(r"(?<=hooks\.slack\.com/)(?:services|workflows|triggers)/[A-Za-z0-9/_-]+"),
+        f"{_REDACTED}:chat-webhook-url",
+    ),
+    (
+        "chat-webhook-url",
+        re.compile(r"(?<=/api/webhooks/)\d+/[A-Za-z0-9_-]+"),
+        f"{_REDACTED}:chat-webhook-url",
+    ),
+    (
+        "chat-webhook-url",
+        re.compile(r"(?<=\.webhook\.office\.com/)webhookb2/[^\s\"'<>]+"),
+        f"{_REDACTED}:chat-webhook-url",
+    ),
+    # A Shared Access Signature in a query string: a Teams Workflows
+    # (Power Automate / Logic Apps) webhook, or any Azure SAS URL.
+    ("sas-signature", re.compile(r"(?<=[?&]sig=)[A-Za-z0-9%_+/=-]+"), _REDACTED),
 )
 
 # Matched on KEY name, for structured data (env dumps, settings rows,

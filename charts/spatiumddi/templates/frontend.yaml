@@ -222,6 +222,12 @@ spec:
   {{- else }}
   type: {{ .Values.frontend.service.type }}
   {{- end }}
+  {{- if or .Values.frontend.controlPlaneVIP (eq .Values.frontend.service.type "LoadBalancer") }}
+  # #1550 — a MetalLB-fronted LoadBalancer (L2/BGP) never routes via
+  # NodePorts; without this every VIP port is also opened as a random
+  # NodePort on every node.
+  allocateLoadBalancerNodePorts: false
+  {{- end }}
   selector:
     {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
   ports:

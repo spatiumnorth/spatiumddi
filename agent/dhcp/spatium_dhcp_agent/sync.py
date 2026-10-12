@@ -42,6 +42,7 @@ from .config import AgentConfig
 from .config_apply import (
     PHASE_RELOAD,
     PHASE_RENDER,
+    PHASE_VALIDATE,
     STATUS_NO_PREVIOUS,
     STATUS_OK,
     STATUS_REVERT_FAILED,
@@ -51,7 +52,13 @@ from .config_apply import (
     Quarantine,
     truncate_error,
 )
-from .kea_ctrl import KeaCtrlError, config_reload, config_test
+from .kea_ctrl import (
+    KeaCheckUnavailable,
+    KeaConfigRejected,
+    KeaCtrlError,
+    config_check,
+    config_reload,
+)
 from .radvd_apply import apply_radvd
 from .render_kea import render as render_kea
 from .v6_unicast import global_ipv6_addresses
@@ -116,9 +123,12 @@ _BOOTSTRAP_RELOAD_TIMEOUT = 15.0
 _BOOTSTRAP_RELOAD_INTERVAL = 1.0
 
 # Outcomes of one daemon's reload attempt. Only REJECTED is a verdict about
-# the config itself; UNREACHABLE means we never got to ask (#882).
+# the config itself; UNREACHABLE means we never got to ask (#882); UNVALIDATED
+# means the ``-t`` preflight could not run, so the config was not reloaded
+# and is not known to be good either (#1447).
 RELOAD_OK = "ok"
 RELOAD_REJECTED = "rejected"
+RELOAD_UNVALIDATED = "unvalidated"
 RELOAD_UNREACHABLE = "unreachable"
 
 
@@ -334,8 +344,8 @@ class SyncLoop:
         Returns True when ``bundle`` is live, False when it was rejected.
 
         Unlike the DNS agent, a revert here always rewrites the on-disk Kea
-        documents even when the running daemon was never disturbed. Kea's
-        ``config-test`` rejects without touching the running server, so the
+        documents even when the running daemon was never disturbed. The
+        ``-t`` preflight rejects without touching the running server, so the
         daemon is fine — but ``_apply_bundle`` has already written the
         refused document to ``kea_config_path``, and that file is what Kea
         reads on its next start. Leaving it would turn a rejected apply into
@@ -441,48 +451,67 @@ class SyncLoop:
     def _reload_socket(
         self,
         socket_path: Path,
-        config_doc: dict[str, Any],
+        config_path: Path,
         daemon: str,
         reload_retry_timeout: float,
     ) -> str:
-        """Preflight (config-test) then reload one Kea daemon.
+        """Preflight (``kea-dhcpX -t``) then reload one Kea daemon.
 
-        Returns ``RELOAD_OK`` / ``RELOAD_REJECTED`` / ``RELOAD_UNREACHABLE``.
-        Never raises, so a v6 failure can't abort the v4 apply (and
-        vice-versa). Two failure modes are distinguished (#477), and #882
-        makes that distinction load-bearing rather than only cosmetic: a
-        REJECTED config is known-bad and triggers a revert to the last
-        config Kea accepted, while an UNREACHABLE socket says nothing about
-        the config — reverting there would discard a perfectly good bundle
-        because Kea happened to be restarting.
+        Returns ``RELOAD_OK`` / ``RELOAD_REJECTED`` / ``RELOAD_UNVALIDATED``
+        / ``RELOAD_UNREACHABLE``. Never raises, so a v6 failure can't abort
+        the v4 apply (and vice-versa). The failure modes are distinguished
+        (#477), and #882 makes that distinction load-bearing rather than only
+        cosmetic: a REJECTED config is known-bad and triggers a revert to the
+        last config Kea accepted, while an UNREACHABLE socket says nothing
+        about the config — reverting there would discard a perfectly good
+        bundle because Kea happened to be restarting.
 
-        * **Config rejected** — config-test / reload answers with a non-zero
-          result. Terminal (retrying won't fix a bad render), so surface Kea's
-          *actual* error text in ``daemon_status`` and skip the reload rather
-          than disturb a running daemon with a config it will reject. This is
-          what turns an opaque "degraded" into "pool 10.0.0.0/24 is not part
-          of the subnet …".
+        * **Config rejected** — ``-t`` exits 1, or the reload itself answers
+          with a non-zero result. Terminal (retrying won't fix a bad render),
+          so surface Kea's *actual* error text in ``daemon_status`` and skip
+          the reload rather than disturb a running daemon with a config it
+          will reject. This is what turns an opaque "degraded" into "pool
+          10.0.0.0/24 is not part of the subnet …".
+        * **Preflight could not run** — ``-t`` missing, timed out, crashed.
+          No verdict either way, so fail closed: no reload, and the apply
+          is not reported as OK (#1447).
         * **Socket not ready** — an ``OSError`` connecting to the control
           socket during Kea's startup window. Retry until the deadline.
+
+        The preflight is a separate process on ``config_path`` — the file
+        ``config-reload`` reads — and never the ``config-test`` command: on
+        Kea 3.0.3 that leaves the running daemon unable to start the HA
+        hook's HTTP listener (#1447).
         """
+        try:
+            config_check(daemon, config_path)
+        except KeaConfigRejected as e:
+            return self._report_rejected(daemon, e)
+        except KeaCheckUnavailable as e:
+            log.warning("kea_config_unvalidated", daemon=daemon, error=str(e))
+            # ``config_apply_`` prefix: the daemon was not touched and is still
+            # serving, so the control plane must read this as a failed apply
+            # (#882), not as a daemon that is down (#1067).
+            self.heartbeat.daemon_status = {
+                "status": "degraded",
+                "reason": f"config_apply_unvalidated: {daemon}: {e}",
+            }
+            self._last_reload_error = f"{daemon}: {e}"
+            return RELOAD_UNVALIDATED
         deadline = time.monotonic() + reload_retry_timeout
         last_err: Exception | None = None
         while True:
             try:
-                # config-test validates WITHOUT applying and returns the real
-                # reason on rejection; only reload once it passes.
-                config_test(socket_path, config_doc)
                 config_reload(socket_path)
                 return RELOAD_OK
             except (KeaCtrlError, OSError) as e:
                 # Retry BOTH classes through the deadline. An OSError is the
                 # control socket not being up yet; and during Kea's startup
-                # window the command channel can answer config-test with a
-                # *transient* KeaCtrlError (empty / non-JSON / not-ready) that a
-                # moment later succeeds — so a rejection is only treated as
-                # terminal once the retry window is exhausted. In the steady-
-                # state apply path reload_retry_timeout is 0, so a genuinely bad
-                # config still reports immediately without a spurious reload.
+                # window the command channel can answer with a *transient*
+                # KeaCtrlError (empty / non-JSON / not-ready) that a moment
+                # later succeeds — so a rejection is only treated as terminal
+                # once the retry window is exhausted. In the steady-state apply
+                # path reload_retry_timeout is 0, so a failure reports at once.
                 last_err = e
                 if time.monotonic() >= deadline:
                     break
@@ -497,13 +526,7 @@ class SyncLoop:
         # Deadline exhausted — report the reason that fits the last error: a
         # config Kea rejected (surface its text) vs a socket we never reached.
         if isinstance(last_err, KeaCtrlError):
-            log.warning("kea_config_rejected", daemon=daemon, error=str(last_err))
-            self.heartbeat.daemon_status = {
-                "status": "degraded",
-                "reason": f"{daemon}_config_rejected: {last_err}",
-            }
-            self._last_reload_error = f"{daemon}: {last_err}"
-            return RELOAD_REJECTED
+            return self._report_rejected(daemon, last_err)
         log.warning("kea_config_reload_failed", daemon=daemon, error=str(last_err))
         self.heartbeat.daemon_status = {
             "status": "degraded",
@@ -511,6 +534,15 @@ class SyncLoop:
         }
         self._last_reload_error = f"{daemon}: {last_err}"
         return RELOAD_UNREACHABLE
+
+    def _report_rejected(self, daemon: str, err: Exception) -> str:
+        log.warning("kea_config_rejected", daemon=daemon, error=str(err))
+        self.heartbeat.daemon_status = {
+            "status": "degraded",
+            "reason": f"{daemon}_config_rejected: {err}",
+        }
+        self._last_reload_error = f"{daemon}: {err}"
+        return RELOAD_REJECTED
 
     def _apply_bundle(
         self,
@@ -608,13 +640,19 @@ class SyncLoop:
             # heartbeat daemon_status reflects the worst of the two.
             self._last_reload_error = None
             r4 = self._reload_socket(
-                self.cfg.kea_control_socket, dhcp4_doc, "dhcp4", reload_retry_timeout
+                self.cfg.kea_control_socket,
+                self.cfg.kea_config_path,
+                "dhcp4",
+                reload_retry_timeout,
             )
             r6 = self._reload_socket(
-                self.cfg.kea_control_socket_v6, dhcp6_doc, "dhcp6", reload_retry_timeout
+                self.cfg.kea_control_socket_v6,
+                self.cfg.kea_config_path_v6,
+                "dhcp6",
+                reload_retry_timeout,
             )
-            # At least one daemon ran config-test against this document and
-            # accepted it, which is what makes it a legitimate revert target.
+            # At least one daemon checked this document and accepted it,
+            # which is what makes it a legitimate revert target.
             self._last_reload_results = {"dhcp4": r4, "dhcp6": r6}
             self._reload_confirmed = RELOAD_OK in (r4, r6)
             if r4 == RELOAD_OK and r6 == RELOAD_OK:
@@ -631,6 +669,20 @@ class SyncLoop:
                 raise ConfigApplyError(
                     PHASE_RELOAD,
                     RuntimeError(self._last_reload_error or "Kea rejected the config"),
+                )
+            elif RELOAD_UNVALIDATED in (r4, r6):
+                # #1447 — the ``-t`` preflight gave no verdict (missing,
+                # timed out, crashed). Fail closed: the daemon was not
+                # reloaded with this document, and it must not be committed
+                # or reported as applied. Raised as a VALIDATE failure so the
+                # caller quarantines (retried on backoff, which covers a
+                # transient timeout) and puts the last-known-good document
+                # back on disk.
+                raise ConfigApplyError(
+                    PHASE_VALIDATE,
+                    RuntimeError(
+                        self._last_reload_error or "Kea config check could not run"
+                    ),
                 )
             # An UNREACHABLE socket is NOT a verdict on the config — Kea may
             # simply be starting. daemon_status already says degraded; leave
@@ -866,7 +918,7 @@ class SyncLoop:
         independently, so one can have taken it while the other refused;
         the refuser never left its old document and is not touched, since a
         Kea reload restarts the HA hook's state machine. ``_reload_socket``
-        runs config-test first and never raises."""
+        runs the ``-t`` preflight first and never raises."""
         self._v6_unicast_applied = snapshot["v6_unicast"]
         sockets = {
             self.cfg.kea_config_path: (self.cfg.kea_control_socket, "dhcp4"),
@@ -880,7 +932,7 @@ class SyncLoop:
             self._atomic_write_json(path, doc)
             socket_path, daemon = sockets[path]
             if self._last_reload_results.get(daemon) == RELOAD_OK:
-                self._reload_socket(socket_path, doc, daemon, 0.0)
+                self._reload_socket(socket_path, path, daemon, 0.0)
 
     def _recheck_v6_unicast(self) -> None:
         """Re-render the current bundle when the host's global IPv6

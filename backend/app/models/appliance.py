@@ -614,6 +614,12 @@ class Appliance(Base):
     reboot_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # #1446 — the boot (``/proc/sys/kernel/random/boot_id``) the reboot
+    # request applies to, recorded from the first heartbeat after the stamp.
+    # The request is retired when a heartbeat arrives from a DIFFERENT boot,
+    # which is the proof it landed. NULL until that first heartbeat, and
+    # always NULL for a supervisor too old to report a boot id.
+    reboot_requested_boot_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # #786 — operator asked to clear a failed upgrade. The visible failure
     # state (the ``last_upgrade_*`` columns above) is re-published from
     # host sidecar files on every heartbeat, so clearing the DB alone does
@@ -940,9 +946,21 @@ class Appliance(Base):
     # dead). The SEED supervisor reads the eviction list off its
     # heartbeat response and deletes the k8s Node (k3s removes the etcd
     # member with it), then reports the hostname back so the backend
-    # clears this flag + settles the row to ``left``. Distinct from a
-    # graceful demote, which the leaving node drives itself.
+    # clears this flag + settles the row to ``left``. A graceful demote's
+    # node drives its own leave, and (#1541) its ``left`` report sets this
+    # too, with ``evict_after_demote``, so the seed deletes the stale Node.
     evict_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
+    )
+    # #1541 — True when the eviction above is the seed's cleanup after a
+    # graceful DEMOTE (the node left etcd itself and reported ``left``; the
+    # seed only deletes its stale Node and confirms etcd agrees), False for a
+    # dead-node Replace. The seed treats the two differently: a Replace arms
+    # #1059's CloudNativePG size hold until the replacement is promoted, and
+    # a demote must never arm it — the slot is given up on purpose, so the
+    # control plane scales down to the committed count. Cleared with
+    # ``evict_requested``.
+    evict_after_demote: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa.text("false")
     )
 

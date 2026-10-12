@@ -157,7 +157,8 @@ async def preview(body: PreviewRequest, db: DB, current_user: CurrentUser) -> Pr
         backup_detail = (
             "No enabled backup target is configured. The factory reset is "
             "destructive and there's no built-in undo. Configure a backup "
-            "destination at Settings → Backup, run a backup, and only then "
+            "destination under Administration → Backup → Destinations, run a "
+            "backup, and only then "
             "proceed — or acknowledge the risk by setting "
             "acknowledge_no_backup=true on the execute call."
         )

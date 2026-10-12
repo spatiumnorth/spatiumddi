@@ -37,6 +37,11 @@
 #   no-external-kea-ha — every render, plus the raw ``k8s/dhcp`` manifests: no
 #                      NodePort / LoadBalancer Service in front of a DHCP agent
 #                      publishes TCP 8000, Kea's unauthenticated HA listener.
+#   dhcp-readiness   — every render, plus a dedicated pass over the umbrella
+#                      posture render and the raw manifests: no DHCP agent
+#                      readiness probe gates on that same HA listener
+#                      (#1589) — a standalone Kea server never binds it, so
+#                      the pod would never become Ready.
 #   dns-agent-service — every render: a DNS agent LoadBalancer Service keeps
 #                      the client address (``externalTrafficPolicy: Local``,
 #                      #1548), plus one dedicated render asserting the
@@ -44,6 +49,17 @@
 #                      family policy, annotations) reach the Service, and
 #                      negative controls for encrypted-transport ports a
 #                      flavor cannot serve (#1553).
+#   slot-image-mirror — every render: the mirror runs the api's image and
+#                      imports the whole application, so its memory and CPU
+#                      limits must each be at least the api's (#1174). Below
+#                      the api it is OOMKilled before it serves a byte, and
+#                      helm, kubeconform and the posture gates all pass it.
+#   rollout-strategy — every render: a Deployment with required pod
+#                      anti-affinity must retire an old pod first, or its
+#                      rollout wedges once replicas == nodes (#590); plus a
+#                      dedicated pass asserting the appliance's api / worker /
+#                      frontend retire first at one replica too, where the
+#                      blocking term rides on the OUTGOING pods (#1541).
 #
 # Runs anywhere helm + kubeconform + python3 (with PyYAML) are on PATH; the
 # CI job and ``make charts-lint`` both call it. Rendered manifests are left
@@ -113,9 +129,32 @@ render() { # name chart [helm --set args...]
         || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-no-external-kea-ha.py" "$file" \
         || failures=$((failures + 1))
+    # #1589 — no DHCP agent readiness probe may gate on the Kea HA
+    # listener (TCP 8000): a standalone server never binds it.
+    python3 "$ROOT/.github/scripts/chart-dhcp-readiness.py" "$file" \
+        || failures=$((failures + 1))
+    # #1550 — MetalLB VIP Services must not allocate NodePorts.
+    python3 "$ROOT/.github/scripts/chart-vip-nodeports.py" "$file" \
+        || failures=$((failures + 1))
     # #1548 — a DNS agent LoadBalancer Service must keep the client
     # address (externalTrafficPolicy: Local); see the script's docstring.
     python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" "$file" \
+        || failures=$((failures + 1))
+    # #1510 — no two Services may ask MetalLB for the same address; only the
+    # one created first would get it.
+    python3 "$ROOT/.github/scripts/chart-lb-address-single-owner.py" "$file" \
+        || failures=$((failures + 1))
+    # A MetalLB VIP must keep the client's source address (the DNS VIP's
+    # rate limits, query logs and RPZ hits are all per client). The DHCP
+    # relay VIP is exempt: Kea answers the relay at giaddr, so the packet's
+    # source address is never used.
+    python3 "$ROOT/.github/scripts/chart-vip-client-ip.py" --allow dhcp-kea-relay "$file" \
+        || failures=$((failures + 1))
+    python3 "$ROOT/.github/scripts/chart-slot-image-mirror.py" "$file" \
+        || failures=$((failures + 1))
+    # #590 / #1541 — required anti-affinity with a surge-first rollout
+    # wedges once replicas == nodes.
+    python3 "$ROOT/.github/scripts/chart-rollout-strategy.py" "$file" \
         || failures=$((failures + 1))
 }
 
@@ -184,6 +223,34 @@ render umbrella-all-on "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 render umbrella-ha "$UMBRELLA" "${UMBRELLA_HA[@]}"
 # Bring-your-own database + Redis: the shape k8s/ha/ installs use.
 render umbrella-external-db "$UMBRELLA" "${UMBRELLA_EXTERNAL[@]}"
+# #1174 — the shape the slot-image mirror actually runs in: an appliance
+# whose control plane has more than one node, where the supervisor turns the
+# mirror on and sizes the api from the node's RAM (``control_plane_resources``
+# writes ``api.resources.limits.memory``: 2949Mi on an 8 GiB node). The mirror
+# runs the api's image, so that sizing has to reach it as well.
+render umbrella-appliance-mirror "$UMBRELLA" \
+    --set slotImageMirror.enabled=true \
+    --set api.resources.limits.memory=2949Mi
+# #1541 — the appliance control plane's own values (``hard`` anti-affinity,
+# which the supervisor writes on every install) at one replica and at three.
+# One replica renders no anti-affinity of its own, but the pods a 3 → 1
+# demote replaces still carry the 3-node required term, which keeps a
+# surged pod off the only node for good — so api and worker must retire
+# first at one replica as well as at three.
+APPLIANCE_CP_HARD=(
+    --set api.podAntiAffinity=hard
+    --set worker.podAntiAffinity=hard
+    --set frontend.podAntiAffinity=hard
+    --set frontend.hostNetwork=true
+)
+for n in 1 3; do
+    render "umbrella-appliance-cp-$n" "$UMBRELLA" "${APPLIANCE_CP_HARD[@]}" \
+        --set api.replicas=$n --set worker.replicas=$n --set frontend.replicas=$n
+    echo "── rollout strategy at $n replica(s) (umbrella, #1541)"
+    python3 "$ROOT/.github/scripts/chart-rollout-strategy.py" \
+        --retire-first api --retire-first worker --retire-first frontend \
+        "$OUT/umbrella-appliance-cp-$n.yaml" || failures=$((failures + 1))
+done
 POSTURE_ARGS="--require-priority"
 render umbrella-posture "$UMBRELLA" "${UMBRELLA_POSTURE[@]}"
 # ...and again on the HA topology. The CNPG ``Cluster`` and the Sentinel
@@ -272,6 +339,7 @@ APPLIANCE_ALL_ON=(
     --set observability.kubeStateMetrics.enabled=true
     --set observability.nodeExporter.enabled=true
     --set dns.useMetalLBVIP=true
+    --set dns.vip=10.0.0.53
     --set cnpg.enabled=true
     # #1281 — the off-cluster shape: an external control-plane URL renders
     # the pinned-certificate env, mount and hostPath volume in every role
@@ -291,6 +359,11 @@ lint "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
 POSTURE_ARGS="--require-priority --allow-no-priority agent-landing"
 render appliance-defaults "$APPLIANCE"
 render appliance-all-on "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
+# #1510 — all three DNS engines on with a DNS VIP: exactly one Service may ask
+# for it, and its selector must reach every engine's pods, so an engine switch
+# never leaves the VIP on a Service without endpoints.
+python3 "$ROOT/.github/scripts/chart-lb-address-single-owner.py" --require \
+    --dns-vip 10.0.0.53 "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
 # The single-node default install shape: one DNS driver + DHCP + supervisor.
 render appliance-full-stack "$APPLIANCE" \
     --set dnsBind9.enabled=true --set dhcpKea.enabled=true --set supervisor.enabled=true
@@ -416,6 +489,107 @@ coverage "$METALLB" "${METALLB_ALL_ON[@]}" "${METALLB_BGP[@]}"
 echo "── no external Kea HA port (raw k8s/dhcp manifests)"
 python3 "$ROOT/.github/scripts/chart-no-external-kea-ha.py" "$ROOT"/k8s/dhcp/*.yaml \
     || failures=$((failures + 1))
+
+# #1589 — the DHCP agent's readiness probe must test the Kea control
+# socket, not the HA listener, in the umbrella chart's render (the
+# posture render is the one that names a DHCP server) and in the raw
+# manifests alike. --require so a render that stops exercising the
+# template fails instead of passing vacuously.
+echo "── DHCP agent readiness probes the Kea control socket (#1589)"
+python3 "$ROOT/.github/scripts/chart-dhcp-readiness.py" \
+    --require --require-kea-socket \
+    "$OUT/umbrella-posture.yaml" "$ROOT/k8s/dhcp/kea-statefulset.yaml" \
+    || failures=$((failures + 1))
+
+# The guard must still FIRE on the probe shape it exists to catch.
+# Grep the message, not just the exit code (same reasoning as the
+# priorityClasses negative control above).
+echo "── negative control: tcpSocket readiness on the Kea HA port must fail"
+cat > "$OUT/neg-dhcp-readiness.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dhcp-kea-dhcp1
+  labels:
+    app.kubernetes.io/name: spatium-dhcp
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spatium-dhcp
+    spec:
+      containers:
+        - name: dhcp
+          readinessProbe:
+            tcpSocket: { port: 8000 }
+EOF
+neg_out="$(python3 "$ROOT/.github/scripts/chart-dhcp-readiness.py" \
+    --require-kea-socket "$OUT/neg-dhcp-readiness.yaml" 2>&1)" && neg_rc=0 || neg_rc=$?
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "HA peer listener"; then
+    echo "   ok: tcpSocket readiness on port 8000 refused by the #1589 guard"
+else
+    echo "   FAIL: expected the #1589 readiness guard to refuse a tcpSocket probe on port 8000 (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
+
+# #1550 — no render above sets frontend.controlPlaneVIP, so the
+# frontend's LoadBalancer shape is exercised here, together with the
+# appliance all-on render (DNS VIPs + DHCP relay VIP). --require so
+# either side silently dropping its VIP Service fails the gate.
+echo "── MetalLB VIP Services allocate no NodePorts (#1550)"
+if helm template umbrella-vip "$UMBRELLA" --kube-version "$K8S_VERSION" \
+        --set frontend.controlPlaneVIP=10.0.0.10 > "$OUT/umbrella-vip.yaml"; then
+    python3 "$ROOT/.github/scripts/chart-vip-nodeports.py" --require \
+        "$OUT/umbrella-vip.yaml" "$OUT/appliance-all-on.yaml" \
+        || failures=$((failures + 1))
+else
+    echo "   FAIL: umbrella chart did not render with frontend.controlPlaneVIP set" >&2
+    failures=$((failures + 1))
+fi
+
+echo "── negative control: a VIP LoadBalancer allocating NodePorts must fail"
+cat > "$OUT/neg-vip-nodeports.yaml" <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-bind9
+spec:
+  type: LoadBalancer
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+EOF
+neg_out="$(python3 "$ROOT/.github/scripts/chart-vip-nodeports.py" \
+    "$OUT/neg-vip-nodeports.yaml" 2>&1)" && neg_rc=0 || neg_rc=$?
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "allocateLoadBalancerNodePorts"; then
+    echo "   ok: VIP LoadBalancer without allocateLoadBalancerNodePorts: false refused by the #1550 guard"
+else
+    echo "   FAIL: expected the #1550 guard to refuse a VIP LoadBalancer allocating NodePorts (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
+
+# #1547 — the raw manifests must point at Services that exist (or
+# that CNPG creates): postgres-rw, the `api` Service, sentinel://
+# Redis URLs and a redis-sentinel Service.
+echo "── raw k8s/ manifests point at Services that exist (#1547)"
+python3 "$ROOT/.github/scripts/chart-raw-k8s-refs.py" "$ROOT/k8s" \
+    || failures=$((failures + 1))
+
+echo "── negative control: a DATABASE_URL host CNPG never creates must fail"
+cp -r "$ROOT/k8s" "$OUT/neg-k8s"
+sed -i 's/@postgres-rw:/@postgres-primary:/' "$OUT/neg-k8s/base/configmap.yaml"
+neg_out="$(python3 "$ROOT/.github/scripts/chart-raw-k8s-refs.py" \
+    "$OUT/neg-k8s" 2>&1)" && neg_rc=0 || neg_rc=$?
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "postgres-primary"; then
+    echo "   ok: DATABASE_URL at postgres-primary refused by the #1547 guard"
+else
+    echo "   FAIL: expected the #1547 guard to refuse a postgres-primary DATABASE_URL (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
 
 if [ "$failures" -ne 0 ]; then
     echo "charts: $failures gate(s) failed" >&2

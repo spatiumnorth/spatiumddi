@@ -43,7 +43,7 @@ import re
 import secrets
 import uuid
 from collections.abc import Sequence
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -70,6 +70,7 @@ from app.core.agent_wake import (
     appliance_channel,
     appliance_wake_channels,
     publish_wake,
+    wake_publishing,
     wake_subscription,
 )
 from app.core.auth_throttle import (
@@ -112,6 +113,7 @@ from app.services.appliance.ca import (
     verify_session_token,
 )
 from app.services.appliance.firewall import firewall_bundle
+from app.services.appliance.group_names import group_name_problem
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.network_mtu import (
     evaluate_node as evaluate_node_mtu,
@@ -121,6 +123,9 @@ from app.services.appliance.network_mtu import (
     network_report,
 )
 from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.ownership import current_dns_drivers as _current_dns_drivers
+from app.services.appliance.ownership import own_server_condition as _own_server_condition
+from app.services.appliance.reboot import request_reboot
 from app.services.appliance.removable import (
     RemovableError,
     archive_path,
@@ -151,6 +156,7 @@ from app.services.appliance.storage_health import (
 from app.services.appliance.syslog import syslog_bundle
 from app.services.appliance.tls_pins import signed_pin_set
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
+from app.services.upgrades.safety import assert_no_upgrade_in_flight
 from app.services.upgrades.schema_rollback import check_release_can_run
 from app.services.upgrades.schema_rollback import enforce as enforce_schema_rollback
 
@@ -1280,6 +1286,9 @@ class SupervisorHeartbeatRequest(BaseModel):
     slot_a_version: str | None = None
     slot_b_version: str | None = None
     is_trial_boot: bool | None = None
+    # #1446 — this boot's kernel boot id. A reboot request is retired when a
+    # heartbeat arrives from a different boot. None from an older supervisor.
+    boot_id: str | None = Field(default=None, max_length=64)
     last_upgrade_state: Literal["ready", "in-flight", "done", "failed"] | None = None
     last_upgrade_state_at: datetime | None = None
     # Issue #386 Part C — tail of the host ``slot-upgrade.log`` so the
@@ -1669,6 +1678,16 @@ class SupervisorHeartbeatResponse(BaseModel):
     # ones it deleted back via ``evicted_node_names`` so the backend
     # clears the flag. Empty in the steady state.
     evict_node_names: list[str] = Field(default_factory=list)
+    # #1541 — ``evict_node_names`` split by why. ``replace_node_names`` are
+    # dead-node Replaces: the seed arms #1059's CNPG size hold on them and
+    # keeps the control plane's size until the replacement is promoted.
+    # ``demote_evict_node_names`` are a graceful demote's cleanup (the node
+    # already left etcd; the seed deletes its stale Node and confirms): no
+    # replacement is coming, so the seed scales the control plane down to the
+    # committed count instead. A supervisor that predates the split reads
+    # only ``evict_node_names`` and holds on both, as before.
+    replace_node_names: list[str] = Field(default_factory=list)
+    demote_evict_node_names: list[str] = Field(default_factory=list)
     # #1284 — the node IPs of each name above. k3s names an etcd member
     # ``<node name>-<8 hex>`` only once it has started; a learner that never
     # did is matched by its peer URL's host.
@@ -1817,6 +1836,9 @@ async def _ingest_lldp_neighbours(
 # trigger it does not own is unlinkable out of the sticky release-state
 # directory — so the flag can't pin the heartbeat long-poll off forever.
 _CLEAR_UPGRADE_GIVE_UP_SECONDS = 600.0
+# #1446 — how long a reboot request is delivered without a heartbeat from a
+# new boot before it is given up (and logged).
+_REBOOT_GIVE_UP_SECONDS = 900.0
 
 
 # (heartbeat_interval + 10 s) so the hold returns before the client gives up.
@@ -1850,11 +1872,10 @@ async def supervisor_heartbeat(
       ``installed_appliance_version`` matches it AND the upgrade
       state is ``done`` or ``ready`` — the upgrade has landed and
       the operator's target is no longer load-bearing.
-    * Auto-clears ``reboot_requested`` 15 s after the stamp on the
-      assumption that the supervisor's heartbeat proves it survived
-      the reboot. Same auto-heal shape as the legacy
-      ``dns_server.reboot_requested`` / ``dhcp_server.reboot_requested``
-      flags in Phase 8f-8.
+    * Retires ``reboot_requested`` once a heartbeat arrives from a
+      different boot than the one the request applied to (#1446), with a
+      give-up backstop. It used to clear 15 s after the stamp, which could
+      happen before the request was ever delivered.
     """
     if not await _module_enabled(db):
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
@@ -2228,6 +2249,7 @@ async def supervisor_heartbeat(
         )
         for ev in evicted:
             ev.evict_requested = False
+            ev.evict_after_demote = False
             ev.cluster_join_state = CLUSTER_JOIN_STATE_LEFT
             ev.cluster_join_reason = None
             logger.info("control_plane_node_evicted", hostname=ev.hostname, by=str(row.id))
@@ -2282,6 +2304,10 @@ async def supervisor_heartbeat(
         row.desired_cluster_role = None
         row.desired_k3s_server_url = None
         row.desired_k3s_join_token_encrypted = None
+        # #1750 — a re-joined node normally registers a fresh Node, but one
+        # that re-used a Node an earlier demote cordoned must not stay
+        # unschedulable as a member. Marker-gated: an operator's cordon stays.
+        await _set_node_schedulable(row.hostname, cordon=False)
     # #590 — clear the promote desired-state on a reported ``failed`` too.
     # The host runner rolls the node back to its prior single-node seed and
     # renames its trigger out of the way, so leaving desired_cluster_role
@@ -2347,6 +2373,23 @@ async def supervisor_heartbeat(
     ):
         row.cluster_role = None
         row.desired_cluster_role = None
+        # #1541 — the node removed its own etcd member before it wiped, but
+        # its k8s Node is still on the seed, and only the seed can say etcd
+        # agrees. Hand the row to the seed's eviction (the path Replace
+        # uses): it deletes the stale Node, confirms etcd no longer lists the
+        # member (#1284), and the row settles ``left`` on that report.
+        #
+        # ``evict_after_demote`` tells the seed this eviction is a demote's
+        # cleanup, not a dead-node Replace: a Replace arms #1059's CNPG size
+        # hold until the replacement is promoted, and a demote has no
+        # replacement coming — armed on it, the hold kept a cluster demoted to
+        # one node at three Postgres instances and three api / frontend /
+        # worker / redis replicas for good (#1541 walk, finding 1).
+        row.evict_requested = True
+        row.evict_after_demote = True
+        row.cluster_join_state = CLUSTER_JOIN_STATE_EVICTING
+        row.cluster_join_state_at = datetime.now(UTC)
+        row.cluster_join_reason = None
     # #590 — and clear it on a failed leave, for the same reason a failed
     # join clears above: the leave runner also renames its trigger away, so
     # a desired-state left standing re-fires the destructive leave every
@@ -2356,6 +2399,8 @@ async def supervisor_heartbeat(
         and row.cluster_join_state == CLUSTER_JOIN_STATE_FAILED
     ):
         row.desired_cluster_role = None
+        # #1750 — the node did not leave: don't strand it cordoned.
+        await _set_node_schedulable(row.hostname, cordon=False)
         logger.warning(
             "control_plane_leave_failed",
             appliance_id=str(row.id),
@@ -2406,18 +2451,58 @@ async def supervisor_heartbeat(
     if row.desired_default_slot is not None and row.durable_default == row.desired_default_slot:
         row.desired_default_slot = None
 
-    # Auto-clear reboot_requested 15 s after the stamp — by that
-    # point the heartbeat is itself proof the reboot landed (or that
-    # the reboot trigger has been written + the host runner is about
-    # to fire). Reduces the chance of a stale flag stalling the
-    # operator's next reboot request.
-    if (
-        row.reboot_requested
-        and row.reboot_requested_at is not None
-        and (datetime.now(UTC) - row.reboot_requested_at).total_seconds() >= 15
-    ):
-        row.reboot_requested = False
-        row.reboot_requested_at = None
+    # #1446 — retire reboot_requested on PROOF it landed, not on a clock.
+    # It used to clear 15 s after the stamp. A node with an upgrade staged
+    # keeps ``desired_appliance_version`` set, which suppresses the
+    # long-poll, so its heartbeats arrive a full interval apart: the first
+    # one after the stamp cleared the flag and then carried ``false`` in
+    # its own response, so the supervisor never saw the request (found on a
+    # 3-node rolling upgrade). The #786 stopwatch, again.
+    #
+    # The first heartbeat after the stamp records which boot the request
+    # applies to; it is delivered until a heartbeat comes from another boot.
+    # ``deliver_reboot`` is read AFTER the retire, unlike the clear-upgrade
+    # command below: delivering it again from the new boot would reboot the
+    # node a second time.
+    deliver_reboot = False
+    if row.reboot_requested:
+        if body.boot_id:
+            if row.reboot_requested_boot_id is None:
+                row.reboot_requested_boot_id = body.boot_id
+                deliver_reboot = True
+            elif body.boot_id != row.reboot_requested_boot_id:
+                row.reboot_requested = False
+                row.reboot_requested_at = None
+                row.reboot_requested_boot_id = None
+            else:
+                deliver_reboot = True
+        else:
+            # A supervisor too old to report its boot: deliver the request
+            # once and retire it. Never clearing it before it was sent is the
+            # fix; repeating it to a supervisor that cannot say whether it
+            # rebooted could reboot the node twice.
+            deliver_reboot = True
+            row.reboot_requested = False
+            row.reboot_requested_at = None
+        if (
+            row.reboot_requested
+            and row.reboot_requested_at is not None
+            and (datetime.now(UTC) - row.reboot_requested_at).total_seconds()
+            >= _REBOOT_GIVE_UP_SECONDS
+        ):
+            # Backstop: a node that never reboots must not keep the flag, and
+            # with it a suppressed long-poll, forever. Said out loud rather
+            # than cleared silently, which was this issue.
+            logger.warning(
+                "appliance_reboot_unacknowledged",
+                appliance_id=str(row.id),
+                hostname=row.hostname,
+                boot_id=body.boot_id,
+            )
+            row.reboot_requested = False
+            row.reboot_requested_at = None
+            row.reboot_requested_boot_id = None
+            deliver_reboot = False
 
     # Retire clear_upgrade_requested on ACKNOWLEDGEMENT, not on a clock
     # (#786). The host's compliance is already observable: the clear's
@@ -2486,7 +2571,9 @@ async def supervisor_heartbeat(
     if body.wait_seconds > 0:
         has_pending_command = (
             row.desired_appliance_version is not None
-            or row.reboot_requested
+            # ``deliver_reboot``, not the row: an old supervisor's request is
+            # retired in the same heartbeat that delivers it (#1446).
+            or deliver_reboot
             # ``deliver_clear_upgrade``, not the row: the auto-expiry above
             # may have just cleared the flag while the response below still
             # carries the command. Reading the row here would make this look
@@ -2730,16 +2817,26 @@ async def supervisor_heartbeat(
     # each node's IPs, so the seed can match an etcd member that has no name.
     evict_rows = (
         await db.execute(
-            select(Appliance.hostname, Appliance.node_ips, Appliance.node_ip).where(
+            select(
+                Appliance.hostname,
+                Appliance.node_ips,
+                Appliance.node_ip,
+                Appliance.evict_after_demote,
+            ).where(
                 Appliance.evict_requested.is_(True),
                 Appliance.hostname.isnot(None),
             )
         )
     ).all()
-    evict_names = [h for (h, _ips, _ip) in evict_rows]
+    evict_names = [h for (h, _ips, _ip, _demote) in evict_rows]
     evict_addresses = {
-        h: [str(a) for a in (ips or ([ip] if ip else []))] for (h, ips, ip) in evict_rows
+        h: [str(a) for a in (ips or ([ip] if ip else []))] for (h, ips, ip, _demote) in evict_rows
     }
+    # #1541 — which of those are a dead-node Replace (the seed holds the
+    # control plane's size for the replacement, #1059) and which are a
+    # demote's cleanup (no replacement coming: the seed scales down).
+    replace_names = [h for (h, _ips, _ip, demote) in evict_rows if not demote]
+    demote_names = [h for (h, _ips, _ip, demote) in evict_rows if demote]
     # #1284 — and the nodes asked to join, so the seed never takes a node
     # promoted again after its eviction for a late arrival of the evicted one.
     join_names: list[str] = []
@@ -2766,7 +2863,7 @@ async def supervisor_heartbeat(
         desired_slot_image_tls_insecure=row.desired_slot_image_tls_insecure,
         desired_next_boot_slot=row.desired_next_boot_slot,  # type: ignore[arg-type]
         desired_default_slot=row.desired_default_slot,  # type: ignore[arg-type]
-        reboot_requested=row.reboot_requested,
+        reboot_requested=deliver_reboot,
         clear_upgrade_requested=deliver_clear_upgrade,
         cert_pem=row.cert_pem,
         ca_chain_pem=ca_chain_pem,
@@ -2795,6 +2892,8 @@ async def supervisor_heartbeat(
         desired_metallb_bgp_peers=metallb_bgp_peers,
         desired_metallb_bgp_advertisements=metallb_bgp_advertisements,
         evict_node_names=evict_names,
+        replace_node_names=replace_names,
+        demote_evict_node_names=demote_names,
         evict_node_addresses=evict_addresses,
         join_node_names=join_names,
         desired_timezone=desired_timezone,
@@ -3987,6 +4086,156 @@ _VALID_ROLES = {
 _DNS_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium"}
 
 
+# #1715 / #1749 — the ownership matching (``_own_server_condition``,
+# ``_current_dns_drivers``) lives in ``app.services.appliance.ownership`` so
+# the DNS / DHCP server moves (server -> appliance) use the very same rules as
+# Fleet (appliance -> server).
+
+
+async def _appliance_own_dns_servers(db: DB, appliance: Appliance) -> list[Any]:
+    """The dns_server row(s) of the appliance's CURRENT DNS engine (#1715).
+
+    An engine switch leaves the old engine's row behind in its old group;
+    moving it would clash on name or driver in the target, so only rows of
+    the current engine are returned (``_retire_stale_engine_rows`` deals
+    with the old one when it is in the way).
+    """
+    from app.models.dns import DNSServer  # noqa: PLC0415
+
+    drivers = _current_dns_drivers(appliance)
+    if not drivers:
+        return []
+    own = await _own_server_condition(db, appliance, DNSServer)
+    return list(
+        (await db.execute(select(DNSServer).where(own, DNSServer.driver.in_(sorted(drivers)))))
+        .scalars()
+        .all()
+    )
+
+
+async def _retire_stale_engine_rows(
+    db: DB, appliance: Appliance, target_group: Any, current_user: Any
+) -> list[str]:
+    """Delete this appliance's OWN dns_server rows in ``target_group`` that
+    belong to a DNS engine it no longer runs (#1715).
+
+    An engine switch (bind9 -> technitium) registers a new row for the new
+    engine and leaves the old engine's row where it was: same name (the
+    hostname), old driver, no agent behind it any more — the role swap
+    removes the node label, so the old engine's DaemonSet pod is gone.
+    Moving the appliance back to that group then clashes with its own dead
+    row on name and on driver, and the operator gets a 409 / 422 about a
+    row they can't see the point of. So the dead row is retired the way the
+    server DELETE does it (audit row, wakes, delete; zone state / record ops
+    / metrics cascade on the FK).
+
+    Only ever a row that is (a) this appliance's by FK or the unambiguous
+    hostname match, (b) of a driver that is NOT the currently assigned
+    engine, and (c) silent for longer than the agent-stale window. A row
+    whose agent is still reporting — the old pod has not stopped yet, right
+    after a switch — is refused with an actionable 409 instead of deleted:
+    deleting a live agent's row only makes it re-register.
+
+    Returns the retired rows' names, for the role-assignment audit row.
+    """
+    from app.core.agent_wake import collect_wake, dns_group_channel, dns_server_channel
+    from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.tasks.dns import AGENT_STALE_AFTER  # noqa: PLC0415
+
+    drivers = _current_dns_drivers(appliance)
+    if not drivers:
+        return []
+    own = await _own_server_condition(db, appliance, DNSServer)
+    stale = (
+        (
+            await db.execute(
+                select(DNSServer)
+                .where(
+                    own,
+                    DNSServer.group_id == target_group.id,
+                    DNSServer.driver.not_in(sorted(drivers)),
+                )
+                .order_by(DNSServer.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    now = datetime.now(UTC)
+    retired: list[str] = []
+    for srv in stale:
+        if srv.last_seen_at is not None and now - srv.last_seen_at < AGENT_STALE_AFTER:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                (
+                    f"Group {target_group.name!r} still holds this appliance's "
+                    f"{srv.driver} server {srv.name!r}, and its agent reported "
+                    f"{int((now - srv.last_seen_at).total_seconds())}s ago. "
+                    "It is retired automatically once it stops reporting "
+                    f"(about {int(AGENT_STALE_AFTER.total_seconds())}s after the "
+                    "engine switch) — save again then, or delete it under DNS → "
+                    "Server groups."
+                ),
+            )
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="delete",
+                resource_type="dns_server",
+                resource_id=str(srv.id),
+                resource_display=srv.name,
+                old_value={
+                    "group_id": str(srv.group_id),
+                    "driver": srv.driver,
+                    "host": srv.host,
+                    "agent_id": str(srv.agent_id) if srv.agent_id else None,
+                    "last_seen_at": srv.last_seen_at.isoformat() if srv.last_seen_at else None,
+                },
+                new_value={
+                    "reason": "retired_stale_engine_row",
+                    "appliance_id": str(appliance.id),
+                    "assigned_engine": sorted(drivers),
+                },
+                result="success",
+            )
+        )
+        collect_wake(dns_server_channel(srv.id), dns_group_channel(srv.group_id))
+        logger.info(
+            "appliance_stale_dns_row_retired",
+            appliance_id=str(appliance.id),
+            server_id=str(srv.id),
+            server_name=srv.name,
+            driver=srv.driver,
+            group_id=str(srv.group_id),
+        )
+        retired.append(srv.name)
+        await db.delete(srv)
+    if retired:
+        # The move's name-clash / single-driver / primary checks query the
+        # target group; they must not see the rows just retired.
+        await db.flush()
+    return retired
+
+
+async def _appliance_own_dhcp_servers(db: DB, appliance: Appliance) -> list[Any]:
+    """The appliance's agent-based (kea) dhcp_server rows (#1715); same
+    matching rules as ``_appliance_own_dns_servers``. ``dhcp_server.name``
+    is globally unique and kea is the only agent engine, so there is no
+    stale-engine row to retire on this side."""
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
+
+    if "dhcp" not in (appliance.assigned_roles or []):
+        return []
+    own = await _own_server_condition(db, appliance, DHCPServer)
+    return list(
+        (await db.execute(select(DHCPServer).where(own, DHCPServer.driver == "kea")))
+        .scalars()
+        .all()
+    )
+
+
 class ApplianceRolesUpdate(BaseModel):
     """Operator-driven role + group + tag assignment payload.
 
@@ -4004,6 +4253,8 @@ class ApplianceRolesUpdate(BaseModel):
             "mutually exclusive — one engine per appliance."
         ),
     )
+    # ``dns_group_id`` / ``dhcp_group_id``: omitted leaves the current
+    # group alone; an explicit ``null`` unassigns it (#1562).
     dns_group_id: uuid.UUID | None = None
     dhcp_group_id: uuid.UUID | None = None
     tags: dict[str, str] | None = None
@@ -4018,7 +4269,10 @@ class ApplianceRolesUpdate(BaseModel):
 @router.put(
     "/appliances/{appliance_id}/roles",
     response_model=ApplianceRow,
-    dependencies=[Depends(require_permission("admin", "appliance"))],
+    # #1715 — the group change moves the appliance's own DNS / DHCP servers
+    # and ``collect_wake``s their agents and both groups; without a collector
+    # on the request those calls were silent no-ops.
+    dependencies=[Depends(require_permission("admin", "appliance")), Depends(wake_publishing)],
     summary="Assign roles + groups + tags (superadmin)",
 )
 async def update_appliance_roles(
@@ -4041,7 +4295,11 @@ async def update_appliance_roles(
     """
     _require_superadmin(current_user)
 
-    row = await db.get(Appliance, appliance_id)
+    # #1715 — FOR UPDATE: two Fleet saves on one appliance used to race the
+    # server moves below on stale reads (two primaries, a move computed from a
+    # group the row had already left). The lock serialises them; the second
+    # save's reads, all after this, see the first one's commit.
+    row = await db.get(Appliance, appliance_id, with_for_update=True)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
     if row.state != APPLIANCE_STATE_APPROVED:
@@ -4049,6 +4307,14 @@ async def update_appliance_roles(
             status.HTTP_409_CONFLICT,
             f"Cannot assign roles to appliance in state {row.state!r}; approve it first.",
         )
+    moved_servers: list[dict[str, Any]] = []
+    retired_servers: list[str] = []
+    signer_check: tuple[Any, str] | None = None
+    # #1782 — captured before the edits below so the Technitium-into-a-
+    # catalog-group refusal fires only on a change, never on a re-save of a
+    # pre-existing assignment.
+    prev_dns_roles = set(row.assigned_roles or [])
+    prev_dns_group_id = row.assigned_dns_group_id
 
     if body.roles is not None:
         # Reject unknown role tokens explicitly so a typo on the API
@@ -4089,27 +4355,161 @@ async def update_appliance_roles(
                 )
         row.assigned_roles = list(body.roles)
 
-    if body.dns_group_id is not None:
-        # Best-effort existence check — wrong group_id → 422.
-        from app.models.dns import DNSServerGroup
+    # #1562 — presence in the payload decides, not non-None: an
+    # explicit ``null`` (the Fleet "(unassigned)" option) clears the
+    # assignment, an omitted field leaves it alone. The downstream
+    # role_assignment builder already handles a group-less role (no
+    # AGENT_GROUP shipped), so clearing is a supported state.
+    if "dns_group_id" in body.model_fields_set:
+        if body.dns_group_id is None:
+            row.assigned_dns_group_id = None
+        else:
+            # Best-effort existence check — wrong group_id → 422.
+            from app.models.dns import DNSServerGroup
 
-        dns_group = await db.get(DNSServerGroup, body.dns_group_id)
-        if dns_group is None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"DNS server group {body.dns_group_id} not found.",
-            )
-        row.assigned_dns_group_id = dns_group.id
-    if body.dhcp_group_id is not None:
-        from app.models.dhcp import DHCPServerGroup
+            dns_group = await db.get(DNSServerGroup, body.dns_group_id)
+            if dns_group is None:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"DNS server group {body.dns_group_id} not found.",
+                )
+            # #1468 — the supervisor drops a name it won't put in the role env.
+            problem = group_name_problem("dns", dns_group.name)
+            if problem is not None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
+            # #1565 — the pointer alone moved the appliance's env and firewall
+            # to the new group while its registered server kept serving the old
+            # one (re-registration never moves a row, by design). Move the
+            # appliance's own DNS server(s) with it, through #934's move, in this
+            # transaction; a move it refuses (a name clash, a mixed-driver group)
+            # refuses the whole PUT, so the pointer and the server can't disagree.
+            from app.services.dns.server_move import ServerMoveError, move_server_to_group
 
-        dhcp_group = await db.get(DHCPServerGroup, body.dhcp_group_id)
-        if dhcp_group is None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"DHCP server group {body.dhcp_group_id} not found.",
+            own_dns = await _appliance_own_dns_servers(db, row)
+            if (
+                not own_dns
+                and _current_dns_drivers(row)
+                and dns_group.id != row.assigned_dns_group_id
+            ):
+                # #1762 — no server row yet: the agent will register into this
+                # group as a new signer, so apply the same refusal a move gets.
+                # Only on a pointer change, so re-saving an unchanged
+                # assignment is never refused. Checked after the #1782
+                # catalog refusal below, the order move_server_to_group uses
+                # for an existing server (compatibility first, then signers).
+                signer_check = (dns_group, next(iter(_current_dns_drivers(row))))
+            if any(srv.group_id != dns_group.id for srv in own_dns):
+                # #1715 — the appliance's own dead row of a previous engine
+                # would block the move on name and driver; retire it first.
+                retired_servers = await _retire_stale_engine_rows(db, row, dns_group, current_user)
+            for server in own_dns:
+                try:
+                    result = await move_server_to_group(db, server, dns_group)
+                except ServerMoveError as exc:
+                    raise HTTPException(
+                        status_code=exc.status_code,
+                        detail=f"Can't move this appliance's DNS server {server.name!r}: {exc.detail}",
+                    ) from exc
+                if result is None:
+                    continue
+                moved_servers.append({"dns_server": str(server.id), "name": server.name})
+                db.add(
+                    AuditLog(
+                        user_id=current_user.id,
+                        user_display_name=current_user.display_name,
+                        auth_source=current_user.auth_source,
+                        action="update",
+                        resource_type="dns_server",
+                        resource_id=str(server.id),
+                        resource_display=server.name,
+                        changed_fields=["group_id"],
+                        new_value={**result.as_audit_value(), "via_appliance_id": str(row.id)},
+                        result="success",
+                    )
+                )
+            row.assigned_dns_group_id = dns_group.id
+    # #1782 — Technitium cannot do catalog zones (#1766). The own-server move
+    # above refuses it for a server that already exists, but an appliance
+    # whose agent has not registered yet has none: the pointer alone would
+    # send a fresh Technitium agent into a catalog group, and registration
+    # cannot refuse it (a refused agent loops). So refuse it here, on change.
+    if row.assigned_dns_group_id is not None and "dns-technitium" in (row.assigned_roles or []):
+        changed = (
+            "dns-technitium" not in prev_dns_roles or row.assigned_dns_group_id != prev_dns_group_id
+        )
+        if changed:
+            from app.models.dns import DNSServerGroup
+            from app.services.dns.server_move import catalog_unsupported_message
+
+            target = await db.get(DNSServerGroup, row.assigned_dns_group_id)
+            if target is not None and target.catalog_zones_enabled:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"DNS server group {target.name!r} has catalog zones enabled. "
+                    + catalog_unsupported_message({"technitium"}),
+                )
+    if signer_check is not None:
+        from app.services.dns.dnssec_signers import second_signer_refusal
+
+        refusal = await second_signer_refusal(db, signer_check[0], driver=signer_check[1])
+        if refusal is not None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, refusal)
+    if "dhcp_group_id" in body.model_fields_set:
+        if body.dhcp_group_id is None:
+            row.assigned_dhcp_group_id = None
+        else:
+            from app.models.dhcp import DHCPServerGroup
+
+            dhcp_group = await db.get(DHCPServerGroup, body.dhcp_group_id)
+            if dhcp_group is None:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"DHCP server group {body.dhcp_group_id} not found.",
+                )
+            problem = group_name_problem("dhcp", dhcp_group.name)
+            if problem is not None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
+            # #1565 — likewise the appliance's DHCP server(s), with the checks
+            # the DHCP server PUT applies to a group change.
+            from app.api.v1.dhcp.servers import (
+                _assert_driver_mix_allowed,
+                _assert_no_v6_scopes_for_windows,
             )
-        row.assigned_dhcp_group_id = dhcp_group.id
+            from app.core.agent_wake import collect_wake, dhcp_group_channel, dhcp_server_channel
+
+            for dserver in await _appliance_own_dhcp_servers(db, row):
+                if dserver.server_group_id == dhcp_group.id:
+                    continue
+                await _assert_driver_mix_allowed(
+                    db, dhcp_group.id, dserver.driver, exclude_server_id=dserver.id
+                )
+                await _assert_no_v6_scopes_for_windows(db, dhcp_group.id, dserver.driver)
+                old_gid = dserver.server_group_id
+                dserver.server_group_id = dhcp_group.id
+                collect_wake(dhcp_server_channel(dserver.id))
+                for gid in (old_gid, dhcp_group.id):
+                    if gid is not None:
+                        collect_wake(dhcp_group_channel(gid))
+                moved_servers.append({"dhcp_server": str(dserver.id), "name": dserver.name})
+                db.add(
+                    AuditLog(
+                        user_id=current_user.id,
+                        user_display_name=current_user.display_name,
+                        auth_source=current_user.auth_source,
+                        action="update",
+                        resource_type="dhcp_server",
+                        resource_id=str(dserver.id),
+                        resource_display=dserver.name,
+                        changed_fields=["server_group_id"],
+                        old_value={"server_group_id": str(old_gid) if old_gid else None},
+                        new_value={
+                            "server_group_id": str(dhcp_group.id),
+                            "via_appliance_id": str(row.id),
+                        },
+                        result="success",
+                    )
+                )
+            row.assigned_dhcp_group_id = dhcp_group.id
 
     if body.tags is not None:
         # Coerce every value to string — JSONB will accept anything
@@ -4163,6 +4563,8 @@ async def update_appliance_roles(
                     str(row.assigned_dhcp_group_id) if row.assigned_dhcp_group_id else None
                 ),
                 "tags": dict(row.tags or {}),
+                **({"moved_servers": moved_servers} if moved_servers else {}),
+                **({"retired_stale_dns_servers": retired_servers} if retired_servers else {}),
             },
         )
     )
@@ -4355,9 +4757,10 @@ async def _refuse_promote_while_evicting(db: DB, row: Appliance) -> None:
     if row.evict_requested or row.cluster_join_state == CLUSTER_JOIN_STATE_EVICTING:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"Appliance {row.hostname!r} is still being evicted (Fleet → Replace): the seed "
-            "removes etcd members under its hostname until the eviction settles. Promote it "
-            "once its row reads 'left' (or clear the cluster state if the eviction is stuck).",
+            f"Appliance {row.hostname!r} is still being evicted (Fleet → Replace, or the "
+            "seed's cleanup after a demote): the seed removes etcd members under its hostname "
+            "until the eviction settles. Promote it once its row reads 'left' (or clear the "
+            "cluster state if the eviction is stuck).",
         )
     if not row.hostname:
         return
@@ -4432,6 +4835,8 @@ async def promote_control_plane(
     odd total member count (etcd quorum hygiene).
     """
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a control-plane promote")
 
     members = await _effective_cp_members(db)
     primary = await _resolve_primary(db, members)
@@ -4549,6 +4954,286 @@ async def promote_control_plane(
     return ApplianceList(appliances=[_row_to_schema(r) for r in targets])
 
 
+@dataclass(frozen=True)
+class _VoterHealth:
+    """One etcd voter as ``demote_control_plane`` judges it (#1541)."""
+
+    name: str
+    live: bool
+    why: str = ""  # what is wrong with it, when not live
+
+
+def _demote_quorum_refusal(voters: Sequence[_VoterHealth], leaving: set[str]) -> str | None:
+    """PURE (#1541, walk finding 2): why demoting ``leaving`` could cost the
+    survivors their quorum, or ``None`` when it cannot.
+
+    Each live leaver removes its own etcd member, one at a time and in any
+    order; a dead one cannot run its leave and stays a voter until it comes
+    back. After ``k`` live removals the cluster has ``n - k`` voters of which
+    ``L - k`` are live (every removed member was live), and it keeps quorum
+    while ``2 * (L - k) > n - k``, i.e. while ``k < 2L - n``. That is
+    monotone in ``k``, so the binding step is the last one, ``k = TL`` (the
+    live leavers): ``2 * (L - TL) > n - TL``. Every intermediate step,
+    including the commit of each removal, is then safe.
+
+    The arithmetic is not the whole rule. A dead or unhealthy voter that is
+    NOT being demoted refuses the demote outright, even where the count alone
+    would pass (five voters, one dead, two demoted leaves 2 of 3 live): the
+    end state could not lose another node, and an operator asking for a
+    demote while a member is down should fix or Replace that member first.
+    An unhealthy voter that IS being demoted is accepted when the arithmetic
+    holds — removing a member that is already gone only helps — though its
+    row waits in ``leaving`` until the node comes back to run the leave
+    (Replace is the path for a node that never will).
+
+    The refusal names EVERY unhealthy voter, each marked as staying or being
+    demoted, rather than the first rule's subject alone. On the #1659 walk
+    the staying-member rule tripped on a seed whose own heartbeat had
+    stalled (#1805) and the message never mentioned the member that was
+    actually powered off, so the operator was sent to fix the node that was
+    fine."""
+    unhealthy = [v for v in voters if not v.live]
+    unhealthy_others = [v for v in unhealthy if v.name not in leaving]
+    n = len(voters)
+    live = n - len(unhealthy)
+    live_leaving = sum(1 for v in voters if v.live and v.name in leaving)
+    keeps_quorum = 2 * (live - live_leaving) > n - live_leaving
+    if not unhealthy_others and keeps_quorum:
+        return None
+    named = ", ".join(
+        f"{v.name!r} ({v.why}; {'being demoted' if v.name in leaving else 'staying'})"
+        for v in unhealthy
+    )
+    reasons: list[str] = []
+    if unhealthy_others:
+        reasons.append(
+            "A demote removes etcd voters while the cluster runs; with a member that "
+            "stays down, the survivors could lose quorum (a leaving node's own etcd can "
+            "still count a dead peer as active). Bring it back, or Replace it, before "
+            "demoting."
+        )
+    if not keeps_quorum:
+        reasons.append(
+            f"After the demote's {live_leaving} live member(s) leave, {live - live_leaving} "
+            f"of the remaining {n - live_leaving} etcd voters would be live, which is not a "
+            "majority."
+        )
+    return f"control-plane member(s) not healthy: {named}. " + " ".join(reasons)
+
+
+def _node_ready_map() -> dict[str, bool] | None:
+    """Every k8s Node's ``Ready`` condition by name, or ``None`` when this
+    control plane does not run on k3s (no ServiceAccount: compose, tests).
+    Raises :class:`k8s.KubeapiUnavailableError` when it does but the Node
+    list cannot be read — the caller must not guess."""
+    from app.services.appliance import k8s  # noqa: PLC0415
+
+    if k8s.get_config() is None:
+        return None
+    status_code, items = k8s.list_nodes()
+    if status_code != 200:
+        raise k8s.KubeapiUnavailableError(f"node list returned {status_code}")
+    out: dict[str, bool] = {}
+    for n in items:
+        name = str((n.get("metadata") or {}).get("name") or "")
+        if name:
+            out[name] = k8s.is_node_ready(n)
+    return out
+
+
+async def _refuse_demote_without_quorum(db: DB, targets: list[Appliance]) -> None:
+    """409 when demoting ``targets`` could leave the survivors without an etcd
+    quorum (#1541, walk finding 2), naming every unhealthy member.
+
+    The leaver's own etcd guards a removal with its view of which peers are
+    active, and a follower's view can be minutes stale: on the walk member-1
+    removed itself while member-2 had been powered off for two minutes, its
+    etcd still counted the idle link to member-2 as active, and the seed was
+    left one live voter of two — no api for four minutes. So the control
+    plane decides first, from evidence it trusts: a voter is live when its
+    supervisor heartbeated within ``ONLINE_STALE_SECONDS`` AND its k8s Node
+    reads Ready (a powered-off node fails both, a wedged one at least the
+    Node). The seed is the exception: on k3s it is judged by its Node alone,
+    because its own heartbeat stalls when a member dies (#1805). Every leave
+    already in flight counts as leaving too."""
+    from app.services.appliance import k8s  # noqa: PLC0415
+    from app.services.appliance.agent_cmd import (  # noqa: PLC0415
+        ONLINE_STALE_SECONDS,
+        appliance_ready,
+    )
+
+    voter_rows = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.cluster_role.in_((CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    try:
+        nodes = await asyncio.to_thread(_node_ready_map)
+    except k8s.KubeapiUnavailableError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Cannot read the k8s Nodes to check the control plane's health before a demote "
+            f"({exc}); refusing rather than guessing. Retry once kubeapi answers.",
+        ) from exc
+
+    now = datetime.now(UTC)
+    target_ids = {t.id for t in targets}
+    voters: list[_VoterHealth] = []
+    leaving: set[str] = set()
+    for r in voter_rows:
+        name = r.hostname or str(r.id)
+        problems: list[str] = []
+        # The seed is judged by its k8s Node alone when there is one to read.
+        # Its supervisor heartbeats to the api Service through cluster DNS like
+        # every member's, and a member's sudden loss stalls that path for about
+        # two minutes while the dead pods are still endpoints (#1805) — so on
+        # the #1659 walk the guard read the healthy seed as down and named it
+        # instead of the member that was off. The Node's Ready condition is the
+        # seed kubelet's own report to its own k3s, which a peer's loss does not
+        # delay, and it turns NotReady within the node-monitor grace period,
+        # sooner than a heartbeat crosses ONLINE_STALE_SECONDS. Off k3s (no
+        # Node list) the heartbeat is all there is, so it still counts there.
+        judge_heartbeat = not (nodes is not None and r.cluster_role == CLUSTER_ROLE_PRIMARY)
+        if judge_heartbeat and not appliance_ready(
+            state=r.state, last_seen_at=r.last_seen_at, now=now
+        ):
+            if r.last_seen_at is None:
+                problems.append("never heartbeated")
+            else:
+                seen = (
+                    r.last_seen_at if r.last_seen_at.tzinfo else r.last_seen_at.replace(tzinfo=UTC)
+                )
+                problems.append(
+                    f"last heartbeat {int((now - seen).total_seconds())}s ago, "
+                    f"over {int(ONLINE_STALE_SECONDS)}s"
+                )
+        if nodes is not None:
+            ready = nodes.get(r.hostname or "")
+            if ready is None:
+                problems.append("no k8s Node")
+            elif not ready:
+                problems.append("Node NotReady")
+        voters.append(_VoterHealth(name=name, live=not problems, why="; ".join(problems)))
+        in_flight_leave = (
+            r.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
+            and r.cluster_join_state != CLUSTER_JOIN_STATE_LEFT
+        )
+        if r.id in target_ids or in_flight_leave:
+            leaving.add(name)
+
+    refusal = _demote_quorum_refusal(voters, leaving)
+    if refusal is not None:
+        logger.warning(
+            "control_plane_demote_refused_quorum",
+            targets=[t.hostname for t in targets],
+            reason=refusal,
+        )
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Refusing the demote: {refusal}")
+
+
+#: #1750 — set on a Node when a demote cordons it, and only then. An uncordon
+#: acts only on a Node carrying it, so a node the operator had already
+#: cordoned before the demote (the rule #1610 applies to upgrades) is never
+#: uncordoned by a failed leave. It lives on the Node rather than the row
+#: because the Node is what it describes: a re-joined node registers a new
+#: Node object without it, and an evicted one takes it with it.
+DEMOTE_CORDON_ANNOTATION = "spatium.io/demote-cordoned"
+
+
+def _node_schedulable_sync(name: str, *, cordon: bool) -> tuple[str, str | None]:
+    """Cordon / uncordon one Node for a demote. ``(outcome, error)``.
+
+    Outcomes: ``cordoned`` / ``uncordoned`` (done), ``pre_cordoned`` (the
+    operator's cordon, left alone and not marked), ``not_ours`` (uncordon
+    skipped: no demote cordon on it), ``gone`` (no such Node — harmless,
+    the eviction already deleted it), ``no_kubeapi`` (compose / tests), and
+    ``failed`` with ``error`` set. Raises nothing it can help."""
+    from app.services.appliance import k8s  # noqa: PLC0415
+
+    if k8s.get_config() is None:
+        return "no_kubeapi", None
+    try:
+        status_code, node = k8s.get_node(name)
+    except k8s.KubeapiUnavailableError as exc:
+        status_code, node, read_err = 0, None, str(exc)
+    else:
+        read_err = None
+    if status_code == 404:
+        return "gone", None
+    spec = (node or {}).get("spec") or {}
+    annotations = ((node or {}).get("metadata") or {}).get("annotations") or {}
+    ours = DEMOTE_CORDON_ANNOTATION in annotations
+
+    if cordon:
+        if status_code == 200 and spec.get("unschedulable") and not ours:
+            return "pre_cordoned", None
+        # Unknown pre-state (the read failed) cordons and marks, so a failed
+        # leave still releases it — #1610's "could not tell" rule.
+        code, err = k8s.patch_node(
+            name,
+            {
+                "metadata": {"annotations": {DEMOTE_CORDON_ANNOTATION: "true"}},
+                "spec": {"unschedulable": True},
+            },
+        )
+        if err is None:
+            return "cordoned", None
+        return ("gone", None) if code == 404 else ("failed", err)
+
+    if status_code != 200:
+        # Cannot tell whose cordon it is: leave it. Clear-cluster-state or a
+        # retried demote's failure path gets another go.
+        return "failed", read_err or f"node read returned {status_code}"
+    if not ours:
+        return "not_ours", None
+    code, err = k8s.patch_node(
+        name,
+        {
+            "metadata": {"annotations": {DEMOTE_CORDON_ANNOTATION: None}},
+            "spec": {"unschedulable": False},
+        },
+    )
+    if err is None:
+        return "uncordoned", None
+    return ("gone", None) if code == 404 else ("failed", err)
+
+
+async def _set_node_schedulable(hostname: str | None, *, cordon: bool) -> None:
+    """Best-effort cordon / uncordon of a demoted member's k8s Node (#1750).
+
+    A demoted member keeps scheduling new pods until its k3s stops, so
+    the helm-controller's replaced install Job can land on it and strand.
+    Never fails the caller: no ServiceAccount (compose) or an unreachable
+    kubeapi just logs, because a missed cordon is the old behaviour, not
+    a reason to refuse a demote.
+
+    Keyed on the row's hostname, the same name the seed's eviction deletes
+    the Node by and the quorum gate looks it up by (k3s names its Node
+    after the host; nothing passes ``--node-name``). Uncordon touches only
+    a Node this marked (:data:`DEMOTE_CORDON_ANNOTATION`)."""
+    if not hostname:
+        return
+    try:
+        outcome, err = await asyncio.to_thread(_node_schedulable_sync, hostname, cordon=cordon)
+    except Exception as exc:  # noqa: BLE001 - best-effort, must not fail the caller
+        outcome, err = "failed", str(exc)
+    if outcome == "failed":
+        logger.warning(
+            "control_plane_cordon_failed" if cordon else "control_plane_uncordon_failed",
+            hostname=hostname,
+            error=err,
+        )
+    elif outcome in ("cordoned", "uncordoned", "pre_cordoned"):
+        logger.info(f"control_plane_node_{outcome}", hostname=hostname)
+
+
 @router.post(
     "/fleet/control-plane/demote",
     response_model=ApplianceList,
@@ -4563,8 +5248,28 @@ async def demote_control_plane(
     """Batch-demote the given control-plane members back to application
     appliances. Refuses a batch that would leave the cluster at an even
     count, and refuses demoting the seed (use a dedicated seed-migration
-    flow for that — out of scope for Phase 7)."""
+    flow for that — out of scope for Phase 7).
+
+    #1541 — each target's leave runner removes its own etcd member while it
+    still votes and only then resets itself. It waits for a survivor to
+    confirm the removal, but since etcd's acceptance IS the removal, a
+    survivor it cannot reach does not fail the leave; a removal etcd refuses
+    does, without touching the node. Its
+    ``left`` report then hands the row to the seed's eviction, which deletes
+    the stale k8s Node and confirms etcd agrees before the row settles
+    ``left``. Before that, nobody removed a demoted node's member, and the
+    only demote three members allow (both non-seed ones) cost the seed its
+    quorum.
+
+    It also refuses (409) a demote while any control-plane member is
+    unhealthy — a stale heartbeat or a NotReady Node — unless that member is
+    itself being demoted and the survivors keep a live majority throughout
+    (:func:`_demote_quorum_refusal` has the arithmetic). The leaver's own
+    etcd guards its removal with a follower's view of the peers, which can
+    still count a powered-off peer as active."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a control-plane demote")
 
     members = await _effective_cp_members(db)
     current_count = len(members)
@@ -4598,6 +5303,19 @@ async def demote_control_plane(
             f"{remaining} members. etcd HA wants an ODD count (1 / 3 / 5 / 7) — demote "
             f"{'one fewer' if len(targets) > 1 else 'one more'} so the remainder is odd.",
         )
+
+    # #1541 (walk finding 2) — never start removing voters while a member is
+    # down: the leaver's own etcd may not know, and its removal then costs the
+    # survivors their quorum.
+    await _refuse_demote_without_quorum(db, targets)
+
+    # #1750 — stop the scheduler placing new pods (a replaced helm install
+    # Job, say) on a node about to stop k3s. Cordon only, no drain: the
+    # node's own k3s teardown and the seed's Node eviction reschedule what
+    # runs there, a drain adds a PDB-bounded wait to a request, and the
+    # point is only that nothing NEW lands. Undone if the leave fails.
+    for row in targets:
+        await _set_node_schedulable(row.hostname, cordon=True)
 
     for row in targets:
         row.desired_cluster_role = DESIRED_CLUSTER_ROLE_NONE
@@ -4677,6 +5395,8 @@ async def replace_control_plane_member(
     stays ``evicting``, with the seed's reason.
     """
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a control-plane replace")
 
     from app.api.v1.appliance.pairing import _generate_code, _hash_code  # noqa: PLC0415
     from app.models.appliance import PairingCode  # noqa: PLC0415
@@ -4728,6 +5448,10 @@ async def replace_control_plane_member(
     row.cluster_join_state_at = datetime.now(UTC)  # #590 staleness clock
     row.cluster_join_reason = None
     row.evict_requested = True
+    # A Replace: the seed holds the control plane's size until the
+    # replacement is promoted (#1059). Explicit, in case the row last
+    # carried a demote's cleanup flag.
+    row.evict_after_demote = False
 
     # Mint a single-use 60-min pairing code for the replacement box.
     code = _generate_code()
@@ -4880,6 +5604,12 @@ async def clear_control_plane_state(
                 "know the node is never coming back.",
             )
 
+    if before["desired_cluster_role"] == DESIRED_CLUSTER_ROLE_NONE and (
+        row.cluster_role == CLUSTER_ROLE_MEMBER
+    ):
+        # #1750 — an abandoned demote leaves a member that demote cordoned.
+        await _set_node_schedulable(row.hostname, cordon=False)
+
     row.cluster_join_state = None
     row.cluster_join_state_at = None
     row.cluster_join_reason = None
@@ -4887,6 +5617,7 @@ async def clear_control_plane_state(
     row.desired_k3s_server_url = None
     row.desired_k3s_join_token_encrypted = None
     row.evict_requested = False
+    row.evict_after_demote = False
 
     db.add(
         AuditLog(
@@ -5056,6 +5787,8 @@ async def restore_etcd_snapshot(
     last-reported inventory + ``confirm_hostname`` must match the seed's
     hostname exactly. Refuses a second restore while one is in flight."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="an etcd snapshot restore")
     seed = await _find_seed_row(db)
     if seed is None:
         raise HTTPException(
@@ -5623,6 +6356,8 @@ async def schedule_appliance_upgrade(
     ``desired_slot_image_url``. The control plane composes the
     authenticated internal URL the supervisor pulls from."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a per-appliance slot upgrade")
     if (body.desired_slot_image_url is None) == (body.slot_image_id is None):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -5896,6 +6631,8 @@ async def schedule_appliance_set_next_boot(
     either reboots manually (``/reboot`` endpoint) or waits for the
     next planned reboot window."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a per-appliance next-boot slot change")
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -5963,6 +6700,8 @@ async def schedule_appliance_set_default_slot(
       slot for good (not just one boot). Calls this against the
       previous slot."""
     _require_superadmin(current_user)
+    # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
+    await assert_no_upgrade_in_flight(db, operation_hint="a per-appliance default-slot change")
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -6011,8 +6750,9 @@ async def schedule_appliance_reboot(
 ) -> ApplianceRow:
     """Stamps ``reboot_requested=True``. The supervisor's next
     heartbeat returns this; the supervisor writes the host-side
-    ``reboot-pending`` trigger; the host runner ``systemctl reboot``s
-    after a 5s grace.
+    ``reboot-pending-fleet`` trigger; the host runner ``systemctl reboot``s
+    after a 5s grace. The request stays set until a heartbeat arrives from
+    the new boot (#1446).
 
     Strict appliance-only — docker / k8s deployments return 409 since
     there's no host to reboot from the supervisor."""
@@ -6034,8 +6774,7 @@ async def schedule_appliance_reboot(
                 "appliance OS."
             ),
         )
-    row.reboot_requested = True
-    row.reboot_requested_at = datetime.now(UTC)
+    request_reboot(row)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -7351,11 +8090,8 @@ async def reveal_appliance_kubeconfig(
     downloaded file directly; operators on a different network may
     need to edit the server line to a reachable address.
     """
+    from app.api.stepup import require_operator_stepup  # noqa: PLC0415
     from app.core.crypto import decrypt_str  # noqa: PLC0415
-    from app.services.reauth import (  # noqa: PLC0415
-        ReauthOutcome,
-        reverify_operator,
-    )
 
     def _audit_denied(reason: str, *, row: Appliance | None = None) -> None:
         db.add(
@@ -7382,20 +8118,18 @@ async def reveal_appliance_kubeconfig(
         )
     # #408 — local users re-confirm with password or TOTP; external-auth
     # users with TOTP (enrol under Settings → Security if not yet enrolled).
-    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
-    if outcome is not ReauthOutcome.OK:
-        await asyncio.sleep(0.1)
-        if outcome is ReauthOutcome.MFA_REQUIRED:
-            _audit_denied("mfa_required")
-            await db.commit()
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Re-confirmation requires MFA. Your account has no local "
-                "password — enrol TOTP under Settings → Security, then retry.",
-            )
-        _audit_denied("bad_credential")
-        await db.commit()
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP code is incorrect.")
+    # #1413 — through the shared step-up, so a wrong answer spends the
+    # per-account budget like every other step-up.
+    await require_operator_stepup(
+        db,
+        current_user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="appliance_kubeconfig_reveal_denied",
+        resource_type="appliance",
+        resource_id=str(appliance_id),
+        resource_display=str(appliance_id),
+    )
 
     row = await db.get(Appliance, appliance_id)
     if row is None:

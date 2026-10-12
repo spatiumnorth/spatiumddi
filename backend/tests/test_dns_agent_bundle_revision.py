@@ -44,12 +44,51 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "c69af6546ce6118fe11c4abfeb4abc230e7d4c8b33c679444fa6e06cfba33748",
         "views": "1e70781c25f21f3563a0800205adfaef09b615eb0990e0f4ab8569f9d02bb7a0",
     },
-    # 2 (#1523): the bundle ships the NOTIFY fields — server options
+    # #1171: every zone copy carries refresh / retry / expire / minimum, at
+    # the ZONE_DEFAULT_* values for these fixtures' zones.
+    2: {
+        "plain": "f3b09e44127b9a25c77f06180586ee1c935853403f98f72988efa8b35d19a73e",
+        "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
+    },
+    # #1373: the serial left the plain group's structural etag (views keep it).
+    3: {
+        "plain": "2ff144dc196f8f186e9a3ba3dcfc6b9f988839d9bf2e2ad6f5ee0596e32138d9",
+        "views": "1f827ac5f77c9df550a3dfd5fb644e184a081bb0e908a90f07b4d5d032a8412b",
+    },
+    # #1373: the zones are listed by name, so the plain group's reverse zone
+    # now comes before its forward one (the views group has one zone).
+    4: {
+        "plain": "90082e1b1aebf1f15faecfdecaa1056b5316cdd884a9479dbad94a84aae1d6ab",
+        "views": "1f827ac5f77c9df550a3dfd5fb644e184a081bb0e908a90f07b4d5d032a8412b",
+    },
+    # #1171's later change under #1373's: a group serves each zone's own SOA
+    # timers only once its last BIND9 agent renders them, so these fixtures'
+    # zones (no agent has said so) carry the old defaults again. 2 is #1171's
+    # stamp of that change alone; 3 and 4 were stamped over its earlier head.
+    5: {
+        "plain": "4f6e1693cdc51817e42e0e4bd45060a8ffddce72ab6ac343e382235bb9581811",
+        "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
+    },
+    # #1513: only a Technitium server's bundle changed (``svcb_target_rule``,
+    # and SVCB targets the a3d9e5c17b42 migration wrote); these fixtures are
+    # BIND9, so their bytes are 5's.
+    6: {
+        "plain": "4f6e1693cdc51817e42e0e4bd45060a8ffddce72ab6ac343e382235bb9581811",
+        "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
+    },
+    # #1759: only a Technitium server's bundle changed (``name_target_rule``,
+    # and the targets d6b2f81a3c57 wrote); these fixtures are BIND9, so
+    # their bytes are 5's and 6's.
+    7: {
+        "plain": "4f6e1693cdc51817e42e0e4bd45060a8ffddce72ab6ac343e382235bb9581811",
+        "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
+    },
+    # 8 (#1523): the bundle ships the NOTIFY fields — server options
     # notify_enabled / also_notify / allow_notify + zone allow_query /
     # also_notify / notify_enabled.
-    2: {
-        "plain": "c1d6e4b64ef3bab17a558a00e4fa3e320cf8529795594e82cda4016e154b743f",
-        "views": "9cba0278d99a1215151c0b160673d35864064d2cd4356a4a71bcdd42f61c40be",
+    8: {
+        "plain": "f7d933cc7f7d4194cbc0afab5f56e878fa547debfeb0455702f08bb76ab5cc19",
+        "views": "3e94415136b79039793de83663d182e3a0e329d962c73e2306fc786ba0c178b1",
     },
 }
 

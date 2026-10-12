@@ -16,6 +16,12 @@ operator copilot do?".
 All Wave 2 tools are read-only. Write tools (Phase 3) will gate on
 a ``writes: bool`` flag plus the existing ``requires_confirmation``
 preview / commit pattern.
+
+Every tool also carries a mandatory ``permission`` declaration
+(GHSA-4wrc-78rq-vgcg), enforced centrally by :meth:`ToolRegistry.call`
+for every caller — the in-app chat AND the MCP endpoint. Before it a
+tool ran with no authorization, so any signed-in account (or a
+resource-scoped API token) could read data its role does not grant.
 """
 
 from __future__ import annotations
@@ -36,6 +42,84 @@ from app.models.auth import User
 # without tripping mypy's invariance — the registry validates against
 # the declared model on dispatch, so the contract is preserved.
 ToolExecutor = Callable[[AsyncSession, User, Any], Awaitable[Any]]
+
+# ── Permission declarations ─────────────────────────────────────────
+#
+# A tool's ``permission`` is one of:
+#
+# * ``(action, resource_type)`` — the caller needs ``action`` on
+#   ``resource_type`` (unscoped, via ``user_has_permission``, which also
+#   applies an API token's coarse resource-grant check). ``resource_type``
+#   may be a tuple, meaning "any of these" — mirroring the
+#   ``require_any_resource_permission`` gates on the aggregate REST
+#   routers. Pick the pair the equivalent REST route requires, so the
+#   copilot never grants more than REST does. Tools that list rows
+#   additionally narrow them per row (an API token bound to one zone /
+#   subnet sees only that instance), the way the REST list routes do.
+# * ``SUPERADMIN`` — superadmin-only, matching a ``SuperAdmin`` REST
+#   surface.
+# * ``AUTHENTICATED`` — any signed-in caller; for tools whose REST
+#   equivalent requires nothing beyond sign-in (``GET /settings``,
+#   ``/alerts``, ``/search`` …) or which return static metadata.
+# * ``SELF`` — any signed-in caller; the tool only reads or acts on the
+#   caller's own rows (saved views, own chat session, own requests).
+SUPERADMIN = "superadmin"
+AUTHENTICATED = "authenticated"
+SELF = "self"
+_NAMED_PERMISSIONS = frozenset({SUPERADMIN, AUTHENTICATED, SELF})
+
+ToolPermission = str | tuple[str, str | tuple[str, ...]]
+
+
+def validate_tool_permission(name: str, permission: object) -> None:
+    """Raise ``ValueError`` unless ``permission`` is a well-formed
+    declaration. Called on registration so a tool cannot ship without one."""
+    if isinstance(permission, str):
+        if permission in _NAMED_PERMISSIONS:
+            return
+    elif isinstance(permission, tuple) and len(permission) == 2:
+        action, rtypes = permission
+        types = rtypes if isinstance(rtypes, tuple) else (rtypes,)
+        if (
+            isinstance(action, str)
+            and action
+            and types
+            and all(isinstance(t, str) and t and t != "*" for t in types)
+        ):
+            return
+    raise ValueError(
+        f"Tool {name!r} has no valid permission declaration ({permission!r}); "
+        "declare (action, resource_type), SUPERADMIN, AUTHENTICATED or SELF."
+    )
+
+
+def tool_permission_allows(user: User, permission: ToolPermission) -> bool:
+    """Whether ``user`` (with any API-token narrowing already stashed on
+    it by the auth dependency) may call a tool declaring ``permission``."""
+    # Imported here: app.core.permissions imports the auth deps, which
+    # must not load on the tool-registry import path.
+    from app.core.permissions import (  # noqa: PLC0415
+        is_effective_superadmin,
+        user_has_permission,
+    )
+
+    if permission == SUPERADMIN:
+        return is_effective_superadmin(user)
+    if permission in (AUTHENTICATED, SELF):
+        return bool(getattr(user, "is_active", False))
+    if isinstance(permission, str):
+        return False  # unknown named permission — fail closed
+    action, rtypes = permission
+    types = rtypes if isinstance(rtypes, tuple) else (rtypes,)
+    return any(user_has_permission(user, action, rt) for rt in types)
+
+
+def describe_tool_permission(permission: ToolPermission) -> str:
+    if isinstance(permission, str):
+        return permission
+    action, rtypes = permission
+    types = rtypes if isinstance(rtypes, tuple) else (rtypes,)
+    return f"{action!r} on " + (repr(types[0]) if len(types) == 1 else f"one of {list(types)}")
 
 
 @dataclass(frozen=True)
@@ -75,6 +159,10 @@ class Tool:
     # means "always available" (the cross-cutting tools — IPAM/DNS/DHCP
     # core lookups, ops helpers).
     module: str | None = None
+    # Mandatory authorization declaration — see ``ToolPermission`` above.
+    # Defaults to None only so the dataclass field order works; the
+    # registry refuses to register a tool without a valid one.
+    permission: ToolPermission | None = None
 
     def parameters_schema(self) -> dict[str, Any]:
         """JSON Schema for the args. Both OpenAI and MCP consume this
@@ -114,6 +202,7 @@ class ToolRegistry:
         self._tools: dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> None:
+        validate_tool_permission(tool.name, tool.permission)
         if tool.name in self._tools:
             raise ValueError(f"Tool {tool.name!r} is already registered.")
         self._tools[tool.name] = tool
@@ -128,6 +217,15 @@ class ToolRegistry:
         """The subset safe to expose to read-only contexts (Wave 2)."""
         return [t for t in self.all() if not t.writes]
 
+    def callable_by(self, user: User, tools: list[Tool]) -> list[Tool]:
+        """The subset of ``tools`` ``user`` is authorized to call — what
+        ``tools/list`` and the chat tool schema advertise."""
+        return [
+            t
+            for t in tools
+            if t.permission is not None and tool_permission_allows(user, t.permission)
+        ]
+
     async def call(
         self,
         name: str,
@@ -139,22 +237,26 @@ class ToolRegistry:
     ) -> Any:
         """Validate ``raw_args`` against the tool's Pydantic model and
         dispatch. Raises :class:`ToolNotFound` /
-        :class:`ToolArgumentError` / :class:`ToolDisabled` on the
-        obvious failure modes.
+        :class:`ToolArgumentError` / :class:`ToolDisabled` /
+        :class:`ToolPermissionDenied` on the obvious failure modes.
 
         ``effective`` is the operator's resolved tool set
         (Tool Catalog × per-provider allowlist). When supplied, the
         registry refuses to dispatch tools outside the set so a
         hallucinating LLM can't call something the operator
-        explicitly disabled. Pass None for "no gating" — legitimate
-        for the MCP HTTP endpoint where the caller has already
-        filtered against ``tools/list``.
+        explicitly disabled. Pass None only where the caller has
+        already resolved the effective set itself.
+
+        The tool's ``permission`` is enforced here for EVERY caller,
+        regardless of ``effective`` (GHSA-4wrc-78rq-vgcg).
         """
         tool = self.get(name)
         if tool is None:
             raise ToolNotFound(name)
         if effective is not None and name not in effective:
             raise ToolDisabled(name, scope="platform")
+        if tool.permission is None or not tool_permission_allows(user, tool.permission):
+            raise ToolPermissionDenied(name, tool.permission)
         try:
             args = tool.args_model.model_validate(raw_args or {})
         except Exception as exc:
@@ -173,6 +275,16 @@ class ToolNotFound(KeyError):
         self.name = name
 
 
+class ToolPermissionDenied(PermissionError):
+    """The caller lacks the permission the tool declares."""
+
+    def __init__(self, name: str, permission: ToolPermission | None) -> None:
+        self.name = name
+        self.permission = permission
+        need = describe_tool_permission(permission) if permission is not None else "unknown"
+        super().__init__(f"Permission denied for tool {name!r}: need {need}")
+
+
 class ToolArgumentError(ValueError):
     def __init__(self, name: str, detail: str) -> None:
         super().__init__(detail)
@@ -189,8 +301,11 @@ def register_tool(
     category: str = "ops",
     default_enabled: bool = True,
     module: str | None = None,
+    permission: ToolPermission,
 ) -> Callable[[ToolExecutor], ToolExecutor]:
     """Decorator. Use on each tool's executor function.
+
+    ``permission`` is mandatory — see ``ToolPermission``.
 
     Example::
 
@@ -202,6 +317,7 @@ def register_tool(
             description="...",
             args_model=ListSpacesArgs,
             category="ipam",
+            permission=("read", "ip_space"),
         )
         async def list_ip_spaces(
             db: AsyncSession, user: User, args: ListSpacesArgs
@@ -220,6 +336,7 @@ def register_tool(
                 category=category,
                 default_enabled=default_enabled,
                 module=module,
+                permission=permission,
             )
         )
         return fn

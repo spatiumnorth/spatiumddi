@@ -113,7 +113,7 @@ nothing here runs on a schedule.
 | `api.openai.com`, `generativelanguage.googleapis.com`, Azure OpenAI (`<your-resource>.openai.azure.com`), Anthropic | Operator Copilot | off; no provider is configured out of the box | **Sends prompts and tool results** — which can include hostnames, subnets and record data — to whichever provider you point it at. Can be fully on-prem: Ollama, vLLM and LocalAI all work through the `openai_compat` driver, in which case nothing leaves your network. |
 | `acme-v02.api.letsencrypt.org`, `acme-staging-v02.api.letsencrypt.org`, or any ACME directory you name | Embedded ACME client (#438) | off | A standard ACME order: the domains you are requesting a certificate for. Those names end up in public Certificate Transparency logs — that is how public CAs work, not something SpatiumDDI adds. |
 | Blocklist feed hosts (Hagezi, OISD, AdGuard, urlhaus, phishing.army, … — the catalogue is `backend/app/data/dns_blocklist_catalog.json`) | RPZ blocking lists | off per list | Nothing — an HTTPS download of the list, once per refresh interval, per list you subscribed to. |
-| `api.cloudflare.com`, `dns.hetzner.com`, `api.linode.com`, `api.vultr.com`, `api.digitalocean.com`, plus the AWS / Azure / Google SDK endpoints | Agentless cloud DNS drivers | off; one server row per provider | Zone and record operations, with **your** credentials, to **your** tenant. |
+| `api.cloudflare.com`, `api.hetzner.cloud`, `api.linode.com`, `api.vultr.com`, `api.digitalocean.com`, plus the AWS / Azure / Google SDK endpoints | Agentless cloud DNS drivers | off; one server row per provider | Zone and record operations, with **your** credentials, to **your** tenant. |
 | `api.meraki.com`, `api.netbird.io`, `api.tailscale.com`, `login.tailscale.com`, `api.ui.com` | Vendor-hosted integration mirrors (Meraki, NetBird, Tailscale, UniFi cloud) | off; one target row each | Read-only API calls with your credentials to your own tenant. Self-hosted integrations (Proxmox, OPNsense, PAN-OS, FortiGate, Kubernetes, Docker, …) reach only the address you type. |
 | `stat.ripe.net`, `www.peeringdb.com`, `ris-live.ripe.net`, `rpki.cloudflare.com`, `rpki-validator.ripe.net` | BGP Looking Glass enrichment | off (`bgp.*` feature modules) | The ASN or prefix being enriched. |
 | Your alert / notification endpoints (Slack webhook, generic webhook, SMTP relay) | Alerting | off until a channel is configured | The alert payload, to the URL or relay you entered. |
@@ -317,8 +317,8 @@ the installer's SSH-key fetch in §3.4 is a separate use),
 `www.spatiumddi.com` (the ACME
 client's User-Agent string, as RFC 8555 asks for), `fingerbank.org`,
 `aistudio.google.com` (the "get an API key" link in an error message),
-`bacnet.org`, `kea.readthedocs.io`, `schema.org` (a JSON-LD `@context`
-identifier in a Teams-format webhook payload — a namespace URI, not a
+`bacnet.org`, `kea.readthedocs.io`, `adaptivecards.io` (the `$schema`
+identifier in a Teams-format webhook payload — a schema URI, not a
 URL that is dereferenced), `www.opengis.net` (the GML namespace in the
 E911 PIDF-LO renderer — likewise an XML namespace identifier, written
 into the document we *emit* and never fetched; the accompanying

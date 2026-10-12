@@ -48,6 +48,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { HeaderButton } from "@/components/ui/header-button";
+import { Modal } from "@/components/ui/modal";
 import { Pager } from "@/components/ui/pager";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
@@ -2002,6 +2003,7 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
                   <th className="px-3 py-2 text-left font-medium">
                     Description
                   </th>
+                  <th className="px-3 py-2 text-left font-medium">Family</th>
                   <th className="px-3 py-2 text-left font-medium">Match</th>
                   <th className="px-3 py-2"></th>
                 </tr>
@@ -2012,6 +2014,13 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
                     <td className="px-3 py-2 font-medium">{c.name}</td>
                     <td className="px-3 py-2 text-muted-foreground">
                       {c.description}
+                    </td>
+                    <td className="px-3 py-2 text-xs whitespace-nowrap">
+                      {c.address_family === "dual"
+                        ? "IPv4 + IPv6"
+                        : c.address_family === "ipv6"
+                          ? "IPv6"
+                          : "IPv4"}
                     </td>
                     <td className="px-3 py-2 font-mono text-xs truncate max-w-md">
                       {c.match_expression}
@@ -3100,6 +3109,97 @@ function ServerDetailView({
   );
 }
 
+/** Delete Server Group (#1399). The server refuses a group that still holds
+ *  servers or live scopes (409), so the dialog reads both first and, when the
+ *  group holds either, says what it holds and offers no Delete: the console
+ *  never sends a delete it knows will be refused. The server's refusal stays
+ *  the backstop (a list read before another tab added a scope, the API, the
+ *  approval queue) and its reason shows in the dialog. What a delete still
+ *  takes is the group's scopes already in Trash, for good. */
+function DeleteServerGroupModal({
+  group,
+  onConfirm,
+  onClose,
+  isPending,
+  error,
+  notice,
+}: {
+  group: DHCPServerGroup;
+  onConfirm: () => void;
+  onClose: () => void;
+  isPending?: boolean;
+  error?: string | null;
+  notice?: string | null;
+}) {
+  const serversQ = useQuery({
+    queryKey: ["dhcp-servers", group.id],
+    queryFn: () => dhcpApi.listServers(group.id),
+  });
+  const scopesQ = useQuery({
+    queryKey: ["dhcp-scopes-group", group.id],
+    queryFn: () => dhcpApi.listScopesByGroup(group.id),
+  });
+  const title = "Delete Server Group";
+
+  if (serversQ.isPending || scopesQ.isPending) {
+    return (
+      <Modal title={title} onClose={onClose}>
+        <p className="text-sm text-muted-foreground">
+          Checking what group "{group.name}" still holds…
+        </p>
+      </Modal>
+    );
+  }
+  // A list that failed to load is read as empty: the server still refuses.
+  const servers = serversQ.data?.length ?? 0;
+  const scopes = scopesQ.data?.length ?? 0;
+  if (servers || scopes) {
+    const held = [
+      servers ? `${servers} server${servers === 1 ? "" : "s"}` : "",
+      scopes ? `${scopes} scope${scopes === 1 ? "" : "s"}` : "",
+    ]
+      .filter(Boolean)
+      .join(" and ");
+    const first = [
+      servers ? "move or delete its servers" : "",
+      scopes ? "delete its scopes" : "",
+    ]
+      .filter(Boolean)
+      .join(", and ");
+    return (
+      <Modal title={title} onClose={onClose}>
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Group "{group.name}" still holds {held}, so it cannot be deleted.
+            First {first}.
+            {scopes > 0 &&
+              " A deleted scope goes to Trash; deleting the group then deletes its scopes in Trash for good, with their pools and reservations."}
+          </p>
+          <div className="flex justify-end">
+            <button
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+  return (
+    <DeleteConfirmModal
+      title={title}
+      description={`Permanently delete group "${group.name}"? Scopes of this group already in Trash are deleted with it, with their pools and reservations, and can no longer be restored.`}
+      onConfirm={onConfirm}
+      onClose={onClose}
+      isPending={isPending}
+      error={error}
+      notice={notice}
+    />
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Page shell
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3292,9 +3392,8 @@ export function DHCPPage() {
         />
       )}
       {delGroup && (
-        <DeleteConfirmModal
-          title="Delete Server Group"
-          description={`Permanently delete group "${delGroup.name}"? The group must be empty — move or delete its servers first.`}
+        <DeleteServerGroupModal
+          group={delGroup}
           onConfirm={() => deleteGroupMut.mutate(delGroup.id)}
           onClose={() => {
             setDelGroup(null);

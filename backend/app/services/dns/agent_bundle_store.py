@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import gzip
 import json
+import struct
 import uuid
+import zlib
 from datetime import datetime
 from typing import Any
 
@@ -61,10 +63,23 @@ _MAX_ERROR = 2000
 # replaces a newer render during a rolling upgrade (which the ``app_version``
 # equality check before #1185 did every 30 s), and a release that leaves the
 # renderer alone re-renders nothing.
-# 2 (#1523): the bundle now ships the NOTIFY fields (server options
-# ``notify_enabled`` / ``also_notify`` / ``allow_notify`` and the zone
-# ``allow_query`` / ``also_notify`` / ``notify_enabled`` overrides).
-RENDERER_REVISION = 2
+#
+# 2 (#1171): every zone copy carries its SOA timers.
+# 3 (#1373): a zone's serial left the structural fingerprint of a group
+#   without views.
+# 4 (#1373): a group's zones are listed by name, not in the order Postgres
+#   happened to read them.
+# 5 (#1171, #1373): 4 with #1171's later change, which serves a zone's own SOA
+#   timers only once the group's last BIND9 agent renders them.
+# 6 (#1513): a Technitium server's bundle carries ``svcb_target_rule``, and
+#   its SVCB / HTTPS targets the trailing dot migration a3d9e5c17b42 wrote.
+# 7 (#1759): a Technitium server's bundle also carries ``name_target_rule``, and
+#   its CNAME / DNAME / NS / PTR / MX / SRV / NAPTR targets the trailing dot
+#   migration d6b2f81a3c57 wrote.
+# 8 (#1523): the bundle ships the NOTIFY fields (server options
+#   ``notify_enabled`` / ``also_notify`` / ``allow_notify`` and the zone
+#   ``allow_query`` / ``also_notify`` / ``notify_enabled`` overrides).
+RENDERER_REVISION = 8
 
 
 def _serves(revision: int | None) -> bool:
@@ -83,27 +98,63 @@ def is_current(server: DNSServer) -> bool:
     )
 
 
+#: How a body is serialised on the wire. These are Starlette
+#: ``JSONResponse.render``'s kwargs, not ``json.dumps``'s defaults (#958):
+#: compact separators, raw UTF-8, no bare ``NaN``. ``default=str`` matches
+#: what ``_compute_etag`` hashes, so the body and the ETag stay consistent.
+#: The streamed render (#1662) encodes each batch of blocklist entries with
+#: these same kwargs.
+WIRE_JSON: dict[str, Any] = {
+    "ensure_ascii": False,
+    "allow_nan": False,
+    "separators": (",", ":"),
+    "default": str,
+}
+
+_GZIP_LEVEL = 6
+
+
 def encode_body(body: Any) -> bytes:
     """Serialise ``body`` (a JSON value — the bundle body, or the ops page)
-    exactly as the route sends it on the wire.
-
-    These are Starlette ``JSONResponse.render``'s kwargs, not ``json.dumps``'s
-    defaults (#958): compact separators, raw UTF-8, no bare ``NaN``.
-    ``default=str`` matches what ``_compute_etag`` hashes, so the body and
-    the ETag stay consistent.
-    """
-    return json.dumps(
-        body,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-        default=str,
-    ).encode("utf-8")
+    exactly as the route sends it on the wire (``WIRE_JSON``)."""
+    return json.dumps(body, **WIRE_JSON).encode("utf-8")
 
 
 def compress_body(body_json: bytes) -> bytes:
     """gzip at rest. ``mtime=0`` keeps the bytes deterministic for one input."""
-    return gzip.compress(body_json, compresslevel=6, mtime=0)
+    return gzip.compress(body_json, compresslevel=_GZIP_LEVEL, mtime=0)
+
+
+class BodyWriter:
+    """A body gzipped as it is written (#1662), so that a render never holds
+    the whole of it uncompressed.
+
+    ``finish()`` returns exactly ``compress_body`` of everything written: the
+    header ``gzip.compress`` writes for this level and ``mtime=0``, one raw
+    deflate stream at the same level (its output does not depend on how the
+    input is split), then the CRC-32 and length trailer.
+    ``tests/test_dns_agent_bundle_blocklist_stream_1662.py`` pins the bytes.
+    """
+
+    _HEADER = gzip.compress(b"", compresslevel=_GZIP_LEVEL, mtime=0)[:10]
+
+    def __init__(self) -> None:
+        self._deflate = zlib.compressobj(_GZIP_LEVEL, zlib.DEFLATED, -zlib.MAX_WBITS)
+        self._parts: list[bytes] = [self._HEADER]
+        self._crc = 0
+        self.size = 0
+
+    def write(self, data: bytes) -> None:
+        self._crc = zlib.crc32(data, self._crc)
+        self.size += len(data)
+        out = self._deflate.compress(data)
+        if out:
+            self._parts.append(out)
+
+    def finish(self) -> bytes:
+        self._parts.append(self._deflate.flush())
+        self._parts.append(struct.pack("<LL", self._crc, self.size & 0xFFFFFFFF))
+        return b"".join(self._parts)
 
 
 async def current(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
@@ -167,12 +218,17 @@ async def store(
     etag: str,
     structural_etag: str,
     ships_ops: bool,
-    body_json: bytes,
+    body_gz: bytes,
+    body_bytes: int,
     records: int,
     render_ms: int,
     rendered_by: str,
 ) -> DNSAgentBundle | None:
     """Insert one rendered bundle and mirror it onto the server row.
+
+    ``body_gz`` is the body already compressed (``compress_body``, or a
+    ``BodyWriter`` the render streamed it into, #1662) and ``body_bytes`` its
+    uncompressed length.
 
     Returns ``None`` — and writes nothing — when a row for
     ``(server, dirty_watermark)`` from this renderer revision or a newer one
@@ -186,7 +242,6 @@ async def store(
     back. The render counter is incremented in SQL so it is exact under
     that race.
     """
-    body_gz = compress_body(body_json)
     app_version = settings.version
     payload: dict[str, Any] = {
         "snapshot_at": snapshot_at,
@@ -195,7 +250,7 @@ async def store(
         "structural_etag": structural_etag,
         "ships_ops": ships_ops,
         "body": body_gz,
-        "body_bytes": len(body_json),
+        "body_bytes": body_bytes,
         "body_gzip_bytes": len(body_gz),
         "records": records,
         "render_ms": render_ms,
@@ -275,7 +330,7 @@ async def store(
         etag=etag,
         structural_etag=structural_etag,
         records=records,
-        body_bytes=len(body_json),
+        body_bytes=body_bytes,
         body_gzip_bytes=len(body_gz),
         render_ms=render_ms,
         rendered_by=rendered_by,
@@ -330,6 +385,8 @@ async def record_failure(db: AsyncSession, server_id: uuid.UUID, error: str) -> 
 
 __all__ = [
     "RENDERER_REVISION",
+    "WIRE_JSON",
+    "BodyWriter",
     "DYNAMIC_KEYS",
     "RENDERED_BY_API",
     "RENDERED_BY_WORKER",

@@ -23,6 +23,12 @@ Auth:
     has been extended to allow POST to ``/api/v1/mcp/*`` under ``read``
     so this works without a dedicated MCP scope. Phase 3 adds an
     ``mcp:write`` scope when write tools land.
+
+    Authentication is not authorization (GHSA-4wrc-78rq-vgcg): the
+    advertised and callable set is the same effective set the in-app chat
+    uses (Tool Catalog × ``default_enabled`` × enabled feature modules),
+    narrowed to the tools the caller's own permissions allow, and
+    ``ToolRegistry.call`` re-checks each tool's declared permission.
 """
 
 from __future__ import annotations
@@ -35,11 +41,17 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel
 
 from app.api.deps import DB, CurrentUser
+from app.models.auth import User
+from app.models.settings import PlatformSettings
+from app.services import feature_modules as fm_svc
 from app.services.ai.tools import (
     REGISTRY,
+    Tool,
     ToolArgumentError,
     ToolDisabled,
     ToolNotFound,
+    ToolPermissionDenied,
+    effective_tool_names,
 )
 
 logger = structlog.get_logger(__name__)
@@ -80,23 +92,39 @@ def _err(req_id: int | str | None, code: int, message: str, data: Any = None) ->
     return {"jsonrpc": "2.0", "id": req_id, "error": payload}
 
 
-def _mcp_tools() -> list[Any]:
-    """The tools the MCP transport exposes — genuinely read-only only.
+async def _mcp_tool_names(db: Any) -> set[str]:
+    """The tools the MCP transport may dispatch — genuinely read-only only.
 
-    SECURITY (#400, M1): ``REGISTRY.read_only()`` keys off the ``writes``
-    flag, but every ``propose_*`` tool is registered ``writes=False``
-    (the propose call itself only previews + persists a proposal row;
-    the mutation runs later through the C2-gated /apply endpoint). We
-    therefore additionally drop ``propose_*`` tools so the MCP surface
-    never previews/stages a write either. ``tools/list`` (advertised
-    set) and ``tools/call`` (dispatch gate) both consume this single
-    source of truth so they can never drift apart.
+    SECURITY (GHSA-4wrc-78rq-vgcg): the same effective set the in-app chat
+    resolves — the operator's Tool Catalog over each tool's
+    ``default_enabled``, minus tools whose feature module is off — so a
+    tool the operator disabled (or never enabled) is not reachable here
+    either. Previously MCP exposed every non-write tool.
+
+    SECURITY (#400, M1): ``effective_tool_names`` keys off the ``writes``
+    flag, but every ``propose_*`` tool is registered ``writes=False`` (the
+    propose call itself only previews + persists a proposal row; the
+    mutation runs later through the C2-gated /apply endpoint). We therefore
+    additionally drop ``propose_*`` tools so the MCP surface never
+    previews/stages a write either. ``tools/list`` (advertised set) and
+    ``tools/call`` (dispatch gate) both consume this single source of truth
+    so they can never drift apart.
     """
-    return [t for t in REGISTRY.read_only() if not t.name.startswith("propose_")]
+    platform_settings = await db.get(PlatformSettings, 1)
+    platform_enabled = platform_settings.ai_tools_enabled if platform_settings is not None else None
+    effective = effective_tool_names(
+        platform_enabled=platform_enabled,
+        provider_enabled=None,
+        enabled_modules=await fm_svc.get_enabled_modules(db),
+    )
+    return {n for n in effective if not n.startswith("propose_")}
 
 
-def _mcp_tool_names() -> set[str]:
-    return {t.name for t in _mcp_tools()}
+async def _mcp_tools(db: Any, user: User) -> list[Tool]:
+    """The tools ``tools/list`` advertises to ``user``: the effective set,
+    narrowed to the ones the caller's permissions allow."""
+    names = await _mcp_tool_names(db)
+    return REGISTRY.callable_by(user, [t for t in REGISTRY.read_only() if t.name in names])
 
 
 # Standard JSON-RPC error codes
@@ -108,7 +136,7 @@ _INTERNAL_ERROR = -32603
 
 
 @router.get("")
-async def mcp_get(current_user: CurrentUser) -> dict[str, Any]:
+async def mcp_get(current_user: CurrentUser, db: DB) -> dict[str, Any]:
     """A bare GET on ``/mcp`` returns server info — useful for browser
     sanity-checks and for Streamable-HTTP clients that probe for
     server identity without going through ``initialize``. Auth is
@@ -117,7 +145,7 @@ async def mcp_get(current_user: CurrentUser) -> dict[str, Any]:
     return {
         "server": _SERVER_INFO,
         "protocol_version": _PROTOCOL_VERSION,
-        "available_tools": len(_mcp_tools()),
+        "available_tools": len(await _mcp_tools(db, current_user)),
         "transport": "streamable_http",
     }
 
@@ -198,7 +226,7 @@ async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
         if method == "tools/list":
             return _ok(
                 req.id,
-                {"tools": [t.to_mcp_tool() for t in _mcp_tools()]},
+                {"tools": [t.to_mcp_tool() for t in await _mcp_tools(db, user)]},
             )
 
         if method == "tools/call":
@@ -210,15 +238,15 @@ async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
                     _INVALID_PARAMS,
                     "tools/call requires string `name`",
                 )
-            # SECURITY (#400, M1): the MCP transport only advertises the
-            # read-only tool set via tools/list, so tools/call must refuse
-            # anything outside it. Passing effective={MCP tool names} makes
-            # the registry raise ToolDisabled for write/propose tools —
-            # without this, a read-scoped API-token client could invoke any
-            # registered tool (including propose_* proposals) by name.
+            # SECURITY (#400, M1 + GHSA-4wrc-78rq-vgcg): tools/call must
+            # refuse anything outside the advertised set. Passing
+            # effective={MCP tool names} makes the registry raise
+            # ToolDisabled for write / propose / catalog-disabled /
+            # module-disabled tools, and the registry itself enforces each
+            # tool's declared permission against the caller.
             try:
                 result = await REGISTRY.call(
-                    name, arguments, db=db, user=user, effective=_mcp_tool_names()
+                    name, arguments, db=db, user=user, effective=await _mcp_tool_names(db)
                 )
             except ToolNotFound as exc:
                 return _err(
@@ -234,6 +262,14 @@ async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
                     req.id,
                     _METHOD_NOT_FOUND,
                     f"tool not found: {exc.name!r}",
+                )
+            except ToolPermissionDenied as exc:
+                # An MCP tool-execution failure, reported in-band the way the
+                # spec asks (``isError``) — the REST analogue is a 403.
+                logger.info("mcp_tool_denied", tool=name, user_id=str(user.id))
+                return _ok(
+                    req.id,
+                    {"content": [{"type": "text", "text": str(exc)}], "isError": True},
                 )
             except ToolArgumentError as exc:
                 return _err(

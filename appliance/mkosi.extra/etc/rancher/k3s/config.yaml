@@ -91,12 +91,12 @@ disable-network-policy: true
 # config since there's no overlay traffic to allow through.
 flannel-backend: host-gw
 
-# Kubeconfig file mode — by default 0600 (root only). 0644 lets the
-# admin user read it via /etc/profile.d/k3s.sh's KUBECONFIG export
-# without a sudo prompt. The file lives in the /etc overlay upper
-# so the operator's permissions changes persist; this just sets the
-# initial bit.
-write-kubeconfig-mode: "0644"
+# Kubeconfig file mode + group: set in config.yaml.d/spatium-kubeconfig.yaml,
+# NOT here (GHSA-h2j9-qrg7-grfw). This file used to say 0644, which made
+# the cluster-admin kubeconfig readable by every local account. A drop-in
+# is what reaches existing installs: this file can sit in the /etc overlay
+# upper (spatium-cluster-join edits it), where an image update never
+# replaces it, and k3s applies drop-ins after it.
 
 # Operator-visible node label so the supervisor (Phase 3) + future
 # Helm charts can target schedule pods to "spatiumddi appliances"

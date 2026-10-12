@@ -20,7 +20,7 @@ import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from jose import JWTError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,6 +64,7 @@ from app.services.agents.ingest_receipt import (
 )
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.dns import agent_bundle_store as bundle_store
+from app.services.dns import dnssec_signers
 from app.services.dns.agent_bundle_render import render_and_store
 from app.services.dns.agent_bundle_store import RENDERED_BY_API, encode_body
 from app.services.dns.agent_config import page_pending_ops
@@ -75,6 +76,12 @@ from app.services.dns.agent_token import (
 )
 from app.services.dns.bundle_dirty import enqueue_renders
 from app.services.dns.record_ops import ack_op, apply_acks, reset_unacknowledged_ops
+from app.services.dns.server_move import CATALOG_UNSUPPORTED_DRIVERS
+from app.services.dns.soa_timers import (
+    AGENT_FEATURES_HEADER,
+    reconcile_soa_timers,
+    renders_soa_timers,
+)
 from app.services.dns.tsig import ensure_group_tsig_key
 from app.services.feature_modules import is_module_enabled
 from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as QUERY_LOG_RETENTION_HOURS
@@ -89,6 +96,15 @@ LONGPOLL_POLL_INTERVAL = 2.0
 # ── Schemas ────────────────────────────────────────────────────────────────────
 
 
+# #1567 — drivers an agent binary can actually serve. The full driver
+# registry also names agentless drivers (windows_dns, the cloud
+# providers, technitium_api) that the operator API accepts but no agent
+# can register as; the supervisor's driver selection raises on anything
+# outside this set, so accepting it here only wrote a junk ``active``
+# server row before the agent crash-looped.
+AGENT_CAPABLE_DRIVERS = frozenset({"bind9", "powerdns", "technitium"})
+
+
 class AgentRegisterRequestV2(BaseModel):
     # Bounds mirror the columns these land in (DNSServer.name/host 255,
     # .driver 50, .agent_fingerprint 128, DNSServerGroup.name 255) — an
@@ -101,6 +117,15 @@ class AgentRegisterRequestV2(BaseModel):
     group_name: str | None = Field(default=None, max_length=255)
     fingerprint: str = Field(max_length=128)
     agent_id: str | None = None  # persisted UUID from previous runs
+
+    @field_validator("driver")
+    @classmethod
+    def validate_driver(cls, v: str) -> str:
+        if v not in AGENT_CAPABLE_DRIVERS:
+            raise ValueError(
+                f"driver must be one of {sorted(AGENT_CAPABLE_DRIVERS)} " "for agent registration"
+            )
+        return v
 
 
 class AgentRegisterResponseV2(BaseModel):
@@ -225,6 +250,69 @@ async def _auth_agent(
     return server, payload
 
 
+async def _switch_soa_timers(db: AsyncSession, group_id: uuid.UUID) -> None:
+    """#1171 — after an agent says what it renders, bring its group's SOA
+    timers in line, in a transaction of its own (the caller's has committed).
+
+    Never fails the request: register and heartbeat carry the agent's token
+    and op acks, and the next heartbeat of any agent in the group retries the
+    switch. The rollback expires every instance in the session, so the caller
+    must have read what it returns before calling this.
+    """
+    try:
+        if await reconcile_soa_timers(db, group_id) is not None:
+            await db.commit()
+    except Exception:  # noqa: BLE001 — see the docstring
+        await db.rollback()
+        logger.exception("dns_group_soa_timers_failed", group_id=str(group_id))
+
+
+async def _warn_if_second_signer(db: DB, group: DNSServerGroup, server: DNSServer) -> None:
+    """#1762 — an agent that auto-registers (``AGENT_GROUP``) into a group
+    that already has a signer and holds signed zones becomes a second
+    independent signer. Registration is not refused: that would leave the
+    agent re-bootstrapping forever with no row an operator can act on. There
+    is also no safe "register but don't sign" mode — a server serving the
+    zone unsigned under the parent's DS is just as bogus as one signing with
+    its own keys. So the row is created and the hazard is made loud: a
+    warning log, an audit row, the zone's ``dnssec_multi_signer`` flag (UI
+    badge + DNSSEC card) and the default-on ``dnssec_multi_signer`` alert.
+    """
+    if server.driver not in dnssec_signers.PER_SERVER_SIGNING_DRIVERS:
+        return
+    n = await dnssec_signers.signing_server_count(db, group.id)
+    if n < 2:
+        return
+    signed = await dnssec_signers.signed_zone_count(db, group.id)
+    if not signed:
+        return
+    message = dnssec_signers.register_warning_message(group.name, server.name, signed, n)
+    logger.warning(
+        "dns_agent_registered_into_signed_group",
+        group_id=str(group.id),
+        server_id=str(server.id),
+        signed_zones=signed,
+        signing_servers=n,
+    )
+    db.add(
+        AuditLog(
+            user_display_name="system:dns-agent",
+            auth_source="system",
+            action="dns.agent.register.dnssec_multi_signer",
+            resource_type="dns_server",
+            resource_id=str(server.id),
+            resource_display=server.name,
+            new_value={
+                "group_id": str(group.id),
+                "signed_zones": signed,
+                "signing_servers": n,
+                "warning": message,
+            },
+            result="success",
+        )
+    )
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
@@ -233,6 +321,9 @@ async def agent_register(
     body: AgentRegisterRequestV2,
     db: DB,
     _psk: str = Depends(_require_bootstrap_key),
+    # #1171 — what the agent renders (``soa-timers``: each zone's own SOA
+    # timers). A header so an older control plane ignores it.
+    agent_features: str | None = Header(default=None, alias=AGENT_FEATURES_HEADER),
 ) -> AgentRegisterResponseV2:
     """Bootstrap registration: PSK-authenticated; returns a per-server JWT."""
     # #1068 — see the matching guard in dhcp/agents.py. Registration is
@@ -246,7 +337,7 @@ async def agent_register(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
                 "The DNS subsystem is disabled on this control plane, so new "
-                "agents cannot register. Enable it under Settings → Features."
+                "agents cannot register. Enable it on the Features & Integrations page."
             ),
         )
     # Resolve or create group
@@ -328,6 +419,7 @@ async def agent_register(
         pending_approval = require_approval
         db.add(server)
         await db.flush()
+        await _warn_if_second_signer(db, group, server)
     else:
         # Anti-hijack: fingerprint change → force approval IFF the
         # operator has opted into the approval gate. Otherwise the
@@ -349,6 +441,20 @@ async def agent_register(
         if server.agent_id is None:
             server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
 
+    # #1782 — Technitium cannot do catalog zones (#1766). Registration must
+    # not refuse (a refused agent re-bootstraps in a loop), and the group API
+    # / server create / move / Fleet role assignment refuse the operator-driven
+    # paths. An agent pointed straight at a catalog group lands here; say so,
+    # and the group's ``catalog_unsupported_warning`` shows it in the UI.
+    if group.catalog_zones_enabled and body.driver in CATALOG_UNSUPPORTED_DRIVERS:
+        logger.warning(
+            "dns_agent_catalog_unsupported_driver",
+            server_id=str(server.id),
+            group=group.name,
+            driver=body.driver,
+            issue="#1766",
+        )
+
     # Mint token
     token, exp = mint_agent_token(
         server_id=str(server.id),
@@ -357,6 +463,7 @@ async def agent_register(
     )
     server.agent_jwt_hash = hash_token(token)
     server.last_seen_at = datetime.now(UTC)
+    server.agent_renders_soa_timers = renders_soa_timers(agent_features)
 
     db.add(
         AuditLog(
@@ -385,7 +492,7 @@ async def agent_register(
         pending_approval=pending_approval,
     )
 
-    return AgentRegisterResponseV2(
+    response = AgentRegisterResponseV2(
         server_id=str(server.id),
         agent_id=str(server.agent_id),
         agent_token=token,
@@ -393,6 +500,11 @@ async def agent_register(
         config_etag=server.last_config_etag,
         pending_approval=pending_approval,
     )
+    # Before the agent's first poll: an agent of an older release joining a
+    # group that serves the zones' own timers switches it to the literal here,
+    # so its first bundle already carries a serial nobody served them under.
+    await _switch_soa_timers(db, server.group_id)
+    return response
 
 
 _BODY_CHUNK = 64 * 1024
@@ -755,6 +867,10 @@ async def agent_heartbeat(
     # reason.
     if body.daemon_version:
         server.daemon_version = body.daemon_version
+    # #1171 — on every heartbeat, from the header: the same server row is run
+    # by an older agent until the upgrade replaces its pod, and by an older one
+    # again if a node is rolled back.
+    server.agent_renders_soa_timers = renders_soa_timers(request.headers.get(AGENT_FEATURES_HEADER))
 
     # Phase 8f-2 — persist whatever slot state the agent reported. Only
     # overwrite when the agent actually sent a value (older agents
@@ -837,13 +953,18 @@ async def agent_heartbeat(
         server.agent_jwt_hash = hash_token(rotated_token)
 
     await db.commit()
-    return AgentHeartbeatResponseV2(
+    response = AgentHeartbeatResponseV2(
         server_id=str(server.id),
         status=server.status,
         acknowledged_at=now,
         rotated_token=rotated_token,
         rotated_expires_at=rotated_exp,
     )
+    # #1171 — the heartbeat that finishes a roll (the group's last BIND9 agent
+    # now renders the zones' own SOA timers), or brings an older agent back,
+    # switches the group and moves the serials.
+    await _switch_soa_timers(db, server.group_id)
+    return response
 
 
 @router.get("/record-ops")
@@ -1135,11 +1256,21 @@ async def agent_dnssec_state(
     Unknown zone names are silently skipped (deleted between sign
     and report) — same fail-soft semantic as ``/zone-state``.
     """
-    _, _ = auth
+    reporter, _ = auth
     now = datetime.now(UTC)
     updated = 0
 
     if not body.zones:
+        return {"updated": 0}
+
+    # #1762 — on a group with several agent servers each signs with its own
+    # keys, so their DS/key reports disagree and the last writer used to win,
+    # flapping the DS the UI shows. Keep one server's report: the primary's,
+    # or the oldest signer's when no signer is primary (see
+    # ``dnssec_signers.is_ds_reporter``). Multi-signer groups are refused for
+    # new signing, so this only governs zones signed before that rule and
+    # agents that auto-registered into a signed group.
+    if not await dnssec_signers.is_ds_reporter(db, reporter):
         return {"updated": 0}
 
     # DNSZone.name is stored *with* the trailing dot in the DB
@@ -1155,7 +1286,9 @@ async def agent_dnssec_state(
         name_set.add(n.rstrip("."))
         if not n.endswith("."):
             name_set.add(n + ".")
-    res = await db.execute(select(DNSZone).where(DNSZone.name.in_(name_set)))
+    res = await db.execute(
+        select(DNSZone).where(DNSZone.name.in_(name_set), DNSZone.group_id == reporter.group_id)
+    )
     zones_by_name: dict[str, DNSZone] = {z.name.rstrip("."): z for z in res.scalars().all()}
 
     for entry in body.zones:

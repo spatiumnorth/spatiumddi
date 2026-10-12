@@ -139,6 +139,22 @@ def test_render_zone_file_is_deterministic(zone: ZoneData, records: list[RecordD
     assert out1 == out2
 
 
+def test_render_zone_file_preserves_ttl_zero_and_mx_preference_zero(
+    zone: ZoneData,
+) -> None:
+    # #1518: TTL 0 ("never cache") and MX preference 0 (highest
+    # priority) are real values, not "unset" — the preview payload must
+    # not rewrite either to a default.
+    records = [
+        RecordData(name="www", record_type="A", value="10.0.0.1", ttl=0),
+        RecordData(name="@", record_type="MX", value="mail.example.com.", ttl=3600, priority=0),
+    ]
+    payload = json.loads(TechnitiumDriver().render_zone_file(zone, records))
+    by_domain_type = {(r["domain"], r["type"]): r for r in payload["records"]}
+    assert by_domain_type[("www.example.com", "A")]["ttl"] == 0
+    assert by_domain_type[("example.com", "MX")]["preference"] == 0
+
+
 def test_render_rpz_zone_returns_empty_string() -> None:
     bl = EffectiveBlocklistData(
         rpz_zone_name="spatium-blocklist.rpz.",
@@ -322,13 +338,13 @@ def test_validate_config_blocklists_are_warned_not_errored(zone: ZoneData) -> No
 def test_capabilities_scope() -> None:
     caps = TechnitiumDriver().capabilities()
     assert set(caps["zone_types"]) == {"primary", "secondary", "stub", "forward"}
-    # Online signing landed in #740.
-    assert caps["dnssec_inline_signing"] is True
+    # #1783: one-shot signing is no longer advertised.
+    assert caps["dnssec_inline_signing"] is False
     # ALIAS/LUA stay unsupported: Technitium's ANAME/APP are a different
     # shape, not a drop-in equivalent.
     assert caps["alias_records"] is False
     assert caps["lua_records"] is False
-    assert caps["catalog_zones"] is True
+    assert caps["catalog_zones"] is False
     assert "SVCB" in caps["record_types"]
     assert "HTTPS" in caps["record_types"]
     assert "DNAME" in caps["record_types"]
@@ -418,22 +434,22 @@ def test_validate_rejects_unknown_zone_type() -> None:
 def test_capabilities_report_zone_types_and_catalog() -> None:
     caps = TechnitiumDriver().capabilities()
     assert set(caps["zone_types"]) == {"primary", "secondary", "stub", "forward"}
-    assert caps["catalog_zones"] is True
+    assert caps["catalog_zones"] is False
 
 
-def test_capabilities_report_dnssec_online_signing() -> None:
-    """Issue #740 — Technitium signs online via /api/zones/dnssec/*, so it
-    joins PowerDNS and BIND9 on the sign/unsign gate."""
-    assert TechnitiumDriver().capabilities()["dnssec_inline_signing"] is True
+def test_capabilities_do_not_report_dnssec_signing() -> None:
+    """#1783 — Technitium signing is one-shot (never re-signed, policy
+    ignored), so the driver stops advertising it. Full support: #1767."""
+    assert TechnitiumDriver().capabilities()["dnssec_inline_signing"] is False
 
 
-def test_dnssec_operations_are_gated_to_technitium() -> None:
+def test_dnssec_operations_gate_for_technitium() -> None:
     from app.api.v1.dns.router import _DRIVER_GATED_OPERATIONS
 
-    assert "technitium" in _DRIVER_GATED_OPERATIONS["dnssec_sign"]
+    # Sign is refused (#1783); unsign stays so an already-signed zone can be
+    # turned off.
+    assert "technitium" not in _DRIVER_GATED_OPERATIONS["dnssec_sign"]
     assert "technitium" in _DRIVER_GATED_OPERATIONS["dnssec_unsign"]
-    # Manual rollover stays BIND9-only: Technitium rolls on its own
-    # schedule (dnssecPrivateKeys carries rolloverDays), like PowerDNS.
     assert "technitium" not in _DRIVER_GATED_OPERATIONS["dnssec_rollover"]
 
 

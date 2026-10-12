@@ -1,0 +1,21 @@
+[Unit]
+Description=Generate SSH host keys if none exist (GHSA-vvh9-6gfw-wphp)
+# The image ships no host keys, so something must create them before
+# sshd starts or sshd refuses to run. On an installed system
+# spatium-etc-render has already restored (or generated) STATE's keys by
+# now and this is condition-skipped; it only acts where etc-render did
+# not run: the live ISO (no /etc overlay, so etc-render's
+# ConditionPathIsMountPoint skips it), or an install whose STATE / /etc
+# overlay failed to mount. Keys made here are throwaway — only
+# etc-render persists keys to STATE.
+After=local-fs.target spatium-etc-render.service spatium-live-bootstrap.service
+Before=ssh.service sshd.service ssh.socket spatium-install.service
+ConditionPathExistsGlob=!/etc/ssh/ssh_host_*_key
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

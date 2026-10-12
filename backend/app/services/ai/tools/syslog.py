@@ -34,6 +34,7 @@ class FindSyslogSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_syslog_settings",
+    permission="authenticated",
     description=(
         "Return the appliance syslog (rsyslog) forwarding configuration: the "
         "master toggle, each forward target (host / port / protocol "

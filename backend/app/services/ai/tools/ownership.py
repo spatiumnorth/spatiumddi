@@ -77,6 +77,7 @@ class ListCustomersArgs(BaseModel):
 
 @register_tool(
     name="list_customers",
+    permission=("read", "customer"),
     module="network.customer",
     description=(
         "List customers (logical owners of network resources). Use for "
@@ -136,6 +137,7 @@ class GetCustomerSummaryArgs(BaseModel):
 
 @register_tool(
     name="get_customer_summary",
+    permission=("read", "customer"),
     module="network.customer",
     description=(
         "Full detail of one customer plus a count of every owned "
@@ -186,6 +188,7 @@ class ListSitesArgs(BaseModel):
 
 @register_tool(
     name="list_sites",
+    permission=("read", "site"),
     module="network.site",
     description=(
         "List sites (physical / logical locations). Use for "
@@ -248,6 +251,7 @@ class ListProvidersArgs(BaseModel):
 
 @register_tool(
     name="list_providers",
+    permission=("read", "provider"),
     module="network.provider",
     description=(
         "List external providers (transit ISPs, peering partners, "

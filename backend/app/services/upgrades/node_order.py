@@ -59,6 +59,8 @@ def pick_node_order(
 def next_node_to_upgrade(
     plan_order: list[str],
     completed_nodes: Iterable[str],
+    *,
+    defer: str | None = None,
 ) -> str | None:
     """Pick the next node from the plan that hasn't been completed yet.
 
@@ -66,11 +68,17 @@ def next_node_to_upgrade(
     time; ``completed_nodes`` is whatever the SystemUpgradeRun row's
     ``progress.per_node`` keys carry for runs that succeeded.
 
+    ``defer`` names a node to take last: the node the drive's own worker
+    runs on. Draining it evicts the worker running the drive, so it is
+    upgraded only after every other node, by a drive handed to a worker
+    elsewhere (#1449).
+
     Returns ``None`` when every node in the plan has completed — the
     orchestrator transitions to ``state='succeeded'`` then.
     """
     done = set(completed_nodes)
-    for name in plan_order:
-        if name not in done:
+    remaining = [name for name in plan_order if name not in done]
+    for name in remaining:
+        if name != defer:
             return name
-    return None
+    return remaining[0] if remaining else None

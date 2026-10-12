@@ -24,7 +24,7 @@ from sqlalchemy import select, text
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup, DNSZone
 from app.models.ipam import Subnet
-from app.services.dns.sync_check import _effective_dns
+from app.services.dns.sync_check import _effective_dns, ipam_authors_zone
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -154,7 +154,10 @@ async def ensure_reverse_zone_for_subnet(
     The function is idempotent: if a reverse zone with the computed FQDN
     already exists in the resolved group it is returned unchanged (or, #844,
     refused when an overlapping subnet in another IP space owns it — however
-    the group was resolved).
+    the group was resolved). A zone of that name SpatiumDDI does not author —
+    a forwarder, a secondary or a stub — is not adopted: another server owns
+    the subnet's reverse names, so the call returns ``None`` and creates
+    nothing beside it (spatiumddi#1419).
 
     Writes an ``audit_log`` entry on newly-created zones.
     """
@@ -220,6 +223,20 @@ async def ensure_reverse_zone_for_subnet(
         )
     )
     existing = existing_q.scalar_one_or_none()
+    if existing is not None and not ipam_authors_zone(existing):
+        # #1419 — a forwarder, a secondary or a stub of this name: another
+        # server owns the subnet's reverse names. It is not the subnet's
+        # reverse zone (IPAM writes no PTR into it), and the (group_id,
+        # view_id, name) unique constraint leaves no room for a primary
+        # beside it.
+        logger.debug(
+            "reverse_zone_not_authored",
+            subnet_id=str(subnet.id),
+            zone_id=str(existing.id),
+            name=reverse_name,
+            zone_type=existing.zone_type,
+        )
+        return None
     if existing is not None:
         # #844 — an OVERLAPPING CIDR in another IP space computes the same
         # reverse zone name, and the (group_id, view_id, name) unique

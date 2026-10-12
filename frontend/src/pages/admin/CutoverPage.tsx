@@ -385,7 +385,7 @@ export function CutoverPage() {
       <div className="p-6">
         <div className="rounded-md border bg-muted/20 p-4 text-sm text-muted-foreground">
           The <strong>Windows cutover</strong> module is turned off. Enable{" "}
-          <code>{MODULE_ID}</code> under Settings → Features to use it.
+          <code>{MODULE_ID}</code> under Features & Integrations to use it.
         </div>
       </div>
     );

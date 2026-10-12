@@ -51,6 +51,7 @@ class FindAVFlowsArgs(BaseModel):
 
 @register_tool(
     name="find_av_flows",
+    permission=("read", "av_flow"),
     description=(
         "List AV-over-IP flows (Dante / AES67 / SMPTE 2110 / NDI) with their "
         "multicast address, protocol, human flow label and PTP clock domain. "
@@ -115,6 +116,7 @@ class CountAVFlowsArgs(BaseModel):
 
 @register_tool(
     name="count_av_flows",
+    permission=("read", "av_flow"),
     description=(
         "Count AV-over-IP flows grouped by protocol, with how many are missing "
         "a PTP clock domain. Use for a quick 'how much AV do we have and is it "
@@ -157,6 +159,7 @@ class FindAVReservedRangesArgs(BaseModel):
 
 @register_tool(
     name="find_av_reserved_ranges",
+    permission=("read", "av_flow"),
     description=(
         "List the multicast ranges an operator has declared for each AV "
         "protocol (e.g. the Dante 239.69.0.0/16 pool). These are what the "

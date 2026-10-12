@@ -35,6 +35,7 @@ drop a lease).
 from __future__ import annotations
 
 import re
+import unicodedata
 
 import idna
 
@@ -453,3 +454,46 @@ def sanitize_hostname(raw: str | None) -> str:
     while labels and len(".".join(labels)) > MAX_NAME_LEN:
         labels.pop()
     return ".".join(labels)
+
+
+# ── Integration-mirrored names (#1459) ────────────────────────────────────
+# A read-only integration (UniFi, Docker, Proxmox, Meraki, the cloud
+# providers, OPNsense, the firewall mirrors, ...) copies an upstream display
+# name into ``IPAddress.hostname``, and IPAM's DNS sync publishes that as a
+# record owner. Upstream names are free text ("Vitrinen Schalter",
+# "John's iPhone", "compose_project.web"), so they are folded here before
+# they reach IPAM.
+
+# German umlauts read better spelled out than dropped ("buero", not "bro").
+# Anything else non-ASCII loses its accents through NFKD below.
+_TRANSLITERATE = str.maketrans(
+    {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"}
+)
+_APOSTROPHES_RE = re.compile(r"['’`]")
+
+
+def _is_host_name(name: str) -> bool:
+    """Whether *name* is already a legal ASCII host name, exactly as written."""
+    if not name or len(name) > MAX_NAME_LEN or not name.isascii():
+        return False
+    return all(_HOST_LABEL_RE.match(label) for label in name.split("."))
+
+
+def sanitize_mirrored_hostname(raw: str | None) -> str:
+    """Fold an integration's upstream name into a legal host name.
+
+    A name that is already a legal host name is returned unchanged, case
+    included, so mirrors that already publish good names don't see their
+    records renamed. Anything else is transliterated (``Büro`` → ``buero``),
+    stripped of apostrophes (``John's`` → ``johns``) and folded with
+    :func:`sanitize_hostname`. Non-raising: ``""`` means nothing usable is
+    left, which callers treat as "no hostname".
+    """
+    if not raw:
+        return ""
+    name = raw.strip()
+    if _is_host_name(name):
+        return name
+    folded = unicodedata.normalize("NFKD", name.translate(_TRANSLITERATE))
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return sanitize_hostname(_APOSTROPHES_RE.sub("", folded))

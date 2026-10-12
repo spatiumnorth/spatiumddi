@@ -92,7 +92,16 @@ def _applied_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict:
     )
     monkeypatch.setattr(service_lifecycle, "_read_chart_tarball", lambda: b"chart")
     monkeypatch.setattr(service_lifecycle, "_resolve_node_name", lambda: "")
+    # Each node's own render is what these tests compare: no chart is live yet
+    # and no other node serves a role, so the apply keeps nothing (#1427).
+    monkeypatch.setattr(k8s_api, "_helmchart_values", lambda name, *, namespace: {})
+    monkeypatch.setattr(k8s_api, "node_role_labels", lambda exclude="", timeout=5.0: (set(), None))
     monkeypatch.setattr(k8s_api, "apply_helmchart", capture)
+    # Each render is of a node alone in its k3s, so a non-member's render is
+    # written too (#1750 refuses only a non-member sharing a cluster).
+    monkeypatch.setattr(
+        k8s_api, "cluster_node_names", lambda timeout=5.0: (["this-node"], None), raising=False
+    )
     result = service_lifecycle.apply_role_assignment(target.profiles, env_file)
     assert result.state == "ready"
     assert len(written) == 1

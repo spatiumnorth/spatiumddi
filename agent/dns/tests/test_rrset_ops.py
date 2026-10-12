@@ -766,7 +766,7 @@ def test_technitium_idempotent_noop_does_not_abandon_later_members(
 
     def _responder(path: str, params: dict[str, Any], n: int) -> dict[str, Any]:
         if n == 2:
-            return {"status": "error", "errorMessage": "Record already exists."}
+            return {"status": "error", "errorMessage": "Cannot add record: record already exists."}
         return {"status": "ok"}
 
     calls = _install_fake_request(driver, _responder)
@@ -1225,3 +1225,30 @@ def test_powerdns_without_rrset_plain_delete_drops_whole_rrset(
     assert calls[1][2]["rrsets"] == [
         {"name": "pool.example.com.", "type": "A", "changetype": "DELETE"}
     ]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Cannot add record: CNAME record already exists for the same name.",
+        "Cannot add record: DNAME record already exists for the same name.",
+        "Record already exists. Use overwrite option if you wish to overwrite existing record.",
+        "Record already exists.",
+    ],
+)
+def test_technitium_conflict_refusal_is_a_failure(tmp_path: Path, message: str) -> None:
+    """#1770: a CNAME/DNAME conflict refusal contains "already exists" but
+    nothing was written; it must raise (NACK), not read as applied."""
+    driver = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(driver)
+    _install_fake_request(
+        driver, lambda path, params, n: {"status": "error", "errorMessage": message}
+    )
+    with pytest.raises(RuntimeError, match="already exists"):
+        driver.apply_record_op(
+            {
+                "zone_name": "example.com.",
+                "op": "create",
+                "record": {"name": "www", "type": "CNAME", "value": "t.example.com.", "ttl": 300},
+            }
+        )

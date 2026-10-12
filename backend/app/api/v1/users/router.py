@@ -7,13 +7,11 @@ from datetime import UTC, datetime
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator, model_validator
-from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select, update
 
 from app.api.deps import DB, SuperAdmin
 from app.api.stepup import require_operator_stepup
 from app.core.demo_mode import forbid_in_demo_mode
-from app.core.permissions import is_effective_superadmin
 from app.core.security import hash_password
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
@@ -33,6 +31,7 @@ from app.services.password_policy import (
 from app.services.password_policy import (
     validate as validate_password_policy,
 )
+from app.services.superadmin_grant import holds_superadmin, loaded_user_holds_superadmin
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -66,6 +65,8 @@ class UserResponse(BaseModel):
     # #1355 — the flag OR a wildcard role. Resetting such an account's
     # password needs the caller's step-up, and the UI reads this to ask for
     # it (the flag alone misses a local user in a Superadmin-role group).
+    # Regardless of ``is_active`` (#1412): a disabled role-only superadmin is
+    # still one for the reset, and for the Role column.
     is_effective_superadmin: bool = False
 
     model_config = {"from_attributes": True}
@@ -93,10 +94,7 @@ class UserResponse(BaseModel):
             cols["locked"] = is_user_locked(data)
             # ``groups`` is selectin-loaded; never trigger an async lazy load
             # from this sync validator if a path skipped it.
-            if "groups" in sa_inspect(data).unloaded:
-                cols["is_effective_superadmin"] = bool(data.is_superadmin)
-            else:
-                cols["is_effective_superadmin"] = is_effective_superadmin(data)
+            cols["is_effective_superadmin"] = loaded_user_holds_superadmin(data)
             return cols
         return data
 
@@ -122,7 +120,14 @@ class CreateUserRequest(BaseModel):
     username: str
     email: str
     display_name: str
-    password: str
+    # Required for a local account. Must be omitted for an external one
+    # (``auth_provider_id`` set), which signs in through its provider (#1291).
+    password: str | None = None
+    # #1291 — pre-create an account bound to this provider: no password,
+    # ``external_id`` NULL. The user's first sign-in through that provider
+    # as this username claims it (``user_sync._find_linked_user``, step 2),
+    # which is how a provider with auto-create off admits someone new.
+    auth_provider_id: uuid.UUID | None = None
     is_superadmin: bool = False
     force_password_change: bool = True
     # #1355 — the caller's own step-up (password, or authenticator code for
@@ -134,7 +139,7 @@ class CreateUserRequest(BaseModel):
 
     @field_validator("password")
     @classmethod
-    def password_length(cls, v: str) -> str:
+    def password_length(cls, v: str | None) -> str | None:
         # #1004 — NOT a length policy. This is the "obviously empty" floor
         # that keeps a legacy client getting a 422 instead of reaching the
         # handler; every length verdict belongs to the configured policy,
@@ -148,9 +153,19 @@ class CreateUserRequest(BaseModel):
         # your current password". A floor of 1 cannot collide with a policy
         # minimum (settings clamp it to 6..128), so the two can never
         # disagree again.
-        if not v:
+        if v is not None and not v:
             raise ValueError("Password cannot be empty")
         return v
+
+    @model_validator(mode="after")
+    def _password_xor_provider(self) -> "CreateUserRequest":
+        if self.auth_provider_id is None and self.password is None:
+            raise ValueError("A local account needs a password")
+        if self.auth_provider_id is not None and self.password is not None:
+            raise ValueError(
+                "An account bound to a provider signs in through it and takes no password"
+            )
+        return self
 
     @field_validator("username")
     @classmethod
@@ -266,6 +281,14 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
             detail="Username or email already in use",
         )
 
+    provider: AuthProvider | None = None
+    if body.auth_provider_id is not None:
+        provider = await db.get(AuthProvider, body.auth_provider_id)
+        if provider is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Auth provider not found"
+            )
+
     method = None
     if body.is_superadmin:
         method = await require_operator_stepup(
@@ -278,6 +301,52 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
             resource_id=body.username,
             resource_display=f"superadmin {body.username}",
         )
+
+    if provider is not None:
+        # #1291 — a pending external account: bound to the provider, no
+        # password, ``external_id`` NULL. The first sign-in through this
+        # provider as this username claims it and records the subject's id;
+        # this administrator action is what authorises that username match,
+        # exactly as after ``link-provider``. A sign-in through any OTHER
+        # provider with the same name is still refused as a collision.
+        user = User(
+            username=body.username,
+            email=body.email,
+            display_name=body.display_name,
+            hashed_password=None,
+            is_superadmin=body.is_superadmin,
+            force_password_change=False,
+            auth_source=provider.type,
+            auth_provider_id=provider.id,
+            external_id=None,
+            is_active=True,
+        )
+        db.add(user)
+        await db.flush()
+        audit = _audit(
+            current_user,
+            "create",
+            str(user.id),
+            f"Created user {body.username} for sign-in through {provider.name}",
+        )
+        audit.new_value = {
+            "auth_source": provider.type,
+            "auth_provider_id": str(provider.id),
+            "auth_provider": provider.name,
+            **({"is_superadmin": True, "stepup_method": method} if method else {}),
+        }
+        db.add(audit)
+        await db.commit()
+        await db.refresh(user)
+        logger.info(
+            "user_created",
+            username=body.username,
+            provider=provider.name,
+            by=current_user.username,
+        )
+        return user
+
+    assert body.password is not None  # the request validator requires it here
     policy, hashed = await _enforce_policy(db, body.password)
     history = push_history(hashed, None, policy.history_count)
     user = User(
@@ -356,11 +425,33 @@ async def update_user(
             resource_display=f"promote {user.username} to superadmin",
         )
 
+    changes: dict[str, object] = {}
+    if method:
+        changes.update(is_superadmin=True, stepup_method=method)
     if body.display_name is not None:
         user.display_name = body.display_name
     if body.email is not None:
         user.email = body.email
-    if body.is_active is not None:
+    if body.is_active is not None and body.is_active != user.is_active:
+        # #1383 — a change of ``is_active`` ends every session the account
+        # holds, as an admin password reset does (#400 M3). Disabling is how an
+        # administrator contains an account (a leaver, a compromised login),
+        # and the sessions only stayed refused for as long as it stayed
+        # disabled: re-enabling it brought every one back, an attacker's
+        # included, and each refresh extended it. Revoking on re-enable too
+        # means a re-enabled account starts with none, even one disabled
+        # before this change or in the database; no session can be in honest
+        # use while the account is disabled, as login and refresh refuse it.
+        changes.update(
+            is_active=body.is_active,
+            sessions_revoked=(
+                await db.execute(
+                    update(UserSession)
+                    .where(UserSession.user_id == user.id, UserSession.revoked.is_(False))
+                    .values(revoked=True)
+                )
+            ).rowcount,
+        )
         user.is_active = body.is_active
     if body.is_superadmin is not None:
         user.is_superadmin = body.is_superadmin
@@ -368,8 +459,8 @@ async def update_user(
         user.force_password_change = body.force_password_change
 
     audit = _audit(current_user, "update", str(user.id), f"Updated user {user.username}")
-    if method:
-        audit.new_value = {"is_superadmin": True, "stepup_method": method}
+    if changes:
+        audit.new_value = changes
     db.add(audit)
     await db.commit()
     await db.refresh(user)
@@ -406,13 +497,14 @@ async def reset_password(
     # policy via the admin path.
     method = None
     # A superadmin's password passes every step-up, so choosing it for them
-    # needs one (#1355). Effective superadmin: the flag or a wildcard role.
-    # The role path reads ``user.groups``: load it explicitly, since a row
-    # already in this session's identity map may not have it yet. No
-    # exemption for the caller's own account: a stolen session resetting its
-    # own password would end up holding the password every step-up asks for.
-    await db.refresh(user, ["groups"])
-    if is_effective_superadmin(user):
+    # needs one (#1355). Superadmin by any path: the flag, a ``*`` / ``*``
+    # role or a live ``*`` / ``*`` grant, and judged regardless of
+    # ``is_active`` (#1412). ``is_effective_superadmin`` answers False for a
+    # disabled role-only superadmin, so a stolen session could disable one,
+    # reset its password here with no step-up, and re-enable it. No exemption
+    # for the caller's own account: a stolen session resetting its own
+    # password would end up holding the password every step-up asks for.
+    if await holds_superadmin(db, user.id):
         method = await require_operator_stepup(
             db,
             current_user,

@@ -1,6 +1,11 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { customFieldsApi, authApi, type CustomField } from "@/lib/api";
+import {
+  customFieldCreatePayload,
+  customFieldUpdatePayload,
+  type CustomFieldForm,
+} from "@/lib/formPayloads";
 import { Plus, Pencil, Trash2, X, Check } from "lucide-react";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 
@@ -25,18 +30,7 @@ const FIELD_TYPE_LABELS: Record<string, string> = {
 
 type ModalMode = "create" | "edit";
 
-interface FieldForm {
-  resource_type: string;
-  name: string;
-  label: string;
-  field_type: string;
-  options: string;
-  is_required: boolean;
-  is_searchable: boolean;
-  default_value: string;
-  display_order: number;
-  description: string;
-}
+type FieldForm = CustomFieldForm;
 
 const EMPTY_FORM: FieldForm = {
   resource_type: "subnet",
@@ -266,27 +260,6 @@ function FieldModal({
   );
 }
 
-function formToPayload(form: FieldForm): Omit<CustomField, "id"> {
-  return {
-    resource_type: form.resource_type,
-    name: form.name,
-    label: form.label,
-    field_type: form.field_type,
-    options:
-      form.field_type === "select"
-        ? form.options
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean)
-        : null,
-    is_required: form.is_required,
-    is_searchable: form.is_searchable,
-    default_value: form.default_value || null,
-    display_order: form.display_order,
-    description: form.description,
-  };
-}
-
 function fieldToForm(field: CustomField): FieldForm {
   return {
     resource_type: field.resource_type,
@@ -420,15 +393,12 @@ export function CustomFieldsPage() {
   function handleSave(form: FieldForm) {
     setModalError("");
     if (modal?.mode === "create") {
-      createMutation.mutate(formToPayload(form));
+      createMutation.mutate(customFieldCreatePayload(form));
     } else if (modal?.mode === "edit" && modal.field) {
-      const {
-        resource_type: _rt,
-        name: _n,
-        field_type: _ft,
-        ...editable
-      } = formToPayload(form);
-      updateMutation.mutate({ id: modal.field.id, data: editable });
+      updateMutation.mutate({
+        id: modal.field.id,
+        data: customFieldUpdatePayload(form),
+      });
     }
   }
 

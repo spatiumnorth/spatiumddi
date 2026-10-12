@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self
 
+import httpx
 import pytest
 import structlog
 import structlog.testing
@@ -133,11 +134,16 @@ class _Resp:
     def json(self) -> Any:
         return self._body
 
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPError(f"HTTP {self.status_code}")
+
 
 class _FakeClient:
-    def __init__(self, calls: list, existing: Any) -> None:
+    def __init__(self, calls: list, existing: Any, zone_doc: Any = None) -> None:
         self._calls = calls
         self._existing = existing
+        self._zone_doc = zone_doc if zone_doc is not None else {"rrsets": []}
 
     def __enter__(self) -> Self:
         return self
@@ -147,7 +153,10 @@ class _FakeClient:
 
     def get(self, url: str, headers: Any = None) -> _Resp:
         self._calls.append(("GET", url, None))
-        return _Resp(200, self._existing)
+        if url.endswith("/zones"):
+            return _Resp(200, self._existing)
+        # GET /zones/{zone}: the read-back the absent-rrset sweep (#1380) uses.
+        return _Resp(200, self._zone_doc)
 
     def post(self, url: str, headers: Any = None, json: Any = None) -> _Resp:
         self._calls.append(("POST", url, json))
@@ -167,13 +176,16 @@ class _FakeClient:
 
 
 def _install_fake_client(
-    monkeypatch: pytest.MonkeyPatch, existing: Any
+    monkeypatch: pytest.MonkeyPatch, existing: Any, zone_doc: Any = None
 ) -> list[tuple[str, str, Any]]:
     calls: list[tuple[str, str, Any]] = []
     monkeypatch.setattr(
         powerdns_mod,
         "httpx",
-        SimpleNamespace(Client=lambda **kw: _FakeClient(calls, existing)),
+        SimpleNamespace(
+            Client=lambda **kw: _FakeClient(calls, existing, zone_doc),
+            HTTPError=httpx.HTTPError,
+        ),
     )
     return calls
 
@@ -254,3 +266,37 @@ def test_reconcile_update_no_put_when_kind_and_masters_match(
         c for c in calls if c[0] == "PUT" and c[1].endswith("/zones/example.com.")
     ]
     assert zone_puts == []
+
+
+def test_reconcile_secondary_never_sweeps_transferred_rrsets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A secondary's rrsets are the transfer's (#1521). The absent-rrset
+    sweep (#1380) treats the bundle as the zone's whole truth, and a
+    secondary's payload carries no rrsets, so sweeping would DELETE every
+    record pdns transferred. The update must not PATCH it at all."""
+    calls = _install_fake_client(
+        monkeypatch,
+        existing=[{"name": "example.com.", "kind": "Slave", "masters": ["192.0.2.10"]}],
+        zone_doc={
+            "rrsets": [
+                {"name": "www.example.com.", "type": "A", "records": [{"content": "192.0.2.1"}]},
+                {"name": "mail.example.com.", "type": "MX", "records": [{"content": "10 mx."}]},
+            ]
+        },
+    )
+    driver = PowerDNSDriver(state_dir=tmp_path)
+    driver._reconcile_zones(
+        "key",
+        [
+            {
+                "name": "example.com.",
+                "kind": "Slave",
+                "masters": ["192.0.2.10"],
+                "rrsets": [],
+                "update_acl": [],
+                "update_tsig_keys": [],
+            }
+        ],
+    )
+    assert [c for c in calls if c[0] == "PATCH"] == []

@@ -33,6 +33,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB
+from app.api.stepup import require_operator_stepup
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_permission
@@ -62,7 +63,6 @@ from app.services.block_sync.reconcile import (
     preview_unifi,
     unifi_config_error,
 )
-from app.services.reauth import ReauthOutcome, reverify_operator
 
 PERMISSION = "manage_block_sync"
 
@@ -752,22 +752,18 @@ async def reveal_credentials(
     """Reveal the stored write-scoped secret after re-confirming the
     operator (password / TOTP), mirroring the agent-bootstrap-key reveal.
     Audited. ``manage_block_sync`` holders only (router-level gate)."""
-    outcome = reverify_operator(user, password=body.password, totp_code=body.totp_code)
-    if outcome is not ReauthOutcome.OK:
-        db.add(
-            AuditLog(
-                user_id=user.id,
-                user_display_name=user.display_name,
-                auth_source=user.auth_source,
-                action="block_sync_reveal_denied",
-                resource_type="network_block_target",
-                resource_id=str(target_id),
-                resource_display=f"{target_kind}:{target_id}",
-                result="forbidden",
-            )
-        )
-        await db.commit()
-        raise HTTPException(status_code=403, detail="Password or TOTP code is incorrect")
+    # #1413 — through the shared step-up, so a wrong answer spends the
+    # per-account budget like every other step-up.
+    await require_operator_stepup(
+        db,
+        user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="block_sync_reveal_denied",
+        resource_type="network_block_target",
+        resource_id=str(target_id),
+        resource_display=f"{target_kind}:{target_id}",
+    )
 
     revealed: dict[str, str] = {}
     if target_kind == "opnsense":

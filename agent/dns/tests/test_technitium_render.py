@@ -17,10 +17,16 @@ Two layers here:
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from spatium_dns_agent.config_apply import ConfigApplyError
 from spatium_dns_agent.drivers.technitium import (
+    NAME_TARGET_RULE_ZONE_FILE,
+    SVCB_TARGET_RULE_ZONE_FILE,
     TechnitiumDriver,
     _blocking_payload,
     _normalize_rdata,
@@ -33,13 +39,18 @@ from spatium_dns_agent.drivers.technitium import (
 
 
 class _FakeResponse:
-    """Stand-in for ``httpx.Response`` — the driver only ever calls
-    ``.json()`` on it."""
+    """Stand-in for ``httpx.Response``. A dict body is a JSON answer; a str
+    body is a plain-text one (``blocked/export``), whose ``.json()`` raises
+    as httpx's does."""
 
-    def __init__(self, body: dict[str, Any]) -> None:
+    def __init__(self, body: dict[str, Any] | str) -> None:
         self._body = body
+        self.status_code = 200
+        self.text = body if isinstance(body, str) else ""
 
     def json(self) -> dict[str, Any]:
+        if isinstance(self._body, str):
+            raise ValueError("not JSON")
         return self._body
 
 
@@ -98,6 +109,40 @@ def test_record_params_mx_default_priority() -> None:
     assert _record_params("MX", "mail.example.com.", {})["preference"] == 10
 
 
+def test_record_params_mx_zero_priority_is_preserved() -> None:
+    # #1518: preference 0 is a real value (highest priority), not "unset".
+    assert _record_params("MX", "mail.example.com.", {"priority": 0}) == {
+        "exchange": "mail.example.com",
+        "preference": 0,
+    }
+
+
+def test_render_preserves_record_ttl_zero(tmp_path: Path) -> None:
+    # #1518: a TTL of 0 ("never cache") must not be rewritten to the
+    # zone TTL by the structural render.
+    d = TechnitiumDriver(state_dir=tmp_path)
+    bundle = {
+        "zones": [
+            {
+                "name": "example.com.",
+                "type": "primary",
+                "ttl": 3600,
+                "records": [
+                    {"name": "www", "type": "A", "value": "10.0.0.1", "ttl": 0},
+                    {"name": "mail", "type": "A", "value": "10.0.0.2"},
+                ],
+            }
+        ]
+    }
+    d.render(bundle)
+    import json
+
+    payload = json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
+    by_domain = {r["domain"]: r for r in payload[0]["records"]}
+    assert by_domain["www.example.com"]["ttl"] == 0
+    assert by_domain["mail.example.com"]["ttl"] == 3600
+
+
 def test_record_params_srv() -> None:
     rec = {"priority": 10, "weight": 20, "port": 5060}
     assert _record_params("SRV", "sip.example.com.", rec) == {
@@ -108,8 +153,273 @@ def test_record_params_srv() -> None:
     }
 
 
+def _b64s(*strings: bytes) -> str:
+    """``characterStringsBase64`` for these character-strings."""
+    return ",".join(base64.b64encode(s).decode("ascii") for s in strings)
+
+
 def test_record_params_txt() -> None:
-    assert _record_params("TXT", "v=spf1 -all", {}) == {"text": "v=spf1 -all"}
+    assert _record_params("TXT", "v=spf1 -all", {}) == {
+        "characterStringsBase64": _b64s(b"v=spf1 -all")
+    }
+
+
+# ── TXT served as entered (issue #1694) ─────────────────────────────────
+#
+# Technitium's ``text`` param is the text itself: the quotes of an
+# already-quoted value became part of the served string, and the
+# name-valued types' trailing-dot strip cut the last character off a
+# value ending in a full stop. The driver now sends the character-strings
+# the value stands for (the shared ``_txt`` parse BIND9 and PowerDNS use)
+# through ``characterStringsBase64``, octet for octet, and reads them back
+# the same way.
+
+
+def test_record_params_txt_already_quoted_value_sends_its_strings() -> None:
+    assert _record_params("TXT", '"v=spf1 -all"', {}) == {
+        "characterStringsBase64": _b64s(b"v=spf1 -all")
+    }
+    # Each quoted string stays a string of its own (DNS-SD keeps one
+    # key=value per string), and \DDD is one octet, UTF-8 or not.
+    assert _record_params("TXT", '"a" "b"', {}) == {"characterStringsBase64": _b64s(b"a", b"b")}
+    assert _record_params("TXT", '"caf\\195\\169"', {}) == {
+        "characterStringsBase64": _b64s(b"caf\xc3\xa9")
+    }
+    assert _record_params("TXT", '"a\\255b"', {}) == {"characterStringsBase64": _b64s(b"a\xffb")}
+    assert _record_params("TXT", '"say \\"hi\\""', {}) == {
+        "characterStringsBase64": _b64s(b'say "hi"')
+    }
+
+
+def test_record_params_txt_keeps_a_trailing_full_stop() -> None:
+    """#1694: the trailing-dot strip is for name-valued targets. It cut
+    the last character off a TXT value that ends in a full stop."""
+    assert _record_params("TXT", "this value ends with a full stop.", {}) == {
+        "characterStringsBase64": _b64s(b"this value ends with a full stop.")
+    }
+    # The name-valued types still lose theirs.
+    assert _record_params("CNAME", "target.example.com.", {}) == {"cname": "target.example.com"}
+
+
+def test_record_params_txt_long_value_splits_on_a_character_boundary() -> None:
+    value = chr(0xE9) * 200  # 400 octets
+    sent = _record_params("TXT", value, {})["characterStringsBase64"].split(",")
+    strings = [base64.b64decode(s) for s in sent]
+    # 255 would cut a 2-octet character in half; BIND9 and PowerDNS cut at 254.
+    assert [len(s) for s in strings] == [254, 146]
+    assert b"".join(strings) == value.encode("utf-8")
+
+
+def test_record_params_txt_leaves_out_an_empty_string() -> None:
+    """Technitium (15.4) cannot hold an empty character-string: it drops
+    one from the list it is sent. The driver leaves them out itself, so
+    the strings it compares are the strings the server holds and a value
+    with an empty string in it does not churn."""
+    assert _record_params("TXT", '"" "a"', {}) == {
+        "characterStringsBase64": _b64s(b"a")
+    }
+    assert _record_params("TXT", '"a" "" "b"', {}) == {
+        "characterStringsBase64": _b64s(b"a", b"b")
+    }
+
+
+def test_record_params_txt_never_asks_for_a_record_with_no_string() -> None:
+    """A TXT record with no string at all is served as a malformed packet
+    (Technitium 15.4 stores one when every string it is sent is empty). A
+    value that is nothing but empty strings is sent as its text, as it was
+    before #1694, and an empty value is refused by the server, as before."""
+    assert _record_params("TXT", '""', {}) == {"characterStringsBase64": _b64s(b'""')}
+    assert _record_params("TXT", '"" ""', {}) == {
+        "characterStringsBase64": _b64s(b'"" ""')
+    }
+    assert _record_params("TXT", "", {}) == {"text": ""}
+    for value in ('""', '"" ""', '"" "a"', '"a" ""', "", "a"):
+        sent = _record_params("TXT", value, {}).get("characterStringsBase64")
+        assert sent is None or all(sent.split(",")), value
+
+
+def _txt_rdata(*strings: bytes) -> dict[str, Any]:
+    """A TXT ``rData`` as Technitium 15.4's records/get returns it."""
+    return {
+        "text": b"".join(strings).decode("utf-8", "replace"),
+        "splitText": any(len(s) != 255 for s in strings[:-1]),
+        "characterStrings": [s.decode("utf-8", "replace") for s in strings],
+        "characterStringsBase64": [base64.b64encode(s).decode("ascii") for s in strings],
+    }
+
+
+def test_normalize_rdata_txt_compares_the_character_strings() -> None:
+    for value, strings in (
+        ('"a" "b"', (b"a", b"b")),
+        ("v=spf1 -all", (b"v=spf1 -all",)),
+        ('"a\\255b"', (b"a\xffb",)),
+        # What Technitium holds for a value with an empty string in it.
+        ('"" "a"', (b"a",)),
+        ('""', (b'""',)),
+    ):
+        assert _normalize_rdata("TXT", _txt_rdata(*strings)) == _record_params("TXT", value, {})
+
+
+def test_get_zone_records_reads_txt_as_its_character_strings(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _install_fake_request(
+        d,
+        lambda *_: {
+            "status": "ok",
+            "response": {
+                "records": [
+                    {"name": "two.z.test", "type": "TXT", "ttl": 300,
+                     "rData": _txt_rdata(b"a", b"b")},
+                ]
+            },
+        },
+    )
+    assert d._get_zone_records("t", "z.test") == [
+        {"domain": "two.z.test", "type": "TXT", "ttl": 300,
+         "characterStringsBase64": _b64s(b"a", b"b")}
+    ]
+
+
+def _txt_desired(name: str, value: str) -> dict[str, Any]:
+    return {"domain": f"{name}.example.com", "type": "TXT", "ttl": 300,
+            **_record_params("TXT", value, {})}
+
+
+def test_reconcile_is_a_noop_for_txt_served_as_entered(tmp_path: Path) -> None:
+    """A steady zone must not churn: what the add sent is what the read
+    gives back, string for string."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    long_octets = (chr(0xE9) * 200).encode("utf-8")
+    calls = _reconcile_with(
+        d,
+        existing=[
+            {"name": "spf.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"v=spf1 -all")},
+            {"name": "two.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"a", b"b")},
+            {"name": "note.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"ends with a full stop.")},
+            {"name": "long.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(long_octets[:254], long_octets[254:])},
+        ],
+        desired=[
+            _txt_desired("spf", '"v=spf1 -all"'),
+            _txt_desired("two", '"a" "b"'),
+            _txt_desired("note", "ends with a full stop."),
+            _txt_desired("long", chr(0xE9) * 200),
+        ],
+    )
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+
+
+def _record_calls(calls: list[tuple[str, str, str, dict[str, Any]]]) -> list[tuple[str, str]]:
+    return [(c[2], c[3]["characterStringsBase64"]) for c in calls
+            if c[2] in ("zones/records/delete", "zones/records/add")]
+
+
+def test_reconcile_replaces_a_txt_served_without_its_full_stop(tmp_path: Path) -> None:
+    """A value the driver served one character short before #1694 is
+    replaced once, and the next pass changes nothing."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    desired = [_txt_desired("note", "a full stop.")]
+    calls = _reconcile_with(
+        d,
+        existing=[{"name": "note.example.com", "type": "TXT", "ttl": 300,
+                   "rData": _txt_rdata(b"a full stop")}],
+        desired=desired,
+    )
+    assert _record_calls(calls) == [
+        ("zones/records/delete", _b64s(b"a full stop")),
+        ("zones/records/add", _b64s(b"a full stop.")),
+    ]
+    calls = _reconcile_with(
+        d,
+        existing=[{"name": "note.example.com", "type": "TXT", "ttl": 300,
+                   "rData": _txt_rdata(b"a full stop.")}],
+        desired=desired,
+    )
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+
+
+def test_reconcile_replaces_a_txt_served_with_its_quotes_once(tmp_path: Path) -> None:
+    """What the driver served before #1694 for an already-quoted value (one
+    string with the quotes in it) is deleted by its own strings and
+    replaced, and the next pass over the replaced record changes nothing."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    desired = [_txt_desired("spf", '"v=spf1 -all"'), _txt_desired("two", '"a" "b"')]
+    calls = _reconcile_with(
+        d,
+        existing=[
+            {"name": "spf.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b'"v=spf1 -all"')},
+            {"name": "two.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b'"a" "b"')},
+        ],
+        desired=desired,
+    )
+    assert sorted(_record_calls(calls)) == sorted([
+        ("zones/records/delete", _b64s(b'"v=spf1 -all"')),
+        ("zones/records/delete", _b64s(b'"a" "b"')),
+        ("zones/records/add", _b64s(b"v=spf1 -all")),
+        ("zones/records/add", _b64s(b"a", b"b")),
+    ])
+    assert all("text" not in c[3] for c in calls if c[2].startswith("zones/records/"))
+
+    calls = _reconcile_with(
+        d,
+        existing=[
+            {"name": "spf.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"v=spf1 -all")},
+            {"name": "two.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"a", b"b")},
+        ],
+        desired=desired,
+    )
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+
+
+def test_apply_record_op_sends_each_txt_member_as_its_strings(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+
+    d.apply_record_op(
+        {
+            "zone_name": "example.com.",
+            "op": "create",
+            "record": {
+                "name": "@",
+                "type": "TXT",
+                "value": '"v=spf1 -all"',
+                "ttl": 300,
+                "rrset": {
+                    "ttl": 300,
+                    "members": [
+                        {"value": '"v=spf1 -all"'},
+                        {"value": "site-verification=abc."},
+                    ],
+                },
+            },
+        }
+    )
+    sent = [(c[3]["overwrite"], c[3]["characterStringsBase64"]) for c in calls]
+    assert sent == [
+        ("true", _b64s(b"v=spf1 -all")),
+        ("false", _b64s(b"site-verification=abc.")),
+    ]
+    assert all("text" not in c[3] for c in calls)
+
+    calls.clear()
+    d.apply_record_op(
+        {
+            "zone_name": "example.com.",
+            "op": "delete",
+            "record": {"name": "@", "type": "TXT", "value": '"v=spf1 -all"'},
+        }
+    )
+    assert [(c[2], c[3]["characterStringsBase64"]) for c in calls] == [
+        ("zones/records/delete", _b64s(b"v=spf1 -all"))
+    ]
 
 
 def test_record_params_caa() -> None:
@@ -164,7 +474,8 @@ def test_svcb_params_no_params() -> None:
     # Root dot stripped — the daemon stores the target un-dotted. See
     # test_svcb_target_root_dot_is_stripped.
     assert target == "svc.example.com"
-    assert params == ""
+    # The API requires svcParams; ``false`` is its spelling of "none".
+    assert params == "false"
 
 
 def test_record_params_svcb() -> None:
@@ -172,9 +483,14 @@ def test_record_params_svcb() -> None:
     assert out == {"svcPriority": 1, "svcTargetName": ".", "svcParams": "alpn|h2"}
 
 
-def test_record_params_https_no_params_omits_svcparams() -> None:
+def test_record_params_https_no_params_sends_false() -> None:
+    """``svcParams`` is a required API parameter (``GetQueryOrForm`` with no
+    default, WebServiceZonesApi.cs 15.4.0); omitting it is refused with
+    "Parameter 'svcParams' missing." for add AND delete. ``false`` = none."""
     out = _record_params("HTTPS", "1 .", {})
-    assert out == {"svcPriority": 1, "svcTargetName": "."}
+    assert out == {"svcPriority": 1, "svcTargetName": ".", "svcParams": "false"}
+    live = _normalize_rdata("HTTPS", {"svcPriority": 1, "svcTargetName": "", "svcParams": {}})
+    assert live == out
 
 
 def test_admin_bootstrap_password_persists(tmp_path: Path) -> None:
@@ -391,11 +707,14 @@ def test_reconcile_converges_ttl_only_change(tmp_path: Path) -> None:
              "ipAddress": "10.0.0.1"}
         ],
     )
+    # In place (#1768): a delete would also take the A's PTR with it.
     paths = [c[2] for c in calls]
-    assert "zones/records/delete" in paths
-    added = [c[3] for c in calls if c[2] == "zones/records/add"]
-    assert len(added) == 1
-    assert added[0]["ttl"] == 300
+    assert "zones/records/delete" not in paths
+    assert "zones/records/add" not in paths
+    updated = [c[3] for c in calls if c[2] == "zones/records/update"]
+    assert len(updated) == 1
+    assert updated[0]["ttl"] == 300
+    assert updated[0]["ipAddress"] == "10.0.0.1"
 
 
 def test_reconcile_is_a_noop_when_already_in_sync(tmp_path: Path) -> None:
@@ -670,7 +989,9 @@ def test_zone_options_only_for_primary() -> None:
     """A secondary transfers IN. Whether it re-serves is a separate
     decision we don't make on the operator's behalf."""
     for ztype in ("Secondary", "Stub", "Forwarder"):
-        assert _zone_options_payload(ztype, _zone_bundle()) == {}
+        payload = _zone_options_payload(ztype, _zone_bundle())
+        # Never a transfer setting; a served type may carry query access (#1763).
+        assert not {k for k in payload if k.startswith("zoneTransfer")}
 
 
 def test_tsig_key_names_track_the_bundle() -> None:
@@ -793,13 +1114,45 @@ def test_tsig_key_names_strip_root_dot() -> None:
     """Technitium stores names un-dotted, so a dotted name would compare
     as different forever."""
     assert _tsig_key_names(
-        {"tsig_keys": [{"name": "a."}, {"name": "b"}, {"name": ""}]}
+        {
+            "tsig_keys": [
+                {"name": "a.", "secret": "s"},
+                {"name": "b", "secret": "s"},
+                {"name": "", "secret": "s"},
+                # Not installable (``_sync_tsig_keys`` skips it), so not pinned.
+                {"name": "c"},
+            ]
+        }
     ) == ["a", "b"]
+
+
+def _forwarding_daemon():
+    """A fake daemon that keeps FWD records: ``zones/create`` of a Forwarder
+    stores its first, ``records/add`` appends, ``records/get`` reads them."""
+    store: dict[str, list[dict[str, Any]]] = {}
+
+    def responder(path, params, n):
+        zone = params.get("zone")
+        if path == "zones/create" and params.get("type") == "Forwarder":
+            store[zone] = [{"protocol": params.get("protocol", "Udp"),
+                            "forwarder": params["forwarder"], "priority": 0,
+                            "dnssecValidation": params.get("dnssecValidation") == "true"}]
+        elif path == "zones/records/add" and params.get("type") == "FWD":
+            store.setdefault(zone, []).append({
+                "protocol": params["protocol"], "forwarder": params["forwarder"],
+                "priority": int(params["forwarderPriority"]),
+                "dnssecValidation": params.get("dnssecValidation") == "true"})
+        elif path == "zones/records/get":
+            return {"status": "ok", "response": {"records": [
+                {"name": zone, "type": "FWD", "rData": r} for r in store.get(zone, [])]}}
+        return {"status": "ok"}
+
+    return responder
 
 
 def test_ensure_zone_exists_sends_type_specific_params(tmp_path: Path) -> None:
     d = TechnitiumDriver(state_dir=tmp_path)
-    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    calls = _install_fake_request(d, _forwarding_daemon())
 
     d._ensure_zone_exists("t", {"zone": "s.test", "type": "Secondary",
                                 "masters": ["192.0.2.1", "192.0.2.2"]})
@@ -807,10 +1160,15 @@ def test_ensure_zone_exists_sends_type_specific_params(tmp_path: Path) -> None:
 
     d._ensure_zone_exists("t", {"zone": "f.test", "type": "Forwarder",
                                 "forwarders": ["8.8.8.8", "9.9.9.9"]})
-    # Technitium's Forwarder zone takes ONE upstream; extras are dropped
-    # with a warning rather than silently.
-    assert calls[-1][3]["forwarder"] == "8.8.8.8"
-    assert "forwarders" not in calls[-1][3]
+    create = [c for c in calls if c[2] == "zones/create" and c[3]["zone"] == "f.test"][0]
+    assert create[3]["forwarder"] == "8.8.8.8"
+    assert create[3]["protocol"] == "Udp"
+    assert "forwarders" not in create[3]
+    # The second upstream is not dropped: it is a further apex FWD record.
+    adds = [c[3] for c in calls if c[2] == "zones/records/add"]
+    assert len(adds) == 1
+    assert adds[0]["type"] == "FWD" and adds[0]["forwarder"] == "9.9.9.9"
+    assert adds[0]["forwarderPriority"] == "1" and adds[0]["protocol"] == "Udp"
 
 
 def test_apply_zone_options_refuses_unknown_transfer_value(tmp_path: Path) -> None:
@@ -1173,25 +1531,98 @@ def test_forwarders_and_protocol_are_sent_together(tmp_path: Path) -> None:
     assert params["forwarderProtocol"] == "Udp"
 
 
-def test_forwarders_substitute_hostname_for_encrypted_transports(tmp_path: Path) -> None:
-    """Technitium rejects an IP for DoT/DoH/DoQ ("Address must be a domain
-    name") — there'd be no name to validate the upstream cert against. The
-    neutral model carries IPs plus one hostname, so the hostname wins."""
+def test_forwarders_pair_the_hostname_with_every_ip_for_encrypted_transports(
+    tmp_path: Path,
+) -> None:
+    """The cert name goes beside each IP, ``"name (ip)"``, so Technitium dials
+    the IP instead of bootstrapping the name by plaintext recursion (#1764)."""
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, lambda *_: {"status": "ok"})
     d._apply_forwarders(
         "t",
         {
-            "forwarders": ["1.1.1.1", "1.0.0.1"],
+            "forwarders": ["1.1.1.1", "1.0.0.1", "2606:4700:4700::1111"],
             "forward_transport": "tls",
             "forward_tls_hostname": "cloudflare-dns.com",
         },
     )
-    assert calls[0][3]["forwarders"] == "cloudflare-dns.com"
+    assert calls[0][3]["forwarders"] == (
+        "cloudflare-dns.com (1.1.1.1),cloudflare-dns.com (1.0.0.1),"
+        "cloudflare-dns.com ([2606:4700:4700::1111])"
+    )
     assert calls[0][3]["forwarderProtocol"] == "Tls"
 
 
-def test_forwarders_refuse_encrypted_transport_without_hostname(tmp_path: Path) -> None:
+def test_forwarders_https_pairs_the_url_with_each_ip(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_forwarders(
+        "t",
+        {
+            "forwarders": ["1.1.1.1"],
+            "forward_transport": "https",
+            "forward_tls_hostname": "cloudflare-dns.com",
+        },
+    )
+    assert calls[0][3]["forwarders"] == "https://cloudflare-dns.com/dns-query (1.1.1.1)"
+    assert calls[0][3]["forwarderProtocol"] == "Https"
+
+
+def test_forwarders_tls_without_hostname_is_refused_not_sent_as_bare_ips(
+    tmp_path: Path,
+) -> None:
+    """A stored opportunistic-DoT row (verify off, no name). Technitium
+    validates the certificate against the address it is given, so bare IPs
+    over Tls would fail every forwarded query wherever the certificate has no
+    IP SAN. The previous forwarders stay and the refusal is reported (#1764)."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d._apply_failures = []
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_forwarders(
+        "t",
+        {"forwarders": ["1.1.1.1", "9.9.9.9"], "forward_transport": "tls",
+         "forward_tls_verify": False},
+    )
+    assert calls == []
+    assert any("forward_tls_hostname" in f for f in d._apply_failures)
+
+
+def test_forwarders_neutral_ip_at_port_becomes_technitium_ip_colon_port(
+    tmp_path: Path,
+) -> None:
+    """The group validator stores ``ip@port``; Technitium reads ``@`` as part
+    of a domain name, so it is translated (``[v6]:port`` for IPv6)."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_forwarders(
+        "t", {"forwarders": ["10.0.0.1@5353", "10.0.0.2", "2001:db8::1@5353"]}
+    )
+    assert calls[0][3]["forwarders"] == "10.0.0.1:5353,10.0.0.2,[2001:db8::1]:5353"
+
+
+def test_encrypted_forwarders_put_the_port_on_the_name(tmp_path: Path) -> None:
+    """Technitium refuses a name and an IP whose ports disagree, and a DoH
+    URL's port must be the URL's: the port rides the name part."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_forwarders(
+        "t",
+        {"forwarders": ["9.9.9.9@8853", "149.112.112.112"], "forward_transport": "tls",
+         "forward_tls_hostname": "dns.quad9.net"},
+    )
+    assert calls[0][3]["forwarders"] == (
+        "dns.quad9.net:8853 (9.9.9.9),dns.quad9.net (149.112.112.112)"
+    )
+    calls.clear()
+    d._apply_forwarders(
+        "t",
+        {"forwarders": ["9.9.9.9@8443"], "forward_transport": "https",
+         "forward_tls_hostname": "dns.quad9.net"},
+    )
+    assert calls[0][3]["forwarders"] == "https://dns.quad9.net:8443/dns-query (9.9.9.9)"
+
+
+def test_forwarders_refuse_https_without_hostname(tmp_path: Path) -> None:
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, lambda *_: {"status": "ok"})
     d._apply_forwarders("t", {"forwarders": ["1.1.1.1"], "forward_transport": "https"})
@@ -1227,7 +1658,7 @@ def test_reconcile_counts_only_real_deletes(tmp_path: Path) -> None:
                 {"name": "gone.z.test", "type": "A", "ttl": 300,
                  "rData": {"ipAddress": "10.0.0.9"}}]}}
         if path == "zones/records/delete":
-            return {"status": "error", "errorMessage": "No such record exists."}
+            return {"status": "error", "errorMessage": "Cannot delete record: no such record exists."}
         return {"status": "ok"}
 
     _install_fake_request(d, responder)
@@ -1252,7 +1683,7 @@ def test_reconcile_counts_only_real_adds(tmp_path: Path) -> None:
         if path == "zones/records/get":
             return {"status": "ok", "response": {"records": []}}
         if path == "zones/records/add":
-            return {"status": "error", "errorMessage": "Record already exists."}
+            return {"status": "error", "errorMessage": "Cannot add record: record already exists."}
         return {"status": "ok"}
 
     _install_fake_request(d, responder)
@@ -1308,6 +1739,88 @@ def test_catalog_membership_cleared_when_disabled(tmp_path: Path) -> None:
     d._apply_catalog("t", None, [{"zone": "p.test", "type": "Primary"}])
     opt = [c for c in calls if c[2] == "zones/options/set"]
     assert opt and opt[0][3]["catalog"] == ""
+
+
+# ── Catalog zone retirement (issue #1519) ─────────────────────────────
+
+
+def _deletes(calls) -> list[dict[str, Any]]:
+    return [c[3] for c in calls if c[2] == "zones/delete"]
+
+
+def test_catalog_zone_deleted_when_turned_off(tmp_path: Path) -> None:
+    """Disabling catalog must delete the producer zone, not just clear
+    membership — and the name has to come from agent state, because a
+    disabled catalog block carries no zone name."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    payload = [{"zone": "p.test", "type": "Primary"}]
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "cat.test"}, payload)
+    calls.clear()
+    d._apply_catalog("t", None, payload)
+    assert _deletes(calls) == [{"zone": "cat.test"}]
+    # State is cleared, so a later pass does not re-delete.
+    calls.clear()
+    d._apply_catalog("t", None, payload)
+    assert _deletes(calls) == []
+
+
+def test_secondary_catalog_zone_deleted_when_turned_off(tmp_path: Path) -> None:
+    """A consumer that is turned off keeps transferring from the old
+    producer until its SecondaryCatalog zone is deleted."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog(
+        "t",
+        {"mode": "consumer", "zone_name": "cat.test", "producer_addr": "192.0.2.9"},
+        [],
+    )
+    calls.clear()
+    d._apply_catalog("t", None, [])
+    assert _deletes(calls) == [{"zone": "cat.test"}]
+
+
+def test_catalog_role_flip_deletes_old_zone_before_creating_new(
+    tmp_path: Path,
+) -> None:
+    """Producer → consumer under the same name: the old Catalog zone
+    must be deleted first, or the SecondaryCatalog create answers
+    "already exists" and the zone keeps its old type."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "cat.test"}, [])
+    calls.clear()
+    d._apply_catalog(
+        "t",
+        {"mode": "consumer", "zone_name": "cat.test", "producer_addr": "192.0.2.9"},
+        [],
+    )
+    paths = [c[2] for c in calls]
+    assert _deletes(calls) == [{"zone": "cat.test"}]
+    assert paths.index("zones/delete") < paths.index("zones/create")
+    assert next(c for c in calls if c[2] == "zones/create")[3]["type"] == (
+        "SecondaryCatalog"
+    )
+
+
+def test_catalog_same_role_reapply_deletes_nothing(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    block = {"mode": "producer", "zone_name": "cat.test"}
+    d._apply_catalog("t", block, [])
+    calls.clear()
+    d._apply_catalog("t", block, [])
+    assert _deletes(calls) == []
+
+
+def test_catalog_rename_deletes_old_zone(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "old.test"}, [])
+    calls.clear()
+    d._apply_catalog("t", {"mode": "producer", "zone_name": "new.test"}, [])
+    assert _deletes(calls) == [{"zone": "old.test"}]
+    assert next(c for c in calls if c[2] == "zones/create")[3]["zone"] == "new.test"
 
 
 # ── Blocklists (issue #744) ─────────────────────────────────────────────
@@ -1383,12 +1896,24 @@ def test_blocking_payload_collapses_per_view_lists() -> None:
     assert out["blocked"] == ["a.test", "b.test"]
 
 
+def _blocking_responder(live: dict[str, str] | None = None):
+    """``{kind}/export`` answers the plain-text ``live`` set (empty by
+    default); everything else answers ok."""
+    live = live or {}
+
+    def responder(path, params, n):
+        kind, _, op = path.partition("/")
+        if op == "export":
+            return live.get(kind, "")
+        return {"status": "ok"}
+
+    return responder
+
+
 def test_apply_blocking_flushes_before_rewriting(tmp_path: Path) -> None:
-    """Flush-then-rewrite, not diff: ``blocked/list`` is a one-level tree
-    browser whose intermediate nodes are not themselves blocked domains,
-    so reconciling against a flat read of it deletes whole subtrees."""
+    """A set that differs is flushed, then imported."""
     d = TechnitiumDriver(state_dir=tmp_path)
-    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    calls = _install_fake_request(d, _blocking_responder())
     d._apply_blocking(
         "t",
         {"enabled": True, "blocked": ["a.test"], "allowed": ["b.test"],
@@ -1396,8 +1921,112 @@ def test_apply_blocking_flushes_before_rewriting(tmp_path: Path) -> None:
     )
     paths = [c[2] for c in calls]
     assert paths[0] == "settings/set"
-    assert paths.index("blocked/flush") < paths.index("blocked/add")
-    assert paths.index("allowed/flush") < paths.index("allowed/add")
+    assert paths.index("blocked/flush") < paths.index("blocked/import")
+    assert paths.index("allowed/flush") < paths.index("allowed/import")
+    # #1425: never one call per domain.
+    assert "blocked/add" not in paths and "allowed/add" not in paths
+
+
+def test_apply_blocking_imports_in_chunks_not_one_call_per_domain(tmp_path: Path) -> None:
+    """``blocked/add`` rewrote Technitium's zone file on every call, so a 16k
+    list took ~30 minutes (#1425). ``blocked/import`` takes a comma-separated
+    list and saves once per call."""
+    from spatium_dns_agent.drivers.technitium import _BLOCKING_IMPORT_CHUNK
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _blocking_responder())
+    domains = [f"d{i:05d}.test" for i in range(12001)]
+    d._apply_blocking(
+        "t", {"enabled": True, "blocked": domains, "blocking_type": "NxDomain"}
+    )
+    imports = [c for c in calls if c[2] == "blocked/import"]
+    assert len(imports) == -(-len(domains) // _BLOCKING_IMPORT_CHUNK)
+    sent = [x for c in imports for x in c[3]["blockedZones"].split(",")]
+    assert sorted(sent) == sorted(domains)
+    assert all(c[1] == "POST" for c in imports)  # form body, not a URL
+
+
+def test_apply_blocking_leaves_an_unchanged_set_alone(tmp_path: Path) -> None:
+    """A structural apply that did not touch a blocklist rewrites nothing:
+    no flush, so no window without blocking (#1425)."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d, _blocking_responder({"blocked": "b.test\na.test\n", "allowed": "c.test\n"})
+    )
+    d._apply_blocking(
+        "t",
+        {"enabled": True, "blocked": ["a.test", "B.test."], "allowed": ["c.test"],
+         "blocking_type": "NxDomain"},
+    )
+    paths = [c[2] for c in calls]
+    assert not any(p.endswith(("/flush", "/import")) for p in paths)
+
+
+def test_apply_blocking_rewrites_only_the_set_that_changed(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d, _blocking_responder({"blocked": "a.test\n", "allowed": "old.test\n"})
+    )
+    d._apply_blocking(
+        "t",
+        {"enabled": True, "blocked": ["a.test"], "allowed": ["new.test"],
+         "blocking_type": "NxDomain"},
+    )
+    paths = [c[2] for c in calls]
+    assert "blocked/flush" not in paths
+    assert paths.index("allowed/flush") < paths.index("allowed/import")
+
+
+def test_apply_blocking_rewrites_when_the_live_set_is_unreadable(tmp_path: Path) -> None:
+    """An error answer to export is not trusted as "already matches"."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path.endswith("/export"):
+            return {"status": "error", "errorMessage": "Access was denied."}
+        return {"status": "ok"}
+
+    calls = _install_fake_request(d, responder)
+    d._apply_blocking("t", {"enabled": True, "blocked": ["a.test"], "blocking_type": "NxDomain"})
+    assert "blocked/import" in [c[2] for c in calls]
+
+
+def test_a_refused_blocklist_import_is_recorded_not_a_name_error(tmp_path: Path) -> None:
+    """A refused ``{kind}/import`` chunk is a refusal like any other. The
+    #1516 note for it referenced names from the per-domain loop the chunked
+    import (#1425) replaced, so it raised NameError and failed the apply."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path == "blocked/import":
+            return {"status": "error", "errorMessage": "Access was denied."}
+        if path.endswith("/export"):
+            return "stale.test\n"
+        return {"status": "ok"}
+
+    _install_fake_request(d, responder)
+    d._apply_failures = []
+    d._apply_blocking("t", {"enabled": True, "blocked": ["a.test"], "blocking_type": "NxDomain"})
+    assert d._apply_failures == ["blocking blocked import (1 from a.test): Access was denied."]
+
+
+def test_apply_blocking_empty_list_still_clears_the_daemon(tmp_path: Path) -> None:
+    """An emptied list has to actually clear on the daemon."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _blocking_responder({"blocked": "stale.test\n"}))
+    d._apply_blocking("t", {"enabled": True, "blocked": [], "blocking_type": "NxDomain"})
+    paths = [c[2] for c in calls]
+    assert "blocked/flush" in paths
+    assert "blocked/import" not in paths
+
+
+def test_idn_entries_compare_in_their_ascii_form() -> None:
+    """Technitium stores and exports the IDNA form, so comparing the Unicode
+    spelling would read an IDN entry as changed on every apply."""
+    from spatium_dns_agent.drivers.technitium import _ascii_domain
+
+    assert _ascii_domain("Bücher.Test.") == "xn--bcher-kva.test"
+    assert _ascii_domain("plain.test") == "plain.test"
 
 
 def test_apply_blocking_rejects_unknown_blocking_type(tmp_path: Path) -> None:
@@ -1444,7 +2073,7 @@ def test_existing_zone_upstream_is_reapplied(tmp_path: Path) -> None:
 
     def responder(path, params, n):
         if path == "zones/create":
-            return {"status": "error", "errorMessage": "Zone already exists."}
+            return {"status": "error", "errorMessage": "Zone already exists: s.test"}
         return {"status": "ok"}
 
     calls = _install_fake_request(d, responder)
@@ -1453,6 +2082,291 @@ def test_existing_zone_upstream_is_reapplied(tmp_path: Path) -> None:
     )
     opts = [c for c in calls if c[2] == "zones/options/set"]
     assert opts and opts[0][3]["primaryNameServerAddresses"] == "192.0.2.9:5353"
+
+
+# ── Zone type change on an existing zone (#1457) ────────────────────────
+
+
+def _soa(zone: str, rp: str = "invalid", ttl: int = 0, serial: int = 7) -> dict[str, Any]:
+    return {
+        "name": zone,
+        "type": "SOA",
+        "ttl": ttl,
+        "rData": {
+            "primaryNameServer": "dns-1",
+            "responsiblePerson": rp,
+            "serial": serial,
+            "refresh": 900,
+            "retry": 300,
+            "expire": 604800,
+            "minimum": 900,
+        },
+    }
+
+
+def _fwd(zone: str, forwarder: str, protocol: str = "Udp") -> dict[str, Any]:
+    return {
+        "name": zone,
+        "type": "FWD",
+        "ttl": 0,
+        "rData": {"protocol": protocol, "forwarder": forwarder, "priority": 0},
+    }
+
+
+def _existing_zone_responder(
+    live_type: str | None,
+    convert: dict[str, Any] | None = None,
+    apex: list[dict[str, Any]] | None = None,
+):
+    """zones/create says "already exists"; options/get reports ``live_type``;
+    records/get returns ``apex``."""
+
+    def responder(path, params, n):
+        if path == "zones/create":
+            return {"status": "error", "errorMessage": f"Zone already exists: {params['zone']}"}
+        if path == "zones/options/get":
+            if live_type is None:
+                return {"status": "error", "errorMessage": "No such zone was found"}
+            return {"status": "ok", "response": {"name": params["zone"], "type": live_type}}
+        if path == "zones/convert":
+            return convert or {"status": "ok", "response": {}}
+        if path == "zones/records/get":
+            return {"status": "ok", "response": {"records": apex or []}}
+        return {"status": "ok"}
+
+    return responder
+
+
+def test_forwarder_zone_switched_to_primary_is_converted(tmp_path: Path) -> None:
+    """The reported case: forward → primary in SpatiumDDI left a Forwarder on
+    the daemon, so names without a local record went to the old upstream."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _existing_zone_responder("Forwarder"))
+
+    d._ensure_zone_exists("t", {"zone": "home.test", "type": "Primary"})
+
+    converts = [c for c in calls if c[2] == "zones/convert"]
+    assert len(converts) == 1
+    assert converts[0][1] == "POST"
+    assert converts[0][3] == {"zone": "home.test", "type": "Primary"}
+
+
+def test_primary_zone_switched_to_forwarder_gets_its_fwd_record(tmp_path: Path) -> None:
+    """QA walk on #1461: zones/convert Primary → Forwarder leaves the zone
+    with no FWD record, and zones/options/set has no ``forwarder`` parameter
+    (answers ok, stores nothing). The upstream has to be added as the
+    zone's apex FWD record, after the convert."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d, _existing_zone_responder("Primary", apex=[_soa("f.test")])
+    )
+
+    d._ensure_zone_exists(
+        "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["192.0.2.53"]}
+    )
+
+    paths = [c[2] for c in calls]
+    assert calls[paths.index("zones/convert")][3]["type"] == "Forwarder"
+    add = paths.index("zones/records/add")
+    assert paths.index("zones/convert") < add
+    assert calls[add][3] == {
+        "domain": "f.test",
+        "zone": "f.test",
+        "type": "FWD",
+        "forwarder": "192.0.2.53",
+        "protocol": "Udp",
+        "forwarderPriority": "0",
+    }
+    assert not any(
+        c[2] == "zones/options/set" and "forwarder" in c[3] for c in calls
+    )
+
+
+def test_changed_forwarder_replaces_the_fwd_record(tmp_path: Path) -> None:
+    """#1647: retargeting an existing forward zone never reached the daemon.
+    The new record goes in before the old one is removed."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d,
+        _existing_zone_responder(
+            "Forwarder", apex=[_soa("f.test"), _fwd("f.test", "192.0.2.1")]
+        ),
+    )
+
+    d._ensure_zone_exists(
+        "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["192.0.2.2"]}
+    )
+
+    paths = [c[2] for c in calls]
+    assert "zones/convert" not in paths
+    add, delete = paths.index("zones/records/add"), paths.index("zones/records/delete")
+    assert add < delete
+    assert calls[add][3]["forwarder"] == "192.0.2.2"
+    assert calls[delete][3] == {
+        "domain": "f.test",
+        "zone": "f.test",
+        "type": "FWD",
+        "forwarder": "192.0.2.1",
+        "protocol": "Udp",
+    }
+
+
+def test_matching_fwd_record_is_left_alone(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d,
+        _existing_zone_responder(
+            "Forwarder", apex=[_soa("f.test"), _fwd("f.test", "192.0.2.2")]
+        ),
+    )
+
+    d._ensure_zone_exists(
+        "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["192.0.2.2"]}
+    )
+
+    paths = [c[2] for c in calls]
+    assert "zones/records/add" not in paths
+    assert "zones/records/delete" not in paths
+
+
+def test_forwarder_converted_to_primary_drops_the_placeholder_soa(tmp_path: Path) -> None:
+    """QA walk on #1461 (C1): the converted zone kept the Forwarder's
+    placeholder SOA (responsible person ``invalid``, TTL 0), so its
+    negative answers were not cached."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d, _existing_zone_responder("Forwarder", apex=[_soa("home.test", serial=4)])
+    )
+
+    d._ensure_zone_exists("t", {"zone": "home.test", "type": "Primary"})
+
+    updates = [c[3] for c in calls if c[2] == "zones/records/update"]
+    assert len(updates) == 1
+    assert updates[0]["type"] == "SOA"
+    assert updates[0]["responsiblePerson"] == "hostadmin@home.test"
+    assert updates[0]["ttl"] == "900"
+    assert updates[0]["serial"] == "4"
+    assert updates[0]["primaryNameServer"] == "dns-1"
+
+
+def test_converted_primary_with_a_real_soa_is_not_touched(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d,
+        _existing_zone_responder(
+            "Forwarder", apex=[_soa("home.test", rp="hostmaster@home.test", ttl=300)]
+        ),
+    )
+
+    d._ensure_zone_exists("t", {"zone": "home.test", "type": "Primary"})
+
+    assert "zones/records/update" not in [c[2] for c in calls]
+
+
+def test_zone_of_the_right_type_is_not_converted(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _existing_zone_responder("Primary"))
+
+    d._ensure_zone_exists("t", {"zone": "p.test", "type": "Primary"})
+
+    assert "zones/convert" not in [c[2] for c in calls]
+
+
+def test_unsupported_conversion_is_logged_and_nothing_is_deleted(tmp_path: Path) -> None:
+    """Technitium refuses Primary/Forwarder → Secondary ("not supported").
+    The agent must not fall back to deleting the zone on its own."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    refused = {
+        "status": "error",
+        "errorMessage": "Cannot convert the zone 's.test' from Primary to Secondary zone: "
+        "not supported.",
+    }
+    calls = _install_fake_request(d, _existing_zone_responder("Primary", convert=refused))
+
+    d._ensure_zone_exists(
+        "t", {"zone": "s.test", "type": "Secondary", "masters": ["192.0.2.1"]}
+    )
+
+    paths = [c[2] for c in calls]
+    assert "zones/convert" in paths
+    assert not any(p.startswith("zones/delete") for p in paths)
+
+
+def test_refused_conversion_is_noted_as_an_apply_failure(tmp_path: Path) -> None:
+    """A refused convert leaves the zone serving the wrong type, so the
+    apply must read as partial (#1516), not as applied."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    refused = {"status": "error", "errorMessage": "not supported."}
+    _install_fake_request(d, _existing_zone_responder("Primary", convert=refused))
+    d._apply_failures = []
+
+    d._ensure_zone_exists("t", {"zone": "s.test", "type": "Secondary", "masters": ["192.0.2.1"]})
+
+    assert d._apply_failures == ["s.test: zone type: not supported."]
+
+
+@pytest.mark.parametrize("refused_path", ["zones/records/add", "zones/records/delete"])
+def test_refused_fwd_record_change_is_noted_as_an_apply_failure(
+    tmp_path: Path, refused_path: str
+) -> None:
+    """The forwarder used to go through ``zones/options/set``, whose refusal
+    is noted; moving it to the FWD record must not drop that."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    inner = _existing_zone_responder(
+        "Forwarder", apex=[_soa("f.test"), _fwd("f.test", "192.0.2.1")]
+    )
+
+    def responder(path, params, n):
+        if path == refused_path:
+            return {"status": "error", "errorMessage": "Access was denied."}
+        return inner(path, params, n)
+
+    _install_fake_request(d, responder)
+    d._apply_failures = []
+
+    d._ensure_zone_exists(
+        "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["192.0.2.2"]}
+    )
+
+    if refused_path == "zones/records/add":
+        assert d._apply_failures == ["f.test: zone upstream: 192.0.2.2: Access was denied."]
+    else:
+        assert d._apply_failures == ["f.test: zone upstream: 192.0.2.1: Access was denied."]
+
+
+def test_refused_fwd_add_keeps_the_old_upstream(tmp_path: Path) -> None:
+    """#1647's invariant survives the multi-record reconciler (#1764): if the
+    new upstream is refused, the old one is not deleted, so the zone is never
+    left with no upstream at all."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    inner = _existing_zone_responder(
+        "Forwarder", apex=[_soa("f.test"), _fwd("f.test", "192.0.2.1")]
+    )
+
+    def responder(path, params, n):
+        if path == "zones/records/add":
+            return {"status": "error", "errorMessage": "Access was denied."}
+        return inner(path, params, n)
+
+    calls = _install_fake_request(d, responder)
+    d._apply_failures = []
+
+    d._ensure_zone_exists(
+        "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["192.0.2.2"]}
+    )
+
+    assert "zones/records/delete" not in [c[2] for c in calls]
+
+
+def test_unreadable_live_type_is_not_guessed(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _existing_zone_responder(None))
+    d._apply_failures = []
+
+    d._ensure_zone_exists("t", {"zone": "x.test", "type": "Primary"})
+
+    assert "zones/convert" not in [c[2] for c in calls]
+    assert d._apply_failures == []
 
 
 def test_empty_tsig_key_set_is_pushed(tmp_path: Path) -> None:
@@ -1508,3 +2422,1931 @@ def test_blocking_payload_drops_redirects_instead_of_allowing_them() -> None:
     # …and the rewrite target must not leak into the server-wide
     # custom-address setting, where it would apply to every blocked name.
     assert out["custom_addresses"] == []
+
+
+# ── Zones the bundle dropped are retired, only if this agent made them ───
+
+
+def _retire(
+    tmp_path: Path,
+    *,
+    desired: list[str],
+    ledger: list[str] | None = None,
+    previous: list[str] | None = None,
+    ledger_raw: str | None = None,
+    errors: dict[str, str] | None = None,
+    bundle_names: list[str] | None | bool = True,
+) -> tuple[list[str], list[str]]:
+    """Run ``_retire_dropped_zones``; return (zones deleted, ledger after).
+
+    ``bundle_names`` is the zone list the bundle carried: ``True`` (the
+    default) means the same names as ``desired``, ``None`` a bundle with no
+    zone list."""
+    import json as _json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    if ledger is not None:
+        d._managed_zones_path().write_text(_json.dumps(ledger))
+    if ledger_raw is not None:
+        d._managed_zones_path().write_text(ledger_raw)
+    prev = tmp_path / "rendered.prev" / "zones.json"
+    if previous is not None:
+        prev.parent.mkdir(parents=True, exist_ok=True)
+        prev.write_text(_json.dumps([{"zone": z} for z in previous]))
+
+    def _responder(path: str, params: dict[str, Any], n: int) -> dict[str, Any]:
+        msg = (errors or {}).get(params.get("zone", ""))
+        return {"status": "error", "errorMessage": msg} if msg else {"status": "ok"}
+
+    calls = _install_fake_request(d, _responder)
+    names = list(desired) if bundle_names is True else bundle_names
+    d._retire_dropped_zones(
+        "tok-1",
+        [{"zone": z} for z in desired],
+        prev,
+        bundle_zone_names=names,  # type: ignore[arg-type]
+    )
+    deleted = [c[3]["zone"] for c in calls if c[2] == "zones/delete"]
+    return deleted, _json.loads(d._managed_zones_path().read_text())
+
+
+def test_zone_dropped_from_the_bundle_is_deleted(tmp_path: Path) -> None:
+    deleted, ledger = _retire(tmp_path, desired=["a.test"], ledger=["a.test", "gone.test"])
+    assert deleted == ["gone.test"]
+    assert ledger == ["a.test"]
+
+
+def test_only_zones_in_the_ledger_are_candidates(tmp_path: Path) -> None:
+    """A zone an operator made on the daemon is never in the ledger, and the
+    retire pass does not even list the daemon's zones to find one."""
+    deleted, ledger = _retire(tmp_path, desired=["a.test"], ledger=["a.test"])
+    assert deleted == []
+    assert ledger == ["a.test"]
+
+
+def test_first_run_seeds_the_ledger_from_the_previous_render(tmp_path: Path) -> None:
+    """An agent upgraded mid-change: the zone the new bundle dropped was in
+    the previous render, so it is still retired."""
+    deleted, ledger = _retire(tmp_path, desired=["a.test"], previous=["a.test", "gone.test"])
+    assert deleted == ["gone.test"]
+    assert ledger == ["a.test"]
+
+
+def test_first_run_without_history_deletes_nothing(tmp_path: Path) -> None:
+    deleted, ledger = _retire(tmp_path, desired=["a.test", "b.test"])
+    assert deleted == []
+    assert ledger == ["a.test", "b.test"]
+
+
+def test_failed_delete_is_retried_and_missing_zone_is_forgotten(tmp_path: Path) -> None:
+    deleted, ledger = _retire(
+        tmp_path,
+        desired=["a.test"],
+        ledger=["a.test", "busy.test", "manual.test"],
+        errors={
+            "busy.test": "Some transient failure",
+            "manual.test": "No such zone was found: manual.test",
+        },
+    )
+    assert sorted(deleted) == ["busy.test", "manual.test"]
+    # The failure stays a candidate for the next pass; the already-gone one
+    # does not.
+    assert ledger == ["a.test", "busy.test"]
+
+
+def test_unreadable_ledger_deletes_nothing_and_is_rebuilt(tmp_path: Path) -> None:
+    deleted, ledger = _retire(tmp_path, desired=["a.test"], ledger_raw="{not json")
+    assert deleted == []
+    assert ledger == ["a.test"]
+
+
+def test_zone_names_compare_case_insensitively(tmp_path: Path) -> None:
+    deleted, _ = _retire(tmp_path, desired=["Example.TEST"], ledger=["example.test"])
+    assert deleted == []
+
+
+# ── An empty zone list vs. no zone list (review on #1497) ────────────────
+#
+# An explicit ``"zones": []`` is what the control plane sends for a group
+# with no zones (``render_bundle_body`` selects ``DNSZone.group_id ==
+# server.group_id`` and nothing else), so it retires everything, like BIND9
+# emptying ``named.conf``. A bundle with no zone list, or a zone the bundle
+# still names that this driver could not render, is not a deletion and
+# retires nothing.
+
+
+def test_explicit_empty_zone_list_retires_every_managed_zone(tmp_path: Path) -> None:
+    """The last zone of a group is deleted: the guard must not block it."""
+    deleted, ledger = _retire(tmp_path, desired=[], ledger=["a.test", "b.test"], bundle_names=[])
+    assert deleted == ["a.test", "b.test"]
+    assert ledger == []
+
+
+def test_no_zone_list_retires_nothing_and_keeps_the_ledger(tmp_path: Path) -> None:
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        deleted, ledger = _retire(
+            tmp_path, desired=[], ledger=["a.test", "b.test"], bundle_names=None
+        )
+    assert deleted == []
+    # Kept, so the next bundle that does carry a list still retires them.
+    assert ledger == ["a.test", "b.test"]
+    held = [e for e in logs if e["event"] == "technitium_zone_retire_held_back"]
+    assert held and held[0]["reason"] == "bundle_has_no_zone_list"
+    assert held[0]["zones"] == ["a.test", "b.test"]
+
+
+def test_zone_still_in_the_bundle_is_not_retired_when_unrendered(tmp_path: Path) -> None:
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        deleted, ledger = _retire(
+            tmp_path,
+            desired=["a.test"],
+            ledger=["a.test", "sec.test", "gone.test"],
+            bundle_names=["a.test", "Sec.Test"],
+        )
+    assert deleted == ["gone.test"]
+    assert ledger == ["a.test", "sec.test"]
+    held = [e for e in logs if e["event"] == "technitium_zone_retire_held_back"]
+    assert held and held[0]["reason"] == "zone_still_in_bundle"
+    assert held[0]["zones"] == ["sec.test"]
+
+
+def _apply_bundle(
+    tmp_path: Path, bundle: dict[str, Any], ledger: list[str]
+) -> tuple[list[str], list[str]]:
+    """render → validate → swap_and_reload against a fake API; return
+    (zones deleted, ledger after)."""
+    import json as _json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d._managed_zones_path().write_text(_json.dumps(ledger))
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    calls = _install_fake_request(d, lambda *_: {"status": "ok", "response": {"records": []}})
+    d.render(bundle)
+    d.validate()
+    d.swap_and_reload()
+    deleted = [c[3]["zone"] for c in calls if c[2] == "zones/delete"]
+    return deleted, _json.loads(d._managed_zones_path().read_text())
+
+
+def test_bundle_of_a_group_with_no_zones_retires_them_end_to_end(tmp_path: Path) -> None:
+    deleted, ledger = _apply_bundle(tmp_path, {"zones": []}, ["a.test", "b.test"])
+    assert deleted == ["a.test", "b.test"]
+    assert ledger == []
+
+
+def test_bundle_without_a_zone_list_retires_nothing_end_to_end(tmp_path: Path) -> None:
+    for i, bundle in enumerate(({}, {"zones": None}, {"zones": {"a.test": {}}})):
+        state = tmp_path / str(i)
+        state.mkdir()
+        deleted, ledger = _apply_bundle(state, bundle, ["a.test", "b.test"])
+        assert deleted == [], bundle
+        assert ledger == ["a.test", "b.test"], bundle
+
+
+def test_zone_the_render_skipped_is_not_retired_end_to_end(tmp_path: Path) -> None:
+    """A secondary that lost its primaries is skipped by the render, but
+    SpatiumDDI still has it: it must not be deleted from the daemon."""
+    bundle = {
+        "zones": [
+            {"name": "a.test.", "type": "primary"},
+            {"name": "sec.test.", "type": "secondary", "masters": []},
+        ]
+    }
+    deleted, ledger = _apply_bundle(tmp_path, bundle, ["a.test", "sec.test", "gone.test"])
+    assert deleted == ["gone.test"]
+    assert ledger == ["a.test", "sec.test"]
+
+
+def test_record_of_the_parent_survives_retiring_the_child_zone(tmp_path: Path) -> None:
+    """QA walk on #1497: Technitium files a record added to ``p1`` under the
+    closest zone it hosts, here ``kid.p1``, and ``zones/delete`` of the child
+    takes it along. The parent's reconcile has to run after the retire, or
+    the name is NXDOMAIN until the next structural pass."""
+    zones: dict[str, list[dict[str, Any]]] = {}
+
+    def _daemon(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        zone = params.get("zone", "")
+        if path == "zones/create":
+            zones.setdefault(zone, [])
+        elif path == "zones/delete":
+            zones.pop(zone, None)
+        elif path == "zones/records/add":
+            domain = params["domain"]
+            home = max((z for z in zones if domain == z or domain.endswith("." + z)), key=len)
+            zones[home].append(params)
+        elif path == "zones/records/get":
+            records = [
+                {
+                    "name": r["domain"],
+                    "type": r["type"],
+                    "ttl": r.get("ttl"),
+                    "rData": {"ipAddress": r.get("ipAddress")},
+                }
+                for r in zones.get(zone, [])
+            ]
+            return {"status": "ok", "response": {"records": records}}
+        return {"status": "ok"}
+
+    def _apply(bundle: dict[str, Any]) -> None:
+        d = TechnitiumDriver(state_dir=tmp_path)
+        _seed_token(d)
+        d.daemon_running = lambda: True  # type: ignore[method-assign]
+        d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+        _install_fake_request(d, _daemon)
+        d.render(bundle)
+        d.validate()
+        d.swap_and_reload()
+
+    parent = {
+        "name": "p1.",
+        "type": "primary",
+        "records": [{"name": "www.kid", "type": "A", "value": "192.0.2.11"}],
+    }
+    _apply({"zones": [{"name": "kid.p1.", "type": "primary", "records": []}, parent]})
+    assert [r["domain"] for r in zones["kid.p1"]] == ["www.kid.p1"]
+
+    _apply({"zones": [parent]})
+    assert "kid.p1" not in zones
+    assert [r["domain"] for r in zones["p1"]] == ["www.kid.p1"]
+
+
+# ── swap_and_reload: TSIG sync (#1517) + partial refusal (#1516) ────────
+
+
+def _ok_responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+    if path == "zones/records/get":
+        return {"status": "ok", "response": {"records": []}}
+    return {"status": "ok"}
+
+
+def _prep_swap(driver: TechnitiumDriver, responder: Any) -> list:
+    """Stub out the daemon/token plumbing so swap_and_reload runs
+    entirely against the fake ``_request``."""
+    driver.daemon_running = lambda: True  # type: ignore[method-assign]
+    driver._wait_for_api_up = lambda: None  # type: ignore[method-assign]
+    driver._get_api_token = lambda: "tok-1"  # type: ignore[method-assign]
+    return _install_fake_request(driver, responder)
+
+
+_ONE_ZONE_BUNDLE = {
+    "zones": [
+        {
+            "name": "example.com.",
+            "type": "primary",
+            "ttl": 3600,
+            "records": [
+                {"name": "www", "type": "A", "value": "10.0.0.1", "ttl": 300},
+            ],
+        }
+    ]
+}
+
+
+def test_swap_syncs_empty_tsig_key_list(tmp_path: Path) -> None:
+    """#1517: a bundle with NO keys must still call settings/set with an
+    empty tsigKeys value, clearing keys the daemon already holds. The old
+    truthiness guard never called the sync at all in that state."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _prep_swap(d, _ok_responder)
+    d.render(_ONE_ZONE_BUNDLE)
+    d.swap_and_reload()
+    tsig_calls = [
+        c for c in calls if c[2] == "settings/set" and "tsigKeys" in c[3]
+    ]
+    assert len(tsig_calls) == 1
+    assert tsig_calls[0][3]["tsigKeys"] == ""
+
+
+def test_swap_succeeds_when_every_step_is_accepted(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _prep_swap(d, _ok_responder)
+    d.render(_ONE_ZONE_BUNDLE)
+    d.swap_and_reload()  # must not raise
+
+
+def test_swap_reports_a_refused_record_add_as_a_partial_apply(tmp_path: Path) -> None:
+    """#1516 / #1608: a refused record add used to be a log line and a
+    reported success, then (first cut of #1608) a raise that quarantined
+    the whole bundle. It is a partial apply now (#1280's model): the apply
+    lands and ``refused_zones()`` names the zone, record and the daemon's
+    reason."""
+
+    def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        if path == "zones/records/add":
+            return {"status": "error", "errorMessage": "invalid record name"}
+        return _ok_responder(path, params, _n)
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _prep_swap(d, responder)
+    d.apply_config(_ONE_ZONE_BUNDLE)  # must not raise
+    assert any(c[2] == "zones/records/add" for c in calls)
+    (refusal,) = d.refused_zones()
+    assert refusal.startswith("example.com: record add www.example.com A: ")
+    assert "invalid record name" in refusal
+
+
+def test_swap_reports_a_refused_zone_create_but_still_reconciles(
+    tmp_path: Path,
+) -> None:
+    """#1516: one refused zone must not stop the rest of the apply —
+    every zone is attempted, and the refusal is reported, not raised."""
+
+    def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        if path == "zones/create":
+            return {"status": "error", "errorMessage": "no SOA from primary"}
+        return _ok_responder(path, params, _n)
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _prep_swap(d, responder)
+    d.apply_config(_ONE_ZONE_BUNDLE)
+    # Records for the (missing) zone were still attempted.
+    assert any(c[2] == "zones/records/add" for c in calls)
+    assert any("zone create: no SOA from primary" in r for r in d.refused_zones())
+
+
+def test_swap_reports_a_refused_tsig_sync(tmp_path: Path) -> None:
+    def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        if path == "settings/set" and "tsigKeys" in params:
+            return {"status": "error", "errorMessage": "bad key"}
+        return _ok_responder(path, params, _n)
+
+    bundle = {
+        **_ONE_ZONE_BUNDLE,
+        "tsig_keys": [
+            {"name": "xfer.example.com.", "secret": "c2VjcmV0", "algorithm": "hmac-sha256"}
+        ],
+    }
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _prep_swap(d, responder)
+    d.apply_config(bundle)
+    assert d.refused_zones() == ["tsig keys: bad key"]
+
+
+def test_swap_fails_when_the_daemon_rejects_our_token(tmp_path: Path) -> None:
+    """An auth failure is not a refusal of the operator's data: nothing can
+    be applied at all, so the apply fails (and #882 quarantines / reverts)
+    rather than reporting every step as a refused item."""
+
+    def responder(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
+        return {"status": "invalid-token"}
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _prep_swap(d, responder)
+    d._reprovision_token = lambda stale: None  # type: ignore[method-assign]
+    with pytest.raises(ConfigApplyError) as excinfo:
+        d.apply_config(_ONE_ZONE_BUNDLE)
+    assert excinfo.value.phase == "reload"
+    assert "auth failure" in str(excinfo.value.cause)
+
+
+# ── #1513: rdata round-trip canonicalisation ────────────────────────────
+
+
+def test_svcb_params_sorted_by_key() -> None:
+    """Read-back rebuilds svcParams sorted; the write side must sort
+    too or the record churns on every structural reconcile."""
+    _, _, params = _svcb_params('1 . port=443 alpn="h2"')
+    assert params == "alpn|h2|port|443"
+
+
+def test_svcb_params_valueless_key_is_emitted_not_dropped() -> None:
+    _, _, params = _svcb_params('1 . no-default-alpn alpn="h2"')
+    assert params == "alpn|h2|no-default-alpn|true"
+
+
+def test_svcb_round_trip_no_churn() -> None:
+    desired = _record_params("SVCB", '1 . port=443 alpn="h2" no-default-alpn', {})
+    from_daemon = _normalize_rdata(
+        "SVCB",
+        {
+            "svcPriority": 1,
+            "svcTargetName": ".",
+            "svcParams": {"alpn": "h2", "port": "443", "no-default-alpn": ""},
+        },
+    )
+    assert desired == from_daemon
+
+
+def test_record_params_uri_preserves_path_trailing_slash() -> None:
+    out = _record_params("URI", "1 1 https://example.com/path/", {})
+    assert out["uri"] == "https://example.com/path/"
+    out = _record_params("URI", "1 1 https://example.com/", {})
+    assert out["uri"] == "https://example.com"
+
+
+def test_normalize_rdata_uri_preserves_path_trailing_slash() -> None:
+    out = _normalize_rdata(
+        "URI", {"priority": 1, "weight": 1, "uri": "https://example.test/path/"}
+    )
+    assert out["uri"] == "https://example.test/path/"
+
+
+def test_aaaa_canonical_form_no_churn() -> None:
+    """A hand-typed expanded/upper-case AAAA must match the daemon's
+    canonical read-back instead of being deleted and re-added."""
+    desired = _record_params("AAAA", "2001:DB8:0:0::1", {})
+    assert desired == {"ipAddress": "2001:db8::1"}
+    from_daemon = _normalize_rdata("AAAA", {"ipAddress": "2001:db8::1"})
+    assert desired == from_daemon
+
+
+def test_name_valued_case_fold_no_churn() -> None:
+    desired = _record_params("CNAME", "WWW.Example.COM.", {})
+    from_daemon = _normalize_rdata("CNAME", {"cname": "www.example.com"})
+    assert desired == from_daemon
+
+
+# ── Zone apex: SOA + NS from the zone's own settings ───────────────────
+#
+# Technitium writes its own apex at zone create: one NS and an SOA MNAME
+# naming the server's host name (the pod name, under the DNS VIP) and a
+# placeholder RNAME. The SOA-update semantics below were checked against a
+# live technitium/dns-server:15.4.0: ``zones/records/update`` for type SOA
+# refuses a call without ``serial`` and stores current + 1, takes the RNAME
+# in either SOA or address form and reads it back as an address, and
+# ``zones/records/get`` without ``listZone`` returns the apex records only.
+
+
+def _render_zone(tmp_path: Path, zone: dict[str, Any]) -> dict[str, Any]:
+    import json as _json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render(_zone_bundle(zones=[zone]))
+    return _json.loads((tmp_path / "rendered.new" / "zones.json").read_text())[0]
+
+
+def test_render_apex_from_primary_ns_and_admin_email(tmp_path: Path) -> None:
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "home.example.test.",
+            "type": "primary",
+            "ttl": 300,
+            "primary_ns": "ns.home.example.test.",
+            "admin_email": "hostmaster.example.test.",
+            "refresh": 3600,
+            "retry": 600,
+            "expire": 604800,
+            "minimum": 300,
+            "records": [{"name": "ns", "type": "A", "value": "192.0.2.53"}],
+        },
+    )
+    assert out["apex"] == {
+        "ns": ["ns.home.example.test"],
+        "soa": {
+            "primaryNameServer": "ns.home.example.test",
+            "responsiblePerson": "hostmaster@example.test",
+            "refresh": 3600,
+            "retry": 600,
+            "expire": 604800,
+            "minimum": 300,
+        },
+        "ttl": 300,
+    }
+
+
+def test_render_apex_declared_ns_records_win(tmp_path: Path) -> None:
+    """The zone's own apex NS records are the NS set (#1153's precedence);
+    a relative target is relative to the zone, as in a zone file."""
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "example.test.",
+            "type": "primary",
+            "primary_ns": "ns0.elsewhere.test",
+            "records": [
+                {"name": "@", "type": "NS", "value": "ns1.example.test."},
+                {"name": "@", "type": "NS", "value": "ns2"},
+                {"name": "sub", "type": "NS", "value": "ns.sub.example.test."},
+            ],
+        },
+    )
+    assert out["apex"]["ns"] == ["ns1.example.test", "ns2.example.test"]
+    # MNAME is still the Primary NS when one is set.
+    assert out["apex"]["soa"]["primaryNameServer"] == "ns0.elsewhere.test"
+    # The delegation stays an ordinary record.
+    assert [r["domain"] for r in out["records"] if r["type"] == "NS"] == ["sub.example.test"]
+
+
+def test_render_apex_absent_when_zone_sets_nothing(tmp_path: Path) -> None:
+    """A zone with no Primary NS or Admin Email keeps the daemon's apex
+    untouched — the behaviour before the apex was managed. The bundle ships
+    every zone's SOA timers since #1171 (the defaults, here), so they alone
+    must not make an apex."""
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "plain.test.",
+            "type": "primary",
+            "ttl": 3600,
+            "refresh": 3600,
+            "retry": 600,
+            "expire": 86400,
+            "minimum": 300,
+            "records": [],
+        },
+    )
+    assert "apex" not in out
+    out = _render_zone(
+        tmp_path, {"name": "bare.test.", "type": "primary", "ttl": 3600, "records": []}
+    )
+    assert "apex" not in out
+
+
+def test_render_apex_only_for_primary_zones(tmp_path: Path) -> None:
+    """A secondary's apex comes from the transfer, so it is not ours."""
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "s.test.",
+            "type": "secondary",
+            "masters": ["192.0.2.1"],
+            "primary_ns": "ns.s.test.",
+        },
+    )
+    assert "apex" not in out
+
+
+def test_render_apex_ignores_unusable_values(tmp_path: Path) -> None:
+    out = _render_zone(
+        tmp_path,
+        {
+            "name": "x.test.",
+            "type": "primary",
+            "primary_ns": "  ",
+            "admin_email": "nodots",
+            "minimum": True,  # a bool is not a timer
+            "refresh": -1,
+        },
+    )
+    assert "apex" not in out
+
+
+def test_responsible_person_forms() -> None:
+    from spatium_dns_agent.drivers.technitium import _responsible_person
+
+    assert _responsible_person("hostmaster.example.test.") == "hostmaster@example.test"
+    assert _responsible_person("first\\.last.example.test.") == "first.last@example.test"
+    assert _responsible_person("Admin@Example.test") == "admin@example.test"
+    assert _responsible_person("nodots") is None
+    assert _responsible_person("") is None
+    assert _responsible_person(None) is None
+
+
+def _apex_reconcile(
+    driver: TechnitiumDriver,
+    apex_records: list[dict[str, Any]],
+    apex: dict[str, Any],
+    fail_paths: set[str] = frozenset(),  # type: ignore[assignment]
+) -> list[tuple[str, str, str, dict[str, Any]]]:
+    def _responder(path: str, params: dict[str, Any], n: int) -> dict[str, Any]:
+        if path == "zones/records/get":
+            if params.get("listZone") == "true":
+                return {"status": "ok", "response": {"records": []}}
+            return {"status": "ok", "response": {"records": apex_records}}
+        if path in fail_paths:
+            return {"status": "error", "errorMessage": "boom"}
+        return {"status": "ok"}
+
+    calls = _install_fake_request(driver, _responder)
+    driver._reconcile_zones(
+        "tok-1", [{"zone": "example.test", "type": "Primary", "records": [], "apex": apex}]
+    )
+    return calls
+
+
+_DAEMON_APEX = [
+    {"name": "example.test", "type": "NS", "ttl": 14400,
+     "rData": {"nameServer": "dns-technitium-snw7c"}},
+    {"name": "example.test", "type": "SOA", "ttl": 900,
+     "rData": {"primaryNameServer": "dns-technitium-snw7c",
+               "responsiblePerson": "hostadmin@example.test", "serial": 41,
+               "refresh": 900, "retry": 300, "expire": 604800, "minimum": 900}},
+]
+
+_WANTED_APEX = {
+    "ns": ["ns.example.test"],
+    "soa": {"primaryNameServer": "ns.example.test",
+            "responsiblePerson": "hostmaster@example.test",
+            "refresh": 3600, "retry": 600, "expire": 604800, "minimum": 300},
+    "ttl": 300,
+}
+
+
+def test_reconcile_apex_rewrites_daemon_soa_and_ns(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _apex_reconcile(d, _DAEMON_APEX, _WANTED_APEX)
+    writes = [(c[2], c[3]) for c in calls if c[2] != "zones/create" and c[2] != "zones/records/get"]
+
+    soa = [p for path, p in writes if path == "zones/records/update"]
+    assert len(soa) == 1
+    assert soa[0]["type"] == "SOA"
+    assert soa[0]["serial"] == 41  # the current serial, which the daemon requires
+    assert soa[0]["primaryNameServer"] == "ns.example.test"
+    assert soa[0]["responsiblePerson"] == "hostmaster@example.test"
+    assert (soa[0]["refresh"], soa[0]["retry"], soa[0]["minimum"], soa[0]["ttl"]) == (
+        3600, 600, 300, 300)
+
+    ns_ops = [(path, p["nameServer"]) for path, p in writes if p.get("type") == "NS"]
+    # The new name server goes in before the daemon's own comes out.
+    assert ns_ops == [
+        ("zones/records/add", "ns.example.test"),
+        ("zones/records/delete", "dns-technitium-snw7c"),
+    ]
+
+
+def test_reconcile_apex_is_a_noop_when_converged(tmp_path: Path) -> None:
+    """Every SOA write bumps the serial, so a converged apex must cost one
+    read and nothing else."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    converged = [
+        {"name": "example.test", "type": "NS", "ttl": 300,
+         "rData": {"nameServer": "ns.example.test"}},
+        {"name": "example.test", "type": "SOA", "ttl": 300,
+         "rData": {"primaryNameServer": "ns.example.test",
+                   "responsiblePerson": "hostmaster@example.test", "serial": 42,
+                   "refresh": 3600, "retry": 600, "expire": 604800, "minimum": 300}},
+    ]
+    calls = _apex_reconcile(d, converged, _WANTED_APEX)
+    assert [c[2] for c in calls if c[2] != "zones/create"] == [
+        "zones/records/get",  # the zone's records
+        "zones/records/get",  # its apex
+    ]
+
+
+def test_reconcile_apex_keeps_old_ns_when_the_add_fails(tmp_path: Path) -> None:
+    """Never leave the zone without a name server."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _apex_reconcile(d, _DAEMON_APEX, _WANTED_APEX, fail_paths={"zones/records/add"})
+    assert "zones/records/delete" not in [c[2] for c in calls]
+
+
+def test_reconcile_apex_untouched_without_apex(tmp_path: Path) -> None:
+    """No ``apex`` in the payload (an older render, or a zone that sets
+    nothing): the daemon's own SOA and NS are not even read."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _apex_reconcile(d, _DAEMON_APEX, None)  # type: ignore[arg-type]
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[3].get("listZone") for c in calls if c[2] == "zones/records/get"] == ["true"]
+
+
+# ── #1513 / #1698: SVCB/HTTPS canonical comparison ──────────────────────
+
+
+def test_svcb_params_are_pipe_separated_for_two_params() -> None:
+    """#1698: Technitium splits svcParams on '|' and walks it two at a time,
+    so pairs joined by ',' only worked for one param."""
+    _, _, params = _svcb_params("1 . port=8443 alpn=h2")
+    assert params == "alpn|h2|port|8443"
+    _, _, params = _svcb_params('1 . alpn="h2,h3" port=443')
+    assert params == "alpn|h2,h3|port|443"
+
+
+def test_svcb_quoted_and_unquoted_value_are_the_same_record() -> None:
+    a = _record_params("SVCB", "1 . alpn=h2", {}, "example.net")
+    b = _record_params("SVCB", '1 . alpn="h2"', {}, "example.net")
+    assert a == b
+    live = _normalize_rdata(
+        "SVCB", {"svcPriority": 1, "svcTargetName": "", "svcParams": {"alpn": "h2"}}
+    )
+    assert live == a
+
+
+def test_svcb_relative_and_absolute_in_zone_target_agree() -> None:
+    for typed in ("1 svc.example.net. alpn=h2", "1 svc alpn=h2", "1 SVC.Example.Net. alpn=h2"):
+        d = _record_params("SVCB", typed, {}, "example.net")
+        assert d["svcTargetName"] == "svc.example.net"
+    assert _svcb_params("1 . alpn=h2", "example.net")[1] == "."
+    # Technitium has no relative names: a daemon holding ``svc`` serves
+    # ``svc.``, so it is NOT the same record as ``svc.example.net``.
+    live = _normalize_rdata(
+        "SVCB", {"svcPriority": 1, "svcTargetName": "svc", "svcParams": {"alpn": "h2"}}
+    )
+    assert live["svcTargetName"] == "svc"
+
+
+def test_svcb_valueless_and_mandatory_and_order() -> None:
+    d = _record_params(
+        "HTTPS", '1 . port=443 no-default-alpn mandatory="port,alpn" alpn=h2', {}, "example.net"
+    )
+    live = _normalize_rdata(
+        "HTTPS",
+        {
+            "svcPriority": 1,
+            "svcTargetName": "",
+            "svcParams": {
+                "alpn": "h2",
+                "mandatory": "alpn,port",
+                "port": "443",
+                "no-default-alpn": None,
+            },
+        },
+    )
+    assert d == live
+    assert d["svcParams"].startswith("mandatory|alpn,port|alpn|h2|no-default-alpn|")
+
+
+def test_svcb_genuinely_different_records_stay_different() -> None:
+    base = _record_params("SVCB", "1 . alpn=h2", {}, "example.net")
+    assert base != _record_params("SVCB", "1 . alpn=h3", {}, "example.net")
+    assert base != _record_params("SVCB", "2 . alpn=h2", {}, "example.net")
+    assert base != _record_params("SVCB", "1 svc alpn=h2", {}, "example.net")
+    assert base != _record_params("SVCB", "1 . alpn=h2 port=443", {}, "example.net")
+    # alpn order is significant, unlike param order.
+    assert _record_params("SVCB", "1 . alpn=h2,h3", {}, "z") != _record_params(
+        "SVCB", "1 . alpn=h3,h2", {}, "z"
+    )
+
+
+def test_svcb_escaped_comma_in_alpn_survives() -> None:
+    _, _, params = _svcb_params('1 . alpn="f\\,oo,bar"')
+    assert params == "alpn|f\\,oo,bar"
+
+
+def _reconcile_calls(
+    tmp_path: Path, value: str, daemon: dict[str, Any], zone: str = "example.net"
+) -> list[str]:
+    """Run the structural reconcile for one SVCB record against a daemon
+    holding ``daemon`` rData; return the add/delete endpoints it hit."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d._ensure_zone_exists = lambda *_a, **_k: None  # type: ignore[method-assign]
+    d._apply_zone_options = lambda *_a, **_k: None  # type: ignore[method-assign]
+    d._get_zone_records = lambda *_a, **_k: [  # type: ignore[method-assign]
+        {"domain": f"svc.{zone}", "type": "SVCB", "ttl": 300, **_normalize_rdata("SVCB", daemon)}
+    ]
+    hit: list[str] = []
+
+    class _Resp:
+        def json(self) -> dict[str, Any]:
+            return {"status": "ok"}
+
+    def _call(_t: str, _m: str, path: str, _p: dict[str, Any]) -> _Resp:
+        hit.append(path)
+        return _Resp()
+
+    d._call = _call  # type: ignore[method-assign]
+    payload = [
+        {
+            "zone": zone,
+            "type": "Primary",
+            "records": [
+                {
+                    "domain": f"svc.{zone}",
+                    "type": "SVCB",
+                    "ttl": 300,
+                    **_record_params("SVCB", value, {}, zone),
+                }
+            ],
+        }
+    ]
+    d._reconcile_zones("tok", payload)
+    return hit
+
+
+@pytest.mark.parametrize(
+    ("stored", "daemon_target", "daemon_params"),
+    [
+        ("1 . alpn=h2", ".", {"alpn": "h2"}),
+        ('1 . alpn="h2"', "", {"alpn": "h2"}),
+        ("1 svc.example.net. alpn=h2", "svc.example.net", {"alpn": "h2"}),
+        # A trailing dot is absolute whatever the label count: never
+        # qualified, so a single-label absolute target is stable.
+        ("1 localhost. alpn=h2", "localhost", {"alpn": "h2"}),
+        ("1 svc alpn=h2", "svc.example.net", {"alpn": "h2"}),
+        ("1 . port=8443 alpn=h2,h3", ".", {"alpn": "h2,h3", "port": "8443"}),
+        ("1 . no-default-alpn alpn=h2", ".", {"alpn": "h2", "no-default-alpn": None}),
+    ],
+)
+def test_svcb_reconcile_does_not_churn(
+    tmp_path: Path, stored: str, daemon_target: str, daemon_params: dict[str, Any]
+) -> None:
+    hit = _reconcile_calls(
+        tmp_path,
+        stored,
+        {"svcPriority": 1, "svcTargetName": daemon_target, "svcParams": daemon_params},
+    )
+    assert hit == []
+
+
+def test_svcb_reconcile_still_replaces_a_different_record(tmp_path: Path) -> None:
+    hit = _reconcile_calls(
+        tmp_path,
+        "1 . alpn=h3",
+        {"svcPriority": 1, "svcTargetName": "", "svcParams": {"alpn": "h2"}},
+    )
+    assert hit == ["zones/records/delete", "zones/records/add"]
+
+
+def test_svcb_single_label_left_by_the_old_agent_is_repaired(tmp_path: Path) -> None:
+    """The old agent sent a relative ``svc`` verbatim, and Technitium served
+    it as ``svc.``. Desired is now ``svc.example.net``, so the record is
+    replaced once instead of being matched and left wrong forever."""
+    hit = _reconcile_calls(
+        tmp_path,
+        "1 svc alpn=h2",
+        {"svcPriority": 1, "svcTargetName": "svc", "svcParams": {"alpn": "h2"}},
+    )
+    assert hit == ["zones/records/delete", "zones/records/add"]
+
+
+def test_svcb_param_less_record_does_not_churn(tmp_path: Path) -> None:
+    hit = _reconcile_calls(
+        tmp_path, "0 cdn.other.net.", {"svcPriority": 0, "svcTargetName": "cdn.other.net", "svcParams": {}}
+    )
+    assert hit == []
+
+
+def test_svcb_ech_and_unnamed_keys_go_as_hex_and_read_back_equal() -> None:
+    """``ech`` and an unnamed key reach ``DnsSvcUnknownParamValue.Parse``,
+    which reads HEX; an unnamed key is ``Enum.Parse``d, so it goes by number.
+    The daemon reports both as colon-hex, the unnamed key by number."""
+    out = _record_params("HTTPS", '1 . alpn=h2 ech="AAEC" key65000="a b"', {}, "z")
+    assert out["svcParams"] == "alpn|h2|ech|000102|65000|612062"
+    live = _normalize_rdata(
+        "HTTPS",
+        {
+            "svcPriority": 1,
+            "svcTargetName": "",
+            "svcParams": {"65000": "61:20:62", "ech": "00:01:02", "alpn": "h2"},
+        },
+    )
+    assert live == out
+
+
+def test_svcb_mandatory_naming_an_unnamed_key_goes_by_number() -> None:
+    _, _, params = _svcb_params("1 . mandatory=key65000,alpn alpn=h2 key65000=x")
+    assert params == "mandatory|alpn,65000|alpn|h2|65000|78"
+
+
+# ── #1513 case 7: a cached pre-#1513 bundle keeps its own target meaning ──
+
+
+def _render_svcb(tmp_path: Path, value: str, rule: str | None) -> str:
+    import json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    bundle: dict[str, Any] = {
+        "zones": [
+            {
+                "name": "up.test.",
+                "type": "primary",
+                "ttl": 3600,
+                "records": [{"name": "c7s", "type": "SVCB", "value": value, "ttl": 300}],
+            }
+        ]
+    }
+    if rule is not None:
+        bundle["svcb_target_rule"] = rule
+    d.render(bundle)
+    payload = json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
+    (rec,) = [r for r in payload[0]["records"] if r["type"] == "SVCB"]
+    return str(rec["svcTargetName"])
+
+
+def test_replaying_a_pre_1513_bundle_keeps_a_dotless_target_absolute(tmp_path: Path) -> None:
+    """The #1731 walk's case 7: the agent replays its cached bundle at start,
+    and a bundle from the renderer before #1513 holds ``1 cdn.example.net``
+    meaning ``cdn.example.net.`` — what that renderer sent to the daemon. It
+    carries no ``svcb_target_rule``, so it must not be read as zone-relative."""
+    assert _render_svcb(tmp_path, '1 cdn.example.net alpn="h2"', None) == "cdn.example.net"
+    assert _render_svcb(tmp_path, "1 svc alpn=h2", None) == "svc"
+
+
+def test_a_zone_file_rule_bundle_reads_a_dotless_target_as_relative(tmp_path: Path) -> None:
+    rule = SVCB_TARGET_RULE_ZONE_FILE
+    assert _render_svcb(tmp_path, "1 svc alpn=h2", rule) == "svc.up.test"
+    assert _render_svcb(tmp_path, "1 cdn.example.net. alpn=h2", rule) == "cdn.example.net"
+    assert _render_svcb(tmp_path, "1 localhost. alpn=h2", rule) == "localhost"
+    # Under either rule a trailing dot is absolute.
+    assert _render_svcb(tmp_path, "1 cdn.example.net. alpn=h2", None) == "cdn.example.net"
+
+
+def test_record_ops_follow_the_rule_of_the_applied_bundle(tmp_path: Path) -> None:
+    def _op_target(rule: str | None) -> str:
+        d = TechnitiumDriver(state_dir=tmp_path)
+        _seed_token(d)
+        bundle: dict[str, Any] = {"zones": []}
+        if rule is not None:
+            bundle["svcb_target_rule"] = rule
+        d.render(bundle)
+        calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+        d.apply_record_op(
+            {
+                "zone_name": "up.test.",
+                "op": "create",
+                "record": {"name": "c7s", "type": "SVCB", "value": "1 svc alpn=h2", "ttl": 300},
+            }
+        )
+        return str(calls[-1][3]["svcTargetName"])
+
+    assert _op_target(None) == "svc"
+    assert _op_target(SVCB_TARGET_RULE_ZONE_FILE) == "svc.up.test"
+
+
+def test_render_reads_the_rule_from_the_bundle(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render({"zones": [], "svcb_target_rule": SVCB_TARGET_RULE_ZONE_FILE})
+    assert d._svcb_zone_file_targets
+    d.render({"zones": []})
+    assert not d._svcb_zone_file_targets
+
+
+# ── Group options (#1763): dnssec_validation + allow_query ──────────────
+
+
+def _apply_with_calls(
+    tmp_path: Path, bundle: dict[str, Any]
+) -> list[tuple[str, str, str, dict[str, Any]]]:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    calls = _install_fake_request(d, lambda *_: {"status": "ok", "response": {"records": []}})
+    d.render(bundle)
+    d.validate()
+    d.swap_and_reload()
+    return calls
+
+
+def _settings_values(calls: Any, key: str) -> list[Any]:
+    return [c[3][key] for c in calls if c[2] == "settings/set" and key in c[3]]
+
+
+@pytest.mark.parametrize(
+    "mode,expected", [("no", "false"), ("yes", "true"), ("auto", "true")]
+)
+def test_dnssec_validation_reaches_the_daemon(tmp_path: Path, mode: str, expected: str) -> None:
+    calls = _apply_with_calls(
+        tmp_path, {"zones": [], "options": {"dnssec_validation": mode, "allow_query": ["any"]}}
+    )
+    assert _settings_values(calls, "dnssecValidation") == [expected]
+
+
+def test_a_bundle_without_the_dnssec_option_leaves_the_daemon_alone(tmp_path: Path) -> None:
+    calls = _apply_with_calls(tmp_path, {"zones": [], "options": {"forwarders": []}})
+    assert _settings_values(calls, "dnssecValidation") == []
+
+
+def _zone(name: str, ztype: str = "primary") -> dict[str, Any]:
+    z: dict[str, Any] = {"name": name, "type": ztype, "records": []}
+    if ztype in ("secondary", "stub"):
+        z["masters"] = ["192.0.2.1"]
+    if ztype == "forward":
+        z["forwarders"] = ["192.0.2.53"]
+    return z
+
+
+def _query_access_calls(calls: Any) -> dict[str, dict[str, Any]]:
+    return {
+        c[3]["zone"]: c[3]
+        for c in calls
+        if c[2] == "zones/options/set" and "queryAccess" in c[3]
+    }
+
+
+def test_allow_query_becomes_a_per_zone_network_acl(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path,
+        {
+            "zones": [_zone("a.test"), _zone("b.test", "secondary"), _zone("c.test", "forward")],
+            "options": {"allow_query": ["!10.1.0.0/16", "10.0.0.0/8", "2001:db8::/32"]},
+        },
+    )
+    sent = _query_access_calls(calls)
+    # BIND's options-level allow-query covers a conditional-forward zone too.
+    assert set(sent) == {"a.test", "b.test", "c.test"}
+    for params in sent.values():
+        assert params["queryAccess"] == "UseSpecifiedNetworkACL"
+        assert params["queryAccessNetworkACL"] == "!10.1.0.0/16,10.0.0.0/8,2001:db8::/32"
+
+
+def test_allow_query_any_clears_an_earlier_restriction(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path, {"zones": [_zone("a.test")], "options": {"allow_query": ["any"]}}
+    )
+    p = _query_access_calls(calls)["a.test"]
+    assert p["queryAccess"] == "Allow"
+    assert p["queryAccessNetworkACL"] == ""
+
+
+def test_allow_query_none_denies(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path, {"zones": [_zone("a.test")], "options": {"allow_query": ["none"]}}
+    )
+    assert _query_access_calls(calls)["a.test"]["queryAccess"] == "Deny"
+
+
+def test_allow_query_none_inside_a_list_denies_everyone(tmp_path: Path) -> None:
+    # BIND compiles ``none`` as ``!any`` (aclconf.c: "none == !any"), so a
+    # ``none`` ahead of an address admits nobody. Dropping it as a no-op
+    # would open the zone to 10/8.
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [_zone("a.test")], "options": {"allow_query": ["none", "10.0.0.0/8"]}},
+    )
+    got = _query_access_calls(calls)["a.test"]
+    acl = [a for a in str(got.get("queryAccessNetworkACL") or "").split(",") if a]
+    # Nobody admitted: either Deny outright, or an ACL holding only denies.
+    assert got["queryAccess"] == "Deny" or all(a.startswith("!") for a in acl)
+
+
+def test_allow_query_address_before_none_keeps_only_that_address(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [_zone("a.test")], "options": {"allow_query": ["10.0.0.0/8", "none", "any"]}},
+    )
+    got = _query_access_calls(calls)["a.test"]
+    assert got["queryAccess"] == "UseSpecifiedNetworkACL"
+    assert got["queryAccessNetworkACL"] == "10.0.0.0/8,!0.0.0.0/0,!::/0"
+
+
+def test_allow_query_any_inside_a_list_keeps_the_exception(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [_zone("a.test")], "options": {"allow_query": ["!192.0.2.0/24", "any"]}},
+    )
+    assert (
+        _query_access_calls(calls)["a.test"]["queryAccessNetworkACL"]
+        == "!192.0.2.0/24,0.0.0.0/0,::/0"
+    )
+
+
+def test_untranslatable_allow_query_is_reported_and_never_guessed(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    calls = _install_fake_request(d, lambda *_: {"status": "ok", "response": {"records": []}})
+    d.render(
+        {
+            "zones": [_zone("a.test"), _zone("b.test"), _zone("c.test", "secondary")],
+            "options": {"allow_query": ["localnets"]},
+        }
+    )
+    d.validate()
+    d.swap_and_reload()
+    assert _query_access_calls(calls) == {}
+    # One refusal for the one group option, naming how many zones it left
+    # alone, not one per zone burying every other refusal.
+    refused = [r for r in d._refused_zones if "allow_query" in r]
+    assert len(refused) == 1, d._refused_zones
+    assert "3 zone(s)" in refused[0]
+
+
+def test_a_clean_apply_after_an_untranslatable_one_reports_nothing(tmp_path: Path) -> None:
+    """The once-per-apply collector is reset, so fixing the option clears it."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    _install_fake_request(d, lambda *_: {"status": "ok", "response": {"records": []}})
+    for allow_query in (["localnets"], ["10.0.0.0/8"]):
+        d.render({"zones": [_zone("a.test")], "options": {"allow_query": allow_query}})
+        d.validate()
+        d.swap_and_reload()
+    assert not [r for r in d._refused_zones if "allow_query" in r]
+
+
+# ── Forward zones: protocol, every upstream, DNSSEC (#1764) ─────────────
+
+
+@pytest.mark.parametrize(
+    "address,protocol",
+    [
+        ("8.8.8.8", "Udp"),
+        ("dns.example", "Udp"),
+        ("8.8.8.8:5353", "Udp"),
+        ("https://dns.quad9.net/dns-query", "Https"),
+        ("https://cloudflare-dns.com/dns-query (1.1.1.1)", "Https"),
+        ("tls://dns.quad9.net", "Tls"),
+        ("dns.quad9.net:853", "Tls"),
+        ("dns.quad9.net:853 (9.9.9.9)", "Tls"),
+        ("[2606:4700:4700::1111]:853", "Tls"),
+        ("quic://dns.adguard.com", "Quic"),
+        ("tcp://10.0.0.1", "Tcp"),
+        ("2606:4700:4700::1111", "Udp"),
+    ],
+)
+def test_forwarder_protocol_is_derived_from_the_address(address: str, protocol: str) -> None:
+    from spatium_dns_agent.drivers.technitium import _forwarder_protocol
+
+    assert _forwarder_protocol(address) == protocol
+
+
+def test_forward_zone_create_sends_protocol_and_dnssec(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._ensure_zone_exists(
+        "t",
+        {"zone": "f.test", "type": "Forwarder",
+         "forwarders": ["https://dns.quad9.net/dns-query"], "dnssec_validation": True},
+    )
+    params = calls[0][3]
+    assert params["forwarder"] == "https://dns.quad9.net/dns-query"
+    assert params["protocol"] == "Https"
+    assert params["dnssecValidation"] == "true"
+
+
+def test_forward_zone_dnssec_off_is_sent_as_false(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._ensure_zone_exists(
+        "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["8.8.8.8"],
+              "dnssec_validation": False},
+    )
+    assert calls[0][3]["dnssecValidation"] == "false"
+
+
+def test_forward_zone_extra_upstreams_keep_protocol_priority_and_dnssec(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _forwarding_daemon())
+    d._ensure_zone_exists(
+        "t",
+        {"zone": "f.test", "type": "Forwarder", "dnssec_validation": True,
+         "forwarders": ["10.0.0.1", "tls://dns.quad9.net", "10.0.0.3"]},
+    )
+    adds = [c[3] for c in calls if c[2] == "zones/records/add"]
+    assert [(a["forwarder"], a["protocol"], a["forwarderPriority"]) for a in adds] == [
+        ("tls://dns.quad9.net", "Tls", "1"),
+        ("10.0.0.3", "Udp", "2"),
+    ]
+    assert all(a["dnssecValidation"] == "true" for a in adds)
+
+
+def _existing_forward_zone(live: list[dict[str, Any]]):
+    def responder(path, params, n):
+        if path == "zones/create":
+            return {"status": "error", "errorMessage": f"Zone already exists: {params['zone']}"}
+        if path == "zones/options/get":
+            return {"status": "ok", "response": {"name": params["zone"], "type": "Forwarder"}}
+        if path == "zones/records/get":
+            return {"status": "ok", "response": {"records": [
+                {"name": "f.test", "type": "FWD", "rData": r} for r in live]}}
+        return {"status": "ok"}
+    return responder
+
+
+def test_existing_forward_zone_converges_to_the_bundle_upstreams(tmp_path: Path) -> None:
+    """Missing upstream added, a changed priority updated in place, a stale
+    one deleted last; an unchanged one is left alone."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _existing_forward_zone([
+        {"protocol": "Udp", "forwarder": "10.0.0.1", "priority": 0, "dnssecValidation": True},
+        {"protocol": "Udp", "forwarder": "10.0.0.2", "priority": 0, "dnssecValidation": True},
+        {"protocol": "Udp", "forwarder": "10.0.0.9", "priority": 3, "dnssecValidation": True},
+    ]))
+    d._ensure_zone_exists(
+        "t",
+        {"zone": "f.test", "type": "Forwarder", "dnssec_validation": True,
+         "forwarders": ["10.0.0.1", "10.0.0.2", "tls://dns.example"]},
+    )
+    writes = [(c[2], c[3]) for c in calls if c[2].startswith("zones/records/") and c[2] != "zones/records/get"]
+    assert [w[0] for w in writes] == [
+        "zones/records/update", "zones/records/add", "zones/records/delete"]
+    assert writes[0][1]["forwarder"] == "10.0.0.2" and writes[0][1]["forwarderPriority"] == "1"
+    assert writes[1][1]["forwarder"] == "tls://dns.example" and writes[1][1]["protocol"] == "Tls"
+    assert writes[2][1]["forwarder"] == "10.0.0.9"
+    assert not any(c[2] == "zones/options/set" for c in calls)
+
+
+def test_existing_forward_zone_in_sync_writes_nothing(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, _existing_forward_zone([
+        {"protocol": "Https", "forwarder": "https://dns.quad9.net/dns-query",
+         "priority": 0, "dnssecValidation": True},
+    ]))
+    d._ensure_zone_exists(
+        "t",
+        {"zone": "f.test", "type": "Forwarder", "dnssec_validation": True,
+         "forwarders": ["https://dns.quad9.net/dns-query"]},
+    )
+    assert [c[2] for c in calls] == ["zones/create", "zones/options/get", "zones/records/get"]
+
+
+def test_render_ships_the_group_dnssec_setting_to_forward_zones(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [{"name": "f.test.", "type": "forward", "forwarders": ["8.8.8.8"]}],
+         "options": {"dnssec_validation": "no"}},
+    )
+    create = [c for c in calls if c[2] == "zones/create" and c[3].get("zone") == "f.test"][0]
+    assert create[3]["dnssecValidation"] == "false"
+
+
+def _technitium_like_daemon():
+    """A fake daemon that keeps FWD records the way Technitium does
+    (``DnsForwarderRecordData``, v15.4.0): the forwarder string is stored
+    verbatim and compared case-insensitively, identity is (protocol,
+    forwarder), an update finds the old record by ``protocol`` +
+    ``forwarder`` and ``newProtocol`` / ``newForwarder`` default to them,
+    and ``zones/create`` of an existing zone answers "Zone already exists"."""
+    zones: dict[str, list[dict[str, Any]]] = {}
+    types: dict[str, str] = {}
+
+    def find(zone, protocol, forwarder):
+        for r in zones.get(zone, []):
+            if r["protocol"] == protocol and r["forwarder"].lower() == forwarder.lower():
+                return r
+        return None
+
+    def responder(path, params, n):
+        zone = params.get("zone")
+        if path == "zones/create":
+            if zone in zones:
+                return {"status": "error", "errorMessage": f"Zone already exists: {zone}"}
+            zones[zone] = [{"protocol": params.get("protocol", "Udp"),
+                            "forwarder": params["forwarder"], "priority": 0,
+                            "dnssecValidation": params.get("dnssecValidation") == "true"}]
+            types[zone] = params.get("type", "Primary")
+        elif path == "zones/options/get":
+            return {"status": "ok", "response": {"name": zone,
+                                                 "type": types.get(zone, "Forwarder")}}
+        elif path == "zones/convert":
+            # Primary -> Forwarder keeps the zone but it has no FWD record.
+            types[zone] = params["type"]
+        elif path == "zones/records/get":
+            return {"status": "ok", "response": {"records": [
+                {"name": zone, "type": "FWD", "rData": dict(r)} for r in zones.get(zone, [])]}}
+        elif path == "zones/records/add":
+            protocol = params.get("protocol", "Udp")
+            if find(zone, protocol, params["forwarder"]) is not None:
+                return {"status": "error",
+                        "errorMessage": "Cannot add record: record already exists."}
+            zones[zone].append({"protocol": protocol, "forwarder": params["forwarder"],
+                                "priority": int(params.get("forwarderPriority", 0)),
+                                "dnssecValidation": params.get("dnssecValidation") == "true"})
+        elif path == "zones/records/update":
+            protocol = params.get("protocol", "Udp")
+            old = find(zone, protocol, params["forwarder"])
+            if old is None:
+                return {"status": "error", "errorMessage": "no such record"}
+            old.update({"protocol": params.get("newProtocol", protocol),
+                        "forwarder": params.get("newForwarder", params["forwarder"]),
+                        "priority": int(params.get("forwarderPriority", 0)),
+                        "dnssecValidation": params.get("dnssecValidation") == "true"})
+        elif path == "zones/records/delete":
+            old = find(zone, params.get("protocol", "Udp"), params["forwarder"])
+            if old is None:
+                return {"status": "error",
+                        "errorMessage": "Cannot delete record: no such record exists."}
+            zones[zone].remove(old)
+        return {"status": "ok"}
+
+    responder.types = types  # type: ignore[attr-defined]
+    return responder, zones
+
+
+@pytest.mark.parametrize(
+    "forwarders",
+    [
+        ["https://dns.quad9.net/dns-query", "9.9.9.9", "tls://dns.quad9.net"],
+        ["Dns.Quad9.NET:853 (9.9.9.9)", "10.0.0.1", "10.0.0.1"],
+        ["10.0.0.1@5353", "2001:db8::53"],
+    ],
+)
+def test_second_forward_zone_pass_against_a_technitium_like_daemon_writes_nothing(
+    tmp_path: Path, forwarders: list[str]
+) -> None:
+    """Every structural pass re-runs the zone sync: the second one must make
+    zero writes, or each apply churns the zone's upstreams (#1764)."""
+    from spatium_dns_agent.drivers.technitium import _zone_forwarder
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    responder, zones = _technitium_like_daemon()
+    calls = _install_fake_request(d, responder)
+    entry = {"zone": "f.test", "type": "Forwarder", "dnssec_validation": True,
+             "forwarders": [_zone_forwarder(f, {}) for f in forwarders]}
+    d._ensure_zone_exists("t", entry)
+    assert len(zones["f.test"]) == len({(f.lower()) for f in entry["forwarders"]})
+    calls.clear()
+    d._ensure_zone_exists("t", entry)
+    assert [c[2] for c in calls] == ["zones/create", "zones/options/get", "zones/records/get"]
+
+
+def test_forward_zone_upgraded_from_udp_records_converges_once(tmp_path: Path) -> None:
+    """A zone an older agent created (DoH URL stored as Udp) gets the Https
+    record and loses the Udp one, then stays put."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    responder, zones = _technitium_like_daemon()
+    zones["f.test"] = [{"protocol": "Udp", "forwarder": "https://dns.quad9.net/dns-query",
+                        "priority": 0, "dnssecValidation": False}]
+    calls = _install_fake_request(d, responder)
+    entry = {"zone": "f.test", "type": "Forwarder", "dnssec_validation": True,
+             "forwarders": ["https://dns.quad9.net/dns-query"]}
+    d._ensure_zone_exists("t", entry)
+    assert zones["f.test"] == [{"protocol": "Https",
+                                "forwarder": "https://dns.quad9.net/dns-query",
+                                "priority": 0, "dnssecValidation": True}]
+    calls.clear()
+    d._ensure_zone_exists("t", entry)
+    assert [c[2] for c in calls] == ["zones/create", "zones/options/get", "zones/records/get"]
+
+
+def test_primary_converted_to_forwarder_gets_every_upstream_then_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """#1457 + #1764: a Primary switched to forward is converted in place and
+    gets the bundle's full upstream set (protocol, priority, DNSSEC), not just
+    the first one as Udp; the next pass converts nothing and writes nothing."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    responder, zones = _technitium_like_daemon()
+    zones["f.test"] = []
+    responder.types["f.test"] = "Primary"  # type: ignore[attr-defined]
+    calls = _install_fake_request(d, responder)
+    entry = {"zone": "f.test", "type": "Forwarder", "dnssec_validation": True,
+             "forwarders": ["10.0.0.1", "tls://dns.quad9.net"]}
+    d._ensure_zone_exists("t", entry)
+    paths = [c[2] for c in calls]
+    assert paths.index("zones/convert") < paths.index("zones/records/add")
+    assert zones["f.test"] == [
+        {"protocol": "Udp", "forwarder": "10.0.0.1", "priority": 0, "dnssecValidation": True},
+        {"protocol": "Tls", "forwarder": "tls://dns.quad9.net", "priority": 1,
+         "dnssecValidation": True},
+    ]
+    calls.clear()
+    d._ensure_zone_exists("t", entry)
+    assert [c[2] for c in calls] == ["zones/create", "zones/options/get", "zones/records/get"]
+
+
+@pytest.mark.parametrize(
+    "entry,options,expected",
+    [
+        ("9.9.9.9", {}, "9.9.9.9"),
+        ("10.0.0.1@5353", {}, "10.0.0.1:5353"),
+        ("9.9.9.9", {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"},
+         "tls://dns.quad9.net (9.9.9.9)"),
+        ("2620:fe::fe", {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"},
+         "tls://dns.quad9.net ([2620:fe::fe])"),
+        ("9.9.9.9", {"forward_transport": "https", "forward_tls_hostname": "dns.quad9.net"},
+         "https://dns.quad9.net/dns-query (9.9.9.9)"),
+        ("9.9.9.9", {"forward_transport": "quic", "forward_tls_hostname": "dns.quad9.net"},
+         "quic://dns.quad9.net (9.9.9.9)"),
+        # The operator's own scheme / port / name is kept.
+        ("https://dns.google/dns-query",
+         {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"},
+         "https://dns.google/dns-query"),
+        ("10.0.0.1@5353", {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"},
+         "10.0.0.1:5353"),
+        ("dns.internal", {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"},
+         "dns.internal"),
+        # No hostname: nothing to validate against, left as written.
+        ("9.9.9.9", {"forward_transport": "tls"}, "9.9.9.9"),
+    ],
+)
+def test_zone_forwarders_inherit_the_group_encrypted_transport(
+    entry: str, options: dict[str, Any], expected: str
+) -> None:
+    """BIND9 applies the group's forward transport to per-zone upstreams
+    (#50) and the Options tab says so; a plain-IP Technitium zone upstream in
+    a DoT group used to go out as cleartext UDP."""
+    from spatium_dns_agent.drivers.technitium import _forwarder_protocol, _zone_forwarder
+
+    out = _zone_forwarder(entry, options)
+    assert out == expected
+    if "://" not in entry and "://" in out:
+        assert _forwarder_protocol(out) == _FORWARDER_PROTOCOLS_FOR_TEST[
+            options["forward_transport"]]
+
+
+_FORWARDER_PROTOCOLS_FOR_TEST = {"tls": "Tls", "https": "Https", "quic": "Quic"}
+
+
+def test_render_pairs_zone_forwarders_with_the_group_tls_name(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [{"name": "f.test.", "type": "forward", "forwarders": ["9.9.9.9"]}],
+         "options": {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net",
+                     "forwarders": ["9.9.9.9"]}},
+    )
+    create = [c for c in calls if c[2] == "zones/create" and c[3].get("zone") == "f.test"][0]
+    assert create[3]["forwarder"] == "tls://dns.quad9.net (9.9.9.9)"
+    assert create[3]["protocol"] == "Tls"
+
+
+# ── Zone transfer ACL grammar, secondary TSIG, TSIG algorithms (#1765) ──
+
+
+def _xfer(allow_transfer: Any, **over: Any) -> dict[str, Any]:
+    keys = over.pop("tsig_keys", [{"name": "k1", "secret": "s", "algorithm": "hmac-sha256"}])
+    return _zone_options_payload(
+        "Primary",
+        _zone_bundle(tsig_keys=keys, options={"allow_transfer": allow_transfer}, **over),
+    )
+
+
+def test_a_negation_beside_any_keeps_the_exclusion() -> None:
+    """``["!10.1.0.0/16", "any"]`` used to become ``Allow``: everyone,
+    the excluded range included."""
+    out = _xfer(["!10.1.0.0/16", "any"])
+    assert out["zoneTransfer"] == "UseSpecifiedNetworkACL"
+    assert out["zoneTransferNetworkACL"] == ["!10.1.0.0/16", "0.0.0.0/0", "::/0"]
+
+
+def test_a_key_element_becomes_the_key_set_not_an_acl() -> None:
+    out = _xfer(['key "xfer"'], tsig_keys=[
+        {"name": "xfer", "secret": "s", "algorithm": "hmac-sha256"},
+        {"name": "other", "secret": "s", "algorithm": "hmac-sha256"},
+    ])
+    assert out["zoneTransfer"] == "Allow"
+    assert "zoneTransferNetworkACL" not in out
+    assert out["zoneTransferTsigKeyNames"] == ["xfer"]
+    assert "_unapplied" not in out
+
+
+def test_exclusions_before_a_key_stay_in_the_acl_with_the_key() -> None:
+    out = _xfer(["!10.1.0.0/16", "key k1"])
+    assert out["zoneTransfer"] == "UseSpecifiedNetworkACL"
+    assert out["zoneTransferNetworkACL"] == ["!10.1.0.0/16", "0.0.0.0/0", "::/0"]
+    assert out["zoneTransferTsigKeyNames"] == ["k1"]
+
+
+def test_localhost_is_loopback_and_a_named_acl_is_expanded() -> None:
+    out = _zone_options_payload(
+        "Primary",
+        _zone_bundle(
+            options={"allow_transfer": ["localhost", "office", "!192.0.2.0/24", "any"]},
+            acls=[
+                {
+                    "name": "office",
+                    "entries": [
+                        {"value": "10.0.0.0/8", "negate": False},
+                        {"value": "10.9.0.0/16", "negate": True},
+                    ],
+                }
+            ],
+        ),
+    )
+    assert out["zoneTransferNetworkACL"] == [
+        "127.0.0.1/32",
+        "::1/128",
+        "10.0.0.0/8",
+        "!10.9.0.0/16",
+        "!192.0.2.0/24",
+        "0.0.0.0/0",
+        "::/0",
+    ]
+
+
+@pytest.mark.parametrize(
+    "elements",
+    [
+        ["localnets"],
+        ["undefined-acl"],
+        ["10.0.0.0/8", "key k1"],  # OR in BIND, AND here
+        ["key k1", "!10.1.0.0/16"],  # the key lets it through first in BIND
+        ["!key k1"],
+        ["!localhost", "any"],  # the server's own addresses are not just loopback
+    ],
+)
+def test_untranslatable_transfer_lists_are_left_alone_and_reported(elements: list[str]) -> None:
+    out = _xfer(elements)
+    assert not {k for k in out if k.startswith("zoneTransfer")}
+    assert [u["kind"] for u in out["_unapplied"]] == ["allow_transfer"]
+
+
+def test_a_negated_acl_with_a_negation_inside_is_refused() -> None:
+    out = _zone_options_payload(
+        "Primary",
+        _zone_bundle(
+            options={"allow_transfer": ["!office", "any"]},
+            acls=[{"name": "office", "entries": [{"value": "10.0.0.0/8", "negate": True}]}],
+        ),
+    )
+    assert out["_unapplied"][0]["kind"] == "allow_transfer"
+
+
+def test_a_key_the_daemon_does_not_hold_denies_instead_of_opening() -> None:
+    out = _xfer(["key gone"])
+    assert out["zoneTransfer"] == "Deny"
+    assert out["zoneTransferTsigKeyNames"] == []
+    assert [u["kind"] for u in out["_unapplied"]] == ["allow_transfer_key"]
+
+
+def test_untranslatable_transfer_is_an_apply_failure_and_sends_no_transfer_options(
+    tmp_path: Path,
+) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    calls = _install_fake_request(d, lambda *_: {"status": "ok", "response": {"records": []}})
+    d.render(
+        {
+            "zones": [_zone("a.test"), {**_zone("b.test"), "allow_transfer": ["localnets"]}],
+            "options": {"allow_transfer": ["10.0.0.0/8"]},
+            "tsig_keys": [],
+        }
+    )
+    d.validate()
+    d.swap_and_reload()
+    sent = {
+        c[3]["zone"]: c[3]
+        for c in calls
+        if c[2] == "zones/options/set" and "queryAccess" in c[3]
+    }
+    assert sent["a.test"]["zoneTransferNetworkACL"] == "10.0.0.0/8"
+    assert "zoneTransfer" not in sent["b.test"]
+    assert [r for r in d._refused_zones if "allow_transfer" in r and "1 zone(s)" in r]
+
+
+def test_query_access_expands_named_acls_too() -> None:
+    from spatium_dns_agent.drivers.technitium import _query_access
+
+    acls = {"office": [("10.0.0.0/8", False)]}
+    assert _query_access(["office"], acls) == ("UseSpecifiedNetworkACL", ["10.0.0.0/8"])
+    assert _query_access(["office"]) is None  # undefined here
+    assert _query_access(["key k1"], acls) is None  # a key means nothing to a query ACL
+
+
+@pytest.mark.parametrize(
+    ("elements", "expected"),
+    [
+        # BIND compiles ``none`` as ``!any``: it denies everyone, so nothing
+        # after it can grant.
+        (["none", "10.0.0.0/8"], ("UseSpecifiedNetworkACL", ["!0.0.0.0/0", "!::/0"])),
+        (
+            ["10.0.0.0/8", "none", "192.0.2.0/24"],
+            ("UseSpecifiedNetworkACL", ["10.0.0.0/8", "!0.0.0.0/0", "!::/0"]),
+        ),
+        # ``!none`` is ``any``.
+        (["!none"], ("Allow", [])),
+        (
+            ["!10.1.0.0/16", "!none"],
+            ("UseSpecifiedNetworkACL", ["!10.1.0.0/16", "0.0.0.0/0", "::/0"]),
+        ),
+    ],
+)
+def test_none_is_a_deny_all_match_as_in_bind(elements: list[str], expected: Any) -> None:
+    from spatium_dns_agent.drivers.technitium import _query_access
+
+    assert _query_access(elements) == expected
+
+
+def test_none_before_a_key_denies_and_after_it_is_harmless() -> None:
+    from spatium_dns_agent.drivers.technitium import _transfer_access
+
+    # Nothing after ``none`` is reachable, the key included: deny everyone.
+    mode, acl, _, _ = _transfer_access(["none", "key k1"], ["k1"])
+    assert (mode, acl) == ("UseSpecifiedNetworkACL", ["!0.0.0.0/0", "!::/0"])
+    assert _transfer_access(["key k1", "none"], ["k1"]) == ("Allow", [], ["k1"], [])
+
+
+def test_an_ipv4_mapped_prefix_is_refused() -> None:
+    from spatium_dns_agent.drivers.technitium import _transfer_access
+
+    # Technitium matches a mapped client as IPv4, so this exclusion would never fire.
+    assert _transfer_access(["!::ffff:10.1.0.0/112", "any"], []) is None
+
+
+# Secondary TSIG
+
+
+def _secondary_calls(tmp_path: Path, bundle: dict[str, Any], responder: Any = None):
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    d.daemon_running = lambda: True  # type: ignore[method-assign]
+    d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
+    calls = _install_fake_request(
+        d, responder or (lambda *_: {"status": "ok", "response": {"records": []}})
+    )
+    d.render(bundle)
+    d.validate()
+    d.swap_and_reload()
+    return d, calls
+
+
+_MASTER_KEY = {"name": "spatium-primary-grp", "secret": "c2VjcmV0", "algorithm": "hmac-sha256"}
+
+
+def test_a_secondary_is_created_with_its_masters_transfer_key(tmp_path: Path) -> None:
+    sec = {**_zone("s.test", "secondary"), "masters_tsig_key": "spatium-primary-grp"}
+    stub = {**_zone("t.test", "stub"), "masters_tsig_key": "spatium-primary-grp"}
+    _, calls = _secondary_calls(
+        tmp_path,
+        {"zones": [sec, stub], "options": {}, "tsig_keys": [_MASTER_KEY]},
+    )
+    created = {c[3]["zone"]: c[3] for c in calls if c[2] == "zones/create"}
+    assert created["s.test"]["tsigKeyName"] == "spatium-primary-grp"
+    # A Stub transfers nothing, and Technitium takes no key for one.
+    assert "tsigKeyName" not in created["t.test"]
+    # The key is installed before the zone refers to it.
+    keys_call = next(c for c in calls if c[2] == "settings/set" and "tsigKeys" in c[3])
+    assert "spatium-primary-grp|c2VjcmV0|hmac-sha256" in keys_call[3]["tsigKeys"]
+    assert calls.index(keys_call) < calls.index(
+        next(c for c in calls if c[2] == "zones/create")
+    )
+
+
+def test_an_existing_secondary_gets_the_key_through_options(tmp_path: Path) -> None:
+    sec = {**_zone("s.test", "secondary"), "masters_tsig_key": "spatium-primary-grp"}
+
+    def respond(path: str, params: dict[str, Any], n: int) -> dict[str, Any]:
+        if path == "zones/create":
+            return {"status": "error", "errorMessage": "Zone already exists: s.test"}
+        return {"status": "ok", "response": {"records": []}}
+
+    _, calls = _secondary_calls(
+        tmp_path,
+        {"zones": [sec], "options": {}, "tsig_keys": [_MASTER_KEY]},
+        respond,
+    )
+    reapply = [
+        c[3]
+        for c in calls
+        if c[2] == "zones/options/set" and "primaryNameServerAddresses" in c[3]
+    ]
+    assert reapply[0]["primaryZoneTransferTsigKeyName"] == "spatium-primary-grp"
+
+
+def test_a_secondary_without_a_managed_master_sends_no_key(tmp_path: Path) -> None:
+    _, calls = _secondary_calls(
+        tmp_path,
+        {"zones": [_zone("s.test", "secondary")], "options": {}, "tsig_keys": []},
+    )
+    create = next(c[3] for c in calls if c[2] == "zones/create")
+    assert "tsigKeyName" not in create
+
+
+def test_a_transfer_key_the_daemon_cannot_install_is_not_sent(tmp_path: Path) -> None:
+    sec = {**_zone("s.test", "secondary"), "masters_tsig_key": "weird"}
+    bad = {"name": "weird", "secret": "s", "algorithm": "hmac-sha3"}
+    d, calls = _secondary_calls(
+        tmp_path,
+        {"zones": [sec], "options": {}, "tsig_keys": [bad]},
+    )
+    assert "tsigKeyName" not in next(c[3] for c in calls if c[2] == "zones/create")
+    assert any("weird" in r and "hmac-sha3" in r for r in d._refused_zones)
+    # ...and the unsigned secondary is reported, not left to expire quietly.
+    assert any("s.test" in r and "refused" in r for r in d._refused_zones)
+
+
+def test_a_secondary_whose_master_shares_no_key_is_an_apply_failure(tmp_path: Path) -> None:
+    """The control plane names no key when the master's group shares none with
+    this one (it never ships another group's secret, #1765); the agent says the
+    transfer will be refused rather than reporting success."""
+    sec = {**_zone("s.test", "secondary"), "masters_tsig_unresolved": True}
+    d, calls = _secondary_calls(tmp_path, {"zones": [sec], "options": {}, "tsig_keys": []})
+    assert "tsigKeyName" not in next(c[3] for c in calls if c[2] == "zones/create")
+    assert any("s.test" in r and "no key it grants" in r for r in d._refused_zones)
+
+
+def test_the_catalog_consumer_signs_with_its_producers_key(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog(
+        "t",
+        {
+            "mode": "consumer",
+            "zone_name": "cat.test.",
+            "producer_addr": "192.0.2.9",
+            "producer_tsig_key": "k1",
+        },
+        [],
+    )
+    assert calls[0][3]["tsigKeyName"] == "k1"
+
+
+# TSIG algorithms
+
+
+@pytest.mark.parametrize("algorithm", ["hmac-sha224", "hmac-sha384-192", "hmac-sha512-256"])
+def test_every_algorithm_technitium_accepts_is_installed(tmp_path: Path, algorithm: str) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._sync_tsig_keys("t", [{"name": "k", "secret": "s", "algorithm": algorithm}])
+    assert calls[0][3]["tsigKeys"] == f"k|s|{algorithm}"
+
+
+def test_a_skipped_key_is_an_apply_failure_and_is_not_pinned(tmp_path: Path) -> None:
+    keys = [
+        {"name": "bad", "secret": "s", "algorithm": "hmac-sha3"},
+        {"name": "good", "secret": "s", "algorithm": "hmac-sha256"},
+    ]
+    d, calls = _secondary_calls(
+        tmp_path,
+        {"zones": [_zone("a.test")], "options": {"allow_transfer": ["any"]}, "tsig_keys": keys},
+    )
+    pinned = next(
+        c[3]["zoneTransferTsigKeyNames"] for c in calls if c[2] == "zones/options/set"
+        and "zoneTransferTsigKeyNames" in c[3]
+    )
+    assert pinned == "good"
+    assert any("bad" in r and "hmac-sha3" in r for r in d._refused_zones)
+
+
+# ── #1759: one target rule for every name-valued type ───────────────────
+
+_NAME_PARAM = {
+    "CNAME": "cname",
+    "DNAME": "dname",
+    "NS": "nameServer",
+    "PTR": "ptrName",
+    "MX": "exchange",
+    "SRV": "target",
+}
+_NAME_CASES = [
+    ("web", "web.up.test"),
+    ("web.sub", "web.sub.up.test"),
+    ("web.example.net.", "web.example.net"),
+    ("localhost.", "localhost"),
+    ("@", "up.test"),
+    (".", "."),
+]
+
+
+@pytest.mark.parametrize("rtype", sorted(_NAME_PARAM))
+@pytest.mark.parametrize(("value", "sent"), _NAME_CASES)
+def test_name_targets_follow_the_zone_file_rule(rtype: str, value: str, sent: str) -> None:
+    got = _record_params(rtype, value, {"priority": 10, "weight": 1, "port": 1}, None, "up.test")
+    assert got[_NAME_PARAM[rtype]] == sent
+
+
+@pytest.mark.parametrize(
+    ("value", "sent"),
+    [
+        ('100 10 "S" "SIP+D2U" "" _sip._udp', "_sip._udp.up.test"),
+        ('100 10 "S" "SIP+D2U" "" _sip._udp.example.net.', "_sip._udp.example.net"),
+        ('100 10 "S" "SIP+D2U" "" @', "up.test"),
+        ('100 10 "" "" "!^.*$!x!" .', "."),
+    ],
+)
+def test_naptr_replacement_follows_the_rule(value: str, sent: str) -> None:
+    got = _record_params("NAPTR", value, {}, None, "up.test")
+    assert got["naptrReplacement"] == sent
+
+
+def test_a_bundle_without_the_marker_keeps_the_absolute_reading() -> None:
+    # No ``name_target_rule``: a dot-less target is absolute, as the renderer
+    # that wrote the bundle meant.
+    assert _record_params("CNAME", "web", {}, None, None) == {"cname": "web"}
+    assert _record_params("MX", "mail.example.net", {}, None, None)["exchange"] == "mail.example.net"
+
+
+def test_read_back_root_compares_equal_to_a_root_target() -> None:
+    sent = _record_params("MX", ".", {"priority": 0}, None, "up.test")
+    back = _normalize_rdata("MX", {"exchange": ".", "preference": 0})
+    assert sent["exchange"] == back["exchange"] == "."
+    naptr = _normalize_rdata("NAPTR", {"order": 1, "preference": 1, "replacement": "Web.Example.Net"})
+    assert naptr["naptrReplacement"] == "web.example.net"
+
+
+def _render_cname(tmp_path: Path, value: str, bundle_extra: dict[str, Any]) -> str:
+    import json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render(
+        {
+            "zones": [
+                {
+                    "name": "up.test.",
+                    "type": "primary",
+                    "ttl": 3600,
+                    "records": [{"name": "www", "type": "CNAME", "value": value, "ttl": 300}],
+                }
+            ],
+            **bundle_extra,
+        }
+    )
+    payload = json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
+    (rec,) = [r for r in payload[0]["records"] if r["type"] == "CNAME"]
+    return str(rec["cname"])
+
+
+def test_replaying_a_pre_1759_bundle_keeps_a_dotless_cname_absolute(tmp_path: Path) -> None:
+    # A bundle cached by a #1513 control plane has the SVCB marker and not the
+    # new one: its CNAME targets keep the reading they were rendered with.
+    assert _render_cname(tmp_path, "web", {}) == "web"
+    assert _render_cname(tmp_path, "web", {"svcb_target_rule": SVCB_TARGET_RULE_ZONE_FILE}) == "web"
+    assert (
+        _render_cname(tmp_path, "web", {"name_target_rule": NAME_TARGET_RULE_ZONE_FILE})
+        == "web.up.test"
+    )
+
+
+def test_record_ops_follow_the_name_rule_of_the_applied_bundle(tmp_path: Path) -> None:
+    def _op_target(extra: dict[str, Any]) -> str:
+        d = TechnitiumDriver(state_dir=tmp_path)
+        _seed_token(d)
+        d.render({"zones": [], **extra})
+        calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+        d.apply_record_op(
+            {
+                "zone_name": "up.test.",
+                "op": "create",
+                "record": {"name": "www", "type": "CNAME", "value": "web", "ttl": 300},
+            }
+        )
+        return str(calls[-1][3]["cname"])
+
+    assert _op_target({}) == "web"
+    assert _op_target({"name_target_rule": NAME_TARGET_RULE_ZONE_FILE}) == "web.up.test"
+
+
+def test_render_reads_the_name_rule_from_the_bundle(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render({"zones": [], "name_target_rule": NAME_TARGET_RULE_ZONE_FILE})
+    assert d._name_zone_file_targets
+    d.render({"zones": []})
+    assert not d._name_zone_file_targets
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Cannot add record: CNAME record already exists for the same name.",
+        # A different CNAME at the name: reconcile only adds what the server
+        # lacks, so this answer cannot mean ours is already there.
+        "Record already exists. Use overwrite option if you wish to overwrite existing record.",
+    ],
+)
+def test_reconcile_add_conflict_is_an_apply_failure(tmp_path: Path, message: str) -> None:
+    """#1770: the conflict refusal must be recorded as an apply failure."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path == "zones/records/get":
+            return {"status": "ok", "response": {"records": []}}
+        if path == "zones/records/add":
+            return {"status": "error", "errorMessage": message}
+        return {"status": "ok"}
+
+    _install_fake_request(d, responder)
+    d._apply_failures = []
+    d._reconcile_zones(
+        "t",
+        [{"zone": "z.test", "type": "Primary", "records": [
+            {"domain": "www.z.test", "type": "CNAME", "ttl": 300, "cname": "t.z.test"}]}],
+    )
+    assert any("already exists" in f for f in d._apply_failures)
+
+
+def _fwd_noop_daemon(add_error: str):
+    """Live apex holds one stale upstream; every FWD add answers ``add_error``."""
+
+    def responder(path, params, n):
+        if path == "zones/records/get":
+            return {"status": "ok", "response": {"records": [
+                {"name": "f.test", "type": "FWD",
+                 "rData": {"protocol": "Udp", "forwarder": "192.0.2.9", "priority": 0}}]}}
+        if path == "zones/records/add":
+            return {"status": "error", "errorMessage": add_error}
+        return {"status": "ok"}
+
+    return responder
+
+
+def test_forwarder_add_exact_noop_counts_as_applied(tmp_path: Path) -> None:
+    """#1770 x #1764: Technitium's exact "record already exists" says the
+    upstream is in, so it must not hold back the stale delete or read as a
+    refused forwarder change."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d, _fwd_noop_daemon("Cannot add record: record already exists.")
+    )
+    d._apply_failures = []
+    d._sync_forwarder_records("t", "f.test", [("192.0.2.53", "Udp", 0)], None)
+    deletes = [c[3] for c in calls if c[2] == "zones/records/delete"]
+    assert [x["forwarder"] for x in deletes] == ["192.0.2.9"]
+    assert d._apply_failures == []
+
+
+def test_forwarder_add_conflict_refusal_keeps_the_old_upstream(tmp_path: Path) -> None:
+    """The overwrite-option answer is not in the no-op set: still refused, so
+    the old upstream stays (#1647) and the failure is noted."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(
+        d,
+        _fwd_noop_daemon(
+            "Record already exists. Use overwrite option if you wish to "
+            "overwrite existing record."
+        ),
+    )
+    d._apply_failures = []
+    d._sync_forwarder_records("t", "f.test", [("192.0.2.53", "Udp", 0)], None)
+    assert not [c for c in calls if c[2] == "zones/records/delete"]
+    assert any("overwrite option" in f for f in d._apply_failures)
+
+
+def test_forwarder_stale_delete_of_a_gone_record_is_not_a_failure(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path == "zones/records/get":
+            return {"status": "ok", "response": {"records": [
+                {"name": "f.test", "type": "FWD",
+                 "rData": {"protocol": "Udp", "forwarder": "192.0.2.9", "priority": 0}}]}}
+        if path == "zones/records/delete":
+            return {"status": "error",
+                    "errorMessage": "Cannot delete record: no such record exists."}
+        return {"status": "ok"}
+
+    _install_fake_request(d, responder)
+    d._apply_failures = []
+    d._sync_forwarder_records("t", "f.test", [("192.0.2.53", "Udp", 0)], None)
+    assert d._apply_failures == []

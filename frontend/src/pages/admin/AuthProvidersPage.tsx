@@ -7,6 +7,8 @@ import {
   type AuthProvider,
   type AuthProviderType,
   type AuthGroupMapping,
+  type AuthGroupMappingCreate,
+  type AuthGroupMappingUpdate,
   type AuthProviderTestResult,
 } from "@/lib/api";
 import {
@@ -24,6 +26,8 @@ import {
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { StepUpSection } from "@/components/StepUpSection";
+import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 
 const TYPE_LABELS: Record<AuthProviderType, string> = {
   ldap: "LDAP / Active Directory",
@@ -1191,9 +1195,37 @@ function MappingsSection({ providerId }: { providerId: string }) {
   const [editExternal, setEditExternal] = useState("");
   const [editGroupId, setEditGroupId] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // #1476 — the save the server answered with "step up first": a mapping
+  // into a group that grants superadmin. Kept so Confirm resubmits it.
+  const [pendingStepUp, setPendingStepUp] = useState<
+    | { kind: "create"; body: AuthGroupMappingCreate }
+    | { kind: "update"; mappingId: string; body: AuthGroupMappingUpdate }
+    | null
+  >(null);
+  const [stepPassword, setStepPassword] = useState("");
+  const [stepTotp, setStepTotp] = useState("");
+
+  function clearStepUp() {
+    setPendingStepUp(null);
+    setStepPassword("");
+    setStepTotp("");
+  }
+
+  function failed(err: unknown, retry: NonNullable<typeof pendingStepUp>) {
+    if (isStepUpRequired(err)) {
+      setPendingStepUp(retry);
+      setError(null);
+      return;
+    }
+    const msg =
+      (err as { response?: { data?: { detail?: unknown } } })?.response?.data
+        ?.detail ?? "Failed to save mapping";
+    setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+  }
 
   const createMut = useMutation({
-    mutationFn: (body: { external_group: string; internal_group_id: string }) =>
+    mutationFn: (body: AuthGroupMappingCreate) =>
       authProvidersApi.createMapping(providerId, body),
     onSuccess: () => {
       qc.invalidateQueries({
@@ -1202,7 +1234,10 @@ function MappingsSection({ providerId }: { providerId: string }) {
       qc.invalidateQueries({ queryKey: ["auth-providers"] });
       setDraftExternal("");
       setDraftGroupId("");
+      setError(null);
+      clearStepUp();
     },
+    onError: (err, body) => failed(err, { kind: "create", body }),
   });
   const updateMut = useMutation({
     mutationFn: ({
@@ -1210,15 +1245,36 @@ function MappingsSection({ providerId }: { providerId: string }) {
       body,
     }: {
       mappingId: string;
-      body: { external_group?: string; internal_group_id?: string };
+      body: AuthGroupMappingUpdate;
     }) => authProvidersApi.updateMapping(providerId, mappingId, body),
     onSuccess: () => {
       qc.invalidateQueries({
         queryKey: ["auth-providers", providerId, "mappings"],
       });
       setEditingId(null);
+      setError(null);
+      clearStepUp();
     },
+    onError: (err, vars) =>
+      failed(err, {
+        kind: "update",
+        mappingId: vars.mappingId,
+        body: vars.body,
+      }),
   });
+
+  function confirmStepUp() {
+    if (!pendingStepUp) return;
+    const stepUp = stepUpBody(stepPassword, stepTotp);
+    if (pendingStepUp.kind === "create") {
+      createMut.mutate({ ...pendingStepUp.body, ...stepUp });
+    } else {
+      updateMut.mutate({
+        mappingId: pendingStepUp.mappingId,
+        body: { ...pendingStepUp.body, ...stepUp },
+      });
+    }
+  }
   const deleteMut = useMutation({
     mutationFn: (mappingId: string) =>
       authProvidersApi.deleteMapping(providerId, mappingId),
@@ -1397,6 +1453,37 @@ function MappingsSection({ providerId }: { providerId: string }) {
           </button>
         </div>
       )}
+      {pendingStepUp && (
+        <div className="space-y-2">
+          <StepUpSection
+            reason="This mapping routes accounts from your identity provider into a group that makes its members superadmins. Confirm it's you to save it."
+            password={stepPassword}
+            onPassword={setStepPassword}
+            totp={stepTotp}
+            onTotp={setStepTotp}
+          />
+          <div className="flex justify-end gap-2">
+            <button
+              onClick={clearStepUp}
+              className="rounded-md border px-3 py-1 text-xs"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={confirmStepUp}
+              disabled={
+                (!stepPassword && !stepTotp) ||
+                createMut.isPending ||
+                updateMut.isPending
+              }
+              className="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground disabled:opacity-50"
+            >
+              Confirm
+            </button>
+          </div>
+        </div>
+      )}
+      {error && <p className="text-xs text-destructive">{error}</p>}
       <ConfirmModal
         open={confirmDeleteId !== null}
         title="Delete mapping"

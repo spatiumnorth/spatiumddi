@@ -518,7 +518,12 @@ async def test_delete_stays_value_scoped_even_with_an_rrset(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "message", ["Record already exists", "No such record was found", "ALREADY EXISTS"]
+    "message",
+    [
+        "Cannot add record: record already exists.",
+        "CANNOT ADD RECORD: RECORD ALREADY EXISTS.",
+        "Cannot delete record: no such record exists.",
+    ],
 )
 async def test_replayed_op_is_an_idempotent_noop(
     monkeypatch: pytest.MonkeyPatch, message: str
@@ -545,6 +550,34 @@ async def test_replayed_op_is_an_idempotent_noop(
     )
     # Both members were attempted — the first not-a-failure didn't stop it.
     assert len(fake.calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Cannot add record: CNAME record already exists for the same name.",
+        "Cannot add record: DNAME record already exists for the same name.",
+        "Cannot add record: CNAME record already exists for the same name",
+        # Raised for a CNAME/DNAME add with overwrite=false whatever the
+        # existing record's value, so it does not prove ours is there.
+        "Record already exists. Use overwrite option if you wish to overwrite existing record.",
+        "Record already exists",
+        "No such record was found",
+    ],
+)
+async def test_conflict_refusal_is_a_failure_not_a_noop(
+    monkeypatch: pytest.MonkeyPatch, message: str
+) -> None:
+    """#1770: the CNAME/DNAME conflict refusal contains "already exists" but
+    means the record was NOT written; counting it as converged marks the op
+    applied while the server keeps serving the old data."""
+    drv, _ = _driver(monkeypatch, [_FakeResponse({"status": "error", "errorMessage": message})])
+    with pytest.raises(Exception, match="(?i)already exists|no such record"):
+        await drv.apply_record_change(
+            _Server({"api_url": "https://x.test", "api_token": "t"}),
+            _change("create", rrset=_rrset("10.0.0.1")),
+        )
 
 
 @pytest.mark.asyncio
@@ -670,7 +703,7 @@ async def test_zone_create_and_delete(monkeypatch: pytest.MonkeyPatch) -> None:
         name = "new.example.com."
         zone_type = "primary"
 
-    drv, fake = _driver(monkeypatch, [_ok({}), _ok({})])
+    drv, fake = _driver(monkeypatch, [_ok({"domain": "new.example.com"}), _ok({})])
     server = _Server({"api_url": "https://x.test", "api_token": "t"})
     await drv.apply_zone_change(server, _Zone(), "create")
     await drv.apply_zone_change(server, _Zone(), "delete")
@@ -678,6 +711,30 @@ async def test_zone_create_and_delete(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fake.calls[0]["params"] == {"zone": "new.example.com", "type": "Primary"}
     assert fake.calls[1]["path"] == "/api/zones/delete"
     assert fake.calls[1]["params"] == {"zone": "new.example.com"}
+
+
+@pytest.mark.asyncio
+async def test_refused_connection_names_a_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1613 QA — ``httpx.ConnectError`` for a refused connection stringifies
+    to ``""``, so the error read "request failed: " with nothing after it.
+    The exception class is always named; its text follows when present."""
+    import httpx
+
+    class _Zone:
+        name = "new.example.com."
+        zone_type = "primary"
+
+    def _refuse() -> Any:
+        raise httpx.ConnectError("")
+
+    drv, _ = _driver(monkeypatch, [_refuse])
+    with pytest.raises(CloudDNSError) as excinfo:
+        await drv.apply_zone_change(
+            _Server({"api_url": "https://x.test", "api_token": "t"}), _Zone(), "create"
+        )
+    message = str(excinfo.value)
+    assert "request failed: ConnectError" in message
+    assert not message.rstrip().endswith("failed:")
 
 
 @pytest.mark.asyncio
@@ -836,3 +893,184 @@ def test_record_type_gate_matches_what_the_driver_advertises() -> None:
         else:
             # ALIAS / LUA are PowerDNS-only and the driver doesn't claim them.
             assert "technitium_api" not in allowed, rtype
+
+
+# ── #1537 — zone create / delete converge on retry ─────────────────────
+
+
+_EMPTY_PRIMARY = [
+    _ok({"zones": [{"name": "new.example.com", "type": "Primary"}], "totalPages": 1}),
+    _ok({"records": [{"type": "SOA", "name": "new.example.com"}, {"type": "NS"}]}),
+]
+
+
+class _TZone:
+    name = "new.example.com."
+    zone_type = "primary"
+
+
+def _tserver() -> Any:
+    return _Server({"api_url": "https://x.test", "api_token": "t"})
+
+
+@pytest.mark.asyncio
+async def test_zone_create_already_exists_is_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An EMPTY Primary zone already there is adopted (#1784 narrows this)."""
+    drv, fake = _driver(
+        monkeypatch,
+        [
+            _FakeResponse(
+                {"status": "error", "errorMessage": "Zone already exists: new.example.com"}
+            ),
+            *_EMPTY_PRIMARY,
+        ],
+    )
+    await drv.apply_zone_change(_tserver(), _TZone(), "create")
+    assert fake.calls[0]["path"] == "/api/zones/create"
+
+
+@pytest.mark.asyncio
+async def test_zone_delete_missing_zone_is_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    drv, _ = _driver(
+        monkeypatch,
+        [
+            _FakeResponse(
+                {"status": "error", "errorMessage": "No such zone was found: new.example.com"}
+            )
+        ],
+    )
+    await drv.apply_zone_change(_tserver(), _TZone(), "delete")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"status": "invalid-token"},
+        {"status": "error", "errorMessage": "Access was denied to use this resource."},
+        {"status": "error", "errorMessage": "Something else went wrong"},
+    ],
+)
+@pytest.mark.parametrize("op", ["create", "delete"])
+async def test_zone_ops_other_failures_still_raise(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, Any], op: str
+) -> None:
+    drv, _ = _driver(monkeypatch, [_FakeResponse(body)])
+    with pytest.raises(CloudDNSError):
+        await drv.apply_zone_change(_tserver(), _TZone(), op)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("op", "body", "changed"),
+    [
+        ("create", {"status": "ok", "response": {"domain": "new.example.com"}}, True),
+        (
+            "create",
+            {"status": "error", "errorMessage": "Zone already exists: new.example.com"},
+            False,
+        ),
+        ("delete", {"status": "ok", "response": {}}, True),
+        (
+            "delete",
+            {"status": "error", "errorMessage": "No such zone was found: new.example.com"},
+            False,
+        ),
+        # Technitium's own lookup → delete race says it this way instead.
+        (
+            "delete",
+            {
+                "status": "error",
+                "errorMessage": "Failed to delete the zone 'new.example.com': no such zone exists.",
+            },
+            False,
+        ),
+    ],
+)
+async def test_zone_ops_report_whether_they_changed_anything(
+    monkeypatch: pytest.MonkeyPatch, op: str, body: dict[str, Any], changed: bool
+) -> None:
+    """``False`` = already in the requested state; the caller's partial
+    failure compensation must leave that server alone (#1537)."""
+    extra = _EMPTY_PRIMARY if (op == "create" and not changed) else []
+    drv, _ = _driver(monkeypatch, [_FakeResponse(body), *extra])
+    assert await drv.apply_zone_change(_tserver(), _TZone(), op) is changed
+
+
+# ── TXT (#1760) ────────────────────────────────────────────────────────
+
+
+def _b64(*strings: bytes) -> str:
+    import base64
+
+    return ",".join(base64.b64encode(s).decode() for s in strings)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # Quotes are presentation syntax, not content.
+        ('"v=spf1 -all"', [b"v=spf1 -all"]),
+        # A trailing full stop is text, not a name.
+        ("Hello.", [b"Hello."]),
+        # Quoted strings stay separate character-strings (DKIM split).
+        ('"v=DKIM1; k=rsa; p=AAA" "BBB"', [b"v=DKIM1; k=rsa; p=AAA", b"BBB"]),
+        ("plain text", [b"plain text"]),
+    ],
+)
+async def test_txt_is_sent_as_character_strings(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: list[bytes]
+) -> None:
+    drv, fake = _driver(monkeypatch, [_ok({})])
+    change = _change("create", name="@", record_type="TXT", value=value)
+    await drv.apply_record_change(_Server({"api_url": "https://x.test", "api_token": "t"}), change)
+    params = fake.calls[0]["params"]
+    assert params["characterStringsBase64"] == _b64(*expected)
+    assert "text" not in params
+
+
+@pytest.mark.asyncio
+async def test_txt_read_back_keeps_string_boundaries_and_the_full_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drv, _ = _driver(
+        monkeypatch,
+        [
+            _ok(
+                {
+                    "records": [
+                        {
+                            "name": "example.com",
+                            "type": "TXT",
+                            "ttl": 60,
+                            "rData": {
+                                "text": "ab",
+                                "characterStringsBase64": [_b64(b"a"), _b64(b"b.")],
+                            },
+                        }
+                    ]
+                }
+            )
+        ],
+    )
+    records = await drv.pull_zone_records(
+        _Server({"api_url": "https://x.test", "api_token": "t"}), "example.com."
+    )
+    assert records[0].value == '"a" "b."'
+
+
+def test_txt_value_round_trips_through_write_and_read() -> None:
+    import base64
+
+    from app.services.technitium.rdata import rdata_to_value, record_params
+
+    stored = '"v=DKIM1; k=rsa; p=AAA" "BBB" "say \\"hi\\"."'
+    sent = record_params("TXT", stored)["characterStringsBase64"].split(",")
+    assert [base64.b64decode(s) for s in sent] == [
+        b"v=DKIM1; k=rsa; p=AAA",
+        b"BBB",
+        b'say "hi".',
+    ]
+    value, _ = rdata_to_value("TXT", {"characterStringsBase64": sent})
+    assert value == stored

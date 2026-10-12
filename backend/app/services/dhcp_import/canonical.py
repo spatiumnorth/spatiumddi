@@ -79,6 +79,9 @@ class ImportedClientClass:
     name: str
     match_expression: str = ""
     description: str = ""
+    # The daemon block the class came from (#1229) — a Kea ``Dhcp6``
+    # ``client-classes`` entry is an IPv6 class.
+    address_family: str = "ipv4"
     options: dict[str, Any] = field(default_factory=dict)
     supported: bool = True
     warning: str | None = None

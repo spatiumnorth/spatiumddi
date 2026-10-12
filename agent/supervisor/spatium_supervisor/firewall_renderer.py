@@ -335,7 +335,10 @@ def render_drop_in(
     # keep it (etcd is loopback-only; 6443 must stay LAN-reachable for the
     # node's own pods + a first promote/join). The runner restores a
     # retired sentinel if the cluster ever shrinks back to single-node.
-    bootstrap_action = "retire" if cp_member_count >= 2 else "keep"
+    # #1508 — only on a control-plane member. An agent appliance runs its
+    # own single-node k3s and gets no scoped ``kubeapi`` rule, so the
+    # sentinel stays its pods' only path to their own API.
+    bootstrap_action = "retire" if cp_member_count >= 2 and is_cp else "keep"
     lines.append(f"# spatium-bootstrap: {bootstrap_action}")
     # #769 — host-runner directive for the baked Web-UI sentinel
     # (00-spatium-webui.nft), which opens 80/443 from first boot so the

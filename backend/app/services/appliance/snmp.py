@@ -66,7 +66,7 @@ def render_snmpd_conf(settings: PlatformSettings) -> str:
     """
     lines: list[str] = [
         "# Managed by SpatiumDDI — edits will be overwritten on next config push.",
-        "# Source of truth: Settings → Appliance → SNMP in the SpatiumDDI UI.",
+        "# Source of truth: Appliance → Fleet → Services → SNMP in the SpatiumDDI UI.",
         "",
     ]
 
@@ -120,7 +120,7 @@ def _render_v2c(settings: PlatformSettings, sources: list[str]) -> list[str]:
         return [
             f"# SNMP v2c community {_quote(community)} configured but no allowed",
             "# sources — daemon will accept nothing. Add at least one CIDR in",
-            "# Settings → Appliance → SNMP.",
+            "# Appliance → Fleet → Services → SNMP.",
         ]
 
     out: list[str] = []

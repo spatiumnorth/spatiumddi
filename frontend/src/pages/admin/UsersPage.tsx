@@ -11,52 +11,16 @@ import {
   Lock,
   LockOpen,
 } from "lucide-react";
-import {
-  authProvidersApi,
-  usersApi,
-  type AppUser,
-  type StepUp,
-} from "@/lib/api";
+import { authProvidersApi, usersApi, type AppUser } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
-import { ReauthFields } from "@/components/ReauthFields";
+import { StepUpSection } from "@/components/StepUpSection";
+import { stepUpBody } from "@/lib/stepup";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function stepUpBody(password: string, totp: string): StepUp {
-  return { stepup_password: password || null, stepup_totp_code: totp || null };
-}
-
-/** #1355 — confirming yourself before handing out a credential that passes
- *  every later step-up (a superadmin, or a superadmin's password). */
-function StepUpSection({
-  reason,
-  password,
-  onPassword,
-  totp,
-  onTotp,
-}: {
-  reason: string;
-  password: string;
-  onPassword: (v: string) => void;
-  totp: string;
-  onTotp: (v: string) => void;
-}) {
-  return (
-    <div className="rounded-md border bg-amber-500/5 p-3">
-      <p className="mb-2 text-xs text-muted-foreground">{reason}</p>
-      <ReauthFields
-        password={password}
-        onPassword={onPassword}
-        totp={totp}
-        onTotp={onTotp}
-      />
-    </div>
-  );
-}
 
 function Field({
   label,
@@ -83,11 +47,20 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
+  // #1291 — "" is a local account; a provider id pre-creates one that signs
+  // in through that provider, which its first sign-in claims. That is how a
+  // provider with auto-create off admits a new user.
+  const [providerId, setProviderId] = useState("");
   const [isSuperadmin, setIsSuperadmin] = useState(false);
   const [forceChange, setForceChange] = useState(true);
   const [stepPassword, setStepPassword] = useState("");
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const providers = useQuery({
+    queryKey: ["auth-providers"],
+    queryFn: authProvidersApi.list,
+  });
+  const external = providerId !== "";
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -95,9 +68,9 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
         username,
         email,
         display_name: displayName,
-        password,
+        ...(external ? { auth_provider_id: providerId } : { password }),
         is_superadmin: isSuperadmin,
-        force_password_change: forceChange,
+        force_password_change: external ? false : forceChange,
         ...(isSuperadmin ? stepUpBody(stepPassword, stepTotp) : {}),
       }),
     onSuccess: () => {
@@ -138,14 +111,35 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
             onChange={(e) => setEmail(e.target.value)}
           />
         </Field>
-        <Field label="Password">
-          <input
+        <Field label="Signs in through">
+          <select
             className={inputCls}
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
+            value={providerId}
+            onChange={(e) => setProviderId(e.target.value)}
+          >
+            <option value="">Local account (password)</option>
+            {(providers.data ?? []).map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name} ({p.type})
+              </option>
+            ))}
+          </select>
         </Field>
+        {external ? (
+          <p className="text-xs text-muted-foreground">
+            The account is claimed the first time this username signs in through
+            the provider, even with auto-create off. It has no password here.
+          </p>
+        ) : (
+          <Field label="Password">
+            <input
+              className={inputCls}
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </Field>
+        )}
         <div className="flex flex-col gap-2">
           <label className="flex cursor-pointer items-center gap-2 text-sm">
             <input
@@ -155,14 +149,16 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
             />
             Superadmin
           </label>
-          <label className="flex cursor-pointer items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={forceChange}
-              onChange={(e) => setForceChange(e.target.checked)}
-            />
-            Require password change on first login
-          </label>
+          {!external && (
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={forceChange}
+                onChange={(e) => setForceChange(e.target.checked)}
+              />
+              Require password change on first login
+            </label>
+          )}
         </div>
         {isSuperadmin && (
           <StepUpSection
@@ -189,7 +185,7 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
             disabled={
               !username ||
               !email ||
-              !password ||
+              (!external && !password) ||
               (isSuperadmin && !stepPassword && !stepTotp) ||
               mutation.isPending
             }
@@ -637,9 +633,19 @@ export function UsersPage() {
                     )}
                   </td>
                   <td className="px-4 py-3">
-                    {user.is_superadmin ? (
-                      <span className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
+                    {(user.is_effective_superadmin ?? user.is_superadmin) ? (
+                      <span
+                        className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400"
+                        title={
+                          user.is_superadmin
+                            ? undefined
+                            : "Superadmin through a group's role (#1412)"
+                        }
+                      >
                         <ShieldCheck className="h-3.5 w-3.5" /> superadmin
+                        {!user.is_superadmin && (
+                          <span className="text-muted-foreground">(role)</span>
+                        )}
                       </span>
                     ) : (
                       <span className="flex items-center gap-1 text-xs text-muted-foreground">

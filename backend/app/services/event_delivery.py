@@ -37,7 +37,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings as _app_settings
-from app.core.crypto import decrypt_str
+from app.core.crypto import decrypt_dict, decrypt_str
 from app.models.event_subscription import EventOutbox, EventSubscription
 
 logger = structlog.get_logger(__name__)
@@ -60,6 +60,18 @@ def _sign(secret: str, ts: str, body: bytes) -> str:
     payload = ts.encode("ascii") + b"." + body
     digest = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
     return f"sha256={digest}"
+
+
+def subscription_headers(sub: EventSubscription) -> dict[str, str]:
+    """The subscription's custom headers, decrypted (#1579).
+
+    Returns ``{}`` when none are stored. Raises ``ValueError`` when the
+    stored ciphertext won't decrypt under this install's key — callers
+    decide whether that fails the delivery or just the header names.
+    """
+    if not sub.headers_encrypted:
+        return {}
+    return {str(k): str(v) for k, v in decrypt_dict(sub.headers_encrypted).items()}
 
 
 async def _deliver_one(
@@ -85,8 +97,13 @@ async def _deliver_one(
     if sig:
         headers["X-SpatiumDDI-Signature"] = sig
     # Operator-supplied custom headers — applied last so the SpatiumDDI-
-    # owned ones above can't be silently overridden.
-    for k, v in (sub.headers or {}).items():
+    # owned ones above can't be silently overridden. Decrypted here, at
+    # send time only (#1579); the values never leave this function.
+    try:
+        custom_headers = subscription_headers(sub)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"headers decrypt failed: {exc}"
+    for k, v in custom_headers.items():
         if k.lower().startswith("x-spatiumddi-"):
             continue
         headers[k] = v
@@ -209,7 +226,7 @@ async def process_due_outbox(db: AsyncSession) -> dict[str, int]:
     return {"claimed": len(rows), "delivered": delivered, "failed": failed, "dead": dead}
 
 
-__all__ = ["process_due_outbox", "_sign", "_backoff_seconds"]
+__all__ = ["process_due_outbox", "subscription_headers", "_sign", "_backoff_seconds"]
 
 
 # Manual retry helper used by the API "retry now" endpoint. Flips a

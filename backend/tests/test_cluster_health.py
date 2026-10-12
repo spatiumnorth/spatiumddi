@@ -67,16 +67,20 @@ def _pod(
     restarts: int = 0,
     owner: str = "ReplicaSet",
     waiting: str | None = None,
+    cnpg: str | None = None,
 ) -> dict:
     state: dict = (
         {"running": {}} if ready else {"waiting": {"reason": waiting or "ContainerCreating"}}
     )
+    labels = {"app.kubernetes.io/component": comp}
+    if cnpg:
+        labels["cnpg.io/cluster"] = cnpg
     return {
         "metadata": {
             "name": name,
             "namespace": ns,
             "creationTimestamp": "2026-06-12T19:00:00Z",
-            "labels": {"app.kubernetes.io/component": comp},
+            "labels": labels,
             "ownerReferences": [{"kind": owner}],
         },
         "spec": {"nodeName": node},
@@ -238,6 +242,63 @@ def test_the_database_reads_healthy_once_the_join_job_is_done(monkeypatch) -> No
     db = comps["database"]
     assert (db["ready"], db["total"], db["status"]) == (3, 3, "healthy")
     assert db["jobs_running"] == 0
+
+
+# ── #1387: the database verdict comes from CNPG ─────────────────────────────
+
+
+def _cnpg(monkeypatch, status: int, wanted: int = 3, ready: int = 0) -> None:
+    body = {"spec": {"instances": wanted}, "status": {"readyInstances": ready}}
+    monkeypatch.setattr(
+        "app.services.appliance.k8s.get_cnpg_cluster",
+        lambda name, namespace=None: (status, body if status == 200 else None),
+    )
+
+
+def test_a_join_that_failed_for_good_is_not_healthy(monkeypatch) -> None:
+    """Its pods are all Failed and skipped, so a pod count read 2/2 healthy
+    while CNPG wants three instances."""
+    _cnpg(monkeypatch, 200, wanted=3, ready=2)
+    comps = _rollup_with(
+        monkeypatch,
+        [
+            _pod("postgresql-1", comp="database", owner="Cluster", cnpg="postgresql"),
+            _pod("postgresql-2", comp="database", owner="Cluster", cnpg="postgresql"),
+            _pod(
+                "postgresql-3-join-abcde",
+                comp="database",
+                owner="Job",
+                phase="Failed",
+                ready=False,
+                cnpg="postgresql",
+            ),
+        ],
+    )
+    db = comps["database"]
+    assert (db["ready"], db["total"], db["status"], db["source"]) == (2, 3, "degraded", "cnpg")
+
+
+def test_first_bootstrap_has_a_database_row(monkeypatch) -> None:
+    _cnpg(monkeypatch, 200, wanted=3, ready=0)
+    comps = _rollup_with(
+        monkeypatch,
+        [_pod("postgresql-1-initdb-abcde", comp="database", owner="Job", cnpg="postgresql")],
+    )
+    db = comps["database"]
+    assert (db["ready"], db["total"], db["status"]) == (0, 3, "down")
+
+
+def test_an_unreadable_cnpg_cluster_falls_back_to_the_pod_count(monkeypatch) -> None:
+    _cnpg(monkeypatch, 403)
+    comps = _rollup_with(
+        monkeypatch,
+        [
+            _pod("postgresql-1", comp="database", owner="Cluster", cnpg="postgresql"),
+            _pod("postgresql-2", comp="database", owner="Cluster", cnpg="postgresql"),
+        ],
+    )
+    db = comps["database"]
+    assert (db["ready"], db["total"], db["source"]) == (2, 2, "pods")
 
 
 def test_a_component_made_only_of_jobs_is_not_a_workload(monkeypatch) -> None:

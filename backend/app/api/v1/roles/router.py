@@ -16,9 +16,11 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
+from app.api.stepup import require_stepup_if_granting_superadmin
 from app.core.permissions import caller_can_grant, require_permission
 from app.models.audit import AuditLog
 from app.models.auth import Role, User
+from app.services.superadmin_grant import SuperadminModel, permissions_grant_superadmin
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -80,6 +82,10 @@ class RoleUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     permissions: list[PermissionEntry] | None = None
+    # #1412 — the caller's step-up, needed only when the edit adds ``*`` /
+    # ``*`` to a role that groups with members already hold.
+    stepup_password: str | None = None
+    stepup_totp_code: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -149,7 +155,14 @@ def _enforce_grant_ceiling(actor: User, perms: list[PermissionEntry]) -> None:
         )
 
 
-def _audit(actor: User, action: str, role: Role, summary: str) -> AuditLog:
+def _audit(
+    actor: User,
+    action: str,
+    role: Role,
+    summary: str,
+    stepup_method: str | None = None,
+    granted: int = 0,
+) -> AuditLog:
     return AuditLog(
         user_id=actor.id,
         user_display_name=actor.display_name,
@@ -158,6 +171,11 @@ def _audit(actor: User, action: str, role: Role, summary: str) -> AuditLog:
         resource_type="role",
         resource_id=str(role.id),
         resource_display=summary,
+        # #1412 — an edit that made users superadmins records how many, and
+        # the step-up that allowed it.
+        new_value=(
+            {"granted_superadmin": granted, "stepup_method": stepup_method} if granted else None
+        ),
     )
 
 
@@ -228,13 +246,37 @@ async def update_role(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail="Role name already in use"
             )
+    new_permissions = None
+    method: str | None = None
+    granted = 0
+    if body.permissions is not None:
+        _enforce_grant_ceiling(current_user, body.permissions)
+        new_permissions = _perm_list_to_dicts(body.permissions)
+        role_id = r.id
+        wildcard = permissions_grant_superadmin(new_permissions)
+
+        def _change(model: SuperadminModel) -> None:
+            model.role_wildcard[role_id] = wildcard
+
+        # Before touching the row: a refused step-up commits its audit row.
+        method, granted = await require_stepup_if_granting_superadmin(
+            db,
+            current_user,
+            password=body.stepup_password,
+            totp_code=body.stepup_totp_code,
+            change=_change,
+            action="update",
+            resource_type="role",
+            resource_id=str(r.id),
+            resource_display=f"update role {r.name}",
+        )
+    if body.name is not None:
         r.name = body.name
     if body.description is not None:
         r.description = body.description
-    if body.permissions is not None:
-        _enforce_grant_ceiling(current_user, body.permissions)
-        r.permissions = _perm_list_to_dicts(body.permissions)
-    db.add(_audit(current_user, "update", r, f"Updated role {r.name}"))
+    if new_permissions is not None:
+        r.permissions = new_permissions
+    db.add(_audit(current_user, "update", r, f"Updated role {r.name}", method, granted))
     await db.commit()
     await db.refresh(r)
     return _to_response(r)

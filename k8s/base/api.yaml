@@ -71,22 +71,39 @@ spec:
                   key: metrics-token
                   optional: true
             - name: DATABASE_URL
-              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-primary:5432/spatiumddi"
+              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
+            # #1547 — Redis password from the Secret, interpolated into
+            # the sentinel:// URLs below. The URLs cannot live in the
+            # ConfigMap: interpolation only expands in an env `value`,
+            # and a ConfigMap must never carry a credential. Same
+            # wiring as the umbrella chart's commonEnv. REDIS_URL
+            # lists every Sentinel by its per-pod headless DNS name so
+            # one is reachable mid-failover; the Celery URLs go through
+            # the `redis-sentinel` Service (backend/app/core/
+            # redis_client.py, backend/app/celery_app.py).
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: redis-password
+            - name: REDIS_SENTINEL_MASTER
+              valueFrom:
+                configMapKeyRef:
+                  name: spatiumddi-config
+                  key: REDIS_SENTINEL_MASTER
+            # The password the Sentinels themselves require (the data
+            # password) — settings.redis_sentinel_password.
+            - name: REDIS_SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: redis-password
             - name: REDIS_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: REDIS_URL
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-0.redis-headless.spatiumddi.svc.cluster.local:26379,redis-1.redis-headless.spatiumddi.svc.cluster.local:26379,redis-2.redis-headless.spatiumddi.svc.cluster.local:26379/0"
             - name: CELERY_BROKER_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: CELERY_BROKER_URL
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-sentinel:26379/1"
             - name: CELERY_RESULT_BACKEND
-              valueFrom:
-                configMapKeyRef:
-                  name: spatiumddi-config
-                  key: CELERY_RESULT_BACKEND
+              value: "sentinel://:$(REDIS_PASSWORD)@redis-sentinel:26379/2"
           # Liveness — "process responds to HTTP". Deliberately shallow:
           # a transient Postgres blip should not trigger a pod restart.
           #

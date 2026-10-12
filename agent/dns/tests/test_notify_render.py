@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self
 
+import httpx
 import pytest
 
 from spatium_dns_agent.drivers import powerdns as powerdns_mod
@@ -218,6 +219,10 @@ class _Resp:
     def json(self) -> Any:
         return self._body
 
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPError(f"HTTP {self.status_code}")
+
 
 class _FakeClient:
     def __init__(self, calls: list) -> None:
@@ -231,7 +236,10 @@ class _FakeClient:
 
     def get(self, url: str, headers: Any = None) -> _Resp:
         self._calls.append(("GET", url, None))
-        return _Resp(200, [{"name": "example.com.", "kind": "Master", "masters": []}])
+        if url.endswith("/zones"):
+            return _Resp(200, [{"name": "example.com.", "kind": "Master", "masters": []}])
+        # GET /zones/{zone}: the read-back the absent-rrset sweep (#1380) uses.
+        return _Resp(200, {"rrsets": []})
 
     def post(self, url: str, headers: Any = None, json: Any = None) -> _Resp:
         self._calls.append(("POST", url, json))
@@ -257,7 +265,7 @@ def test_pdns_reconcile_sets_and_clears_also_notify(
     monkeypatch.setattr(
         powerdns_mod,
         "httpx",
-        SimpleNamespace(Client=lambda **kw: _FakeClient(calls)),
+        SimpleNamespace(Client=lambda **kw: _FakeClient(calls), HTTPError=httpx.HTTPError),
     )
     driver = PowerDNSDriver(state_dir=tmp_path)
     base = {
@@ -278,3 +286,38 @@ def test_pdns_reconcile_sets_and_clears_also_notify(
     driver._reconcile_zones("key", [{**base, "also_notify": []}])
     dels = [c for c in calls if c[0] == "DELETE" and "ALSO-NOTIFY" in c[1]]
     assert dels, "empty target list clears the metadata"
+
+
+def test_pdns_reconcile_fails_the_apply_when_also_notify_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A target list PowerDNS refuses fails the apply, as the dynamic-update
+    metadata does (#1225), instead of looking applied (#1523)."""
+    calls: list[tuple[str, str, Any]] = []
+
+    class _RefusingClient(_FakeClient):
+        def put(self, url: str, headers: Any = None, json: Any = None) -> _Resp:
+            self._calls.append(("PUT", url, json))
+            return _Resp(422, {"error": "bad ALSO-NOTIFY"})
+
+    monkeypatch.setattr(
+        powerdns_mod,
+        "httpx",
+        SimpleNamespace(Client=lambda **kw: _RefusingClient(calls), HTTPError=httpx.HTTPError),
+    )
+    driver = PowerDNSDriver(state_dir=tmp_path)
+    with pytest.raises(RuntimeError, match="also-notify"):
+        driver._reconcile_zones(
+            "key",
+            [
+                {
+                    "name": "example.com.",
+                    "kind": "Master",
+                    "masters": [],
+                    "rrsets": [],
+                    "update_acl": [],
+                    "update_tsig_keys": [],
+                    "also_notify": ["192.0.2.53"],
+                }
+            ],
+        )

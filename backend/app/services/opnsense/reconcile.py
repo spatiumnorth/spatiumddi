@@ -40,6 +40,7 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.opnsense import OPNsenseRouter
+from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import owned_by_other_integration, owning_integration
 from app.services.opnsense.client import (
     OPNsenseClient,
@@ -83,6 +84,9 @@ class _DesiredAddress:
     description: str
     mac: str | None = None
     auto_from_lease: bool = False
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass

@@ -184,6 +184,8 @@ def _render_control_values_at(mem_mib: int) -> dict:
         set -euo pipefail
         {body}
         SPATIUMDDI_VERSION=0.0.0-test
+        APP_KEY_SECRET=spatium-control-app-keys
+        CHART_APP_SECRET=spatium-control-spatiumddi-app
         DNS_AGENT_KEY_VAL=x
         DHCP_AGENT_KEY_VAL=x
         LG_AGENT_KEY_VAL=x
@@ -238,6 +240,8 @@ def test_an_unreadable_memtotal_renders_no_postgres_fragment_and_stays_valid() -
         set -euo pipefail
         {body}
         SPATIUMDDI_VERSION=0.0.0-test
+        APP_KEY_SECRET=spatium-control-app-keys
+        CHART_APP_SECRET=spatium-control-spatiumddi-app
         DNS_AGENT_KEY_VAL=x
         DHCP_AGENT_KEY_VAL=x
         LG_AGENT_KEY_VAL=x

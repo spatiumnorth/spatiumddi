@@ -435,8 +435,14 @@ cloud-hosted DNS-01 layer on top of it (Phases 3–4 below).
 4. For each authorization it solves the `dns-01` challenge
    (`backend/app/services/acme_client/dns01.py`): the challenge FQDN
    is resolved to the **most specific managed primary zone** that is a
-   suffix of the name (longest-suffix match), a
-   `_acme-challenge.<domain>` TXT record is written through the exact
+   suffix of the name (longest-suffix match). **Public zones go first**
+   (#1454): a zone whose group has type `external`, or whose group is
+   served by a cloud DNS driver, beats a more specific internal zone, so
+   with split-horizon DNS the TXT for `*.home.example.com` lands in the
+   public `example.com` rather than an internal-only `home.example.com`
+   the CA can't see. Internal zones are used only when no public zone
+   covers the name (e.g. a private ACME CA that resolves internally).
+   A `_acme-challenge.<domain>` TXT record is written through the exact
    same `record_ops` pipeline the rest of DNS uses
    (`enqueue_record_op` + `bump_zone_serial` + `wait_for_op_applied`),
    and the solve **blocks until the DNS agent acknowledges the op as
@@ -521,6 +527,25 @@ within **30 days of its `valid_to`**. The re-issue reuses the exact
 `POST /issue` machinery (same orchestrator, same self-solve), so a
 renewal is just a normal order against the stored account.
 
+**Renewal reuses each cert's own issuance shape.** The sweep reads the
+challenge type, DNS provider and domain list from the *successful
+order that produced that cert* — an http-01 cert renews as http-01,
+with its own domains. (Before #1529 the sweep renewed everything as
+managed-zone DNS-01 from one global domain list, so http-01 certs
+never renewed.) For certs with no linked order it falls back to the
+shape recorded on `platform_settings`, which is written **only when an
+order succeeds** — never at order creation, so a failed issue attempt
+can't retarget an existing cert's renewal.
+
+**Manual DNS-01 certs are the exception.** A cert issued with the
+manual TXT fallback for domains SpatiumDDI doesn't host cannot be
+renewed unattended. If every domain has since become covered by a
+managed zone, the sweep renews it as plain DNS-01; otherwise it
+**skips the cert and opens an `acme-manual-renewal` alert** instead of
+minting an order that can never succeed — renew it by hand via a fresh
+issue before it expires. The alert auto-resolves the next time the
+sweep renews that cert.
+
 The task is **gated on two flags** — it does nothing unless both
 `platform_settings.acme_enabled` and
 `platform_settings.acme_auto_renew` are on. `acme_enabled` is set
@@ -552,13 +577,17 @@ afterward, exactly as it does for a managed zone.
 There is **no extra configuration on the ACME screen** for this — you
 configure the provider's credentials once under **DNS** (the same
 cloud-DNS driver config the rest of DNS uses), and the ACME client
-reuses it. The `dns_provider` field on `POST /issue` just lets you pin
-a specific provider when a name is ambiguous.
+reuses it. The `dns_provider` field on `POST /issue` is recorded on the
+order but does not affect zone selection yet; when a public and an
+internal zone both cover a name, the public one wins (see above).
 
 **Preview first.** `POST /preview` takes the same `domains[]` and
 returns, per domain, whether it is auto-solvable and how — `managed`
 (true if a managed *or* cloud-driver zone covers it), the `zone_name`,
-the `record_name` that will hold the TXT, and the `driver`. The Web UI
+the `record_name` that will hold the TXT, and the `driver`. A `note`
+is set when a more specific internal zone also covers the name and was
+skipped for the public one. Wildcards show the base-name record
+(`*.example.com` → `_acme-challenge.example.com`). The Web UI
 calls this in the Issue modal so the operator sees green "auto" rows
 vs. amber "manual" rows before committing.
 

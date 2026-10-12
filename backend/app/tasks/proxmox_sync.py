@@ -66,21 +66,22 @@ async def _run_sweep() -> dict[str, Any]:
                     if elapsed < timedelta(seconds=node.sync_interval_seconds):
                         skipped_interval += 1
                         continue
+                node_name = node.name  # a failed flush expires node
                 try:
                     summary = await reconcile_node(db, node)
                 except Exception as exc:  # noqa: BLE001 — one node shouldn't poison the sweep
                     err_count += 1
-                    errors.append(f"{node.name}: {exc}")
-                    logger.warning(
-                        "proxmox_reconcile_crash",
-                        node=str(node.id),
-                        error=str(exc),
-                    )
                     # A crash inside reconcile_node leaves the shared session
                     # in a failed-transaction state; without this rollback the
                     # next node's first query raises PendingRollbackError,
                     # turning one bad node into a sweep-wide failure (#333).
                     await db.rollback()
+                    errors.append(f"{node_name}: {exc}")
+                    logger.warning(
+                        "proxmox_reconcile_crash",
+                        node=str(node_id),
+                        error=str(exc),
+                    )
                     continue
                 ran += 1
                 if summary.ok:

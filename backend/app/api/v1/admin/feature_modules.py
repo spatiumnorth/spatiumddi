@@ -28,7 +28,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.core.auth_throttle import login_rate_limited
+from app.api.stepup import refuse_if_stepup_blocked
+from app.core.auth_throttle import login_rate_limited, record_stepup_password_failure
 from app.core.demo_mode import DEMO_RESTRICTED_MODULES, is_demo_mode
 from app.core.permissions import is_effective_superadmin
 from app.core.request_meta import get_trusted_client_ip
@@ -498,7 +499,24 @@ async def break_glass(
             f"Confirmation phrase must be exactly {BREAK_GLASS_PHRASE!r}",
         )
 
-    # 3. Password / TOTP re-confirmation (#408 pattern).
+    # 3. Password / TOTP re-confirmation (#408 pattern). The shared budget gate
+    # first (#1413): this endpoint keeps its own break-glass audit row and
+    # lockout counter, so it uses the gate rather than require_operator_stepup,
+    # but a wrong answer spends the same per-account step-up budget.
+    try:
+        await refuse_if_stepup_blocked(current_user)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            _break_glass_audit(
+                db,
+                user=current_user,
+                kind=body.kind,
+                result="forbidden",
+                new_value={"reason": "stepup_blocked"},
+                action=_BREAK_GLASS_ACTION_DENIED,
+            )
+            await db.commit()
+        raise
     outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
     if outcome is not ReauthOutcome.OK:
         reason = "mfa_required" if outcome is ReauthOutcome.MFA_REQUIRED else "bad_credential"
@@ -508,6 +526,8 @@ async def break_glass(
         if outcome is ReauthOutcome.BAD_CREDENTIAL:
             settings_row = await db.get(PlatformSettings, 1)
             register_failure(current_user, LockoutPolicy.from_row(settings_row))
+            if body.password or body.totp_code:
+                await record_stepup_password_failure(current_user.id)
         _break_glass_audit(
             db,
             user=current_user,

@@ -38,7 +38,9 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.netbird import NetbirdInstance
-from app.services.integration_ownership import owned_by_other_integration
+from app.services._mirror_hostname import normalize_desired_hostname
+from app.services.dns.cname_conflict import find_record_insert_conflict
+from app.services.integration_ownership import address_taken, owned_by_other_integration
 from app.services.netbird.client import (
     NetbirdClient,
     NetbirdClientError,
@@ -58,6 +60,9 @@ class _DesiredAddress:
     hostname: str
     description: str
     custom_fields: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass
@@ -175,9 +180,11 @@ def _compute_desired(
             "user_id": p.user_id,
         }
         cf = {k: v for k, v in cf.items() if v not in (None, "", [], False)}
-        # The peer's FQDN is the most useful "hostname" for an IPAM row;
-        # fall back to the short hostname / name while onboarding.
-        hostname = p.dns_label or p.hostname or p.name
+        # Host label only in ``hostname`` (#1557): ``dns_label`` is an
+        # FQDN and IPAM publishing appends the zone to hostname, which
+        # doubled the suffix. The full label stays in custom_fields
+        # above (``dns_label``).
+        hostname = (p.dns_label or "").split(".")[0] or p.hostname or p.name
         out.append(
             _DesiredAddress(
                 address=p.ip,
@@ -323,6 +330,16 @@ async def _apply_addresses(
             row = current[addr]
             changed = False
             if row.subnet_id != subnet.id:
+                # Another integration's row (or another NetBird instance's) may
+                # already sit at the target (subnet, address); moving onto
+                # it would hit ``uq_ip_address_subnet_address`` and roll
+                # back the whole sync. Leave our row where it is.
+                if await address_taken(db, subnet.id, d.address, exclude_id=row.id):
+                    summary.warnings.append(
+                        f"address {addr}: subnet {subnet.network} already has a row "
+                        f"for it; not moving"
+                    )
+                    continue
                 dirty_subnets.add(row.subnet_id)
                 row.subnet_id = subnet.id
                 changed = True
@@ -346,6 +363,12 @@ async def _apply_addresses(
                 dirty_subnets.add(subnet.id)
                 summary.addresses_updated += 1
         else:
+            # The claim pass above took every row we may claim; one
+            # still at this (subnet, address) has another owner
+            # (warned there). Inserting next to it would hit
+            # ``uq_ip_address_subnet_address``.
+            if await address_taken(db, subnet.id, d.address):
+                continue
             db.add(
                 IPAddress(
                     subnet_id=subnet.id,
@@ -485,6 +508,23 @@ async def _apply_synthetic_dns(
 
     for key in desired_keys - current_by_key.keys():
         label, rtype, value = key
+        # #1561: never insert beside a non-owned record at the same
+        # name — skip + warn instead.
+        conflict = await find_record_insert_conflict(
+            db,
+            zone.id,
+            name=label,
+            record_type=rtype,
+            own_fk="netbird_instance_id",
+            own_id=instance.id,
+        )
+        if conflict is not None:
+            summary.warnings.append(
+                f"DNS record {label} ({rtype}) in zone {zone_name!r} conflicts with "
+                f"existing {conflict.record_type} record at the same name, not owned "
+                f"by this instance; skipping insert"
+            )
+            continue
         fqdn = zone_name.rstrip(".") if label == "@" else f"{label}.{zone_name.rstrip('.')}"
         db.add(
             DNSRecord(

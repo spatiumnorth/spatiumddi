@@ -54,12 +54,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
+from app.api.stepup import require_operator_stepup
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.models.appliance import PairingClaim, PairingCode
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.services.reauth import ReauthOutcome, reverify_operator
 
 logger = structlog.get_logger(__name__)
 
@@ -535,15 +535,18 @@ async def reveal_pairing_code(
 
     # #408 — local users re-confirm with password or TOTP; external-auth
     # users with TOTP (enrol under Settings → Security if not yet enrolled).
-    outcome = reverify_operator(current_user, password=body.password, totp_code=body.totp_code)
-    if outcome is ReauthOutcome.MFA_REQUIRED:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Re-confirmation requires MFA. Your account has no local password "
-            "— enrol TOTP under Settings → Security, then retry.",
-        )
-    if outcome is not ReauthOutcome.OK:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password or TOTP verification failed.")
+    # #1413 — through the shared step-up: a wrong answer spends the
+    # per-account budget, and a refusal is now audited (it was not).
+    await require_operator_stepup(
+        db,
+        current_user,
+        password=body.password,
+        totp_code=body.totp_code,
+        action="pairing_code_reveal_denied",
+        resource_type="pairing_code",
+        resource_id=str(code_id),
+        resource_display=str(code_id),
+    )
 
     row = await db.get(PairingCode, code_id)
     if row is None:

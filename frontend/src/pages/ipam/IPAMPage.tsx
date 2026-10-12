@@ -3287,7 +3287,6 @@ export function AddAddressModal({
   // publish beyond the singular primary. Only surfaced when the
   // subnet has ``dns_split_horizon`` on (effective).
   const [extraZoneIds, setExtraZoneIds] = useState<string[]>([]);
-  const [dhcpScopeId, setDhcpScopeId] = useState<string>("");
   // Issue #472 — let the operator create a scope inline when none exists yet,
   // instead of sending them off to the DHCP Pools tab and back.
   const [showCreateScope, setShowCreateScope] = useState(false);
@@ -3304,8 +3303,12 @@ export function AddAddressModal({
   const [addressCreated, setAddressCreated] = useState(false);
   // Only a reservation is made on a scope (the static_dhcp branch of the
   // mutation below). A "dhcp" row records an address the DHCP server
-  // leases, and nothing takes a scope for it, so the picker is not shown
-  // for one (#1306). Edit address draws the same line (#867).
+  // leases, and nothing takes a scope for it, so the no-scope notice is
+  // not shown for one (#1306). Edit address draws the same line (#867).
+  // #1629 — there is no scope *picker* any more: since #1628 the server
+  // syncs the reservation onto the subnet's sole matching scope and
+  // warns instead of guessing when there are several, so the dialog
+  // sends no scope and the old picker (which no request carried) is gone.
   const needsDhcpScope = ipStatus === "static_dhcp";
 
   // Scopes load unconditionally (cheap) so we can do the dynamic-pool
@@ -3329,12 +3332,6 @@ export function AddAddressModal({
     })),
   });
   const allPools = poolQueries.flatMap((q) => q.data ?? []);
-
-  useEffect(() => {
-    if (needsDhcpScope && !dhcpScopeId && dhcpScopes.length > 0) {
-      setDhcpScopeId(dhcpScopes[0].id);
-    }
-  }, [needsDhcpScope, dhcpScopes.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Which dynamic pool does the manually-entered IP fall in, if any?
   // In-pool allocation is allowed (#631) — the server returns a soft,
@@ -3478,28 +3475,17 @@ export function AddAddressModal({
               reserved_until: reservedIso,
               force,
             });
-      // If the user picked a static_dhcp status and a scope, mirror the row
-      // into the DHCP side so the two stay in sync (the backend
-      // `upsert_ipam_for_static` helper in `services/dhcp/static_ipam.py` will
-      // find the existing IPAM row and just link / update it — no duplicate is
-      // created).
-      // #516 — the address IS already created at this point; a failing
-      // reservation must NOT surface as "Failed to allocate address" (the
-      // row exists, so re-submitting collides). Catch it separately and
-      // report it as a partial success instead.
-      let staticError: string | null = null;
-      if (ipStatus === "static_dhcp" && dhcpScopeId && mac) {
-        try {
-          await dhcpApi.createStatic(dhcpScopeId, {
-            ip_address: String(created.address),
-            mac_address: mac,
-            hostname: hostname || "",
-            description: description || "",
-          });
-        } catch (e) {
-          staticError = formatApiError(e, "DHCP reservation failed");
-        }
-      }
+      // #1628 — the backend now creates the DHCP reservation server-side
+      // when the row is a ``static_dhcp`` reservation
+      // (``sync_static_for_ipam_row``), so there is no chained
+      // ``createStatic`` call anymore. When the server could not mirror
+      // the row (no scope, several scopes, a conflicting reservation),
+      // the response carries ``dhcp_static_warning`` instead.
+      // #516 — the address IS already created at this point; an
+      // unmirrored reservation must NOT surface as "Failed to allocate
+      // address" (the row exists, so re-submitting collides). Report it
+      // as a partial success instead.
+      const staticError = created.dhcp_static_warning ?? null;
       return { created, staticError };
     },
     onSuccess: ({ staticError }) => {
@@ -3510,12 +3496,15 @@ export function AddAddressModal({
       qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
       if (staticError) {
-        // Address created, reservation failed — keep the modal open so the
-        // operator sees this; the row already exists (don't re-submit).
+        // Address created, reservation not mirrored — keep the modal open
+        // so the operator sees this; the row already exists (don't
+        // re-submit).
         setAddressCreated(true);
         setError(
-          `Address allocated, but the DHCP reservation failed: ${staticError}. ` +
-            "The address row was created — close this and edit the row to retry the reservation.",
+          // The warning already ends in a full stop — don't add a
+          // second one (#1629 walk).
+          `Address allocated, but the DHCP reservation was not created: ${staticError.replace(/\.\s*$/, "")}. ` +
+            "The address row was created — close this and edit the row once the cause is fixed.",
         );
         return;
       }
@@ -3842,47 +3831,30 @@ export function AddAddressModal({
             <div />
           )}
         </div>
-        {needsDhcpScope && (
-          <Field label="DHCP Scope">
-            {dhcpScopes.length === 0 ? (
-              <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
-                No DHCP scope exists for this subnet — a reservation needs one.
-                <button
-                  type="button"
-                  onClick={() => setShowCreateScope(true)}
-                  className="ml-1 font-medium text-primary underline hover:no-underline"
-                >
-                  Create a scope
-                </button>{" "}
-                to continue.
-              </div>
-            ) : (
-              <select
-                className={inputCls}
-                value={dhcpScopeId}
-                onChange={(e) => setDhcpScopeId(e.target.value)}
-              >
-                {dhcpScopes.map((sc) => (
-                  <option key={sc.id} value={sc.id}>
-                    {sc.name || `Scope ${sc.id.slice(0, 8)}`}
-                    {" — group "}
-                    {sc.group_id.slice(0, 8)}
-                  </option>
-                ))}
-              </select>
-            )}
-            {ipStatus === "static_dhcp" && !mac && (
-              <p className="mt-1 text-xs text-amber-600">
-                MAC address required to create a static DHCP reservation.
-              </p>
-            )}
+        {needsDhcpScope && dhcpScopes.length === 0 && (
+          <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
+            No DHCP scope exists for this subnet — a reservation needs one, so
+            the server will create the address without one and say so.
+            <button
+              type="button"
+              onClick={() => setShowCreateScope(true)}
+              className="ml-1 font-medium text-primary underline hover:no-underline"
+            >
+              Create a scope
+            </button>{" "}
+            first if you want the reservation now.
             {showCreateScope && (
               <CreateScopeModal
                 subnetId={subnetId}
                 onClose={() => setShowCreateScope(false)}
               />
             )}
-          </Field>
+          </div>
+        )}
+        {needsDhcpScope && !mac && (
+          <p className="text-xs text-amber-600">
+            MAC address required to create a static DHCP reservation.
+          </p>
         )}
         <Field label="Description">
           <input
@@ -8784,11 +8756,13 @@ export function EditAddressModal({
     CollisionWarning[] | null
   >(null);
   // #867 — parity with AddAddressModal: flipping an existing row to
-  // ``static_dhcp`` must be able to pin the reservation on a scope instead of
-  // silently saving a row the DHCP server keeps leasing. Only surfaced when no
-  // reservation is linked yet — a linked row is owned by the DHCP side
-  // (``upsert_ipam_for_static`` is the source of truth for hostname/MAC).
-  const [dhcpScopeId, setDhcpScopeId] = useState<string>("");
+  // ``static_dhcp`` pins a reservation server-side (#1628) instead of
+  // silently saving a row the DHCP server keeps leasing. The no-scope
+  // notice is only surfaced when no reservation is linked yet.
+  // #1629 — there is no scope *picker* any more: the server syncs the
+  // reservation onto the subnet's sole matching scope and warns instead
+  // of guessing when there are several, so the dialog sends no scope
+  // and the old picker (which no request carried) is gone.
   const [showCreateScope, setShowCreateScope] = useState(false);
   const needsDhcpScope =
     status === "static_dhcp" && !address.static_assignment_id;
@@ -8804,12 +8778,6 @@ export function EditAddressModal({
     queryFn: () => dhcpApi.listScopesBySubnet(address.subnet_id),
     enabled: needsDhcpScope && dhcpOn,
   });
-
-  useEffect(() => {
-    if (needsDhcpScope && !dhcpScopeId && dhcpScopes.length > 0) {
-      setDhcpScopeId(dhcpScopes[0].id);
-    }
-  }, [needsDhcpScope, dhcpScopes.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_address"],
@@ -8937,23 +8905,14 @@ export function EditAddressModal({
         reserved_until: reservedIso,
         force,
       });
-      // #867 — mirror the row into the DHCP side, same chained pattern +
-      // partial-failure contract as AddAddressModal (#516). Unlike create,
-      // the row update is idempotent, so a failed reservation is retried by
-      // simply saving again.
-      let staticError: string | null = null;
-      if (needsDhcpScope && dhcpScopeId && macAddress) {
-        try {
-          await dhcpApi.createStatic(dhcpScopeId, {
-            ip_address: String(address.address),
-            mac_address: macAddress,
-            hostname: hostname || "",
-            description: description || "",
-          });
-        } catch (e) {
-          staticError = formatApiError(e, "DHCP reservation failed");
-        }
-      }
+      // #1628 — the backend syncs the DHCP reservation server-side on
+      // update (``sync_static_for_ipam_row``), so there is no chained
+      // ``createStatic`` call anymore. When the server could not mirror
+      // the row, the response carries ``dhcp_static_warning`` instead.
+      // #867 — same partial-failure contract as AddAddressModal (#516):
+      // the row update is idempotent, so an unmirrored reservation is
+      // retried by simply saving again once the cause is fixed.
+      const staticError = updated.dhcp_static_warning ?? null;
       return { updated, staticError };
     },
     onSuccess: ({ staticError }) => {
@@ -8961,14 +8920,17 @@ export function EditAddressModal({
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
-      if (dhcpScopeId) {
-        qc.invalidateQueries({ queryKey: ["dhcp-statics", dhcpScopeId] });
-      }
+      // The server may have created / updated / removed the linked
+      // reservation on any scope — invalidate every statics list.
+      qc.invalidateQueries({ queryKey: ["dhcp-statics"] });
       if (staticError) {
-        // Row saved, reservation failed — keep the modal open so the
-        // operator sees it; saving again retries just the reservation.
+        // Row saved, reservation not mirrored — keep the modal open so
+        // the operator sees it; saving again retries once the cause is
+        // fixed.
         setError(
-          `Address saved, but the DHCP reservation failed: ${staticError}. ` +
+          // The warning already ends in a full stop — don't add a
+          // second one (#1629 walk).
+          `Address saved, but the DHCP reservation was not created: ${staticError.replace(/\.\s*$/, "")}. ` +
             "Fix the cause and press Save again to retry the reservation.",
         );
         return;
@@ -9141,63 +9103,48 @@ export function EditAddressModal({
             ))}
           </select>
         </Field>
-        {/* #867 — scope picker for pinning a reservation on a row edited
-            into ``static_dhcp``. Mirrors AddAddressModal, incl. the #472
-            inline create-scope escape hatch. */}
-        {needsDhcpScope && (
-          <Field label="DHCP Scope">
-            {dhcpScopes.length === 0 ? (
-              <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
-                No DHCP scope exists for this subnet — a reservation needs one.
-                <button
-                  type="button"
-                  onClick={() => setShowCreateScope(true)}
-                  className="ml-1 font-medium text-primary underline hover:no-underline"
-                >
-                  Create a scope
-                </button>{" "}
-                to continue.
-              </div>
-            ) : (
-              <select
-                className={inputCls}
-                value={dhcpScopeId}
-                onChange={(e) => setDhcpScopeId(e.target.value)}
-              >
-                {dhcpScopes.map((sc) => (
-                  <option key={sc.id} value={sc.id}>
-                    {sc.name || `Scope ${sc.id.slice(0, 8)}`}
-                    {" — group "}
-                    {sc.group_id.slice(0, 8)}
-                  </option>
-                ))}
-              </select>
-            )}
-            {!macAddress && (
-              <p className="mt-1 text-xs text-amber-600">
-                MAC address required to create a static DHCP reservation.
-              </p>
-            )}
+        {/* #867 — no-scope notice for a row edited into ``static_dhcp``.
+            Mirrors AddAddressModal, incl. the #472 inline create-scope
+            escape hatch. There is no scope picker (#1629): the server
+            picks the subnet's sole matching scope itself. */}
+        {needsDhcpScope && dhcpScopes.length === 0 && (
+          <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
+            No DHCP scope exists for this subnet — a reservation needs one, so
+            the server will save the address without one and say so.
+            <button
+              type="button"
+              onClick={() => setShowCreateScope(true)}
+              className="ml-1 font-medium text-primary underline hover:no-underline"
+            >
+              Create a scope
+            </button>{" "}
+            first if you want the reservation now.
             {showCreateScope && (
               <CreateScopeModal
                 subnetId={address.subnet_id}
                 onClose={() => setShowCreateScope(false)}
               />
             )}
-          </Field>
+          </div>
+        )}
+        {status === "static_dhcp" && !macAddress && (
+          <p className="text-xs text-amber-600">
+            MAC address required to create a static DHCP reservation.
+          </p>
         )}
         {status === "static_dhcp" && address.static_assignment_id && (
           <p className="text-[11px] text-muted-foreground">
-            A DHCP reservation is already linked to this address — the
-            reservation (DHCP side) is the source of truth for hostname and MAC.
+            A DHCP reservation is linked to this address. Saving keeps it in
+            step — the reservation takes this row's MAC and hostname — and it is
+            removed if the status moves away from static_dhcp.
           </p>
         )}
         {address.status === "static_dhcp" &&
           status !== "static_dhcp" &&
           address.static_assignment_id && (
             <p className="text-[11px] text-amber-700 dark:text-amber-400">
-              This edit does not remove the linked DHCP reservation — delete it
-              on the DHCP side to actually free the address.
+              Saving removes the linked DHCP reservation — the server deletes it
+              in step with this row's status change.
             </p>
           )}
         <div className="grid grid-cols-2 gap-2">
@@ -11022,7 +10969,12 @@ function DeleteOrOrphanModal({
 }
 
 /** Two-step destruction modal: step 1 confirms intent, step 2 requires checkbox. */
-function ConfirmDestroyModal({
+/** IPAM's two-step delete confirm. Every caller deletes into Trash — the
+ *  tree's Delete… on a block or a subnet, and the block and space views'
+ *  bulk deletes — so its last step says what can be restored and until when
+ *  (#1398). An IP address purge, the one IPAM delete for good, has its own
+ *  dialogs. */
+export function ConfirmDestroyModal({
   title,
   description,
   checkLabel,
@@ -11082,12 +11034,14 @@ function ConfirmDestroyModal({
   }
 
   return (
-    <Modal title="Confirm Permanent Deletion" onClose={onClose}>
+    <Modal title="Move to Trash" onClose={onClose}>
       <div className="space-y-4">
-        <p className="text-sm font-medium text-destructive">
-          This action cannot be undone.
-        </p>
         <p className="text-sm text-muted-foreground">{description}</p>
+        <p className="text-sm text-muted-foreground">
+          Deleted objects go to Trash: you can restore them from Administration
+          → Trash within 30 days, after which the nightly purge deletes them for
+          good.
+        </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input
             type="checkbox"
@@ -11119,7 +11073,7 @@ function ConfirmDestroyModal({
             disabled={!checked || isPending}
             className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
           >
-            {isPending ? "Deleting…" : "Delete permanently"}
+            {isPending ? "Deleting…" : "Move to Trash"}
           </button>
         </div>
       </div>
@@ -11233,7 +11187,7 @@ function SpaceAsnBadge({ asnId }: { asnId: string }) {
 
 // ─── Edit IP Space Modal (name/description + delete trigger) ─────────────────
 
-function EditSpaceModal({
+export function EditSpaceModal({
   space,
   onClose,
   onDeleted,
@@ -11349,8 +11303,8 @@ function EditSpaceModal({
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">
             Are you sure you want to delete{" "}
-            <strong className="text-foreground">{space.name}</strong>? This will
-            permanently delete all blocks, subnets, and IP addresses within it.
+            <strong className="text-foreground">{space.name}</strong>? It moves
+            to Trash with every block and subnet inside it.
           </p>
           <div className="flex justify-end gap-2">
             <button
@@ -11374,18 +11328,13 @@ function EditSpaceModal({
   // ── Delete step 2: final confirm with checkbox ──
   if (deleteStep === 2) {
     return (
-      <Modal
-        title="Confirm Permanent Deletion"
-        onClose={() => setDeleteStep(0)}
-      >
+      <Modal title="Move to Trash" onClose={() => setDeleteStep(0)}>
         <div className="space-y-4">
-          <p className="text-sm font-medium text-destructive">
-            This action cannot be undone.
-          </p>
           <p className="text-sm text-muted-foreground">
-            All subnets and IP address records in{" "}
-            <strong className="text-foreground">{space.name}</strong> will be
-            permanently removed from the database.
+            <strong className="text-foreground">{space.name}</strong>, with
+            every block and subnet inside it, will be moved to Trash. You can
+            restore them together within 30 days from Administration → Trash;
+            after that the nightly purge deletes them for good.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -11394,7 +11343,8 @@ function EditSpaceModal({
               checked={deleteChecked}
               onChange={(e) => setDeleteChecked(e.target.checked)}
             />
-            I understand this will permanently delete all data in this IP space.
+            I understand {space.name} and everything inside it will be moved to
+            Trash.
           </label>
           {deleteError && (
             <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
@@ -11416,7 +11366,7 @@ function EditSpaceModal({
               disabled={!deleteChecked || deleteMutation.isPending}
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
-              {deleteMutation.isPending ? "Deleting…" : "Delete permanently"}
+              {deleteMutation.isPending ? "Deleting…" : "Move to Trash"}
             </button>
           </div>
         </div>
@@ -11552,9 +11502,10 @@ function EditSpaceModal({
       {tab === "danger" && (
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
-            Deleting an IP space permanently removes every block, subnet, and IP
-            address row inside it. The deletion is gated by a typed confirm in
-            the next step.
+            Deleting an IP space moves it to Trash with every block and subnet
+            inside it, restorable together for 30 days. Purging it from Trash
+            deletes them for good. The deletion is gated by a confirm in the
+            next step.
           </p>
           <button
             onClick={() => setDeleteStep(1)}
@@ -12143,8 +12094,8 @@ function EditBlockModal({
             <strong className="text-foreground font-mono">
               {block.network}
             </strong>
-            {block.name ? ` (${block.name})` : ""}? This will permanently delete
-            all subnets and IP addresses within it.
+            {block.name ? ` (${block.name})` : ""}? It moves to Trash with every
+            block and subnet inside it.
           </p>
           <div className="flex justify-end gap-2">
             <button
@@ -12168,20 +12119,15 @@ function EditBlockModal({
   // ── Delete step 2 ──
   if (deleteStep === 2) {
     return (
-      <Modal
-        title="Confirm Permanent Deletion"
-        onClose={() => setDeleteStep(0)}
-      >
+      <Modal title="Move to Trash" onClose={() => setDeleteStep(0)}>
         <div className="space-y-4">
-          <p className="text-sm font-medium text-destructive">
-            This action cannot be undone.
-          </p>
           <p className="text-sm text-muted-foreground">
-            All subnets and IP address records within{" "}
             <strong className="text-foreground font-mono">
               {block.network}
-            </strong>{" "}
-            will be permanently removed from the database.
+            </strong>
+            , with every block and subnet inside it, will be moved to Trash. You
+            can restore them together within 30 days from Administration →
+            Trash; after that the nightly purge deletes them for good.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -12190,7 +12136,8 @@ function EditBlockModal({
               checked={deleteChecked}
               onChange={(e) => setDeleteChecked(e.target.checked)}
             />
-            I understand this will permanently delete all data in this block.
+            I understand {block.network} and everything inside it will be moved
+            to Trash.
           </label>
           {deleteError && (
             <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
@@ -12212,7 +12159,7 @@ function EditBlockModal({
               disabled={!deleteChecked || deleteMutation.isPending}
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
-              {deleteMutation.isPending ? "Deleting…" : "Delete permanently"}
+              {deleteMutation.isPending ? "Deleting…" : "Move to Trash"}
             </button>
           </div>
         </div>
@@ -12334,9 +12281,10 @@ function EditBlockModal({
       {tab === "danger" && (
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
-            Deleting a block permanently removes every subnet and IP address row
-            inside it. The deletion is gated by a typed confirm in the next
-            step.
+            Deleting a block moves it to Trash with every block and subnet
+            inside it, restorable together for 30 days. Purging it from Trash
+            deletes them for good. The deletion is gated by a confirm in the
+            next step.
           </p>
           <button
             onClick={() => setDeleteStep(1)}
@@ -13129,14 +13077,14 @@ function BlockDetailView({
             <ConfirmDestroyModal
               title={`Delete ${noun}`}
               description={
-                sCount > 0
-                  ? `This will move ${sCount} subnet${sCount === 1 ? "" : "s"} to Trash` +
-                    (bCount > 0
-                      ? ` and permanently delete ${bCount} empty block${bCount === 1 ? "" : "s"}.`
-                      : ". You can restore from Admin → Trash within 30 days.")
-                  : `This will permanently delete ${bCount} empty block${bCount === 1 ? "" : "s"}. Blocks are not restorable from Trash.`
+                (sCount > 0 && bCount > 0
+                  ? `This will move ${sCount} subnet${sCount === 1 ? "" : "s"} and ${bCount} empty block${bCount === 1 ? "" : "s"} to Trash.`
+                  : sCount > 0
+                    ? `This will move ${sCount} subnet${sCount === 1 ? "" : "s"} to Trash.`
+                    : `This will move ${bCount} empty block${bCount === 1 ? "" : "s"} to Trash.`) +
+                " You can restore them from Administration → Trash within 30 days."
               }
-              checkLabel={`I understand ${noun} will be deleted.`}
+              checkLabel={`I understand ${noun} will be moved to Trash.`}
               isPending={blockBulkDeleteMut.isPending}
               error={blockBulkDeleteError}
               notice={blockBulkDeleteNotice}
@@ -15422,7 +15370,7 @@ function SpaceSection({
         <ConfirmDestroyModal
           title="Delete Block"
           description={`Delete block ${blockToDelete.network}${blockToDelete.name ? ` (${blockToDelete.name})` : ""}?`}
-          checkLabel={`I understand everything inside ${blockToDelete.network} will be permanently deleted.`}
+          checkLabel={`I understand ${blockToDelete.network} and everything inside it will be moved to Trash.`}
           isPending={deleteBlockMut.isPending}
           error={blockDeleteError}
           onClose={() => {
@@ -15470,7 +15418,7 @@ function SpaceSection({
         <ConfirmDestroyModal
           title="Delete Subnet"
           description={`Delete subnet ${subnetToDelete.network}${subnetToDelete.name ? ` (${subnetToDelete.name})` : ""}?`}
-          checkLabel={`I understand ${subnetToDelete.network} and all its contents will be permanently deleted.`}
+          checkLabel={`I understand ${subnetToDelete.network} and its contents will be moved to Trash.`}
           isPending={deleteSubnet.isPending}
           error={subnetDeleteError}
           onClose={() => {

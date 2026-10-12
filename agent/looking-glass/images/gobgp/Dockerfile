@@ -9,7 +9,7 @@
 # export-policy-list is ever populated, so the daemon can receive routes
 # from every configured peer but can never advertise one back.
 ARG PYTHON_VERSION=3.14
-ARG GOBGP_VERSION=4.9.0
+ARG GOBGP_VERSION=4.10.0
 
 FROM alpine:3.24 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
@@ -48,7 +48,7 @@ RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packa
 # Stated in the PAST tense on purpose: Dependabot bumps the ``FROM`` line but
 # cannot touch this comment, so any wording that names the CURRENT pin goes
 # stale on the very next bump — which is exactly what happened at 1.26.6.
-FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine AS gobgp-build
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine AS gobgp-build
 ARG GOBGP_VERSION
 ARG TARGETOS
 ARG TARGETARCH
@@ -56,7 +56,7 @@ RUN apk add --no-cache git
 WORKDIR /src
 RUN git clone --depth 1 --branch "v${GOBGP_VERSION}" https://github.com/osrg/gobgp .
 # Bump vulnerable transitive deps above the versions gobgp pins so Trivy
-# (HIGH/CRITICAL) stays green. The CVEs these clear: golang.org/x/net below
+# (HIGH/CRITICAL) stays green. The CVEs such overrides clear: golang.org/x/net below
 # 0.55 carries several HIGH (html XSS, IDNA punycode privilege escalation,
 # HTTP/2 DoS); x/text below 0.39 carries CVE-2026-56852 (norm.Iter infinite
 # loop); grpc-go below 1.82.1 carries GHSA-hrxh-6v49-42gf (xDS RBAC +
@@ -85,16 +85,15 @@ RUN git clone --depth 1 --branch "v${GOBGP_VERSION}" https://github.com/osrg/gob
 # GoBGP version: a comment naming the pinned release goes stale on
 # the next bump and then asserts something false (#975 found it had).
 #
-# At v4.9.0 upstream pins x/net v0.55.0 (indirect), x/text v0.37.0 and
-# grpc v1.82.1 — so all three below are still upgrades.
+# Upstream's go.mod lagged a CVE fix again (#1729): x/net below 0.60.0
+# carries CVE-2026-78669 (HIGH, net/http/internal/http2), so x/net is
+# raised past upstream's pin below — a strict upgrade, per the rule above.
+# Drop the line once upstream's go.mod reaches it.
 #
 # Dependabot does not see these: they are `go get` arguments in a Dockerfile,
 # not a tracked manifest, which is why they live in versions.json's orbit and
 # why `make trivy IMAGE=looking-glass` is what surfaces the next one.
-RUN go get \
-      golang.org/x/net@v0.58.0 \
-      golang.org/x/text@v0.41.0 \
-      google.golang.org/grpc@v1.83.2
+RUN go get golang.org/x/net@v0.60.0 && go mod tidy
 ENV CGO_ENABLED=0
 RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgpd ./cmd/gobgpd \
@@ -102,6 +101,10 @@ RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgp ./cmd/gobgp
 
 FROM alpine:3.24 AS runtime
+# Re-declared (no value) so the global GOBGP_VERSION pin is in scope in
+# this stage — without it the /etc/spatiumddi-versions write below
+# expands it to empty and the image reports `gobgp=`.
+ARG GOBGP_VERSION
 # ``libcap`` brings in ``setcap`` so gobgpd can bind BGP's privileged
 # TCP/179 as the unprivileged ``spatium`` user (same pattern as
 # kea-dhcp4/6 + named/pdns_server in the DHCP/DNS images — a
