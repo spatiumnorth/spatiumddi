@@ -129,7 +129,26 @@ the formatter handles the rest.
   off and both demoted, it accepted its own removal and left the seed one
   live voter of two. The check narrows that window, it does not close
   it: a member that dies within the 40–50 s before its Node turns NotReady,
-  or during the leave itself, is not seen.
+  or during the leave itself, is not seen. The refusal names every
+  unhealthy member, each marked as staying or being demoted, and on k3s
+  the seed is judged by its Node alone: a member's sudden loss stalls the
+  seed's own heartbeat for about two minutes (#1805), and the first cut
+  then named the healthy seed instead of the member that was off.
+
+  Three more from the gate walk of a 3 → 1 demote. **The api and worker
+  rollouts no longer wedge.** The one-replica render switched both to a
+  surge-first rollout, but the one surviving old pod still carried the
+  3-node spec's required anti-affinity, which keeps the new pod off the
+  only node; the rollout timed out and the old 3-node pods, three redis
+  sentinels in their env, served on. Under the appliance's `hard`
+  anti-affinity both now retire an old pod first at any replica count, so
+  a one-node control plane takes a brief api / worker outage on each
+  rollout, as its frontend already did with `Recreate`. **The slot-image
+  mirror's volume is reclaimed** with Redis's and Postgres's when the seed
+  deletes an evicted node; the mirror sat Pending for good on a volume
+  pinned to the removed node. Nothing re-creates that claim on its own, so
+  the seed re-creates it once the old one has gone, and the mirror starts
+  empty on a live node (the images it held were on the removed node).
 
 - **Rolling upgrades no longer strand nodes or skip their safety
   checks (#1542, #1545, #1546, #1544).** A failure at any step after

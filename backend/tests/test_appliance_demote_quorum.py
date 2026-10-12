@@ -245,3 +245,88 @@ async def test_a_leave_already_in_flight_counts_as_leaving(
     # and 3 - 2 = 1 is odd, so it is the quorum check that refuses.
     assert resp.status_code == 409, resp.text
     assert "1 of the remaining 2" in resp.text
+
+
+# ── who the refusal names (#1659 walk, C3) ───────────────────────────
+
+
+def test_the_refusal_names_every_unhealthy_voter() -> None:
+    """A staying member that reads down and a demoted one that is down are
+    both named, each marked, so the operator is not sent to fix one node
+    while the other goes unmentioned."""
+    voters = [_v("seed", live=False), _v("m1"), _v("m2", live=False)]
+    why = _demote_quorum_refusal(voters, {"m1", "m2"})
+    assert why is not None
+    assert "'seed' (Node NotReady; staying)" in why
+    assert "'m2' (Node NotReady; being demoted)" in why
+    assert "0 of the remaining 2" in why
+    assert "Bring it back, or Replace it" in why
+
+
+@pytest.mark.asyncio
+async def test_a_stale_seed_heartbeat_does_not_hide_the_powered_off_member(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    """The walk's C3: m2 powered off (Node NotReady, heartbeat stale) and the
+    seed's own heartbeat stalled too (#1805) while its Node stayed Ready. On
+    k3s the seed is judged by its Node, so the refusal names m2 — and only
+    m2 — instead of the seed."""
+    token = await _admin(db_session)
+    seed, m1, m2 = await _three(db_session, m2_seen_ago=timedelta(seconds=94))
+    seed.last_seen_at = datetime.now(UTC) - timedelta(seconds=95)
+    await db_session.commit()
+    monkeypatch.setattr(
+        supervisor, "_node_ready_map", lambda: {"seed": True, "m1": True, "m2": False}
+    )
+
+    resp = await client.post(
+        DEMOTE, json={"appliance_ids": [str(m1.id), str(m2.id)]}, headers=_hdr(token)
+    )
+
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert "'m2'" in detail and "Node NotReady" in detail
+    assert "'seed'" not in detail
+    assert "1 of the remaining 2" in detail
+    await db_session.refresh(m1)
+    assert m1.desired_cluster_role is None
+
+
+@pytest.mark.asyncio
+async def test_a_seed_whose_node_is_notready_still_refuses(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    """Fail closed: dropping the seed's heartbeat from the judgement does not
+    make it unconditionally live — its Node is still read."""
+    token = await _admin(db_session)
+    _, m1, m2 = await _three(db_session)
+    await db_session.commit()
+    monkeypatch.setattr(
+        supervisor, "_node_ready_map", lambda: {"seed": False, "m1": True, "m2": True}
+    )
+
+    resp = await client.post(
+        DEMOTE, json={"appliance_ids": [str(m1.id), str(m2.id)]}, headers=_hdr(token)
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "'seed' (Node NotReady; staying)" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_off_k3s_a_stale_seed_heartbeat_still_refuses(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """With no Node list to read the heartbeat is the only evidence, so a
+    stale seed still refuses (and is named)."""
+    token = await _admin(db_session)
+    seed, m1, m2 = await _three(db_session)
+    seed.last_seen_at = datetime.now(UTC) - timedelta(minutes=3)
+    await db_session.commit()
+
+    resp = await client.post(
+        DEMOTE, json={"appliance_ids": [str(m1.id), str(m2.id)]}, headers=_hdr(token)
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "'seed'" in resp.json()["detail"]

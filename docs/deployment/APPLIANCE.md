@@ -583,11 +583,16 @@ The row then reads `evicting` until the seed has deleted the node's stale
 k8s Node and confirmed etcd agrees, and settles `left` on that. The seed
 then scales Postgres and the control-plane replicas down to the new member
 count (a dead-node Replace, by contrast, holds the old size until the
-replacement is promoted).
+replacement is promoted), and re-creates the slot-image mirror's volume on
+a live node if the removed node held it. On a one-node control plane the
+api and worker roll out by retiring the old pod first, so each rollout there
+costs a brief api outage.
 
 A demote is refused (409) while any control-plane member is unhealthy — no
 heartbeat for 90 s, or a k8s Node that is NotReady or missing — and the
-error names it. The one exception is demoting the unhealthy member itself,
+error names every unhealthy member. The seed is judged by its k8s Node
+alone, since its own heartbeat can stall for a couple of minutes when
+another member dies. The one exception is demoting the unhealthy member itself,
 allowed when a majority of the voters stays live throughout; its row waits
 in `leaving` until the node comes back to run its leave (use Replace for a
 node that never will). The check exists because the leaving node removes its

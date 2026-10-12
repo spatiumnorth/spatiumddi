@@ -4987,27 +4987,41 @@ def _demote_quorum_refusal(voters: Sequence[_VoterHealth], leaving: set[str]) ->
     An unhealthy voter that IS being demoted is accepted when the arithmetic
     holds — removing a member that is already gone only helps — though its
     row waits in ``leaving`` until the node comes back to run the leave
-    (Replace is the path for a node that never will)."""
-    unhealthy_others = [v for v in voters if not v.live and v.name not in leaving]
-    if unhealthy_others:
-        names = ", ".join(f"{v.name!r} ({v.why})" for v in unhealthy_others)
-        return (
-            f"control-plane member(s) {names} are not healthy. A demote removes etcd "
-            "voters while the cluster runs; with a member down, the survivors could lose "
-            "quorum (a leaving node's own etcd can still count a dead peer as active). "
-            "Bring it back, or Replace it, before demoting."
-        )
+    (Replace is the path for a node that never will).
+
+    The refusal names EVERY unhealthy voter, each marked as staying or being
+    demoted, rather than the first rule's subject alone. On the #1659 walk
+    the staying-member rule tripped on a seed whose own heartbeat had
+    stalled (#1805) and the message never mentioned the member that was
+    actually powered off, so the operator was sent to fix the node that was
+    fine."""
+    unhealthy = [v for v in voters if not v.live]
+    unhealthy_others = [v for v in unhealthy if v.name not in leaving]
     n = len(voters)
-    live = sum(1 for v in voters if v.live)
+    live = n - len(unhealthy)
     live_leaving = sum(1 for v in voters if v.live and v.name in leaving)
-    if 2 * (live - live_leaving) <= n - live_leaving:
-        dead = ", ".join(f"{v.name!r} ({v.why})" for v in voters if not v.live)
-        return (
-            f"after the demote's {live_leaving} live member(s) leave, {live - live_leaving} of "
-            f"the remaining {n - live_leaving} etcd voters would be live, which is not a "
-            f"majority. Not healthy: {dead}."
+    keeps_quorum = 2 * (live - live_leaving) > n - live_leaving
+    if not unhealthy_others and keeps_quorum:
+        return None
+    named = ", ".join(
+        f"{v.name!r} ({v.why}; {'being demoted' if v.name in leaving else 'staying'})"
+        for v in unhealthy
+    )
+    reasons: list[str] = []
+    if unhealthy_others:
+        reasons.append(
+            "A demote removes etcd voters while the cluster runs; with a member that "
+            "stays down, the survivors could lose quorum (a leaving node's own etcd can "
+            "still count a dead peer as active). Bring it back, or Replace it, before "
+            "demoting."
         )
-    return None
+    if not keeps_quorum:
+        reasons.append(
+            f"After the demote's {live_leaving} live member(s) leave, {live - live_leaving} "
+            f"of the remaining {n - live_leaving} etcd voters would be live, which is not a "
+            "majority."
+        )
+    return f"control-plane member(s) not healthy: {named}. " + " ".join(reasons)
 
 
 def _node_ready_map() -> dict[str, bool] | None:
@@ -5032,7 +5046,7 @@ def _node_ready_map() -> dict[str, bool] | None:
 
 async def _refuse_demote_without_quorum(db: DB, targets: list[Appliance]) -> None:
     """409 when demoting ``targets`` could leave the survivors without an etcd
-    quorum (#1541, walk finding 2), naming the unhealthy member.
+    quorum (#1541, walk finding 2), naming every unhealthy member.
 
     The leaver's own etcd guards a removal with its view of which peers are
     active, and a follower's view can be minutes stale: on the walk member-1
@@ -5042,7 +5056,9 @@ async def _refuse_demote_without_quorum(db: DB, targets: list[Appliance]) -> Non
     plane decides first, from evidence it trusts: a voter is live when its
     supervisor heartbeated within ``ONLINE_STALE_SECONDS`` AND its k8s Node
     reads Ready (a powered-off node fails both, a wedged one at least the
-    Node). Every leave already in flight counts as leaving too."""
+    Node). The seed is the exception: on k3s it is judged by its Node alone,
+    because its own heartbeat stalls when a member dies (#1805). Every leave
+    already in flight counts as leaving too."""
     from app.services.appliance import k8s  # noqa: PLC0415
     from app.services.appliance.agent_cmd import (  # noqa: PLC0415
         ONLINE_STALE_SECONDS,
@@ -5077,7 +5093,20 @@ async def _refuse_demote_without_quorum(db: DB, targets: list[Appliance]) -> Non
     for r in voter_rows:
         name = r.hostname or str(r.id)
         problems: list[str] = []
-        if not appliance_ready(state=r.state, last_seen_at=r.last_seen_at, now=now):
+        # The seed is judged by its k8s Node alone when there is one to read.
+        # Its supervisor heartbeats to the api Service through cluster DNS like
+        # every member's, and a member's sudden loss stalls that path for about
+        # two minutes while the dead pods are still endpoints (#1805) — so on
+        # the #1659 walk the guard read the healthy seed as down and named it
+        # instead of the member that was off. The Node's Ready condition is the
+        # seed kubelet's own report to its own k3s, which a peer's loss does not
+        # delay, and it turns NotReady within the node-monitor grace period,
+        # sooner than a heartbeat crosses ONLINE_STALE_SECONDS. Off k3s (no
+        # Node list) the heartbeat is all there is, so it still counts there.
+        judge_heartbeat = not (nodes is not None and r.cluster_role == CLUSTER_ROLE_PRIMARY)
+        if judge_heartbeat and not appliance_ready(
+            state=r.state, last_seen_at=r.last_seen_at, now=now
+        ):
             if r.last_seen_at is None:
                 problems.append("never heartbeated")
             else:

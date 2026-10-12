@@ -335,6 +335,14 @@ _etcd_evictions = etcd_evict.EtcdEvictions()
 # "Postgres is whole" early-out; cleared by the tick that settles them.
 _stranded_pending: set[str] = set()
 
+# #1541 — slot-image mirror claims the seed deleted off an evicted node and
+# still owes the cluster a fresh copy of (``{claim_name: manifest}``). Nothing
+# else re-creates them — the claim is a plain Helm-owned PVC — so they are
+# retried every tick until the old claim has finished terminating. Module
+# state: a restart in between leaves the claim missing until the next Helm
+# upgrade of the control-plane release, which re-creates absent objects.
+_mirror_claims_owed: dict[str, dict] = {}
+
 
 class _ReplaceHold:
     """#1059 — the CloudNativePG size hold a dead-node replace arms (and,
@@ -1343,9 +1351,40 @@ def heartbeat_once(
                         node=name,
                         error=pvc_err,
                     )
+                # #1541 — the slot-image mirror's local-path claim is
+                # stranded the same way (its pod sits Pending on the dead
+                # node's PV affinity), and only this re-creates it.
+                owed, mirror_err = k8s_api.reclaim_stranded_mirror_storage(str(name))
+                if owed:
+                    _mirror_claims_owed.update(owed)
+                    log.info(
+                        "supervisor.heartbeat.mirror_storage_reclaimed",
+                        node=name,
+                        pvcs=sorted(owed),
+                    )
+                if mirror_err:
+                    log.warning(
+                        "supervisor.heartbeat.mirror_storage_reclaim_failed",
+                        node=name,
+                        error=mirror_err,
+                    )
             else:
                 log.warning(
                     "supervisor.heartbeat.node_evict_failed", node=name, error=evict_err
+                )
+        if _mirror_claims_owed:
+            created, still_owed, recreate_err = k8s_api.recreate_reclaimed_claims(
+                dict(_mirror_claims_owed)
+            )
+            _mirror_claims_owed.clear()
+            _mirror_claims_owed.update(still_owed)
+            if created:
+                log.info("supervisor.heartbeat.mirror_storage_recreated", pvcs=created)
+            if recreate_err:
+                log.warning(
+                    "supervisor.heartbeat.mirror_storage_recreate_failed",
+                    error=recreate_err,
+                    owed=sorted(still_owed),
                 )
         confirmed, reasons = _etcd_evictions.tick(
             {
