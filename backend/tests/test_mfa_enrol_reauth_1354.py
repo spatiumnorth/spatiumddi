@@ -320,7 +320,8 @@ def test_oidc_auth_time_must_be_recent_and_present():
             _require_fresh_auth_time(stale, started)
     with pytest.raises(OIDCServiceError, match="future"):
         _require_fresh_auth_time(started + 3600, started)
-    for unusable in (None, "yesterday", True, [1]):
+    # NaN compares False against both bounds, so it must be refused up front.
+    for unusable in (None, "yesterday", True, [1], float("nan"), float("inf"), float("-inf")):
         with pytest.raises(OIDCServiceError, match="no usable auth_time"):
             _require_fresh_auth_time(unusable, started)
 
@@ -553,6 +554,69 @@ async def test_a_replayed_callback_leaves_no_second_proof(
     replay = await _oidc_callback(client, provider, cookie, state, subject="sub-1")
     assert replay.headers["location"] == "/account?mfa_reauth=failed"
     assert (await client.post(BEGIN, headers=headers)).status_code == 403
+
+
+async def test_a_reauth_callback_signs_nobody_in(client: AsyncClient, db_session: AsyncSession):
+    # A step-up is not a login: no refresh cookie, no new session row, and the
+    # browser goes back to /account, never to the login callback.
+    provider = await _oidc_provider(db_session)
+    user, headers = await _account(db_session, provider, external_id="sub-1")
+    _, cookie, state = await _start_oidc(client, headers)
+    cb = await _oidc_callback(client, provider, cookie, state, subject="sub-1")
+    assert cb.headers["location"] == "/account?mfa_reauth=ok"
+    assert "access_token" not in cb.headers["location"]
+    set_cookies = cb.headers.get_list("set-cookie")
+    assert not any(c.startswith(auth_router._REFRESH_COOKIE + "=") for c in set_cookies)
+    rows = (
+        (await db_session.execute(select(UserSession).where(UserSession.user_id == user.id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+
+
+async def test_a_flow_token_with_a_forged_purpose_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+):
+    # ``purpose`` rides inside the signed token: re-signing a login flow with
+    # it added under any other key is an invalid flow, not a re-authentication.
+    from jose import jwt as jose_jwt
+
+    provider = await _oidc_provider(db_session)
+    user, headers = await _account(db_session, provider, external_id="sub-1")
+    _, cookie, state = await _start_oidc(client, headers)
+    claims = auth_router._verify_flow_token(cookie.split("=", 1)[1])
+    forged = jose_jwt.encode(claims, "not-the-secret-key", algorithm="HS256")
+    cb = await _oidc_callback(client, provider, f"oidc_flow={forged}", state, subject="sub-1")
+    assert cb.headers["location"].startswith("/login")
+    assert (await client.post(BEGIN, headers=headers)).status_code == 403
+    assert user.id
+
+
+async def test_redis_down_fails_every_reauth_step_closed(
+    client: AsyncClient, db_session: AsyncSession
+):
+    import app.core.mfa_enrol_proof as proof
+
+    def down(*_a, **_kw):
+        raise ConnectionError("redis down")
+
+    provider = await _oidc_provider(db_session)
+    _, headers = await _account(db_session, provider, external_id="sub-1")
+
+    # The callback cannot claim its flow: no proof, and it says it failed.
+    _, cookie, state = await _start_oidc(client, headers)
+    with patch.object(proof, "make_async_redis", down):
+        cb = await _oidc_callback(client, provider, cookie, state, subject="sub-1")
+    assert cb.headers["location"] == "/account?mfa_reauth=failed"
+
+    # A real proof that cannot be read is a 503, never an enrolment.
+    _, cookie, state = await _start_oidc(client, headers)
+    ok = await _oidc_callback(client, provider, cookie, state, subject="sub-1")
+    assert ok.headers["location"] == "/account?mfa_reauth=ok"
+    with patch.object(proof, "make_async_redis", down):
+        r = await client.post(BEGIN, headers=headers)
+    assert r.status_code == 503
 
 
 async def test_a_login_flow_cookie_cannot_pass_as_a_reauth(

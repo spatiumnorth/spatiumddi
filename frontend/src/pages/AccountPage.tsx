@@ -95,13 +95,17 @@ function MfaPanel() {
   // Back from the IdP: ok means the re-login is proven, so carry straight on
   // into the enrolment; failed says so. The param is cleared at once so a
   // reload does not repeat it, and the ref keeps strict-mode's second effect
-  // from spending the single-use proof twice.
+  // from spending the single-use proof twice. It waits for the status and
+  // acts only for an account that re-authenticates at an IdP: the param is
+  // just a URL, so a crafted ``?mfa_reauth=ok`` link must not send a local or
+  // directory account's begin without its password, which would spend one of
+  // its step-up attempts per click (the server still gates every begin).
   const [params, setParams] = useSearchParams();
   const reauthResult = params.get("mfa_reauth");
   const handled = useRef(false);
   const [reauthFailed, setReauthFailed] = useState(false);
   useEffect(() => {
-    if (!reauthResult || handled.current) return;
+    if (!reauthResult || handled.current || !status) return;
     handled.current = true;
     setParams(
       (p) => {
@@ -110,10 +114,11 @@ function MfaPanel() {
       },
       { replace: true },
     );
+    if (status.enrol_requires !== "provider_reauth" || status.enabled) return;
     if (reauthResult === "ok") enrollBegin.mutate(undefined);
     else setReauthFailed(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reauthResult]);
+  }, [reauthResult, status]);
   const signInTooOld =
     status?.enrol_requires === "recent_sign_in" && !status.enrol_sign_in_recent;
   // With no status there is no way to know which step-up applies, so the

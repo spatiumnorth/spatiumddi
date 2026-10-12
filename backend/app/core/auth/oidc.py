@@ -8,6 +8,7 @@ token exchange with ID-token verification, and an admin probe.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, cast
@@ -40,7 +41,9 @@ AUTH_TIME_LEEWAY_SECONDS = 30
 
 def _require_fresh_auth_time(raw: Any, fresh_since: int, *, now: float | None = None) -> None:
     # bool is an int subclass; ``true`` is not a time.
-    if isinstance(raw, bool) or not isinstance(raw, int | float):
+    # ``math.isfinite``: Python's JSON decoder accepts ``NaN`` / ``Infinity``,
+    # and NaN compares False both ways, so it would pass both bounds below.
+    if isinstance(raw, bool) or not isinstance(raw, int | float) or not math.isfinite(raw):
         raise OIDCServiceError("ID token has no usable auth_time, so it proves no fresh sign-in")
     current = time.time() if now is None else now
     if raw < fresh_since - AUTH_TIME_LEEWAY_SECONDS:
