@@ -1091,7 +1091,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     }
     if server.driver in ("technitium", "bind9"):
         # #1761 / #1786: Technitium and BIND9 read this (the BIND9 agent
-        # renders ``allow-recursion`` from it, treating ["any"] as unset), so
+        # renders ``allow-recursion`` from it, omitting it for ["any"]), so
         # PowerDNS's etag does not move with it.
         options_block["allow_recursion"] = (
             list(getattr(opts, "allow_recursion", None) or []) if opts else []

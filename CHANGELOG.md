@@ -86,20 +86,25 @@ the formatter handles the rest.
 
 - **The BIND9 agent now renders `allow-recursion` (#1786).** The
   group's `allow_recursion` was stored and shipped in the bundle but
-  never written to `named.conf`, so BIND always ran its built-in
-  `localnets; localhost;` whatever the operator set. An explicit list
-  now renders in `options {}` (named ACLs resolve to the `acl {}`
-  blocks from #899; the API already validates the entries like
-  `allow_query`, and the agent drops any malformed stored element
-  rather than let `named-checkconf` refuse the bundle). The stored
-  default `["any"]`, an empty list, and recursion off render nothing:
-  `["any"]` cannot be told apart from an untouched group, and
-  rendering it would open every existing recursive group to the
-  internet on upgrade. **To open recursion deliberately, list
-  `0.0.0.0/0` and `::/0`.** Existing groups on the default see no
-  change. The BIND9 bundle now carries `allow_recursion`, so a
-  recursive BIND9 group's etag shifts once on upgrade (one benign
-  re-apply).
+  never written to `named.conf`. An explicit list now renders in
+  `options {}` (named ACLs resolve to the `acl {}` blocks from #899;
+  the API validates the entries like `allow_query`). The agent drops
+  any stored element `named-checkconf` would refuse, including an ACL
+  that no longer exists, and renders `none` if nothing survives, so one
+  bad element cannot stop the group converging and a broken
+  restriction fails closed. An ACL cited by the server options can no
+  longer be deleted or renamed. **What the default means:** the stored
+  default `["any"]`, an empty list, and recursion off render no
+  `allow-recursion` line. BIND then derives recursion from
+  `allow-query`, which the agent always renders (default `any`), so a
+  default recursive BIND9 group is an open resolver, as it has been
+  all along (the issue's "BIND ran `localnets; localhost;`" was wrong;
+  verified against BIND 9.20). This change keeps that, rather than cut
+  off resolvers serving routed clients; set `allow_recursion` or
+  `allow_query` to restrict it. Technitium maps the same default to
+  private networks only (#1761), so the two engines differ on it. Every
+  BIND9 group's etag shifts once on upgrade (one re-apply);
+  `named.conf` is byte-identical unless `allow_recursion` is explicit.
 
 - **DNSSEC is refused on a multi-server group, and the DS report is group-scoped (#1762).** Each agent server (BIND9, PowerDNS, Technitium) signs with keys it generated, so a signed zone on a group with two servers was served with two DNSKEY sets against one published DS, and validating resolvers got SERVFAIL from whichever server it did not match. Signing (the sign endpoint, `dnssec_enabled` on zone create and update, and both Copilot paths) now returns 422 when the group has more than one agent server. Adding or moving a server into a group that holds signed zones is refused too: server create, server move, a Fleet group change, and the Copilot `assign_appliance_role`. So is moving a signed zone into a multi-server group. **Disabled servers count**: a disabled agent still receives the bundle, so a disabled BIND9 server still signs with its own keys, and a disabled PowerDNS or Technitium server serves the zone unsigned under the DS. These checks lock the group row, so two concurrent requests cannot both pass. An agent that auto-registers into a signed group is not refused, because refusing would break its bootstrap. Instead it is logged and audited, and it trips the same flag as zones signed before this fix: `dnssec_multi_signer` on the zone and on `…/dnssec/info`, a red **DNSSEC: multiple signers** badge and a warning on the DNSSEC card, and a new default-on, critical `dnssec_multi_signer` alert. Those zones are not unsigned automatically. `/dns/agents/dnssec-state` now matches zones only within the reporting server's group, so same-named zones in different groups no longer collide. On a multi-server group it keeps one server's report (the primary's, or the oldest signer's when the group has no primary), which ends the last-writer-wins DS flapping.
 

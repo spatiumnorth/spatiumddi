@@ -3129,12 +3129,12 @@ class TechnitiumDriver(DriverBase):
         * ``recursion_enabled`` false → ``Deny``.
         * ``allow_recursion`` absent, empty, or exactly ``["any"]`` →
           ``AllowOnlyForPrivateNetworks``. ``["any"]`` is the model's stored
-          default and nothing distinguishes it from an explicit choice, while
-          the BIND9 agent treats it as unset (#1786) and so runs BIND's
-          localnets/localhost default. Mapping it to ``Allow``
-          would open recursion to the internet on upgrade; the engine's
-          private-network default is the closest match and is what
-          Technitium already did. ``Allow`` is therefore never sent.
+          default and nothing distinguishes it from an explicit choice.
+          Mapping it to ``Allow`` would open recursion to the internet on
+          upgrade; the engine's private-network default is what Technitium
+          already did. ``Allow`` is therefore never sent. NOTE: this differs
+          from BIND9, where an omitted ``allow-recursion`` inherits the
+          rendered ``allow-query`` (``any`` by default), not localnets (#1786).
         * otherwise ``UseSpecifiedNetworkACL`` with the list translated to
           CIDRs. Unresolvable tokens (named ACLs, garbage) are dropped with
           a warning; if none survive the result is ``Deny`` — fail closed.

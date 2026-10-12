@@ -7282,8 +7282,13 @@ function OptionsTab({ groupId }: { groupId: string }) {
               setAllowRecursion(e.target.value);
               setDirty(true);
             }}
-            placeholder="any = BIND default (localnets, localhost); 0.0.0.0/0, ::/0 opens it"
+            placeholder="any"
           />
+          <p className="text-xs text-muted-foreground">
+            &quot;any&quot; (the default) or blank: on BIND9 recursion is as
+            wide as allow-query; on Technitium, private networks only. List
+            networks to restrict it.
+          </p>
         </Field>
       </div>
 
