@@ -98,8 +98,10 @@ the formatter handles the rest.
   Forwarder to Primary keeps the zone's records, and Primary to
   Forwarder works too. Technitium refuses a conversion to Secondary or
   Stub ("not supported"); that is logged at error as
-  `technitium_zone_type_mismatch` rather than worked around with a
-  delete, since the agent never deletes zones on its own.
+  `technitium_zone_type_mismatch` and reported as a partial apply
+  (#1516) rather than worked around with a delete, since the agent
+  never deletes zones on its own. A refused forwarder change is
+  reported the same way.
   A forward zone's upstream is now written as the zone's FWD record
   instead of through `zones/options/set`, which has no `forwarder`
   parameter (it answers `ok` and stores nothing). So a zone converted to

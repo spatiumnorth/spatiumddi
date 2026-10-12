@@ -2773,6 +2773,7 @@ class TechnitiumDriver(DriverBase):
             desired_type=ztype,
             error=resp.get("errorMessage"),
         )
+        self._note_apply_failure(f"{zone}: zone type: {resp.get('errorMessage')}")
 
     def _reapply_zone_upstream(
         self, token: str, zone: str, ztype: str, params: dict[str, Any]
@@ -2857,6 +2858,9 @@ class TechnitiumDriver(DriverBase):
                     forwarder=forwarder,
                     error=body.get("errorMessage"),
                 )
+                self._note_apply_failure(
+                    f"{zone}: zone upstream: {body.get('errorMessage')}"
+                )
                 return
             log.info("technitium_zone_forwarder_set", zone=zone, forwarder=forwarder)
         for rec in live:
@@ -2881,6 +2885,9 @@ class TechnitiumDriver(DriverBase):
                     zone=zone,
                     forwarder=rdata.get("forwarder"),
                     error=body.get("errorMessage"),
+                )
+                self._note_apply_failure(
+                    f"{zone}: zone upstream: {body.get('errorMessage')}"
                 )
 
     def _replace_placeholder_soa(self, token: str, zone: str) -> None:

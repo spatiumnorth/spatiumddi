@@ -2175,13 +2175,54 @@ def test_unsupported_conversion_is_logged_and_nothing_is_deleted(tmp_path: Path)
     assert not any(p.startswith("zones/delete") for p in paths)
 
 
+def test_refused_conversion_is_noted_as_an_apply_failure(tmp_path: Path) -> None:
+    """A refused convert leaves the zone serving the wrong type, so the
+    apply must read as partial (#1516), not as applied."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    refused = {"status": "error", "errorMessage": "not supported."}
+    _install_fake_request(d, _existing_zone_responder("Primary", convert=refused))
+    d._apply_failures = []
+
+    d._ensure_zone_exists("t", {"zone": "s.test", "type": "Secondary", "masters": ["192.0.2.1"]})
+
+    assert d._apply_failures == ["s.test: zone type: not supported."]
+
+
+@pytest.mark.parametrize("refused_path", ["zones/records/add", "zones/records/delete"])
+def test_refused_fwd_record_change_is_noted_as_an_apply_failure(
+    tmp_path: Path, refused_path: str
+) -> None:
+    """The forwarder used to go through ``zones/options/set``, whose refusal
+    is noted; moving it to the FWD record must not drop that."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    inner = _existing_zone_responder(
+        "Forwarder", apex=[_soa("f.test"), _fwd("f.test", "192.0.2.1")]
+    )
+
+    def responder(path, params, n):
+        if path == refused_path:
+            return {"status": "error", "errorMessage": "Access was denied."}
+        return inner(path, params, n)
+
+    _install_fake_request(d, responder)
+    d._apply_failures = []
+
+    d._ensure_zone_exists(
+        "t", {"zone": "f.test", "type": "Forwarder", "forwarders": ["192.0.2.2"]}
+    )
+
+    assert d._apply_failures == ["f.test: zone upstream: Access was denied."]
+
+
 def test_unreadable_live_type_is_not_guessed(tmp_path: Path) -> None:
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, _existing_zone_responder(None))
+    d._apply_failures = []
 
     d._ensure_zone_exists("t", {"zone": "x.test", "type": "Primary"})
 
     assert "zones/convert" not in [c[2] for c in calls]
+    assert d._apply_failures == []
 
 
 def test_empty_tsig_key_set_is_pushed(tmp_path: Path) -> None:
