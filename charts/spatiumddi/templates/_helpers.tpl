@@ -157,13 +157,33 @@ So under ``hard`` we invert the knobs — retire one old pod, then schedule its
 replacement onto the node it just freed. Costs one replica of capacity during
 a rollout instead of deadlocking. (frontend's hostNetwork path uses Recreate
 for the same underlying reason: an exclusive per-node resource.)
+
+#1541 — under ``hard`` this holds at ONE replica too, although a one-replica
+render carries no anti-affinity of its own. The pods a rollout replaces were
+rendered by the PREVIOUS values, and required anti-affinity is symmetric: an
+existing pod's term keeps an incoming pod that matches it off its node just
+as the incoming pod's own term would. A demote from three nodes to one
+renders ``replicas: 1``, and the one surviving old pod still carries the
+3-node spec's required term. Surge-first then puts the new pod beside it on
+the only node, where it is refused ("didn't satisfy existing pods
+anti-affinity rules"), ``maxUnavailable: 0`` forbids retiring the old pod
+first, and the rollout wedges for good with the old 3-node pods serving
+(observed on the #1659 walk). The chart cannot see the previous render
+offline, so ``hard`` at one replica retires first unconditionally.
+
+The cost: a one-node control plane takes a brief api / worker outage on
+every rollout, the time a fresh pod takes to become ready. A one-node
+cluster has no second node to surge onto in the shape that matters, and the
+frontend's hostNetwork path already accepts the same trade with Recreate.
+The opposite direction (1 → 3) is the ``replicas > 1`` case above and is
+unchanged.
 */}}
 {{- define "spatiumddi.deploymentStrategy" -}}
 {{- $mode := default "soft" .mode -}}
 strategy:
   type: RollingUpdate
   rollingUpdate:
-  {{- if and (gt (int .replicas) 1) (eq $mode "hard") }}
+  {{- if eq $mode "hard" }}
     maxSurge: 0
     maxUnavailable: 1
   {{- else }}

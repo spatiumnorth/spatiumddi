@@ -946,9 +946,21 @@ class Appliance(Base):
     # dead). The SEED supervisor reads the eviction list off its
     # heartbeat response and deletes the k8s Node (k3s removes the etcd
     # member with it), then reports the hostname back so the backend
-    # clears this flag + settles the row to ``left``. Distinct from a
-    # graceful demote, which the leaving node drives itself.
+    # clears this flag + settles the row to ``left``. A graceful demote's
+    # node drives its own leave, and (#1541) its ``left`` report sets this
+    # too, with ``evict_after_demote``, so the seed deletes the stale Node.
     evict_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
+    )
+    # #1541 — True when the eviction above is the seed's cleanup after a
+    # graceful DEMOTE (the node left etcd itself and reported ``left``; the
+    # seed only deletes its stale Node and confirms etcd agrees), False for a
+    # dead-node Replace. The seed treats the two differently: a Replace arms
+    # #1059's CloudNativePG size hold until the replacement is promoted, and
+    # a demote must never arm it — the slot is given up on purpose, so the
+    # control plane scales down to the committed count. Cleared with
+    # ``evict_requested``.
+    evict_after_demote: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa.text("false")
     )
 

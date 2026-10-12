@@ -7490,6 +7490,7 @@ async def update_record(
     )
     before_name, before_value = record.name, record.value
     before_view = record.view_id
+    before_op = record_op_payload(record)
     for k, v in changes.items():
         setattr(record, k, v)
     # #424 — validate the merged per-type fields (record_type is immutable on
@@ -7553,21 +7554,44 @@ async def update_record(
     target_serial = bump_zone_serial(zone) if zone is not None else None
     op = None
     if zone is not None:
-        op = await enqueue_record_op(
-            db,
-            zone,
-            "update",
-            {
-                "name": record.name,
-                "type": record.record_type,
-                "value": record.value,
-                "ttl": record.ttl,
-                "priority": record.priority,
-                "weight": record.weight,
-                "port": record.port,
-            },
-            target_serial=target_serial,
-        )
+        new_payload = {
+            "name": record.name,
+            "type": record.record_type,
+            "value": record.value,
+            "ttl": record.ttl,
+            "priority": record.priority,
+            "weight": record.weight,
+            "port": record.port,
+        }
+        if name_changed:
+            # #1773 — a rename is delete-at-old-name + create-at-new-name: an
+            # "update" replaces the RRset AT the new name and never touches
+            # the old one, so the old name stayed served (#492 fixed only the
+            # IPAM path). One batch, delete first (#1489): agentless drivers
+            # get both in one apply_record_changes call, agents get two
+            # ordered rows. record_type is immutable on update, so a rename is
+            # the only identity change an edit can make.
+            ops = await enqueue_record_ops_batch(
+                db,
+                zone,
+                [
+                    {"op": "delete", "record": before_op, "target_serial": target_serial},
+                    {
+                        "op": "create",
+                        "record": {**new_payload, "record_id": str(record.id)},
+                        "target_serial": target_serial,
+                    },
+                ],
+            )
+            # Surface a failure of either half: a failed delete leaves the old
+            # name live, which is the very bug being fixed.
+            op = next((o for o in ops if o is not None and o.last_error), None) or (
+                ops[-1] if ops else None
+            )
+        else:
+            op = await enqueue_record_op(
+                db, zone, "update", new_payload, target_serial=target_serial
+            )
     # #1538 — as create: a failed first agentless attempt is surfaced, not
     # silently audited as success.
     provider_warning = _agentless_op_warning(op)

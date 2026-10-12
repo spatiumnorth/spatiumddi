@@ -956,6 +956,12 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "forward_tls_hostname": (getattr(opts, "forward_tls_hostname", None) if opts else None),
         "forward_tls_verify": (bool(getattr(opts, "forward_tls_verify", True)) if opts else True),
     }
+    if server.driver == "technitium":
+        # #1761: only Technitium reads this (the BIND9 agent renders a bare
+        # ``recursion yes|no``), so no other driver's etag moves with it.
+        options_block["allow_recursion"] = (
+            list(getattr(opts, "allow_recursion", None) or []) if opts else []
+        )
     if server.driver == "powerdns":
         # PowerDNS ALIAS expansion (#1353): the group's own plain-DNS
         # forwarders, or "" for ALIAS off. Never a built-in public resolver.
