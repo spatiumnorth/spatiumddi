@@ -292,8 +292,31 @@ config-driven, not op-driven (unlike PowerDNS's REST sign):
    `rndc dnssec -rollover -key <tag> <zone>` and re-reports. Sign/unsign ops
    are no-ops on the BIND9 agent (the config render drives signing).
 
-Gating: `_DRIVER_GATED_OPERATIONS` allows `dnssec_sign`/`dnssec_unsign` on
-`{powerdns, bind9}` and `dnssec_rollover` on `{bind9}`.
+Gating: `_DRIVER_GATED_OPERATIONS` allows `dnssec_sign` on `{powerdns, bind9}`
+(`dnssec_signers.SIGNING_DRIVERS`, the one list the router, zone move and the
+single-signer rule all read), `dnssec_unsign` on `{powerdns, bind9, technitium}`
+(Technitium only so a zone signed before #1783 can be turned off), and
+`dnssec_rollover` on `{bind9}`.
+
+**One signer per group ([#1762](https://github.com/spatiumnorth/spatiumddi/issues/1762)).**
+Keys are node-local on every agent engine — BIND9's `K*` files in the agent
+state dir, PowerDNS's LMDB cryptokeys, Technitium's own key store — and the
+control plane holds none of them, so two agent servers in one group serve a
+signed zone with two DNSKEY sets against one published DS. BIND9 is the
+sharpest case: signing is config-driven, so *every* server that receives the
+bundle renders `inline-signing yes;` for a `dnssec_enabled` zone — there is no
+sign op to withhold, and `is_enabled` does not stop a server receiving the
+bundle. `services/dns/dnssec_signers.py` therefore counts every agent server
+of a signing driver (enabled or not; agentless drivers excluded) and the
+`dnssec_sign` gate refuses when there is more than one; a server joining a
+group that holds signed zones is refused on every operator path (create,
+move, Fleet, Copilot). Existing multi-signer zones keep rendering signed on
+every server — unsigning them automatically would be its own outage — and are
+surfaced instead (`dnssec_multi_signer` on the zone, the UI badge + DNSSEC
+card, and the `dnssec_multi_signer` alert). The `/dnssec-state` report is
+matched within the reporting server's group, and on a multi-signer group only
+one server's report (the primary's, else the oldest signer's) is stored. See
+[`DNS.md`](../features/DNS.md) ("One signing server per group").
 
 ### 2.6 Rate limiting (RRL) + amplification (issue #146)
 
@@ -567,7 +590,7 @@ PowerDNS does the full DNSSEC dance internally:
 2. `POST /cryptokeys` with `keytype: zsk` (same algorithm). PowerDNS now signs all rrsets in the zone with the ZSK on every query.
 3. `PUT /zones/<zone>/rectify` — recomputes NSEC / NSEC3 chain. The agent deliberately does **not** set the `PRESIGNED` zone metadata: that flag is for externally-signed zones loaded as already-signed, whereas pdns derives online-signing intent from the presence of active/published cryptokeys (and pdns rejects setting `PRESIGNED` with "Unsupported metadata kind" — re-verified on 5.0.5 in #638).
 
-After signing, the agent enumerates DS records via `GET /cryptokeys` and POSTs them back to the control plane through the new `POST /api/v1/dns/agents/dnssec-state` endpoint. The control plane caches them in `dns_zone.dnssec_ds_records` (JSONB) so the operator-facing zone-edit page renders them without round-tripping the agent.
+After signing, the agent enumerates DS records via `GET /cryptokeys` and POSTs them back to the control plane through the new `POST /api/v1/dns/agents/dnssec-state` endpoint. The control plane caches them in `dns_zone.dnssec_ds_records` (JSONB) so the operator-facing zone-edit page renders them without round-tripping the agent. The cryptokeys are per container, so signing is refused on a group with more than one PowerDNS server (§2.5, #1762).
 
 **Backup integration.** DNSSEC keys live in the agent's LMDB store, **not** in the control-plane backup. Restoring a DNSSEC-signed zone to a fresh agent regenerates keys and produces NEW DS records, which must be re-published to the parent registrar. The restore endpoint surfaces this as a `RestoreOutcomeResponse.warnings[]` advisory. See [issue #127 Phase 4d](https://github.com/spatiumnorth/spatiumddi/issues/127).
 
@@ -693,7 +716,7 @@ Each driver's `capabilities()` returns the same dict shape Windows / PowerDNS us
 | ALIAS records | apex CNAME auto-flattened | read-only (`AliasTarget`, null TTL; authoring deferred) | deferred | — |
 | Apex handling | Cloudflare flattens CNAME-at-apex | apex SOA / NS provider-managed | apex SOA Azure-managed (skipped on read) | apex SOA provider-managed |
 
-**No cloud driver advertises online DNSSEC sign/unsign (#29).** Cloud DNSSEC is a zone-level *provider* toggle — Route 53 needs a KMS asymmetric key, Cloudflare/Google a managed-zone enable — not the per-record online signing the `dnssec_sign`/`unsign` ops model, so every cloud driver's capability dict carries `dnssec_online: False` and the DNSSEC sign/unsign operations stay gated server-side by `_DRIVER_GATED_OPERATIONS` to BIND9 / PowerDNS / Technitium (rollover to BIND9 alone). Likewise **cloud ALIAS authoring is deferred** — Route 53 / Azure alias targets need a provider resource id the generic `ALIAS` record type can't express (so `alias_records: False` and `ALIAS` is gated to PowerDNS), though existing alias rrsets are still read back. Wiring real cloud DNSSEC (provider enable + DS retrieval) and cloud ALIAS authoring is a #29 follow-up.
+**No cloud driver advertises online DNSSEC sign/unsign (#29).** Cloud DNSSEC is a zone-level *provider* toggle — Route 53 needs a KMS asymmetric key, Cloudflare/Google a managed-zone enable — not the per-record online signing the `dnssec_sign`/`unsign` ops model, so every cloud driver's capability dict carries `dnssec_online: False` and the DNSSEC sign/unsign operations stay gated server-side by `_DRIVER_GATED_OPERATIONS` to BIND9 / PowerDNS (rollover to BIND9 alone). Likewise **cloud ALIAS authoring is deferred** — Route 53 / Azure alias targets need a provider resource id the generic `ALIAS` record type can't express (so `alias_records: False` and `ALIAS` is gated to PowerDNS), though existing alias rrsets are still read back. Wiring real cloud DNSSEC (provider enable + DS retrieval) and cloud ALIAS authoring is a #29 follow-up.
 
 ### 4A.4 Provider-specific wrinkles the hooks paper over
 
@@ -740,7 +763,7 @@ The token never reaches the control plane — same agent-local trust boundary as
     "name": "technitium",
     "views": False,
     "rpz": False,
-    "dnssec_inline_signing": True,
+    "dnssec_inline_signing": False,   # #1783 - not advertised; see 4B.3b
     "incremental_updates": "rest_api",
     "zone_types": ["forward", "primary", "secondary", "stub"],
     "record_types": [...],            # A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/
@@ -779,7 +802,13 @@ Three behaviours worth knowing, all confirmed against a live daemon:
 
 **Catalog zones (RFC 9432) are NOT supported on Technitium** ([#1782](https://github.com/spatiumnorth/spatiumddi/issues/1782); the fix is [#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766), 1.1.0). Both roles are broken: as **producer**, turning the catalog on makes every member zone inherit the catalog zone's transfer `Deny` and notify `None`, which silently undoes the #734 transfer grant, so drift, Sync with Servers and NOTIFY all stop; as **consumer**, the `SecondaryCatalog` zone is created without TSIG, cannot transfer the producer's denied catalog, and stays empty. The driver reports `catalog_zones: False`; enabling `catalog_zones_enabled` on a group with a `technitium` / `technitium_api` server is a 422, as is putting such a server into a catalog-enabled group: on server create, on a driver change, on a server move, and on a Fleet or Copilot role assignment that points a `dns-technitium` appliance at one. An agent that auto-registers straight into a catalog group (its `AGENT_GROUP` names one) is *not* refused, because a refused registration re-bootstraps in a loop; it logs `dns_agent_catalog_unsupported_driver` and the group carries the warning below. A group that already had it on keeps rendering as before, and `GET /dns/groups` carries a `catalog_unsupported_warning` (also shown in the group editor). The agent code (`_apply_catalog`: producer `Catalog` zone + `catalog=<name>` stamping, consumer `SecondaryCatalog`, `catalog=""` to unenrol) is retained for #1766.
 
-### 4B.3b DNSSEC (issue #740)
+### 4B.3b DNSSEC (issue #740, withdrawn in #1783)
+
+> **SpatiumDDI does not support DNSSEC signing on Technitium (#1783).** `technitium` is absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`, so the sign endpoint, `dnssec_enabled` on zone create or update, and the Copilot all answer 422 naming #1767, and `capabilities()` reports `dnssec_inline_signing: False`. The reason: signing here is one-shot. The sign op is sent once, so a zone is not re-signed when a server joins the group, when the zone is re-created or restored, or when a data volume is lost; the zone's `DNSSECPolicy` is ignored (always ECDSA P256 / NSEC); and key state is re-reported only while the zone is signed. The zone then shows signed in SpatiumDDI while being unsigned on the wire. Full support is tracked in [#1767](https://github.com/spatiumnorth/spatiumddi/issues/1767) (1.1.0).
+>
+> **Zones already signed on Technitium are left alone.** The agent does not unsign them and they keep serving signed. Their zone response carries `dnssec_unmanaged_warning: true` and the UI shows a "DNSSEC not managed" badge. `dnssec_unsign` stays allowed on `technitium`, so an operator can still turn DNSSEC off.
+>
+> The rest of this section describes the agent mechanism that remains for those zones. Disregard its claims of sign-on-demand and of rollover being left to the daemon: Technitium's own key rollover is not surfaced here.
 
 Online signing, op-driven — the same shape as PowerDNS, not BIND9's config-rendered `dnssec-policy`. `dnssec_sign` / `dnssec_unsign` ride the record-op queue and branch out before any rrset machinery.
 
@@ -1089,7 +1118,7 @@ Mixed installs work via multiple groups:
 | Reference impl, BIND muscle memory, RPZ blocking | **BIND9** |
 | ALIAS records (CNAME at apex) | **PowerDNS** |
 | LUA records (computed responses, geo-routing) | **PowerDNS** |
-| One-toggle online DNSSEC | **PowerDNS** or **Technitium** |
+| One-toggle online DNSSEC | **PowerDNS** (BIND9 signs inline from a policy; Technitium is not supported, #1783) |
 | Manual NSEC3 + KSK / ZSK rollover control | **BIND9** |
 | First-class views / split-horizon (issue #24) | **BIND9** |
 | Catalog zones as **producer** | BIND9 or PowerDNS (Technitium refused, #1782) |
@@ -1105,7 +1134,7 @@ BIND9, PowerDNS, and Technitium drivers are all supported indefinitely. PowerDNS
 
 **Picking between the two Technitium drivers** comes down to one question — do you want SpatiumDDI to *run* the daemon?
 
-- Yes → `technitium` (§4B). Full feature set: DNSSEC, encrypted transports, forwarders, blocklists (not catalog zones — #1782).
+- Yes → `technitium` (§4B). Encrypted transports, forwarders, blocklists. Not catalog zones (#1782) or DNSSEC signing (#1783; #1767).
 - No, it's already running → `technitium_api` (§4C). Zones and records only; the rest stays managed in Technitium's own console.
 
 A group is single-driver, so servers of the two kinds live in separate groups.

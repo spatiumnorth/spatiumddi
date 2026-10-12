@@ -4309,6 +4309,7 @@ async def update_appliance_roles(
         )
     moved_servers: list[dict[str, Any]] = []
     retired_servers: list[str] = []
+    signer_check: tuple[Any, str] | None = None
     # #1782 — captured before the edits below so the Technitium-into-a-
     # catalog-group refusal fires only on a change, never on a re-save of a
     # pre-existing assignment.
@@ -4385,6 +4386,18 @@ async def update_appliance_roles(
             from app.services.dns.server_move import ServerMoveError, move_server_to_group
 
             own_dns = await _appliance_own_dns_servers(db, row)
+            if (
+                not own_dns
+                and _current_dns_drivers(row)
+                and dns_group.id != row.assigned_dns_group_id
+            ):
+                # #1762 — no server row yet: the agent will register into this
+                # group as a new signer, so apply the same refusal a move gets.
+                # Only on a pointer change, so re-saving an unchanged
+                # assignment is never refused. Checked after the #1782
+                # catalog refusal below, the order move_server_to_group uses
+                # for an existing server (compatibility first, then signers).
+                signer_check = (dns_group, next(iter(_current_dns_drivers(row))))
             if any(srv.group_id != dns_group.id for srv in own_dns):
                 # #1715 — the appliance's own dead row of a previous engine
                 # would block the move on name and driver; retire it first.
@@ -4435,6 +4448,12 @@ async def update_appliance_roles(
                     f"DNS server group {target.name!r} has catalog zones enabled. "
                     + catalog_unsupported_message({"technitium"}),
                 )
+    if signer_check is not None:
+        from app.services.dns.dnssec_signers import second_signer_refusal
+
+        refusal = await second_signer_refusal(db, signer_check[0], driver=signer_check[1])
+        if refusal is not None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, refusal)
     if "dhcp_group_id" in body.model_fields_set:
         if body.dhcp_group_id is None:
             row.assigned_dhcp_group_id = None

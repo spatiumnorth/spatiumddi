@@ -5599,6 +5599,11 @@ export interface DNSZone {
   linked_subnet_id: string | null;
   domain_id?: string | null;
   dnssec_enabled: boolean;
+  // #1762 — signed on a group with more than one DNS server, each signing
+  // with its own keys (validating resolvers SERVFAIL on the mismatch).
+  dnssec_multi_signer?: boolean;
+  /** #1783 - signed on a Technitium group; SpatiumDDI won't keep it signed (#1767). */
+  dnssec_unmanaged_warning?: boolean;
   auto_tls_probe?: boolean;
   dnssec_policy_id?: string | null;
   // Dynamic-update (RFC 2136) ACL toggle (issue #641). ACL rows are
@@ -5943,6 +5948,12 @@ export interface ZoneDnssecInfo {
   dnssec_ds_records: string[];
   dnssec_synced_at: string | null;
   keys: DNSKeyState[];
+  // #1762 — see Zone.dnssec_multi_signer; signing_servers is the group's count.
+  dnssec_multi_signer?: boolean;
+  signing_servers?: number;
+  // #1783 - the group runs Technitium; sign / re-sign are refused (#1767).
+  signing_unmanaged?: boolean;
+  dnssec_unmanaged_warning?: boolean;
 }
 
 /** A reusable BIND9 dnssec-policy definition (issue #49). */

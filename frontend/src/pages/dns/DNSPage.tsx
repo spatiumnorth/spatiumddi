@@ -2314,6 +2314,11 @@ function DnssecCard({
   const dsRecords = info.data?.dnssec_ds_records ?? [];
   const syncedAt = info.data?.dnssec_synced_at ?? null;
   const keys = info.data?.keys ?? [];
+  const multiSigner = info.data?.dnssec_multi_signer ?? false;
+  const signingServers = info.data?.signing_servers ?? 0;
+  const signingUnmanaged = info.data?.signing_unmanaged ?? false;
+  const unmanagedNote =
+    "SpatiumDDI does not sign zones on Technitium: it signs once and never re-signs on a new server, a re-created zone or a lost volume (#1767). Use a BIND9 or PowerDNS group for signed zones.";
   const busy =
     signMut.isPending || unsignMut.isPending || rolloverMut.isPending;
 
@@ -2329,6 +2334,29 @@ function DnssecCard({
 
   return (
     <div className="rounded-md border bg-muted/30 p-3 space-y-3">
+      {multiSigner && (
+        <div
+          role="alert"
+          className="rounded border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive"
+        >
+          <span className="font-medium">
+            Signed by {signingServers} servers.
+          </span>{" "}
+          Every server in this group signs the zone with its own keys, so the DS
+          below matches at most one of them and validating resolvers get
+          SERVFAIL from the others. Keep a single DNS server in the group
+          (delete or move the others — disabling a server does not stop it
+          serving the zone), or unsign the zone. Re-signing is refused until
+          then.
+        </div>
+      )}
+      {signingUnmanaged && (
+        <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
+          {enabled
+            ? "DNSSEC not managed. This zone was signed on Technitium and keeps serving signed, but SpatiumDDI does not keep it signed: it is not re-signed on a new server, a re-created zone or a lost volume (#1767). You can still unsign it."
+            : unmanagedNote}
+        </div>
+      )}
       <div className="flex items-center justify-between gap-3">
         <div>
           <div className="text-sm font-medium">DNSSEC</div>
@@ -2365,10 +2393,14 @@ function DnssecCard({
             <>
               <button
                 type="button"
-                disabled={busy}
+                disabled={busy || signingUnmanaged}
                 onClick={() => signMut.mutate(undefined)}
                 className="rounded border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
-                title="Re-run sign (keeps the current policy)"
+                title={
+                  signingUnmanaged
+                    ? unmanagedNote
+                    : "Re-run sign (keeps the current policy)"
+                }
               >
                 {signMut.isPending ? "Re-signing…" : "Re-sign"}
               </button>
@@ -2401,7 +2433,8 @@ function DnssecCard({
               </select>
               <button
                 type="button"
-                disabled={busy}
+                disabled={busy || signingUnmanaged}
+                title={signingUnmanaged ? unmanagedNote : undefined}
                 onClick={() => signMut.mutate(policyId || null)}
                 className="rounded bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
               >
@@ -3938,6 +3971,22 @@ function ZoneDetailView({
             {zone.dnssec_enabled && (
               <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-emerald-500/15 text-emerald-600">
                 DNSSEC
+              </span>
+            )}
+            {zone.dnssec_multi_signer && (
+              <span
+                className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-destructive/15 text-destructive"
+                title="This zone is DNSSEC-signed on a group with more than one DNS server. Each server signs it with its own keys, so the DS published at the parent matches at most one of them and validating resolvers get SERVFAIL from the others. Keep one server in the group (disabling a server does not stop it serving the zone), or unsign the zone."
+              >
+                DNSSEC: multiple signers
+              </span>
+            )}
+            {zone.dnssec_unmanaged_warning && (
+              <span
+                className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-700 dark:text-amber-300"
+                title="This zone was signed on Technitium. It keeps serving signed, but SpatiumDDI does not keep it signed: it is not re-signed on a new server, a re-created zone or a lost volume (#1767)."
+              >
+                DNSSEC not managed
               </span>
             )}
             {zone.dynamic_update_enabled && (
