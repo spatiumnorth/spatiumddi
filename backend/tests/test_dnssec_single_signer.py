@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
@@ -53,8 +54,13 @@ async def _group(db, driver="bind9", servers=1, enabled=True, name=None):
     db.add(g)
     await db.flush()
     out = []
+    # Explicit created_at: the column defaults to now(), which is the
+    # transaction start, so every server flushed in one test would tie and
+    # the "oldest" rule would fall through to random UUID order.
+    base = datetime(2026, 1, 1, tzinfo=UTC)
     for i in range(servers):
         s = DNSServer(
+            created_at=base + timedelta(seconds=i),
             group_id=g.id,
             driver=driver,
             host=f"10.0.0.{i + 1}",
@@ -63,7 +69,7 @@ async def _group(db, driver="bind9", servers=1, enabled=True, name=None):
             is_enabled=enabled,
         )
         db.add(s)
-        await db.flush()  # distinct created_at order for the "oldest" rule
+        await db.flush()
         out.append(s)
     return g, out
 
