@@ -456,7 +456,6 @@ def leave_self() -> int:
         log(f"leave-self: removed this node's etcd member {describe(m)}")
     subprocess.run(["sh", "-c", STOP_K3S_CMD], capture_output=True, timeout=120, check=False)
     deadline = time.monotonic() + LEAVE_CONFIRM_S
-    why = "no answer yet"
     answered = False
     while True:
         try:
