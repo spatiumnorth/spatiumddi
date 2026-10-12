@@ -68,6 +68,7 @@ import httpx
 import structlog
 
 from app.drivers.dns._cloud_base import (
+    CloudDNSConflictError,
     CloudDNSDriverBase,
     CloudDNSError,
     CloudDNSProbe,
@@ -106,6 +107,8 @@ _ZONES_PER_PAGE = 100
 _MAX_ZONES = 5000
 
 _TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+
+EXPERIMENTAL_NOTE = "technitium_api is experimental in 1.0"
 
 logger = structlog.get_logger(__name__)
 
@@ -548,7 +551,14 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                 # A created zone answers ``{"domain": …}``; ``_unwrap``
                 # turns "Zone already exists" into an empty body (#1537),
                 # i.e. the zone was already there and nothing changed.
-                return bool(created)
+                if created:
+                    return True
+                # #1784 — adopting is only safe for a zone SpatiumDDI could
+                # have created itself: an EMPTY Primary. Anything else is the
+                # operator's own data, and a later delete from SpatiumDDI
+                # would remove it (#1775).
+                await self._refuse_unsafe_adoption(client, creds, bare)
+                return False
             if op == "delete":
                 try:
                     await self._call(
@@ -577,6 +587,65 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
             # directly, and asserted by
             # test_unsupported_zone_op_is_refused_before_any_request.
             raise CloudDNSError(f"Technitium: unsupported zone op {op!r}")
+
+    async def _refuse_unsafe_adoption(
+        self, client: httpx.AsyncClient, creds: dict[str, Any], bare: str
+    ) -> None:
+        """Raise unless the existing zone ``bare`` is an empty Primary zone.
+
+        "Empty" means no record besides the apex SOA and NS that Technitium
+        puts in every new Primary zone (a sub-apex NS is a delegation).
+        Raises :class:`CloudDNSConflictError` (mapped to 409 by the zone
+        push), whose message names the reason.
+        """
+        existing = next(
+            (z for z in await self._walk_zones(creds) if self._zone_name(z).rstrip(".") == bare),
+            None,
+        )
+        if existing is None:
+            # Created between our two calls, or hidden from this token:
+            # nothing to inspect, and nothing proves it is safe.
+            raise CloudDNSConflictError(
+                f"{EXPERIMENTAL_NOTE}: zone {bare!r} already exists on the server "
+                f"but is not visible to this token, so it cannot be adopted."
+            )
+        ztype = str(existing.get("type") or "Primary")
+        if ztype not in _MANAGEABLE_ZONE_TYPES:
+            raise CloudDNSConflictError(
+                f"{EXPERIMENTAL_NOTE}: {bare!r} already exists on the server as a "
+                f"{ztype} zone. Only an empty Primary zone is adopted; delete it "
+                f"in the Technitium console first, or leave it unmanaged."
+            )
+        body = self._as_dict(
+            await self._call(
+                client,
+                "zones/records/get",
+                f"record list for {bare!r}",
+                {"domain": bare, "zone": bare, "listZone": "true"},
+            )
+        )
+
+        # Only the APEX SOA / NS are Technitium's own: an NS below the apex
+        # is a delegation the operator made, and deleting the zone later
+        # would delete it too.
+        def _technitium_default(r: dict[str, Any]) -> bool:
+            rtype = str(r.get("type") or "").upper()
+            at_apex = str(r.get("name") or bare).rstrip(".").lower() in (bare.lower(), "@", "")
+            return rtype in ("SOA", "NS") and at_apex
+
+        foreign = [
+            str(r.get("type") or "").upper()
+            for r in body.get("records") or []
+            if isinstance(r, dict) and not _technitium_default(r)
+        ]
+        if foreign:
+            raise CloudDNSConflictError(
+                f"{EXPERIMENTAL_NOTE}: Primary zone {bare!r} already exists on the "
+                f"server and holds {len(foreign)} record(s) SpatiumDDI did not "
+                f"create. Only an empty zone is adopted, because deleting the zone "
+                f"from SpatiumDDI later would delete them too. Remove them in the "
+                f"Technitium console first."
+            )
 
     # ── Probe ───────────────────────────────────────────────────────────
 
@@ -656,6 +725,10 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         return {
             "name": "technitium_api",
             "agentless": True,
+            # #1784 — supported for 1.0: ONE server per group, zones
+            # SpatiumDDI creates (empty Primary adoption only), no pools, no
+            # group / zone options. The API enforces it with 422s.
+            "experimental": True,
             "manages_zones": True,
             "topology_pull": True,
             "views": False,
@@ -678,7 +751,9 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                 "already runs. Zones + records are managed from the control "
                 "plane over Technitium's HTTP API with a bearer token; there "
                 "is no agent to deploy. DNSSEC, forwarders and the native "
-                "blocklists remain on the agent-managed 'technitium' driver."
+                "blocklists remain on the agent-managed 'technitium' driver. "
+                "EXPERIMENTAL in 1.0: one server per group, zones SpatiumDDI "
+                "creates, no DNS pools, no group or zone options."
             ),
         }
 

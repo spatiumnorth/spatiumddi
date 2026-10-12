@@ -62,6 +62,7 @@ import binascii
 import ipaddress
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -112,6 +113,11 @@ _ZONE_TYPE_MAP = {
 # come from the transfer, and a forwarder has none — reconciling any of
 # them would fight the daemon and delete records it just pulled.
 _RECORD_MANAGED_ZONE_TYPES = frozenset({"Primary"})
+
+# Zone types that pull a transfer and so can sign it (APIDOCS "Create Zone" /
+# "Set Zone Options": ``tsigKeyName`` / ``primaryZoneTransferTsigKeyName`` are
+# for Secondary, SecondaryForwarder and SecondaryCatalog; a Stub takes neither).
+_TSIG_SECONDARY_ZONE_TYPES = frozenset({"Secondary", "SecondaryCatalog"})
 
 # ``zones/options/set`` SILENTLY IGNORES a value it does not recognise —
 # verified live: setting zoneTransfer="Bogus" returns {"status":"ok"} and
@@ -184,6 +190,242 @@ _FORWARDER_PROTOCOLS = {
     "quic": "Quic",
 }
 
+# Scheme of a forwarder address -> the protocol Technitium must be told to use.
+# ``zones/create`` and the FWD record both default ``protocol`` to ``Udp`` and
+# *re-derive the address from it*: ``NameServerAddress.Clone(Udp)`` of an
+# ``https://`` address keeps the host and takes port 53, so a DoH URL silently
+# became cleartext UDP to ``host:53`` (#1764; APIDOCS.md "Create Zone" /
+# "Add Record", Technitium DnsServer v15.4.0). ``h3://`` and ``http://`` are
+# parsed as DoH endpoints by ``NameServerAddress``.
+_FORWARDER_SCHEMES = {
+    "https": "Https",
+    "h3": "Https",
+    "http": "Https",
+    "tls": "Tls",
+    "quic": "Quic",
+    "tcp": "Tcp",
+    "udp": "Udp",
+}
+_DOT_PORT = "853"
+
+
+def _split_host_port(text: str) -> tuple[str, str | None]:
+    """``host``, ``host:port``, ``host@port``, ``[v6]``, ``[v6]:port`` or a
+    bare v6 -> (host, port).
+
+    ``ip@port`` is SpatiumDDI's neutral spelling (the group forwarder
+    validator stores it, BIND's ``ip port n``); Technitium has no ``@`` form.
+    """
+    text = text.strip()
+    if "@" in text and "://" not in text:
+        host, _, port = text.rpartition("@")
+        host = host.strip()
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        return host, port.strip() or None
+    if text.startswith("["):
+        end = text.find("]")
+        if end > 0:
+            rest = text[end + 1 :]
+            return text[1:end], (rest[1:] or None) if rest.startswith(":") else None
+    if text.count(":") == 1:
+        host, _, port = text.partition(":")
+        return host, port or None
+    return text, None
+
+
+def _forwarder_protocol(address: str) -> str:
+    """The Technitium ``protocol`` an upstream address implies (#1764).
+
+    Scheme first (``https://`` Https, ``tls://`` Tls, ``quic://`` Quic, ...),
+    then the well-known DoT port (``host:853`` Tls), otherwise plain ``Udp``.
+    An optional ``name (ip)`` suffix is ignored. ``:853`` is read as DoT, not
+    DoQ: only an explicit ``quic://`` selects Quic.
+    """
+    head = address.split(" (", 1)[0].strip()
+    scheme, sep, _rest = head.partition("://")
+    if sep and scheme.lower() in _FORWARDER_SCHEMES:
+        return _FORWARDER_SCHEMES[scheme.lower()]
+    if _split_host_port(head)[1] == _DOT_PORT:
+        return "Tls"
+    return "Udp"
+
+
+def _forwarder_specs(forwarders: list[str]) -> list[tuple[str, str, int]]:
+    """``(address, protocol, priority)`` per upstream of a forward zone.
+
+    Priority is the list position, so the operator's order is kept: Technitium
+    queries a lower value first and queries equal priorities concurrently
+    (APIDOCS.md "Add Record", ``forwarderPriority``; a ``byte``, hence the cap).
+    """
+    out: list[tuple[str, str, int]] = []
+    seen: set[tuple[str, str]] = set()
+    for address in forwarders:
+        protocol = _forwarder_protocol(address)
+        key = (_norm_forwarder(address), protocol)
+        # A repeated upstream is one record on the daemon (identity is
+        # protocol + forwarder): keeping both would update its priority back
+        # and forth on every pass.
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((address, protocol, min(len(out), 255)))
+    return out
+
+
+def _is_ip(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _ip_port(host: str, port: str | None) -> str:
+    """``ip`` / ``ip:port`` / ``[v6]:port`` in Technitium's address format."""
+    if not port:
+        return host
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def _technitium_forwarder(entry: str) -> str:
+    """A neutral ``ip@port`` forwarder in Technitium's ``ip:port`` form.
+
+    Anything else (a hostname, a DoH URL, ``name (ip)``) is passed on as
+    written. Technitium reads ``@`` as part of a domain name, so an
+    ``ip@port`` sent verbatim was never the address the operator meant.
+    """
+    text = str(entry).strip()
+    if "@" not in text or "://" in text or "(" in text:
+        return text
+    host, port = _split_host_port(text)
+    return _ip_port(host, port) if _is_ip(host) else text
+
+
+def _norm_forwarder(address: str) -> str:
+    """Comparison key for an upstream address as stored vs as sent."""
+    return " ".join(str(address).lower().split()).rstrip(".")
+
+
+def _address_with_ip(host_part: str, ip: str) -> str:
+    """``"<host_part> (<ip>)"`` in Technitium's Name Server Address Format.
+
+    A bare IPv6 is bracketed (APIDOCS.md "Name Server Address Format");
+    ``ip:port`` and ``[v6]:port`` are passed on as written.
+    """
+    ip = ip.strip()
+    if ip.count(":") > 1 and not ip.startswith("["):
+        ip = f"[{ip}]"
+    return f"{host_part} ({ip})"
+
+
+def _encrypted_forwarders(forwarders: list[str], hostname: str, transport: str) -> list[str]:
+    """One ``name (ip)`` entry per upstream IP for DoT / DoH / DoQ (#1764).
+
+    The name is what the certificate is checked against; the IP in brackets
+    is what Technitium dials, "instead of trying to resolve it separately"
+    (APIDOCS.md "Name Server Address Format"). Sending the name alone made
+    the daemon bootstrap it by plaintext recursion from the root, which
+    defeats the point of encrypting and SERVFAILs where egress is limited to
+    853/443. An entry that is not an IP literal cannot be paired; with none
+    pairable the bare name is sent.
+    """
+    out: list[str] = []
+    for fwd in forwarders:
+        paired = _paired_address(fwd, hostname, transport, scheme=False)
+        if paired is not None:
+            out.append(paired)
+    if out:
+        return out
+    return [f"https://{hostname}/dns-query" if transport == "https" else hostname]
+
+
+def _paired_address(
+    fwd: str, hostname: str, transport: str, *, scheme: bool
+) -> str | None:
+    """``fwd`` (``ip``, ``ip@port``, ``ip:port``, ``[v6]:port``) paired with
+    the certificate name, or None when ``fwd`` is not an IP literal.
+
+    The port goes on the NAME part: Technitium refuses a name and an IP
+    whose ports disagree, and a DoH URL's port must be the one in the URL
+    (``NameServerAddress.InternalParse``). ``scheme`` prefixes ``tls://`` /
+    ``quic://`` so the address carries its own protocol, which a zone's
+    FWD record needs and the server setting (``forwarderProtocol``) does not.
+    """
+    host, port = _split_host_port(fwd)
+    if not _is_ip(host):
+        return None
+    if transport == "https":
+        name = f"{hostname}:{port}" if port and port != "443" else hostname
+        return _address_with_ip(f"https://{name}/dns-query", host)
+    name = f"{hostname}:{port}" if port else hostname
+    if scheme:
+        name = f"{transport}://{name}"
+    return _address_with_ip(name, host)
+
+
+def _zone_forwarder(entry: str, options: dict[str, Any]) -> str:
+    """A forward zone's upstream as its FWD record should carry it.
+
+    The group's encrypted ``forward_transport`` applies to per-zone
+    upstreams too, as it does on BIND9 (#50): a plain IP with no scheme and
+    no DoT port, in a group forwarding over tls/https/quic with a
+    ``forward_tls_hostname``, becomes ``tls://<name> (<ip>)`` (or the DoH /
+    DoQ equivalent) instead of going out as cleartext UDP. An address that
+    names its own scheme or port is the operator's choice and kept.
+    """
+    text = _technitium_forwarder(entry)
+    transport = str(options.get("forward_transport") or "do53")
+    hostname = str(options.get("forward_tls_hostname") or "").strip()
+    if transport not in ("tls", "https", "quic") or not hostname:
+        return text
+    if "://" in text or "(" in text or _forwarder_protocol(text) != "Udp":
+        return text
+    host, port = _split_host_port(text)
+    if port and port != "53":
+        # An explicit non-53 port on a plain address is a deliberate
+        # target; keep it rather than guess what it speaks.
+        return text
+    paired = _paired_address(host, hostname, transport, scheme=True)
+    return paired if paired is not None else text
+
+
+def _dnssec_flag(raw: Any) -> bool | None:
+    """Group ``dnssec_validation`` (``auto|yes|no``) -> Technitium's boolean.
+
+    ``None`` when the bundle carries no usable value (old bundle): the
+    daemon's own default then stands.
+    """
+    if raw is None:
+        return None
+    value = str(raw).strip().lower()
+    if value not in ("auto", "yes", "no"):
+        return None
+    return value != "no"
+
+# ── Recursion + rate limiting (issue #1761) ─────────────────────────────
+#
+# ``settings/set`` silently ignores an unrecognised ``recursion`` value
+# (it is parsed with a try-parse), so every value is checked against this
+# set in ``_apply_recursion`` before it is sent.
+_RECURSION_MODES = frozenset(
+    {"Deny", "Allow", "AllowOnlyForPrivateNetworks", "UseSpecifiedNetworkACL"}
+)
+# BIND ACL keywords that have no CIDR spelling, expanded for Technitium's
+# ``recursionNetworkACL`` (``NetworkAccessControl`` entries: CIDR or
+# ``!``-prefixed CIDR).
+_ACL_ANY = ("0.0.0.0/0", "::/0")
+_ACL_LOCALHOST = ("127.0.0.0/8", "::1/128")
+_ACL_LOCALNETS = (
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "fc00::/7",
+    "fe80::/10",
+)
+
+
 # ── Blocklists (issue #744) ─────────────────────────────────────────────
 #
 # Technitium has no RPZ. It blocks natively, either from subscribed URL
@@ -218,10 +460,13 @@ _TSIG_ALGORITHMS = frozenset(
     {
         "hmac-md5",
         "hmac-sha1",
+        "hmac-sha224",
         "hmac-sha256",
         "hmac-sha256-128",
         "hmac-sha384",
+        "hmac-sha384-192",
         "hmac-sha512",
+        "hmac-sha512-256",
     }
 )
 
@@ -550,14 +795,19 @@ def _svcb_render(params: list[tuple[str, str | None]]) -> str:
     return " ".join(k if v is None else f"{k}={_q(v)}" for k, v in params)
 
 
-def _svcb_target(name: str, origin: str | None) -> str:
-    """A presentation-format target -> Technitium's form: absolute, lower
-    case, no trailing dot, ``.`` for the root.
+def _zone_file_target(name: str, origin: str | None) -> str:
+    """A presentation-format name-valued target -> Technitium's form:
+    absolute, lower case, no trailing dot, ``.`` for the root.
 
-    A trailing dot means absolute and is honoured whatever the label count
-    (``localhost.`` stays ``localhost``). Without one the name is relative
-    to ``origin`` (``svc`` in ``example.net`` is ``svc.example.net``), as in
-    a zone file; with no origin it is left as written.
+    ONE rule for every name a record points at: SVCB / HTTPS targets, CNAME,
+    DNAME, NS, PTR, MX exchange, SRV target and the NAPTR replacement (#1759).
+    ``@`` is the zone, a trailing dot means absolute and is honoured whatever
+    the label count (``localhost.`` stays ``localhost``), and anything else
+    is relative to ``origin`` (``svc`` in ``example.net`` is
+    ``svc.example.net``), as in a zone file; with no origin it is left as
+    written. ``.`` is the root (Null MX ``0 .``, SRV "no service"), sent as
+    ``"."``: Technitium trims the dots itself, and an EMPTY parameter is
+    read as missing (``Extensions.GetQueryOrFormAlt``).
     """
     name = name.strip()
     if name in ("", "."):
@@ -570,9 +820,20 @@ def _svcb_target(name: str, origin: str | None) -> str:
     return f"{name}.{zone}".lower() if zone else name.lower()
 
 
+def _dotted_target(name: Any) -> str:
+    """A target as Technitium reports it (absolute, no trailing dot, ``"."``
+    for the root) -> the presentation form stored: its trailing dot, so BIND9
+    reads it as absolute too. An absent value stays empty."""
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    bare = raw.rstrip(".")
+    return f"{bare}." if bare else "."
+
+
 def _svcb_daemon_target(name: Any) -> str:
     """Technitium's read-back target, which is always absolute, in the same
-    form ``_svcb_target`` produces. ``""`` is the root."""
+    form ``_zone_file_target`` produces. ``""`` is the root."""
     bare = str(name or "").strip().rstrip(".").lower()
     return bare or "."
 
@@ -586,7 +847,7 @@ def _svcb_parse(value: str, origin: str | None) -> tuple[int, str, list[tuple[st
     for tok in tokens[2:]:
         key, eq, raw = tok.partition("=")
         items.append((key, _svcb_unquote(raw) if eq else None))
-    return (priority, _svcb_target(tokens[1], origin), _svcb_param_list(items, False))
+    return (priority, _zone_file_target(tokens[1], origin), _svcb_param_list(items, False))
 
 
 def _svcb_daemon_params(raw: Any) -> list[tuple[str, str | None]]:
@@ -604,6 +865,15 @@ def _svcb_daemon_params(raw: Any) -> list[tuple[str, str | None]]:
 #: Without it, a dot-less target is absolute, as the older renderer meant.
 SVCB_TARGET_RULE_KEY = "svcb_target_rule"
 SVCB_TARGET_RULE_ZONE_FILE = "zone-file"
+
+#: The bundle key a control plane from #1759 on sets to say a dot-less CNAME /
+#: DNAME / NS / PTR / MX / SRV / NAPTR target is relative to the zone, the
+#: way the SVCB marker above says it of SVCB. Separate from that key because
+#: a bundle cached by a #1513 control plane carries the SVCB marker and not
+#: this one, and its CNAME targets must keep the absolute reading they were
+#: rendered with. Same value, same fallback: no key, absolute.
+NAME_TARGET_RULE_KEY = "name_target_rule"
+NAME_TARGET_RULE_ZONE_FILE = "zone-file"
 
 
 def _svcb_params(value: str, origin: str | None = None) -> tuple[int, str, str]:
@@ -711,7 +981,7 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
         _move("flags", "naptrFlags")
         _move("services", "naptrServices")
         _move("regexp", "naptrRegexp")
-        _move("replacement", "naptrReplacement")
+        _move("replacement", "naptrReplacement", lambda v: str(v).lower())
     elif rtype == "URI":
         _move("priority", "uriPriority")
         _move("weight", "uriWeight")
@@ -866,19 +1136,329 @@ def _zone_apex(zone_name: str, zone: dict[str, Any]) -> dict[str, Any] | None:
     return apex
 
 
+#: Apply-failure text per ``_unapplied`` kind (once per apply, with a zone count).
+_UNAPPLIED_ACL_MESSAGES = {
+    "allow_query": (
+        "allow_query: the group's list has an element Technitium cannot "
+        "express (localnets, an undefined ACL name or a key), so query "
+        "access was left as the daemon has it on {zones} zone(s)"
+    ),
+    "allow_transfer": (
+        "allow_transfer: the list has an element Technitium cannot express "
+        "(localnets, a key beside an address, a negated key or ACL, an "
+        "undefined ACL name), so zone transfer was left as the daemon has it "
+        "on {zones} zone(s)"
+    ),
+    "allow_transfer_key": (
+        "allow_transfer: the list names a TSIG key the daemon does not hold "
+        "(missing, no secret or an unsupported algorithm), so transfer is "
+        "limited to the keys it does hold on {zones} zone(s)"
+    ),
+}
+
+
+def _usable_tsig_keys(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    """The bundle's TSIG keys ``_sync_tsig_keys`` will actually install.
+
+    A key it skips (no secret, an algorithm Technitium does not have) must not
+    be pinned onto a zone either: Technitium would then demand a signature by a
+    key it does not hold and refuse every transfer (#1765).
+    """
+    out = []
+    for k in bundle.get("tsig_keys") or []:
+        if not (k.get("name") or "").rstrip("."):
+            continue
+        if not _tsig_key_installable(k):
+            continue
+        out.append(k)
+    return out
+
+
+def _tsig_key_installable(key: dict[str, Any]) -> bool:
+    return bool(key.get("secret")) and (
+        (key.get("algorithm") or "hmac-sha256").lower() in _TSIG_ALGORITHMS
+    )
+
+
 def _tsig_key_names(bundle: dict[str, Any]) -> list[str]:
-    """Bundle TSIG key names, root dot stripped.
+    """Names of the bundle's installable TSIG keys, root dot stripped.
 
     Technitium stores names un-dotted (verified: sending ``spatium-xfer.``
     reads back as ``spatium-xfer``), so normalise here or every options
     comparison sees a difference that isn't one.
     """
-    out = []
-    for k in bundle.get("tsig_keys") or []:
-        name = (k.get("name") or "").rstrip(".")
+    return sorted({(k.get("name") or "").rstrip(".") for k in _usable_tsig_keys(bundle)})
+
+
+def _bundle_acls(bundle: dict[str, Any]) -> dict[str, list[tuple[str, bool]]]:
+    """The bundle's named ACLs (#899) as ``name -> [(value, negate)]``."""
+    out: dict[str, list[tuple[str, bool]]] = {}
+    for acl in bundle.get("acls") or []:
+        name = str(acl.get("name") or "").strip()
         if name:
-            out.append(name)
-    return sorted(set(out))
+            out[name] = [
+                (str(e.get("value") or ""), bool(e.get("negate")))
+                for e in acl.get("entries") or []
+            ]
+    return out
+
+
+# ── BIND address-match translation (#1765)
+#
+# SpatiumDDI stores ``allow_query`` / ``allow_transfer`` as BIND address-match
+# lists. Technitium has no such grammar: a network ACL is an ordered list of
+# addresses / CIDRs where a leading ``!`` denies and the first match wins
+# (APIDOCS "Set Zone Options", ``NetworkAccessControl.cs``), no match denies,
+# and transfer TSIG keys are a SEPARATE set that is ANDed with the ACL
+# (``DnsServer.cs``: ``IsZoneTransferAllowed`` then ``IsTsigAuthenticated``).
+# This block translates what can be translated exactly and raises
+# ``AddressMatchError`` for everything else, because a guess either widens
+# access or locks the zone out. It is shared, byte for byte, with the agent
+# (``test_technitium_acl_parity.py``).
+_OPEN_ACL: list[str] = ["0.0.0.0/0", "::/0"]
+_V4_MAPPED = ipaddress.ip_network("::ffff:0:0/96")
+_KEY_ELEMENT = re.compile(r'^key\s+"?([A-Za-z0-9][A-Za-z0-9_.-]*)"?$', re.IGNORECASE)
+
+
+class AddressMatchError(ValueError):
+    """The list holds an element Technitium cannot express exactly."""
+
+
+def _flatten_address_match(
+    elements: list[Any], acls: dict[str, list[tuple[str, bool]]], trail: tuple[str, ...]
+) -> list[tuple[bool, str, str]]:
+    """Ordered ``(negated, kind, value)`` items, named ACLs expanded inline.
+
+    ``kind`` is ``net`` / ``any`` / ``key`` (``none`` arrives as a negated
+    ``any``, which is what BIND compiles it to). BIND flattens a nested
+    ACL into the list that cites it, so first-match order is preserved.
+    """
+    items: list[tuple[bool, str, str]] = []
+    for raw in elements:
+        text = str(raw).strip()
+        if not text:
+            continue
+        neg = text.startswith("!")
+        body = text[1:].strip() if neg else text
+        low = body.lower()
+        if low == "any":
+            items.append((neg, "any", ""))
+            continue
+        if low == "none":
+            # BIND compiles ``none`` as ``!any`` (aclconf.c: "none == !any"):
+            # a match that DENIES everyone, ending the list there. So
+            # ``["none", "10.0.0.0/8"]`` admits nobody, and ``!none`` admits
+            # everyone. Dropping it instead would let the later elements grant.
+            items.append((not neg, "any", ""))
+            continue
+        if low == "localhost":
+            if neg:
+                raise AddressMatchError(
+                    "'!localhost' cannot be applied: Technitium has no equivalent of the "
+                    "server's own addresses, so the exclusion would be lost"
+                )
+            items.append((False, "net", "127.0.0.1/32"))
+            items.append((False, "net", "::1/128"))
+            continue
+        if low == "localnets":
+            raise AddressMatchError(
+                "'localnets' cannot be applied: Technitium has no equivalent of the "
+                "server's directly attached networks"
+            )
+        key = _KEY_ELEMENT.match(body)
+        if key:
+            if neg:
+                raise AddressMatchError(f"'!{body}' cannot be applied: a key cannot be negated")
+            items.append((False, "key", key.group(1)))
+            continue
+        try:
+            net = ipaddress.ip_network(body, strict=False)
+        except ValueError:
+            pass
+        else:
+            if net.version == 6 and net.subnet_of(_V4_MAPPED):  # type: ignore[arg-type]
+                raise AddressMatchError(
+                    f"{body!r} cannot be applied: Technitium matches an IPv4-mapped client "
+                    "as IPv4, so an IPv4-mapped prefix would never match; write the IPv4 "
+                    "prefix instead"
+                )
+            items.append((neg, "net", str(net)))
+            continue
+        if body not in acls:
+            raise AddressMatchError(
+                f"{body!r} is not an address, a CIDR prefix, 'key <name>' or an ACL defined in "
+                "this group"
+            )
+        if body in trail:
+            raise AddressMatchError(f"ACL {body!r} refers to itself")
+        inner = _flatten_address_match(
+            [
+                ("!" if n or v.startswith("!") else "") + v.lstrip("!").strip()
+                for v, n in acls[body]
+            ],
+            acls,
+            (*trail, body),
+        )
+        if neg:
+            if any(i[0] or i[1] == "key" for i in inner):
+                raise AddressMatchError(
+                    f"'!{body}' cannot be applied: the ACL holds a negation or a key, and "
+                    "inverting it is not a prefix list"
+                )
+            inner = [(True, k, v) for _, k, v in inner]
+        items.extend(inner)
+    return items
+
+
+def translate_address_match(
+    elements: Any,
+    acls: dict[str, list[tuple[str, bool]]] | None = None,
+    *,
+    allow_keys: bool = False,
+) -> tuple[list[str], list[str]]:
+    """BIND address-match list -> ``(technitium_acl, key_names)``.
+
+    ``acl`` is an ordered list for ``*NetworkACL`` (``!`` kept, ``any`` as both
+    default routes, ``none`` as their negation); ``key_names`` are the ``key X`` elements.
+    With keys present the result is the negations followed by the open ACL, to
+    be ANDed with the key set: that is exact only while every address element
+    is a negation placed before the first key. A positive address beside a key
+    is an OR in BIND and an AND here, so it is refused rather than narrowed.
+    """
+    items = _flatten_address_match(list(elements or []), acls or {}, ())
+    # A deny-everyone match (``none`` / ``!any``) ends evaluation in BIND and in
+    # Technitium alike, so nothing after it is reachable: drop the tail rather
+    # than refuse an element that can never take effect.
+    deny_all = next((i for i, it in enumerate(items) if it[0] and it[1] == "any"), None)
+    if deny_all is not None:
+        items = items[: deny_all + 1]
+    first_key = next((i for i, it in enumerate(items) if it[1] == "key"), None)
+    if first_key is not None and deny_all is not None and deny_all > first_key:
+        # ``[key X, none]``: after the keys, a final deny-all only restates
+        # "no match denies", which holds in both systems.
+        items = items[:deny_all]
+    if first_key is not None and not allow_keys:
+        raise AddressMatchError("'key <name>' cannot be applied to this list")
+    acl: list[str] = []
+    keys: list[str] = []
+    for index, (neg, kind, value) in enumerate(items):
+        if kind == "key":
+            if value not in keys:
+                keys.append(value)
+            continue
+        if first_key is not None:
+            if not neg:
+                raise AddressMatchError(
+                    "an address listed next to 'key <name>' is an OR in BIND but Technitium "
+                    "requires the address AND the key, so it cannot be applied"
+                )
+            if index > first_key:
+                raise AddressMatchError(
+                    "a negation listed after 'key <name>' cannot be applied: BIND lets the key "
+                    "through first, Technitium would still apply the exclusion"
+                )
+        for net in _OPEN_ACL if kind == "any" else [value]:
+            acl.append(("!" if neg else "") + net)
+    if first_key is not None:
+        acl.extend(_OPEN_ACL)
+    return acl, keys
+
+
+# ── end of the block shared with the agent
+
+
+# Zone types whose queries the group's ``allow_query`` governs. BIND applies
+# an options-level ``allow-query`` to every query the server receives, a
+# conditional-forward zone's included, so a Forwarder zone carries it too
+# (Technitium's "Set Zone Options" accepts ``queryAccess`` on every zone type
+# but ``SecondaryCatalog``). A catalog zone is not a served namespace.
+_QUERY_ACCESS_ZONE_TYPES = frozenset({"Primary", "Secondary", "Stub", "Forwarder"})
+
+
+def _query_access(
+    allow_query: Any, acls: dict[str, list[tuple[str, bool]]] | None = None
+) -> tuple[str, list[str]] | None:
+    """Translate a group's BIND ``allow-query`` list into Technitium's
+    per-zone ``queryAccess`` + ``queryAccessNetworkACL`` (#1763, #1765).
+
+    Parameters per APIDOCS.md, "Set Zone Options" (TechnitiumSoftware/
+    DnsServer v15.4.0): ``queryAccess`` is one of ``Deny`` / ``Allow`` /
+    ``AllowOnlyPrivateNetworks`` / ``AllowOnlyZoneNameServers`` /
+    ``UseSpecifiedNetworkACL`` / ``AllowZoneNameServersAndUseSpecifiedNetworkACL``;
+    ``queryAccessNetworkACL`` is a comma separated list of IPs / networks, a
+    leading ``!`` denies, evaluated in order, and "if no networks match, the
+    default policy is to deny all except loopback".
+
+    The grammar is ``translate_address_match``'s: addresses, ``!`` negations,
+    ``localhost`` and named ACLs from the bundle. Returns ``None`` when the
+    list holds an element with no Technitium equivalent (``localnets``, a key,
+    an undefined ACL name): the caller leaves the zone alone and says so,
+    because guessing would either widen the access or lock the zone out.
+
+    Empty / absent means ``any``, as the BIND9 agent reads it. ``none`` is
+    NOT a no-op: BIND compiles it as ``!any`` (``aclconf.c``: "none ==
+    !any"), so ``["none", "10.0.0.0/8"]`` admits nobody.
+    """
+    elements = [str(e).strip() for e in (allow_query or []) if str(e).strip()]
+    if not elements:
+        return "Allow", []
+    lowered = [e.lower() for e in elements]
+    if lowered == ["any"]:
+        return "Allow", []
+    if lowered == ["none"]:
+        return "Deny", []
+    try:
+        acl, _ = translate_address_match(elements, acls, allow_keys=False)
+    except AddressMatchError:
+        return None
+    if not acl:
+        return "Deny", []
+    if acl == _OPEN_ACL:
+        return "Allow", []
+    return "UseSpecifiedNetworkACL", acl
+
+
+def _transfer_access(
+    source: Any,
+    names: list[str],
+    acls: dict[str, list[tuple[str, bool]]] | None = None,
+) -> tuple[str, list[str], list[str], list[str]] | None:
+    """Translate an ``allow_transfer`` list into
+    ``(zoneTransfer, zoneTransferNetworkACL, zoneTransferTsigKeyNames, missing)``.
+
+    ``names`` are the group's installable TSIG keys. Technitium ANDs the
+    network ACL with the key set (``DnsServer.cs``), so ``Allow`` + names is
+    "any source, but signed by one of these" (#734).
+
+    * empty / ``none``: the #734 posture, ``Allow`` + every key, or ``Deny``
+      when the group has none;
+    * ``key X``: only the named keys that are installed. ``missing`` lists
+      the ones that are not; when none are, the zone is denied rather than
+      left open to a signature nobody can make;
+    * an address list: the translated ACL, plus every group key as before.
+
+    ``None`` when the list cannot be expressed exactly.
+    """
+    elements = [str(a).strip() for a in (source or []) if str(a).strip()]
+    if not elements or {e.lower() for e in elements} == {"none"}:
+        return ("Allow" if names else "Deny"), [], names, []
+    try:
+        acl, keys = translate_address_match(elements, acls, allow_keys=True)
+    except AddressMatchError:
+        return None
+    missing: list[str] = []
+    if keys:
+        installed = {n.lower(): n for n in names}
+        wanted = [installed[k.lower()] for k in keys if k.lower() in installed]
+        missing = [k for k in keys if k.lower() not in installed]
+        if not wanted:
+            return "Deny", [], [], missing
+        names = sorted(set(wanted))
+    if not acl:
+        return "Deny", [], [], missing
+    if acl == _OPEN_ACL:
+        return "Allow", [], names, missing
+    return "UseSpecifiedNetworkACL", acl, names, missing
 
 
 def _zone_options_payload(
@@ -899,8 +1479,13 @@ def _zone_options_payload(
     be silently ignored here — which is the exact defect #734 is about, one
     driver over.
 
-    The list follows BIND's vocabulary: ``["none"]`` (or empty) denies,
-    ``any`` allows, anything else is treated as a network ACL.
+    The list follows BIND's vocabulary and is translated by
+    ``_transfer_access`` (#1765): ``["none"]`` (or empty) denies, ``key X``
+    becomes the key set, ``localhost`` loopback, named ACLs are expanded, and
+    ``!`` exclusions stay in order under ``UseSpecifiedNetworkACL``. A list
+    with an element Technitium cannot express is left alone and reported in
+    ``_unapplied`` — it used to be guessed at, which turned
+    ``["!10.1.0.0/16", "any"]`` into ``Allow`` and lost the exclusion.
 
     Issue #734: ``none`` is the default, so honouring it literally left the
     control plane unable to read any zone — the drift report and
@@ -912,40 +1497,71 @@ def _zone_options_payload(
     ``allow-transfer { key "…"; };`` and is narrower than an address ACL,
     not wider: it demands possession of a secret.
     """
+    payload: dict[str, Any] = {}
+    unapplied: list[dict[str, str]] = []
+    acls = _bundle_acls(bundle)
+    if ztype in _QUERY_ACCESS_ZONE_TYPES:
+        # The group's ``allow_query`` (#1763). Always sent, ``Allow`` included,
+        # so widening the list back to ``any`` un-restricts a zone an earlier
+        # bundle restricted; an empty ACL clears the stored one.
+        qa = _query_access((bundle.get("options") or {}).get("allow_query"), acls)
+        if qa is None:
+            unapplied.append(
+                {
+                    "kind": "allow_query",
+                    "reason": "allow_query has an element Technitium cannot express",
+                }
+            )
+        else:
+            payload["queryAccess"] = qa[0]
+            payload["queryAccessNetworkACL"] = qa[1]
     if ztype != "Primary":
-        return {}
+        if unapplied:
+            payload["_unapplied"] = unapplied
+        return payload
     opts = bundle.get("options") or {}
     zone_acl = (zone or {}).get("allow_transfer")
     source = zone_acl if zone_acl is not None else opts.get("allow_transfer")
-    acl = [str(a) for a in (source or []) if a]
-    lowered = {a.lower() for a in acl}
-    names = _tsig_key_names(bundle)
-
-    payload: dict[str, Any] = {}
-    if not acl or lowered == {"none"}:
-        payload["zoneTransfer"] = "Allow" if names else "Deny"
-    elif "any" in lowered:
-        payload["zoneTransfer"] = "Allow"
+    transfer = _transfer_access(source, _tsig_key_names(bundle), acls)
+    if transfer is None:
+        unapplied.append(
+            {
+                "kind": "allow_transfer",
+                "reason": "allow_transfer has an element Technitium cannot express",
+            }
+        )
     else:
-        payload["zoneTransfer"] = "UseSpecifiedNetworkACL"
-        payload["zoneTransferNetworkACL"] = [a for a in acl if a.lower() != "none"]
-
-    # Naming keys here is what makes a transfer TSIG-*authenticated* rather
-    # than merely address-filtered.
-    #
-    # ALWAYS sent, including empty. Technitium treats an absent parameter as
-    # "leave unchanged" and an empty one as "clear" (verified in upstream
-    # ``WebServiceZonesApi.cs``: ``Length == 0`` sets the set to null). So
-    # omitting it when the group's last key is deleted would strand the old
-    # key names on every zone, and transfers from an otherwise-permitted
-    # network would then fail forever, demanding a signature by a key that
-    # no longer exists anywhere. The control plane is the source of truth for
-    # this list, the same stance ``_sync_tsig_keys`` takes for the keys.
-    #
-    # On a Deny zone the list is necessarily empty (the branch above only
-    # picks Deny when there are no keys), so this never reads as "signed
-    # transfer enabled" on a zone that cannot transfer at all.
-    payload["zoneTransferTsigKeyNames"] = names
+        mode, acl, names, missing = transfer
+        payload["zoneTransfer"] = mode
+        if acl:
+            payload["zoneTransferNetworkACL"] = acl
+        # Naming keys here is what makes a transfer TSIG-*authenticated*
+        # rather than merely address-filtered.
+        #
+        # ALWAYS sent, including empty. Technitium treats an absent parameter
+        # as "leave unchanged" and an empty one as "clear" (verified in
+        # upstream ``WebServiceZonesApi.cs``: ``Length == 0`` sets the set to
+        # null). So omitting it when the group's last key is deleted would
+        # strand the old key names on every zone, and transfers from an
+        # otherwise-permitted network would then fail forever, demanding a
+        # signature by a key that no longer exists anywhere. The control plane
+        # is the source of truth for this list, the same stance
+        # ``_sync_tsig_keys`` takes for the keys.
+        #
+        # On a Deny zone the list is necessarily empty (the translation only
+        # picks Deny when there are no keys to name), so this never reads as
+        # "signed transfer enabled" on a zone that cannot transfer at all.
+        payload["zoneTransferTsigKeyNames"] = names
+        if missing:
+            unapplied.append(
+                {
+                    "kind": "allow_transfer_key",
+                    "reason": "allow_transfer names key(s) the daemon does not hold: "
+                    + ", ".join(missing),
+                }
+            )
+    if unapplied:
+        payload["_unapplied"] = unapplied
     return payload
 
 
@@ -1095,7 +1711,11 @@ def _txt_params(value: str) -> dict[str, Any]:
 
 
 def _record_params(
-    rtype: str, value: str, rec: dict[str, Any], origin: str | None = None
+    rtype: str,
+    value: str,
+    rec: dict[str, Any],
+    origin: str | None = None,
+    name_origin: str | None = None,
 ) -> dict[str, Any]:
     """Build the type-specific param dict for
     ``/api/zones/records/{add,delete}`` — shared by both endpoints since
@@ -1110,7 +1730,19 @@ def _record_params(
     if rtype == "TXT":
         # Text, not a name: it keeps a trailing full stop (#1694).
         return _txt_params(value)
+    raw = value
     value = value.rstrip(".")
+
+    def _target(name: str) -> str:
+        # The one target rule for every name-valued type (#1759): ``@`` is
+        # the zone, a trailing dot is absolute, anything else is relative to
+        # the zone, ``.`` is the root and goes out as ``"."`` (Technitium
+        # reads an empty parameter as missing). ``name_origin`` is None for
+        # a bundle that predates the rule: a dot-less target is absolute.
+        if name_origin is None:
+            return name.rstrip(".").lower() or "."
+        return _zone_file_target(name, name_origin)
+
     if rtype in ("A", "AAAA"):
         # Canonicalised (#1513) so the desired side matches the daemon's
         # canonical read-back regardless of how the operator typed it.
@@ -1118,24 +1750,24 @@ def _record_params(
     # Name-valued targets are folded to lower case on BOTH sides of the
     # fingerprint (#1513); DNS names are case-insensitive.
     if rtype == "CNAME":
-        return {"cname": value.lower()}
+        return {"cname": _target(raw)}
     if rtype == "DNAME":
-        return {"dname": value.lower()}
+        return {"dname": _target(raw)}
     if rtype == "NS":
-        return {"nameServer": value.lower()}
+        return {"nameServer": _target(raw)}
     if rtype == "PTR":
-        return {"ptrName": value.lower()}
+        return {"ptrName": _target(raw)}
     if rtype == "MX":
         # Absence, not falsiness — preference 0 is the highest priority
         # (Microsoft 365 publishes it), and ``or 10`` silently promoted
         # it to a backup. Issue #1518.
         return {
-            "exchange": value.lower(),
+            "exchange": _target(raw),
             "preference": rec.get("priority") if rec.get("priority") is not None else 10,
         }
     if rtype == "SRV":
         return {
-            "target": value.lower(),
+            "target": _target(raw),
             "priority": rec.get("priority") if rec.get("priority") is not None else 0,
             "weight": rec.get("weight") if rec.get("weight") is not None else 0,
             "port": rec.get("port") if rec.get("port") is not None else 0,
@@ -1167,14 +1799,16 @@ def _record_params(
             "sshfpFingerprint": tokens[2].lower() if len(tokens) > 2 else "",
         }
     if rtype == "NAPTR":
-        tokens = shlex.split(value)
+        # The replacement is the last token and its trailing dot says it is
+        # absolute, so split ``raw``, not the rstripped value (#1759).
+        tokens = shlex.split(raw if name_origin is not None else value)
         return {
             "naptrOrder": tokens[0] if len(tokens) > 0 else "0",
             "naptrPreference": tokens[1] if len(tokens) > 1 else "0",
             "naptrFlags": tokens[2] if len(tokens) > 2 else "",
             "naptrServices": tokens[3] if len(tokens) > 3 else "",
             "naptrRegexp": tokens[4] if len(tokens) > 4 else "",
-            "naptrReplacement": tokens[5] if len(tokens) > 5 else ".",
+            "naptrReplacement": _target(tokens[5] if len(tokens) > 5 else "."),
         }
     if rtype == "URI":
         tokens = shlex.split(value)
@@ -1219,6 +1853,16 @@ class TechnitiumDriver(DriverBase):
     # cached bundle from the older control plane keeps its own meaning, and
     # read by ``apply_record_op`` for ops shipped beside that bundle.
     _svcb_zone_file_targets: bool = False
+    # The same, for every other name-valued target (#1759), read from
+    # ``name_target_rule``. Independent of the SVCB flag: a bundle cached by
+    # a #1513 control plane has the SVCB marker and not this one.
+    _name_zone_file_targets: bool = False
+
+    # Zones whose group ``allow_query`` this apply could not express (#1763),
+    # collected by ``_apply_zone_options`` and reported ONCE by
+    # ``swap_and_reload``: the cause is one group option, and a refusal per
+    # zone would bury every other refusal in the truncated apply error.
+    _unapplied_acl: dict[str, list[str]] | None = None
 
     def _note_apply_failure(self, what: str) -> None:
         if self._apply_failures is not None:
@@ -1228,6 +1872,12 @@ class TechnitiumDriver(DriverBase):
         """The origin a dot-less SVCB target is relative to, or ``None`` when
         the applied bundle predates #1513 and a dot-less target is absolute."""
         return zone if self._svcb_zone_file_targets else None
+
+    def _name_origin(self, zone: str) -> str | None:
+        """The origin a dot-less CNAME / DNAME / NS / PTR / MX / SRV / NAPTR
+        target is relative to, or ``None`` when the applied bundle predates
+        #1759 and a dot-less target is absolute."""
+        return zone if self._name_zone_file_targets else None
 
 
     # ── Render / validate / swap ────────────────────────────────────────────
@@ -1247,6 +1897,7 @@ class TechnitiumDriver(DriverBase):
         new_dir.mkdir(parents=True)
 
         self._svcb_zone_file_targets = bundle.get(SVCB_TARGET_RULE_KEY) == SVCB_TARGET_RULE_ZONE_FILE
+        self._name_zone_file_targets = bundle.get(NAME_TARGET_RULE_KEY) == NAME_TARGET_RULE_ZONE_FILE
 
         raw_zones = bundle.get("zones")
         if not isinstance(raw_zones, list):
@@ -1267,6 +1918,26 @@ class TechnitiumDriver(DriverBase):
                 }
             )
         )
+
+        # The key a secondary signs with is always one of the group's own
+        # (#1765): the control plane names only a key this group holds with
+        # the same secret as one its master grants, so no other group's
+        # secret is ever installed here.
+        server_tsig_keys = list(bundle.get("tsig_keys") or [])
+        installable_keys = {
+            (k.get("name") or "").rstrip(".").lower(): (k.get("name") or "").rstrip(".")
+            for k in _usable_tsig_keys(bundle)
+        }
+
+        def _signing_key(name: Any, where: str) -> str | None:
+            """The installed spelling of a transfer key, or None (and say so)."""
+            wanted = str(name or "").rstrip(".")
+            if not wanted:
+                return None
+            if wanted.lower() in installable_keys:
+                return installable_keys[wanted.lower()]
+            log.warning("technitium_transfer_key_not_installed", where=where, key=wanted)
+            return None
 
         zones_payload = []
         for zone in raw_zones or []:
@@ -1331,7 +2002,11 @@ class TechnitiumDriver(DriverBase):
                                 else (_zone_ttl if _zone_ttl is not None else 3600)
                             ),
                             **_record_params(
-                                rtype, rec.get("value") or "", rec, self._svcb_origin(zname)
+                                rtype,
+                                rec.get("value") or "",
+                                rec,
+                                self._svcb_origin(zname),
+                                self._name_origin(zname),
                             ),
                         }
                     )
@@ -1347,8 +2022,25 @@ class TechnitiumDriver(DriverBase):
             }
             if masters:
                 entry["masters"] = masters
+            if ztype == "Secondary":
+                # Stub has no transfer, so no key (APIDOCS "Create Zone":
+                # ``tsigKeyName`` is for Secondary / SecondaryForwarder /
+                # SecondaryCatalog).
+                signing = _signing_key(zone.get("masters_tsig_key"), zname)
+                if signing:
+                    entry["tsig_key"] = signing
+                elif zone.get("masters_tsig_key") or zone.get("masters_tsig_unresolved"):
+                    # A SpatiumDDI master requires a signed transfer and there
+                    # is no key to sign with: say so instead of creating a
+                    # zone that is refused every AXFR and expires.
+                    entry["tsig_unresolved"] = True
             if forwarders:
-                entry["forwarders"] = forwarders
+                group_opts = bundle.get("options") or {}
+                entry["forwarders"] = [_zone_forwarder(f, group_opts) for f in forwarders]
+            if ztype == "Forwarder":
+                dnssec = _dnssec_flag((bundle.get("options") or {}).get("dnssec_validation"))
+                if dnssec is not None:
+                    entry["dnssec_validation"] = dnssec
             if ztype in _RECORD_MANAGED_ZONE_TYPES:
                 apex = _zone_apex(zname, zone)
                 if apex is not None:
@@ -1362,6 +2054,13 @@ class TechnitiumDriver(DriverBase):
         # Written to its own file, and 0600: unlike zones.json this one
         # carries TSIG shared secrets.
         catalog = bundle.get("catalog") or bundle.get("catalog_block") or None
+        if catalog and catalog.get("producer_tsig_key"):
+            catalog = {
+                **catalog,
+                "producer_tsig_key": _signing_key(
+                    catalog.get("producer_tsig_key"), "catalog consumer"
+                ),
+            }
         server_payload = {
             # Encrypted transports + forwarders (#741). Carried verbatim so
             # swap_and_reload can apply them without re-reading the bundle.
@@ -1376,7 +2075,7 @@ class TechnitiumDriver(DriverBase):
                     "secret": k.get("secret") or "",
                     "algorithm": (k.get("algorithm") or "hmac-sha256").lower(),
                 }
-                for k in (bundle.get("tsig_keys") or [])
+                for k in server_tsig_keys
                 if (k.get("name") or "").rstrip(".")
             ],
             "catalog": catalog,
@@ -1449,6 +2148,7 @@ class TechnitiumDriver(DriverBase):
         # them through ``refused_zones()`` so the apply reads as a partial
         # one rather than as success (#1280's model).
         self._apply_failures = []
+        self._unapplied_acl = {}
         try:
             server_path = current / "server.json"
             server_state: dict[str, Any] = {}
@@ -1479,6 +2179,11 @@ class TechnitiumDriver(DriverBase):
                     token, server_options, server_state.get("tls_cert")
                 )
                 self._apply_forwarders(token, server_options)
+                self._apply_dnssec_validation(token, server_options)
+                # #1761: recursion policy + per-client rate limit. Both
+                # have daemon defaults that stay in force unless sent.
+                self._apply_recursion(token, server_options)
+                self._apply_rate_limits(token, server_options)
 
             # Blocklists (#744). Always applied, even when empty — an emptied
             # list has to actually clear on the daemon.
@@ -1496,9 +2201,22 @@ class TechnitiumDriver(DriverBase):
             )
             self._reconcile_zones(token, payload)
             self._apply_catalog(token, server_state.get("catalog"), payload)
+            unsigned = sorted(e["zone"] for e in payload if e.get("tsig_unresolved"))
+            if unsigned:
+                self._note_apply_failure(
+                    "secondary zone(s) "
+                    + ", ".join(unsigned)
+                    + ": the master is a SpatiumDDI server that requires a signed "
+                    "transfer and this group holds no key it grants (add the same TSIG "
+                    "key, name and secret, to both groups), so every transfer will be "
+                    "refused"
+                )
+            for kind, skipped in sorted((self._unapplied_acl or {}).items()):
+                self._note_apply_failure(_UNAPPLIED_ACL_MESSAGES[kind].format(zones=len(skipped)))
             failures = list(self._apply_failures)
         finally:
             self._apply_failures = None
+            self._unapplied_acl = None
         # Partial apply, not a failure (#1280): every step the daemon took is
         # live, and re-applying this bundle or the last-known-good cannot make
         # it accept what it just refused — the QA walk of #1608 showed a
@@ -1624,7 +2342,11 @@ class TechnitiumDriver(DriverBase):
             name = (k.get("name") or "").rstrip(".")
             secret = k.get("secret") or ""
             algorithm = (k.get("algorithm") or "hmac-sha256").lower()
-            if not name or not secret:
+            if not name:
+                continue
+            if not secret:
+                log.warning("technitium_tsig_key_without_secret", key=name)
+                self._note_apply_failure(f"tsig key {name}: no secret, so it was not installed")
                 continue
             if algorithm not in _TSIG_ALGORITHMS:
                 log.warning(
@@ -1632,6 +2354,14 @@ class TechnitiumDriver(DriverBase):
                     key=name,
                     algorithm=algorithm,
                     supported=sorted(_TSIG_ALGORITHMS),
+                )
+                # Reported, not just logged (#1765): a skipped key is not
+                # pinned onto the zones (``_tsig_key_names``), so a transfer
+                # signed with it is refused and the operator needs to know
+                # why.
+                self._note_apply_failure(
+                    f"tsig key {name}: algorithm {algorithm} is not supported by "
+                    "Technitium, so it was not installed"
                 )
                 continue
             tokens.extend([name, secret, algorithm])
@@ -1695,6 +2425,7 @@ class TechnitiumDriver(DriverBase):
                     "zone": cat_name,
                     "type": "SecondaryCatalog",
                     "masters": [str(producer)],
+                    "tsig_key": (catalog or {}).get("producer_tsig_key"),
                 },
             )
             self._save_catalog_state({"zone_name": cat_name, "mode": mode})
@@ -1873,7 +2604,13 @@ class TechnitiumDriver(DriverBase):
             "domain": name,
             "zone": zone,
             "type": rtype,
-            **_record_params(rtype, rec.get("value") or "", rec, self._svcb_origin(zone)),
+            **_record_params(
+                rtype,
+                rec.get("value") or "",
+                rec,
+                self._svcb_origin(zone),
+                self._name_origin(zone),
+            ),
         }
 
         # #773 — the control plane ships the complete desired RRset. Technitium's
@@ -1923,6 +2660,7 @@ class TechnitiumDriver(DriverBase):
                                 member.get("value") or "",
                                 member,
                                 self._svcb_origin(zone),
+                                self._name_origin(zone),
                             ),
                         },
                         zone,
@@ -2269,6 +3007,36 @@ class TechnitiumDriver(DriverBase):
             doq=bool(options.get("doq_enabled")),
         )
 
+    def _apply_dnssec_validation(self, token: str, options: dict[str, Any]) -> None:
+        """Set the resolver's DNSSEC validation from the group's option (#1763).
+
+        ``settings/set`` takes a boolean ``dnssecValidation`` (APIDOCS.md,
+        "Set DNS Settings", Technitium DnsServer v15.4.0), default ``true``.
+        The group's ``dnssec_validation`` is BIND's ``auto | yes | no``: ``no``
+        turns validation off, and both others validate (``auto`` is BIND's
+        built-in-trust-anchor mode, which is what Technitium does when on).
+        Without this, ``no`` behind a DNSSEC-stripping upstream still
+        validated and SERVFAILed every signed name. An old bundle without
+        the key leaves the daemon alone.
+        """
+        raw = options.get("dnssec_validation")
+        if raw is None:
+            return
+        value = str(raw).strip().lower()
+        if value not in ("auto", "yes", "no"):
+            log.error("technitium_dnssec_validation_value_invalid", value=raw)
+            self._note_apply_failure(f"dnssec validation: bad value {raw!r}")
+            return
+        body = self._call(
+            token,
+            "POST",
+            "settings/set",
+            {"dnssecValidation": "false" if value == "no" else "true"},
+        ).json()
+        if body.get("status") != "ok":
+            log.error("technitium_dnssec_validation_failed", error=body.get("errorMessage"))
+            self._note_apply_failure(f"dnssec validation: {body.get('errorMessage')}")
+
     def _apply_forwarders(self, token: str, options: dict[str, Any]) -> None:
         """Set the upstream forwarders and the protocol to reach them with.
 
@@ -2277,13 +3045,23 @@ class TechnitiumDriver(DriverBase):
         ok and leaves it at Udp). So the two always go together, or not at
         all.
 
-        For DoT/DoH/DoQ, Technitium wants a **domain name** — an IP address
-        is rejected outright ("Address must be a domain name"), because
-        there would be no name to validate the upstream certificate
-        against. That is a real mismatch with the neutral model, which
-        carries a list of forwarder IPs plus one ``forward_tls_hostname``:
-        over an encrypted transport the hostname is the only usable
-        address, so it wins and the IPs are dropped with a warning.
+        For DoT/DoH/DoQ the certificate is checked against a **name**, so
+        the group's ``forward_tls_hostname`` is paired with every forwarder
+        IP as ``"<name> (<ip>)"`` (``https://<name>/dns-query (<ip>)`` for
+        DoH). Technitium dials the bracketed IP and validates the name
+        (APIDOCS.md "Name Server Address Format"). It used to send the name
+        alone, which made the daemon resolve it by plaintext recursion from
+        the root before it could forward (#1764).
+
+        Technitium has no switch to skip certificate validation
+        (``TlsClientConnection`` authenticates against the server's host
+        unconditionally), so ``forward_tls_verify=false`` cannot be honoured
+        and a hostname is required for every encrypted transport. A stored
+        row without one is refused (reported, previous forwarders kept)
+        rather than sent as bare IPs, which would fail every forwarded query
+        wherever the certificate carries no IP SAN.
+
+        A neutral ``ip@port`` is sent as Technitium's ``ip:port``.
         """
         forwarders = [str(f) for f in (options.get("forwarders") or []) if f]
         transport = str(options.get("forward_transport") or "do53")
@@ -2316,25 +3094,29 @@ class TechnitiumDriver(DriverBase):
         if transport != "do53":
             hostname = options.get("forward_tls_hostname")
             if hostname:
-                if forwarders != [hostname]:
-                    log.info(
-                        "technitium_forwarder_hostname_substituted",
-                        transport=transport,
-                        hostname=hostname,
-                        dropped=forwarders,
-                        reason="encrypted transports need a name to validate against",
-                    )
-                forwarders = [str(hostname)]
+                forwarders = _encrypted_forwarders(forwarders, str(hostname), transport)
             else:
+                # Not "send the IPs over Tls": Technitium validates the
+                # certificate against the address it was given, so bare IPs
+                # work only where the certificate carries them as IP SANs,
+                # and everywhere else every forwarded query would fail. The
+                # previous forwarders keep resolving and the refusal is
+                # reported; the API no longer lets this be newly stored.
                 log.error(
                     "technitium_forwarder_hostname_missing",
                     transport=transport,
-                    hint="forward_tls_hostname is required for tls/https/quic",
+                    hint=(
+                        "forward_tls_hostname is required: Technitium always validates "
+                        "the upstream certificate, against that name"
+                    ),
                 )
                 self._note_apply_failure(
-                    f"forwarders: no forward_tls_hostname for {transport}"
+                    f"forwarders: no forward_tls_hostname for {transport}; Technitium "
+                    "always validates the upstream certificate, so set one"
                 )
                 return
+        else:
+            forwarders = [_technitium_forwarder(f) for f in forwarders]
 
         resp = self._call(
             token,
@@ -2354,6 +3136,140 @@ class TechnitiumDriver(DriverBase):
         log.info(
             "technitium_forwarders_applied", protocol=protocol, count=len(forwarders)
         )
+
+    def _apply_recursion(self, token: str, options: dict[str, Any]) -> None:
+        """Set the recursion policy from the bundle (#1761).
+
+        Technitium's fresh default is ``AllowOnlyForPrivateNetworks``; left
+        alone, a group with recursion off (or ``is_recursive=false``, which
+        the bundle already folds into ``recursion_enabled``) still resolves
+        for every RFC 1918 client, and an ``allow_recursion`` naming a
+        public range is refused. Always sent, so turning recursion off or
+        editing the list converges instead of sticking.
+        """
+        mode, acl = self._recursion_params(options)
+        if mode not in _RECURSION_MODES:
+            # settings/set try-parses the enum and ignores a bad value with
+            # status "ok", so an unknown mode would read as applied.
+            log.error("technitium_recursion_mode_invalid", mode=mode)
+            self._note_apply_failure(f"recursion: invalid mode {mode!r}")
+            return
+        params: dict[str, Any] = {"recursion": mode}
+        if mode == "UseSpecifiedNetworkACL":
+            params["recursionNetworkACL"] = ",".join(acl)
+        body = self._call(token, "POST", "settings/set", params).json()
+        if body.get("status") != "ok":
+            log.error("technitium_recursion_failed", mode=mode, error=body.get("errorMessage"))
+            self._note_apply_failure(f"recursion: {body.get('errorMessage')}")
+            return
+        log.info("technitium_recursion_applied", mode=mode, acl=len(acl))
+
+    @staticmethod
+    def _recursion_params(options: dict[str, Any]) -> tuple[str, list[str]]:
+        """Pure mapping: bundle options → (``recursion`` mode, ACL entries).
+
+        * ``recursion_enabled`` false → ``Deny``.
+        * ``allow_recursion`` absent, empty, or exactly ``["any"]`` →
+          ``AllowOnlyForPrivateNetworks``. ``["any"]`` is the model's stored
+          default and nothing distinguishes it from an explicit choice, while
+          the BIND9 agent never renders ``allow-recursion`` (#1786) and so
+          runs BIND's localnets/localhost default. Mapping it to ``Allow``
+          would open recursion to the internet on upgrade; the engine's
+          private-network default is the closest match and is what
+          Technitium already did. ``Allow`` is therefore never sent.
+        * otherwise ``UseSpecifiedNetworkACL`` with the list translated to
+          CIDRs. Unresolvable tokens (named ACLs, garbage) are dropped with
+          a warning; if none survive the result is ``Deny`` — fail closed.
+        """
+        if not options.get("recursion_enabled", True):
+            return "Deny", []
+        raw = [str(e).strip() for e in (options.get("allow_recursion") or []) if str(e).strip()]
+        if not raw or [e.lower() for e in raw] == ["any"]:
+            return "AllowOnlyForPrivateNetworks", []
+        acl: list[str] = []
+        for entry in raw:
+            deny = entry.startswith("!")
+            name = entry.lstrip("!").strip()
+            low = name.lower()
+            if low == "any":
+                cidrs: tuple[str, ...] = _ACL_ANY
+            elif low == "none":
+                continue
+            elif low == "localhost":
+                cidrs = _ACL_LOCALHOST
+            elif low == "localnets":
+                cidrs = _ACL_LOCALNETS
+            else:
+                try:
+                    ipaddress.ip_network(name, strict=False)
+                except ValueError:
+                    log.warning("technitium_allow_recursion_entry_dropped", entry=entry)
+                    continue
+                cidrs = (name,)
+            acl.extend(("!" + c) if deny else c for c in cidrs)
+        if not any(not a.startswith("!") for a in acl):
+            return "Deny", []
+        return "UseSpecifiedNetworkACL", acl
+
+    def _apply_rate_limits(self, token: str, options: dict[str, Any]) -> None:
+        """Map the group's RRL intent onto Technitium's QPM limits (#1761).
+
+        Technitium ships ``qpmPrefixLimits`` of 600/min per IPv4 /32 and
+        6000/min per /24 (IPv6 600 / 1200 / 6000), averaged over 5 minutes,
+        applied to every inbound query. With RRL off in SpatiumDDI those
+        defaults stayed in force and dropped a busy downstream resolver's
+        answers. So: RRL off (or ``log-only``, which Technitium cannot
+        express) sends EMPTY limits, which disables the feature; RRL on
+        derives a per-client (/32, /128) limit from
+        ``rrl_responses_per_second`` x 60, a sample window from
+        ``rrl_window`` (seconds → whole minutes, min 1) and the truncation
+        share from ``rrl_slip`` (BIND: every Nth response slips, so 100/N %;
+        0 = drop all). ``rrl_exempt_clients`` becomes the bypass list.
+        This is an approximation, not equivalence: BIND limits identical
+        responses per second, Technitium counts queries per minute.
+        """
+        params = self._rate_limit_params(options)
+        body = self._call(token, "POST", "settings/set", params).json()
+        if body.get("status") != "ok":
+            log.error("technitium_rate_limits_failed", error=body.get("errorMessage"))
+            self._note_apply_failure(f"rate limits: {body.get('errorMessage')}")
+            return
+        log.info("technitium_rate_limits_applied", enabled=bool(params["qpmPrefixLimitsIPv4"]))
+
+    @staticmethod
+    def _rate_limit_params(options: dict[str, Any]) -> dict[str, Any]:
+        """Pure mapping: bundle options → the ``settings/set`` qpm payload."""
+        if not options.get("rrl_enabled") or options.get("rrl_log_only"):
+            if options.get("rrl_enabled"):
+                log.warning(
+                    "technitium_rrl_log_only_not_supported",
+                    hint="Technitium cannot log without limiting; limits left off",
+                )
+            return {
+                "qpmPrefixLimitsIPv4": "",
+                "qpmPrefixLimitsIPv6": "",
+                "qpmLimitBypassList": "",
+            }
+        rps = max(1, int(options.get("rrl_responses_per_second") or 15))
+        limit = rps * 60
+        window_s = max(1, int(options.get("rrl_window") or 15))
+        slip = int(options.get("rrl_slip") if options.get("rrl_slip") is not None else 2)
+        pct = 0 if slip <= 0 else min(100, round(100 / slip))
+        bypass: list[str] = []
+        for c in options.get("rrl_exempt_clients") or []:
+            try:
+                ipaddress.ip_network(str(c).strip(), strict=False)
+            except ValueError:
+                log.warning("technitium_rrl_exempt_entry_dropped", entry=str(c))
+                continue
+            bypass.append(str(c).strip())
+        return {
+            "qpmPrefixLimitsIPv4": f"32|{limit}|{limit}",
+            "qpmPrefixLimitsIPv6": f"128|{limit}|{limit}",
+            "qpmLimitSampleMinutes": max(1, -(-window_s // 60)),
+            "qpmLimitUdpTruncationPercentage": pct,
+            "qpmLimitBypassList": ",".join(bypass),
+        }
 
     # ── DNSSEC (issue #740) ─────────────────────────────────────────────
 
@@ -2727,23 +3643,28 @@ class TechnitiumDriver(DriverBase):
         zone = entry["zone"]
         ztype = entry.get("type", "Primary")
         params: dict[str, Any] = {"zone": zone, "type": ztype}
+        forwarder_specs: list[tuple[str, str, int]] = []
+        dnssec: bool | None = None
         if ztype in ("Secondary", "Stub", "SecondaryCatalog"):
             params["primaryNameServerAddresses"] = ",".join(
                 _technitium_master(m) for m in entry.get("masters") or []
             )
+            if ztype in _TSIG_SECONDARY_ZONE_TYPES and entry.get("tsig_key"):
+                # The key the zone's masters require for a transfer (#1765).
+                # Without it a signed-only primary refuses every AXFR, and the
+                # zone expires to SERVFAIL after a create that succeeded.
+                params["tsigKeyName"] = entry["tsig_key"]
         elif ztype == "Forwarder":
-            forwarders = entry.get("forwarders") or []
-            # Technitium's Forwarder zone takes a single upstream; BIND's
-            # takes a list. Use the first and say so, rather than silently
-            # dropping the rest.
-            params["forwarder"] = forwarders[0]
-            if len(forwarders) > 1:
-                log.warning(
-                    "technitium_forwarder_extra_upstreams_ignored",
-                    zone=zone,
-                    used=forwarders[0],
-                    ignored=forwarders[1:],
-                )
+            # First upstream rides zones/create with its protocol (without
+            # ``protocol`` Technitium uses Udp and re-derives the address, so
+            # a DoH URL went out as cleartext host:53, #1764). The rest are
+            # further apex FWD records, added by ``_sync_forwarder_records``.
+            forwarder_specs = _forwarder_specs([str(f) for f in entry.get("forwarders") or []])
+            dnssec = entry.get("dnssec_validation")
+            params["forwarder"] = forwarder_specs[0][0]
+            params["protocol"] = forwarder_specs[0][1]
+            if dnssec is not None:
+                params["dnssecValidation"] = "true" if dnssec else "false"
 
         resp = self._call(token, "POST", "zones/create", params)
         body = resp.json()
@@ -2756,7 +3677,17 @@ class TechnitiumDriver(DriverBase):
                 # permanent silent no-op: the operator edits it, the
                 # bundle changes, and the daemon keeps transferring from
                 # the old address forever.
-                self._reapply_zone_upstream(token, zone, ztype, params)
+                #
+                # The same holds for the zone TYPE (#1457): a zone switched
+                # from forward to primary in SpatiumDDI stayed a Forwarder
+                # here, so every name that was not a local record went to
+                # the old upstream. Convert first, so the upstream below is
+                # applied to the type the zone now has (a zone converted to
+                # Forwarder gets every upstream in the bundle, #1764).
+                self._reconcile_zone_type(token, zone, ztype)
+                self._reapply_zone_upstream(
+                    token, zone, ztype, params, forwarder_specs, dnssec
+                )
                 return
             log.error(
                 "technitium_zone_create_failed",
@@ -2767,18 +3698,83 @@ class TechnitiumDriver(DriverBase):
             self._note_apply_failure(
                 f"{zone}: zone create: {body.get('errorMessage')}"
             )
+            return
+        if ztype == "Forwarder":
+            # The create carried the first upstream only.
+            self._sync_forwarder_records(token, zone, forwarder_specs, dnssec)
+
+    def _reconcile_zone_type(self, token: str, zone: str, ztype: str) -> None:
+        """Bring an existing zone's type in line with the bundle (#1457).
+
+        ``zones/create`` never changes the type of a zone that already
+        exists, so a type change in SpatiumDDI used to stop at the daemon.
+        ``zones/convert`` changes it in place and keeps the zone's records
+        (verified live against 15.4.0: Forwarder → Primary keeps every
+        record, Primary → Forwarder works too). Converting to Secondary or
+        Stub is refused by Technitium ("not supported") from both Primary
+        and Forwarder; that is logged at error rather than worked around
+        with a delete + recreate, because deleting a zone is not something
+        the agent does on its own (see ``_reconcile_zones``).
+
+        An unreadable live type is skipped, not guessed: converting on a
+        wrong guess is worse than leaving the zone as it is.
+        """
+        body = self._call(token, "GET", "zones/options/get", {"zone": zone}).json()
+        live = (body.get("response") or {}).get("type") if body.get("status") == "ok" else None
+        if not live:
+            log.warning(
+                "technitium_zone_type_unreadable",
+                zone=zone,
+                error=body.get("errorMessage"),
+            )
+            return
+        if live == ztype:
+            return
+        resp = self._call(token, "POST", "zones/convert", {"zone": zone, "type": ztype}).json()
+        if resp.get("status") == "ok":
+            log.info("technitium_zone_type_converted", zone=zone, from_type=live, to_type=ztype)
+            if live == "Forwarder" and ztype == "Primary":
+                self._replace_placeholder_soa(token, zone)
+            return
+        log.error(
+            "technitium_zone_type_mismatch",
+            zone=zone,
+            live_type=live,
+            desired_type=ztype,
+            error=resp.get("errorMessage"),
+        )
+        self._note_apply_failure(f"{zone}: zone type: {resp.get('errorMessage')}")
 
     def _reapply_zone_upstream(
-        self, token: str, zone: str, ztype: str, params: dict[str, Any]
+        self,
+        token: str,
+        zone: str,
+        ztype: str,
+        params: dict[str, Any],
+        forwarder_specs: list[tuple[str, str, int]] | None = None,
+        dnssec: bool | None = None,
     ) -> None:
-        """Push a existing zone's upstream through ``zones/options/set``."""
+        """Push an existing zone's upstream to the daemon.
+
+        A secondary/stub's primaries go through ``zones/options/set``. A
+        Forwarder's upstreams do not: ``zones/options/set`` has no
+        ``forwarder`` parameter (it answers ``ok`` and stores nothing,
+        #1647); they live in the zone's apex FWD records, see
+        ``_sync_forwarder_records``.
+        """
+        if "forwarder" in params:
+            self._sync_forwarder_records(token, zone, forwarder_specs or [], dnssec)
+            return
         opts: dict[str, Any] = {"zone": zone}
         if "primaryNameServerAddresses" in params:
             opts["primaryNameServerAddresses"] = params["primaryNameServerAddresses"]
-        elif "forwarder" in params:
-            opts["forwarder"] = params["forwarder"]
         else:
             return
+        if ztype in _TSIG_SECONDARY_ZONE_TYPES:
+            # Always sent, empty included: an absent parameter leaves the old
+            # key, an empty one clears it (``WebServiceZonesApi.cs``), and the
+            # control plane decides which masters need signing (#1765).
+            opts["primaryZoneTransferTsigKeyName"] = params.get("tsigKeyName", "")
         body = self._call(token, "POST", "zones/options/set", opts).json()
         if body.get("status") != "ok":
             log.warning(
@@ -2789,6 +3785,184 @@ class TechnitiumDriver(DriverBase):
             )
             self._note_apply_failure(
                 f"{zone}: zone upstream: {body.get('errorMessage')}"
+            )
+
+    def _apex_records(self, token: str, zone: str) -> list[dict[str, Any]] | None:
+        """The zone's apex records, or None when they can't be read."""
+        body = self._call(
+            token, "GET", "zones/records/get", {"domain": zone, "zone": zone}
+        ).json()
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_zone_apex_unreadable", zone=zone, error=body.get("errorMessage")
+            )
+            return None
+        return [
+            r
+            for r in (body.get("response") or {}).get("records") or []
+            if (r.get("name") or "").rstrip(".").lower() == zone.lower()
+        ]
+
+    def _sync_forwarder_records(
+        self,
+        token: str,
+        zone: str,
+        specs: list[tuple[str, str, int]],
+        dnssec: bool | None,
+    ) -> None:
+        """Make the zone's apex FWD records exactly ``specs`` (#1764).
+
+        A Forwarder zone's upstreams are its apex FWD records. A record's
+        identity is ``(protocol, forwarder)``; ``forwarderPriority`` and
+        ``dnssecValidation`` are its data (APIDOCS.md "Add Record" /
+        "Update Record" / "Delete Record"; ``WebServiceZonesApi.cs``).
+        So: a missing record is added, one whose priority or DNSSEC flag
+        differs is updated in place, and a record no longer wanted is
+        deleted LAST, so the zone never has no upstream in between. If an
+        add is refused, nothing is deleted: the old upstream stays until
+        the new one is in (#1647). ``dnssec`` None leaves the flag at
+        whatever the record has.
+
+        This is also the path a zone converted to Forwarder takes
+        (#1457): ``zones/convert`` from Primary leaves it with no FWD
+        record at all, so every upstream here is an add. Every refusal is
+        noted, so a refused forwarder change reads as a partial apply
+        (#1516).
+        """
+        if not specs:
+            return
+        apex = self._apex_records(token, zone)
+        if apex is None:
+            self._note_apply_failure(f"{zone}: zone upstream: apex records unreadable")
+            return
+        live = [(r.get("rData") or {}) for r in apex if r.get("type") == "FWD"]
+        by_key = {(_norm_forwarder(r.get("forwarder") or ""), r.get("protocol") or "Udp"): r for r in live}
+        wanted: set[tuple[str, str]] = set()
+        add_refused = False
+        for address, protocol, priority in specs:
+            key = (_norm_forwarder(address), protocol)
+            wanted.add(key)
+            have = by_key.get(key)
+            params: dict[str, Any] = {
+                "domain": zone,
+                "zone": zone,
+                "type": "FWD",
+                "forwarder": address,
+                "protocol": protocol,
+                "forwarderPriority": str(priority),
+            }
+            if have is None:
+                if dnssec is not None:
+                    params["dnssecValidation"] = "true" if dnssec else "false"
+                path = "zones/records/add"
+            else:
+                live_dnssec = bool(have.get("dnssecValidation"))
+                if int(have.get("priority") or 0) == priority and (
+                    dnssec is None or live_dnssec == dnssec
+                ):
+                    continue
+                params["forwarder"] = have.get("forwarder") or address
+                params["dnssecValidation"] = (
+                    "true" if (live_dnssec if dnssec is None else dnssec) else "false"
+                )
+                path = "zones/records/update"
+            result = self._call(token, "POST", path, params).json()
+            if result.get("status") != "ok" and _is_record_noop(result.get("errorMessage")):
+                # Technitium's exact "record already exists" (#1770): this
+                # upstream is in, under a spelling ``_norm_forwarder`` did not
+                # fold to ours. Applied, so it does not hold back the stale
+                # deletes below. The CNAME-style conflict answers are not in
+                # the no-op set and still count as refused.
+                log.info("technitium_zone_forwarder_set", zone=zone, forwarder=address)
+            elif result.get("status") != "ok":
+                log.warning(
+                    "technitium_zone_forwarder_set_failed",
+                    zone=zone,
+                    forwarder=address,
+                    error=result.get("errorMessage"),
+                )
+                self._note_apply_failure(
+                    f"{zone}: zone upstream: {address}: {result.get('errorMessage')}"
+                )
+                if path == "zones/records/add":
+                    add_refused = True
+            else:
+                log.info("technitium_zone_forwarder_set", zone=zone, forwarder=address)
+        stale = [(k, r) for k, r in by_key.items() if k not in wanted]
+        if stale and add_refused:
+            log.warning(
+                "technitium_zone_forwarder_stale_kept",
+                zone=zone,
+                forwarders=[r.get("forwarder") for _, r in stale],
+            )
+            return
+        for _key, rdata in stale:
+            result = self._call(
+                token,
+                "POST",
+                "zones/records/delete",
+                {
+                    "domain": zone,
+                    "zone": zone,
+                    "type": "FWD",
+                    "forwarder": rdata.get("forwarder"),
+                    "protocol": rdata.get("protocol") or "Udp",
+                },
+            ).json()
+            if result.get("status") != "ok" and (
+                _norm_error(result.get("errorMessage")) != _RECORD_ABSENT_MESSAGE
+            ):
+                # "no such record exists" (#1770): already gone, which is the
+                # state this delete wanted.
+                log.warning(
+                    "technitium_zone_forwarder_remove_failed",
+                    zone=zone,
+                    forwarder=rdata.get("forwarder"),
+                    error=result.get("errorMessage"),
+                )
+                self._note_apply_failure(
+                    f"{zone}: zone upstream: {rdata.get('forwarder')}: "
+                    f"{result.get('errorMessage')}"
+                )
+
+    def _replace_placeholder_soa(self, token: str, zone: str) -> None:
+        """Give a zone converted from Forwarder a real SOA.
+
+        A Forwarder zone carries a placeholder SOA (responsible person
+        ``invalid``, TTL 0), and ``zones/convert`` keeps it. As a Primary
+        that means negative answers are not cached. Set what Technitium
+        gives a zone created as Primary (``hostadmin@<zone>``, TTL 900),
+        keeping the rest. Only the placeholder is touched; any other SOA
+        is left alone.
+        """
+        apex = self._apex_records(token, zone)
+        soa = next((r for r in apex or [] if r.get("type") == "SOA"), None)
+        if soa is None:
+            return
+        rdata = soa.get("rData") or {}
+        if rdata.get("responsiblePerson") != "invalid":
+            return
+        body = self._call(
+            token,
+            "POST",
+            "zones/records/update",
+            {
+                "domain": zone,
+                "zone": zone,
+                "type": "SOA",
+                "ttl": "900",
+                "primaryNameServer": rdata.get("primaryNameServer") or "",
+                "responsiblePerson": f"hostadmin@{zone}",
+                "serial": str(rdata.get("serial") or 1),
+                "refresh": str(rdata.get("refresh") or 900),
+                "retry": str(rdata.get("retry") or 300),
+                "expire": str(rdata.get("expire") or 604800),
+                "minimum": str(rdata.get("minimum") or 900),
+            },
+        ).json()
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_zone_soa_placeholder_kept", zone=zone, error=body.get("errorMessage")
             )
 
     def _apply_zone_options(
@@ -2804,6 +3978,15 @@ class TechnitiumDriver(DriverBase):
         security regression that no log line would report. Refuse to send
         anything not in the known set.
         """
+        options = dict(options)
+        for item in options.pop("_unapplied", None) or []:
+            # Left as the daemon has it rather than guessed at (see
+            # ``_query_access`` / ``_transfer_access``); the API refuses to
+            # store such a value for a Technitium group, so this is a row saved
+            # before that gate.
+            log.error("technitium_zone_option_unapplied", zone=zone, **item)
+            if self._unapplied_acl is not None:
+                self._unapplied_acl.setdefault(item["kind"], []).append(zone)
         if not options:
             return
         transfer = options.get("zoneTransfer")

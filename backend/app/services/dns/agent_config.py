@@ -35,6 +35,7 @@ from sqlalchemy.types import UserDefinedType
 
 from app.config import settings
 from app.core.crypto import decrypt_str
+from app.drivers.dns.base import TsigKey
 from app.models.appliance import ApplianceCertificate
 from app.models.dns import (
     DNSAcl,
@@ -80,7 +81,12 @@ from app.services.dns.record_ops import (
     supersede,
 )
 from app.services.dns.soa_timers import served_soa_timers
-from app.services.dns.tsig import legacy_group_key, view_transfer_key
+from app.services.dns.tsig import (
+    legacy_group_key,
+    resolve_group_transfer_key,
+    transfer_needs_tsig,
+    view_transfer_key,
+)
 from app.services.dns_blocklist import (
     build_effective_for_group,
     build_effective_for_view,
@@ -141,6 +147,15 @@ _RECORD_DRIVEN_KEYS = frozenset({"records", "serial"})
 # #1513 meant.
 SVCB_TARGET_RULE_KEY = "svcb_target_rule"
 SVCB_TARGET_RULE_ZONE_FILE = "zone-file"
+
+# #1759 — the same statement for every OTHER name-valued target (CNAME,
+# DNAME, NS, PTR, MX exchange, SRV target, NAPTR replacement). A separate key,
+# not a rename of the SVCB one: a bundle a #1513 control plane stored carries
+# ``svcb_target_rule`` and not this, and the agent must keep reading that
+# bundle's CNAME targets as absolute, as they were rendered. Without the key
+# a dot-less target is absolute.
+NAME_TARGET_RULE_KEY = "name_target_rule"
+NAME_TARGET_RULE_ZONE_FILE = "zone-file"
 
 
 #: How an ETag's payload is serialised before it is hashed. The streamed
@@ -240,6 +255,124 @@ def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
     except AclCycleError as exc:
         logger.error("dns_acl_cycle_in_bundle", error=str(exc))
         return sorted(prepared, key=lambda a: a["name"])
+
+
+def _master_host(master: Any) -> str:
+    """``ip``, ``ip@port`` or ``[v6]`` of a neutral ``masters`` entry -> host."""
+    text = str(master or "").strip()
+    if "@" in text:
+        text = text.rpartition("@")[0]
+    return text.strip("[]").lower()
+
+
+async def _master_granted_keys(db: AsyncSession, group_id: Any) -> list[TsigKey]:
+    """Every key a managed master in ``group_id`` grants transfer to, in the
+    order the control plane would sign with (#734): the group's transfer key
+    first, then the operator keys by name. The BIND9 agent grants every key in
+    its bundle (``_transfer_key_grants``); a Technitium master pins the same set."""
+    keys: list[TsigKey] = []
+    first = await resolve_group_transfer_key(db, group_id)
+    if first is not None:
+        keys.append(first)
+    for k in (
+        (
+            await db.execute(
+                select(DNSTSIGKey).where(DNSTSIGKey.group_id == group_id).order_by(DNSTSIGKey.name)
+            )
+        )
+        .scalars()
+        .all()
+    ):
+        try:
+            keys.append(
+                TsigKey(name=k.name, algorithm=k.algorithm, secret=decrypt_str(k.secret_encrypted))
+            )
+        except ValueError:
+            continue
+    return keys
+
+
+async def _add_master_transfer_keys(
+    db: AsyncSession,
+    zone_payload: list[dict[str, Any]],
+    catalog_block: dict[str, Any] | None,
+    tsig_keys: list[dict[str, Any]],
+) -> None:
+    """Name the TSIG key a Technitium secondary signs its transfers with (#1765).
+
+    A SpatiumDDI primary grants transfer only to the keys of ITS group (#734),
+    so a secondary has to sign with one of them. A master is recognised by
+    address among the agent-managed servers (``transfer_needs_tsig``); one that
+    is not (an operator's own BIND, authorised by source address) gets no key,
+    because signing a request its master has never heard of turns a working
+    unsigned transfer into NOTAUTH.
+
+    **Only a key this server's own group already holds is ever named** —
+    matched by name, algorithm AND secret against a key the master grants.
+    No other group's secret enters this bundle. That rules out shipping the
+    master group's own key: on a BIND9 master that key is also the
+    unrestricted ``allow-update`` grant on every primary zone, so handing it
+    to another group's daemon would hand over write access to the whole master
+    group to anyone who can create a secondary zone here. A master in the SAME
+    group signs with the group key, which both sides hold. A master in another
+    group needs a key the operator placed in both groups (same name, algorithm
+    and secret); without one the zone is marked ``masters_tsig_unresolved`` and
+    the agent reports the transfer as one that will be refused, rather than
+    creating a zone that silently expires.
+
+    Sets ``masters_tsig_key`` (or ``masters_tsig_unresolved``) on each
+    secondary zone and ``producer_tsig_key`` on a consumer catalog block.
+    """
+    secondaries = [
+        zp
+        for zp in zone_payload
+        if str(zp.get("type") or "").lower() in ("secondary", "slave") and zp.get("masters")
+    ]
+    consumer = catalog_block if (catalog_block or {}).get("mode") == "consumer" else None
+    if not secondaries and consumer is None:
+        return
+    managed = {
+        _master_host(row.host): row
+        for row in (
+            await db.execute(select(DNSServer).where(DNSServer.agent_id.is_not(None)))
+        ).scalars()
+        if transfer_needs_tsig(row)
+    }
+    local = {k["name"].rstrip(".").lower(): k for k in tsig_keys}
+    granted: dict[Any, list[TsigKey]] = {}
+
+    async def key_for(masters: list[Any]) -> tuple[str | None, bool]:
+        """``(key name, a managed master was found)``."""
+        found = False
+        for master in masters:
+            row = managed.get(_master_host(master))
+            if row is None:
+                continue
+            found = True
+            if row.group_id not in granted:
+                granted[row.group_id] = await _master_granted_keys(db, row.group_id)
+            for key in granted[row.group_id]:
+                have = local.get(key.name.rstrip(".").lower())
+                if (
+                    have is not None
+                    and have.get("secret") == key.secret
+                    and str(have.get("algorithm") or "hmac-sha256").lower()
+                    == str(key.algorithm or "hmac-sha256").lower()
+                ):
+                    return str(have["name"]).rstrip("."), True
+        return None, found
+
+    for zp in secondaries:
+        name, found = await key_for(list(zp["masters"]))
+        if name:
+            zp["masters_tsig_key"] = name
+        elif found:
+            logger.warning("dns_secondary_master_shares_no_tsig_key", zone=zp.get("name"))
+            zp["masters_tsig_unresolved"] = True
+    if consumer is not None and consumer.get("producer_addr"):
+        name, _ = await key_for([consumer["producer_addr"]])
+        if name:
+            consumer["producer_tsig_key"] = name
 
 
 def _safe_update_acl(zone_id: Any, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -956,6 +1089,12 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "forward_tls_hostname": (getattr(opts, "forward_tls_hostname", None) if opts else None),
         "forward_tls_verify": (bool(getattr(opts, "forward_tls_verify", True)) if opts else True),
     }
+    if server.driver == "technitium":
+        # #1761: only Technitium reads this (the BIND9 agent renders a bare
+        # ``recursion yes|no``), so no other driver's etag moves with it.
+        options_block["allow_recursion"] = (
+            list(getattr(opts, "allow_recursion", None) or []) if opts else []
+        )
     if server.driver == "powerdns":
         # PowerDNS ALIAS expansion (#1353): the group's own plain-DNS
         # forwarders, or "" for ALIAS off. Never a built-in public resolver.
@@ -1254,6 +1393,9 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                     "fingerprint_sha256": cert_row.fingerprint_sha256,
                 }
 
+    if server.driver == "technitium":
+        await _add_master_transfer_keys(db, zone_payload, catalog_block, tsig_keys)
+
     bundle_body: dict[str, Any] = {
         "server_id": str(server.id),
         "driver": server.driver,
@@ -1324,6 +1466,11 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # zones under the rule even when nothing else changed.
         bundle_body[SVCB_TARGET_RULE_KEY] = SVCB_TARGET_RULE_ZONE_FILE
         structural[SVCB_TARGET_RULE_KEY] = SVCB_TARGET_RULE_ZONE_FILE
+        # #1759 — and the same for every other name-valued target, so a
+        # dot-less CNAME / NS / MX / SRV / PTR / DNAME / NAPTR target is
+        # relative to the zone too. Structural for the same reason.
+        bundle_body[NAME_TARGET_RULE_KEY] = NAME_TARGET_RULE_ZONE_FILE
+        structural[NAME_TARGET_RULE_KEY] = NAME_TARGET_RULE_ZONE_FILE
     return _Assembled(
         body=bundle_body,
         structural=structural,

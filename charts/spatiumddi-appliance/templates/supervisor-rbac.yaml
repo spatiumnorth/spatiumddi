@@ -94,10 +94,14 @@ rules:
     # seed's heartbeat right after delete_node). Without the reclaim the
     # missing replica's sentinel silently halves the failover quorum and
     # the next node loss strands the Redis master for good. delete on
-    # pods+PVCs only — everything else in this Role stays read-only.
+    # pods+PVCs (and create on PVCs, #1541) — everything else in this
+    # Role stays read-only.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["get", "list", "delete"]
+    # #1541 — create: the slot-image mirror's claim is a plain Helm-owned
+    # PVC, not a StatefulSet volumeClaimTemplate, so nothing re-creates it
+    # after the stranded one is reclaimed (k8s_api.recreate_reclaimed_claims).
+    verbs: ["get", "list", "delete", "create"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["delete"]
