@@ -171,11 +171,14 @@ _NAME_VALUED_TYPES = frozenset({"CNAME", "DNAME", "NS", "PTR", "MX", "SRV"})
 def targets_are_relative(server: Any) -> bool:
     """How ``server``'s driver reads a name target with no trailing dot (#1794).
 
-    True for the zone-file drivers: BIND9, PowerDNS and both Technitium
-    drivers store and serve the value as a zone file would, so ``a.b`` is
+    True for the zone-file drivers: BIND9 and both Technitium drivers
+    store and serve the value as a zone file would, so ``a.b`` is
     ``a.b.<zone>.`` and only a trailing dot makes a name absolute. The
     agentless Windows driver without WinRM credentials (Path A) is one too:
     its writes are RFC 2136 updates parsed against the zone origin.
+    PowerDNS falls through to True as well, but its answer is never
+    consulted: it implements no record pull, so drift and sync never reach
+    a comparison for it (its HTTP API does not read content zone-file style).
 
     False for the drivers whose API takes the name as given, so a dot-less
     name holding a dot is already absolute: the cloud providers, and Windows

@@ -206,3 +206,65 @@ async def test_drift_converges_per_driver(
     assert s.status == "ok", s.error
     assert s.drift_count == 0, (s.extra_on_server, s.missing_on_server)
     assert s.in_sync == len(_CASES)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("managed_driver", "stored", "wire"),
+    [
+        # A BIND9 managed group serves a dot-less ``a.b`` as ``a.b.<zone>.``.
+        ("bind9", "a.b", "a.b.corp.example."),
+        # A cloud managed group serves it as the absolute ``a.b.``: the DB side
+        # is read the way the managed group reads it, not always zone-file.
+        ("route53", "a.b", "a.b."),
+    ],
+)
+async def test_cutover_parity_reads_the_db_side_by_the_managed_group(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    managed_driver: str,
+    stored: str,
+    wire: str,
+) -> None:
+    from app.services.cutover import parity as parity_mod
+
+    group = DNSServerGroup(name=f"m-{uuid.uuid4().hex[:6]}")
+    source_group = DNSServerGroup(name=f"w-{uuid.uuid4().hex[:6]}")
+    db_session.add_all([group, source_group])
+    await db_session.flush()
+    source = DNSServer(
+        group_id=source_group.id,
+        name="win-dns",
+        driver="windows_dns",
+        host="10.0.0.10",
+        port=53,
+        is_enabled=True,
+    )
+    db_session.add_all(
+        [
+            DNSServer(
+                group_id=group.id,
+                name="ns-managed",
+                driver=managed_driver,
+                host="10.0.0.53",
+                port=53,
+                is_enabled=True,
+                is_primary=True,
+            ),
+            source,
+        ]
+    )
+    zone = DNSZone(group_id=group.id, name="corp.example.", zone_type="primary", kind="forward")
+    db_session.add(zone)
+    await db_session.flush()
+    db_session.add(DNSRecord(zone_id=zone.id, name="www", record_type="CNAME", value=stored))
+    await db_session.commit()
+
+    live = [RecordData(name="www", record_type="CNAME", value=wire)]
+    monkeypatch.setattr(parity_mod, "get_dns_driver", lambda _d: _Driver(live))
+    report = await parity_mod.compute_dns_parity(
+        db_session, source_server=source, zone=zone, source_zone_name="corp.example"
+    )
+    assert report.status == "ok", report.error
+    assert report.in_sync == 1, report.differences
+    assert not report.differences

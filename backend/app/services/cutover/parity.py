@@ -55,7 +55,7 @@ from app.models.dns import DNSRecord, DNSServer, DNSZone
 from app.models.ipam import Subnet
 from app.services.cutover.canonical import ParityDifference, ParityReport
 from app.services.dhcp_import.options import normalise_mac
-from app.services.dns.pull_from_server import _key
+from app.services.dns.pull_from_server import _key, targets_are_relative
 
 logger = structlog.get_logger(__name__)
 
@@ -163,7 +163,7 @@ def normalise_option_value(value: Any) -> str:
 
 
 def _bucket_records(
-    rows: list[Any], zone_name: str
+    rows: list[Any], zone_name: str, *, relative_targets: bool
 ) -> dict[tuple[str, str], list[tuple[Any, Any]]]:
     """Group records by ``(name, type)``, carrying each one's canonical value.
 
@@ -172,13 +172,14 @@ def _bucket_records(
     normalised value plus, for MX / SRV, the structured priority / weight /
     port (#1525) — is the identity used for multiset matching inside it.
 
-    Targets are read zone-file style (#1794): the DB side is what a managed
-    zone-file server will serve, and Windows reports every name target
-    absolute with its trailing dot, so only the DB side is ambiguous.
+    ``relative_targets`` is how the side's driver reads a dot-less name target
+    (#1794, :func:`~app.services.dns.pull_from_server.targets_are_relative`).
+    The two sides are read independently: the DB rows the way the managed
+    zone's own group serves them, the wire the way the source server reports.
     """
     buckets: dict[tuple[str, str], list[tuple[Any, Any]]] = {}
     for row in rows:
-        name, rtype, *rest = _key(row, zone_name, relative_targets=True)
+        name, rtype, *rest = _key(row, zone_name, relative_targets=relative_targets)
         buckets.setdefault((name, rtype), []).append((tuple(rest), row))
     return buckets
 
@@ -248,6 +249,19 @@ async def compute_dns_parity(
         (await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))).scalars().all()
     )
 
+    # #1794 — the DB rows mean what the managed zone's own group serves: a
+    # dot-less ``a.b`` is in-zone on a zone-file driver and absolute on a cloud
+    # one. Read here, before the network, per the session note above.
+    managed_server = (
+        await db.execute(
+            select(DNSServer)
+            .where(DNSServer.group_id == zone.group_id)
+            .order_by(DNSServer.is_primary.desc(), DNSServer.name)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    db_relative = targets_are_relative(managed_server) if managed_server is not None else True
+
     if zone.view_id is not None:
         report.warnings.append(_SPLIT_HORIZON_ZONE_WARNING)
     elif any(r.view_id is not None for r in db_rows):
@@ -285,8 +299,10 @@ async def compute_dns_parity(
         )
         return report
 
-    wire_buckets = _bucket_records(list(on_wire), zone.name)
-    db_buckets = _bucket_records(db_rows, zone.name)
+    wire_buckets = _bucket_records(
+        list(on_wire), zone.name, relative_targets=targets_are_relative(source_server)
+    )
+    db_buckets = _bucket_records(db_rows, zone.name, relative_targets=db_relative)
     windows_only_class = _windows_only_class(zone)
 
     # An empty pull is NOT proof of an empty zone. ``_parse_records`` logs
