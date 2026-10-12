@@ -277,6 +277,12 @@ async def axfr_zone_records(
                     value = _absolutize(rdata.target)
                 elif rtype == "TXT":
                     value = "".join(s.decode("utf-8", errors="replace") for s in rdata.strings)
+                elif rtype in ("SVCB", "HTTPS"):
+                    # Same reason as ``_absolutize``: ``to_text()`` on a
+                    # relativized in-zone target gives ``svc``, which reads
+                    # as a different record from a stored ``svc.zone.``
+                    # (#1513). Derelativize so the target is unambiguous.
+                    value = rdata.to_text(origin=zone_origin, relativize=False)
                 else:
                     value = rdata.to_text()
                 out.append(

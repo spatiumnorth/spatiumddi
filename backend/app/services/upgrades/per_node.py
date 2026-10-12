@@ -8,7 +8,8 @@ for testing / dry-run.
 
 Step shape (one row per step in the issue body; ``CHAIN`` is the order):
 
-    1. preflight gate                — reuse Phase A's run_all
+    1. preflight gate                — reuse Phase A's run_all, then wait
+                                        for the CNPG instance count (#1544)
     2. etcd snapshot                  — TODO follow-up; relies on k3s
                                         auto-snapshots (every 6 h) until
                                         the supervisor exposes a hook.
@@ -35,10 +36,17 @@ Step shape (one row per step in the issue body; ``CHAIN`` is the order):
                                         on its own, #1445)
    11. health gate                    — poll until installed_appliance_version
                                         == desired_appliance_version
-   12. convergence                    — node Ready + CNPG instance reported
-                                        + DaemonSet pod Ready
+   12. convergence                    — node Ready + DaemonSet pod Ready
    13. uncordon + clear window        — uncordon_node + maintenance off
-   14. cluster verify                 — re-run a small slice of preflight
+   14. cluster verify                 — wait for the CNPG instance count
+                                        (#1544), then re-run a small slice
+                                        of preflight
+
+A failure once the run holds the node — the CNPG maintenance window set, or
+the node cordoned — runs a ``release_node`` compensation (#1542): it clears
+the window and uncordons, except a node the run never cordoned or one already
+cordoned before the upgrade. A failure before the window (mirror ready,
+trigger slot apply, stage) holds nothing and releases nothing.
 
 Stage before drain (#1463). A node fetches its image over HTTPS from the
 appliance itself: an uploaded image is served through the slot-image mirror,
@@ -88,7 +96,7 @@ from app.services.appliance.slot_image_target import (
     desired_slot_image_url,
     stamp_desired_slot_image,
 )
-from app.services.upgrades import chart_bump, preflight
+from app.services.upgrades import chart_bump, preflight, safety
 
 logger = structlog.get_logger(__name__)
 
@@ -108,6 +116,7 @@ StepName = Literal[
     "convergence",
     "uncordon",
     "cluster_verify",
+    "release_node",
 ]
 
 # The chain's order, once. ``single_node_upgrade`` runs it and resolves a
@@ -143,6 +152,7 @@ DEFAULT_STAGE_TIMEOUT_S = 3000.0  # 50 min — the host's 45 min apply ceiling +
 DEFAULT_HEALTH_GATE_TIMEOUT_S = 1800.0  # 30 min — reboot + first heartbeat from the new slot
 DEFAULT_CONVERGENCE_TIMEOUT_S = 900.0  # 15 min — etcd rejoin + CNPG resync
 DEFAULT_SWITCHOVER_TIMEOUT_S = 180.0  # 3 min — CNPG cordon-triggered switch
+DEFAULT_CNPG_READY_TIMEOUT_S = 900.0  # 15 min — an evicted instance rescheduling + catching up
 # 10 min — the mirror's pod back on its node after that node's reboot: its
 # migrate-wait init container, then the api image cold-starting.
 DEFAULT_MIRROR_READY_TIMEOUT_S = 600.0
@@ -200,10 +210,55 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ── CNPG instance-count wait (#1544) ─────────────────────────────────
+
+
+async def _wait_cnpg_instances_ready(
+    cluster_name: str,
+    namespace: str | None,
+    *,
+    timeout_s: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Poll until the CNPG Cluster reads ``readyInstances == spec.instances``.
+
+    Returns ``(ok, detail)``. Reuses ``safety.check_cnpg_instances_ready``,
+    the read the post-run verification uses. ``ok`` with no cluster name, a
+    single-instance cluster, or a 404 (cluster intentionally torn down,
+    mirroring ``_step_verify_primary_moved``). Any other non-ok verdict —
+    short an instance, kubeapi unreachable, a non-200 — keeps polling until
+    ``timeout_s``.
+
+    Callers run this only where the node being upgraded is SCHEDULABLE:
+    after its uncordon, or before its cordon. Waiting while it is cordoned
+    would wait on its own evicted instance, which the cordon holds Pending
+    (ddi-pg's case 3 on #1610).
+    """
+    if not cluster_name:
+        return True, {"cnpg_wait": "skipped: no CNPG cluster"}
+    deadline = time.monotonic() + timeout_s
+    while True:
+        check = safety.check_cnpg_instances_ready(cluster_name, namespace=namespace)
+        if check.level == "ok" or (check.level == "warn" and check.detail.get("status") == 404):
+            return True, {
+                "cnpg_ready_instances": check.detail.get("ready_instances"),
+                "cnpg_spec_instances": check.detail.get("spec_instances"),
+            }
+        if time.monotonic() >= deadline:
+            return False, {"cnpg_wait_error": check.message, "cnpg_wait_timeout_s": timeout_s}
+        await asyncio.sleep(_POLL_INTERVAL_S)
+
+
 # ── Step 1: preflight ────────────────────────────────────────────────
 
 
-async def _step_preflight(target_version: str, lease_holder: str | None = None) -> StepResult:
+async def _step_preflight(
+    target_version: str,
+    lease_holder: str | None = None,
+    *,
+    cnpg_cluster_name: str = "",
+    cnpg_namespace: str | None = None,
+    cnpg_timeout_s: float = DEFAULT_CNPG_READY_TIMEOUT_S,
+) -> StepResult:
     step = StepResult(name="preflight", started_at=_now_iso())
     # The orchestrator holds the upgrade lease while it drives this chain;
     # without its identity, the in-flight check fails on that very lease.
@@ -216,10 +271,30 @@ async def _step_preflight(target_version: str, lease_holder: str | None = None) 
             overall=report.overall,
             failed_checks=fails,
         )
+    # #1544 — this node must not be cordoned and drained while CNPG is
+    # short an instance: draining it then could take the database to one
+    # instance, or none. The previous node's cluster_verify already waited
+    # for this; waiting again here also covers a run that resumed or was
+    # taken over between nodes. Nothing is held yet, so a timeout fails
+    # cleanly with nothing to release.
+    ok, cnpg_detail = await _wait_cnpg_instances_ready(
+        cnpg_cluster_name, cnpg_namespace, timeout_s=cnpg_timeout_s
+    )
+    if not ok:
+        return step.finish(
+            False,
+            error=(
+                f"CNPG instances not all ready within {cnpg_timeout_s:.0f}s: "
+                f"{cnpg_detail.get('cnpg_wait_error')}"
+            ),
+            overall=report.overall,
+            **cnpg_detail,
+        )
     return step.finish(
         True,
         overall=report.overall,
         warns=[r.name for r in report.results if r.level == "warn"],
+        **cnpg_detail,
     )
 
 
@@ -295,6 +370,18 @@ async def _step_cnpg_maintenance_on(cluster_name: str, namespace: str | None) ->
 
 async def _step_cordon(node_name: str) -> StepResult:
     step = StepResult(name="cordon", started_at=_now_iso(), detail={"node": node_name})
+    # Record whether the node was already unschedulable BEFORE this cordon,
+    # so a failure's release (#1542) does not uncordon a node an operator
+    # had cordoned on purpose. ``None`` = could not tell; the release then
+    # uncordons, as it did before this was recorded.
+    was_unschedulable: bool | None = None
+    try:
+        status, node = k8s.get_node(node_name)
+    except k8s.KubeapiUnavailableError:
+        status, node = 0, None
+    if status == 200 and node is not None:
+        was_unschedulable = bool((node.get("spec") or {}).get("unschedulable"))
+    step.detail["was_unschedulable"] = was_unschedulable
     ok, err = k8s.cordon_node(node_name)
     if not ok:
         return step.finish(False, error=err or "cordon failed")
@@ -411,6 +498,7 @@ async def _step_drain(
 
         # Filter to evictable pods.
         candidates: list[tuple[str, str]] = []  # [(name, namespace)]
+        unowned: list[str] = []
         for pod in pods:
             if k8s.pod_is_owned_by_daemonset(pod):
                 continue
@@ -423,7 +511,31 @@ async def _step_drain(
             ns = meta.get("namespace")
             if not name or not ns:
                 continue
+            if not k8s.pod_has_controller(pod):
+                # #1546 — a bare pod has no controller to re-create
+                # it; evicting it deletes it for good. The docstring's
+                # no-force rule forbids that, so the pod is a drain
+                # blocker, never a candidate.
+                unowned.append(f"{ns}/{name}")
+                continue
             candidates.append((name, ns))
+
+        if unowned:
+            # Fail fast — an unowned pod never becomes evictable, so
+            # polling until the timeout only delays the operator.
+            # The pods are named in the step detail as blockers.
+            return step.finish(
+                False,
+                error=(
+                    f"drain blocked: {len(unowned)} pod(s) on {node_name} have "
+                    "no controller owner and would not be re-created if "
+                    "evicted (no --force semantics): " + ", ".join(sorted(unowned))
+                ),
+                evicted_count=len(set(evicted)),
+                evicted=list(set(evicted)),
+                unowned_pods=sorted(unowned),
+                blocked=[{"pod": p, "reason": "no controller owner"} for p in sorted(unowned)],
+            )
 
         if not candidates:
             return step.finish(
@@ -904,9 +1016,12 @@ async def _step_convergence(
       probe marker file from Phase A2 fires only after the agent has
       synced + the daemon is responding).
 
-    CNPG instance-streaming + Redis-reconnected are nice-to-have but
-    not load-bearing — CNPG's own readiness probe handles that
-    through the Cluster.status block; we don't gate uncordon on it.
+    It deliberately does NOT wait for the CNPG instance count (#1544).
+    The node's own drain evicted its Postgres instance, whose local-path
+    volume pins it to this node, and the cordon keeps the replacement pod
+    Pending — so the count cannot recover until the uncordon that follows
+    this step. The count is waited for in ``cluster_verify`` (after the
+    uncordon) and in the next node's ``preflight`` (before its cordon).
     """
     step = StepResult(name="convergence", started_at=_now_iso(), detail={"node": node_name})
     deadline = time.monotonic() + timeout_s
@@ -972,6 +1087,15 @@ async def _step_uncordon(
     ok, err = k8s.uncordon_node(node_name)
     if not ok:
         return step.finish(False, error=err or "uncordon failed")
+    if not cluster_name:
+        # #1545 — an empty cluster name is documented as "disables
+        # CNPG-related steps", and the maintenance-window SET above is
+        # skipped on that basis. The CLEAR must be skipped too:
+        # patch_cnpg_maintenance_window("") PATCHes the clusters
+        # collection URL, gets a non-200, and fails the step after a
+        # successful uncordon — flipping a clean per-node upgrade to
+        # failed at its last step.
+        return step.finish(True, maintenance_window_clear_skipped=True)
     ok, err = k8s.patch_cnpg_maintenance_window(
         cluster_name,
         in_progress=False,
@@ -990,11 +1114,86 @@ async def _step_uncordon(
     return step.finish(True)
 
 
+# ── Compensation: release the node after a failure ───────────────────
+
+
+async def _step_release_node(
+    node_name: str,
+    cluster_name: str,
+    namespace: str | None,
+    *,
+    clear_window: bool,
+    uncordon_skip_reason: str | None = None,
+) -> StepResult:
+    """Compensating step for #1542 — best-effort release of a node
+    whose upgrade failed once this run had started holding it.
+
+    Uncordons the node and, when this run set the CNPG maintenance
+    window, clears it. Both actions are idempotent (uncordoning an
+    uncordoned node is a 200; clearing an unset window is a no-op
+    patch), so this is safe to run even when the failing step
+    partially released the node itself. The outcome is recorded as
+    its own step in the per-node progress, so the operator can see
+    whether the node was released or is still cordoned with the
+    window on and needs a manual release.
+
+    ``uncordon_skip_reason`` set means the uncordon must not happen: the
+    run never cordoned the node (it failed at or before the cordon with
+    the window already set), or the node was already unschedulable before
+    the upgrade cordoned it, so uncordoning would undo an operator's
+    cordon. The window clear still runs.
+    """
+    step = StepResult(
+        name="release_node",
+        started_at=_now_iso(),
+        detail={"node": node_name, "cluster": cluster_name},
+    )
+    done: dict[str, Any] = {}
+    if uncordon_skip_reason is not None:
+        done["uncordon_skipped"] = uncordon_skip_reason
+    else:
+        ok, err = k8s.uncordon_node(node_name)
+        if not ok:
+            return step.finish(
+                False, error=f"compensating uncordon failed: {err}", uncordon_ok=False
+            )
+        done["uncordon_ok"] = True
+    if not (clear_window and cluster_name):
+        return step.finish(True, maintenance_window_clear_skipped=True, **done)
+    ok, err = k8s.patch_cnpg_maintenance_window(
+        cluster_name,
+        in_progress=False,
+        reuse_pvc=True,
+        namespace=namespace,
+    )
+    if not ok:
+        prefix = "uncordon ok, " if done.get("uncordon_ok") else ""
+        return step.finish(
+            False,
+            error=f"{prefix}compensating maintenance-window clear failed: {err}",
+            **done,
+        )
+    return step.finish(True, maintenance_window_cleared=True, **done)
+
+
 # ── Step 14: cluster verify ──────────────────────────────────────────
 
 
-async def _step_cluster_verify(target_version: str) -> StepResult:
-    """Re-run the cheap subset of preflight: replication lag + quorum.
+async def _step_cluster_verify(
+    target_version: str,
+    *,
+    cnpg_cluster_name: str = "",
+    cnpg_namespace: str | None = None,
+    cnpg_timeout_s: float = DEFAULT_CNPG_READY_TIMEOUT_S,
+) -> StepResult:
+    """Wait for the node's Postgres instance, then re-run the cheap subset
+    of preflight: replication lag + quorum.
+
+    #1544 — runs after the uncordon, so the instance this node's drain
+    evicted (pinned to the node by its local-path volume) can schedule
+    again. The node is not reported done, and the next node is not started,
+    until CNPG reads ``readyInstances == spec.instances``. This is also
+    what makes the LAST node wait before the run reports success.
 
     Disk + version-path + inflight-lease aren't useful here — we just
     came out of the upgrade, those rows haven't changed enough to
@@ -1002,6 +1201,19 @@ async def _step_cluster_verify(target_version: str) -> StepResult:
     + every node is Ready again."
     """
     step = StepResult(name="cluster_verify", started_at=_now_iso())
+    ok, cnpg_detail = await _wait_cnpg_instances_ready(
+        cnpg_cluster_name, cnpg_namespace, timeout_s=cnpg_timeout_s
+    )
+    if not ok:
+        return step.finish(
+            False,
+            error=(
+                f"CNPG instances not all ready within {cnpg_timeout_s:.0f}s "
+                f"after uncordon: {cnpg_detail.get('cnpg_wait_error')}"
+            ),
+            **cnpg_detail,
+        )
+    step.detail.update(cnpg_detail)
     repl = await preflight.check_replication_lag()
     quorum = preflight.check_quorum()
     results = {"replication_lag": repl.level, "quorum": quorum.level}
@@ -1078,6 +1290,55 @@ async def single_node_upgrade(
 
     results: list[StepResult] = []
 
+    # #1542 — compensation state for a failure once this run holds the
+    # node (window set and/or cordoned). On a resume past a step, the
+    # earlier invocation already did it, so seed the flags from
+    # start_index; the step runs below flip them as they complete in this
+    # invocation.
+    cordon_done = start_index > steps_in_order.index("cordon")
+    window_set = bool(cnpg_cluster_name) and start_index > steps_in_order.index(
+        "cnpg_maintenance_on"
+    )
+    released = start_index > steps_in_order.index("uncordon")
+    # Set from the cordon step's pre-cordon read. A resumed run did not
+    # read it, so it falls back to uncordoning, as before.
+    pre_cordoned = False
+
+    async def _fail(step: StepName) -> SingleNodeResult:
+        """Fail the chain, first releasing what this run holds (#1542):
+        the CNPG maintenance window it set, and the cordon it applied.
+        Without the compensation the node stays cordoned and the window
+        stays on until an operator releases them by hand."""
+        if (cordon_done or window_set) and not released:
+            skip: str | None = None
+            if not cordon_done:
+                skip = "the run never cordoned the node"
+            elif pre_cordoned:
+                skip = "the node was already cordoned before the upgrade"
+            try:
+                comp = await _step_release_node(
+                    node_name,
+                    cnpg_cluster_name,
+                    cnpg_namespace,
+                    clear_window=window_set,
+                    uncordon_skip_reason=skip,
+                )
+            except Exception as exc:  # noqa: BLE001 — never mask the real failure
+                # The compensation is best-effort: an exception here must
+                # not escape and replace the step failure being reported.
+                comp = StepResult(name="release_node", started_at=_now_iso()).finish(
+                    False, error=f"compensating release crashed: {exc}"
+                )
+            results.append(comp)
+            if not comp.ok:
+                logger.error(
+                    "single_node_upgrade_release_failed",
+                    node=node_name,
+                    failed_at=step,
+                    error=comp.error,
+                )
+        return _failed(node_name, target_version, step, results)
+
     async def _run(step: StepName, coro: Any) -> bool:
         if steps_in_order.index(step) < start_index:
             return True
@@ -1091,7 +1352,15 @@ async def single_node_upgrade(
         results.append(r)
         return r.ok
 
-    if not await _run("preflight", _step_preflight(target_version, lease_holder)):
+    if not await _run(
+        "preflight",
+        _step_preflight(
+            target_version,
+            lease_holder,
+            cnpg_cluster_name=cnpg_cluster_name,
+            cnpg_namespace=cnpg_namespace,
+        ),
+    ):
         return _failed(node_name, target_version, "preflight", results)
     if not await _run("etcd_snapshot", _step_etcd_snapshot()):
         return _failed(node_name, target_version, "etcd_snapshot", results)
@@ -1137,29 +1406,46 @@ async def single_node_upgrade(
             _step_cnpg_maintenance_on(cnpg_cluster_name, cnpg_namespace),
         ):
             return _failed(node_name, target_version, "cnpg_maintenance_on", results)
+        window_set = True
     if not await _run("cordon", _step_cordon(node_name)):
-        return _failed(node_name, target_version, "cordon", results)
+        # The window may already be set — release it (#1542). The node is
+        # not uncordoned: this run did not cordon it.
+        return await _fail("cordon")
+    if start_index <= steps_in_order.index("cordon"):
+        pre_cordoned = results[-1].detail.get("was_unschedulable") is True
+    cordon_done = True
     if cnpg_cluster_name:
         if not await _run(
             "verify_primary_moved",
             _step_verify_primary_moved(cnpg_cluster_name, node_name, cnpg_namespace),
         ):
-            return _failed(node_name, target_version, "verify_primary_moved", results)
+            return await _fail("verify_primary_moved")
     if not await _run("drain", _step_drain(node_name)):
-        return _failed(node_name, target_version, "drain", results)
+        return await _fail("drain")
     if not await _run("reboot", _step_reboot(db, node_name, target_version, stamped_at=stamped_at)):
-        return _failed(node_name, target_version, "reboot", results)
+        return await _fail("reboot")
     if not await _run(
         "health_gate",
         _step_health_gate(db, node_name, target_version, stamped_at=stamped_at),
     ):
-        return _failed(node_name, target_version, "health_gate", results)
+        return await _fail("health_gate")
     if not await _run("convergence", _step_convergence(node_name)):
-        return _failed(node_name, target_version, "convergence", results)
+        return await _fail("convergence")
     if not await _run("uncordon", _step_uncordon(node_name, cnpg_cluster_name, cnpg_namespace)):
-        return _failed(node_name, target_version, "uncordon", results)
-    if not await _run("cluster_verify", _step_cluster_verify(target_version)):
-        return _failed(node_name, target_version, "cluster_verify", results)
+        return await _fail("uncordon")
+    released = True
+    if not await _run(
+        "cluster_verify",
+        _step_cluster_verify(
+            target_version,
+            cnpg_cluster_name=cnpg_cluster_name,
+            cnpg_namespace=cnpg_namespace,
+        ),
+    ):
+        # The node is already uncordoned and its window cleared by the
+        # uncordon step (``released``), so ``_fail`` releases nothing: the
+        # node stays in service and the run stops before the next drain.
+        return await _fail("cluster_verify")
 
     return SingleNodeResult(
         node_name=node_name,
@@ -1176,7 +1462,15 @@ def _failed(
     failed_at: StepName,
     results: list[StepResult],
 ) -> SingleNodeResult:
-    last_err = results[-1].error if results else "unknown"
+    # The error is the FAILING step's, not the last recorded step's —
+    # a #1542 release_node compensation step may have been appended
+    # after the failure, and its outcome must not mask why the chain
+    # actually failed.
+    failed_step = next((r for r in reversed(results) if r.name == failed_at), None)
+    if failed_step is not None:
+        last_err = failed_step.error
+    else:
+        last_err = results[-1].error if results else "unknown"
     return SingleNodeResult(
         node_name=node_name,
         target_version=target_version,

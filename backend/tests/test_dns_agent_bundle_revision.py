@@ -69,6 +69,13 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "4f6e1693cdc51817e42e0e4bd45060a8ffddce72ab6ac343e382235bb9581811",
         "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
     },
+    # #1513: only a Technitium server's bundle changed (``svcb_target_rule``,
+    # and SVCB targets the a3d9e5c17b42 migration wrote); these fixtures are
+    # BIND9, so their bytes are 5's.
+    6: {
+        "plain": "4f6e1693cdc51817e42e0e4bd45060a8ffddce72ab6ac343e382235bb9581811",
+        "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
+    },
 }
 
 

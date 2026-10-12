@@ -25,6 +25,7 @@ import pytest
 
 from spatium_dns_agent.config_apply import ConfigApplyError
 from spatium_dns_agent.drivers.technitium import (
+    SVCB_TARGET_RULE_ZONE_FILE,
     TechnitiumDriver,
     _blocking_payload,
     _normalize_rdata,
@@ -472,7 +473,8 @@ def test_svcb_params_no_params() -> None:
     # Root dot stripped — the daemon stores the target un-dotted. See
     # test_svcb_target_root_dot_is_stripped.
     assert target == "svc.example.com"
-    assert params == ""
+    # The API requires svcParams; ``false`` is its spelling of "none".
+    assert params == "false"
 
 
 def test_record_params_svcb() -> None:
@@ -480,9 +482,14 @@ def test_record_params_svcb() -> None:
     assert out == {"svcPriority": 1, "svcTargetName": ".", "svcParams": "alpn|h2"}
 
 
-def test_record_params_https_no_params_omits_svcparams() -> None:
+def test_record_params_https_no_params_sends_false() -> None:
+    """``svcParams`` is a required API parameter (``GetQueryOrForm`` with no
+    default, WebServiceZonesApi.cs 15.4.0); omitting it is refused with
+    "Parameter 'svcParams' missing." for add AND delete. ``false`` = none."""
     out = _record_params("HTTPS", "1 .", {})
-    assert out == {"svcPriority": 1, "svcTargetName": "."}
+    assert out == {"svcPriority": 1, "svcTargetName": ".", "svcParams": "false"}
+    live = _normalize_rdata("HTTPS", {"svcPriority": 1, "svcTargetName": "", "svcParams": {}})
+    assert live == out
 
 
 def test_admin_bootstrap_password_persists(tmp_path: Path) -> None:
@@ -2404,12 +2411,12 @@ def test_svcb_params_sorted_by_key() -> None:
     """Read-back rebuilds svcParams sorted; the write side must sort
     too or the record churns on every structural reconcile."""
     _, _, params = _svcb_params('1 . port=443 alpn="h2"')
-    assert params == "alpn|h2,port|443"
+    assert params == "alpn|h2|port|443"
 
 
 def test_svcb_params_valueless_key_is_emitted_not_dropped() -> None:
     _, _, params = _svcb_params('1 . no-default-alpn alpn="h2"')
-    assert params == "alpn|h2,no-default-alpn|"
+    assert params == "alpn|h2|no-default-alpn|true"
 
 
 def test_svcb_round_trip_no_churn() -> None:
@@ -2686,3 +2693,264 @@ def test_reconcile_apex_untouched_without_apex(tmp_path: Path) -> None:
     calls = _apex_reconcile(d, _DAEMON_APEX, None)  # type: ignore[arg-type]
     assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
     assert [c[3].get("listZone") for c in calls if c[2] == "zones/records/get"] == ["true"]
+
+
+# ── #1513 / #1698: SVCB/HTTPS canonical comparison ──────────────────────
+
+
+def test_svcb_params_are_pipe_separated_for_two_params() -> None:
+    """#1698: Technitium splits svcParams on '|' and walks it two at a time,
+    so pairs joined by ',' only worked for one param."""
+    _, _, params = _svcb_params("1 . port=8443 alpn=h2")
+    assert params == "alpn|h2|port|8443"
+    _, _, params = _svcb_params('1 . alpn="h2,h3" port=443')
+    assert params == "alpn|h2,h3|port|443"
+
+
+def test_svcb_quoted_and_unquoted_value_are_the_same_record() -> None:
+    a = _record_params("SVCB", "1 . alpn=h2", {}, "example.net")
+    b = _record_params("SVCB", '1 . alpn="h2"', {}, "example.net")
+    assert a == b
+    live = _normalize_rdata(
+        "SVCB", {"svcPriority": 1, "svcTargetName": "", "svcParams": {"alpn": "h2"}}
+    )
+    assert live == a
+
+
+def test_svcb_relative_and_absolute_in_zone_target_agree() -> None:
+    for typed in ("1 svc.example.net. alpn=h2", "1 svc alpn=h2", "1 SVC.Example.Net. alpn=h2"):
+        d = _record_params("SVCB", typed, {}, "example.net")
+        assert d["svcTargetName"] == "svc.example.net"
+    assert _svcb_params("1 . alpn=h2", "example.net")[1] == "."
+    # Technitium has no relative names: a daemon holding ``svc`` serves
+    # ``svc.``, so it is NOT the same record as ``svc.example.net``.
+    live = _normalize_rdata(
+        "SVCB", {"svcPriority": 1, "svcTargetName": "svc", "svcParams": {"alpn": "h2"}}
+    )
+    assert live["svcTargetName"] == "svc"
+
+
+def test_svcb_valueless_and_mandatory_and_order() -> None:
+    d = _record_params(
+        "HTTPS", '1 . port=443 no-default-alpn mandatory="port,alpn" alpn=h2', {}, "example.net"
+    )
+    live = _normalize_rdata(
+        "HTTPS",
+        {
+            "svcPriority": 1,
+            "svcTargetName": "",
+            "svcParams": {
+                "alpn": "h2",
+                "mandatory": "alpn,port",
+                "port": "443",
+                "no-default-alpn": None,
+            },
+        },
+    )
+    assert d == live
+    assert d["svcParams"].startswith("mandatory|alpn,port|alpn|h2|no-default-alpn|")
+
+
+def test_svcb_genuinely_different_records_stay_different() -> None:
+    base = _record_params("SVCB", "1 . alpn=h2", {}, "example.net")
+    assert base != _record_params("SVCB", "1 . alpn=h3", {}, "example.net")
+    assert base != _record_params("SVCB", "2 . alpn=h2", {}, "example.net")
+    assert base != _record_params("SVCB", "1 svc alpn=h2", {}, "example.net")
+    assert base != _record_params("SVCB", "1 . alpn=h2 port=443", {}, "example.net")
+    # alpn order is significant, unlike param order.
+    assert _record_params("SVCB", "1 . alpn=h2,h3", {}, "z") != _record_params(
+        "SVCB", "1 . alpn=h3,h2", {}, "z"
+    )
+
+
+def test_svcb_escaped_comma_in_alpn_survives() -> None:
+    _, _, params = _svcb_params('1 . alpn="f\\,oo,bar"')
+    assert params == "alpn|f\\,oo,bar"
+
+
+def _reconcile_calls(
+    tmp_path: Path, value: str, daemon: dict[str, Any], zone: str = "example.net"
+) -> list[str]:
+    """Run the structural reconcile for one SVCB record against a daemon
+    holding ``daemon`` rData; return the add/delete endpoints it hit."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d._ensure_zone_exists = lambda *_a, **_k: None  # type: ignore[method-assign]
+    d._apply_zone_options = lambda *_a, **_k: None  # type: ignore[method-assign]
+    d._get_zone_records = lambda *_a, **_k: [  # type: ignore[method-assign]
+        {"domain": f"svc.{zone}", "type": "SVCB", "ttl": 300, **_normalize_rdata("SVCB", daemon)}
+    ]
+    hit: list[str] = []
+
+    class _Resp:
+        def json(self) -> dict[str, Any]:
+            return {"status": "ok"}
+
+    def _call(_t: str, _m: str, path: str, _p: dict[str, Any]) -> _Resp:
+        hit.append(path)
+        return _Resp()
+
+    d._call = _call  # type: ignore[method-assign]
+    payload = [
+        {
+            "zone": zone,
+            "type": "Primary",
+            "records": [
+                {
+                    "domain": f"svc.{zone}",
+                    "type": "SVCB",
+                    "ttl": 300,
+                    **_record_params("SVCB", value, {}, zone),
+                }
+            ],
+        }
+    ]
+    d._reconcile_zones("tok", payload)
+    return hit
+
+
+@pytest.mark.parametrize(
+    ("stored", "daemon_target", "daemon_params"),
+    [
+        ("1 . alpn=h2", ".", {"alpn": "h2"}),
+        ('1 . alpn="h2"', "", {"alpn": "h2"}),
+        ("1 svc.example.net. alpn=h2", "svc.example.net", {"alpn": "h2"}),
+        # A trailing dot is absolute whatever the label count: never
+        # qualified, so a single-label absolute target is stable.
+        ("1 localhost. alpn=h2", "localhost", {"alpn": "h2"}),
+        ("1 svc alpn=h2", "svc.example.net", {"alpn": "h2"}),
+        ("1 . port=8443 alpn=h2,h3", ".", {"alpn": "h2,h3", "port": "8443"}),
+        ("1 . no-default-alpn alpn=h2", ".", {"alpn": "h2", "no-default-alpn": None}),
+    ],
+)
+def test_svcb_reconcile_does_not_churn(
+    tmp_path: Path, stored: str, daemon_target: str, daemon_params: dict[str, Any]
+) -> None:
+    hit = _reconcile_calls(
+        tmp_path,
+        stored,
+        {"svcPriority": 1, "svcTargetName": daemon_target, "svcParams": daemon_params},
+    )
+    assert hit == []
+
+
+def test_svcb_reconcile_still_replaces_a_different_record(tmp_path: Path) -> None:
+    hit = _reconcile_calls(
+        tmp_path,
+        "1 . alpn=h3",
+        {"svcPriority": 1, "svcTargetName": "", "svcParams": {"alpn": "h2"}},
+    )
+    assert hit == ["zones/records/delete", "zones/records/add"]
+
+
+def test_svcb_single_label_left_by_the_old_agent_is_repaired(tmp_path: Path) -> None:
+    """The old agent sent a relative ``svc`` verbatim, and Technitium served
+    it as ``svc.``. Desired is now ``svc.example.net``, so the record is
+    replaced once instead of being matched and left wrong forever."""
+    hit = _reconcile_calls(
+        tmp_path,
+        "1 svc alpn=h2",
+        {"svcPriority": 1, "svcTargetName": "svc", "svcParams": {"alpn": "h2"}},
+    )
+    assert hit == ["zones/records/delete", "zones/records/add"]
+
+
+def test_svcb_param_less_record_does_not_churn(tmp_path: Path) -> None:
+    hit = _reconcile_calls(
+        tmp_path, "0 cdn.other.net.", {"svcPriority": 0, "svcTargetName": "cdn.other.net", "svcParams": {}}
+    )
+    assert hit == []
+
+
+def test_svcb_ech_and_unnamed_keys_go_as_hex_and_read_back_equal() -> None:
+    """``ech`` and an unnamed key reach ``DnsSvcUnknownParamValue.Parse``,
+    which reads HEX; an unnamed key is ``Enum.Parse``d, so it goes by number.
+    The daemon reports both as colon-hex, the unnamed key by number."""
+    out = _record_params("HTTPS", '1 . alpn=h2 ech="AAEC" key65000="a b"', {}, "z")
+    assert out["svcParams"] == "alpn|h2|ech|000102|65000|612062"
+    live = _normalize_rdata(
+        "HTTPS",
+        {
+            "svcPriority": 1,
+            "svcTargetName": "",
+            "svcParams": {"65000": "61:20:62", "ech": "00:01:02", "alpn": "h2"},
+        },
+    )
+    assert live == out
+
+
+def test_svcb_mandatory_naming_an_unnamed_key_goes_by_number() -> None:
+    _, _, params = _svcb_params("1 . mandatory=key65000,alpn alpn=h2 key65000=x")
+    assert params == "mandatory|alpn,65000|alpn|h2|65000|78"
+
+
+# ── #1513 case 7: a cached pre-#1513 bundle keeps its own target meaning ──
+
+
+def _render_svcb(tmp_path: Path, value: str, rule: str | None) -> str:
+    import json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    bundle: dict[str, Any] = {
+        "zones": [
+            {
+                "name": "up.test.",
+                "type": "primary",
+                "ttl": 3600,
+                "records": [{"name": "c7s", "type": "SVCB", "value": value, "ttl": 300}],
+            }
+        ]
+    }
+    if rule is not None:
+        bundle["svcb_target_rule"] = rule
+    d.render(bundle)
+    payload = json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
+    (rec,) = [r for r in payload[0]["records"] if r["type"] == "SVCB"]
+    return str(rec["svcTargetName"])
+
+
+def test_replaying_a_pre_1513_bundle_keeps_a_dotless_target_absolute(tmp_path: Path) -> None:
+    """The #1731 walk's case 7: the agent replays its cached bundle at start,
+    and a bundle from the renderer before #1513 holds ``1 cdn.example.net``
+    meaning ``cdn.example.net.`` — what that renderer sent to the daemon. It
+    carries no ``svcb_target_rule``, so it must not be read as zone-relative."""
+    assert _render_svcb(tmp_path, '1 cdn.example.net alpn="h2"', None) == "cdn.example.net"
+    assert _render_svcb(tmp_path, "1 svc alpn=h2", None) == "svc"
+
+
+def test_a_zone_file_rule_bundle_reads_a_dotless_target_as_relative(tmp_path: Path) -> None:
+    rule = SVCB_TARGET_RULE_ZONE_FILE
+    assert _render_svcb(tmp_path, "1 svc alpn=h2", rule) == "svc.up.test"
+    assert _render_svcb(tmp_path, "1 cdn.example.net. alpn=h2", rule) == "cdn.example.net"
+    assert _render_svcb(tmp_path, "1 localhost. alpn=h2", rule) == "localhost"
+    # Under either rule a trailing dot is absolute.
+    assert _render_svcb(tmp_path, "1 cdn.example.net. alpn=h2", None) == "cdn.example.net"
+
+
+def test_record_ops_follow_the_rule_of_the_applied_bundle(tmp_path: Path) -> None:
+    def _op_target(rule: str | None) -> str:
+        d = TechnitiumDriver(state_dir=tmp_path)
+        _seed_token(d)
+        bundle: dict[str, Any] = {"zones": []}
+        if rule is not None:
+            bundle["svcb_target_rule"] = rule
+        d.render(bundle)
+        calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+        d.apply_record_op(
+            {
+                "zone_name": "up.test.",
+                "op": "create",
+                "record": {"name": "c7s", "type": "SVCB", "value": "1 svc alpn=h2", "ttl": 300},
+            }
+        )
+        return str(calls[-1][3]["svcTargetName"])
+
+    assert _op_target(None) == "svc"
+    assert _op_target(SVCB_TARGET_RULE_ZONE_FILE) == "svc.up.test"
+
+
+def test_render_reads_the_rule_from_the_bundle(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render({"zones": [], "svcb_target_rule": SVCB_TARGET_RULE_ZONE_FILE})
+    assert d._svcb_zone_file_targets
+    d.render({"zones": []})
+    assert not d._svcb_zone_file_targets
