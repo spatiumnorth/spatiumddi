@@ -84,6 +84,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Technitium now follows the group's recursion and rate-limit
+  settings (#1761).** The agent never sent `recursion` or
+  `qpmPrefixLimits*`, so the daemon's own defaults stayed in force:
+  recursion for every private network even on an authoritative-only
+  group, and 600 queries/min per client with rate limiting shown as off,
+  which dropped a busy downstream resolver's answers. Recursion off
+  (or `is_recursive=false`) now sends `Deny`. An explicit
+  `allow_recursion` list sends `UseSpecifiedNetworkACL` with the list as
+  CIDRs, failing closed to `Deny` when no entry is usable. The stored
+  default `["any"]`, like an empty list, keeps Technitium's
+  private-networks-only recursion: SpatiumDDI does not open recursion on
+  Technitium through the default, because the BIND9 agent never renders
+  `allow_recursion` either (#1786) and `["any"]` cannot be told apart
+  from an untouched group. So recursion-enabled groups see no change on
+  upgrade. RRL off sends empty QPM limits; RRL on derives a per-client
+  limit from `rrl_responses_per_second`, the window from `rrl_window`,
+  the truncation share from `rrl_slip`, and `rrl_exempt_clients` as the
+  bypass list. **Behaviour change on upgrade:** `rrl_enabled` defaults
+  to off, so every Technitium group with RRL off loses the daemon's
+  built-in 600 qpm per-client limit (and the /24 and IPv6 prefix limits
+  beside it). That is the fix; turn RRL on to rate-limit. The bundle
+  gains `allow_recursion` for Technitium only.
+
 - **Renaming a DNS record now retracts the old name (#1773).** The
   record PUT queued a single `update` carrying only the new name, which
   replaces the RRset at the new name and never touches the old one. On

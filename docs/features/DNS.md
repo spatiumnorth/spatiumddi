@@ -24,7 +24,7 @@ SpatiumDDI ships five authoritative DNS drivers (Technitium in two shapes — se
 | Capability | BIND9 | PowerDNS | Technitium | Windows DNS |
 |---|:---:|:---:|:---:|:---:|
 | Authoritative zone serving | ✅ | ✅ | ✅ | ✅ |
-| Recursive resolver | ✅ | — (recursor is a separate daemon) | ✅ (own daemon, not exposed in v1) | ✅ |
+| Recursive resolver | ✅ | — (recursor is a separate daemon) | ✅ (own daemon; the agent applies the group's recursion policy + ACL, #1761) | ✅ |
 | Record CRUD wire protocol | RFC 2136 + rndc | REST API (PATCH rrsets) | REST API (per-record add/delete) | RFC 2136 (Path A) / WinRM (Path B) |
 | Zone CRUD wire protocol | rndc addzone / delzone | REST API | REST API | WinRM (Path B only) |
 | ALIAS records (CNAME at apex) | — | ✅ | — (has ANAME/APP instead — deferred) | — |

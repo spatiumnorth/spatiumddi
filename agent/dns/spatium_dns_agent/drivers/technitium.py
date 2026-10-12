@@ -184,6 +184,29 @@ _FORWARDER_PROTOCOLS = {
     "quic": "Quic",
 }
 
+# ── Recursion + rate limiting (issue #1761) ─────────────────────────────
+#
+# ``settings/set`` silently ignores an unrecognised ``recursion`` value
+# (it is parsed with a try-parse), so every value is checked against this
+# set in ``_apply_recursion`` before it is sent.
+_RECURSION_MODES = frozenset(
+    {"Deny", "Allow", "AllowOnlyForPrivateNetworks", "UseSpecifiedNetworkACL"}
+)
+# BIND ACL keywords that have no CIDR spelling, expanded for Technitium's
+# ``recursionNetworkACL`` (``NetworkAccessControl`` entries: CIDR or
+# ``!``-prefixed CIDR).
+_ACL_ANY = ("0.0.0.0/0", "::/0")
+_ACL_LOCALHOST = ("127.0.0.0/8", "::1/128")
+_ACL_LOCALNETS = (
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "fc00::/7",
+    "fe80::/10",
+)
+
+
 # ── Blocklists (issue #744) ─────────────────────────────────────────────
 #
 # Technitium has no RPZ. It blocks natively, either from subscribed URL
@@ -1436,6 +1459,10 @@ class TechnitiumDriver(DriverBase):
                     token, server_options, server_state.get("tls_cert")
                 )
                 self._apply_forwarders(token, server_options)
+                # #1761: recursion policy + per-client rate limit. Both
+                # have daemon defaults that stay in force unless sent.
+                self._apply_recursion(token, server_options)
+                self._apply_rate_limits(token, server_options)
 
             # Blocklists (#744). Always applied, even when empty — an emptied
             # list has to actually clear on the daemon.
@@ -2312,6 +2339,140 @@ class TechnitiumDriver(DriverBase):
         log.info(
             "technitium_forwarders_applied", protocol=protocol, count=len(forwarders)
         )
+
+    def _apply_recursion(self, token: str, options: dict[str, Any]) -> None:
+        """Set the recursion policy from the bundle (#1761).
+
+        Technitium's fresh default is ``AllowOnlyForPrivateNetworks``; left
+        alone, a group with recursion off (or ``is_recursive=false``, which
+        the bundle already folds into ``recursion_enabled``) still resolves
+        for every RFC 1918 client, and an ``allow_recursion`` naming a
+        public range is refused. Always sent, so turning recursion off or
+        editing the list converges instead of sticking.
+        """
+        mode, acl = self._recursion_params(options)
+        if mode not in _RECURSION_MODES:
+            # settings/set try-parses the enum and ignores a bad value with
+            # status "ok", so an unknown mode would read as applied.
+            log.error("technitium_recursion_mode_invalid", mode=mode)
+            self._note_apply_failure(f"recursion: invalid mode {mode!r}")
+            return
+        params: dict[str, Any] = {"recursion": mode}
+        if mode == "UseSpecifiedNetworkACL":
+            params["recursionNetworkACL"] = ",".join(acl)
+        body = self._call(token, "POST", "settings/set", params).json()
+        if body.get("status") != "ok":
+            log.error("technitium_recursion_failed", mode=mode, error=body.get("errorMessage"))
+            self._note_apply_failure(f"recursion: {body.get('errorMessage')}")
+            return
+        log.info("technitium_recursion_applied", mode=mode, acl=len(acl))
+
+    @staticmethod
+    def _recursion_params(options: dict[str, Any]) -> tuple[str, list[str]]:
+        """Pure mapping: bundle options → (``recursion`` mode, ACL entries).
+
+        * ``recursion_enabled`` false → ``Deny``.
+        * ``allow_recursion`` absent, empty, or exactly ``["any"]`` →
+          ``AllowOnlyForPrivateNetworks``. ``["any"]`` is the model's stored
+          default and nothing distinguishes it from an explicit choice, while
+          the BIND9 agent never renders ``allow-recursion`` (#1786) and so
+          runs BIND's localnets/localhost default. Mapping it to ``Allow``
+          would open recursion to the internet on upgrade; the engine's
+          private-network default is the closest match and is what
+          Technitium already did. ``Allow`` is therefore never sent.
+        * otherwise ``UseSpecifiedNetworkACL`` with the list translated to
+          CIDRs. Unresolvable tokens (named ACLs, garbage) are dropped with
+          a warning; if none survive the result is ``Deny`` — fail closed.
+        """
+        if not options.get("recursion_enabled", True):
+            return "Deny", []
+        raw = [str(e).strip() for e in (options.get("allow_recursion") or []) if str(e).strip()]
+        if not raw or [e.lower() for e in raw] == ["any"]:
+            return "AllowOnlyForPrivateNetworks", []
+        acl: list[str] = []
+        for entry in raw:
+            deny = entry.startswith("!")
+            name = entry.lstrip("!").strip()
+            low = name.lower()
+            if low == "any":
+                cidrs: tuple[str, ...] = _ACL_ANY
+            elif low == "none":
+                continue
+            elif low == "localhost":
+                cidrs = _ACL_LOCALHOST
+            elif low == "localnets":
+                cidrs = _ACL_LOCALNETS
+            else:
+                try:
+                    ipaddress.ip_network(name, strict=False)
+                except ValueError:
+                    log.warning("technitium_allow_recursion_entry_dropped", entry=entry)
+                    continue
+                cidrs = (name,)
+            acl.extend(("!" + c) if deny else c for c in cidrs)
+        if not any(not a.startswith("!") for a in acl):
+            return "Deny", []
+        return "UseSpecifiedNetworkACL", acl
+
+    def _apply_rate_limits(self, token: str, options: dict[str, Any]) -> None:
+        """Map the group's RRL intent onto Technitium's QPM limits (#1761).
+
+        Technitium ships ``qpmPrefixLimits`` of 600/min per IPv4 /32 and
+        6000/min per /24 (IPv6 600 / 1200 / 6000), averaged over 5 minutes,
+        applied to every inbound query. With RRL off in SpatiumDDI those
+        defaults stayed in force and dropped a busy downstream resolver's
+        answers. So: RRL off (or ``log-only``, which Technitium cannot
+        express) sends EMPTY limits, which disables the feature; RRL on
+        derives a per-client (/32, /128) limit from
+        ``rrl_responses_per_second`` x 60, a sample window from
+        ``rrl_window`` (seconds → whole minutes, min 1) and the truncation
+        share from ``rrl_slip`` (BIND: every Nth response slips, so 100/N %;
+        0 = drop all). ``rrl_exempt_clients`` becomes the bypass list.
+        This is an approximation, not equivalence: BIND limits identical
+        responses per second, Technitium counts queries per minute.
+        """
+        params = self._rate_limit_params(options)
+        body = self._call(token, "POST", "settings/set", params).json()
+        if body.get("status") != "ok":
+            log.error("technitium_rate_limits_failed", error=body.get("errorMessage"))
+            self._note_apply_failure(f"rate limits: {body.get('errorMessage')}")
+            return
+        log.info("technitium_rate_limits_applied", enabled=bool(params["qpmPrefixLimitsIPv4"]))
+
+    @staticmethod
+    def _rate_limit_params(options: dict[str, Any]) -> dict[str, Any]:
+        """Pure mapping: bundle options → the ``settings/set`` qpm payload."""
+        if not options.get("rrl_enabled") or options.get("rrl_log_only"):
+            if options.get("rrl_enabled"):
+                log.warning(
+                    "technitium_rrl_log_only_not_supported",
+                    hint="Technitium cannot log without limiting; limits left off",
+                )
+            return {
+                "qpmPrefixLimitsIPv4": "",
+                "qpmPrefixLimitsIPv6": "",
+                "qpmLimitBypassList": "",
+            }
+        rps = max(1, int(options.get("rrl_responses_per_second") or 15))
+        limit = rps * 60
+        window_s = max(1, int(options.get("rrl_window") or 15))
+        slip = int(options.get("rrl_slip") if options.get("rrl_slip") is not None else 2)
+        pct = 0 if slip <= 0 else min(100, round(100 / slip))
+        bypass: list[str] = []
+        for c in options.get("rrl_exempt_clients") or []:
+            try:
+                ipaddress.ip_network(str(c).strip(), strict=False)
+            except ValueError:
+                log.warning("technitium_rrl_exempt_entry_dropped", entry=str(c))
+                continue
+            bypass.append(str(c).strip())
+        return {
+            "qpmPrefixLimitsIPv4": f"32|{limit}|{limit}",
+            "qpmPrefixLimitsIPv6": f"128|{limit}|{limit}",
+            "qpmLimitSampleMinutes": max(1, -(-window_s // 60)),
+            "qpmLimitUdpTruncationPercentage": pct,
+            "qpmLimitBypassList": ",".join(bypass),
+        }
 
     # ── DNSSEC (issue #740) ─────────────────────────────────────────────
 
