@@ -115,6 +115,23 @@ the formatter handles the rest.
   you have edited since the import is left as you typed it. Check
   imported zones you have since moved.
 
+- **Technitium no longer claims catalog-zone support (#1782).** Both
+  roles are broken: producer member zones inherit the catalog zone's
+  transfer Deny / notify None (undoing the #734 grant, so drift, Sync
+  with Servers and NOTIFY stop), and the consumer's `SecondaryCatalog`
+  has no TSIG and stays empty. The `technitium` driver now reports
+  `catalog_zones: False`; turning catalog zones on for a group with a
+  `technitium` / `technitium_api` server, or putting such a server into a
+  catalog-enabled group (server create, driver change, server move, or a
+  Fleet / Copilot role assignment pointing a `dns-technitium` appliance
+  at one), is a 422 naming #1766 (the 1.1.0 fix). An agent
+  auto-registering straight into a catalog group is logged, not refused,
+  since a refused registration loops. A group that already has it on
+  keeps rendering as before and shows a `catalog_unsupported_warning` on
+  the API and in the group editor.
+  `DNS_DRIVERS.md`, `DNS.md`, `GETTING_STARTED.md`, `TOPOLOGIES.md` and the
+  README no longer say both roles work.
+
 - **Agentless Technitium servers now serve TXT records as written
   (#1760).** The #1694 fix reached only the agent-managed driver. The
   agentless `technitium_api` driver still sent a TXT value as
@@ -3201,6 +3218,10 @@ the formatter handles the rest.
   zone-file reading of a dot-less target does not re-point them.
   Downgrade is a no-op: the dotted value means the same under either
   reading.
+- `e3a81c5d07f2` — #1541: `appliance.evict_after_demote`, a boolean,
+  NOT NULL, default false. No backfill: every eviction an older build
+  stamped was a Replace, which is what false means. Downgrade drops the
+  column.
 - `d6b2f81a3c57` — #1759, data-only: CNAME / DNAME / NS / PTR / MX /
   SRV / NAPTR records in groups running a Technitium driver whose target
   has two or more labels and no trailing dot get the dot they were
@@ -3215,11 +3236,6 @@ the formatter handles the rest.
   rows queues a whole-RRset update op per agent server and bumps the
   zone serial. Agentless groups other than `technitium_api` get the row
   change and no push. Downgrade is a no-op.
-
-- `e3a81c5d07f2` — #1541: `appliance.evict_after_demote`, a boolean,
-  NOT NULL, default false. No backfill: every eviction an older build
-  stamped was a Replace, which is what false means. Downgrade drops the
-  column.
 
 ## 2026.10.02-1 — 2026-10-02
 

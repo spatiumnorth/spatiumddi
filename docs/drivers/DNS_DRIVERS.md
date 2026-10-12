@@ -777,7 +777,7 @@ Three behaviours worth knowing, all confirmed against a live daemon:
 
 **TSIG keys** live in *global* settings, not per zone. The wire format is a **flat pipe-delimited token list read in triples** — `name|secret|algorithm|name2|secret2|algorithm2|…`. Not JSON, and not `name|algorithm|secret` (that fails with "TSIG algorithm is not supported", because it reads the secret as the algorithm). `settings/set` **replaces the whole list**, so keys an operator added directly in the Technitium console are dropped on the next sync — the same control-plane-is-truth stance the rest of the driver takes, but worth knowing. Note also that `zoneTransferTsigKeyNames` accepts a key the server does not have, so keys are pushed *before* anything references them.
 
-**Catalog zones (RFC 9432)** work in both roles. As **producer** the agent creates the `Catalog` zone and stamps `catalog=<name>` onto each primary it owns. As **consumer** it creates a `SecondaryCatalog` zone pointed at the producer — note that zone is *not* in the bundle's zone list (the control plane ships it as a catalog block, not a zone row), so `_apply_catalog` has to create it or a consumer silently does nothing at all. Turning catalog zones off clears membership by writing `catalog=""`, which is how Technitium unsets the field; without that, disabling the feature would leave every member permanently enrolled.
+**Catalog zones (RFC 9432) are NOT supported on Technitium** ([#1782](https://github.com/spatiumnorth/spatiumddi/issues/1782); the fix is [#1766](https://github.com/spatiumnorth/spatiumddi/issues/1766), 1.1.0). Both roles are broken: as **producer**, turning the catalog on makes every member zone inherit the catalog zone's transfer `Deny` and notify `None`, which silently undoes the #734 transfer grant, so drift, Sync with Servers and NOTIFY all stop; as **consumer**, the `SecondaryCatalog` zone is created without TSIG, cannot transfer the producer's denied catalog, and stays empty. The driver reports `catalog_zones: False`; enabling `catalog_zones_enabled` on a group with a `technitium` / `technitium_api` server is a 422, as is putting such a server into a catalog-enabled group: on server create, on a driver change, on a server move, and on a Fleet or Copilot role assignment that points a `dns-technitium` appliance at one. An agent that auto-registers straight into a catalog group (its `AGENT_GROUP` names one) is *not* refused, because a refused registration re-bootstraps in a loop; it logs `dns_agent_catalog_unsupported_driver` and the group carries the warning below. A group that already had it on keeps rendering as before, and `GET /dns/groups` carries a `catalog_unsupported_warning` (also shown in the group editor). The agent code (`_apply_catalog`: producer `Catalog` zone + `catalog=<name>` stamping, consumer `SecondaryCatalog`, `catalog=""` to unenrol) is retained for #1766.
 
 ### 4B.3b DNSSEC (issue #740)
 
@@ -1076,8 +1076,8 @@ Mixed installs work via multiple groups:
 | One-toggle online DNSSEC | **PowerDNS** or **Technitium** |
 | Manual NSEC3 + KSK / ZSK rollover control | **BIND9** |
 | First-class views / split-horizon (issue #24) | **BIND9** |
-| Catalog zones as **producer** | BIND9, PowerDNS or Technitium — same wire bytes |
-| Catalog zones as **consumer** | **BIND9** or **Technitium** (not wired up on the PowerDNS agent) |
+| Catalog zones as **producer** | BIND9 or PowerDNS (Technitium refused, #1782) |
+| Catalog zones as **consumer** | **BIND9** (not wired up on the PowerDNS agent; Technitium refused, #1782) |
 | Native DoT / DoH with no sidecar | **BIND9** or **Technitium** |
 | DNS-over-QUIC, or encrypted *upstream* forwarding over DoH / DoQ | **Technitium** (BIND 9.20 has no client-side HTTP or QUIC transport; pdns doesn't forward at all) |
 | Query logs on the Logs page | **BIND9** or **PowerDNS** (Technitium pending, §4B.5) |
@@ -1089,7 +1089,7 @@ BIND9, PowerDNS, and Technitium drivers are all supported indefinitely. PowerDNS
 
 **Picking between the two Technitium drivers** comes down to one question — do you want SpatiumDDI to *run* the daemon?
 
-- Yes → `technitium` (§4B). Full feature set: DNSSEC, encrypted transports, forwarders, blocklists, catalog zones.
+- Yes → `technitium` (§4B). Full feature set: DNSSEC, encrypted transports, forwarders, blocklists (not catalog zones — #1782).
 - No, it's already running → `technitium_api` (§4C). Zones and records only; the rest stays managed in Technitium's own console.
 
 A group is single-driver, so servers of the two kinds live in separate groups.

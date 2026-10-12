@@ -106,6 +106,36 @@ class ServerMoveResult:
         }
 
 
+# #1782 — Technitium catalog zones are broken in both roles (the producer's
+# member zones inherit the catalog's transfer Deny / notify None, undoing the
+# #734 grant; the consumer's SecondaryCatalog has no TSIG and stays empty).
+# The real fix is #1766 (1.1.0); until then SpatiumDDI stops claiming it.
+CATALOG_UNSUPPORTED_DRIVERS = frozenset({"technitium", "technitium_api"})
+
+
+def catalog_unsupported_message(drivers: list[str] | set[str]) -> str:
+    bad = ", ".join(sorted(set(drivers) & CATALOG_UNSUPPORTED_DRIVERS))
+    return (
+        f"Catalog zones are not supported on Technitium (driver {bad}): its member "
+        "zones inherit the catalog zone's zone-transfer Deny and notify None, which "
+        "stops zone transfers, drift checks and NOTIFY, and its consumer catalog is "
+        "created without TSIG, so it stays empty. Support is tracked in #1766 (1.1.0)."
+    )
+
+
+async def ensure_group_catalog_compatible(
+    db: AsyncSession, group: DNSServerGroup, driver: str
+) -> None:
+    """Refuse (422) putting a ``driver`` server into a catalog-enabled group
+    when that driver cannot do catalog zones (#1782)."""
+    if group.catalog_zones_enabled and driver in CATALOG_UNSUPPORTED_DRIVERS:
+        raise ServerMoveError(
+            f"Group {group.name!r} has catalog zones enabled. "
+            + catalog_unsupported_message({driver}),
+            status_code=422,
+        )
+
+
 async def ensure_group_single_driver(
     db: AsyncSession,
     group_id: uuid.UUID,
@@ -245,6 +275,7 @@ async def move_server_to_group(
         group_name=target_group.name,
         hint=f"move it to a {server.driver}-only group, or an empty one.",
     )
+    await ensure_group_catalog_compatible(db, target_group, server.driver)
 
     # ── Purge state that belongs to the old group ─────────────────────
     zone_state_purged = (

@@ -3676,6 +3676,9 @@ async def _preview_assign_appliance_role(
     group_problem = await _assign_role_group_problem(db, args)
     if group_problem is not None:
         return PreviewResult(ok=False, detail=group_problem)
+    catalog_problem = await _assign_role_catalog_problem(db, row, args)
+    if catalog_problem is not None:
+        return PreviewResult(ok=False, detail=catalog_problem)
 
     preview_lines = [
         f"Assign roles to **{row.hostname}** ({appliance_uuid})",
@@ -3727,6 +3730,36 @@ async def _assign_role_group_problem(db: AsyncSession, args: AssignApplianceRole
     return None
 
 
+async def _assign_role_catalog_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#1782 — same refusal as the REST role-assign route: a Technitium
+    appliance must not be pointed at a catalog-enabled DNS group (#1766).
+    Only on a change, so a pre-existing assignment can still be re-saved."""
+    from app.models.dns import DNSServerGroup  # noqa: PLC0415
+    from app.services.dns.server_move import catalog_unsupported_message  # noqa: PLC0415
+
+    if "dns-technitium" not in args.roles:
+        return None
+    if "dns_group_id" in args.model_fields_set:
+        try:
+            group_id = UUID(args.dns_group_id) if args.dns_group_id else None
+        except ValueError:
+            return None  # _assign_role_group_problem reports the bad UUID
+    else:
+        group_id = row.assigned_dns_group_id
+    if group_id is None:
+        return None
+    if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
+        return None
+    group = await db.get(DNSServerGroup, group_id)
+    if group is None or not group.catalog_zones_enabled:
+        return None
+    return f"DNS server group {group.name!r} has catalog zones enabled. " + (
+        catalog_unsupported_message({"technitium"})
+    )
+
+
 async def _apply_assign_appliance_role(
     db: AsyncSession, user: User, args: AssignApplianceRoleArgs
 ) -> dict[str, Any]:
@@ -3747,6 +3780,9 @@ async def _apply_assign_appliance_role(
     group_problem = await _assign_role_group_problem(db, args)
     if group_problem is not None:
         raise ValueError(group_problem)
+    catalog_problem = await _assign_role_catalog_problem(db, row, args)
+    if catalog_problem is not None:
+        raise ValueError(catalog_problem)
     row.assigned_roles = list(args.roles)
     # #1562 — same contract as the REST roles endpoint: a group field
     # present in the payload with a null value unassigns the group; an
