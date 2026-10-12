@@ -482,6 +482,9 @@ frontend:
 # ── Worker (Celery queues: ipam, dns, dhcp, default, bundles) ─────────────────────────
 worker:
   replicas: 2
+  # #1754 — must exceed the worst-case warm shutdown (WORKER_TERMINATION_GRACE_S
+  # in backend/app/celery_app.py); a lower value reopens the SIGKILL window.
+  terminationGracePeriodSeconds: 90
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   # #983 Phase 2 — mount a ServiceAccount on the worker so it can read the
   # kubelet Summary API. Alert evaluation runs in the WORKER, so without this
