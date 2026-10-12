@@ -89,6 +89,7 @@ class FindPairingCodesArgs(BaseModel):
 
 @register_tool(
     name="find_pairing_codes",
+    permission="superadmin",
     description=(
         "List appliance pairing codes (superadmin only). Each row "
         "carries the last two digits of the code, persistent flag, "

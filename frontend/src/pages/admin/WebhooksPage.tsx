@@ -85,13 +85,11 @@ function SubscriptionEditor({
     existing?.event_types ?? [],
   );
   const [eventFilter, setEventFilter] = useState("");
-  const [headers, setHeaders] = useState<string>(
-    existing?.headers
-      ? Object.entries(existing.headers)
-          .map(([k, v]) => `${k}: ${v}`)
-          .join("\n")
-      : "",
-  );
+  // Header values are never returned by the API (#1579) — the editor
+  // starts blank on edit: blank = keep the stored headers, typed lines
+  // replace them, and the checkbox below clears them.
+  const [headers, setHeaders] = useState<string>("");
+  const [clearHeaders, setClearHeaders] = useState(false);
   const [timeoutSeconds, setTimeoutSeconds] = useState(
     existing?.timeout_seconds ?? 10,
   );
@@ -127,7 +125,14 @@ function SubscriptionEditor({
         enabled,
         url: url.trim(),
         event_types: eventTypes.length > 0 ? eventTypes : null,
-        headers: parseHeaders(),
+        // Write-only headers (#1579): on edit, an explicit ``{}``
+        // clears, typed lines replace, and blank (``null``) keeps the
+        // stored values the server never shows us.
+        headers: existing
+          ? clearHeaders
+            ? {}
+            : parseHeaders()
+          : parseHeaders(),
         timeout_seconds: timeoutSeconds,
         max_attempts: maxAttempts,
         // ``null`` on edit when the operator didn't retype it = keep
@@ -347,14 +352,33 @@ function SubscriptionEditor({
 
         <Field
           label="Custom headers (optional)"
-          hint="One header per line, ``Key: value`` format. ``X-SpatiumDDI-*`` reserved for the platform."
+          hint={
+            existing && existing.headers_set
+              ? `Stored headers: ${existing.header_names.join(", ")} — values are encrypted and never shown. Leave blank to keep them, type new lines to replace them all, or tick the box to remove them.`
+              : "One header per line, ``Key: value`` format. Values are encrypted at rest and never shown again. ``X-SpatiumDDI-*`` reserved for the platform."
+          }
         >
           <textarea
             className={cn(inputCls, "font-mono min-h-[60px]")}
             value={headers}
+            disabled={clearHeaders}
             onChange={(e) => setHeaders(e.target.value)}
-            placeholder={`Authorization: Bearer …\nX-Custom: value`}
+            placeholder={
+              existing && existing.headers_set
+                ? "(stored — leave blank to keep)"
+                : `Authorization: Bearer …\nX-Custom: value`
+            }
           />
+          {existing && existing.headers_set && (
+            <label className="mt-1 flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={clearHeaders}
+                onChange={(e) => setClearHeaders(e.target.checked)}
+              />
+              Remove all stored headers
+            </label>
+          )}
         </Field>
 
         <div className="grid grid-cols-2 gap-3">

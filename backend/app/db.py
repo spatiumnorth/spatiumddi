@@ -119,6 +119,12 @@ async def task_session() -> AsyncGenerator[AsyncSession, None]:
         json_serializer=_json_serializer,
         pool_size=1,
         max_overflow=0,
+        # A long task outlives its connection: the rolling upgrade holds one
+        # session across the CNPG switchover it waits for, and the next query
+        # after it met "connection is closed" (#1445). Pinging on checkout
+        # replaces a dead connection between transactions, as the module
+        # engine above already does.
+        pool_pre_ping=True,
     )
     factory = async_sessionmaker(task_engine, class_=AsyncSession, expire_on_commit=False)
     try:

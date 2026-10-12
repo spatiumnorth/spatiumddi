@@ -164,23 +164,23 @@ def normalise_option_value(value: Any) -> str:
 
 def _bucket_records(
     rows: list[Any], zone_name: str
-) -> dict[tuple[str, str], list[tuple[str, Any]]]:
+) -> dict[tuple[str, str], list[tuple[Any, Any]]]:
     """Group records by ``(name, type)``, carrying each one's canonical value.
 
-    The ``(name, type, value)`` triple from
-    :func:`app.services.dns.pull_from_server._key` is split: the first two
-    elements form the bucket, the third is the normalised value used for
-    multiset matching inside it.
+    The identity tuple from :func:`app.services.dns.pull_from_server._key`
+    is split: the first two elements form the bucket, the rest — the
+    normalised value plus, for MX / SRV, the structured priority / weight /
+    port (#1525) — is the identity used for multiset matching inside it.
     """
-    buckets: dict[tuple[str, str], list[tuple[str, Any]]] = {}
+    buckets: dict[tuple[str, str], list[tuple[Any, Any]]] = {}
     for row in rows:
-        name, rtype, value = _key(row, zone_name)
-        buckets.setdefault((name, rtype), []).append((value, row))
+        name, rtype, *rest = _key(row, zone_name)
+        buckets.setdefault((name, rtype), []).append((tuple(rest), row))
     return buckets
 
 
 def _split_bucket(
-    wire_items: list[tuple[str, Any]], db_items: list[tuple[str, Any]]
+    wire_items: list[tuple[Any, Any]], db_items: list[tuple[Any, Any]]
 ) -> tuple[int, list[Any], list[Any]]:
     """Multiset-match one ``(name, type)`` bucket.
 
@@ -188,7 +188,7 @@ def _split_bucket(
     count rather than by set membership, so a zone with three A records at the
     same name where Windows has four reports exactly one leftover, not zero.
     """
-    remaining: Counter[str] = Counter(value for value, _ in db_items)
+    remaining: Counter[Any] = Counter(value for value, _ in db_items)
 
     matched = 0
     wire_only: list[Any] = []

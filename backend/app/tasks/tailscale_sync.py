@@ -42,6 +42,9 @@ async def _run_sweep() -> dict[str, Any]:
                 .scalars()
                 .all()
             )
+            # A per-tenant rollback (below) expires every ORM object on the
+            # shared session, so walk ids and re-fetch each tenant (#333).
+            tenant_ids = [tenant.id for tenant in rows]
 
             now = datetime.now(UTC)
             ran = 0
@@ -50,20 +53,27 @@ async def _run_sweep() -> dict[str, Any]:
             err_count = 0
             errors: list[str] = []
 
-            for tenant in rows:
+            for tenant_id in tenant_ids:
+                tenant = await db.get(TailscaleTenant, tenant_id)
+                if tenant is None:
+                    continue
                 if tenant.last_synced_at is not None:
                     elapsed = now - tenant.last_synced_at
                     if elapsed < timedelta(seconds=tenant.sync_interval_seconds):
                         skipped_interval += 1
                         continue
+                tenant_name = tenant.name  # a failed flush expires tenant
                 try:
                     summary = await reconcile_tenant(db, tenant)
                 except Exception as exc:  # noqa: BLE001
                     err_count += 1
-                    errors.append(f"{tenant.name}: {exc}")
+                    # A crash leaves the shared session in a failed
+                    # transaction; roll back so the next tenant still syncs.
+                    await db.rollback()
+                    errors.append(f"{tenant_name}: {exc}")
                     logger.warning(
                         "tailscale_reconcile_crash",
-                        tenant=str(tenant.id),
+                        tenant=str(tenant_id),
                         error=str(exc),
                     )
                     continue

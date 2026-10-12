@@ -267,11 +267,11 @@ async def get_image(image_id: uuid.UUID, request: Request) -> FileResponse:
 class MirrorDiskUsage(BaseModel):
     """Disk-usage snapshot of the mirror's PVC volume.
 
-    Phase A's ``check_disk_headroom`` checks the api pod's local /var
-    — useful on docker-compose, useless on multi-node because the
-    api's /var isn't where the slot image actually lands. The Phase B
-    preflight ``check_mirror_disk_headroom`` calls this endpoint to
-    get the real numbers from the mirror's PVC.
+    The preflight's ``disk_headroom`` judges each appliance node's own
+    ``/var`` from its heartbeat (#1234) — where ``spatium-upgrade-slot``
+    stages the image. The mirror's PVC is a separate volume nothing
+    there sees, so the Phase B preflight ``check_mirror_disk_headroom``
+    calls this endpoint to get the real numbers from it.
     """
 
     path: str

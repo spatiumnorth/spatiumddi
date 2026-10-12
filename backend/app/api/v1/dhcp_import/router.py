@@ -76,6 +76,7 @@ class ImportedClientClassOut(BaseModel):
     name: str
     match_expression: str = ""
     description: str = ""
+    address_family: Literal["ipv4", "ipv6", "dual"] = "ipv4"
     options: dict = Field(default_factory=dict)
     supported: bool = True
     warning: str | None = None

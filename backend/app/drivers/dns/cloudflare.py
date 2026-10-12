@@ -20,8 +20,9 @@ Credential dict shape (decrypted from ``DNSServer.credentials_encrypted``)::
 
     {"api_token": "<scoped-token>", "account_id": "<optional>"}
 
-``account_id`` is only consulted when *creating* a zone — Cloudflare's
-``POST /zones`` requires the owning account, but record / read calls do not.
+``account_id`` is consulted by the zone create / delete paths only —
+Cloudflare's ``POST /zones`` requires the owning account, and the zone
+lifecycle scopes its name lookup to it (#1537); record / read calls do not.
 """
 
 from __future__ import annotations
@@ -30,14 +31,44 @@ import ipaddress
 from typing import Any
 
 import httpx
+import structlog
 
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
     CloudDNSError,
     CloudDNSZone,
+    compose_structured_rdata,
     normalize_fqdn,
+    split_structured_rdata,
 )
-from app.drivers.dns.base import RecordChange, RecordData, RRsetData
+from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
+
+logger = structlog.get_logger(__name__)
+
+# Cloudflare API error 1061, "Zone already exists" (zone create, #1537).
+_ZONE_ALREADY_EXISTS = 1061
+
+
+class _CloudflareZoneNotFound(CloudDNSError):
+    """The zone-by-name lookup came back empty (#1537).
+
+    A distinct type so the delete path can treat an absent zone as done
+    without matching on message text.
+    """
+
+
+class _CloudflareAPIError(CloudDNSError):
+    """A Cloudflare API failure that keeps its HTTP status and error codes.
+
+    Lets the zone create / delete paths tell the one converged answer apart
+    from auth, throttling and server errors without matching message text.
+    """
+
+    def __init__(self, message: str, *, status: int, codes: list[Any]) -> None:
+        super().__init__(message)
+        self.status = status
+        self.codes = codes
+
 
 # Cloudflare API v4 base. Pinned here (not configurable) — there is no
 # self-hosted Cloudflare. The token in the Authorization header is the
@@ -88,12 +119,59 @@ def _content_key(record_type: str, content: str) -> str:
     return value
 
 
+def _srv_member_key(member: RRsetMember) -> tuple[int, int, int, str]:
+    """``(priority, weight, port, target)`` for a desired SRV member.
+
+    Missing numeric fields default to 0, as the ``data`` payload sends them.
+    """
+    return (
+        member.priority if member.priority is not None else 0,
+        member.weight if member.weight is not None else 0,
+        member.port if member.port is not None else 0,
+        member.value.rstrip(".").lower(),
+    )
+
+
+def _srv_row_key(row: dict[str, Any]) -> tuple[int, int, int, str] | None:
+    """``(priority, weight, port, target)`` for a live Cloudflare SRV row.
+
+    Read from the ``data`` object when present, otherwise split out of the
+    composed ``content`` string. ``None`` when neither parses, so the row is
+    never mistaken for a member.
+    """
+    data = row.get("data") or {}
+    if data:
+        try:
+            return (
+                int(data.get("priority") or 0),
+                int(data.get("weight") or 0),
+                int(data.get("port") or 0),
+                str(data.get("target") or "").rstrip(".").lower(),
+            )
+        except (TypeError, ValueError):
+            return None
+    content = str(row.get("content") or "")
+    target, priority, weight, port = split_structured_rdata("SRV", content)
+    if priority is not None and weight is not None and port is not None:
+        return (priority, weight, port, target.rstrip(".").lower())
+    # Cloudflare's own SRV content omits the priority ("<weight> <port>
+    # <target>") and carries it as the row's top-level ``priority``.
+    parts = content.split(None, 2)
+    if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+        try:
+            prio = int(row.get("priority") or 0)
+        except (TypeError, ValueError):
+            return None
+        return (prio, int(parts[0]), int(parts[1]), parts[2].strip().rstrip(".").lower())
+    return None
+
+
 class CloudflareDNSDriver(CloudDNSDriverBase):
     """Agentless driver for Cloudflare-hosted authoritative zones."""
 
     name = "cloudflare"
     # The Add-DNS-server modal renders + the probe requires only the token.
-    # ``account_id`` is optional (zone-create only) so it is not listed here.
+    # ``account_id`` is optional (zone create / delete only), so it is not listed here.
     credential_fields: tuple[str, ...] = ("api_token",)
 
     # ── HTTP plumbing ───────────────────────────────────────────────────
@@ -134,7 +212,11 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         errors = body.get("errors") or []
         messages = [str(e.get("message", e)) for e in errors if e]
         detail = "; ".join(m for m in messages if m) or f"HTTP {status}"
-        raise CloudDNSError(f"Cloudflare API error: {detail}")
+        raise _CloudflareAPIError(
+            f"Cloudflare API error: {detail}",
+            status=status,
+            codes=[e.get("code") for e in errors if isinstance(e, dict)],
+        )
 
     def _token(self, creds: dict[str, Any]) -> str:
         token = (creds or {}).get("api_token")
@@ -142,18 +224,32 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
             raise CloudDNSError("Cloudflare credentials missing 'api_token'.")
         return str(token)
 
-    async def _resolve_zone_id(self, client: httpx.AsyncClient, zone_fqdn: str) -> str:
+    async def _resolve_zone_id(
+        self,
+        client: httpx.AsyncClient,
+        zone_fqdn: str,
+        account_id: str | None = None,
+    ) -> str:
         """Look up the opaque Cloudflare zone id for a zone FQDN.
 
         Cloudflare's ``GET /zones?name=`` filter wants the bare name with no
         trailing dot, so the apex FQDN is de-dotted before the query.
+
+        ``account_id`` scopes the lookup to that account (#1537). A token
+        can span several accounts, and the same domain can be a zone in
+        more than one of them; unscoped, ``results[0]`` is whichever the
+        API lists first, which is how a zone delete would reach into the
+        wrong account.
         """
         name = normalize_fqdn(zone_fqdn).rstrip(".")
-        resp = await client.get("/zones", params={"name": name})
+        params: dict[str, Any] = {"name": name}
+        if account_id:
+            params["account.id"] = str(account_id)
+        resp = await client.get("/zones", params=params)
         body = self._unwrap(resp)
         results = body.get("result") or []
         if not results:
-            raise CloudDNSError(f"Cloudflare zone {name!r} not found on this account.")
+            raise _CloudflareZoneNotFound(f"Cloudflare zone {name!r} not found on this account.")
         return str(results[0]["id"])
 
     @staticmethod
@@ -224,13 +320,31 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 for rec in body.get("result") or []:
                     raw_ttl = rec.get("ttl")
                     ttl = None if raw_ttl == _TTL_AUTO else raw_ttl
+                    rtype = str(rec["type"]).upper()
+                    value = rec.get("content") or ""
+                    priority = rec.get("priority")
+                    weight: int | None = None
+                    port: int | None = None
+                    if rtype == "SRV":
+                        # SRV components live in the ``data`` object
+                        # (#1526); ``content`` is the composed string.
+                        data = rec.get("data") or {}
+                        if data:
+                            value = str(data.get("target") or value)
+                            priority = data.get("priority", priority)
+                            weight = data.get("weight")
+                            port = data.get("port")
+                        else:
+                            value, priority, weight, port = split_structured_rdata(rtype, value)
                     records.append(
                         RecordData(
                             name=self._relativize(rec["name"], zone_fqdn),
                             record_type=rec["type"],
-                            value=rec["content"],
+                            value=value,
                             ttl=ttl,
-                            priority=rec.get("priority"),
+                            priority=priority,
+                            weight=weight,
+                            port=port,
                         )
                     )
                 info = body.get("result_info") or {}
@@ -261,10 +375,20 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         payload: dict[str, Any] = {
             "type": rec.record_type,
             "name": self._absolute_name(rec.name, zone_fqdn),
-            "content": rec.value,
             # Cloudflare's "automatic" TTL is the sentinel 1.
             "ttl": _TTL_AUTO if rec.ttl is None else rec.ttl,
         }
+        if rec.record_type.upper() == "SRV":
+            # Cloudflare takes SRV components as a ``data`` object, not a
+            # content string (#1526): priority / weight / port / target.
+            payload["data"] = {
+                "priority": rec.priority if rec.priority is not None else 0,
+                "weight": rec.weight if rec.weight is not None else 0,
+                "port": rec.port if rec.port is not None else 0,
+                "target": rec.value,
+            }
+            return payload
+        payload["content"] = rec.value
         if rec.priority is not None:
             payload["priority"] = rec.priority
         return payload
@@ -380,25 +504,34 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         unmatched = await self._list_rrset(client, zone_id, name, rtype)
         proxied = any(r.get("proxied") for r in unmatched)
         to_create: list[dict[str, Any]] = []
+        is_srv = rtype.upper() == "SRV"
         for member in rrset.members:
-            payload: dict[str, Any] = {
-                "type": rtype,
-                "name": name,
-                "content": member.value,
-                "ttl": wire_ttl,
-            }
-            if member.priority is not None:
-                payload["priority"] = member.priority
-            key = _content_key(rtype, member.value)
-            match = next(
-                (
-                    r
-                    for r in unmatched
-                    if _content_key(rtype, str(r.get("content") or "")) == key
-                    and (not keyed_priority or r.get("priority") == member.priority)
-                ),
-                None,
-            )
+            payload: dict[str, Any] = {"type": rtype, "name": name, "ttl": wire_ttl}
+            if is_srv:
+                # SRV goes out as a ``data`` object (#1526), matched on all
+                # four components rather than on ``content``.
+                srv_key = _srv_member_key(member)
+                payload["data"] = {
+                    "priority": srv_key[0],
+                    "weight": srv_key[1],
+                    "port": srv_key[2],
+                    "target": member.value,
+                }
+                match = next((r for r in unmatched if _srv_row_key(r) == srv_key), None)
+            else:
+                payload["content"] = member.value
+                if member.priority is not None:
+                    payload["priority"] = member.priority
+                key = _content_key(rtype, member.value)
+                match = next(
+                    (
+                        r
+                        for r in unmatched
+                        if _content_key(rtype, str(r.get("content") or "")) == key
+                        and (not keyed_priority or r.get("priority") == member.priority)
+                    ),
+                    None,
+                )
             if match is None:
                 if proxied:
                     payload["proxied"] = True
@@ -424,8 +557,9 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                 # any row above, so it is one of the rows still unmatched.
                 # Deleting them now could delete the very record that was
                 # just reported as present: stop before the delete pass.
+                shown = payload.get("content", payload.get("data"))
                 raise CloudDNSError(
-                    f"Cloudflare: {name} {rtype} {payload['content']!r} exists in a form "
+                    f"Cloudflare: {name} {rtype} {shown!r} exists in a form "
                     "this driver does not recognise; left the existing records in place."
                 ) from exc
 
@@ -458,7 +592,11 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                     zone_id,
                     payload["name"],
                     change.record.record_type,
-                    content=change.record.value,
+                    content=(
+                        compose_structured_rdata(change.record)
+                        if change.record.record_type.upper() == "SRV"
+                        else change.record.value
+                    ),
                     priority=change.record.priority,
                 )
                 if existing is None:
@@ -484,7 +622,11 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
                     zone_id,
                     payload["name"],
                     change.record.record_type,
-                    content=change.record.value,
+                    content=(
+                        compose_structured_rdata(change.record)
+                        if change.record.record_type.upper() == "SRV"
+                        else change.record.value
+                    ),
                     priority=change.record.priority,
                 )
                 if rid is None:
@@ -497,27 +639,78 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
             raise CloudDNSError(f"Cloudflare: unsupported record op {change.op!r}")
 
     # ── Zone writes ─────────────────────────────────────────────────────
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> bool | None:
         token = self._token(creds)
         zone_fqdn = normalize_fqdn(getattr(zone, "name", ""))
         bare = zone_fqdn.rstrip(".")
+        account_id = (creds or {}).get("account_id") or None
         async with self._client(token) as client:
             if op == "create":
                 payload: dict[str, Any] = {"name": bare}
                 # Real Cloudflare requires the owning account on zone create;
                 # include it when the operator supplied an account_id.
-                account_id = (creds or {}).get("account_id")
                 if account_id:
                     payload["account"] = {"id": str(account_id)}
                 resp = await client.post("/zones", json=payload)
-                self._unwrap(resp)
-                return
+                try:
+                    self._unwrap(resp)
+                except _CloudflareAPIError as exc:
+                    # #1537 — error 1061 "already exists" is the only
+                    # converged signal, and on its own it is not enough:
+                    # Cloudflare returns the SAME code when a different
+                    # account holds the domain active. So confirm the zone
+                    # is visible to this token — scoped to the configured
+                    # account when there is one — before calling it done;
+                    # a zone only someone else can see stays a failure.
+                    if _ZONE_ALREADY_EXISTS not in exc.codes:
+                        raise
+                    try:
+                        await self._resolve_zone_id(client, zone_fqdn, account_id)
+                    except _CloudflareZoneNotFound:
+                        raise exc from None
+                    logger.info(
+                        "cloudflare.apply_zone.create_already_exists",
+                        server=str(getattr(server, "id", "")),
+                        zone=bare,
+                    )
+                    return False
+                return True
 
             if op == "delete":
-                zone_id = await self._resolve_zone_id(client, zone_fqdn)
+                try:
+                    zone_id = await self._resolve_zone_id(client, zone_fqdn, account_id)
+                except _CloudflareZoneNotFound:
+                    # #1537 — an already-absent zone is the desired end state.
+                    # Only the empty lookup; auth, rate-limit and 5xx errors
+                    # from the lookup are _CloudflareAPIError and propagate.
+                    logger.info(
+                        "cloudflare.apply_zone.delete_noop_absent",
+                        server=str(getattr(server, "id", "")),
+                        zone=bare,
+                    )
+                    return False
                 resp = await client.delete(f"/zones/{zone_id}")
-                self._unwrap(resp)
-                return
+                try:
+                    self._unwrap(resp)
+                except _CloudflareAPIError as exc:
+                    # Gone between the lookup and the delete (HTTP 404 only).
+                    if exc.status != 404:
+                        raise
+                    logger.info(
+                        "cloudflare.apply_zone.delete_noop_absent",
+                        server=str(getattr(server, "id", "")),
+                        zone=bare,
+                    )
+                    return False
+                return True
 
             raise CloudDNSError(f"Cloudflare: unsupported zone op {op!r}")
 

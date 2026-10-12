@@ -1,0 +1,143 @@
+#!/bin/bash
+# spatiumddi-trigger-guard — refuse host-runner trigger files written by
+# anyone other than the expected writers (GHSA-h2j9-qrg7-grfw).
+#
+# Every root host runner under /usr/local/bin acts on a trigger file the
+# supervisor or the api drops into /var/lib/spatiumddi/release-state. The
+# runners themselves never asked WHO wrote the file, and the directory used
+# to be mode 1777, so any local account — a compromised snmpd or lldpd, say
+# — could drive root actions: rewrite authorized_keys, nftables, APT
+# sources, schedule a slot upgrade, join a cluster. The directory is now
+# 1770 root:spatium-host (gid 2770), which is the primary control. This
+# guard is the second one: it runs as ``ExecCondition=`` in every runner's
+# .service, so it holds even if the directory mode regresses.
+#
+# A trigger is ACCEPTED only when it is a regular file (not a symlink),
+# owned by an allowed uid, and — unless root owns it — sits in a directory
+# that is not world-writable. Allowed uids, by default:
+#   0     root (host runners, the console, firstboot)
+#   100   the supervisor's in-pod ``spatium`` user (pinned in its Dockerfile)
+#   1000  the api pod (runAsUser 1000) — also the installer's admin account
+# The world-writable check exists because uid 100 on the HOST is whichever
+# system daemon happened to be created first; it can only matter while the
+# directory is still the legacy 1777, and there it is the only thing that
+# tells the supervisor's file from that daemon's.
+#
+# A REJECTED trigger is renamed to ``<name>.rejected.<epoch>`` and logged.
+# Renaming rather than leaving it is load-bearing: the pcap and storage
+# planes use level-triggered ``PathExistsGlob``, and a file left matching
+# re-fires the unit until systemd's start limit kills the path unit (#999).
+# The rename itself re-fires the ``PathChanged`` units once; that run finds
+# nothing and skips.
+#
+# Usage:  spatiumddi-trigger-guard <path-or-glob>...
+# Exit codes follow systemd's ExecCondition= contract:
+#   0  at least one acceptable trigger is present → run the unit
+#   1  nothing acceptable to act on (absent, or every match rejected) →
+#      skip the unit cleanly; it does NOT end up "failed"
+# Never 255: that would mark the unit failed instead of skipping it.
+#
+# Env overrides exist for appliance/tests only: SPATIUM_TRIGGER_ALLOWED_UIDS,
+# SPATIUM_TRIGGER_ROOT, SPATIUM_TRIGGER_GUARD_LOG.
+
+set -u
+
+ALLOWED_UIDS="${SPATIUM_TRIGGER_ALLOWED_UIDS:-0 100 1000}"
+TRIGGER_ROOT="${SPATIUM_TRIGGER_ROOT:-/var/lib/spatiumddi/release-state}"
+LOG="${SPATIUM_TRIGGER_GUARD_LOG:-/var/log/spatiumddi/trigger-guard.log}"
+
+log() {
+    local line
+    line="[$(date -Iseconds 2>/dev/null)] spatiumddi-trigger-guard: $*"
+    printf '%s\n' "$line" >&2
+    printf '%s\n' "$line" >> "$LOG" 2>/dev/null || true
+}
+
+uid_allowed() {  # $1 = uid
+    local u
+    for u in $ALLOWED_UIDS; do
+        [ "$u" = "$1" ] && return 0
+    done
+    return 1
+}
+
+world_writable() {  # $1 = directory
+    local mode
+    mode=$(stat -c '%a' -- "$1" 2>/dev/null) || return 1
+    [ -n "$mode" ] || return 1
+    (( (8#$mode & 2) != 0 ))
+}
+
+# Echo the reason a trigger must be refused; print nothing to accept it.
+refusal_reason() {  # $1 = path
+    local f="$1" owner dir
+    if [ -L "$f" ]; then
+        echo "is a symlink"
+        return
+    fi
+    if [ ! -f "$f" ]; then
+        echo "is not a regular file"
+        return
+    fi
+    owner=$(stat -c '%u' -- "$f" 2>/dev/null) || owner=""
+    if [ -z "$owner" ]; then
+        echo "could not be stat'd"
+        return
+    fi
+    if ! uid_allowed "$owner"; then
+        echo "is owned by uid $owner (allowed: $ALLOWED_UIDS)"
+        return
+    fi
+    [ "$owner" = "0" ] && return
+    dir=$(dirname -- "$f")
+    for d in "$dir" "$TRIGGER_ROOT"; do
+        if [ -d "$d" ] && world_writable "$d"; then
+            echo "is owned by uid $owner but $d is world-writable, so its owner proves nothing"
+            return
+        fi
+    done
+}
+
+quarantine() {  # $1 = path, $2 = reason
+    local dest
+    dest="$1.rejected.$(date +%s)"
+    if mv -f -- "$1" "$dest" 2>/dev/null; then
+        log "REJECTED $1: $2 — moved to $dest"
+    elif rm -f -- "$1" 2>/dev/null; then
+        log "REJECTED $1: $2 — could not rename, removed"
+    else
+        log "REJECTED $1: $2 — could not rename or remove it"
+    fi
+}
+
+if [ "$#" -eq 0 ]; then
+    log "no trigger path given — refusing to run the unit"
+    exit 1
+fi
+
+accepted=0
+shopt -s nullglob
+for spec in "$@"; do
+    case "$spec" in
+        *'*'*|*'?'*|*'['*)
+            # Unquoted on purpose: this is the glob expansion.
+            # shellcheck disable=SC2206
+            matches=( $spec )
+            ;;
+        *)
+            matches=()
+            [ -e "$spec" ] || [ -L "$spec" ] && matches=( "$spec" )
+            ;;
+    esac
+    for f in "${matches[@]}"; do
+        reason=$(refusal_reason "$f")
+        if [ -n "$reason" ]; then
+            quarantine "$f" "$reason"
+        else
+            accepted=$((accepted + 1))
+        fi
+    done
+done
+
+[ "$accepted" -gt 0 ] && exit 0
+exit 1

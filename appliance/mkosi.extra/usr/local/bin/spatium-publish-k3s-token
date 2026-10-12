@@ -12,7 +12,9 @@
 #
 # Runs After=k3s.service on every boot. The token is created by k3s
 # during server init, which can lag the service start, so we poll for
-# it briefly. Every k3s server in the cluster shares the same join
+# it briefly. #1509 — that window can be too short on a fresh seed, so
+# spatiumddi-publish-k3s-token.path also runs this whenever k3s writes
+# the token. Every k3s server in the cluster shares the same join
 # token, so publishing on each node is correct + harmless.
 set -uo pipefail
 
@@ -27,15 +29,16 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     if [ -r "$TOKEN_FILE" ]; then
         # #555 — write via a RANDOM-named temp (mktemp creates it fresh at
         # 0600 and won't write through a symlink an attacker pre-planted at
-        # the predictable ``$SIDECAR.new`` name in the 1777 release-state
-        # dir — the token is cluster-admin-equivalent). The FINAL sidecar
-        # stays 0644 on purpose: the supervisor's unprivileged process user
-        # (uid 100 spatium, su-exec'd from root by the entrypoint) must read
-        # it through the release-state bind mount. A 0600-root sidecar is
+        # the predictable ``$SIDECAR.new`` name in the release-state dir,
+        # which was 1777 until GHSA-h2j9-qrg7-grfw — the token is
+        # cluster-admin-equivalent). The FINAL sidecar stays 0644 on
+        # purpose: the supervisor's unprivileged process user (uid 100
+        # spatium, su-exec'd from root by the entrypoint) must read it
+        # through the release-state bind mount. A 0600-root sidecar is
         # invisible to that user → read_k3s_join_token() returns None → the
-        # seed never reports its token → promote 409s. Same 0644 precedent
-        # as firstboot's /etc/spatiumddi/.env. Single-tenant box; the host
-        # filesystem is the trust boundary, not this mode.
+        # seed never reports its token → promote 409s. Its "other" read bit
+        # no longer reaches other host accounts: the directory is 1770
+        # root:2770, so only root and gid-2770 members can traverse to it.
         tmp="$(mktemp "$SIDECAR.XXXXXX" 2>/dev/null)" || { sleep 3; continue; }
         if tr -d '\r\n' < "$TOKEN_FILE" > "$tmp" 2>/dev/null; then
             chmod 0644 "$tmp"

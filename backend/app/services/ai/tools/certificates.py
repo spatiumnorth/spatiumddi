@@ -89,6 +89,7 @@ class FindCertificatesArgs(BaseModel):
 
 @register_tool(
     name="find_certificates",
+    permission=("read", "appliance"),
     description=(
         "List the appliance Web UI TLS certificates. Each row carries "
         "the operator label (name), source (uploaded / csr / letsencrypt "
@@ -145,6 +146,7 @@ class CountCertificatesExpiringArgs(BaseModel):
 
 @register_tool(
     name="count_certificates_expiring",
+    permission=("read", "appliance"),
     description=(
         "Count appliance Web UI TLS certificates whose validity expires "
         "within N days of now (default 30). Counts only the active cert "
@@ -201,6 +203,7 @@ class GetACMEAccountArgs(BaseModel):
 
 @register_tool(
     name="get_acme_account",
+    permission="superadmin",
     description=(
         "Read the embedded ACME client account configured for Let's "
         "Encrypt issuance (superadmin only). Returns the CA directory "

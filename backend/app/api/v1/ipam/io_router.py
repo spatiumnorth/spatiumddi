@@ -86,6 +86,14 @@ async def import_commit(
     strategy: Literal["skip", "overwrite", "fail"] = Form(default="fail"),
 ) -> dict:
     """Commit the import in a single transaction. Writes audit entries per mutation."""
+    # The import creates / updates blocks and subnets, so the coarse router
+    # gate (which also admits any address_set grant) is not enough.
+    for rtype in ("ip_block", "subnet"):
+        if not user_has_permission(current_user, "write", rtype):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: need 'write' on '{rtype}'",
+            )
     data = await _read_upload(file)
     payload = parse_payload(data, file.filename or "", file.content_type)
     result = await commit_import(

@@ -273,16 +273,16 @@ async def test_the_agent_never_drops_an_applied_op_across_stale_bodies_and_a_str
     # before it reads, committed after.
     await _change(db_session, server, zone, "a")
     async with _straddling_write(server_id, zone, "c") as t:
-        real = agent_bundle_render.render_bundle_body
+        real = agent_bundle_render.encode_bundle_body
 
         async def _read_then_commit(db, srv):  # noqa: ANN001, ANN202
             rendered = await real(db, srv)
             await t.commit()
             return rendered
 
-        monkeypatch.setattr(agent_bundle_render, "render_bundle_body", _read_then_commit)
+        monkeypatch.setattr(agent_bundle_render, "encode_bundle_body", _read_then_commit)
         b3 = await _render(db_session, server)
-        monkeypatch.setattr(agent_bundle_render, "render_bundle_body", real)
+        monkeypatch.setattr(agent_bundle_render, "encode_bundle_body", real)
     await db_session.refresh(server)
     assert not store.is_current(server), "C's commit left b3 behind"
 
@@ -321,6 +321,12 @@ async def test_a_bundle_pruned_between_its_read_and_its_body_load_serves_the_new
     runs (agents/config 500, NoResultFound in load_body). The poll must serve
     the newest bundle instead, with its ops re-paged against THAT bundle's
     snapshot: never the page it built for the pruned one."""
+    # The poll's deadline is wall-clock and the renders the hook runs inside
+    # it are not free: on a loaded CI runner one took 834 ms against the
+    # fixture's 1 s hold, the deadline passed before the poll could re-read,
+    # and it answered 304 (#1655). Nothing here waits on the deadline (the
+    # poll returns as soon as it serves), so give it room, not a race.
+    monkeypatch.setattr(agents_api, "LONGPOLL_TIMEOUT_SECONDS", 60)
     server, zone, headers = await _agent(db_session)
     await db_session.commit()
     server_id = server.id

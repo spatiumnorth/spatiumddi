@@ -20,11 +20,13 @@ own config under ``/etc/dns`` and is configured entirely over its HTTP API
   reconcile it against the live API in ``swap_and_reload()`` (same split as
   PowerDNS, for symmetry with the rest of the codebase, even though there's
   no config file being swapped here).
-* Zone apex NS/SOA are Technitium-managed (auto-created on
-  ``/api/zones/create``) and are NOT pushed from the bundle — confirmed the
-  daemon renders its own SOA + one NS record at zone creation, so treating
-  the bundle's NS/SOA as authoritative would just create duplicate/foreign
-  NS records alongside Technitium's own.
+* Zone apex NS/SOA are created by the daemon on ``/api/zones/create`` (one
+  NS and an SOA MNAME naming its own host name, which in a pod is the pod
+  name). They are not reconciled record by record with the rest of the
+  zone: ``_reconcile_zone_apex`` rewrites the SOA fields the zone sets
+  (Primary NS, Admin Email, and with them the timers) and replaces the apex
+  NS set as a whole, each only when it differs, and leaves a zone that sets
+  neither Primary NS nor Admin Email nor apex NS alone.
 
 Zone types (issue #743): primary, secondary, stub and forward, plus
 catalog-zone membership for the primaries this server owns. Only a
@@ -55,6 +57,9 @@ live-pull + blocklist wiring (#744).
 
 from __future__ import annotations
 
+import base64
+import binascii
+import ipaddress
 import json
 import os
 import secrets
@@ -68,9 +73,10 @@ from typing import Any
 import httpx
 import structlog
 
-from ._process import find_running_daemon, is_zombie
-from .base import RRSET_OP_KINDS, DriverBase
 from ..secure_io import write_private
+from ._process import find_running_daemon, is_zombie
+from ._txt import txt_strings
+from .base import RRSET_OP_KINDS, DriverBase
 
 log = structlog.get_logger(__name__)
 
@@ -80,6 +86,9 @@ _API_TIMEOUT = 10.0
 _ADMIN_PASSWORD_FILE = "technitium-admin-password"
 _API_TOKEN_FILE = "technitium-api.token"
 _TOKEN_NAME = "spatiumddi-agent"
+# Zones this agent created from a bundle — the only ones it may delete when
+# the bundle drops them (see ``_retire_dropped_zones``).
+_MANAGED_ZONES_FILE = "technitium-managed-zones.json"
 
 # Record types whose zone-apex form is daemon-managed (SOA always; NS only
 # at the apex — an off-apex NS is a legitimate delegation record and IS
@@ -159,6 +168,14 @@ _DNSSEC_KEY_TYPES = {"KeySigningKey": "ksk", "ZoneSigningKey": "zsk"}
 # writes a .pfx into its own state dir.
 _TLS_CERT_FILE = "technitium-tls.pfx"
 
+# Catalog-zone state (issue #1519). The catalog zone is not in the
+# bundle's zone list, so when catalog is turned off the bundle carries
+# no name for the zone that has to go — the previously applied
+# (zone_name, mode) pair is tracked in agent state instead, the same
+# approach #1497 takes for retired zones.
+_CATALOG_STATE_FILE = "technitium-catalog-state.json"
+_CATALOG_ZONE_TYPES = {"producer": "Catalog", "consumer": "SecondaryCatalog"}
+
 # Neutral forward_transport → Technitium's ``forwarderProtocol``.
 _FORWARDER_PROTOCOLS = {
     "do53": "Udp",
@@ -219,40 +236,346 @@ def _qualified_name(zone_name: str, name: str) -> str:
     return f"{bare}.{zone}"
 
 
-def _svcb_params(value: str) -> tuple[int, str, str]:
+def _canonical_ip(value: str) -> str:
+    """Canonical form of an A/AAAA value via ``ipaddress`` (#1513).
+
+    Records are stored exactly as typed but Technitium returns addresses
+    in canonical form, so an expanded/upper-case AAAA
+    (``2001:DB8:0:0::1``) never string-matched and churned on every
+    structural reconcile. An unparseable value passes through unchanged
+    — it degrades to a comparison mismatch, not an exception.
+    """
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return value
+
+
+def _strip_bare_authority_slash(uri: str) -> str:
+    """Strip a single trailing slash ONLY when the URI has no path
+    beyond the authority (#1513).
+
+    ``https://host/`` → ``https://host`` (Technitium appends that slash
+    itself when storing a bare-authority URI, so both sides strip it),
+    while ``https://host/path/`` keeps its slash — it can change the
+    resource the URI points to, and the old ``rstrip("/")`` removed it.
+    """
+    if not uri.endswith("/"):
+        return uri
+    after_authority_marker = uri.split("://", 1)[-1]
+    if after_authority_marker.count("/") == 1:
+        return uri[:-1]
+    return uri
+
+
+# ── SVCB / HTTPS (RFC 9460) ────────────────────────────────────────────
+#
+# Three forms meet here, and every comparison reduces them to one:
+#
+# * PRESENTATION, what an operator stores and BIND renders verbatim:
+#   ``1 svc alpn=h2,h3 port=443``. A target without a trailing dot is
+#   RELATIVE to the zone (RFC 1035 §5.1), exactly as BIND reads it.
+# * TECHNITIUM WIRE, what ``zones/records/{add,delete}`` parses
+#   (``WebServiceZonesApi.cs``, 15.4.0): ``svcTargetName`` is trimmed of
+#   dots and stored verbatim, so Technitium has no relative names at all —
+#   ``svc`` is served as ``svc.``, never as ``svc.<zone>.``. ``svcParams``
+#   is split on ``|`` and walked two tokens at a time (``alpn|h2,h3|port|443``),
+#   or is the literal ``false`` for none — the parameter is required, so
+#   omitting it is "Parameter 'svcParams' missing.". The key is
+#   ``Enum.Parse<DnsSvcParamKey>`` on the name, so ``keyNNNNN`` must go as
+#   its NUMBER; ``ech`` and every unnamed key fall through to
+#   ``DnsSvcUnknownParamValue``, which parses HEX, not base64.
+# * TECHNITIUM READ-BACK (``zones/records/get``): ``svcTargetName`` as
+#   stored (no dot, ``""`` for the root), and ``svcParams`` as an object of
+#   ``key -> ToString()`` in the order the record was added — ``null`` for
+#   ``no-default-alpn``, ``61:62`` colon-hex for ``ech`` and unnamed keys,
+#   and an unnamed key reported by its number (``"65000"``).
+#
+# Canonical form: params in key-NUMBER order, ``mandatory`` sorted, hint
+# addresses canonical, ``ech`` as normalised base64, unnamed keys as
+# ``keyN`` with an RFC 1035-escaped value, values unquoted unless they hold
+# whitespace. ``alpn`` order is significant and kept.
+#
+# This block is duplicated byte-for-byte in
+# ``backend/app/services/technitium/rdata.py`` (the agent image cannot
+# import ``app``). Keep the two identical.
+
+_SVCB_KEY_NUM = {
+    "mandatory": 0,
+    "alpn": 1,
+    "no-default-alpn": 2,
+    "port": 3,
+    "ipv4hint": 4,
+    "ech": 5,
+    "ipv6hint": 6,
+    "dohpath": 7,
+}
+_SVCB_KEY_NAME = {num: name for name, num in _SVCB_KEY_NUM.items()}
+# Technitium ignores the value it is given for ``no-default-alpn``
+# (``DnsSvcParamValue.Parse`` returns an empty ALPN value) but its splitter
+# still needs a token in the value slot, and an empty one is refused.
+_SVCB_VALUELESS_PLACEHOLDER = "true"
+# Technitium's own spelling of "no SvcParams" (AliasMode, or a bare
+# ServiceMode record).
+_SVCB_NO_PARAMS = "false"
+
+
+def _svcb_ip(value: str) -> str:
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return value.strip()
+
+
+def _svcb_norm_key(key: str) -> str:
+    """``ALPN`` / ``key1`` / ``1`` -> ``alpn``; ``key065000`` / ``65000`` ->
+    ``key65000``. Technitium reports an unnamed key by its bare number."""
+    k = key.strip().lower().replace("_", "-")
+    if k.isdigit():
+        num = int(k)
+    elif k.startswith("key") and k[3:].isdigit():
+        num = int(k[3:])
+    else:
+        return k
+    return _SVCB_KEY_NAME.get(num, f"key{num}")
+
+
+def _svcb_key_num(key: str) -> int:
+    if key in _SVCB_KEY_NUM:
+        return _SVCB_KEY_NUM[key]
+    if key.startswith("key") and key[3:].isdigit():
+        return int(key[3:])
+    return 65536
+
+
+def _svcb_is_generic(key: str) -> bool:
+    return key.startswith("key") and key[3:].isdigit()
+
+
+def _svcb_split(value: str) -> list[str]:
+    """Split presentation-format rdata on whitespace outside double quotes.
+
+    Backslash escapes are kept verbatim (``alpn=h2\\,x`` keeps its escaped
+    comma), unlike ``shlex.split``, which eats the backslash.
+    """
+    tokens: list[str] = []
+    cur: list[str] = []
+    in_quote = False
+    it = iter(value)
+    for ch in it:
+        if ch == "\\":
+            cur.append(ch)
+            cur.append(next(it, ""))
+        elif ch == '"':
+            in_quote = not in_quote
+            cur.append(ch)
+        elif ch.isspace() and not in_quote:
+            if cur:
+                tokens.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        tokens.append("".join(cur))
+    return tokens
+
+
+def _svcb_unquote(raw: str) -> str:
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        return raw[1:-1]
+    return raw
+
+
+def _svcb_unescape(text: str) -> bytes:
+    """RFC 1035 §5.1 character-string -> bytes (``\\DDD`` and ``\\X``)."""
+    out = bytearray()
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            digits = text[i + 1 : i + 4]
+            if len(digits) == 3 and digits.isdigit() and int(digits) < 256:
+                out.append(int(digits))
+                i += 4
+                continue
+            out.extend(text[i + 1].encode("utf-8"))
+            i += 2
+            continue
+        out.extend(ch.encode("utf-8"))
+        i += 1
+    return bytes(out)
+
+
+def _svcb_escape(data: bytes) -> str:
+    """bytes -> an RFC 1035 character-string needing no quotes."""
+    out: list[str] = []
+    for b in data:
+        if b in (0x22, 0x5C):
+            out.append("\\" + chr(b))
+        elif 0x21 <= b <= 0x7E:
+            out.append(chr(b))
+        else:
+            out.append(f"\\{b:03d}")
+    return "".join(out)
+
+
+def _svcb_hex_bytes(value: str) -> bytes | None:
+    try:
+        return bytes.fromhex(value.replace(":", "").replace("-", ""))
+    except ValueError:
+        return None
+
+
+def _svcb_b64_bytes(value: str) -> bytes | None:
+    try:
+        return base64.b64decode(value.strip(), validate=True)
+    except (ValueError, binascii.Error):
+        return None
+
+
+def _svcb_canon_value(key: str, val: str | None, from_daemon: bool) -> str | None:
+    """One param value in canonical presentation form (``None`` = valueless).
+
+    ``from_daemon`` says ``val`` is Technitium's read-back ``ToString()``
+    (colon-hex for ``ech`` / unnamed keys) rather than presentation text.
+    """
+    if val is None or val == "":
+        return None
+    if key == "mandatory":
+        names = {_svcb_norm_key(n) for n in val.split(",") if n.strip()}
+        return ",".join(sorted(names, key=lambda n: (_svcb_key_num(n), n))) or None
+    if key in ("ipv4hint", "ipv6hint"):
+        return ",".join(_svcb_ip(a) for a in val.split(",") if a.strip())
+    if key == "port":
+        return str(int(val)) if val.strip().isdigit() else val
+    if key == "ech":
+        data = _svcb_hex_bytes(val) if from_daemon else _svcb_b64_bytes(val)
+        return base64.b64encode(data).decode("ascii") if data is not None else val
+    if _svcb_is_generic(key):
+        data = _svcb_hex_bytes(val) if from_daemon else _svcb_unescape(val)
+        if data is None:
+            return val
+        return _svcb_escape(data) or None
+    return val
+
+
+def _svcb_param_list(
+    items: list[tuple[str, str | None]], from_daemon: bool
+) -> list[tuple[str, str | None]]:
+    """Canonical ``(key, value-or-None)`` list, in key-number order."""
+    out: dict[str, str | None] = {}
+    for raw_key, raw_val in items:
+        key = _svcb_norm_key(raw_key)
+        out[key] = _svcb_canon_value(key, raw_val, from_daemon)
+    return sorted(out.items(), key=lambda kv: (_svcb_key_num(kv[0]), kv[0]))
+
+
+def _svcb_wire_key(key: str) -> str:
+    return key[3:] if _svcb_is_generic(key) else key
+
+
+def _svcb_wire_value(key: str, val: str | None) -> str:
+    if key == "mandatory" and val:
+        return ",".join(_svcb_wire_key(n) for n in val.split(","))
+    if key == "ech" and val:
+        data = _svcb_b64_bytes(val)
+        return data.hex().upper() if data is not None else val
+    if _svcb_is_generic(key):
+        return _svcb_unescape(val).hex().upper() if val else ""
+    if val is None:
+        # Only ``no-default-alpn`` is valueless by definition; anything else
+        # sent empty is the operator's empty value, not a made-up one.
+        return _SVCB_VALUELESS_PLACEHOLDER if key == "no-default-alpn" else ""
+    return val
+
+
+def _svcb_wire(params: list[tuple[str, str | None]]) -> str:
+    """Technitium's ``svcParams`` for an already-canonical list."""
+    if not params:
+        return _SVCB_NO_PARAMS
+    parts: list[str] = []
+    for key, val in params:
+        parts.append(_svcb_wire_key(key))
+        parts.append(_svcb_wire_value(key, val))
+    return "|".join(parts)
+
+
+def _svcb_render(params: list[tuple[str, str | None]]) -> str:
+    def _q(v: str) -> str:
+        return f'"{v}"' if any(c.isspace() for c in v) else v
+
+    return " ".join(k if v is None else f"{k}={_q(v)}" for k, v in params)
+
+
+def _svcb_target(name: str, origin: str | None) -> str:
+    """A presentation-format target -> Technitium's form: absolute, lower
+    case, no trailing dot, ``.`` for the root.
+
+    A trailing dot means absolute and is honoured whatever the label count
+    (``localhost.`` stays ``localhost``). Without one the name is relative
+    to ``origin`` (``svc`` in ``example.net`` is ``svc.example.net``), as in
+    a zone file; with no origin it is left as written.
+    """
+    name = name.strip()
+    if name in ("", "."):
+        return "."
+    if name.endswith("."):
+        return name.rstrip(".").lower() or "."
+    zone = (origin or "").strip().rstrip(".").lower()
+    if name == "@":
+        return zone or "."
+    return f"{name}.{zone}".lower() if zone else name.lower()
+
+
+def _svcb_daemon_target(name: Any) -> str:
+    """Technitium's read-back target, which is always absolute, in the same
+    form ``_svcb_target`` produces. ``""`` is the root."""
+    bare = str(name or "").strip().rstrip(".").lower()
+    return bare or "."
+
+
+def _svcb_parse(value: str, origin: str | None) -> tuple[int, str, list[tuple[str, str | None]]]:
+    tokens = _svcb_split(value)
+    if len(tokens) < 2:
+        return (1, ".", [])
+    priority = int(tokens[0]) if tokens[0].isdigit() else 1
+    items: list[tuple[str, str | None]] = []
+    for tok in tokens[2:]:
+        key, eq, raw = tok.partition("=")
+        items.append((key, _svcb_unquote(raw) if eq else None))
+    return (priority, _svcb_target(tokens[1], origin), _svcb_param_list(items, False))
+
+
+def _svcb_daemon_params(raw: Any) -> list[tuple[str, str | None]]:
+    """Technitium's read-back ``svcParams`` object, canonical."""
+    if not isinstance(raw, dict):
+        return []
+    return _svcb_param_list(
+        [(str(k), None if v in (None, "") else str(v)) for k, v in raw.items()], True
+    )
+# ── end of the block shared with the agent ──────────────────────────────
+
+
+#: The bundle key a control plane from #1513 on sets to say a dot-less
+#: SVCB / HTTPS target is relative to the zone (``agent_config`` sets it).
+#: Without it, a dot-less target is absolute, as the older renderer meant.
+SVCB_TARGET_RULE_KEY = "svcb_target_rule"
+SVCB_TARGET_RULE_ZONE_FILE = "zone-file"
+
+
+def _svcb_params(value: str, origin: str | None = None) -> tuple[int, str, str]:
     """Parse a BIND-zone-file-style SVCB/HTTPS rdata string into
     ``(priority, target, svcParams)`` for the Technitium API.
 
-    Input shape (matches what the control-plane driver + BIND9 render,
-    e.g. ``'1 . alpn="h2,h3"'``): priority, target, then space-separated
-    ``key=value`` params with optionally-quoted values.
-
-    Multi-value params pass through intact: Technitium's ``svcParams``
-    wire format is ``key|value`` pairs comma-joined, and a single param
-    whose value itself contains commas (``alpn|h2,h3``) is accepted and
-    stored as ``{"alpn": "h2,h3"}`` — verified against a live
-    ``technitium/dns-server:15.4.0``. What it rejects is splitting the
-    values into separate pairs (``alpn|h2|h3`` and ``alpn|h2,alpn|h3``
-    both fail with "Requested value 'h3' was not found"), so join on
-    the value, never on the key. Issue #745.
+    The target is relative to ``origin`` unless it ends in a dot (a
+    zone-file rule; Technitium itself has no relative names, so ``svc``
+    sent as-is would be served as ``svc.``). ``svcParams`` goes out in
+    key-number order and ``|``-separated (``alpn|h2,h3|port|443``) — the
+    comma-joined pairs this sent before #1698 only ever parsed for ONE
+    param — or as ``false`` when there are none, since the API requires it.
     """
-    tokens = shlex.split(value)
-    if len(tokens) < 2:
-        return (1, ".", "")
-    priority = int(tokens[0]) if tokens[0].isdigit() else 1
-    # The caller's leading ``value.rstrip(".")`` cannot reach this target —
-    # it is mid-string, with the svcParams after it — so strip the root dot
-    # here. Technitium stores the target un-dotted, and leaving it on makes
-    # every SVCB/HTTPS record read as changed on every reconcile. ``or "."``
-    # keeps a bare apex target from becoming the empty string.
-    target = tokens[1].rstrip(".") or "."
-    parts = []
-    for tok in tokens[2:]:
-        if "=" not in tok:
-            continue
-        key, _, raw_val = tok.partition("=")
-        parts.append(f"{key}|{raw_val}")
-    return (priority, target, ",".join(parts))
+    priority, target, params = _svcb_parse(value, origin)
+    return (priority, target, _svcb_wire(params))
 
 
 # ── rData → add-param normalisation ────────────────────────────────────
@@ -274,8 +597,8 @@ def _svcb_params(value: str) -> tuple[int, str, str]:
 # converged.
 #
 # Types whose rData already matches the add params — A, AAAA, CNAME,
-# DNAME, PTR, NS, MX, SRV, TXT, CAA — are deliberately absent here and
-# pass through untouched.
+# DNAME, PTR, NS, MX, SRV, CAA — are deliberately absent here and pass
+# through untouched.
 
 _TLSA_USAGE = {"PKIX-TA": "0", "PKIX-EE": "1", "DANE-TA": "2", "DANE-EE": "3"}
 _TLSA_SELECTOR = {"Cert": "0", "SPKI": "1"}
@@ -300,6 +623,27 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
     ``_record_params`` produces, so the two are comparable and so a
     delete built from it uses param names the API accepts."""
     out = dict(flat)
+
+    if rtype in ("A", "AAAA") and out.get("ipAddress"):
+        # #1513: canonicalise through ipaddress — the daemon returns
+        # canonical form while the desired side may be hand-typed
+        # expanded/upper-case, and the fingerprint compares strings.
+        out["ipAddress"] = _canonical_ip(str(out["ipAddress"]))
+    # Name-valued fields are case-insensitive; fold case on the
+    # read-back side (the desired side is folded in ``_record_params``)
+    # so a mixed-case target cannot churn (#1513 — the Technitium
+    # case-folding itself is unverified, but folding BOTH sides is
+    # correct regardless of what the daemon does).
+    _name_key = {
+        "CNAME": "cname",
+        "DNAME": "dname",
+        "NS": "nameServer",
+        "PTR": "ptrName",
+        "MX": "exchange",
+        "SRV": "target",
+    }.get(rtype)
+    if _name_key and out.get(_name_key):
+        out[_name_key] = str(out[_name_key]).lower()
 
     def _move(src: str, dst: str, conv: Any = None) -> None:
         if src in out:
@@ -329,18 +673,26 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
         _move("priority", "uriPriority")
         _move("weight", "uriWeight")
         # Technitium normalises a bare-authority URI by appending "/".
-        # Strip a single trailing slash on both sides rather than let
-        # that one character churn the record on every pass.
+        # Strip that one slash on both sides rather than let it churn
+        # the record — but ONLY that one: a path's trailing slash is
+        # significant (#1513).
         if "uri" in out:
-            out["uri"] = str(out["uri"]).rstrip("/")
+            out["uri"] = _strip_bare_authority_slash(str(out["uri"]))
     elif rtype in ("SVCB", "HTTPS"):
-        # svcParams goes out as "k|v,k|v" and comes back as a dict.
-        params = out.get("svcParams")
-        if isinstance(params, dict):
-            out["svcParams"] = ",".join(f"{k}|{v}" for k, v in sorted(params.items()))
-        # An apex target "." is stored as the empty string.
-        if out.get("svcTargetName") == "":
-            out["svcTargetName"] = "."
+        # Rebuild the exact params the desired side sends (#1513): the
+        # daemon reports ``svcParams`` as ``key -> ToString()`` and the
+        # target as stored, which is always absolute.
+        out["svcParams"] = _svcb_wire(_svcb_daemon_params(out.get("svcParams")))
+        out["svcTargetName"] = _svcb_daemon_target(out.get("svcTargetName"))
+    elif rtype == "TXT":
+        # Only characterStringsBase64 is the record exactly (#1694): the
+        # GET's ``text`` joins the strings, so "ab" and "a" "b" read the
+        # same; ``characterStrings`` decodes them as UTF-8; ``splitText``
+        # is derived from the string lengths.
+        strings = out.pop("characterStringsBase64", None) or []
+        for derived in ("text", "splitText", "characterStrings"):
+            out.pop(derived, None)
+        out["characterStringsBase64"] = ",".join(str(s) for s in strings)
     return out
 
 
@@ -354,6 +706,121 @@ def _technitium_master(entry: str) -> str:
     """
     host, sep, port = str(entry).strip().partition("@")
     return f"{host}:{port}" if sep and port else host
+
+
+# SOA fields the zone row owns, besides MNAME / RNAME. Shipped by the bundle
+# from #1171 on; an older control plane leaves them out and the daemon's
+# values stand.
+_SOA_TIMERS = ("refresh", "retry", "expire", "minimum")
+
+
+def _host_name(value: Any) -> str | None:
+    """``value`` as the bare, lower-case host name Technitium reads back, or
+    None when it cannot be one.
+
+    ``primary_ns`` is stored with or without the trailing dot (the zone form
+    keeps it, the importers strip it) and both mean an absolute name, the
+    reading the BIND9 renderer gives it too (#1153). Technitium returns
+    names un-dotted and lower-case, so comparing in that form is what keeps
+    a converged apex from looking changed.
+    """
+    if not isinstance(value, str):
+        return None
+    name = value.strip().rstrip(".").lower()
+    if not name or name == "@" or not name.isascii() or ".." in name:
+        return None
+    if any(c.isspace() for c in name):
+        return None
+    return name
+
+
+def _responsible_person(value: Any) -> str | None:
+    """A zone's ``admin_email`` in the ``user@domain`` form Technitium stores.
+
+    The zone row keeps the RNAME in SOA form (``hostmaster.example.com.``,
+    the first unescaped dot standing for the ``@``). Technitium converts that
+    itself on write, but reads it back as an address, so the comparison has
+    to happen in that form. An address that already has an ``@`` is kept.
+    """
+    if not isinstance(value, str):
+        return None
+    name = value.strip().rstrip(".")
+    if not name or not name.isascii() or any(c.isspace() for c in name):
+        return None
+    if "@" in name:
+        return name.lower()
+    i = 0
+    while True:
+        i = name.find(".", i)
+        if i <= 0:
+            return None
+        if name[i - 1] != "\\":
+            break
+        i += 1
+    local, domain = name[:i].replace("\\.", "."), name[i + 1 :]
+    return f"{local}@{domain}".lower() if domain else None
+
+
+def _zone_apex(zone_name: str, zone: dict[str, Any]) -> dict[str, Any] | None:
+    """The apex a primary zone should serve: its NS set and SOA fields.
+
+    Technitium writes its own apex when it creates a zone: one NS and an
+    SOA MNAME naming the server's host name, which in a pod is the pod
+    name, plus a placeholder RNAME. Left alone, every server in a group
+    answers with a different, unresolvable name server, and the zone's own
+    Primary NS / Admin Email / SOA timers never reach the wire.
+
+    Same precedence as the BIND9 renderer (#1153): the zone's own apex NS
+    records are the NS set, else its ``primary_ns``. MNAME is ``primary_ns``,
+    else the first declared NS. A field the zone does not set is left out,
+    so the daemon's value stands; a zone that sets neither apex NS, Primary
+    NS nor Admin Email returns None and its apex is not touched at all. The
+    bundle ships every zone's SOA timers since #1171, defaults included, so
+    they cannot mean the zone set anything: they ride along only with an
+    apex the zone does set.
+    """
+    zname = zone_name.rstrip(".").lower()
+    declared: list[str] = []
+    for rec in zone.get("records") or []:
+        if (rec.get("type") or "").upper() != "NS":
+            continue
+        if _qualified_name(zname, rec.get("name") or "@").lower() != zname:
+            continue
+        value = str(rec.get("value") or "").strip()
+        # Read the target as a zone file would: ``@`` is the apex, a name
+        # without the trailing dot is relative to the zone.
+        if value in ("", "@"):
+            host: str | None = zname
+        elif value.endswith("."):
+            host = _host_name(value)
+        else:
+            host = _host_name(f"{value}.{zname}")
+        if host and host not in declared:
+            declared.append(host)
+
+    primary = _host_name(zone.get("primary_ns"))
+    ns = declared or ([primary] if primary else [])
+
+    soa: dict[str, Any] = {}
+    mname = primary or (declared[0] if declared else None)
+    if mname:
+        soa["primaryNameServer"] = mname
+    rname = _responsible_person(zone.get("admin_email"))
+    if rname:
+        soa["responsiblePerson"] = rname
+    if not ns and not soa:
+        return None
+    for field in _SOA_TIMERS:
+        timer = zone.get(field)
+        if isinstance(timer, int) and not isinstance(timer, bool) and timer >= 0:
+            soa[field] = timer
+    ttl = zone.get("ttl")
+    apex: dict[str, Any] = {"ns": ns, "soa": soa}
+    if isinstance(ttl, int) and not isinstance(ttl, bool) and ttl > 0:
+        # The SOA record's own TTL caps negative caching together with
+        # MINIMUM (RFC 2308), and BIND serves it at the zone's $TTL.
+        apex["ttl"] = ttl
+    return apex
 
 
 def _tsig_key_names(bundle: dict[str, Any]) -> list[str]:
@@ -550,33 +1017,86 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any]:
+def _txt_params(value: str) -> dict[str, Any]:
+    """A TXT value as the character-strings it stands for (#1694).
+
+    Technitium's ``text`` param is the text itself, so the quotes of an
+    already-quoted value (``"v=spf1 -all"``, as providers print SPF,
+    DMARC and DKIM values) were served as part of the string, two quoted
+    strings could not stay two, and a ``\\DDD`` octet that is not UTF-8
+    could not be sent at all. ``characterStringsBase64`` takes the strings
+    themselves, octet for octet, comma-separated. They come from the parse
+    the BIND9 and PowerDNS drivers render (``_txt.txt_strings``), so the
+    three engines serve the same strings, and the record GET hands the same
+    list back for ``_normalize_rdata`` to compare and delete by.
+
+    Technitium cannot hold an empty character-string: it drops one from the
+    list, and a record left with no string at all is served as a malformed
+    packet. So empty strings are left out here as well, and what is compared
+    is what the server holds. A value that is nothing but empty strings
+    (``""``) goes as its text, as it did before #1694, and an empty value is
+    refused by the server, as before.
+    """
+    strings = [s for s in txt_strings(value) if s]
+    if not strings:
+        if not value:
+            return {"text": ""}
+        # As the ``text`` param took it: one string, cut every 255 octets.
+        raw = value.encode("utf-8")
+        strings = [raw[i : i + 255] for i in range(0, len(raw), 255)]
+    return {
+        "characterStringsBase64": ",".join(
+            base64.b64encode(s).decode("ascii") for s in strings
+        )
+    }
+
+
+def _record_params(
+    rtype: str, value: str, rec: dict[str, Any], origin: str | None = None
+) -> dict[str, Any]:
     """Build the type-specific param dict for
     ``/api/zones/records/{add,delete}`` — shared by both endpoints since
     ``delete`` requires the exact same value params to identify the record.
     """
+    if rtype in ("SVCB", "HTTPS"):
+        # Before the blanket rstrip: a trailing dot on the TARGET is what
+        # says it is absolute (a bare one is relative to the zone).
+        # ``svcParams`` is always sent: the API requires it (``false`` = none).
+        priority, target, params = _svcb_params(value, origin)
+        return {"svcPriority": priority, "svcTargetName": target, "svcParams": params}
+    if rtype == "TXT":
+        # Text, not a name: it keeps a trailing full stop (#1694).
+        return _txt_params(value)
     value = value.rstrip(".")
     if rtype in ("A", "AAAA"):
-        return {"ipAddress": value}
+        # Canonicalised (#1513) so the desired side matches the daemon's
+        # canonical read-back regardless of how the operator typed it.
+        return {"ipAddress": _canonical_ip(value)}
+    # Name-valued targets are folded to lower case on BOTH sides of the
+    # fingerprint (#1513); DNS names are case-insensitive.
     if rtype == "CNAME":
-        return {"cname": value}
+        return {"cname": value.lower()}
     if rtype == "DNAME":
-        return {"dname": value}
+        return {"dname": value.lower()}
     if rtype == "NS":
-        return {"nameServer": value}
+        return {"nameServer": value.lower()}
     if rtype == "PTR":
-        return {"ptrName": value}
+        return {"ptrName": value.lower()}
     if rtype == "MX":
-        return {"exchange": value, "preference": rec.get("priority") or 10}
+        # Absence, not falsiness — preference 0 is the highest priority
+        # (Microsoft 365 publishes it), and ``or 10`` silently promoted
+        # it to a backup. Issue #1518.
+        return {
+            "exchange": value.lower(),
+            "preference": rec.get("priority") if rec.get("priority") is not None else 10,
+        }
     if rtype == "SRV":
         return {
-            "target": value,
-            "priority": rec.get("priority") or 0,
-            "weight": rec.get("weight") or 0,
-            "port": rec.get("port") or 0,
+            "target": value.lower(),
+            "priority": rec.get("priority") if rec.get("priority") is not None else 0,
+            "weight": rec.get("weight") if rec.get("weight") is not None else 0,
+            "port": rec.get("port") if rec.get("port") is not None else 0,
         }
-    if rtype == "TXT":
-        return {"text": value}
     if rtype == "CAA":
         # value shape: "<flags> <tag> <target>", e.g. '0 issue "letsencrypt.org"'
         tokens = shlex.split(value)
@@ -618,16 +1138,13 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
         return {
             "uriPriority": tokens[0] if len(tokens) > 0 else "1",
             "uriWeight": tokens[1] if len(tokens) > 1 else "1",
-            # Trailing slash stripped on both sides — Technitium appends
-            # one to a bare-authority URI when it stores the record.
-            "uri": tokens[2].rstrip("/") if len(tokens) > 2 else "",
+            # Only a bare-authority trailing slash is stripped (#1513) —
+            # Technitium appends one there when it stores the record,
+            # but a path's trailing slash is part of the target.
+            "uri": (
+                _strip_bare_authority_slash(tokens[2]) if len(tokens) > 2 else ""
+            ),
         }
-    if rtype in ("SVCB", "HTTPS"):
-        priority, target, params = _svcb_params(value)
-        out: dict[str, Any] = {"svcPriority": priority, "svcTargetName": target}
-        if params:
-            out["svcParams"] = params
-        return out
     # Unrecognised type — pass the raw value through under a best-guess key
     # so the API's own error message tells us what's missing, rather than
     # silently dropping the record.
@@ -636,6 +1153,38 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
 
 class TechnitiumDriver(DriverBase):
     """Technitium agent driver — v1."""
+
+    # Per-apply refusal collector (#1516). ``swap_and_reload`` installs a
+    # list here; the log-and-continue helpers below append every step the
+    # daemon refused, and ``swap_and_reload`` hands the list to
+    # ``refused_zones()`` (#1280's partial apply). The apply still lands:
+    # the sync loop reports the refusals, commits the bundle and keeps
+    # draining record ops, instead of quarantining the whole bundle and
+    # holding back every later change behind the one refused record. A
+    # transport / auth failure is not a refusal — ``_call`` raises those,
+    # which fails the apply as before. ``None`` outside an apply (record
+    # ops, direct helper calls) means "log only", preserving the helpers'
+    # standalone behaviour.
+    _apply_failures: list[str] | None = None
+
+    # How a dot-less SVCB / HTTPS target in the bundle is read (#1513). A
+    # control plane from before #1513 rendered a dot-less target meaning
+    # ABSOLUTE (it was sent to the daemon as-is, and Technitium has no
+    # relative names); one from #1513 on means relative to the zone, as in a
+    # zone file, and says so with ``svcb_target_rule: "zone-file"`` in the
+    # bundle. Set by ``render`` from the bundle being applied, so replaying a
+    # cached bundle from the older control plane keeps its own meaning, and
+    # read by ``apply_record_op`` for ops shipped beside that bundle.
+    _svcb_zone_file_targets: bool = False
+
+    def _note_apply_failure(self, what: str) -> None:
+        if self._apply_failures is not None:
+            self._apply_failures.append(what)
+
+    def _svcb_origin(self, zone: str) -> str | None:
+        """The origin a dot-less SVCB target is relative to, or ``None`` when
+        the applied bundle predates #1513 and a dot-less target is absolute."""
+        return zone if self._svcb_zone_file_targets else None
 
 
     # ── Render / validate / swap ────────────────────────────────────────────
@@ -654,8 +1203,30 @@ class TechnitiumDriver(DriverBase):
             shutil.rmtree(new_dir)
         new_dir.mkdir(parents=True)
 
+        self._svcb_zone_file_targets = bundle.get(SVCB_TARGET_RULE_KEY) == SVCB_TARGET_RULE_ZONE_FILE
+
+        raw_zones = bundle.get("zones")
+        if not isinstance(raw_zones, list):
+            raw_zones = None
+        # Every zone name the bundle carries, including the ones skipped
+        # below: ``_retire_dropped_zones`` must not delete a zone SpatiumDDI
+        # still has just because this driver could not render it. ``None``
+        # when the bundle has no zone list at all, which is not the same
+        # claim as an empty one and retires nothing.
+        bundle_zone_names = (
+            None
+            if raw_zones is None
+            else sorted(
+                {
+                    str(z.get("name") or "").rstrip(".").lower()
+                    for z in raw_zones
+                    if isinstance(z, dict) and str(z.get("name") or "").rstrip(".")
+                }
+            )
+        )
+
         zones_payload = []
-        for zone in bundle.get("zones", []) or []:
+        for zone in raw_zones or []:
             zname = (zone.get("name") or "").rstrip(".")
             if not zname:
                 continue
@@ -695,16 +1266,30 @@ class TechnitiumDriver(DriverBase):
                         continue
                     name = _qualified_name(zname, rec.get("name") or "@")
                     if rtype == "NS" and name == zname:
-                        # Apex NS is daemon-managed (created at zone-create
-                        # time, pointed at the container's own hostname).
-                        # Off-apex NS (delegations) are handled normally.
+                        # Apex NS is reconciled with the SOA, as a set
+                        # (``_zone_apex`` / ``_reconcile_zone_apex``), not
+                        # record by record: the daemon writes its own apex
+                        # NS at zone create. Off-apex NS (delegations) are
+                        # handled normally.
                         continue
+                    # Absence, not falsiness — a TTL of 0 means "never
+                    # cache" and must survive the structural reconcile
+                    # exactly as the incremental op path writes it.
+                    # Issue #1518.
+                    _rec_ttl = rec.get("ttl")
+                    _zone_ttl = zone.get("ttl")
                     records.append(
                         {
                             "domain": name,
                             "type": rtype,
-                            "ttl": rec.get("ttl") or zone.get("ttl") or 3600,
-                            **_record_params(rtype, rec.get("value") or "", rec),
+                            "ttl": (
+                                _rec_ttl
+                                if _rec_ttl is not None
+                                else (_zone_ttl if _zone_ttl is not None else 3600)
+                            ),
+                            **_record_params(
+                                rtype, rec.get("value") or "", rec, self._svcb_origin(zname)
+                            ),
                         }
                     )
 
@@ -721,6 +1306,10 @@ class TechnitiumDriver(DriverBase):
                 entry["masters"] = masters
             if forwarders:
                 entry["forwarders"] = forwarders
+            if ztype in _RECORD_MANAGED_ZONE_TYPES:
+                apex = _zone_apex(zname, zone)
+                if apex is not None:
+                    entry["apex"] = apex
             zones_payload.append(entry)
 
 
@@ -748,6 +1337,7 @@ class TechnitiumDriver(DriverBase):
                 if (k.get("name") or "").rstrip(".")
             ],
             "catalog": catalog,
+            "bundle_zone_names": bundle_zone_names,
         }
         self._write_secret(
             new_dir / "server.json", json.dumps(server_payload, indent=2)
@@ -791,44 +1381,183 @@ class TechnitiumDriver(DriverBase):
         zones_path = current / "zones.json"
         try:
             payload = json.loads(zones_path.read_text())
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.error("technitium_zones_payload_unreadable", error=str(exc))
-            return
+            # #1516: returning normally here read as a successful apply —
+            # the sync loop advanced the etag, reported the serials as
+            # served and committed the bundle as last-known-good with
+            # nothing applied at all. Raise so the #882 quarantine /
+            # revert path engages and the bundle is retried — this is our
+            # own state failing, not the daemon refusing data.
+            raise RuntimeError(f"technitium zones.json unreadable: {exc}") from exc
 
         token = self._get_api_token()
         if token is None:
             log.error("technitium_reconcile_skipped_no_token")
-            return
+            raise RuntimeError("technitium reconcile skipped: no API token available")
 
         # TSIG keys first: a zone's ``zoneTransferTsigKeyNames`` is accepted
         # even when it names a key the server does not have (verified — the
         # API stores it happily), and the failure only shows up later as a
         # refused transfer. Push the keys before anything references them.
-        server_path = current / "server.json"
-        server_state: dict[str, Any] = {}
-        if server_path.exists():
-            try:
-                server_state = json.loads(server_path.read_text())
-            except ValueError as exc:
-                log.error("technitium_server_payload_unreadable", error=str(exc))
-        if server_state.get("tsig_keys"):
-            self._sync_tsig_keys(token, server_state["tsig_keys"])
+        #
+        # Every step below still runs even when an earlier one is refused
+        # (#1516): attempt everything, collect the refusals, and report
+        # them through ``refused_zones()`` so the apply reads as a partial
+        # one rather than as success (#1280's model).
+        self._apply_failures = []
+        try:
+            server_path = current / "server.json"
+            server_state: dict[str, Any] = {}
+            server_state_known = False
+            if server_path.exists():
+                try:
+                    server_state = json.loads(server_path.read_text())
+                    server_state_known = True
+                except ValueError as exc:
+                    # Our own render, unreadable: the TSIG / transport /
+                    # blocking state is unknown rather than refused, so this
+                    # fails the apply outright.
+                    log.error("technitium_server_payload_unreadable", error=str(exc))
+                    raise RuntimeError(f"technitium server.json unreadable: {exc}") from exc
+            # #1517: unconditional whenever server.json was readable —
+            # an emptied key list is a real desired state and the callee
+            # clears every key on the daemon. Only an unreadable (or
+            # missing) server.json skips it: then the desired list is
+            # unknown, not empty, and clearing would be a guess.
+            if server_state_known:
+                self._sync_tsig_keys(token, server_state.get("tsig_keys") or [])
 
-        # Encrypted listeners + upstream forwarding (#741). Before the zone
-        # reconcile so a slow zone pass cannot delay bringing a listener up.
-        server_options = server_state.get("options") or {}
-        if server_options:
-            self._apply_transport_settings(
-                token, server_options, server_state.get("tls_cert")
+            # Encrypted listeners + upstream forwarding (#741). Before the zone
+            # reconcile so a slow zone pass cannot delay bringing a listener up.
+            server_options = server_state.get("options") or {}
+            if server_options:
+                self._apply_transport_settings(
+                    token, server_options, server_state.get("tls_cert")
+                )
+                self._apply_forwarders(token, server_options)
+
+            # Blocklists (#744). Always applied, even when empty — an emptied
+            # list has to actually clear on the daemon.
+            self._apply_blocking(token, server_state.get("blocking") or {})
+
+            # Retire before reconciling: Technitium files a parent's record
+            # under the closest zone it hosts, so a dropped child zone that
+            # shadows it takes the record along on delete. The reconcile
+            # below then puts it back in the parent in the same pass.
+            self._retire_dropped_zones(
+                token,
+                payload,
+                backup / "zones.json",
+                bundle_zone_names=server_state.get("bundle_zone_names"),
             )
-            self._apply_forwarders(token, server_options)
+            self._reconcile_zones(token, payload)
+            self._apply_catalog(token, server_state.get("catalog"), payload)
+            failures = list(self._apply_failures)
+        finally:
+            self._apply_failures = None
+        # Partial apply, not a failure (#1280): every step the daemon took is
+        # live, and re-applying this bundle or the last-known-good cannot make
+        # it accept what it just refused — the QA walk of #1608 showed a
+        # raise here quarantining the bundle, holding back every later change
+        # to the group, and the revert deleting records it had just added.
+        self._refused_zones = tuple(failures)
+        if failures:
+            log.warning(
+                "technitium_apply_partly_refused", count=len(failures), refused=failures[:10]
+            )
 
-        # Blocklists (#744). Always applied, even when empty — an emptied
-        # list has to actually clear on the daemon.
-        self._apply_blocking(token, server_state.get("blocking") or {})
+    def _managed_zones_path(self) -> Path:
+        return self.state_dir / _MANAGED_ZONES_FILE
 
-        self._reconcile_zones(token, payload)
-        self._apply_catalog(token, server_state.get("catalog"), payload)
+    def _retire_dropped_zones(
+        self,
+        token: str,
+        payload: list[dict[str, Any]],
+        previous_render: Path,
+        *,
+        bundle_zone_names: list[str] | None,
+    ) -> None:
+        """Delete the zones this agent put on the daemon that the bundle dropped.
+
+        ``_reconcile_zones`` creates every zone in the bundle and never
+        deletes one, so a zone deleted in SpatiumDDI kept answering on every
+        Technitium server, authoritatively, with the records it last had.
+        BIND9 has no such gap: a zone that leaves the bundle leaves
+        ``named.conf``.
+
+        Only zones in the ledger are candidates, and the ledger holds only
+        names this agent got from a bundle. A zone an operator created on
+        the daemon directly is never in it, so it is never touched. The
+        ledger is seeded from the previous render the first time (an agent
+        upgraded from a version without it), so a zone dropped by the very
+        bundle that brought the upgrade is still retired; anything orphaned
+        before that is left for the operator. A delete that fails keeps its
+        name in the ledger so the next pass retries it.
+
+        Retirement follows the zone list the control plane sent, not what
+        this driver managed to render, so two cases hold it back:
+
+        * ``bundle_zone_names`` is ``None``: the bundle had no zone list
+          (key absent, ``null``, not a list) or ``server.json`` could not be
+          read. Nothing is deleted and the ledger is kept. An explicit empty
+          list is different: it is what a group with no zones sends, and
+          every zone in the ledger is retired, as BIND9 empties
+          ``named.conf``.
+        * A zone the bundle still names but the render skipped (a type
+          Technitium cannot serve, a secondary with no primaries, a
+          forwarder with no upstream) stays, and stays in the ledger.
+        """
+        desired = {str(z.get("zone") or "").lower() for z in payload if z.get("zone")}
+        path = self._managed_zones_path()
+        managed: set[str]
+        try:
+            managed = {str(n).lower() for n in json.loads(path.read_text())}
+        except FileNotFoundError:
+            managed = set()
+            try:
+                previous = json.loads(previous_render.read_text())
+                managed = {str(z.get("zone") or "").lower() for z in previous if z.get("zone")}
+            except (OSError, ValueError, AttributeError):
+                pass
+        except (OSError, ValueError, TypeError) as exc:
+            # An unreadable ledger must not turn into "delete nothing ever"
+            # silently, nor into a guess. Rebuild it from this bundle.
+            log.warning("technitium_managed_zones_unreadable", error=str(exc))
+            managed = set()
+
+        if not isinstance(bundle_zone_names, list):
+            if managed - desired:
+                log.warning(
+                    "technitium_zone_retire_held_back",
+                    reason="bundle_has_no_zone_list",
+                    zones=sorted(managed - desired),
+                )
+            self._write_secret(path, json.dumps(sorted(managed | desired)))
+            return
+
+        named = {str(n).lower() for n in bundle_zone_names}
+        held = (managed - desired) & named
+        if held:
+            log.warning(
+                "technitium_zone_retire_held_back",
+                reason="zone_still_in_bundle",
+                zones=sorted(held),
+            )
+
+        kept: set[str] = set()
+        for zone in sorted(managed - desired - named):
+            body = self._call(token, "POST", "zones/delete", {"zone": zone}).json()
+            error = body.get("errorMessage") or ""
+            if body.get("status") == "ok":
+                log.info("technitium_zone_retired", zone=zone)
+            elif "no such zone" in error.lower() or "does not exist" in error.lower():
+                pass  # already gone, e.g. removed by hand
+            else:
+                kept.add(zone)
+                log.warning("technitium_zone_retire_failed", zone=zone, error=error)
+
+        self._write_secret(path, json.dumps(sorted(desired | held | kept)))
 
     def _sync_tsig_keys(self, token: str, keys: list[dict[str, Any]]) -> None:
         """Publish the bundle's TSIG keys into Technitium's global settings.
@@ -872,6 +1601,7 @@ class TechnitiumDriver(DriverBase):
             log.error(
                 "technitium_tsig_keys_apply_failed", error=body.get("errorMessage")
             )
+            self._note_apply_failure(f"tsig keys: {body.get('errorMessage')}")
         else:
             log.info("technitium_tsig_keys_applied", count=len(tokens) // 3)
 
@@ -891,6 +1621,15 @@ class TechnitiumDriver(DriverBase):
         **Neither** (catalog turned off) clears membership. Without that,
         disabling catalog zones would leave every member permanently
         enrolled, because nothing else ever touches the option.
+
+        The catalog zone itself is also deleted whenever it stops
+        being the desired one (issue #1519): catalog off, a renamed
+        catalog zone, or a producer↔consumer flip. A flip has to delete
+        first — creating the new role under the same name answers
+        "already exists", which the create path treats as success, so
+        the zone would silently keep its old type. The previously
+        applied role is read from agent state (``_CATALOG_STATE_FILE``)
+        because a disabled catalog block carries no zone name at all.
         """
         cat_name = (catalog or {}).get("zone_name") or ""
         cat_name = cat_name.rstrip(".")
@@ -904,7 +1643,9 @@ class TechnitiumDriver(DriverBase):
                     zone=cat_name or None,
                     producer=producer,
                 )
+                self._note_apply_failure("catalog consumer: incomplete catalog block")
                 return
+            self._retire_stale_catalog_zone(token, cat_name, mode)
             self._ensure_zone_exists(
                 token,
                 {
@@ -913,7 +1654,11 @@ class TechnitiumDriver(DriverBase):
                     "masters": [str(producer)],
                 },
             )
+            self._save_catalog_state({"zone_name": cat_name, "mode": mode})
             return
+
+        desired_type = _CATALOG_ZONE_TYPES.get(mode or "") if cat_name else None
+        self._retire_stale_catalog_zone(token, cat_name, mode)
 
         if mode == "producer" and cat_name:
             self._ensure_zone_exists(token, {"zone": cat_name, "type": "Catalog"})
@@ -936,6 +1681,65 @@ class TechnitiumDriver(DriverBase):
                     catalog=desired or None,
                     error=body.get("errorMessage"),
                 )
+                self._note_apply_failure(
+                    f"catalog membership {zone}: {body.get('errorMessage')}"
+                )
+        self._save_catalog_state(
+            {"zone_name": cat_name, "mode": mode} if desired_type else None
+        )
+
+    # ── Catalog-zone state (issue #1519) ───────────────────────────────
+
+    def _catalog_state_path(self) -> Path:
+        return self.state_dir / _CATALOG_STATE_FILE
+
+    def _load_catalog_state(self) -> dict[str, Any] | None:
+        try:
+            state = json.loads(self._catalog_state_path().read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(state, dict) or not state.get("zone_name"):
+            return None
+        return state
+
+    def _save_catalog_state(self, state: dict[str, Any] | None) -> None:
+        path = self._catalog_state_path()
+        if state is None:
+            path.unlink(missing_ok=True)
+            return
+        path.write_text(json.dumps(state))
+
+    def _retire_stale_catalog_zone(
+        self, token: str, cat_name: str, mode: str | None
+    ) -> None:
+        """Delete the previously applied catalog zone if it is no
+        longer the desired one (different name, different role, or
+        catalog now off)."""
+        prev = self._load_catalog_state()
+        if prev is None:
+            return
+        prev_name = str(prev.get("zone_name") or "").rstrip(".")
+        prev_type = _CATALOG_ZONE_TYPES.get(str(prev.get("mode") or ""))
+        if not prev_name or prev_type is None:
+            return
+        desired_type = _CATALOG_ZONE_TYPES.get(mode or "") if cat_name else None
+        if prev_name == cat_name and prev_type == desired_type:
+            return
+        resp = self._call(token, "POST", "zones/delete", {"zone": prev_name})
+        body = resp.json()
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_catalog_zone_delete_failed",
+                zone=prev_name,
+                zone_type=prev_type,
+                error=body.get("errorMessage"),
+            )
+        else:
+            log.info(
+                "technitium_catalog_zone_retired",
+                zone=prev_name,
+                zone_type=prev_type,
+            )
 
     def _wait_for_api_up(self, *, timeout_s: float = 15.0) -> None:
         deadline = time.monotonic() + timeout_s
@@ -1026,7 +1830,7 @@ class TechnitiumDriver(DriverBase):
             "domain": name,
             "zone": zone,
             "type": rtype,
-            **_record_params(rtype, rec.get("value") or "", rec),
+            **_record_params(rtype, rec.get("value") or "", rec, self._svcb_origin(zone)),
         }
 
         # #773 — the control plane ships the complete desired RRset. Technitium's
@@ -1071,7 +1875,12 @@ class TechnitiumDriver(DriverBase):
                             "type": rtype,
                             "ttl": rrset_ttl,
                             "overwrite": "true" if index == 0 else "false",
-                            **_record_params(rtype, member.get("value") or "", member),
+                            **_record_params(
+                                rtype,
+                                member.get("value") or "",
+                                member,
+                                self._svcb_origin(zone),
+                            ),
                         },
                         zone,
                         name,
@@ -1185,6 +1994,7 @@ class TechnitiumDriver(DriverBase):
                 value=blocking_type,
                 supported=sorted(_BLOCKING_TYPES),
             )
+            self._note_apply_failure(f"blocking: invalid type {blocking_type}")
             return
 
         settings: dict[str, Any] = {
@@ -1206,6 +2016,7 @@ class TechnitiumDriver(DriverBase):
             log.error(
                 "technitium_blocking_settings_failed", error=body.get("errorMessage")
             )
+            self._note_apply_failure(f"blocking settings: {body.get('errorMessage')}")
             return
 
         unchanged: list[str] = []
@@ -1223,6 +2034,9 @@ class TechnitiumDriver(DriverBase):
                     f"technitium_{kind}_flush_failed",
                     error=flushed.get("errorMessage"),
                 )
+                self._note_apply_failure(
+                    f"blocking {kind} flush: {flushed.get('errorMessage')}"
+                )
                 continue
             for start in range(0, len(desired), _BLOCKING_IMPORT_CHUNK):
                 chunk = desired[start : start + _BLOCKING_IMPORT_CHUNK]
@@ -1235,6 +2049,10 @@ class TechnitiumDriver(DriverBase):
                         first=chunk[0],
                         count=len(chunk),
                         error=imported.get("errorMessage"),
+                    )
+                    self._note_apply_failure(
+                        f"blocking {kind} import ({len(chunk)} from {chunk[0]}): "
+                        f"{imported.get('errorMessage')}"
                     )
         log.info(
             "technitium_blocking_applied",
@@ -1342,6 +2160,7 @@ class TechnitiumDriver(DriverBase):
         if wants_tls:
             if not cert_path:
                 log.error("technitium_encrypted_transport_skipped_no_cert")
+                self._note_apply_failure("encrypted transport: no usable TLS cert")
                 cert_ok = False
             else:
                 body = self._call(
@@ -1352,6 +2171,9 @@ class TechnitiumDriver(DriverBase):
                         "technitium_tls_cert_path_rejected",
                         path=cert_path,
                         error=body.get("errorMessage"),
+                    )
+                    self._note_apply_failure(
+                        f"tls cert path: {body.get('errorMessage')}"
                     )
                     cert_ok = False
 
@@ -1394,6 +2216,9 @@ class TechnitiumDriver(DriverBase):
             log.error(
                 "technitium_transport_settings_failed", error=body.get("errorMessage")
             )
+            self._note_apply_failure(
+                f"transport settings: {body.get('errorMessage')}"
+            )
             return
         log.info(
             "technitium_transport_settings_applied",
@@ -1423,6 +2248,7 @@ class TechnitiumDriver(DriverBase):
         protocol = _FORWARDER_PROTOCOLS.get(transport)
         if protocol is None:
             log.warning("technitium_forward_transport_unsupported", transport=transport)
+            self._note_apply_failure(f"forwarders: unsupported transport {transport}")
             return
 
         if not forwarders:
@@ -1437,6 +2263,9 @@ class TechnitiumDriver(DriverBase):
             if body.get("status") != "ok":
                 log.error(
                     "technitium_forwarders_clear_failed", error=body.get("errorMessage")
+                )
+                self._note_apply_failure(
+                    f"forwarders clear: {body.get('errorMessage')}"
                 )
             else:
                 log.info("technitium_forwarders_cleared")
@@ -1460,6 +2289,9 @@ class TechnitiumDriver(DriverBase):
                     transport=transport,
                     hint="forward_tls_hostname is required for tls/https/quic",
                 )
+                self._note_apply_failure(
+                    f"forwarders: no forward_tls_hostname for {transport}"
+                )
                 return
 
         resp = self._call(
@@ -1475,6 +2307,7 @@ class TechnitiumDriver(DriverBase):
                 protocol=protocol,
                 error=body.get("errorMessage"),
             )
+            self._note_apply_failure(f"forwarders: {body.get('errorMessage')}")
             return
         log.info(
             "technitium_forwarders_applied", protocol=protocol, count=len(forwarders)
@@ -1593,10 +2426,9 @@ class TechnitiumDriver(DriverBase):
         records present on the daemon but absent from desired state and
         add records present in desired state but absent on the daemon.
 
-        Zones present on the daemon but absent from ``payload`` are NOT
-        deleted — same safety stance as the other drivers (operators
-        delete a zone explicitly, it doesn't disappear from a sync
-        glitch).
+        Zones absent from ``payload`` are not deleted here. A zone this
+        agent created and the bundle has since dropped is retired by
+        ``_retire_dropped_zones``; a zone it never managed is left alone.
         """
         for zone_payload in payload:
             zone = zone_payload["zone"]
@@ -1673,6 +2505,10 @@ class TechnitiumDriver(DriverBase):
                             record=rec,
                             error=body.get("errorMessage"),
                         )
+                        self._note_apply_failure(
+                            f"{zone}: record delete {rec.get('domain')} {rec.get('type')}: "
+                            f"{body.get('errorMessage')}"
+                        )
                 else:
                     deleted += 1
 
@@ -1695,6 +2531,10 @@ class TechnitiumDriver(DriverBase):
                             record=rec,
                             error=body.get("errorMessage"),
                         )
+                        self._note_apply_failure(
+                            f"{zone}: record add {rec.get('domain')} {rec.get('type')}: "
+                            f"{body.get('errorMessage')}"
+                        )
                     continue
                 added += 1
             if added or deleted:
@@ -1704,6 +2544,131 @@ class TechnitiumDriver(DriverBase):
                     added=added,
                     deleted=deleted,
                 )
+            self._reconcile_zone_apex(token, zone, zone_payload.get("apex"))
+
+    def _reconcile_zone_apex(self, token: str, zone: str, apex: dict[str, Any] | None) -> None:
+        """Bring a primary zone's SOA and apex NS set in line with ``apex``.
+
+        Both are written only when they differ from what the daemon serves.
+        A SOA update makes Technitium bump the serial (verified against
+        15.4: it requires the current serial and stores current + 1), so an
+        unconditional write would change every zone's serial on every pass.
+
+        NS targets are added before the old ones are removed, so the zone is
+        never left without a name server, even if a call fails halfway.
+        """
+        if not apex:
+            return
+        resp = self._call(token, "GET", "zones/records/get", {"domain": zone, "zone": zone})
+        try:
+            body = resp.json()
+        except ValueError:
+            return
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_zone_apex_read_failed", zone=zone, error=body.get("errorMessage")
+            )
+            return
+        records = body.get("response", {}).get("records") or []
+        apex_name = zone.rstrip(".").lower()
+        at_apex = [r for r in records if (r.get("name") or "").lower() == apex_name]
+        soa = next((r for r in at_apex if r.get("type") == "SOA"), None)
+        live_ns = [
+            str((r.get("rData") or {}).get("nameServer") or "").rstrip(".").lower()
+            for r in at_apex
+            if r.get("type") == "NS"
+        ]
+
+        soa_changed = False
+        desired_soa = apex.get("soa") or {}
+        ttl = apex.get("ttl")
+        if soa is not None and (desired_soa or ttl):
+            current = soa.get("rData") or {}
+            current_fields: dict[str, Any] = {
+                key: str(current.get(key) or "").rstrip(".").lower()
+                for key in ("primaryNameServer", "responsiblePerson")
+            }
+            current_fields.update({f: current.get(f) for f in _SOA_TIMERS})
+            differs = any(current_fields.get(k) != v for k, v in desired_soa.items())
+            if ttl and soa.get("ttl") != ttl:
+                differs = True
+            if differs:
+                params: dict[str, Any] = {
+                    "zone": zone,
+                    "domain": zone,
+                    "type": "SOA",
+                    "serial": current.get("serial"),
+                    "ttl": ttl or soa.get("ttl"),
+                    **{k: current_fields[k] for k in ("primaryNameServer", "responsiblePerson")},
+                    **{f: current.get(f) for f in _SOA_TIMERS},
+                }
+                params.update(desired_soa)
+                body = self._call(token, "POST", "zones/records/update", params).json()
+                if body.get("status") == "ok":
+                    soa_changed = True
+                else:
+                    log.warning(
+                        "technitium_zone_soa_update_failed",
+                        zone=zone,
+                        error=body.get("errorMessage"),
+                    )
+
+        added: list[str] = []
+        removed: list[str] = []
+        desired_ns = apex.get("ns") or []
+        if desired_ns:
+            for target in desired_ns:
+                if target in live_ns:
+                    continue
+                body = self._call(
+                    token,
+                    "POST",
+                    "zones/records/add",
+                    {
+                        "zone": zone,
+                        "domain": zone,
+                        "type": "NS",
+                        "ttl": ttl or 3600,
+                        "nameServer": target,
+                    },
+                ).json()
+                if body.get("status") == "ok":
+                    added.append(target)
+                else:
+                    log.warning(
+                        "technitium_zone_apex_ns_add_failed",
+                        zone=zone,
+                        name_server=target,
+                        error=body.get("errorMessage"),
+                    )
+            # Only drop the old set once the new one is in place.
+            if all(t in live_ns or t in added for t in desired_ns):
+                for target in live_ns:
+                    if target in desired_ns:
+                        continue
+                    body = self._call(
+                        token,
+                        "POST",
+                        "zones/records/delete",
+                        {"zone": zone, "domain": zone, "type": "NS", "nameServer": target},
+                    ).json()
+                    if body.get("status") == "ok":
+                        removed.append(target)
+                    else:
+                        log.warning(
+                            "technitium_zone_apex_ns_delete_failed",
+                            zone=zone,
+                            name_server=target,
+                            error=body.get("errorMessage"),
+                        )
+        if soa_changed or added or removed:
+            log.info(
+                "technitium_zone_apex_reconciled",
+                zone=zone,
+                soa_updated=soa_changed,
+                ns_added=added,
+                ns_removed=removed,
+            )
 
     def _ensure_zone_exists(self, token: str, entry: dict[str, Any]) -> None:
         """Create the zone if absent, with the params its type requires.
@@ -1763,6 +2728,9 @@ class TechnitiumDriver(DriverBase):
                 zone=zone,
                 zone_type=ztype,
                 error=body.get("errorMessage"),
+            )
+            self._note_apply_failure(
+                f"{zone}: zone create: {body.get('errorMessage')}"
             )
 
     def _reconcile_zone_type(self, token: str, zone: str, ztype: str) -> None:
@@ -1830,6 +2798,9 @@ class TechnitiumDriver(DriverBase):
                 zone=zone,
                 zone_type=ztype,
                 error=body.get("errorMessage"),
+            )
+            self._note_apply_failure(
+                f"{zone}: zone upstream: {body.get('errorMessage')}"
             )
 
     def _apex_records(self, token: str, zone: str) -> list[dict[str, Any]] | None:
@@ -1975,6 +2946,7 @@ class TechnitiumDriver(DriverBase):
                 value=transfer,
                 supported=sorted(_ZONE_TRANSFER_VALUES),
             )
+            self._note_apply_failure(f"{zone}: zone options: bad zoneTransfer {transfer}")
             return
 
         params: dict[str, Any] = {"zone": zone}
@@ -1990,6 +2962,9 @@ class TechnitiumDriver(DriverBase):
                 zone=zone,
                 error=body.get("errorMessage"),
             )
+            self._note_apply_failure(
+                f"{zone}: zone options: {body.get('errorMessage')}"
+            )
 
     def _get_zone_records(self, token: str, zone: str) -> list[dict[str, Any]]:
         resp = self._call(
@@ -2001,8 +2976,15 @@ class TechnitiumDriver(DriverBase):
         try:
             body = resp.json()
         except ValueError:
+            self._note_apply_failure(f"{zone}: zone records get: non-JSON response")
             return []
         if body.get("status") != "ok":
+            # Reading an empty/error body as "zone is empty" would make
+            # the reconcile re-add everything and report the refused
+            # reads as churn (#1516).
+            self._note_apply_failure(
+                f"{zone}: zone records get: {body.get('errorMessage') or body.get('status')}"
+            )
             return []
         out = []
         for rec in body.get("response", {}).get("records") or []:
@@ -2025,19 +3007,14 @@ class TechnitiumDriver(DriverBase):
                 continue
             flat = {"domain": rec.get("name"), "type": rtype, "ttl": rec.get("ttl")}
             flat.update(rec.get("rData") or {})
-            # Technitium's TXT rData carries extra derived fields
-            # (splitText/characterStrings/characterStringsBase64) that
-            # never round-trip through our add params — drop them so the
-            # fingerprint comparison in ``_reconcile_zones`` doesn't treat
-            # every existing TXT record as "different from desired" on
-            # every single reconcile pass.
-            for extra_key in (
-                "splitText",
-                "characterStrings",
-                "characterStringsBase64",
-                "autoIpv4Hint",
-                "autoIpv6Hint",
-            ):
+            # Technitium's SVCB/HTTPS rData carries derived fields
+            # (autoIpv4Hint/autoIpv6Hint) that never round-trip through our
+            # add params — drop them so the fingerprint comparison in
+            # ``_reconcile_zones`` doesn't treat every such record as
+            # "different from desired" on every single reconcile pass.
+            # TXT's derived fields are folded by ``_normalize_rdata``
+            # (#1694).
+            for extra_key in ("autoIpv4Hint", "autoIpv6Hint"):
                 flat.pop(extra_key, None)
             out.append(_normalize_rdata(rtype, flat))
         return out
@@ -2083,9 +3060,12 @@ class TechnitiumDriver(DriverBase):
         """
         password = self.admin_bootstrap_password()
         try:
-            resp = httpx.get(
+            # A form body, never query parameters: a URL is logged (httpx
+            # writes every request line at INFO) and the password must not be
+            # (GHSA-x4gw-9gqx-vr4m).
+            resp = httpx.post(
                 f"{_API_BASE}/user/createToken",
-                params={"user": "admin", "pass": password, "tokenName": _TOKEN_NAME},
+                data={"user": "admin", "pass": password, "tokenName": _TOKEN_NAME},
                 timeout=_API_TIMEOUT,
             )
             body = resp.json()
@@ -2153,6 +3133,15 @@ class TechnitiumDriver(DriverBase):
             if fresh is not None:
                 log.info("technitium_api_token_reprovisioned", path=path)
                 resp = self._request(fresh, method, path, params)
+        # A daemon that cannot authenticate us or answers 5xx has not
+        # REFUSED anything — it is unusable. Raise, so a structural apply
+        # fails (and is quarantined / reverted) instead of reading every
+        # step as a per-item refusal and reporting a partial apply (#1608).
+        if self._is_invalid_token(resp):
+            raise RuntimeError(f"Technitium API {path}: token rejected (auth failure)")
+        status_code = getattr(resp, "status_code", 200)
+        if isinstance(status_code, int) and status_code >= 500:
+            raise RuntimeError(f"Technitium API {path}: HTTP {status_code}")
         return resp
 
     def _request(

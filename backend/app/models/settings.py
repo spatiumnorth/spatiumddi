@@ -1105,9 +1105,12 @@ class PlatformSettings(Base):
     # ``security.certificates`` feature module is the separate discovery
     # toggle. ``acme_auto_renew`` is the seam for the deferred renewal
     # beat task (not yet consumed in Phase 1). ``acme_challenge_type`` /
-    # ``acme_dns_provider`` / ``acme_domains`` are populated by
-    # ``POST /issue`` to record the desired issuance shape for that
-    # Phase-2 renewal task to read.
+    # ``acme_dns_provider`` / ``acme_domains`` record the issuance shape
+    # of the last SUCCESSFUL order — written by the orchestrator on
+    # success only (#1529; ``POST /issue`` used to write them at order
+    # creation, so a failed attempt could retarget renewals). The
+    # renewal sweep's per-certificate source of truth is the successful
+    # order itself; these columns are its legacy fallback.
     acme_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )

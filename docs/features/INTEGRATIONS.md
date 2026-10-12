@@ -24,7 +24,8 @@ Every integration follows the same reconciler pattern:
 4. **Sync Now** button per target fires the reconciler on demand, bypassing the interval gate.
 5. **Provenance FK** on every mirrored row (`kubernetes_cluster_id`, `docker_host_id`, …) with `ON DELETE CASCADE` so removing a target sweeps every row it created.
 6. **Status surfacing** — each target row carries `last_synced_at` + `last_sync_error`. Dashboard folds these into a green / amber / red dot on the Integrations panel.
-7. **Smart parent-block detection** — when a mirrored CIDR is an RFC 1918 or CGNAT range (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`) and no enclosing operator block exists in the target space, the reconciler auto-creates the canonical private supernet as an **unowned** top-level block. Unowned = no integration FK, so it survives removal of the integration and can be shared with manual allocations.
+7. **Legal host names** (#1459) — an address's hostname is copied from an upstream name (a UniFi client alias, a VM name, a Meraki client description). A name that is already a legal host name is kept as written. Anything else is folded before it reaches IPAM, so the record IPAM's DNS sync publishes is one the DNS servers accept: umlauts spelled out, accents and apostrophes dropped, other characters outside letters / digits / hyphens turned into `-`, lower-cased (`Sonos Büro` → `sonos-buero`). The upstream name is kept at the end of the address's description (`… — name: Sonos Büro`). Two devices with the same upstream name still get the same hostname.
+8. **Smart parent-block detection** — when a mirrored CIDR is an RFC 1918 or CGNAT range (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`) and no enclosing operator block exists in the target space, the reconciler auto-creates the canonical private supernet as an **unowned** top-level block. Unowned = no integration FK, so it survives removal of the integration and can be shared with manual allocations.
 
 ---
 

@@ -747,6 +747,26 @@ def _static_audit_value(
     }
 
 
+def audit_static_removed(db: AsyncSession, user: User | None, st: DHCPStaticAssignment) -> None:
+    """Audit a reservation removed as a side effect of an IPAM delete
+    (GHSA-hxpx-gjqf-6p4f): the same ``dhcp_static_assignment`` row the
+    statics endpoints write, so the removal leaves a trail as a reservation."""
+    _audit_static_change(
+        db,
+        user,
+        "delete",
+        static_id=st.id,
+        mac=str(st.mac_address),
+        ip=str(st.ip_address),
+        old_value={
+            "scope_id": str(st.scope_id),
+            "ip_address": str(st.ip_address),
+            "mac_address": str(st.mac_address),
+            "hostname": st.hostname or "",
+        },
+    )
+
+
 def _dhcp_permission_warning(
     acting_user: User | None, action: str, row: IPAddress, *, verb: str
 ) -> str | None:

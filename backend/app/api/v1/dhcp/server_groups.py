@@ -33,6 +33,10 @@ from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPServerGroup
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteGroupArgs
+from app.services.appliance.group_names import (
+    group_assigned_to_appliance,
+    group_name_problem,
+)
 from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp import windows_failover_manage as fo_manage
 from app.services.dhcp.windows_failover_report import group_failover_report
@@ -463,6 +467,18 @@ async def update_group(
         for k, v in body.model_dump(exclude_unset=True).items()
         if v is not None or k in NULLABLE_CLEARABLE_GROUP_FIELDS
     }
+    # #1468 — an appliance's supervisor gets this group by NAME and drops a
+    # name it won't put in its role env, so don't rename an assigned group
+    # into one. Only on an actual change: re-saving a legacy name is fine.
+    new_name = changes.get("name")
+    if (
+        new_name is not None
+        and new_name != g.name
+        and await group_assigned_to_appliance(db, "dhcp", g.id)
+    ):
+        problem = group_name_problem("dhcp", new_name)
+        if problem is not None:
+            raise HTTPException(status_code=422, detail=problem)
     for k, v in changes.items():
         setattr(g, k, v)
     # HA tuning (mode / heartbeat / delays / auto-failover), the Kea socket

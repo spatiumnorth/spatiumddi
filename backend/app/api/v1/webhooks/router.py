@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.core.crypto import decrypt_str, encrypt_str
+from app.core.crypto import decrypt_str, encrypt_dict, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services import event_delivery
@@ -63,6 +63,11 @@ class WebhookSubscriptionWrite(BaseModel):
     # the response (``secret_plaintext``).
     secret: str | None = None
     event_types: list[str] | None = None
+    # Write-only (#1579, mirroring the #1506 contract): on update,
+    # ``None`` (or omitted) keeps the stored headers, ``{}`` clears
+    # them, any other dict replaces them. Values are Fernet-encrypted
+    # at rest and never returned — responses carry header names plus a
+    # ``headers_set`` flag only.
     headers: dict[str, str] | None = None
     timeout_seconds: int = Field(default=10, ge=1, le=30)
     max_attempts: int = Field(default=8, ge=1, le=20)
@@ -84,7 +89,11 @@ class WebhookSubscriptionResponse(BaseModel):
     url: str
     secret_set: bool
     event_types: list[str] | None
-    headers: dict[str, str] | None
+    # Header VALUES are credentials (#1579) and are never returned —
+    # only their names, so the operator can still see which headers a
+    # subscription sends, plus whether any are stored at all.
+    header_names: list[str]
+    headers_set: bool
     timeout_seconds: int
     max_attempts: int
     created_at: datetime
@@ -116,6 +125,17 @@ class WebhookDeliveryResponse(BaseModel):
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
+def _header_names(sub: EventSubscription) -> list[str]:
+    """Sorted custom-header names for the response — never the values
+    (#1579). A value that won't decrypt yields no names rather than an
+    error: the list endpoint shouldn't 500 over one bad row, and the
+    delivery path reports the decrypt failure on its own."""
+    try:
+        return sorted(event_delivery.subscription_headers(sub))
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _to_response(
     sub: EventSubscription, *, secret_plaintext: str | None = None
 ) -> WebhookSubscriptionResponse:
@@ -127,7 +147,8 @@ def _to_response(
         url=sub.url,
         secret_set=bool(sub.secret_encrypted),
         event_types=list(sub.event_types) if sub.event_types else None,
-        headers=dict(sub.headers) if sub.headers else None,
+        header_names=_header_names(sub),
+        headers_set=bool(sub.headers_encrypted),
         timeout_seconds=sub.timeout_seconds,
         max_attempts=sub.max_attempts,
         created_at=sub.created_at,
@@ -149,7 +170,18 @@ def _apply_body(
     sub.enabled = body.enabled
     sub.url = body.url
     sub.event_types = body.event_types or None
-    sub.headers = body.headers or None
+    # Headers are write-only (#1579): ``None`` keeps the stored dict on
+    # update (on create it simply means "none"), ``{}`` clears it, and
+    # a non-empty dict is encrypted and stored.
+    if creating:
+        sub.headers_encrypted = encrypt_dict(body.headers) if body.headers else None
+    elif body.headers is not None:
+        sub.headers_encrypted = encrypt_dict(body.headers) if body.headers else None
+        # The pre-#1579 plaintext copy must not outlive a clear or a
+        # replace: a schema downgrade would bring the old value back. An
+        # old pod mid-rolling-upgrade then sends no header for this row,
+        # which is what the edit asked for.
+        sub.legacy_plaintext_headers = None
     sub.timeout_seconds = body.timeout_seconds
     sub.max_attempts = body.max_attempts
 

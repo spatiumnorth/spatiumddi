@@ -227,14 +227,21 @@ async def get_current_user(
         request.state.signed_in_at = session.created_at
         # Bump ``last_seen_at`` no more than once per minute per
         # session — gives the admin viewer a recent timestamp without
-        # a write on every authenticated request.
+        # a write on every authenticated request. Not for a disabled
+        # account (#1383): its request is refused below, and the Sessions
+        # view must not show it as activity. Read as one column, so the
+        # commit still lands before the User is loaded.
         now = datetime.now(UTC)
         if session.last_seen_at is None or (now - session.last_seen_at) > timedelta(seconds=60):
-            session.last_seen_at = now
-            try:
-                await db.commit()
-            except Exception:  # noqa: BLE001 — last_seen is best-effort
-                await db.rollback()
+            active = (
+                await db.execute(select(User.is_active).where(User.id == user_id))
+            ).scalar_one_or_none()
+            if active:
+                session.last_seen_at = now
+                try:
+                    await db.commit()
+                except Exception:  # noqa: BLE001 — last_seen is best-effort
+                    await db.rollback()
 
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()

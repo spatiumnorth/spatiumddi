@@ -21,8 +21,10 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime, timedelta
 
+import asyncpg
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -248,63 +250,60 @@ async def test_runner_refuses_a_target_already_in_progress(db_session: AsyncSess
         await runner_mod.run_backup_for_target(db_session, target=target, triggered_by="manual")
 
 
-class _LockResult:
-    def __init__(self, value: bool) -> None:
-        self._value = value
-
-    def scalar_one(self) -> bool:
-        return self._value
-
-
-class _LockSession:
-    """Minimal session stub recording the advisory-lock SQL."""
-
-    def __init__(self, acquired: bool) -> None:
-        self._acquired = acquired
-        self.statements: list[str] = []
-
-    async def execute(self, stmt, params=None):  # type: ignore[no-untyped-def]
-        self.statements.append(str(stmt))
-        return _LockResult(self._acquired)
-
-    async def commit(self) -> None:
-        return None
+# The restore lock is taken on a connection of its own to ``db_url``, not
+# through the request session (#1648), so these run against the test
+# database. test_restore_lock_one_connection.py covers the pool, a running
+# restore's phases and cancellation.
+_DB_URL = os.environ["DATABASE_URL"]
 
 
-async def test_restore_refuses_when_the_advisory_lock_is_held(monkeypatch) -> None:
+async def _restore_lock_connection() -> asyncpg.Connection:
+    return await asyncpg.connect(_DB_URL.replace("+asyncpg", ""))
+
+
+async def test_restore_refuses_when_the_advisory_lock_is_held(
+    monkeypatch, db_session: AsyncSession
+) -> None:
     async def _inner_must_not_run(db, **kwargs):  # pragma: no cover — tripwire
         raise AssertionError("restore body ran without the advisory lock")
 
     monkeypatch.setattr(restore, "_apply_backup_restore_inner", _inner_must_not_run)
-    session = _LockSession(acquired=False)
-    with pytest.raises(BackupRestoreError, match="already in progress"):
-        await restore.apply_backup_restore(
-            session,
-            archive_bytes=b"zip",
-            passphrase="hunter2hunter2",
-            confirmation_phrase=restore.CONFIRM_PHRASE,
-            db_url="postgresql+asyncpg://u:p@h:5432/db",
-        )
-    assert any("pg_try_advisory_lock" in s for s in session.statements)
+    holder = await _restore_lock_connection()  # another restore, mid-flight
+    try:
+        assert await holder.fetchval("SELECT pg_try_advisory_lock($1)", restore._RESTORE_LOCK_KEY)
+        with pytest.raises(BackupRestoreError, match="already in progress"):
+            await restore.apply_backup_restore(
+                db_session,
+                archive_bytes=b"zip",
+                passphrase="hunter2hunter2",
+                confirmation_phrase=restore.CONFIRM_PHRASE,
+                db_url=_DB_URL,
+            )
+    finally:
+        await holder.close()
 
 
-async def test_restore_releases_the_advisory_lock(monkeypatch) -> None:
+async def test_restore_releases_the_advisory_lock(monkeypatch, db_session: AsyncSession) -> None:
     sentinel = object()
 
     async def _inner(db, **kwargs):
         return sentinel
 
     monkeypatch.setattr(restore, "_apply_backup_restore_inner", _inner)
-    session = _LockSession(acquired=True)
     out = await restore.apply_backup_restore(
-        session,
+        db_session,
         archive_bytes=b"zip",
         passphrase="hunter2hunter2",
         confirmation_phrase=restore.CONFIRM_PHRASE,
-        db_url="postgresql+asyncpg://u:p@h:5432/db",
+        db_url=_DB_URL,
     )
     assert out is sentinel
-    assert any("pg_advisory_unlock" in s for s in session.statements)
+    # Free again: the next restore's connection takes it.
+    other = await _restore_lock_connection()
+    try:
+        assert await other.fetchval("SELECT pg_try_advisory_lock($1)", restore._RESTORE_LOCK_KEY)
+    finally:
+        await other.close()
 
 
 async def test_two_safety_dumps_in_one_second_do_not_collide(tmp_path, monkeypatch) -> None:

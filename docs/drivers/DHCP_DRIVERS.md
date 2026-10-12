@@ -87,8 +87,8 @@ Located at [`app/drivers/dhcp/kea.py`](https://github.com/spatiumnorth/spatiumdd
 
 | Operation | Mechanism | Notes |
 |---|---|---|
-| Full scope/pool/reservation push | `ConfigBundle` → agent fetches via long-poll → agent renders + writes `/etc/kea/kea-dhcp4.conf` → `config-test` → `config-reload` over the Kea **unix control socket** | Incremental config — no daemon restart. |
-| Validate | `config-test` on the unix socket (with the full config doc as `arguments`) | Preflight — a config Kea rejects is never reloaded. |
+| Full scope/pool/reservation push | `ConfigBundle` → agent fetches via long-poll → agent renders + writes `/etc/kea/kea-dhcp4.conf` → `kea-dhcp4 -t` on that file → `config-reload` over the Kea **unix control socket** | Incremental config — no daemon restart. |
+| Validate | `kea-dhcp4 -t <file>` / `kea-dhcp6 -t <file>` in a separate process (30 s timeout) | Preflight — a config Kea rejects is never reloaded, and neither is one the check could not run on. Not the `config-test` command: on Kea 3.0.3 it stops the HA listener from binding (#1447). |
 | Read leases | Agent tails the **memfile lease CSV** (`/var/lib/kea/kea-leases4.csv`) | Not the `lease_cmds` HTTP API. The hook is still loaded (HA depends on it), but leases reach the control plane by CSV tail → `POST /dhcp/agents/lease-events`. |
 | HA state | `status-get` on the DHCPv4 unix socket, every ~15 s | Drives the live HA pill in the UI. DHCPv4 only — HA is not rendered into `Dhcp6`. |
 | Metrics | `statistic-get-all` on the unix socket, every ~60 s | Deltas of the `pkt4-*` counters. |
@@ -100,7 +100,7 @@ Note also that the backend's `KeaDriver.apply_config()` / `reload()` / `get_leas
 The agent drives Kea by:
 
 1. Rendering the config bundle into Kea JSON (`Dhcp4` for IPv4, `Dhcp6` for IPv6 — address-family split on `DHCPScope.address_family`).
-2. Sending `config-test` with the rendered doc to catch validation errors *before* touching the live config (a daemon too old to know the command answers `result=2`, which is treated as a soft pass).
+2. Running `kea-dhcp4 -t` / `kea-dhcp6 -t` on the written file to catch validation errors *before* touching the live config. Exit 1 is a rejection; a check that cannot run (missing binary, timeout, crash) fails the apply in the `validate` phase rather than passing it.
 3. Calling `config-reload`, which re-reads the file without dropping in-flight leases.
 
 ### Kea 3.0 path restrictions

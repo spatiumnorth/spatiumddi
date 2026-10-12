@@ -944,3 +944,358 @@ async def test_apply_record_update_without_rrset_carries_proxied(
     put = next(c for c in fake.calls if c["method"] == "put")
     assert put["path"] == "/zones/zid/dns_records/rid"
     assert put["json"]["proxied"] is True
+
+
+# ── MX / SRV split-form contract (#1526) ────────────────────────────────────
+
+
+async def test_apply_record_create_srv_sends_data_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SRV goes out as a Cloudflare ``data`` object — priority, weight,
+    port and target — not a bare-target content string."""
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": "zid"}]))],
+            "post": [_FakeResponse(200, _env({"id": "new"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=3600,
+            priority=10,
+            weight=20,
+            port=5060,
+        ),
+        target_serial=1,
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert post["json"]["data"] == {
+        "priority": 10,
+        "weight": 20,
+        "port": 5060,
+        "target": "sip.example.com",
+    }
+    assert "content" not in post["json"]
+
+
+async def test_list_zone_records_splits_srv_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    zone_lookup = _env([{"id": "zid"}])
+    records = _env(
+        [
+            {
+                "name": "_sip._tcp.example.com",
+                "type": "SRV",
+                "content": "10 20 5060 sip.example.com",
+                "ttl": 3600,
+                "data": {
+                    "priority": 10,
+                    "weight": 20,
+                    "port": 5060,
+                    "target": "sip.example.com",
+                },
+            },
+            {
+                "name": "_xmpp._tcp.example.com",
+                "type": "SRV",
+                "content": "5 0 5222 xmpp.example.com",
+                "ttl": 3600,
+            },
+        ]
+    )
+    fake = _FakeClient({"get": [_FakeResponse(200, zone_lookup), _FakeResponse(200, records)]})
+    driver = _patch_client(monkeypatch, fake)
+
+    out = await driver._list_zone_records(_Server(), _CREDS, "example.com.")
+
+    assert out[0] == RecordData(
+        name="_sip._tcp",
+        record_type="SRV",
+        value="sip.example.com",
+        ttl=3600,
+        priority=10,
+        weight=20,
+        port=5060,
+    )
+    # No ``data`` object → the composed content string is split instead.
+    assert out[1] == RecordData(
+        name="_xmpp._tcp",
+        record_type="SRV",
+        value="xmpp.example.com",
+        ttl=3600,
+        priority=5,
+        weight=0,
+        port=5222,
+    )
+
+
+# ── SRV through the #783 set write (#1526 × #1495) ─────────────────────
+
+
+async def test_set_write_srv_sends_data_object(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An op carrying an RRset takes the set-write path; SRV must still go
+    out as a ``data`` object, never a bare-target ``content``."""
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": "zid"}])), _FakeResponse(200, _env([]))],
+            "post": [_FakeResponse(200, _env({"id": "new"}))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="create",
+        zone_name="example.com.",
+        record=RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=300,
+            priority=10,
+            weight=20,
+            port=5060,
+        ),
+        target_serial=1,
+        rrset=RRsetData(
+            ttl=300,
+            members=(RRsetMember(value="sip.example.com", priority=10, weight=20, port=5060),),
+        ),
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert post["json"]["data"] == {
+        "priority": 10,
+        "weight": 20,
+        "port": 5060,
+        "target": "sip.example.com",
+    }
+    assert "content" not in post["json"]
+
+
+@pytest.mark.parametrize(
+    "row_extra",
+    [
+        {
+            "content": "20 5060 sip.example.com",
+            "priority": 10,
+            "data": {"priority": 10, "weight": 20, "port": 5060, "target": "sip.example.com"},
+        },
+        {"content": "20 5060 sip.example.com.", "priority": 10},
+        {"content": "10 20 5060 sip.example.com"},
+    ],
+)
+async def test_set_write_srv_converged_is_a_noop(
+    monkeypatch: pytest.MonkeyPatch, row_extra: dict[str, Any]
+) -> None:
+    """A live SRV row matching on all four components is kept untouched,
+    whichever shape Cloudflare reports it in."""
+    row = {
+        "id": "s",
+        "type": "SRV",
+        "name": "_sip._tcp.example.com",
+        "ttl": 300,
+        **row_extra,
+    }
+    fake = _FakeClient(
+        {"get": [_FakeResponse(200, _env([{"id": "zid"}])), _FakeResponse(200, _env([row]))]}
+    )
+    driver = _patch_client(monkeypatch, fake)
+    change = RecordChange(
+        op="update",
+        zone_name="example.com.",
+        record=RecordData(
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com",
+            ttl=300,
+            priority=10,
+            weight=20,
+            port=5060,
+        ),
+        target_serial=1,
+        rrset=RRsetData(
+            ttl=300,
+            members=(RRsetMember(value="sip.example.com", priority=10, weight=20, port=5060),),
+        ),
+    )
+
+    await driver._apply_record(_Server(), _CREDS, change)
+
+    assert [c["method"] for c in fake.calls] == ["get", "get"]
+
+
+# ── #1537 — zone create / delete converge on retry ──────────────────────
+def _err(status: int, code: int, message: str = "boom") -> _FakeResponse:
+    return _FakeResponse(
+        status,
+        {"success": False, "errors": [{"code": code, "message": message}], "result": None},
+    )
+
+
+async def test_apply_zone_create_already_exists_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(
+        {
+            "post": [_err(400, 1061, "Zone already exists")],
+            "get": [_FakeResponse(200, _env([{"id": "zid"}]))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    await driver._apply_zone(_Server(), _CREDS, zone, "create")
+    assert [c["method"] for c in fake.calls] == ["post", "get"]
+
+
+async def test_apply_zone_create_exists_but_not_visible_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """1061 with no zone visible to the token is not proof it is ours."""
+    fake = _FakeClient(
+        {
+            "post": [_err(400, 1061, "Zone already exists")],
+            "get": [_FakeResponse(200, _env([]))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_Server(), _CREDS, zone, "create")
+
+
+@pytest.mark.parametrize(
+    ("status", "code"), [(403, 9109), (429, 971), (500, 1061 + 1), (400, 1097)]
+)
+async def test_apply_zone_create_other_errors_still_raise(
+    monkeypatch: pytest.MonkeyPatch, status: int, code: int
+) -> None:
+    fake = _FakeClient({"post": [_err(status, code)]})
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_Server(), _CREDS, zone, "create")
+
+
+async def test_apply_zone_delete_absent_zone_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient({"get": [_FakeResponse(200, _env([]))]})
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+    assert [c["method"] for c in fake.calls] == ["get"]
+
+
+async def test_apply_zone_delete_404_after_lookup_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": "zid"}]))],
+            "delete": [_err(404, 1001, "Invalid zone")],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500])
+async def test_apply_zone_delete_other_errors_still_raise(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    # Lookup itself failing (auth / throttle) must not read as "absent".
+    fake = _FakeClient({"get": [_err(status, 9109)]})
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": "zid"}]))],
+            "delete": [_err(status, 9109)],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+
+async def test_apply_zone_reports_whether_it_changed_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``False`` = already in the requested state, so the caller's
+    partial-failure compensation leaves that server alone (#1537)."""
+    zone = type("Z", (), {"name": "example.org."})()
+    fake = _FakeClient({"post": [_FakeResponse(200, _env({"id": "zid"}))]})
+    assert await _patch_client(monkeypatch, fake)._apply_zone(_Server(), _CREDS, zone, "create")
+
+    fake = _FakeClient(
+        {
+            "post": [_err(400, 1061, "Zone already exists")],
+            "get": [_FakeResponse(200, _env([{"id": "zid"}]))],
+        }
+    )
+    assert (
+        await _patch_client(monkeypatch, fake)._apply_zone(_Server(), _CREDS, zone, "create")
+        is False
+    )
+
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": "zid"}]))],
+            "delete": [_FakeResponse(200, _env({"id": "zid"}))],
+        }
+    )
+    assert await _patch_client(monkeypatch, fake)._apply_zone(_Server(), _CREDS, zone, "delete")
+
+    fake = _FakeClient({"get": [_FakeResponse(200, _env([]))]})
+    assert (
+        await _patch_client(monkeypatch, fake)._apply_zone(_Server(), _CREDS, zone, "delete")
+        is False
+    )
+
+
+async def test_apply_zone_1061_from_another_account_raises_the_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cloudflare answers 1061 when a DIFFERENT account holds the domain
+    active too. The confirming lookup is scoped to the configured account,
+    and a miss re-raises Cloudflare's own error rather than "not found"."""
+    fake = _FakeClient(
+        {
+            "post": [_err(400, 1061, "example.org already exists")],
+            "get": [_FakeResponse(200, _env([]))],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    creds = {"api_token": "tok", "account_id": "acct-a"}
+    with pytest.raises(CloudDNSError, match="already exists"):
+        await driver._apply_zone(_Server(), creds, zone, "create")
+    assert fake.calls[1]["params"] == {"name": "example.org", "account.id": "acct-a"}
+
+
+async def test_apply_zone_delete_lookup_is_scoped_to_the_configured_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token spanning several accounts must not delete the same-named
+    zone in whichever account the API happens to list first."""
+    fake = _FakeClient({"get": [_FakeResponse(200, _env([]))]})
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "example.org."})()
+    creds = {"api_token": "tok", "account_id": "acct-a"}
+    assert await driver._apply_zone(_Server(), creds, zone, "delete") is False
+    assert fake.calls[0]["params"] == {"name": "example.org", "account.id": "acct-a"}
+    assert [c["method"] for c in fake.calls] == ["get"]

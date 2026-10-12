@@ -37,6 +37,7 @@ class MaintenanceStatusArgs(BaseModel):
 
 @register_tool(
     name="maintenance_status",
+    permission="authenticated",
     description=(
         "Report whether SpatiumDDI is in system-wide maintenance mode "
         "(issue #57). Returns the enabled flag, the operator-set banner "
@@ -88,6 +89,7 @@ class SetMaintenanceModeArgs(BaseModel):
 
 @register_tool(
     name="set_maintenance_mode",
+    permission="superadmin",
     description=(
         "Turn system-wide maintenance mode on or off (issue #57). DISABLED by "
         "default — flipping maintenance mode makes the ENTIRE platform "

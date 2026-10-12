@@ -4519,6 +4519,7 @@ EOF
             --exclude="/var/lib/spatiumddi/swapfile" \
             --exclude="/etc/spatiumddi/.env" \
             --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
+            --exclude="/etc/ssh/ssh_host_*" \
             --exclude="/etc/issue.d/zz-spatium-live.issue" \
             / "$MOUNT/" 2>> "$INSTALL_LOG" \
             | { _last=-1
@@ -4637,33 +4638,26 @@ EOF
         #   /var/persist/etc-work  workdir   (overlay scratch space)
         mkdir -p "$MOUNT/var/persist/etc" "$MOUNT/var/persist/etc-work"
 
-        # Issue #276 — SSH host keys + machine config are seeded into
-        # the STATE partition, which spatium-etc-render copies into
-        # /etc on every boot BEFORE sshd / k3s start. STATE survives
-        # both an OS slot swap AND a /var factory reset, so the host
-        # key + hostname stay stable forever. Strip the keys out of
-        # /etc.image (the overlay LOWER) so a future slot image's
-        # mkosi-built keys can never shadow the operator's. (Supersedes
-        # the #272 Phase 1 bandaid that parked keys in
-        # /var/persist/etc/ssh — STATE is the authoritative home now.)
+        # Issue #276 — machine config is seeded into the STATE partition,
+        # which spatium-etc-render copies into /etc on every boot BEFORE
+        # sshd / k3s start. STATE survives both an OS slot swap AND a /var
+        # factory reset, so the host key + hostname stay stable forever.
+        #
+        # GHSA-vvh9-6gfw-wphp — SSH host keys are NOT seeded from the
+        # image any more. They used to be copied from /etc.image, i.e. the
+        # keys generated once in the build container, so every install of
+        # a release shared them. The image ships none now (mkosi.finalize)
+        # and the rsync above excludes the live session's throwaway set;
+        # spatium-etc-render generates this appliance's own on first boot
+        # and persists them here. Keys STATE already holds from a previous
+        # install are left untouched (#995 item 25 — STATE is not
+        # reformatted on a reinstall, and replacing them would give every
+        # client that knew this appliance a host-key-changed warning).
+        # The rm is belt and braces: nothing key-shaped may sit in the
+        # overlay lower, where it would shadow STATE's.
         STATE_MNT="$MOUNT/var/lib/spatium-state"
         mkdir -p "$STATE_MNT/ssh"
-        for k in "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key \
-                 "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key.pub; do
-            [ -f "$k" ] || continue
-            # #995 item 25 — never overwrite a key STATE already holds.
-            # STATE is not reformatted on a reinstall, so this loop would
-            # otherwise copy the NEW image's freshly-generated host keys
-            # over the preserved ones and every client that knew this
-            # appliance would get REMOTE HOST IDENTIFICATION HAS CHANGED —
-            # the one thing keeping STATE is for.
-            if [ -e "$STATE_MNT/ssh/$(basename "$k")" ]; then
-                rm -f "$k"
-                continue
-            fi
-            cp -a "$k" "$STATE_MNT/ssh/" >> "$INSTALL_LOG" 2>&1
-            rm -f "$k"
-        done
+        rm -f "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_* "$MOUNT/etc/ssh/"ssh_host_*
 
         # spatium-config.yaml — the operator-authoritative machine
         # config the render service reads. Flat ``key: value`` shape
@@ -5187,11 +5181,26 @@ EOF
             log "SSH: password authentication disabled (key-only)"
         fi
 
-        # Disable cloud-init on the installed system (we configured
-        # everything ourselves; cloud-init would just sit waiting for a
-        # datasource that isn't there).
+        # Disable cloud-init on the installed system: the network, the
+        # admin account and every other answer come from STATE, which we
+        # wrote ourselves.
+        #
+        # #1511 — the masks alone never worked. They land in the /etc
+        # overlay (/var/persist/etc), which etc.mount brings up after
+        # systemd has loaded its units, so at boot every cloud-init unit
+        # was still loadable, and cloud-init 25.1 (trixie) also renamed
+        # them (cloud-init-main, cloud-init-network). With the CIDATA
+        # drive still attached after a preseed install, init-local wrote
+        # a DHCP profile (cloud-init-<iface>.nmconnection) beside the
+        # static one. Every cloud-init unit carries
+        # ConditionPathExists=!/etc/cloud/cloud-init.disabled and starts
+        # after etc.mount, so the marker is what keeps it off. The masks
+        # stay, with the 25.1 names, for anything that reloads units later.
+        install -d -m 0755 "$MOUNT/etc/cloud"
+        : > "$MOUNT/etc/cloud/cloud-init.disabled"
         chroot "$MOUNT" systemctl mask \
-            cloud-init.service cloud-init-local.service \
+            cloud-init.service cloud-init-main.service \
+            cloud-init-local.service cloud-init-network.service \
             cloud-config.service cloud-final.service \
             >> "$INSTALL_LOG" 2>&1 || true
 

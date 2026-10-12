@@ -59,7 +59,7 @@ class AuditForwardTarget(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # webhook_flavor: generic | slack | teams | discord
     # Picks the platform-specific JSON shape at send time. ``generic`` is
     # the original behaviour (raw audit/alert payload); the others wrap
-    # in Slack mrkdwn / Teams MessageCard / Discord embed format so a
+    # in Slack mrkdwn / Teams Adaptive Card / Discord embed format so a
     # standard incoming-webhook URL works without a transformer.
     webhook_flavor: Mapped[str] = mapped_column(
         String(16),

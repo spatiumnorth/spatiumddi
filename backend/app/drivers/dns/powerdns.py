@@ -43,6 +43,7 @@ from typing import Any
 import structlog
 
 from app.core.dns_names import strip_control_chars
+from app.drivers.dns._txt import quote_txt as _quote_txt
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -87,21 +88,6 @@ _SUPPORTED_RECORD_TYPES = frozenset(
         "DNAME",
     }
 )
-
-
-def _quote_txt(value: str) -> str:
-    """Quote a TXT record value per RFC 1035 (split into ≤255 chunks).
-
-    PowerDNS's REST API accepts the same wire-format quoted-string
-    representation BIND9 zone files use, so we re-derive the format
-    here rather than depending on the BIND driver module.
-    """
-    s = value
-    if s.startswith('"') and s.endswith('"') and len(s) >= 2:
-        s = s[1:-1]
-    s = s.replace("\\", "\\\\").replace('"', '\\"')
-    chunks = [s[i : i + 255] for i in range(0, len(s), 255)] or [""]
-    return " ".join(f'"{c}"' for c in chunks)
 
 
 def _record_content(rr: RecordData) -> str:

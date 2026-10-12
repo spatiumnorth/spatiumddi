@@ -105,6 +105,11 @@ import { useSessionState } from "@/lib/useSessionState";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 import { HA_V4_ONLY_NOTE } from "@/lib/dhcpHa";
+import {
+  isPartialApply,
+  PARTIAL_APPLY_EXPLAIN,
+  partialApplyDetail,
+} from "@/lib/configApply";
 import { WidgetErrorBoundary } from "@/components/WidgetErrorBoundary";
 
 /**
@@ -1721,7 +1726,15 @@ export function DashboardPage() {
   // agent too old to report is where a silent revert would hide, so it
   // is deliberately not counted as a failure either.
   const configFailedServers = supervisedServers.filter(
-    (s) => s.config_apply_status != null && s.config_apply_status !== "ok",
+    (s) =>
+      s.config_apply_status != null &&
+      s.config_apply_status !== "ok" &&
+      !isPartialApply(s.config_apply_status, s.config_apply_error),
+  ).length;
+  // A partial apply (#1280) still needs attention, but nothing failed to
+  // apply as a whole, so it is counted apart from "config failed".
+  const zonesRefusedServers = supervisedServers.filter((s) =>
+    isPartialApply(s.config_apply_status, s.config_apply_error),
   ).length;
   // #1067 — an agent whose daemon is not serving keeps heartbeating too, so
   // ``status`` and the last-seen stamp read normal while it answers nothing
@@ -1934,11 +1947,14 @@ export function DashboardPage() {
               label="Agents needing attention"
               value={unhealthyServers + configFailedServers}
               sub={
-                unhealthyServers + configFailedServers > 0 ? (
+                unhealthyServers + configFailedServers + zonesRefusedServers >
+                0 ? (
                   <span className="text-red-600 dark:text-red-400">
                     {unhealthyServers} unreachable
                     {configFailedServers > 0 &&
                       ` · ${configFailedServers} config failed`}
+                    {zonesRefusedServers > 0 &&
+                      ` · ${zonesRefusedServers} with zones refused`}
                   </span>
                 ) : (
                   `${activeServers} healthy · paused and maintenance excluded`
@@ -2822,6 +2838,16 @@ function ConfigApplyChip({
   error?: string | null;
 }) {
   if (status == null || status === "ok") return null;
+  // A partial apply reports `reverted`, but nothing rolled back (#1280).
+  if (isPartialApply(status, error)) {
+    return (
+      <StatusChip
+        tone="amber"
+        label="zones refused"
+        title={`${PARTIAL_APPLY_EXPLAIN}\n\n${partialApplyDetail(error)}`}
+      />
+    );
+  }
   // `reverted` means a known-good config is still serving; the other two
   // mean the running state is wrong or unknown.
   const tone = status === "reverted" ? "amber" : "red";

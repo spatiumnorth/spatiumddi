@@ -46,6 +46,7 @@ class GetRedisStatsArgs(BaseModel):
 
 @register_tool(
     name="get_redis_stats",
+    permission="superadmin",
     description=(
         "Redis health + the agent config-wake bus (superadmin only). "
         "Returns Redis INFO summary (version, role, used/peak memory, "

@@ -259,7 +259,14 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         try:
             resp = await client.get(f"/api/{path}", params=params or {})
         except httpx.HTTPError as exc:
-            raise CloudDNSError(f"Technitium {what} request failed: {exc}") from exc
+            # A refused connection raises a ConnectError whose str() is empty,
+            # which left "request failed:" with no cause at all (#1613 QA).
+            # The class name always says something; the text, when present,
+            # says more.
+            cause = type(exc).__name__
+            if str(exc):
+                cause = f"{cause}: {exc}"
+            raise CloudDNSError(f"Technitium {what} request failed: {cause}") from exc
         return self._unwrap(resp, what)
 
     # ── Zone reads ──────────────────────────────────────────────────────
@@ -443,7 +450,14 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         base = {"domain": domain, "zone": zone_bare, "type": rtype}
 
         def _params(r: RecordData) -> dict[str, Any]:
-            return record_params(rtype, r.value, priority=r.priority, weight=r.weight, port=r.port)
+            return record_params(
+                rtype,
+                r.value,
+                priority=r.priority,
+                weight=r.weight,
+                port=r.port,
+                origin=zone_bare,
+            )
 
         async with self._client(api_url, token, verify) as client:
             if change.op == "delete":
@@ -490,7 +504,15 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
 
     # ── Zone writes ─────────────────────────────────────────────────────
 
-    async def _apply_zone(self, server: Any, creds: dict[str, Any], zone: Any, op: str) -> None:
+    async def _apply_zone(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        zone: Any,
+        op: str,
+        *,
+        managed_records: list[RecordData] | None = None,
+    ) -> bool | None:
         api_url, token, verify = self._creds(creds)
         bare = normalize_fqdn(str(getattr(zone, "name", ""))).rstrip(".")
         if not bare:
@@ -515,16 +537,39 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
 
         async with self._client(api_url, token, verify) as client:
             if op == "create":
-                await self._call(
+                created = await self._call(
                     client,
                     "zones/create",
                     f"create zone {bare!r}",
                     {"zone": bare, "type": "Primary"},
                 )
-                return
+                # A created zone answers ``{"domain": …}``; ``_unwrap``
+                # turns "Zone already exists" into an empty body (#1537),
+                # i.e. the zone was already there and nothing changed.
+                return bool(created)
             if op == "delete":
-                await self._call(client, "zones/delete", f"delete zone {bare!r}", {"zone": bare})
-                return
+                try:
+                    await self._call(
+                        client, "zones/delete", f"delete zone {bare!r}", {"zone": bare}
+                    )
+                except CloudDNSError as exc:
+                    # #1537 — Technitium answers "No such zone was found: x"
+                    # for a zone that is already gone. Matched on the error
+                    # envelope text only; invalid-token / 2fa / transport
+                    # errors have different messages and still raise.
+                    # "...: no such zone exists." is the same answer when
+                    # the zone vanishes between Technitium's own lookup and
+                    # its delete.
+                    msg = str(exc).lower()
+                    if "no such zone was found" in msg or "no such zone exists" in msg:
+                        logger.info(
+                            "technitium_api.zone_delete_noop_absent",
+                            server=str(getattr(server, "id", "")),
+                            zone=bare,
+                        )
+                        return False
+                    raise
+                return True
             # Unreachable while ``CloudDNSDriverBase.apply_zone_change``
             # validates op first — kept so this method is safe to call
             # directly, and asserted by

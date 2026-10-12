@@ -177,6 +177,7 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     couldn't see. Individual suites used to opt in to a local reset
     fixture; doing it globally fixes the whole class.
     """
+    from app.api import health
     from app.core import maintenance_mode
     from app.services import feature_modules
     from app.services.appliance import cluster_health
@@ -193,11 +194,14 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     # stubbed verdict outlives the per-test TRUNCATE and would answer for
     # unrelated tests.
     cluster_health.invalidate_probe_cache()
+    # GHSA-c58p-8cq9-g3gm — /health/platform caches its Celery worker ping.
+    health.invalidate_worker_ping_cache()
     yield
     maintenance_mode.invalidate_cache()
     feature_modules.invalidate_cache()
     tld_registry.invalidate_effective_cache()
     cluster_health.invalidate_probe_cache()
+    health.invalidate_worker_ping_cache()
 
 
 @pytest.fixture(autouse=True)

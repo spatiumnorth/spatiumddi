@@ -45,6 +45,7 @@ class FindNewDevicesArgs(BaseModel):
 
 @register_tool(
     name="find_new_devices",
+    permission=("read", "ip_address"),
     description=(
         "List recently first-seen MAC addresses (new-device / arpwatch review "
         "queue). Each row has the IP, subnet, MAC, OUI vendor, source (dhcp_lease "
@@ -103,6 +104,7 @@ class CountNewDevicesArgs(BaseModel):
 
 @register_tool(
     name="count_new_devices",
+    permission=("read", "ip_address"),
     description=(
         "Count new-device sightings by classification (new / acknowledged / "
         "known), plus how many new ones appeared in the last 24h and the "
@@ -134,6 +136,7 @@ class FindMacAllowlistArgs(BaseModel):
 
 @register_tool(
     name="find_mac_allowlist",
+    permission=("read", "ip_address"),
     description=(
         "List the trusted-MAC allowlist entries (exact MAC or OUI prefix) that "
         "suppress new-device alerts. Use to check whether a MAC/vendor is already "

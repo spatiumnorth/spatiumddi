@@ -46,6 +46,7 @@ class FindBrandingSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_branding_settings",
+    permission="authenticated",
     description=(
         "Return the platform branding configuration — the product title "
         "shown in the browser tab / sign-in heading / sidebar wordmark, "

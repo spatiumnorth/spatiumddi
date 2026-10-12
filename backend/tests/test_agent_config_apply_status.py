@@ -154,6 +154,39 @@ async def test_matcher_fires_on_a_reverted_agent(db_session: AsyncSession) -> No
     assert severity == SEVERITY_BY_STATUS[STATUS_REVERTED]
 
 
+async def test_a_partial_apply_does_not_claim_a_rollback(db_session: AsyncSession) -> None:
+    """A PowerDNS agent that served every zone but one reports ``reverted``
+    (there is no partial status) with a marked error. The alert used to say
+    the server rolled back and was NOT serving what is saved, the opposite of
+    what happened (ddi-pg's walk of #1280)."""
+    from app.services.agents.config_apply import PARTIAL_APPLY_PREFIX, is_partial_apply
+
+    error = (
+        f"{PARTIAL_APPLY_PREFIX}the daemon refused 1 zone(s); every other zone is "
+        "served: bad.test. create: HTTP 422 Duplicate record in RRset"
+    )
+    await _dns_server(
+        db_session,
+        "ns-partial",
+        config_apply_status=STATUS_REVERTED,
+        config_failed_etag="sha256:live",
+        config_apply_error=error,
+    )
+    matches = await _matching_agent_config_rejected_subjects(db_session, _RULE)
+    assert len(matches) == 1
+    _subject, _display, message, severity = matches[0]
+    assert "rolled back" not in message.replace("Nothing was rolled back", "")
+    assert "NOT serving" not in message
+    assert "applied the configuration" in message
+    assert "bad.test." in message and "Duplicate record in RRset" in message
+    assert PARTIAL_APPLY_PREFIX not in message
+    assert "sha256:live" not in message, "the 'rejected' etag is the live one"
+    assert severity == SEVERITY_BY_STATUS[STATUS_REVERTED]
+    assert is_partial_apply(STATUS_REVERTED, error)
+    assert not is_partial_apply(STATUS_REVERTED, "named-checkconf failed")
+    assert not is_partial_apply("revert_failed", error)
+
+
 async def test_matcher_ignores_ok_and_never_reported(db_session: AsyncSession) -> None:
     """NULL means the agent has never reported — a pre-#882 agent or an
     agentless driver with no apply loop. Firing on those would alarm every

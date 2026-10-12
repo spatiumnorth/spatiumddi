@@ -104,6 +104,7 @@ class FindProvisioningRequestsArgs(BaseModel):
 
 @register_tool(
     name="find_provisioning_requests",
+    permission="self",
     description=(
         "List self-service provisioning requests (IP / subnet / DNS / DHCP) "
         "submitted through the request portal, with optional state, kind and "
@@ -154,6 +155,7 @@ class CountProvisioningRequestsArgs(BaseModel):
 
 @register_tool(
     name="count_provisioning_requests",
+    permission="self",
     description=(
         "Count self-service provisioning requests grouped by lifecycle state. "
         "Use to size the request backlog waiting on approvers. Read-only."
@@ -190,6 +192,7 @@ class ListRequestKindsArgs(BaseModel):
 
 @register_tool(
     name="list_request_kinds",
+    permission="authenticated",
     description=(
         "List what can be asked for through the self-service request portal "
         "(subnet / IP address / DNS record / DHCP reservation), with a "

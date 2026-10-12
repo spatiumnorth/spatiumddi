@@ -681,6 +681,30 @@ async def test_zone_create_and_delete(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_refused_connection_names_a_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1613 QA — ``httpx.ConnectError`` for a refused connection stringifies
+    to ``""``, so the error read "request failed: " with nothing after it.
+    The exception class is always named; its text follows when present."""
+    import httpx
+
+    class _Zone:
+        name = "new.example.com."
+        zone_type = "primary"
+
+    def _refuse() -> Any:
+        raise httpx.ConnectError("")
+
+    drv, _ = _driver(monkeypatch, [_refuse])
+    with pytest.raises(CloudDNSError) as excinfo:
+        await drv.apply_zone_change(
+            _Server({"api_url": "https://x.test", "api_token": "t"}), _Zone(), "create"
+        )
+    message = str(excinfo.value)
+    assert "request failed: ConnectError" in message
+    assert not message.rstrip().endswith("failed:")
+
+
+@pytest.mark.asyncio
 async def test_unsupported_zone_op_is_refused_before_any_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -836,3 +860,96 @@ def test_record_type_gate_matches_what_the_driver_advertises() -> None:
         else:
             # ALIAS / LUA are PowerDNS-only and the driver doesn't claim them.
             assert "technitium_api" not in allowed, rtype
+
+
+# ── #1537 — zone create / delete converge on retry ─────────────────────
+
+
+class _TZone:
+    name = "new.example.com."
+    zone_type = "primary"
+
+
+def _tserver() -> Any:
+    return _Server({"api_url": "https://x.test", "api_token": "t"})
+
+
+@pytest.mark.asyncio
+async def test_zone_create_already_exists_is_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    drv, fake = _driver(
+        monkeypatch,
+        [
+            _FakeResponse(
+                {"status": "error", "errorMessage": "Zone already exists: new.example.com"}
+            )
+        ],
+    )
+    await drv.apply_zone_change(_tserver(), _TZone(), "create")
+    assert fake.calls[0]["path"] == "/api/zones/create"
+
+
+@pytest.mark.asyncio
+async def test_zone_delete_missing_zone_is_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    drv, _ = _driver(
+        monkeypatch,
+        [
+            _FakeResponse(
+                {"status": "error", "errorMessage": "No such zone was found: new.example.com"}
+            )
+        ],
+    )
+    await drv.apply_zone_change(_tserver(), _TZone(), "delete")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"status": "invalid-token"},
+        {"status": "error", "errorMessage": "Access was denied to use this resource."},
+        {"status": "error", "errorMessage": "Something else went wrong"},
+    ],
+)
+@pytest.mark.parametrize("op", ["create", "delete"])
+async def test_zone_ops_other_failures_still_raise(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, Any], op: str
+) -> None:
+    drv, _ = _driver(monkeypatch, [_FakeResponse(body)])
+    with pytest.raises(CloudDNSError):
+        await drv.apply_zone_change(_tserver(), _TZone(), op)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("op", "body", "changed"),
+    [
+        ("create", {"status": "ok", "response": {"domain": "new.example.com"}}, True),
+        (
+            "create",
+            {"status": "error", "errorMessage": "Zone already exists: new.example.com"},
+            False,
+        ),
+        ("delete", {"status": "ok", "response": {}}, True),
+        (
+            "delete",
+            {"status": "error", "errorMessage": "No such zone was found: new.example.com"},
+            False,
+        ),
+        # Technitium's own lookup → delete race says it this way instead.
+        (
+            "delete",
+            {
+                "status": "error",
+                "errorMessage": "Failed to delete the zone 'new.example.com': no such zone exists.",
+            },
+            False,
+        ),
+    ],
+)
+async def test_zone_ops_report_whether_they_changed_anything(
+    monkeypatch: pytest.MonkeyPatch, op: str, body: dict[str, Any], changed: bool
+) -> None:
+    """``False`` = already in the requested state; the caller's partial
+    failure compensation must leave that server alone (#1537)."""
+    drv, _ = _driver(monkeypatch, [_FakeResponse(body)])
+    assert await drv.apply_zone_change(_tserver(), _TZone(), op) is changed

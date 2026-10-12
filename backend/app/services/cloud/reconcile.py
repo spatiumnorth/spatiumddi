@@ -56,12 +56,18 @@ from app.core.crypto import decrypt_dict
 from app.models.audit import AuditLog
 from app.models.cloud import CloudEndpoint
 from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.cloud.base import (
     CloudConnectorError,
     CloudInventory,
     get_connector,
 )
-from app.services.integration_ownership import owned_by_other_integration, owning_integration
+from app.services.integration_ownership import (
+    address_taken,
+    owned_by_other_integration,
+    owning_integration,
+    subnet_has_surviving_addresses,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -97,6 +103,9 @@ class _DesiredAddress:
     # to the endpoint's ``public_space_id`` when one is configured; every
     # other row (and the fallback) lands in ``ipam_space_id``.
     public: bool = False
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass
@@ -461,6 +470,13 @@ async def _apply_blocks_and_subnets(
         for net_str, row in current_subnets.items():
             if net_str in desired_map:
                 continue
+            # #1558: don't cascade-delete operator / foreign /
+            # operator-edited addresses with the subnet — un-claim it
+            # instead when any survive, like the OPNsense reconciler.
+            if await subnet_has_surviving_addresses(db, row.id, "cloud_endpoint_id"):
+                row.cloud_endpoint_id = None
+                summary.subnets_updated += 1
+                continue
             await db.delete(row)
             summary.subnets_deleted += 1
 
@@ -654,6 +670,16 @@ async def _apply_addresses(
             changed = False
             # subnet_id is factual — always correct it.
             if row.subnet_id != subnet.id:
+                # Another integration's row (or another Cloud endpoint's) may
+                # already sit at the target (subnet, address); moving onto
+                # it would hit ``uq_ip_address_subnet_address`` and roll
+                # back the whole sync. Leave our row where it is.
+                if await address_taken(db, subnet.id, d.address, exclude_id=row.id):
+                    summary.warnings.append(
+                        f"address {addr}: subnet {subnet.network} already has a row "
+                        f"for it; not moving"
+                    )
+                    continue
                 dirty_subnets.add(row.subnet_id)
                 row.subnet_id = subnet.id
                 changed = True
@@ -674,6 +700,12 @@ async def _apply_addresses(
                 dirty_subnets.add(subnet.id)
                 summary.addresses_updated += 1
         else:
+            # The claim pass above took every row we may claim; one
+            # still at this (subnet, address) has another owner
+            # (warned there). Inserting next to it would hit
+            # ``uq_ip_address_subnet_address``.
+            if await address_taken(db, subnet.id, d.address):
+                continue
             db.add(
                 IPAddress(
                     subnet_id=subnet.id,

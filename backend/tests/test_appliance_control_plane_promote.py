@@ -1031,3 +1031,52 @@ async def test_a_settled_eviction_can_be_promoted_again(
     await db_session.refresh(evicted)
     assert evicted.desired_cluster_role == "member"
     assert evicted.cluster_join_state == "joining"
+
+
+# ── #1543: nothing reshapes the cluster mid-upgrade ──────────────────────────
+
+_GUARDED = (
+    "promote_control_plane",
+    "demote_control_plane",
+    "replace_control_plane_member",
+    "restore_etcd_snapshot",
+    "schedule_appliance_upgrade",
+    "schedule_appliance_set_next_boot",
+    "schedule_appliance_set_default_slot",
+)
+
+
+def test_every_cluster_reshaping_handler_checks_for_an_upgrade_in_flight() -> None:
+    """``assert_no_upgrade_in_flight`` existed for exactly these paths, and
+    only backup and factory reset called it."""
+    import inspect
+
+    from app.api.v1.appliance import supervisor
+
+    missing = [
+        name
+        for name in _GUARDED
+        if "assert_no_upgrade_in_flight(" not in inspect.getsource(getattr(supervisor, name))
+    ]
+    assert missing == []
+
+
+async def test_demote_refused_mid_upgrade(db_session: AsyncSession, client: AsyncClient) -> None:
+    from app.models.system_upgrade import SystemUpgradeRun
+
+    token = await _admin(db_session)
+    await _seed(db_session)
+    m1 = await _appliance(db_session, "m1", cluster_role=CLUSTER_ROLE_MEMBER)
+    m2 = await _appliance(db_session, "m2", cluster_role=CLUSTER_ROLE_MEMBER)
+    db_session.add(SystemUpgradeRun(kind="rolling", state="running", target_version="2026.10.06-1"))
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/appliance/fleet/control-plane/demote",
+        json={"appliance_ids": [str(m1.id), str(m2.id)]},
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 409, resp.text
+    assert "rolling upgrade" in resp.text
+    await db_session.refresh(m1)
+    assert m1.cluster_join_state != "leaving"

@@ -184,7 +184,8 @@ def compile_firewall_body(
     lines.append("# for the operator-override surface that lands at the end of this file.")
     lines.append(f"# profile: {profile}")
     lines.append(f"# roles: {','.join(roles) if roles else '(idle)'}")
-    bootstrap_action = "retire" if cp_member_count >= 2 else "keep"
+    # #1508 — retire only on a control-plane member; an agent keeps it.
+    bootstrap_action = "retire" if cp_member_count >= 2 and is_cp else "keep"
     lines.append(f"# spatium-bootstrap: {bootstrap_action}")
     # #769 — host-runner directive for the baked Web-UI sentinel
     # (00-spatium-webui.nft), which opens 80/443 from first boot so the

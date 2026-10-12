@@ -2003,6 +2003,7 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
                   <th className="px-3 py-2 text-left font-medium">
                     Description
                   </th>
+                  <th className="px-3 py-2 text-left font-medium">Family</th>
                   <th className="px-3 py-2 text-left font-medium">Match</th>
                   <th className="px-3 py-2"></th>
                 </tr>
@@ -2013,6 +2014,13 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
                     <td className="px-3 py-2 font-medium">{c.name}</td>
                     <td className="px-3 py-2 text-muted-foreground">
                       {c.description}
+                    </td>
+                    <td className="px-3 py-2 text-xs whitespace-nowrap">
+                      {c.address_family === "dual"
+                        ? "IPv4 + IPv6"
+                        : c.address_family === "ipv6"
+                          ? "IPv6"
+                          : "IPv4"}
                     </td>
                     <td className="px-3 py-2 font-mono text-xs truncate max-w-md">
                       {c.match_expression}

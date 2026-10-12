@@ -40,6 +40,7 @@ from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
 from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.dhcp.option_spelling import group_drivers, scopes_losing_raw_options
 from app.services.dhcp.pull_leases import pull_leases_from_server
 from app.services.dhcp.stats import (
     STATS_BUCKET_SECONDS,
@@ -451,6 +452,36 @@ class SyncLeasesResponse(BaseModel):
 _UNCOORDINATABLE_DRIVERS = frozenset({"kea", "windows_dhcp"})
 
 
+async def _assert_group_options_servable(
+    db: DB, group_id: uuid.UUID | None, driver: str, *, exclude_server_id: uuid.UUID | None = None
+) -> None:
+    """422 when this server joining ``group_id`` would make its servers drop
+    raw-code options already stored on the group's scopes (#1347).
+
+    Windows reads ``opt-NN`` and drops ``code:NN``; Kea and FortiGate the
+    reverse. The scope write refuses a key the group cannot serve, but a
+    scope saved on a Kea, FortiGate or empty group kept its ``code:NN`` when
+    a Windows server joined, and was then served without it, silently.
+    """
+    if group_id is None:
+        return
+    drivers = await group_drivers(db, group_id, exclude_server_id=exclude_server_id)
+    affected = await scopes_losing_raw_options(db, group_id, drivers | {driver})
+    if not affected:
+        return
+    listed = "; ".join(f"{label}: {', '.join(keys)}" for label, keys in affected[:5])
+    more = f" (and {len(affected) - 5} more)" if len(affected) > 5 else ""
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail=(
+            f"A {driver} server in this group would not serve raw options already set "
+            f"on {len(affected)} scope(s): {listed}{more}. Windows reads opt-NN and drops "
+            "code:NN, Kea and FortiGate the reverse. Re-key or remove those options "
+            "first, or use a named option."
+        ),
+    )
+
+
 async def _assert_no_v6_scopes_for_windows(db: DB, group_id: uuid.UUID | None, driver: str) -> None:
     """422 when a Windows server would join a group with DHCPv6 scopes (#1480).
 
@@ -524,6 +555,7 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
         raise HTTPException(status_code=409, detail="A DHCP server with that name exists")
 
     await _assert_driver_mix_allowed(db, body.server_group_id, body.driver)
+    await _assert_group_options_servable(db, body.server_group_id, body.driver)
     await _assert_no_v6_scopes_for_windows(db, body.server_group_id, body.driver)
     payload = body.model_dump(exclude={"windows_credentials", "cloud_credentials"})
     # Resolve the per-driver default port when the caller omitted it: cloud/REST
@@ -624,6 +656,9 @@ async def update_server(
     target_driver = changes.get("driver", s.driver)
     if target_group != s.server_group_id or target_driver != s.driver:
         await _assert_driver_mix_allowed(db, target_group, target_driver, exclude_server_id=s.id)
+        await _assert_group_options_servable(
+            db, target_group, target_driver, exclude_server_id=s.id
+        )
         await _assert_no_v6_scopes_for_windows(db, target_group, target_driver)
     for k, v in changes.items():
         setattr(s, k, v)

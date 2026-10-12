@@ -35,6 +35,7 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -448,6 +449,17 @@ _TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pendin
 _REBOOT_TRIGGER_FILE = Path(
     "/var/lib/spatiumddi-host/release-state/reboot-pending-fleet"
 )
+# #1446 — the boot a fleet reboot trigger was last written in. The control
+# plane keeps delivering ``reboot_requested`` until a heartbeat arrives from
+# a different boot, so between writing the trigger and the host going down,
+# heartbeats still carry it. Without this marker each of those would
+# re-write the trigger the runner had just moved aside, and a trigger left
+# behind by the shutdown would make the NEXT request a no-op (the
+# ``exists()`` check below), which is the "reboot cleared, nothing happened"
+# failure this issue is about.
+_REBOOT_FIRED_BOOT_MARKER = Path(
+    "/var/lib/spatiumddi-host/release-state/reboot-fleet-fired-boot"
+)
 # Issue #386 Part B — fire-once marker. Records the last
 # ``desired_slot_image_url`` the supervisor wrote a trigger for, so a
 # failed apply (which renames the trigger to ``.failed.<ts>`` and would
@@ -652,12 +664,37 @@ _CLUSTER_JOIN_STATE_SIDECAR = Path(
 # transition target — so re-driving against a different seed starts with a
 # fresh budget. ``reset_cluster_join_attempts()`` clears both ledgers
 # whenever the control plane stops asking for a role change.
-_CLUSTER_JOIN_MAX_ATTEMPTS = 3
+#
+# #1212 — a JOIN's re-fires are spaced too, and its ceiling is high enough
+# that its attempts outlast the backend's retry window. The backend keeps a
+# transiently failed member's desired role for 15 minutes (#961) so that the
+# join is retried once the path to the seed is back. The supervisor used to
+# re-fire on every heartbeat, with a ceiling of three and no spacing. An
+# attempt against an unreachable seed fails in ~20 s, so all three landed in
+# the first ~2.5 minutes of an outage and the rest of the window went unused:
+# a member whose path came back four minutes in stayed a standalone node.
+#
+# The next join against the same target now waits
+# ``_cluster_join_retry_delay_s()`` after the last fire, measured from the
+# ledger's timestamp: one minute, two, then every four. The first retry
+# still comes a minute after the first attempt; that is the retry #961's
+# concurrent-promote race needs. Eight attempts take about 23 minutes, past
+# the window, so for a transient failure the backend's clear, not this
+# ceiling, now ends the retries. The ceiling stays the backstop for a
+# control plane that never processes the failure: 8 wipes over ~23 minutes,
+# where it used to be 3 in ~2.5.
+_CLUSTER_JOIN_MAX_ATTEMPTS = 8
+_CLUSTER_JOIN_RETRY_BASE_S = 60.0
+_CLUSTER_JOIN_RETRY_MAX_S = 240.0
+# The leave is exactly as destructive, but the backend clears a failed
+# leave's desired role at once, so there is no window to span: it keeps the
+# original ceiling and no spacing.
+_CLUSTER_LEAVE_MAX_ATTEMPTS = 3
 
 # #590 — "this terminal verdict has already been delivered" marker.
 #
 # The .state sidecar is written by the ROOT host runner and lives in a
-# 1777-sticky dir, so this unprivileged supervisor cannot delete it — it
+# sticky dir, so this unprivileged supervisor cannot delete it — it
 # would otherwise keep re-reporting a stale ``failed`` from a previous
 # episode. Now that the backend CLEARS the desired-state on a reported
 # ``failed`` (instead of re-firing the join forever), a stale re-report
@@ -907,10 +944,10 @@ def apply_clear_upgrade_command() -> bool:
     except OSError as exc:
         log.warning("supervisor.clear_upgrade.state_reset_failed", error=str(exc))
 
-    # OVERWRITE rather than unlink. release-state is mode 1777 (sticky) and
-    # this file is root-owned (the host runner writes it); a non-owner can
-    # never unlink it, but the runner now publishes it 0666 so an in-place
-    # write succeeds. An empty object reads as "no progress" to every
+    # OVERWRITE rather than unlink. release-state is sticky (1770 root:2770)
+    # and this file is root-owned (the host runner writes it); a non-owner
+    # can never unlink it, but the runner publishes it 0660 to gid 2770,
+    # which this process carries, so an in-place write succeeds. An empty object reads as "no progress" to every
     # consumer, which is what a cleared upgrade should show.
     try:
         if _SLOT_UPGRADE_PROGRESS.exists():
@@ -1093,8 +1130,9 @@ def _write_owner_only(tmp: Path, payload: str) -> None:
     The host-config trigger files can carry decrypted secrets — the SNMP
     community, APT private-mirror passwords + GPG armour (#155), the syslog
     forwarding CA material (#156), the SSH config (#157), and the k3s join
-    token (#272) — and they land in the 1777-sticky ``release-state`` dir
-    that any unprivileged host user can list. A plain ``write_text`` then
+    token (#272) — and they land in the shared ``release-state`` dir, which
+    every host account could list while it was 1777 (GHSA-h2j9-qrg7-grfw)
+    and the api pod still can. A plain ``write_text`` then
     ``chmod(0o600)`` left a window where the file existed at the umask
     default (typically 0644, world-readable) before the chmod landed, so a
     local user could race-open the ``.new`` temp and read the secret.
@@ -1155,7 +1193,7 @@ def _fire_host_config(
         tmp = trigger_file.with_suffix(".new")
         # The payload can carry decrypted secrets (SNMP community, APT
         # GPG armour + private-mirror passwords #155, syslog CA #156, the
-        # SSH config #157) and lands in the 1777-sticky release-state dir.
+        # SSH config #157) and lands in the shared, sticky release-state dir.
         # Create it owner-only atomically — see _write_owner_only — so no
         # window exists where another unprivileged host user could read it.
         _write_owner_only(tmp, payload)
@@ -1309,6 +1347,15 @@ def _read_slot_upgrade_progress() -> dict[str, object] | None:
     return data if isinstance(data, dict) else None
 
 
+def read_boot_id() -> str | None:
+    """This boot's kernel boot id, or None when it cannot be read."""
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
 def maybe_fire_reboot(reboot_requested: bool) -> bool:
     """Phase 8f-8 — write the reboot trigger when the control plane
     has stamped ``reboot_requested=True`` on the server row.
@@ -1319,15 +1366,26 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
     ``/var/lib/spatiumddi-host/release-state`` bind mount only exist
     on a SpatiumDDI appliance — but defence in depth is cheap.
 
-    Returns True if a trigger was fired, False otherwise. Idempotent —
-    if the trigger file already exists (host runner hasn't picked it
-    up yet) we skip rather than stacking writes.
+    Returns True if a trigger was fired, False otherwise. Fires at most
+    once per boot (#1446): the control plane keeps sending the request
+    until a heartbeat comes from a new boot, so every heartbeat between the
+    write and the shutdown carries it again.
     """
     if detect_deployment_kind() != "appliance":
         return False
     if not reboot_requested:
         return False
-    if _REBOOT_TRIGGER_FILE.exists():
+    boot_id = read_boot_id()
+    try:
+        fired_in = _REBOOT_FIRED_BOOT_MARKER.read_text(encoding="utf-8").strip()
+    except OSError:
+        fired_in = ""
+    # #1446 — once per boot. A trigger already written in THIS boot is the
+    # host going down; a trigger left over from an EARLIER boot is stale (the
+    # runner never consumed it) and is rewritten, so PathChanged fires.
+    if boot_id and fired_in == boot_id:
+        return False
+    if _REBOOT_TRIGGER_FILE.exists() and not boot_id:
         return False
     try:
         _REBOOT_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1340,6 +1398,8 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
             encoding="utf-8",
         )
         tmp.replace(_REBOOT_TRIGGER_FILE)
+        if boot_id:
+            _REBOOT_FIRED_BOOT_MARKER.write_text(boot_id + "\n", encoding="utf-8")
         return True
     except OSError:
         return False
@@ -1651,7 +1711,22 @@ def _join_target_fingerprint(server_url: str, join_token: str) -> str:
     return digest.hexdigest()[:16]
 
 
-def _cluster_transition_should_fire(trigger_file: Path, fingerprint: str) -> bool:
+def _cluster_join_retry_delay_s(attempts: int) -> float:
+    """#1212 — how long after fire number ``attempts`` (>= 1) the next join
+    against the same target may fire: 60 s, 120 s, then 240 s each time."""
+    return min(
+        _CLUSTER_JOIN_RETRY_BASE_S * (2 ** max(0, attempts - 1)),
+        _CLUSTER_JOIN_RETRY_MAX_S,
+    )
+
+
+def _cluster_transition_should_fire(
+    trigger_file: Path,
+    fingerprint: str,
+    *,
+    max_attempts: int,
+    retry_delay_s: Callable[[int], float] | None = None,
+) -> bool:
     """#590 — bound the number of times a DESTRUCTIVE cluster transition
     re-fires against the same target.
 
@@ -1661,27 +1736,48 @@ def _cluster_transition_should_fire(trigger_file: Path, fingerprint: str) -> boo
     backend's clear-on-failed is the primary brake; this is the backstop
     for a control plane that never processes the failure.
 
+    #1212 — with ``retry_delay_s``, a re-fire against the same target also
+    waits ``retry_delay_s(attempts)`` after the last fire the ledger
+    recorded, so the attempts spread across the backend's retry window
+    instead of being spent in its first minutes. A ledger stamped in the
+    future (the clock stepped back) never holds a fire back: the ceiling
+    still bounds it.
+
     Reuses the module's hash-keyed fire-state ledger (``_read_fire_state``
     / ``_write_fire_state``), the same one the host-config planes use for
     their re-fire backoff. Budget is per fingerprint: a transition against
     a different target starts over.
     """
     fire_state = _fire_state_path(trigger_file)
-    prev_fingerprint, attempts, _last_at = _read_fire_state(fire_state)
+    prev_fingerprint, attempts, last_at = _read_fire_state(fire_state)
     if prev_fingerprint != fingerprint:
-        attempts = 0
-    if attempts >= _CLUSTER_JOIN_MAX_ATTEMPTS:
+        attempts, last_at = 0, None
+    if attempts >= max_attempts:
         log.error(
             "supervisor.cluster_transition.attempt_ceiling_reached",
             trigger=trigger_file.name,
             attempts=attempts,
-            max_attempts=_CLUSTER_JOIN_MAX_ATTEMPTS,
+            max_attempts=max_attempts,
             detail=(
                 "refusing to re-fire the destructive transition; see "
                 "/var/log/spatiumddi/cluster-join.log, then re-drive it to retry"
             ),
         )
         return False
+    if retry_delay_s is not None and attempts and last_at is not None:
+        if last_at.tzinfo is None:
+            last_at = last_at.replace(tzinfo=UTC)
+        elapsed = (datetime.now(UTC) - last_at).total_seconds()
+        wait = retry_delay_s(attempts) - elapsed
+        if elapsed >= 0 and wait > 0:
+            log.info(
+                "supervisor.cluster_transition.retry_deferred",
+                trigger=trigger_file.name,
+                attempts=attempts,
+                max_attempts=max_attempts,
+                next_attempt_in_s=round(wait),
+            )
+            return False
     return True
 
 
@@ -1793,9 +1889,15 @@ def maybe_fire_cluster_join(
     # trigger-file presence alone can't stop a doomed join from re-wiping this
     # node's k3s state on every heartbeat. Budget is per target: a promote
     # against a different seed (or a re-promote after the ledger is reset)
-    # starts over.
+    # starts over. #1212 — re-fires against the same target are spaced
+    # (1, 2, then 4 minutes apart), so they cover the backend's retry window.
     fingerprint = _join_target_fingerprint(server_url, join_token)
-    if not _cluster_transition_should_fire(_CLUSTER_JOIN_TRIGGER_FILE, fingerprint):
+    if not _cluster_transition_should_fire(
+        _CLUSTER_JOIN_TRIGGER_FILE,
+        fingerprint,
+        max_attempts=_CLUSTER_JOIN_MAX_ATTEMPTS,
+        retry_delay_s=_cluster_join_retry_delay_s,
+    ):
         return False
     try:
         _CLUSTER_JOIN_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1804,7 +1906,7 @@ def maybe_fire_cluster_join(
         )
         # The join token is a control-plane-admin-equivalent secret; write
         # it owner-only atomically (see _write_owner_only) so it can't be
-        # read by another unprivileged user out of the 1777-sticky dir.
+        # read by another writer of the shared, sticky release-state dir.
         _write_owner_only(tmp, f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n")
         tmp.replace(_CLUSTER_JOIN_TRIGGER_FILE)
     except OSError:
@@ -1828,10 +1930,12 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
     #590 — the leave is exactly as destructive as the join (``do_leave``
     runs the same full ``backup_and_wipe_identity`` + k3s restart) and the
     runner renames a failed leave trigger to ``.failed.<ts>`` just like the
-    join. So it gets the same per-target attempt ceiling; without it a
-    demote that can never come Ready re-wipes this node's k3s state on
-    every heartbeat, forever, whenever the control plane isn't around to
-    clear the desired-state.
+    join. So it gets the same kind of per-target attempt ceiling (its own,
+    ``_CLUSTER_LEAVE_MAX_ATTEMPTS``, with none of the join's #1212 retry
+    spacing: the backend clears a failed leave at once, so there is no
+    window to spread attempts across); without it a demote that can never
+    come Ready re-wipes this node's k3s state on every heartbeat, forever,
+    whenever the control plane isn't around to clear the desired-state.
     """
     if detect_deployment_kind() != "appliance":
         return False
@@ -1849,7 +1953,9 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
     # A leave has no target coordinates, so the whole operation is one
     # fingerprint — the budget bounds "this node's demote", period.
     fingerprint = "leave"
-    if not _cluster_transition_should_fire(_CLUSTER_LEAVE_TRIGGER_FILE, fingerprint):
+    if not _cluster_transition_should_fire(
+        _CLUSTER_LEAVE_TRIGGER_FILE, fingerprint, max_attempts=_CLUSTER_LEAVE_MAX_ATTEMPTS
+    ):
         return False
     try:
         _CLUSTER_LEAVE_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -4167,6 +4273,11 @@ def collect() -> dict[str, object]:
         "slot_a_version": slot_a_version,
         "slot_b_version": slot_b_version,
         "is_trial_boot": is_trial_boot,
+        # #1446 — which boot this heartbeat comes from. The control plane
+        # retires a reboot request when a heartbeat arrives from a
+        # different boot, instead of on a 15 s stopwatch that could expire
+        # before the request was ever delivered.
+        "boot_id": read_boot_id() if is_appliance else None,
         "last_upgrade_state": last_state,
         "last_upgrade_state_at": last_state_at.isoformat() if last_state_at else None,
         # #386 Part C — full upgrade status for the Fleet UI.

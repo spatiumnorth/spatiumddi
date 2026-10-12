@@ -281,6 +281,10 @@ class WorkloadHealth(BaseModel):
     # component reads "degraded" even at ready == total.
     jobs_running: int = 0
     status: str
+    # #1387 — for the database row: "cnpg" when ready / total are the CNPG
+    # Cluster's readyInstances / spec.instances, "pods" when it could not be
+    # read and they are a pod count. None for every other component.
+    source: str | None = None
 
 
 class ClusterDnsProbe(BaseModel):

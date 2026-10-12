@@ -5,7 +5,7 @@
 # kea-ctrl-agent was removed in #637. Kea 3.0 deprecates it (it logs
 # CTRL_AGENT_IS_DEPRECATED on every start), and SpatiumDDI never used it:
 # the agent talks to kea-dhcp4 / kea-dhcp6 directly over their unix control
-# sockets (spatium_dhcp_agent/kea_ctrl.py — config-test, config-reload,
+# sockets (spatium_dhcp_agent/kea_ctrl.py — config-reload,
 # status-get, statistic-get-all). Supervising a daemon nothing calls was a
 # liability, not a feature: its crash-loop give-up path would be seen by the
 # child-exit poll below and take the whole container down with it.

@@ -84,6 +84,7 @@ class NetworkPingArgs(BaseModel):
 
 @register_tool(
     name="network_ping",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
@@ -124,6 +125,7 @@ class NetworkTracerouteArgs(BaseModel):
 
 @register_tool(
     name="network_traceroute",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
@@ -185,6 +187,7 @@ class NetworkDigArgs(BaseModel):
 
 @register_tool(
     name="network_dig",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
@@ -225,6 +228,7 @@ class NetworkPortTestArgs(BaseModel):
 
 @register_tool(
     name="network_port_test",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
@@ -267,6 +271,7 @@ class NetworkTlsCertArgs(BaseModel):
 
 @register_tool(
     name="network_tls_cert",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
@@ -317,6 +322,7 @@ class LookupMacVendorArgs(BaseModel):
 
 @register_tool(
     name="lookup_mac_vendor",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(
@@ -352,6 +358,7 @@ class NetworkWhoisArgs(BaseModel):
 
 @register_tool(
     name="network_whois",
+    permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
     description=(

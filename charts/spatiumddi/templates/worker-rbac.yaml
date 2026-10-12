@@ -15,11 +15,20 @@ The grant is deliberately MUCH narrower than the api's. The worker gets:
                              else on the kubelet (#983 item 6).
   * optionally ``nodes/proxy [get]`` while the fallback transport is on.
 
-It does NOT get pods/eviction, HelmChartConfig patch, Secret write, or
-node patch — everything the api's upgrade-orchestrator role carries. Sharing
-the api's ServiceAccount would have been one line and would have handed the
-widest task surface in the product the ability to cordon nodes and evict
-pods.
+Its baseline grant has NO pods/eviction, HelmChartConfig patch, Secret
+write or node patch. Sharing the api's ServiceAccount would have been one
+line and would have handed the widest task surface in the product the
+ability to cordon nodes and evict pods.
+
+THE ONE EXCEPTION: the rolling-upgrade orchestrator (#1445). It runs in the
+worker, as the ``app.tasks.upgrade_orchestrator`` Celery task, and needs the
+upgrade lease, node cordon and eviction, the CNPG Cluster patch and the
+HelmChartConfig patch. With only the api's ServiceAccount bound to those,
+the orchestrator could never take its lease on a real cluster. So when
+``api.upgradeOrchestratorRBAC.enabled`` is on, the worker is bound to the
+orchestrator's ClusterRole and kube-system Role, plus a namespaced Role of
+its own carrying only the orchestrator's rules from the api's Role. That
+Role leaves out the api's Secret patch and Deployment patch on purpose.
 
 ``get_cluster_health`` also lists pods cluster-wide, which is NOT granted
 here: that call already degrades to an empty pod list on a non-200, and the
@@ -71,4 +80,79 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: {{ include "spatiumddi.fullname" . }}-worker-node-metrics
+{{- if and .Values.api.serviceAccount.enabled .Values.api.upgradeOrchestratorRBAC.enabled }}
+---
+# #1445 — the orchestrator's namespaced rules, the same as the
+# upgradeOrchestratorRBAC block of the api's Role and nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-worker-upgrade-orchestrator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "worker") .) | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    # No ``delete``, as in the api's Role: release clears the holder.
+    verbs: ["get", "list", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-worker-upgrade-orchestrator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "worker") .) | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "spatiumddi.fullname" . }}-worker
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "spatiumddi.fullname" . }}-worker-upgrade-orchestrator
+---
+# Cordon, eviction and node reads: the api's orchestrator ClusterRole.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-worker-upgrade-orchestrator
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "worker") .) | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "spatiumddi.fullname" . }}-worker
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "spatiumddi.fullname" . }}-api-upgrade-orchestrator
+---
+# The chart bump's HelmChartConfig patch in kube-system: the api's Role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-worker-helm
+  namespace: kube-system
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "worker") .) | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "spatiumddi.fullname" . }}-worker
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "spatiumddi.fullname" . }}-api-helm
+{{- end }}
 {{- end }}

@@ -830,10 +830,47 @@ def cmd_apply(args) -> int:
     return 0
 
 
+# #1630 — the suffix a tarball carries while it is being copied into the
+# images dir. The running k3s watches that dir and imports, 2 s after any
+# event, every file whose name ends in one of wharfie's tarball extensions
+# (``.tar``, ``.tar.zst``, ``.tgz``, …) or ``.txt`` (k3s
+# pkg/agent/containerd/watcher.go ``isFileSupported``). ``.part`` is none
+# of them, so the watcher skips the file until the rename puts the whole
+# of it in place under its real name.
+_PART_SUFFIX = ".part"
+
+
+def _install_atomically(src: Path, final: Path) -> None:
+    """Copy ``src`` to ``final`` so no reader ever sees a partial ``final``:
+    copy (content + mtime, like ``copy2``) to a hidden ``.part`` sibling,
+    fsync it, then rename it over ``final`` (#1630)."""
+    tmp = final.with_name(f".{final.name}{_PART_SUFFIX}")
+    try:
+        shutil.copy2(src, tmp)
+        with open(tmp, "rb") as fh:
+            os.fsync(fh.fileno())
+        os.replace(tmp, final)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _refresh_baked_images(target_dev: str) -> None:
     """Copy the new slot's baked image tarballs to the persistent /var
     partition's k3s airgap-images dir. See cmd_apply for the
     architecture background.
+
+    #1630 — each tarball lands atomically (``_install_atomically``). The
+    old slot's k3s keeps running through the apply and its image watcher
+    imports whatever appears in this dir. Copied in place, it read every
+    tarball while it was still being written: those imports fail
+    ("short read", "window size exceeded", "rle symbol … >= max"), and
+    one cut off inside a tarball's ``index.json`` leaves a containerd
+    ingest under the shared ref ``tar-index.json`` that fails every
+    shorter ``index.json`` imported after it, on the next boot included
+    (``unexpected commit size 3071, expected 374``). The node then came up
+    on the new slot without its DNS and DHCP agents' images. Now the
+    watcher sees each file once, whole, under its real name.
 
     Best-effort: a mount failure just leaves the persistent /var with
     its previous tarballs and the operator gets ErrImageNeverPull on
@@ -856,10 +893,19 @@ def _refresh_baked_images(target_dev: str) -> None:
                 print(f"  WARN: no baked-image dir at {src}")
                 return
             dest.mkdir(parents=True, exist_ok=True)
+            # A copy an earlier apply was killed in the middle of.
+            for stale in dest.glob(f".*{_PART_SUFFIX}"):
+                stale.unlink(missing_ok=True)
             copied = 0
-            for tarball in src.glob("*.tar.zst"):
-                shutil.copy2(tarball, dest / tarball.name)
+            for tarball in sorted(src.glob("*.tar.zst")):
+                _install_atomically(tarball, dest / tarball.name)
                 copied += 1
+            # The renames must survive the reboot that follows the apply.
+            dir_fd = os.open(dest, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
             print(f"  refreshed {copied} baked tarballs → {dest}")
         finally:
             subprocess.run(["umount", str(mountpoint)], check=False)

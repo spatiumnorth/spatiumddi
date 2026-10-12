@@ -33,6 +33,9 @@ spec:
         {{- include "spatiumddi-appliance.podLabels" . | nindent 8 }}
         app.kubernetes.io/name: dns-powerdns
         app.kubernetes.io/component: dns-powerdns
+        # #1510 — every DNS engine's pods carry this, and the one ``dns-vip``
+        # Service selects on it, so the DNS VIP follows whichever engine runs.
+        spatium.io/dns-vip: "true"
     spec:
       {{- with .Values.dnsPowerdns.priorityClassName }}
       priorityClassName: {{ . | quote }}
@@ -44,7 +47,8 @@ spec:
       {{- end }}
       {{- if not .Values.dns.useMetalLBVIP }}
       # #272 Phase 5 — default path: bind :53 on the node IP. A DNS VIP
-      # drops hostNetwork in favour of the LoadBalancer Service below.
+      # drops hostNetwork in favour of the shared ``dns-vip`` LoadBalancer
+      # Service (dns-vip.yaml).
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
@@ -81,6 +85,16 @@ spec:
               value: {{ .Values.dnsPowerdns.agentKey | quote }}
             - name: AGENT_GROUP
               value: {{ .Values.dnsPowerdns.serverGroupName | quote }}
+            {{- if .Values.dns.useMetalLBVIP }}
+            # #1715 — without hostNetwork the pod's own nodename is the POD
+            # name, so the agent would register under ``dns-…-x7k2q`` and a
+            # Fleet group change (which finds the appliance's servers by its
+            # hostname) could never find it. The node name is the hostname.
+            - name: AGENT_HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- end }}
             {{- if .Values.dnsPowerdns.lmdbRestore }}
             # #638 — the LMDB rollback lever. PowerDNS 5.0 migrates the LMDB
             # schema one way on first open, and the A/B slot rollback swaps
@@ -160,18 +174,11 @@ metadata:
   labels:
     {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
     app.kubernetes.io/component: dns-powerdns
-  {{- if .Values.dns.useMetalLBVIP }}
-  annotations:
-    # #272 Phase 5 — pin the DNS resolver VIP from the MetalLB pool.
-    metallb.universe.tf/address-pool: {{ .Values.dns.vipPool | quote }}
-    metallb.universe.tf/loadBalancerIPs: {{ .Values.dns.vip | quote }}
-  {{- end }}
 spec:
-  {{- if .Values.dns.useMetalLBVIP }}
-  type: LoadBalancer
-  {{- else }}
+  # #1510 — always ClusterIP. The DNS VIP lives on the single ``dns-vip``
+  # Service (dns-vip.yaml): three LoadBalancers asking MetalLB for the same
+  # address let the oldest one keep it, even after its engine was switched off.
   type: ClusterIP
-  {{- end }}
   selector:
     app.kubernetes.io/name: dns-powerdns
   ports:

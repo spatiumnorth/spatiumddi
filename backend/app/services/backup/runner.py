@@ -46,6 +46,7 @@ from app.services.backup.schedule import compute_next_run
 from app.services.backup.targets import (
     PRE_RESTORE_KEEP_LAST_N,
     BackupDestinationError,
+    DestinationConfigError,
     RetentionLockedError,
     SecretFieldError,
     decrypt_config_secrets,
@@ -54,6 +55,64 @@ from app.services.backup.targets import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+# A failed run's audit row is forwarded as-is (syslog / webhook / SMTP
+# targets, the ``system.backup_failed`` event), but a driver's error text
+# routinely names the destination: NFS server and export, SMB share, S3
+# bucket, SCP host and path. The audit row therefore carries only one of
+# these fixed categories (#1617); the full text stays on the target
+# (``last_run_error``, superadmin-only) and in ``error_detail``, which no
+# forwarder emits. Checked in order, first match wins.
+_FAILURE_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("timeout", ("timed out", "timeout")),
+    (
+        "unreachable",
+        (
+            "connection refused",
+            "unreachable",
+            "no route to host",
+            "name or service not known",
+            "could not resolve",
+            "could not connect",
+            "connection reset",
+            "temporary failure in name resolution",
+        ),
+    ),
+    (
+        "permission_denied",
+        ("permission denied", "access denied", "forbidden", "not permitted", "unauthorized"),
+    ),
+    (
+        "auth_failed",
+        ("authentication", "auth failed", "login failed", "logon failure", "logon_failure"),
+    ),
+    ("no_space", ("no space", "disk full", "quota")),
+    ("not_found", ("not found", "no such file", "no such bucket", "does not exist")),
+)
+
+
+def backup_failure_category(exc: BaseException) -> str:
+    """A short, non-identifying category for a failed backup run.
+
+    Never echoes any part of the error text, only one of a fixed set of
+    words, so it is safe on a forwarded audit row.
+    """
+    if isinstance(exc, SecretFieldError):
+        return "secret_unreadable"
+    if isinstance(exc, BackupArchiveError):
+        return "archive_error"
+    if isinstance(exc, DestinationConfigError):
+        return "config_invalid"
+    if isinstance(exc, RetentionLockedError):
+        return "retention_locked"
+    text = str(exc).lower()
+    for category, needles in _FAILURE_CATEGORIES:
+        if any(n in text for n in needles):
+            return category
+    if isinstance(exc, BackupDestinationError):
+        return "destination_error"
+    return "unexpected"
 
 
 class BackupRunBusyError(Exception):
@@ -193,7 +252,11 @@ async def reap_stale_backup_run(
             user_id=None,
             user_display_name=actor_display,
             result="failure",
-            new_value={"triggered_by": "stale_reaper", "kind": target.kind},
+            new_value={
+                "triggered_by": "stale_reaper",
+                "kind": target.kind,
+                "failure_category": "run_died",
+            },
             error_detail=error,
         )
     )
@@ -436,7 +499,13 @@ async def run_backup_for_target(
         target.last_run_error = str(exc)[:5000]
         if target.schedule_cron:
             target.next_run_at = compute_next_run(target.schedule_cron, after=finished)
-        result.update({"error": str(exc), "duration_ms": duration_ms})
+        result.update(
+            {
+                "error": str(exc),
+                "failure_category": backup_failure_category(exc),
+                "duration_ms": duration_ms,
+            }
+        )
         action = "backup_target_run_failed"
         result_state = "failed"
         logger.warning(
@@ -463,7 +532,13 @@ async def run_backup_for_target(
         target.last_run_error = f"unexpected error: {exc}"[:5000]
         if target.schedule_cron:
             target.next_run_at = compute_next_run(target.schedule_cron, after=finished)
-        result.update({"error": f"unexpected error: {exc}", "duration_ms": duration_ms})
+        result.update(
+            {
+                "error": f"unexpected error: {exc}",
+                "failure_category": backup_failure_category(exc),
+                "duration_ms": duration_ms,
+            }
+        )
         action = "backup_target_run_failed"
         result_state = "failed"
         logger.exception(
@@ -482,10 +557,12 @@ async def run_backup_for_target(
             user_id=actor_id,
             user_display_name=actor_display,
             result=result_state,
+            # No ``error`` here: this row is forwarded, and the text can name
+            # the destination (#1617). ``failure_category`` says why.
             new_value={
                 "triggered_by": triggered_by,
                 "kind": target.kind,
-                **{k: v for k, v in result.items() if k != "error" or v is not None},
+                **{k: v for k, v in result.items() if k != "error"},
             },
             error_detail=result.get("error"),
         )

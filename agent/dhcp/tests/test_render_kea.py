@@ -779,3 +779,96 @@ def test_lease_cache_scope_override_of_zero_survives() -> None:
 def test_lease_cache_scope_max_age_override_renders() -> None:
     out = render(_lc_bundle(group_threshold=0.25, scope_threshold=0.5, scope_max_age=120))
     assert out["Dhcp4"]["subnet4"][0]["cache-max-age"] == 120
+
+
+# ── Renew / rebind timers (#1259) ──────────────────────────────────────
+
+
+def _keys(node: object) -> set[str]:
+    """Every dict key anywhere in a rendered document."""
+    if isinstance(node, dict):
+        return set(node) | {k for v in node.values() for k in _keys(v)}
+    if isinstance(node, list):
+        return {k for v in node for k in _keys(v)}
+    return set()
+
+
+def _dual_stack_bundle() -> dict:
+    return {
+        "server": {"interfaces": ["*"], "dhcp_socket_type": "raw"},
+        "global_options": {"lease_time": 86400},
+        "scopes": [
+            {
+                "subnet_cidr": "10.38.0.0/24",
+                "lease_time": 86400,
+                "pools": [
+                    {"start_ip": "10.38.0.10", "end_ip": "10.38.0.99", "pool_type": "dynamic"}
+                ],
+                "statics": [],
+            },
+            {
+                "subnet_cidr": "2001:db8:38::/64",
+                "lease_time": 86400,
+                "address_family": "ipv6",
+                "v6_address_mode": "stateful",
+                "pools": [
+                    {
+                        "start_ip": "2001:db8:38::100",
+                        "end_ip": "2001:db8:38::1ff",
+                        "pool_type": "dynamic",
+                    }
+                ],
+                "statics": [],
+            },
+        ],
+    }
+
+
+def test_no_fixed_renew_or_rebind_timer_is_rendered() -> None:
+    """The roots used to pin T1/T2 to 900/1800 s whatever the lease time,
+    so a 1-day lease renewed every 15 minutes. Kea prefers explicit timers
+    over calculated ones and subnets inherit them, so ANY renew/rebind timer
+    above the subnet level would switch the calculation off again."""
+    out = render(_dual_stack_bundle())
+    for family in ("Dhcp4", "Dhcp6"):
+        keys = _keys(out[family])
+        assert "renew-timer" not in keys, family
+        assert "rebind-timer" not in keys, family
+
+
+def test_v4_tee_times_are_calculated_from_the_lease() -> None:
+    """kea-dhcp4 defaults ``calculate-tee-times`` to false and then sends no
+    T1/T2 options at all, so it has to be switched on. RFC 2131 §4.4.5."""
+    d4 = render(_dual_stack_bundle())["Dhcp4"]
+    assert d4["calculate-tee-times"] is True
+    assert d4["t1-percent"] == 0.5
+    assert d4["t2-percent"] == 0.875
+
+
+def test_v6_tee_times_are_calculated_from_the_lease() -> None:
+    """RFC 8415 recommends 0.5 / 0.8 (also Kea's own v6 default)."""
+    d6 = render(_dual_stack_bundle())["Dhcp6"]
+    assert d6["calculate-tee-times"] is True
+    assert d6["t1-percent"] == 0.5
+    assert d6["t2-percent"] == 0.8
+
+
+def test_idle_v6_skeleton_also_has_no_fixed_timers() -> None:
+    out = render(_lc_bundle())
+    assert out["Dhcp6"]["subnet6"] == []
+    assert "renew-timer" not in out["Dhcp6"]
+    assert out["Dhcp6"]["calculate-tee-times"] is True
+
+
+def test_explicit_per_subnet_timers_still_render(bundle: dict) -> None:
+    """The legacy subnet shape can carry explicit timers. They stay on the
+    subnet (where Kea lets them win over the calculation for that subnet
+    only) and never leak onto the root."""
+    bundle["subnets"][0]["renew_timer"] = 600
+    bundle["subnets"][0]["rebind_timer"] = 1050
+    d4 = render(bundle)["Dhcp4"]
+    assert d4["subnet4"][0]["renew-timer"] == 600
+    assert d4["subnet4"][0]["rebind-timer"] == 1050
+    assert "renew-timer" not in d4
+    assert "rebind-timer" not in d4
+    assert d4["calculate-tee-times"] is True

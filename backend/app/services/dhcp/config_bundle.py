@@ -54,6 +54,7 @@ from app.services.dhcp.device_policy import (
     load_fingerprint_snapshot,
 )
 from app.services.dhcp.option_validation import (
+    options_for_family,
     phone_options_loadable,
     vendor_class_match_renderable,
     vendor_class_match_test,
@@ -360,15 +361,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
             )
         )
 
-    client_classes = tuple(
-        ClientClassDef(
-            name=c.name,
-            match_expression=c.match_expression or "",
-            description=c.description or "",
-            options=dict(c.options or {}),
-        )
-        for c in cc_rows
-    )
+    client_classes = tuple(_client_class_def(c) for c in cc_rows)
 
     mac_blocks = tuple(
         MACBlockDef(
@@ -737,6 +730,27 @@ def _with_v6_domain_search(
     if not search:
         return options
     return {**options, "domain-search": search}
+
+
+def _client_class_def(c: DHCPClientClass) -> ClientClassDef:
+    """A client class with the options each daemon gets (#1229, #1295)."""
+    options = dict(c.options or {})
+    family = c.address_family or "ipv4"
+    if family == "dual":
+        v4, v6 = options_for_family(options, "ipv4"), options_for_family(options, "ipv6")
+    elif family == "ipv6":
+        v4, v6 = {}, options
+    else:
+        v4, v6 = options, {}
+    return ClientClassDef(
+        name=c.name,
+        match_expression=c.match_expression or "",
+        description=c.description or "",
+        options=options,
+        address_family=family,
+        options_v4=v4,
+        options_v6=v6,
+    )
 
 
 def _with_location_options(

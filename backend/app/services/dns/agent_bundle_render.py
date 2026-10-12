@@ -4,7 +4,8 @@ Shared by the worker task (``app.tasks.agent_bundles``) and, during the
 migration release, by the api's inline fallback in the long-poll. Both
 run the same build ``build_config_bundle`` always ran — minus the ops
 page — serialise it once in the #958 wire shape and hand the bytes to
-``agent_bundle_store``.
+``agent_bundle_store``: ``agent_config.encode_bundle_body``, which streams
+the blocklist entries into the gzipped body a batch at a time (#1662).
 
 Ordering inside is load-bearing:
 
@@ -38,7 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSAgentBundle, DNSServer
 from app.services.dns import agent_bundle_store as bundle_store
-from app.services.dns.agent_config import render_bundle_body, retire_queued_ops
+from app.services.dns.agent_config import encode_bundle_body, retire_queued_ops
 
 
 @dataclass(frozen=True)
@@ -78,8 +79,7 @@ async def render_and_store(
     snapshot_at, visible_xacts = (
         await db.execute(select(func.clock_timestamp(), cast(func.pg_current_snapshot(), Text)))
     ).one()
-    rendered = await render_bundle_body(db, server)
-    body_json = bundle_store.encode_body(rendered.body)
+    rendered = await encode_bundle_body(db, server)
     render_ms = int((time.monotonic() - started) * 1000)
     # Exactly the inline build's rule: under split-horizon the queued ops the
     # render folded in are retired — unless the server is in maintenance,
@@ -95,7 +95,8 @@ async def render_and_store(
         etag=rendered.etag,
         structural_etag=rendered.structural_etag,
         ships_ops=not rendered.has_views,
-        body_json=body_json,
+        body_gz=rendered.body_gz,
+        body_bytes=rendered.body_bytes,
         records=rendered.records,
         render_ms=render_ms,
         rendered_by=rendered_by,
@@ -107,7 +108,7 @@ async def render_and_store(
         structural_etag=rendered.structural_etag,
         records=rendered.records,
         render_ms=render_ms,
-        body_bytes=len(body_json),
+        body_bytes=rendered.body_bytes,
         rendered_by=rendered_by,
     )
 

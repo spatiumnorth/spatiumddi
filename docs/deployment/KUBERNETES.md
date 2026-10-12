@@ -386,9 +386,11 @@ steps in [`k8s/README.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/
 ### Redis — Sentinel
 
 Set `redis.kind: sentinel` to render a StatefulSet where each pod runs a
-`redis-server` + a `redis-sentinel` sidecar. Pod-0 starts as master; the rest
-replicate from it; the sentinels elect a new master and fail over
-automatically. The api / worker / beat pick up a `sentinel://` URL and resolve
+`redis-server` + a `redis-sentinel` sidecar. A starting pod asks the running
+sentinels which pod is the master and replicates from it (or starts as master
+when they name the pod itself); only when no sentinel answers, the whole set
+starting cold, does pod-0 start as master with the rest replicating from it.
+The sentinels elect a new master and fail over automatically. The api / worker / beat pick up a `sentinel://` URL and resolve
 the live master through the sentinels — no static master Service needed.
 
 ```yaml

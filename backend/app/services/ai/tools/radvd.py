@@ -35,6 +35,7 @@ class FindRASubnetsArgs(BaseModel):
 
 @register_tool(
     name="find_ra_subnets",
+    permission=("read", "dhcp_server"),
     description=(
         "List IPv6 subnets/scopes with Router Advertisements enabled, showing the "
         "resolved M/O flags, prefix + router lifetimes, and RDNSS/DNSSL the DHCP "
@@ -96,6 +97,7 @@ class FindObservedRAArgs(BaseModel):
 
 @register_tool(
     name="find_observed_ra_routers",
+    permission=("read", "dhcp_server"),
     description=(
         "List IPv6 routers the DHCP agent's passive RA sniffer has observed, with "
         "their advertised prefixes, M/O flags, and rogue/expected/acknowledged "
@@ -139,6 +141,7 @@ class CountRogueRAArgs(BaseModel):
 
 @register_tool(
     name="count_rogue_ra_routers",
+    permission=("read", "dhcp_server"),
     description="Count IPv6 routers currently classified as rogue RAs within the recency window.",
     args_model=CountRogueRAArgs,
     category="dhcp",
@@ -164,6 +167,7 @@ async def count_rogue_ra_routers(
 
 @register_tool(
     name="propose_allowlist_ra_router",
+    permission=("write", "dhcp_server"),
     description=(
         "Prepare a proposal to add an IPv6 router (by source IP or MAC) to a DHCP "
         "group's expected-RA-router allowlist so it stops classifying as a rogue "

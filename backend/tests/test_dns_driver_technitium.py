@@ -139,6 +139,22 @@ def test_render_zone_file_is_deterministic(zone: ZoneData, records: list[RecordD
     assert out1 == out2
 
 
+def test_render_zone_file_preserves_ttl_zero_and_mx_preference_zero(
+    zone: ZoneData,
+) -> None:
+    # #1518: TTL 0 ("never cache") and MX preference 0 (highest
+    # priority) are real values, not "unset" — the preview payload must
+    # not rewrite either to a default.
+    records = [
+        RecordData(name="www", record_type="A", value="10.0.0.1", ttl=0),
+        RecordData(name="@", record_type="MX", value="mail.example.com.", ttl=3600, priority=0),
+    ]
+    payload = json.loads(TechnitiumDriver().render_zone_file(zone, records))
+    by_domain_type = {(r["domain"], r["type"]): r for r in payload["records"]}
+    assert by_domain_type[("www.example.com", "A")]["ttl"] == 0
+    assert by_domain_type[("example.com", "MX")]["preference"] == 0
+
+
 def test_render_rpz_zone_returns_empty_string() -> None:
     bl = EffectiveBlocklistData(
         rpz_zone_name="spatium-blocklist.rpz.",

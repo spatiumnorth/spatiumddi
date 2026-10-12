@@ -105,6 +105,43 @@ class ServerMoveResult:
         }
 
 
+async def ensure_group_single_driver(
+    db: AsyncSession,
+    group_id: uuid.UUID,
+    driver: str,
+    *,
+    group_name: str,
+    hint: str,
+    exclude_server_id: uuid.UUID | None = None,
+) -> None:
+    """Refuse (422) putting a ``driver`` server into a group that already
+    runs a different driver (#1540).
+
+    A group is single-driver (docs/drivers/DNS_DRIVERS.md §5.1): its
+    rendered config, catalog-zone semantics and AXFR shape all assume
+    one driver, record fan-out follows the primary's driver, and the
+    driver-gated operations 422 on a mixed group. Shared by the move
+    path (which has always checked), server create, and a driver change
+    on update — the two paths that used to manufacture mixed groups
+    silently. ``exclude_server_id`` is the server being changed, whose
+    own current driver must not count against its new one.
+    """
+    conditions = [
+        DNSServer.group_id == group_id,
+        DNSServer.driver != driver,
+    ]
+    if exclude_server_id is not None:
+        conditions.append(DNSServer.id != exclude_server_id)
+    res = await db.execute(select(DNSServer.driver).where(*conditions).distinct())
+    foreign_drivers = sorted({d for d in res.scalars().all() if d})
+    if foreign_drivers:
+        raise ServerMoveError(
+            f"Group {group_name!r} runs {foreign_drivers}; this server runs "
+            f"{driver!r}. A server group is single-driver — {hint}",
+            status_code=422,
+        )
+
+
 async def _elect_primary(
     db: AsyncSession, group_id: uuid.UUID, *, exclude_id: uuid.UUID
 ) -> DNSServer | None:
@@ -187,24 +224,18 @@ async def move_server_to_group(
     # Driver homogeneity. A group is single-driver (docs/drivers/
     # DNS_DRIVERS.md §5.1): its rendered config, catalog-zone semantics and
     # AXFR shape all assume one driver, and the driver-gated operations
-    # (DNSSEC signing, ALIAS records) 422 on a mixed group. Today that is
-    # enforced lazily, at operation time, so a mixed group is reachable and
-    # only fails later on an unrelated action. A move is a NEW operation
-    # with no existing installs to break, so it fails closed here instead
-    # of manufacturing a state that breaks something else afterwards.
-    res = await db.execute(
-        select(DNSServer.driver)
-        .where(DNSServer.group_id == target_group.id, DNSServer.driver != server.driver)
-        .distinct()
+    # (DNSSEC signing, ALIAS records) 422 on a mixed group. A move is a
+    # NEW operation with no existing installs to break, so it fails
+    # closed here instead of manufacturing a state that breaks something
+    # else afterwards. The check itself is shared with server create and
+    # driver-change updates (#1540).
+    await ensure_group_single_driver(
+        db,
+        target_group.id,
+        server.driver,
+        group_name=target_group.name,
+        hint=f"move it to a {server.driver}-only group, or an empty one.",
     )
-    foreign_drivers = sorted({d for d in res.scalars().all() if d})
-    if foreign_drivers:
-        raise ServerMoveError(
-            f"Group {target_group.name!r} runs {foreign_drivers}; this server runs "
-            f"{server.driver!r}. A server group is single-driver — move it to a "
-            f"{server.driver}-only group, or an empty one.",
-            status_code=422,
-        )
 
     # ── Purge state that belongs to the old group ─────────────────────
     zone_state_purged = (

@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, IPBlock, NATMapping, Subnet
 from app.models.panos import FIREWALL_OBJECT_KINDS, FirewallObject
+from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
 
 _BIGINT_MAX = 2**63 - 1
@@ -104,6 +105,9 @@ class MirrorAddress:
     description: str
     status: str = "dhcp"
     auto_from_lease: bool = True
+
+    def __post_init__(self) -> None:
+        normalize_desired_hostname(self)
 
 
 @dataclass

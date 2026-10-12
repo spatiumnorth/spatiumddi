@@ -486,6 +486,8 @@ class WindowsDHCPReadOnlyDriver(DHCPDriver):
     """
 
     name = "windows_dhcp"
+    # #1347 — Windows reads ``opt-NN`` and drops ``code:NN`` (``_options_by_id``).
+    raw_option_spelling = "opt"
 
     # ── reads ──────────────────────────────────────────────────────────
 

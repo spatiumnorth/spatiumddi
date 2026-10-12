@@ -55,6 +55,16 @@ _NONCE_BYTES = 12
 _KEY_BYTES = 32  # AES-256
 _ENVELOPE_VERSION = 1
 
+# The band of envelope-declared iteration counts ``decrypt_secrets``
+# will honour (#1568). The count comes from the archive, which is
+# untrusted until the passphrase check passes: a crafted envelope
+# could declare 10**12 iterations and pin the api CPU deriving a key
+# for an archive restore will refuse anyway, and a count far under
+# the OWASP floor is not an envelope this build wrote. Envelopes
+# outside the band are refused before any derivation happens.
+_MIN_PBKDF2_ITERATIONS = 100_000
+_MAX_PBKDF2_ITERATIONS = 10_000_000
+
 
 class BackupCryptoError(Exception):
     """Raised when a backup envelope can't be decrypted or parsed.
@@ -165,24 +175,35 @@ def decrypt_secrets(envelope_bytes: bytes, *, passphrase: str) -> dict[str, Any]
         iterations = int(envelope.get("iterations", _PBKDF2_ITERATIONS))
     except (KeyError, ValueError, TypeError) as exc:
         raise BackupCryptoError("secrets envelope is missing required fields") from exc
-    # We always derive at the envelope's declared iteration count —
+    # We derive at the envelope's declared iteration count — that
     # locks the cost factor to whatever was used at backup time, so
     # an operator who tightens iterations in a future build can still
-    # decrypt older archives.
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=_KEY_BYTES,
-        salt=salt,
-        iterations=iterations,
-    )
-    key = kdf.derive(passphrase.encode("utf-8"))
-    aes = AESGCM(key)
+    # decrypt older archives. The count is archive-controlled input,
+    # though, so it is confined to a sane band first (#1568).
+    if not _MIN_PBKDF2_ITERATIONS <= iterations <= _MAX_PBKDF2_ITERATIONS:
+        raise BackupCryptoError(
+            f"secrets envelope declares {iterations} PBKDF2 iterations, outside "
+            f"the accepted band {_MIN_PBKDF2_ITERATIONS}..{_MAX_PBKDF2_ITERATIONS}"
+        )
+    # Malformed salt / nonce values make the KDF and AES-GCM raise
+    # ValueError; wrap those as BackupCryptoError so a malformed
+    # envelope is a clean 400 on restore, not an uncaught 500 (#1568).
     try:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=_KEY_BYTES,
+            salt=salt,
+            iterations=iterations,
+        )
+        key = kdf.derive(passphrase.encode("utf-8"))
+        aes = AESGCM(key)
         plaintext = aes.decrypt(nonce, ciphertext, associated_data=None)
     except InvalidTag as exc:
         raise BackupCryptoError(
             "decryption failed — passphrase mismatch or corrupted archive"
         ) from exc
+    except ValueError as exc:
+        raise BackupCryptoError(f"secrets envelope is malformed: {exc}") from exc
     try:
         return json.loads(plaintext.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:

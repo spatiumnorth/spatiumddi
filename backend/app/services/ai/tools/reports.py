@@ -53,6 +53,7 @@ class FindTopSubnetsArgs(BaseModel):
 
 @register_tool(
     name="find_top_subnets_by_utilization",
+    permission=("read", "subnet"),
     module=_MODULE,
     description=(
         "Return the most-utilized subnets, ranked by utilization "
@@ -82,6 +83,7 @@ class FindTopOwnersArgs(BaseModel):
 
 @register_tool(
     name="find_top_owners_by_ip_count",
+    permission=("read", "customer"),
     module=_MODULE,
     description=(
         "Return the customers owning the most IP addresses, ranked by "
@@ -126,6 +128,7 @@ class FindTopModifiedResourcesArgs(BaseModel):
 
 @register_tool(
     name="find_top_modified_resources",
+    permission=("read", "audit_log"),
     module=_MODULE,
     description=(
         "Return the most-frequently-modified resources over the trailing "
@@ -155,6 +158,7 @@ class FindTopDNSClientsArgs(BaseModel):
 
 @register_tool(
     name="find_top_dns_clients",
+    permission=("read", ("server", "dns_group")),
     module=_MODULE,
     description=(
         "Return the noisiest DNS clients by query volume over the DNS "
