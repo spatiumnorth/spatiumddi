@@ -20,8 +20,9 @@ Credential dict shape (decrypted from ``DNSServer.credentials_encrypted``)::
 
     {"api_token": "<scoped-token>", "account_id": "<optional>"}
 
-``account_id`` is only consulted when *creating* a zone — Cloudflare's
-``POST /zones`` requires the owning account, but record / read calls do not.
+``account_id`` is consulted by the zone create / delete paths only —
+Cloudflare's ``POST /zones`` requires the owning account, and the zone
+lifecycle scopes its name lookup to it (#1537); record / read calls do not.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import ipaddress
 from typing import Any
 
 import httpx
+import structlog
 
 from app.drivers.dns._cloud_base import (
     CloudDNSDriverBase,
@@ -40,6 +42,33 @@ from app.drivers.dns._cloud_base import (
     split_structured_rdata,
 )
 from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
+
+logger = structlog.get_logger(__name__)
+
+# Cloudflare API error 1061, "Zone already exists" (zone create, #1537).
+_ZONE_ALREADY_EXISTS = 1061
+
+
+class _CloudflareZoneNotFound(CloudDNSError):
+    """The zone-by-name lookup came back empty (#1537).
+
+    A distinct type so the delete path can treat an absent zone as done
+    without matching on message text.
+    """
+
+
+class _CloudflareAPIError(CloudDNSError):
+    """A Cloudflare API failure that keeps its HTTP status and error codes.
+
+    Lets the zone create / delete paths tell the one converged answer apart
+    from auth, throttling and server errors without matching message text.
+    """
+
+    def __init__(self, message: str, *, status: int, codes: list[Any]) -> None:
+        super().__init__(message)
+        self.status = status
+        self.codes = codes
+
 
 # Cloudflare API v4 base. Pinned here (not configurable) — there is no
 # self-hosted Cloudflare. The token in the Authorization header is the
@@ -142,7 +171,7 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
 
     name = "cloudflare"
     # The Add-DNS-server modal renders + the probe requires only the token.
-    # ``account_id`` is optional (zone-create only) so it is not listed here.
+    # ``account_id`` is optional (zone create / delete only), so it is not listed here.
     credential_fields: tuple[str, ...] = ("api_token",)
 
     # ── HTTP plumbing ───────────────────────────────────────────────────
@@ -183,7 +212,11 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         errors = body.get("errors") or []
         messages = [str(e.get("message", e)) for e in errors if e]
         detail = "; ".join(m for m in messages if m) or f"HTTP {status}"
-        raise CloudDNSError(f"Cloudflare API error: {detail}")
+        raise _CloudflareAPIError(
+            f"Cloudflare API error: {detail}",
+            status=status,
+            codes=[e.get("code") for e in errors if isinstance(e, dict)],
+        )
 
     def _token(self, creds: dict[str, Any]) -> str:
         token = (creds or {}).get("api_token")
@@ -191,18 +224,32 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
             raise CloudDNSError("Cloudflare credentials missing 'api_token'.")
         return str(token)
 
-    async def _resolve_zone_id(self, client: httpx.AsyncClient, zone_fqdn: str) -> str:
+    async def _resolve_zone_id(
+        self,
+        client: httpx.AsyncClient,
+        zone_fqdn: str,
+        account_id: str | None = None,
+    ) -> str:
         """Look up the opaque Cloudflare zone id for a zone FQDN.
 
         Cloudflare's ``GET /zones?name=`` filter wants the bare name with no
         trailing dot, so the apex FQDN is de-dotted before the query.
+
+        ``account_id`` scopes the lookup to that account (#1537). A token
+        can span several accounts, and the same domain can be a zone in
+        more than one of them; unscoped, ``results[0]`` is whichever the
+        API lists first, which is how a zone delete would reach into the
+        wrong account.
         """
         name = normalize_fqdn(zone_fqdn).rstrip(".")
-        resp = await client.get("/zones", params={"name": name})
+        params: dict[str, Any] = {"name": name}
+        if account_id:
+            params["account.id"] = str(account_id)
+        resp = await client.get("/zones", params=params)
         body = self._unwrap(resp)
         results = body.get("result") or []
         if not results:
-            raise CloudDNSError(f"Cloudflare zone {name!r} not found on this account.")
+            raise _CloudflareZoneNotFound(f"Cloudflare zone {name!r} not found on this account.")
         return str(results[0]["id"])
 
     @staticmethod
@@ -600,27 +647,70 @@ class CloudflareDNSDriver(CloudDNSDriverBase):
         op: str,
         *,
         managed_records: list[RecordData] | None = None,
-    ) -> None:
+    ) -> bool | None:
         token = self._token(creds)
         zone_fqdn = normalize_fqdn(getattr(zone, "name", ""))
         bare = zone_fqdn.rstrip(".")
+        account_id = (creds or {}).get("account_id") or None
         async with self._client(token) as client:
             if op == "create":
                 payload: dict[str, Any] = {"name": bare}
                 # Real Cloudflare requires the owning account on zone create;
                 # include it when the operator supplied an account_id.
-                account_id = (creds or {}).get("account_id")
                 if account_id:
                     payload["account"] = {"id": str(account_id)}
                 resp = await client.post("/zones", json=payload)
-                self._unwrap(resp)
-                return
+                try:
+                    self._unwrap(resp)
+                except _CloudflareAPIError as exc:
+                    # #1537 — error 1061 "already exists" is the only
+                    # converged signal, and on its own it is not enough:
+                    # Cloudflare returns the SAME code when a different
+                    # account holds the domain active. So confirm the zone
+                    # is visible to this token — scoped to the configured
+                    # account when there is one — before calling it done;
+                    # a zone only someone else can see stays a failure.
+                    if _ZONE_ALREADY_EXISTS not in exc.codes:
+                        raise
+                    try:
+                        await self._resolve_zone_id(client, zone_fqdn, account_id)
+                    except _CloudflareZoneNotFound:
+                        raise exc from None
+                    logger.info(
+                        "cloudflare.apply_zone.create_already_exists",
+                        server=str(getattr(server, "id", "")),
+                        zone=bare,
+                    )
+                    return False
+                return True
 
             if op == "delete":
-                zone_id = await self._resolve_zone_id(client, zone_fqdn)
+                try:
+                    zone_id = await self._resolve_zone_id(client, zone_fqdn, account_id)
+                except _CloudflareZoneNotFound:
+                    # #1537 — an already-absent zone is the desired end state.
+                    # Only the empty lookup; auth, rate-limit and 5xx errors
+                    # from the lookup are _CloudflareAPIError and propagate.
+                    logger.info(
+                        "cloudflare.apply_zone.delete_noop_absent",
+                        server=str(getattr(server, "id", "")),
+                        zone=bare,
+                    )
+                    return False
                 resp = await client.delete(f"/zones/{zone_id}")
-                self._unwrap(resp)
-                return
+                try:
+                    self._unwrap(resp)
+                except _CloudflareAPIError as exc:
+                    # Gone between the lookup and the delete (HTTP 404 only).
+                    if exc.status != 404:
+                        raise
+                    logger.info(
+                        "cloudflare.apply_zone.delete_noop_absent",
+                        server=str(getattr(server, "id", "")),
+                        zone=bare,
+                    )
+                    return False
+                return True
 
             raise CloudDNSError(f"Cloudflare: unsupported zone op {op!r}")
 

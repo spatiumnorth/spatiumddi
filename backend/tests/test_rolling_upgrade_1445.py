@@ -142,11 +142,12 @@ async def test_the_slot_apply_stamp_is_committed_before_the_health_gate(
     for name in (
         "preflight",
         "etcd_snapshot",
+        "trigger_slot_apply",
+        "stage",
         "cnpg_maintenance_on",
         "cordon",
         "verify_primary_moved",
         "drain",
-        "trigger_slot_apply",
         "reboot",
         "health_gate",
         "convergence",
@@ -165,8 +166,9 @@ async def test_the_slot_apply_stamp_is_committed_before_the_health_gate(
     assert result.ok is True
     i = events.index("trigger_slot_apply")
     assert events[i + 1] == "commit"
-    assert events[i + 2] == "reboot"
-    assert events[i + 3] == "health_gate"
+    # #1463 — the node stages next, before it is drained and rebooted.
+    assert events[i + 2] == "stage"
+    assert i + 1 < events.index("health_gate")
 
 
 # ── Replication state the app's role cannot see ───────────────────────────────
@@ -277,7 +279,7 @@ async def test_the_node_chain_forwards_the_lease_holder_to_preflight(
 ) -> None:
     seen: list[Any] = []
 
-    async def _preflight(target_version: str, lease_holder: str | None = None) -> Any:
+    async def _preflight(target_version: str, lease_holder: str | None = None, **_k: Any) -> Any:
         seen.append(lease_holder)
         return per_node.StepResult(name="preflight", started_at="t").finish(True)
 
@@ -287,9 +289,10 @@ async def test_the_node_chain_forwards_the_lease_holder_to_preflight(
     monkeypatch.setattr(per_node, "_step_preflight", _preflight)
     for name in (
         "etcd_snapshot",
+        "trigger_slot_apply",
+        "stage",
         "cordon",
         "drain",
-        "trigger_slot_apply",
         "reboot",
         "health_gate",
         "convergence",

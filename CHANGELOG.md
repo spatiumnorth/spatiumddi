@@ -131,6 +131,382 @@ the formatter handles the rest.
   it: a member that dies within the 40–50 s before its Node turns NotReady,
   or during the leave itself, is not seen.
 
+- **Rolling upgrades no longer strand nodes or skip their safety
+  checks (#1542, #1545, #1546, #1544).** A failure at any step after
+  the cordon (the reboot step included, and in a run resumed past the
+  cordon) now runs a compensating release — uncordon the node and
+  clear the CNPG maintenance window this run set — instead of leaving
+  the node cordoned with the window on. A failure at the cordon itself,
+  after the window was set, clears the window without uncordoning a
+  node the run never cordoned; and a node that was already cordoned
+  before the upgrade is left cordoned. When the run has no CNPG
+  cluster (none configured and none detected), the maintenance-window
+  clear at uncordon time is skipped instead of failing every node's
+  uncordon. The drain step refuses to evict pods with no controller
+  owner, honouring the no-force rule (a bare pod would never be
+  re-created). And no node is drained while the CNPG cluster is short
+  an instance: after each node's uncordon, the chain waits (up to
+  15 minutes) for `readyInstances` to reach `spec.instances` before it
+  reports the node done, the last node included, and each node's
+  preflight waits for the same count before its cordon. The wait comes
+  after the uncordon on purpose: the node's own drain evicts its
+  Postgres instance, whose local-path volume pins it to that node, so
+  the count cannot recover while the node is cordoned. An earlier
+  version of this fix waited before the uncordon and timed out on the
+  first node holding an instance, which ended the run.
+
+- **A Fleet group change now finds the appliance's own servers
+  (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
+  group by selecting `appliance_id`, which nothing writes: agents
+  register with `host` set to the node's hostname, so on a real
+  appliance only the pointer moved and the server kept serving the old
+  group. The roles PUT now also matches agent-based rows by hostname
+  (case-insensitive, never a row another appliance owns, and not when
+  two approved appliances share the hostname). After an engine switch
+  only the current engine's DNS row moves. Moving back to the group the
+  old engine served used to clash with the appliance's own dead row of
+  that engine (same name, other driver); that row is now retired as part
+  of the save, audited like a server delete, and only when it is this
+  appliance's, of an engine it no longer runs, and silent for more than
+  two minutes. While the old agent is still reporting, the save answers
+  409 naming the row. A clash with any other row still refuses the move,
+  and a re-registering agent still does not undo it. The route now
+  publishes the wakes the move collects (before, there was no collector,
+  so the moved agent and both groups converged only on the safety tick),
+  writes an audit row per moved server, and locks the appliance row so
+  two saves cannot interleave. Under a DNS VIP the agent pod has no
+  hostNetwork, so it registered under its pod name; it now registers
+  under the node name.
+
+- **Technitium SVCB / HTTPS records are sent the way the daemon parses
+  them, and stop churning and reading as drift (#1513, #1698).**
+  - **Two or more SvcParams were refused (#1698).** Technitium splits
+    `svcParams` on `|` and reads key, value, key, value
+    (`alpn|h2|port|8443`); the agent and the agentless driver joined pairs
+    with commas, which parses for one param only. A record with no params
+    sent nothing, and the API requires the field (`false` means none), so
+    an AliasMode record was refused too, and so was its delete. `ech` and
+    unnamed `keyNNNNN` params now go as hex and by key number, which is
+    what the daemon parses.
+  - **A stored record churned.** `1 . alpn=h2` read back as
+    `1 . alpn="h2"` and params came back in another order, so the
+    structural reconcile deleted and re-added the record on every pass.
+    Both sides now compare one RFC 9460 form: params in key-number order,
+    values unquoted, `mandatory` sorted, hint addresses canonical.
+  - **Drift and Sync with Servers listed it twice**, once as missing and
+    once as extra: the zone transfer gave an in-zone target relative
+    (`svc`). It is now absolute, and both sides compare the same form.
+  - **A target is read the way a zone file reads it**: a trailing dot is
+    absolute whatever the label count (`localhost.` and `.` are never
+    rewritten), and no trailing dot is relative to the zone. Technitium
+    has no relative names, so a stored `1 svc alpn=h2` used to be served
+    as `svc.`; it is now served as `svc.<zone>.`, and the agent replaces
+    the old record once. A migration writes the trailing dot on the
+    dot-less multi-label targets of Technitium groups (`cdn.example.net`),
+    which were always served as absolute, so nothing they serve changes.
+    BIND9 and PowerDNS groups are not touched.
+  - **The upgrade itself does not re-point those records.** A Technitium
+    server's bundle now says which rule its targets follow
+    (`svcb_target_rule`), and the agent applies that rule to the bundle it
+    is applying. The agent replays its cached bundle on start, and a cached
+    bundle from before the upgrade has no such field, so its dot-less
+    targets stay absolute, as that build meant them. The migration also
+    marks the affected servers' stored bundles out of date and rewrites the
+    same targets in their queued record ops. Because the field is part of
+    the bundle's structural fingerprint, every Technitium agent
+    re-reconciles its zones once under the new rule when the new bundle
+    arrives. Before this, the new agent served
+    `cdn.example.net.<zone>.` from its cache until the next structural
+    change in the group.
+  - Records the Technitium importer and the agentless pull read are now
+    stored with absolute targets and unquoted params.
+  - Not verified against a live daemon: the `no-default-alpn`, `ech` and
+    `keyNNNNN` forms, taken from Technitium 15.4.0's source.
+
+- **Losing the node that held the Redis master no longer restarts
+  every Celery worker (#1669).** kombu leaves `socket_timeout`,
+  `socket_connect_timeout` and `socket_keepalive` unset, and the
+  Sentinel queries had no timeouts either, so a connection to a
+  vanished peer never errored: the worker stayed deaf after Sentinel
+  promoted a replica, its `inspect ping` liveness probe failed three
+  times, and the pod was killed. The broker now sets a 10 s socket
+  timeout, 5 s connect timeout and TCP keepalive (the kernel resets a
+  connection to a vanished peer within about 25 s), on plain
+  `redis://` URLs too; Sentinel queries and the result backend get
+  shorter timeouts of their own (below). The worker now reconnects to
+  the promoted master on its own. The liveness
+  probe tolerates 5 misses instead of 3.
+  - **The worker reconnects within about 2 s of Sentinel's switch.**
+    Celery's reconnect loop waited kombu's default 2, 4, 6 ... up to
+    30 s between attempts, so a worker could reconnect 10 s or more after
+    a master was available again. The wait is now 1 s and then 2 s each
+    time (through celery's `worker_consumer` setting). Each attempt is
+    one bounded Sentinel lookup, so while no master exists a worker asks
+    Sentinel at most once every 2 s. Celery's 100 reconnect attempts now
+    run out after roughly 4–8 minutes of continuous outage instead of
+    about 45, after which the worker exits and is restarted.
+  - **A warm shutdown with no Redis master finishes.** It used to run
+    out its 60 s grace and end in SIGKILL, on main as well. The worker
+    heartbeat publishes every 2 s from the event loop and, with no
+    master, sat in kombu's reconnect for as long as the outage lasted,
+    so SIGTERM was never acted on. Nothing reads worker heartbeats or
+    events, so the worker now starts with `--without-heartbeat` and
+    `--without-gossip` (gossip only consumes heartbeats), as well as
+    `--without-mingle`: mingle syncs revoked-task lists, SpatiumDDI
+    never revokes a task, and a reconnect that met a dead Sentinel
+    inside it exited the worker. Sentinel lookups also no longer take
+    redis-py's default 3 retries, which nest around the connect too and
+    made one lookup against an unreachable Sentinel take about 100 s,
+    and Sentinel queries now time out after 3 s (2 s to connect)
+    instead of the data connections' 10 s and 5 s. In a test rig,
+    shutdowns with no master take 3–23 s. With a task that finishes
+    and fails its result write during the shutdown, they take 31–43 s,
+    17 s of which, in the longer case, is the task still running.
+  - **The first result write in each pool child after a failover no
+    longer fails its task.** Its pooled socket still pointed at the old
+    master, and celery's first read of the task's state is not retried.
+    Result writes now retry up to 2 times, each on a connection that
+    asks Sentinel for the current master, and the result backend's socket
+    and connect timeouts are 5 s and 2 s. A write that cannot succeed
+    because there is no master fails after at most about 16 s (it took
+    about 40 s on a test cluster).
+  - **A `Task.retry` during a broker outage is requeued instead of
+    deleted.** celery turns any failure to publish the retry into
+    `Reject(requeue=False)`, which `task_acks_late` turns into a deleted
+    message; this happened on main too whenever Sentinel had no master.
+    A reject caused by a broker error is now a requeue, so the task runs
+    again once Redis is back.
+  - Not fixed here: Sentinel goes into TILT on a node loss and fails over
+    only after 78–102 s (#1718), and a worker reconnects only after that.
+
+- **A rolling upgrade from an uploaded image no longer drains the
+  slot-image mirror before a node fetches from it (#1463).** On a
+  multi-node appliance an uploaded image reaches every node through the
+  slot-image mirror, one pod whose local volume pins it to one node. The
+  per-node chain cordoned and drained each node before telling it to
+  fetch, so the mirror's own node evicted its image source first: the
+  replacement could not schedule on the cordoned node, every download
+  answered 502, and the run failed there with the node cordoned and its
+  CNPG maintenance window open. The chain now stamps the node and waits
+  for the host to stage the new slot while the node is still in service,
+  and cordons, drains and reboots it only after that; a fetch that fails
+  leaves the node uncordoned and serving. Before a node is stamped the
+  run also waits, up to 10 minutes, for the mirror to have a Ready pod
+  again, since it comes back only once its own node is uncordoned after
+  the reboot; a mirror that never returns fails that node before it is
+  touched, under its own alert category. A cordon, switchover or drain
+  failure now happens with the new slot already staged and armed for the
+  node's next boot, and its alert hint says so. An upgrade from an
+  operator-supplied URL, or on a cluster with no mirror, is unchanged.
+  Also: the database connection is released before the node leaves
+  service, so the CNPG switchover the cordon triggers can no longer
+  leave the reboot step committing on a closed connection.
+
+- **Agentless DNS drivers treat an existing zone on create and a
+  missing zone on delete as done (#1537).** A zone push to several
+  agentless servers can fail partway; the DB rolls back but the servers
+  already done keep their change, so the retry used to fail on the first
+  server ("already exists" on create, "not found" on delete). Each
+  driver now accepts only the provider's own signal: Cloudflare error
+  1061 on create and an absent zone or HTTP 404 on delete; Azure DNS
+  creates with `If-None-Match: *` (412 means it exists, and an existing
+  zone's tags are no longer overwritten) and treats 404 on delete as
+  done; Google Cloud DNS accepts a 409 on create only when a managed zone
+  with that DNS name exists, and matches the delete 404 by exception
+  class rather than message text; Technitium accepts
+  `No such zone was found` on delete. Cloudflare returns 1061 also when
+  a *different* account holds the domain, so the create confirms the
+  zone with a lookup scoped to the configured `account_id`; the delete
+  lookup is scoped the same way, where it used to take whichever
+  same-named zone the token's accounts listed first. Windows DNS probed
+  with `SilentlyContinue`, so an access-denied probe read as "zone
+  absent" and a delete reported success; only Win32 9601 now means
+  absent. Authentication, throttling and server errors still fail in
+  every driver, and Route 53 still refuses to adopt a same-named zone it
+  did not create. DigitalOcean, Linode and Vultr do not yet converge
+  (Hetzner does on delete only).
+
+- **A failed multi-server zone push no longer rolls back a zone it did
+  not create (#1537).** The rollback after a partial failure (delete
+  what was created, re-create what was deleted) now skips any server
+  that was already in the requested state. Before, a create that found
+  the zone already on one server and then failed on another would
+  delete that zone, records and all; on Cloudflare and Azure that
+  removes a live zone. Such servers are named in the error as "Left as
+  found". A successful create that found the zone already on a provider
+  adopts it, and now says so: the servers are listed in the create's
+  audit entry and in a new `adopted_existing_on` field on the response
+  (zone create, create from template, and the move's audit entry), because
+  deleting the zone in SpatiumDDI later removes it from those servers too.
+
+- **A k3s start on the seed no longer puts the first-boot Web UI
+  certificate back (#1215).** firstboot hands the self-signed
+  certificate it mints on the seed's first boot to k3s as an
+  auto-deploy manifest, and k3s re-applies every such manifest each
+  time it starts. So every k3s start on the seed, a restart, a crash
+  or any reboot including a rolling upgrade's, wrote that certificate
+  back into `spatium-appliance-tls` over the one the api had deployed:
+  an uploaded, CSR-signed or ACME certificate. A frontend pod that
+  started afterwards served the first-boot certificate, which names
+  only the seed, and since #1282 the api's write-back rolled every
+  frontend pod a few minutes after each seed reboot. Once the Secret
+  exists, the seed now puts k3s's `.skip` marker beside the manifest,
+  which k3s honours by leaving both the Addon and the Secret untouched.
+  firstboot writes it on every boot; a new k3s.service `ExecStartPre`
+  writes it before k3s starts on a seed upgraded from a build without
+  it, and only when every sign says the Secret is already in the
+  datastore; and a cluster leave drops it, because the datastore it
+  starts k3s on is new. A marker found with no Secret behind it makes
+  firstboot create the Secret from the manifest.
+
+- **A selective restore works on an appliance, and one that fails
+  leaves the database as it was (#1693).** A restore with `sections`
+  emptied the selected sections' FK-cascade closure in one transaction,
+  which committed, and loaded the archive's rows in a second with
+  `pg_restore --data-only --disable-triggers`. That flag emits
+  `ALTER TABLE … DISABLE TRIGGER ALL`, which PostgreSQL refuses to a
+  non-superuser on any table with a foreign key, and an appliance
+  connects as the app role, which is not one. So every selective
+  restore on an appliance answered 400 after emptying the closure
+  (71 tables for `ipam`), `alembic_version` among them: the api stayed
+  not ready and the UI that could undo it answered 502. CI never saw
+  it, because its Postgres connects as a superuser. The emptying and
+  the load now run in one transaction, through the same streamed psql
+  replay the full restore uses, so a failure of any kind rolls the
+  emptying back. The closure's foreign keys are dropped for the load
+  and added back from their own definitions before it commits, which
+  needs only ownership and checks every row loaded. Two behaviour
+  changes: an archive whose rows point at something deleted since the
+  backup, outside the restored sections, is now refused with the
+  constraint named (a superuser used to load them pointing at nothing),
+  and a selective restore holds every table's lock for the length of
+  its load, as the full restore does (#1648). A restore whose
+  `TRUNCATE … CASCADE` would reach a table outside the closure (a
+  foreign key a migration created and no model declares) is refused
+  too, instead of emptying a table it never reloads.
+
+- **A selective restore no longer restarts the sequences of the tables
+  it reloads (#1720).** `TRUNCATE … RESTART IDENTITY` sent every
+  sequence the closure owns back to its start, and
+  `pg_restore --data-only --table` reloads rows, not sequences. After a
+  restore of `audit`, every audited write, logins included, answered
+  409 on a duplicate `audit_log.seq` until as many had failed as the
+  restored log had rows; after a restore of `dns`, every DHCP log post
+  failed the same way on `dhcp_log_entry`. Each sequence a reloaded
+  table owns is now set past the largest value its column holds, in
+  the restore's one transaction. As after a full restore, values that
+  rows written after the backup had held can be handed out again.
+
+- **The DNS agent bundle render streams a blocklist instead of holding
+  it whole (#1662).** The render of a server whose group carries a
+  blocklist built every entry as a row, an `EffectiveEntry` and a dict,
+  then serialised the whole payload three times (the structural ETag,
+  the ETag, the body) and kept the body. With the catalog's Hagezi
+  Gambling feed (~582k domains, a 60.8 MB body) the Celery child grew
+  ~400 MB, the render took the whole 1 GiB worker of an appliance at
+  the sizing floor, and once the kernel OOM-killed the worker with
+  every DHCP, DNS, IPAM and default task beside it. The render now
+  reads each list through a server-side cursor, 5,000 entries at a
+  time, and writes them straight into the two running ETag hashes and
+  the gzip stream, so it holds one batch whatever the list's length.
+  The stored body, its ETag and its structural ETag are byte-identical
+  (a test pins them to the values before the change), so no agent
+  re-renders and no renderer revision bump is owed. In the backend
+  tests the render's peak grew ~826 bytes per entry before and ~3
+  after (133 MB to 8 MB at 160k entries).
+
+- **An SCP / SFTP backup target can check a pinned host key and sign
+  in with a private key again (#1692).** paramiko 4.0 removed DSA
+  (`paramiko.DSSKey`), the backend's `paramiko>=3.4.0` has no upper
+  bound, and the image installs 5.x, but the driver still named
+  `DSSKey` in two places that run on every connect. Every
+  `known_hosts` line raised and was skipped, so the checked host-key
+  modes (`known_hosts`, the default, and `strict`) refused every
+  server as "not found in known_hosts", even one whose key was
+  pinned; and a target with a private key answered Test connection
+  with a 500. Only `insecure_skip` with a password worked. DSA keys
+  are no longer offered (OpenSSH dropped them too), and new tests load
+  real known_hosts lines and private keys and complete a real SSH
+  handshake with the installed paramiko. Two more found validating the
+  fix: a known_hosts line the driver cannot decode (`ssh-dss`, a FIDO
+  `sk-*` key, bad base64) no longer drops a valid pin for the same host
+  on a later line, and an OpenSSH-format DSA key, a PKCS#8 key, or an
+  encrypted key with no passphrase is now a Test-connection error that
+  says which, rather than a 500 or a misleading "not a valid RSA key".
+
+- **A member whose join fails for a transient reason keeps retrying for
+  the whole retry window (#1212).** After a transient join failure the
+  backend keeps the member's desired role for 15 minutes (#961), so that
+  its supervisor re-fires the join once the path to the seed is back. But
+  the supervisor re-fired on every heartbeat, three attempts at most and
+  none spaced, and an attempt against an unreachable seed fails in about
+  20 seconds. All three landed in the first two and a half minutes of an
+  outage. A member whose path to the seed's control-plane ports came back
+  after that stayed a standalone node with its row `failed`, and the
+  cluster kept an even control-plane count until an operator re-promoted
+  or replaced it. Re-fires against the same seed are now spaced from the
+  last attempt's time in the supervisor's own attempt ledger: one minute,
+  two, then every four. The first retry still comes a minute after the
+  first attempt, and the attempts now reach past the 15-minute window.
+  So the backend's window ends a transient failure's retries, and a
+  member whose path returns inside it joins with no operator action. The
+  ceiling stays as the backstop for a control plane that never processes
+  the failure: eight attempts over about 23 minutes, where it used to be
+  three in two and a half. A demote's leave is unchanged.
+
+- **On a multi-node control plane the slot-image mirror starts and stays
+  up, so an uploaded upgrade image has somewhere to live (#1174).** Once the
+  control plane has more than one node, the supervisor turns on the
+  slot-image mirror: the one place an uploaded or imported upgrade image is
+  kept, and where every node fetches it during a rolling upgrade. The mirror
+  runs the api's image and imports the whole application before it serves a
+  byte (about 280 MiB once started), but it kept resources written for a
+  small idle process, 256Mi of memory and 500m of CPU. It was OOMKilled
+  during that import and crash-looped, so an air-gapped rolling upgrade had
+  no image source. The mirror is now sized as the api: it takes
+  `api.resources` (on an appliance, the memory limit the supervisor sizes
+  from the node's RAM), with any `slotImageMirror.resources` key laid over
+  it, and the Charts job refuses a render whose mirror memory or CPU limit
+  is below the api's. Its liveness and readiness probes are the api's too
+  (`api.probes`, with `slotImageMirror.probes` laid over them): its own
+  probes killed a start that had not bound its port about 40 seconds in,
+  and gave each check the kubelet's default 1 second, so a slow cold start
+  on a busy node was killed before it served (the pod in #1174 logged 12
+  liveness kills before its OOMKills).
+
+- **An ACME order whose CA cannot be reached now ends, and says why
+  (#1686).** A refused, timed-out or reset connection to the CA left
+  the order `processing` for the Celery task's retries, and nothing
+  settled it once the last retry failed. It stayed `processing` with
+  no error for good, the UI polled it forever, and the renewal sweep
+  skipped every certificate with the same domains as "already being
+  (re)issued", so the certificate could expire behind it. The task's
+  last attempt now ends the order `invalid` with `last_error` naming
+  the error and the host it could not reach. Each retry before that
+  leaves a `retrying: …` note, which the Certificates tab shows under
+  the processing order.
+
+- **Records put into a zone by its zone-file import are served
+  (#1683).** Importing a zone file into an existing zone wrote the
+  new, changed and removed records to the database and stopped
+  there: it queued no record op and left the zone's serial alone. An
+  agent applies a record change from a record op (records stay out of
+  the bundle's structural fingerprint in a group without views), and
+  an agentless provider only through its driver, so the imported
+  records were not served until something else re-rendered the zone,
+  in the report the next record write in it. The import now queues
+  its changes as one batch of record ops on one serial bump, as the
+  record API does, removals first so a CNAME that replaces an A can
+  land. When an agentless provider does not take every change, the
+  response carries `provider_warning` and the import's audit entry
+  reads error (#1538). Since a record change no longer reloads its
+  zone (#1373, above), that later write would not have rescued them
+  either. Because the import now reaches the servers, it is refused
+  where the record API is: a zone the Tailscale or NetBird
+  integration owns, and a record type a server in the group cannot
+  serve (SVCB, HTTPS and DNAME on a hosted-DNS or Windows group)
+  answer 422 before anything is written.
+
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads
   named only when the bundle's structural fingerprint moves; a record
@@ -462,7 +838,25 @@ the formatter handles the rest.
   own character-string (a DNS-SD `"txtvers=1" "path=/printer"`
   keeps both), `\DDD` is one octet as RFC 1035 §5.1 says, and only
   a string over 255 octets is split further. Control characters are
-  stripped. The Technitium TXT path is unchanged (#1694).
+  stripped. The Technitium agent serves the same strings since #1694
+  (next entry).
+
+- **The Technitium agent serves a TXT value as entered (#1694).**
+  The agent sent each TXT value to Technitium as one text string. A
+  value stored already quoted, the way providers print SPF, DMARC
+  and DKIM records (`"v=spf1 -all"`), was served with its quote
+  characters as part of the text, so receivers found no SPF record;
+  two quoted strings were served as one; and a trailing full stop
+  was cut off, as if the value were a host name. The agent now sends
+  Technitium the character-strings the BIND9 and PowerDNS agents
+  serve (the same `drivers/_txt.py` parse, through Technitium's
+  `characterStringsBase64`), keeps a trailing full stop, and compares
+  what the server holds string by string, so a steady zone does not
+  churn. Technitium cannot hold an empty string: the agent leaves one
+  out, and a value that is nothing but empty strings (`""`) is served
+  as its text, as before. A record an older agent served the old way
+  is replaced once, on the agent's first full reconcile after the
+  upgrade.
 
 - **Rolling-upgrade preflight warns on a SemVer jump that skips a major
   version (#1182).** Between two CalVer releases the version check warns when
@@ -2578,6 +2972,12 @@ the formatter handles the rest.
   (`ipv4` | `ipv6` | `dual`), backfilled from each class's test
   expression and whether its group has a DHCPv6 scope. Downgrade drops
   the column.
+- `a3d9e5c17b42` — #1513, data-only: SVCB / HTTPS records in groups
+  running a Technitium driver whose target has two or more labels and no
+  trailing dot get the dot they were already served with, so the new
+  zone-file reading of a dot-less target does not re-point them.
+  Downgrade is a no-op: the dotted value means the same under either
+  reading.
 
 ## 2026.10.02-1 — 2026-10-02
 

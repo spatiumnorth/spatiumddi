@@ -17,6 +17,7 @@ Two layers here:
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ import pytest
 
 from spatium_dns_agent.config_apply import ConfigApplyError
 from spatium_dns_agent.drivers.technitium import (
+    SVCB_TARGET_RULE_ZONE_FILE,
     TechnitiumDriver,
     _blocking_payload,
     _normalize_rdata,
@@ -150,8 +152,273 @@ def test_record_params_srv() -> None:
     }
 
 
+def _b64s(*strings: bytes) -> str:
+    """``characterStringsBase64`` for these character-strings."""
+    return ",".join(base64.b64encode(s).decode("ascii") for s in strings)
+
+
 def test_record_params_txt() -> None:
-    assert _record_params("TXT", "v=spf1 -all", {}) == {"text": "v=spf1 -all"}
+    assert _record_params("TXT", "v=spf1 -all", {}) == {
+        "characterStringsBase64": _b64s(b"v=spf1 -all")
+    }
+
+
+# ── TXT served as entered (issue #1694) ─────────────────────────────────
+#
+# Technitium's ``text`` param is the text itself: the quotes of an
+# already-quoted value became part of the served string, and the
+# name-valued types' trailing-dot strip cut the last character off a
+# value ending in a full stop. The driver now sends the character-strings
+# the value stands for (the shared ``_txt`` parse BIND9 and PowerDNS use)
+# through ``characterStringsBase64``, octet for octet, and reads them back
+# the same way.
+
+
+def test_record_params_txt_already_quoted_value_sends_its_strings() -> None:
+    assert _record_params("TXT", '"v=spf1 -all"', {}) == {
+        "characterStringsBase64": _b64s(b"v=spf1 -all")
+    }
+    # Each quoted string stays a string of its own (DNS-SD keeps one
+    # key=value per string), and \DDD is one octet, UTF-8 or not.
+    assert _record_params("TXT", '"a" "b"', {}) == {"characterStringsBase64": _b64s(b"a", b"b")}
+    assert _record_params("TXT", '"caf\\195\\169"', {}) == {
+        "characterStringsBase64": _b64s(b"caf\xc3\xa9")
+    }
+    assert _record_params("TXT", '"a\\255b"', {}) == {"characterStringsBase64": _b64s(b"a\xffb")}
+    assert _record_params("TXT", '"say \\"hi\\""', {}) == {
+        "characterStringsBase64": _b64s(b'say "hi"')
+    }
+
+
+def test_record_params_txt_keeps_a_trailing_full_stop() -> None:
+    """#1694: the trailing-dot strip is for name-valued targets. It cut
+    the last character off a TXT value that ends in a full stop."""
+    assert _record_params("TXT", "this value ends with a full stop.", {}) == {
+        "characterStringsBase64": _b64s(b"this value ends with a full stop.")
+    }
+    # The name-valued types still lose theirs.
+    assert _record_params("CNAME", "target.example.com.", {}) == {"cname": "target.example.com"}
+
+
+def test_record_params_txt_long_value_splits_on_a_character_boundary() -> None:
+    value = chr(0xE9) * 200  # 400 octets
+    sent = _record_params("TXT", value, {})["characterStringsBase64"].split(",")
+    strings = [base64.b64decode(s) for s in sent]
+    # 255 would cut a 2-octet character in half; BIND9 and PowerDNS cut at 254.
+    assert [len(s) for s in strings] == [254, 146]
+    assert b"".join(strings) == value.encode("utf-8")
+
+
+def test_record_params_txt_leaves_out_an_empty_string() -> None:
+    """Technitium (15.4) cannot hold an empty character-string: it drops
+    one from the list it is sent. The driver leaves them out itself, so
+    the strings it compares are the strings the server holds and a value
+    with an empty string in it does not churn."""
+    assert _record_params("TXT", '"" "a"', {}) == {
+        "characterStringsBase64": _b64s(b"a")
+    }
+    assert _record_params("TXT", '"a" "" "b"', {}) == {
+        "characterStringsBase64": _b64s(b"a", b"b")
+    }
+
+
+def test_record_params_txt_never_asks_for_a_record_with_no_string() -> None:
+    """A TXT record with no string at all is served as a malformed packet
+    (Technitium 15.4 stores one when every string it is sent is empty). A
+    value that is nothing but empty strings is sent as its text, as it was
+    before #1694, and an empty value is refused by the server, as before."""
+    assert _record_params("TXT", '""', {}) == {"characterStringsBase64": _b64s(b'""')}
+    assert _record_params("TXT", '"" ""', {}) == {
+        "characterStringsBase64": _b64s(b'"" ""')
+    }
+    assert _record_params("TXT", "", {}) == {"text": ""}
+    for value in ('""', '"" ""', '"" "a"', '"a" ""', "", "a"):
+        sent = _record_params("TXT", value, {}).get("characterStringsBase64")
+        assert sent is None or all(sent.split(",")), value
+
+
+def _txt_rdata(*strings: bytes) -> dict[str, Any]:
+    """A TXT ``rData`` as Technitium 15.4's records/get returns it."""
+    return {
+        "text": b"".join(strings).decode("utf-8", "replace"),
+        "splitText": any(len(s) != 255 for s in strings[:-1]),
+        "characterStrings": [s.decode("utf-8", "replace") for s in strings],
+        "characterStringsBase64": [base64.b64encode(s).decode("ascii") for s in strings],
+    }
+
+
+def test_normalize_rdata_txt_compares_the_character_strings() -> None:
+    for value, strings in (
+        ('"a" "b"', (b"a", b"b")),
+        ("v=spf1 -all", (b"v=spf1 -all",)),
+        ('"a\\255b"', (b"a\xffb",)),
+        # What Technitium holds for a value with an empty string in it.
+        ('"" "a"', (b"a",)),
+        ('""', (b'""',)),
+    ):
+        assert _normalize_rdata("TXT", _txt_rdata(*strings)) == _record_params("TXT", value, {})
+
+
+def test_get_zone_records_reads_txt_as_its_character_strings(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _install_fake_request(
+        d,
+        lambda *_: {
+            "status": "ok",
+            "response": {
+                "records": [
+                    {"name": "two.z.test", "type": "TXT", "ttl": 300,
+                     "rData": _txt_rdata(b"a", b"b")},
+                ]
+            },
+        },
+    )
+    assert d._get_zone_records("t", "z.test") == [
+        {"domain": "two.z.test", "type": "TXT", "ttl": 300,
+         "characterStringsBase64": _b64s(b"a", b"b")}
+    ]
+
+
+def _txt_desired(name: str, value: str) -> dict[str, Any]:
+    return {"domain": f"{name}.example.com", "type": "TXT", "ttl": 300,
+            **_record_params("TXT", value, {})}
+
+
+def test_reconcile_is_a_noop_for_txt_served_as_entered(tmp_path: Path) -> None:
+    """A steady zone must not churn: what the add sent is what the read
+    gives back, string for string."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    long_octets = (chr(0xE9) * 200).encode("utf-8")
+    calls = _reconcile_with(
+        d,
+        existing=[
+            {"name": "spf.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"v=spf1 -all")},
+            {"name": "two.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"a", b"b")},
+            {"name": "note.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"ends with a full stop.")},
+            {"name": "long.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(long_octets[:254], long_octets[254:])},
+        ],
+        desired=[
+            _txt_desired("spf", '"v=spf1 -all"'),
+            _txt_desired("two", '"a" "b"'),
+            _txt_desired("note", "ends with a full stop."),
+            _txt_desired("long", chr(0xE9) * 200),
+        ],
+    )
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+
+
+def _record_calls(calls: list[tuple[str, str, str, dict[str, Any]]]) -> list[tuple[str, str]]:
+    return [(c[2], c[3]["characterStringsBase64"]) for c in calls
+            if c[2] in ("zones/records/delete", "zones/records/add")]
+
+
+def test_reconcile_replaces_a_txt_served_without_its_full_stop(tmp_path: Path) -> None:
+    """A value the driver served one character short before #1694 is
+    replaced once, and the next pass changes nothing."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    desired = [_txt_desired("note", "a full stop.")]
+    calls = _reconcile_with(
+        d,
+        existing=[{"name": "note.example.com", "type": "TXT", "ttl": 300,
+                   "rData": _txt_rdata(b"a full stop")}],
+        desired=desired,
+    )
+    assert _record_calls(calls) == [
+        ("zones/records/delete", _b64s(b"a full stop")),
+        ("zones/records/add", _b64s(b"a full stop.")),
+    ]
+    calls = _reconcile_with(
+        d,
+        existing=[{"name": "note.example.com", "type": "TXT", "ttl": 300,
+                   "rData": _txt_rdata(b"a full stop.")}],
+        desired=desired,
+    )
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+
+
+def test_reconcile_replaces_a_txt_served_with_its_quotes_once(tmp_path: Path) -> None:
+    """What the driver served before #1694 for an already-quoted value (one
+    string with the quotes in it) is deleted by its own strings and
+    replaced, and the next pass over the replaced record changes nothing."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    desired = [_txt_desired("spf", '"v=spf1 -all"'), _txt_desired("two", '"a" "b"')]
+    calls = _reconcile_with(
+        d,
+        existing=[
+            {"name": "spf.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b'"v=spf1 -all"')},
+            {"name": "two.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b'"a" "b"')},
+        ],
+        desired=desired,
+    )
+    assert sorted(_record_calls(calls)) == sorted([
+        ("zones/records/delete", _b64s(b'"v=spf1 -all"')),
+        ("zones/records/delete", _b64s(b'"a" "b"')),
+        ("zones/records/add", _b64s(b"v=spf1 -all")),
+        ("zones/records/add", _b64s(b"a", b"b")),
+    ])
+    assert all("text" not in c[3] for c in calls if c[2].startswith("zones/records/"))
+
+    calls = _reconcile_with(
+        d,
+        existing=[
+            {"name": "spf.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"v=spf1 -all")},
+            {"name": "two.example.com", "type": "TXT", "ttl": 300,
+             "rData": _txt_rdata(b"a", b"b")},
+        ],
+        desired=desired,
+    )
+    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+
+
+def test_apply_record_op_sends_each_txt_member_as_its_strings(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+
+    d.apply_record_op(
+        {
+            "zone_name": "example.com.",
+            "op": "create",
+            "record": {
+                "name": "@",
+                "type": "TXT",
+                "value": '"v=spf1 -all"',
+                "ttl": 300,
+                "rrset": {
+                    "ttl": 300,
+                    "members": [
+                        {"value": '"v=spf1 -all"'},
+                        {"value": "site-verification=abc."},
+                    ],
+                },
+            },
+        }
+    )
+    sent = [(c[3]["overwrite"], c[3]["characterStringsBase64"]) for c in calls]
+    assert sent == [
+        ("true", _b64s(b"v=spf1 -all")),
+        ("false", _b64s(b"site-verification=abc.")),
+    ]
+    assert all("text" not in c[3] for c in calls)
+
+    calls.clear()
+    d.apply_record_op(
+        {
+            "zone_name": "example.com.",
+            "op": "delete",
+            "record": {"name": "@", "type": "TXT", "value": '"v=spf1 -all"'},
+        }
+    )
+    assert [(c[2], c[3]["characterStringsBase64"]) for c in calls] == [
+        ("zones/records/delete", _b64s(b"v=spf1 -all"))
+    ]
 
 
 def test_record_params_caa() -> None:
@@ -206,7 +473,8 @@ def test_svcb_params_no_params() -> None:
     # Root dot stripped — the daemon stores the target un-dotted. See
     # test_svcb_target_root_dot_is_stripped.
     assert target == "svc.example.com"
-    assert params == ""
+    # The API requires svcParams; ``false`` is its spelling of "none".
+    assert params == "false"
 
 
 def test_record_params_svcb() -> None:
@@ -214,9 +482,14 @@ def test_record_params_svcb() -> None:
     assert out == {"svcPriority": 1, "svcTargetName": ".", "svcParams": "alpn|h2"}
 
 
-def test_record_params_https_no_params_omits_svcparams() -> None:
+def test_record_params_https_no_params_sends_false() -> None:
+    """``svcParams`` is a required API parameter (``GetQueryOrForm`` with no
+    default, WebServiceZonesApi.cs 15.4.0); omitting it is refused with
+    "Parameter 'svcParams' missing." for add AND delete. ``false`` = none."""
     out = _record_params("HTTPS", "1 .", {})
-    assert out == {"svcPriority": 1, "svcTargetName": "."}
+    assert out == {"svcPriority": 1, "svcTargetName": ".", "svcParams": "false"}
+    live = _normalize_rdata("HTTPS", {"svcPriority": 1, "svcTargetName": "", "svcParams": {}})
+    assert live == out
 
 
 def test_admin_bootstrap_password_persists(tmp_path: Path) -> None:
@@ -2138,12 +2411,12 @@ def test_svcb_params_sorted_by_key() -> None:
     """Read-back rebuilds svcParams sorted; the write side must sort
     too or the record churns on every structural reconcile."""
     _, _, params = _svcb_params('1 . port=443 alpn="h2"')
-    assert params == "alpn|h2,port|443"
+    assert params == "alpn|h2|port|443"
 
 
 def test_svcb_params_valueless_key_is_emitted_not_dropped() -> None:
     _, _, params = _svcb_params('1 . no-default-alpn alpn="h2"')
-    assert params == "alpn|h2,no-default-alpn|"
+    assert params == "alpn|h2|no-default-alpn|true"
 
 
 def test_svcb_round_trip_no_churn() -> None:
@@ -2420,3 +2693,264 @@ def test_reconcile_apex_untouched_without_apex(tmp_path: Path) -> None:
     calls = _apex_reconcile(d, _DAEMON_APEX, None)  # type: ignore[arg-type]
     assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
     assert [c[3].get("listZone") for c in calls if c[2] == "zones/records/get"] == ["true"]
+
+
+# ── #1513 / #1698: SVCB/HTTPS canonical comparison ──────────────────────
+
+
+def test_svcb_params_are_pipe_separated_for_two_params() -> None:
+    """#1698: Technitium splits svcParams on '|' and walks it two at a time,
+    so pairs joined by ',' only worked for one param."""
+    _, _, params = _svcb_params("1 . port=8443 alpn=h2")
+    assert params == "alpn|h2|port|8443"
+    _, _, params = _svcb_params('1 . alpn="h2,h3" port=443')
+    assert params == "alpn|h2,h3|port|443"
+
+
+def test_svcb_quoted_and_unquoted_value_are_the_same_record() -> None:
+    a = _record_params("SVCB", "1 . alpn=h2", {}, "example.net")
+    b = _record_params("SVCB", '1 . alpn="h2"', {}, "example.net")
+    assert a == b
+    live = _normalize_rdata(
+        "SVCB", {"svcPriority": 1, "svcTargetName": "", "svcParams": {"alpn": "h2"}}
+    )
+    assert live == a
+
+
+def test_svcb_relative_and_absolute_in_zone_target_agree() -> None:
+    for typed in ("1 svc.example.net. alpn=h2", "1 svc alpn=h2", "1 SVC.Example.Net. alpn=h2"):
+        d = _record_params("SVCB", typed, {}, "example.net")
+        assert d["svcTargetName"] == "svc.example.net"
+    assert _svcb_params("1 . alpn=h2", "example.net")[1] == "."
+    # Technitium has no relative names: a daemon holding ``svc`` serves
+    # ``svc.``, so it is NOT the same record as ``svc.example.net``.
+    live = _normalize_rdata(
+        "SVCB", {"svcPriority": 1, "svcTargetName": "svc", "svcParams": {"alpn": "h2"}}
+    )
+    assert live["svcTargetName"] == "svc"
+
+
+def test_svcb_valueless_and_mandatory_and_order() -> None:
+    d = _record_params(
+        "HTTPS", '1 . port=443 no-default-alpn mandatory="port,alpn" alpn=h2', {}, "example.net"
+    )
+    live = _normalize_rdata(
+        "HTTPS",
+        {
+            "svcPriority": 1,
+            "svcTargetName": "",
+            "svcParams": {
+                "alpn": "h2",
+                "mandatory": "alpn,port",
+                "port": "443",
+                "no-default-alpn": None,
+            },
+        },
+    )
+    assert d == live
+    assert d["svcParams"].startswith("mandatory|alpn,port|alpn|h2|no-default-alpn|")
+
+
+def test_svcb_genuinely_different_records_stay_different() -> None:
+    base = _record_params("SVCB", "1 . alpn=h2", {}, "example.net")
+    assert base != _record_params("SVCB", "1 . alpn=h3", {}, "example.net")
+    assert base != _record_params("SVCB", "2 . alpn=h2", {}, "example.net")
+    assert base != _record_params("SVCB", "1 svc alpn=h2", {}, "example.net")
+    assert base != _record_params("SVCB", "1 . alpn=h2 port=443", {}, "example.net")
+    # alpn order is significant, unlike param order.
+    assert _record_params("SVCB", "1 . alpn=h2,h3", {}, "z") != _record_params(
+        "SVCB", "1 . alpn=h3,h2", {}, "z"
+    )
+
+
+def test_svcb_escaped_comma_in_alpn_survives() -> None:
+    _, _, params = _svcb_params('1 . alpn="f\\,oo,bar"')
+    assert params == "alpn|f\\,oo,bar"
+
+
+def _reconcile_calls(
+    tmp_path: Path, value: str, daemon: dict[str, Any], zone: str = "example.net"
+) -> list[str]:
+    """Run the structural reconcile for one SVCB record against a daemon
+    holding ``daemon`` rData; return the add/delete endpoints it hit."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d._ensure_zone_exists = lambda *_a, **_k: None  # type: ignore[method-assign]
+    d._apply_zone_options = lambda *_a, **_k: None  # type: ignore[method-assign]
+    d._get_zone_records = lambda *_a, **_k: [  # type: ignore[method-assign]
+        {"domain": f"svc.{zone}", "type": "SVCB", "ttl": 300, **_normalize_rdata("SVCB", daemon)}
+    ]
+    hit: list[str] = []
+
+    class _Resp:
+        def json(self) -> dict[str, Any]:
+            return {"status": "ok"}
+
+    def _call(_t: str, _m: str, path: str, _p: dict[str, Any]) -> _Resp:
+        hit.append(path)
+        return _Resp()
+
+    d._call = _call  # type: ignore[method-assign]
+    payload = [
+        {
+            "zone": zone,
+            "type": "Primary",
+            "records": [
+                {
+                    "domain": f"svc.{zone}",
+                    "type": "SVCB",
+                    "ttl": 300,
+                    **_record_params("SVCB", value, {}, zone),
+                }
+            ],
+        }
+    ]
+    d._reconcile_zones("tok", payload)
+    return hit
+
+
+@pytest.mark.parametrize(
+    ("stored", "daemon_target", "daemon_params"),
+    [
+        ("1 . alpn=h2", ".", {"alpn": "h2"}),
+        ('1 . alpn="h2"', "", {"alpn": "h2"}),
+        ("1 svc.example.net. alpn=h2", "svc.example.net", {"alpn": "h2"}),
+        # A trailing dot is absolute whatever the label count: never
+        # qualified, so a single-label absolute target is stable.
+        ("1 localhost. alpn=h2", "localhost", {"alpn": "h2"}),
+        ("1 svc alpn=h2", "svc.example.net", {"alpn": "h2"}),
+        ("1 . port=8443 alpn=h2,h3", ".", {"alpn": "h2,h3", "port": "8443"}),
+        ("1 . no-default-alpn alpn=h2", ".", {"alpn": "h2", "no-default-alpn": None}),
+    ],
+)
+def test_svcb_reconcile_does_not_churn(
+    tmp_path: Path, stored: str, daemon_target: str, daemon_params: dict[str, Any]
+) -> None:
+    hit = _reconcile_calls(
+        tmp_path,
+        stored,
+        {"svcPriority": 1, "svcTargetName": daemon_target, "svcParams": daemon_params},
+    )
+    assert hit == []
+
+
+def test_svcb_reconcile_still_replaces_a_different_record(tmp_path: Path) -> None:
+    hit = _reconcile_calls(
+        tmp_path,
+        "1 . alpn=h3",
+        {"svcPriority": 1, "svcTargetName": "", "svcParams": {"alpn": "h2"}},
+    )
+    assert hit == ["zones/records/delete", "zones/records/add"]
+
+
+def test_svcb_single_label_left_by_the_old_agent_is_repaired(tmp_path: Path) -> None:
+    """The old agent sent a relative ``svc`` verbatim, and Technitium served
+    it as ``svc.``. Desired is now ``svc.example.net``, so the record is
+    replaced once instead of being matched and left wrong forever."""
+    hit = _reconcile_calls(
+        tmp_path,
+        "1 svc alpn=h2",
+        {"svcPriority": 1, "svcTargetName": "svc", "svcParams": {"alpn": "h2"}},
+    )
+    assert hit == ["zones/records/delete", "zones/records/add"]
+
+
+def test_svcb_param_less_record_does_not_churn(tmp_path: Path) -> None:
+    hit = _reconcile_calls(
+        tmp_path, "0 cdn.other.net.", {"svcPriority": 0, "svcTargetName": "cdn.other.net", "svcParams": {}}
+    )
+    assert hit == []
+
+
+def test_svcb_ech_and_unnamed_keys_go_as_hex_and_read_back_equal() -> None:
+    """``ech`` and an unnamed key reach ``DnsSvcUnknownParamValue.Parse``,
+    which reads HEX; an unnamed key is ``Enum.Parse``d, so it goes by number.
+    The daemon reports both as colon-hex, the unnamed key by number."""
+    out = _record_params("HTTPS", '1 . alpn=h2 ech="AAEC" key65000="a b"', {}, "z")
+    assert out["svcParams"] == "alpn|h2|ech|000102|65000|612062"
+    live = _normalize_rdata(
+        "HTTPS",
+        {
+            "svcPriority": 1,
+            "svcTargetName": "",
+            "svcParams": {"65000": "61:20:62", "ech": "00:01:02", "alpn": "h2"},
+        },
+    )
+    assert live == out
+
+
+def test_svcb_mandatory_naming_an_unnamed_key_goes_by_number() -> None:
+    _, _, params = _svcb_params("1 . mandatory=key65000,alpn alpn=h2 key65000=x")
+    assert params == "mandatory|alpn,65000|alpn|h2|65000|78"
+
+
+# ── #1513 case 7: a cached pre-#1513 bundle keeps its own target meaning ──
+
+
+def _render_svcb(tmp_path: Path, value: str, rule: str | None) -> str:
+    import json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    bundle: dict[str, Any] = {
+        "zones": [
+            {
+                "name": "up.test.",
+                "type": "primary",
+                "ttl": 3600,
+                "records": [{"name": "c7s", "type": "SVCB", "value": value, "ttl": 300}],
+            }
+        ]
+    }
+    if rule is not None:
+        bundle["svcb_target_rule"] = rule
+    d.render(bundle)
+    payload = json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
+    (rec,) = [r for r in payload[0]["records"] if r["type"] == "SVCB"]
+    return str(rec["svcTargetName"])
+
+
+def test_replaying_a_pre_1513_bundle_keeps_a_dotless_target_absolute(tmp_path: Path) -> None:
+    """The #1731 walk's case 7: the agent replays its cached bundle at start,
+    and a bundle from the renderer before #1513 holds ``1 cdn.example.net``
+    meaning ``cdn.example.net.`` — what that renderer sent to the daemon. It
+    carries no ``svcb_target_rule``, so it must not be read as zone-relative."""
+    assert _render_svcb(tmp_path, '1 cdn.example.net alpn="h2"', None) == "cdn.example.net"
+    assert _render_svcb(tmp_path, "1 svc alpn=h2", None) == "svc"
+
+
+def test_a_zone_file_rule_bundle_reads_a_dotless_target_as_relative(tmp_path: Path) -> None:
+    rule = SVCB_TARGET_RULE_ZONE_FILE
+    assert _render_svcb(tmp_path, "1 svc alpn=h2", rule) == "svc.up.test"
+    assert _render_svcb(tmp_path, "1 cdn.example.net. alpn=h2", rule) == "cdn.example.net"
+    assert _render_svcb(tmp_path, "1 localhost. alpn=h2", rule) == "localhost"
+    # Under either rule a trailing dot is absolute.
+    assert _render_svcb(tmp_path, "1 cdn.example.net. alpn=h2", None) == "cdn.example.net"
+
+
+def test_record_ops_follow_the_rule_of_the_applied_bundle(tmp_path: Path) -> None:
+    def _op_target(rule: str | None) -> str:
+        d = TechnitiumDriver(state_dir=tmp_path)
+        _seed_token(d)
+        bundle: dict[str, Any] = {"zones": []}
+        if rule is not None:
+            bundle["svcb_target_rule"] = rule
+        d.render(bundle)
+        calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+        d.apply_record_op(
+            {
+                "zone_name": "up.test.",
+                "op": "create",
+                "record": {"name": "c7s", "type": "SVCB", "value": "1 svc alpn=h2", "ttl": 300},
+            }
+        )
+        return str(calls[-1][3]["svcTargetName"])
+
+    assert _op_target(None) == "svc"
+    assert _op_target(SVCB_TARGET_RULE_ZONE_FILE) == "svc.up.test"
+
+
+def test_render_reads_the_rule_from_the_bundle(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render({"zones": [], "svcb_target_rule": SVCB_TARGET_RULE_ZONE_FILE})
+    assert d._svcb_zone_file_targets
+    d.render({"zones": []})
+    assert not d._svcb_zone_file_targets

@@ -70,6 +70,7 @@ from app.core.agent_wake import (
     appliance_channel,
     appliance_wake_channels,
     publish_wake,
+    wake_publishing,
     wake_subscription,
 )
 from app.core.auth_throttle import (
@@ -4077,6 +4078,211 @@ _VALID_ROLES = {
 _DNS_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium"}
 
 
+# #1715 — engine role -> the dns_server.driver its agent registers with.
+_DNS_ROLE_DRIVER = {
+    "dns-bind9": "bind9",
+    "dns-powerdns": "powerdns",
+    "dns-technitium": "technitium",
+}
+
+
+def _norm_host(value: str) -> str:
+    """A hostname as compared for ownership (#1715): case-folded, trailing
+    root dot dropped. Both sides come from the node's kernel nodename (the
+    supervisor's ``APPLIANCE_HOSTNAME`` is firstboot's ``hostname``; a
+    hostNetwork agent's ``os.uname().nodename`` / the downward-API node
+    name), so they agree in practice; this only absorbs the spellings a
+    hand edit or a k8s node name (always lowercase) can introduce."""
+    return value.strip().rstrip(".").lower()
+
+
+async def _hostname_is_unambiguous(db: DB, appliance: Appliance) -> bool:
+    """True when no OTHER approved appliance shares this one's hostname
+    (case-insensitively). A hostname match is only a safe way to claim a
+    server row when it can't be someone else's."""
+    others = (
+        await db.execute(
+            select(Appliance.hostname).where(
+                Appliance.id != appliance.id,
+                Appliance.state == APPLIANCE_STATE_APPROVED,
+            )
+        )
+    ).scalars()
+    mine = _norm_host(appliance.hostname or "")
+    return bool(mine) and all(_norm_host(h or "") != mine for h in others)
+
+
+async def _own_server_condition(db: DB, appliance: Appliance, model: Any) -> Any:
+    """SQL condition selecting ``model`` (DNSServer / DHCPServer) rows that
+    belong to ``appliance`` (#1715).
+
+    Agents register with ``host`` = the node's hostname and never set
+    ``appliance_id``, so the FK alone finds nothing on a real appliance.
+    Hostname is matched too (as ``_find_appliance_dependents`` does), but
+    only on agent-based rows not already owned by another appliance, and
+    only when the hostname is unambiguous across approved appliances.
+    """
+    conds = [model.appliance_id == appliance.id]
+    if await _hostname_is_unambiguous(db, appliance):
+        conds.append(
+            (
+                sa_func.lower(sa_func.rtrim(sa_func.trim(model.host), "."))
+                == _norm_host(appliance.hostname)
+            )
+            & model.appliance_id.is_(None)
+            & model.agent_id.is_not(None)
+        )
+    return or_(*conds)
+
+
+def _current_dns_drivers(appliance: Appliance) -> set[str]:
+    return {_DNS_ROLE_DRIVER[r] for r in (appliance.assigned_roles or []) if r in _DNS_ROLE_DRIVER}
+
+
+async def _appliance_own_dns_servers(db: DB, appliance: Appliance) -> list[Any]:
+    """The dns_server row(s) of the appliance's CURRENT DNS engine (#1715).
+
+    An engine switch leaves the old engine's row behind in its old group;
+    moving it would clash on name or driver in the target, so only rows of
+    the current engine are returned (``_retire_stale_engine_rows`` deals
+    with the old one when it is in the way).
+    """
+    from app.models.dns import DNSServer  # noqa: PLC0415
+
+    drivers = _current_dns_drivers(appliance)
+    if not drivers:
+        return []
+    own = await _own_server_condition(db, appliance, DNSServer)
+    return list(
+        (await db.execute(select(DNSServer).where(own, DNSServer.driver.in_(sorted(drivers)))))
+        .scalars()
+        .all()
+    )
+
+
+async def _retire_stale_engine_rows(
+    db: DB, appliance: Appliance, target_group: Any, current_user: Any
+) -> list[str]:
+    """Delete this appliance's OWN dns_server rows in ``target_group`` that
+    belong to a DNS engine it no longer runs (#1715).
+
+    An engine switch (bind9 -> technitium) registers a new row for the new
+    engine and leaves the old engine's row where it was: same name (the
+    hostname), old driver, no agent behind it any more — the role swap
+    removes the node label, so the old engine's DaemonSet pod is gone.
+    Moving the appliance back to that group then clashes with its own dead
+    row on name and on driver, and the operator gets a 409 / 422 about a
+    row they can't see the point of. So the dead row is retired the way the
+    server DELETE does it (audit row, wakes, delete; zone state / record ops
+    / metrics cascade on the FK).
+
+    Only ever a row that is (a) this appliance's by FK or the unambiguous
+    hostname match, (b) of a driver that is NOT the currently assigned
+    engine, and (c) silent for longer than the agent-stale window. A row
+    whose agent is still reporting — the old pod has not stopped yet, right
+    after a switch — is refused with an actionable 409 instead of deleted:
+    deleting a live agent's row only makes it re-register.
+
+    Returns the retired rows' names, for the role-assignment audit row.
+    """
+    from app.core.agent_wake import collect_wake, dns_group_channel, dns_server_channel
+    from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.tasks.dns import AGENT_STALE_AFTER  # noqa: PLC0415
+
+    drivers = _current_dns_drivers(appliance)
+    if not drivers:
+        return []
+    own = await _own_server_condition(db, appliance, DNSServer)
+    stale = (
+        (
+            await db.execute(
+                select(DNSServer)
+                .where(
+                    own,
+                    DNSServer.group_id == target_group.id,
+                    DNSServer.driver.not_in(sorted(drivers)),
+                )
+                .order_by(DNSServer.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    now = datetime.now(UTC)
+    retired: list[str] = []
+    for srv in stale:
+        if srv.last_seen_at is not None and now - srv.last_seen_at < AGENT_STALE_AFTER:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                (
+                    f"Group {target_group.name!r} still holds this appliance's "
+                    f"{srv.driver} server {srv.name!r}, and its agent reported "
+                    f"{int((now - srv.last_seen_at).total_seconds())}s ago. "
+                    "It is retired automatically once it stops reporting "
+                    f"(about {int(AGENT_STALE_AFTER.total_seconds())}s after the "
+                    "engine switch) — save again then, or delete it under DNS → "
+                    "Server groups."
+                ),
+            )
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="delete",
+                resource_type="dns_server",
+                resource_id=str(srv.id),
+                resource_display=srv.name,
+                old_value={
+                    "group_id": str(srv.group_id),
+                    "driver": srv.driver,
+                    "host": srv.host,
+                    "agent_id": str(srv.agent_id) if srv.agent_id else None,
+                    "last_seen_at": srv.last_seen_at.isoformat() if srv.last_seen_at else None,
+                },
+                new_value={
+                    "reason": "retired_stale_engine_row",
+                    "appliance_id": str(appliance.id),
+                    "assigned_engine": sorted(drivers),
+                },
+                result="success",
+            )
+        )
+        collect_wake(dns_server_channel(srv.id), dns_group_channel(srv.group_id))
+        logger.info(
+            "appliance_stale_dns_row_retired",
+            appliance_id=str(appliance.id),
+            server_id=str(srv.id),
+            server_name=srv.name,
+            driver=srv.driver,
+            group_id=str(srv.group_id),
+        )
+        retired.append(srv.name)
+        await db.delete(srv)
+    if retired:
+        # The move's name-clash / single-driver / primary checks query the
+        # target group; they must not see the rows just retired.
+        await db.flush()
+    return retired
+
+
+async def _appliance_own_dhcp_servers(db: DB, appliance: Appliance) -> list[Any]:
+    """The appliance's agent-based (kea) dhcp_server rows (#1715); same
+    matching rules as ``_appliance_own_dns_servers``. ``dhcp_server.name``
+    is globally unique and kea is the only agent engine, so there is no
+    stale-engine row to retire on this side."""
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
+
+    if "dhcp" not in (appliance.assigned_roles or []):
+        return []
+    own = await _own_server_condition(db, appliance, DHCPServer)
+    return list(
+        (await db.execute(select(DHCPServer).where(own, DHCPServer.driver == "kea")))
+        .scalars()
+        .all()
+    )
+
+
 class ApplianceRolesUpdate(BaseModel):
     """Operator-driven role + group + tag assignment payload.
 
@@ -4110,7 +4316,10 @@ class ApplianceRolesUpdate(BaseModel):
 @router.put(
     "/appliances/{appliance_id}/roles",
     response_model=ApplianceRow,
-    dependencies=[Depends(require_permission("admin", "appliance"))],
+    # #1715 — the group change moves the appliance's own DNS / DHCP servers
+    # and ``collect_wake``s their agents and both groups; without a collector
+    # on the request those calls were silent no-ops.
+    dependencies=[Depends(require_permission("admin", "appliance")), Depends(wake_publishing)],
     summary="Assign roles + groups + tags (superadmin)",
 )
 async def update_appliance_roles(
@@ -4133,7 +4342,11 @@ async def update_appliance_roles(
     """
     _require_superadmin(current_user)
 
-    row = await db.get(Appliance, appliance_id)
+    # #1715 — FOR UPDATE: two Fleet saves on one appliance used to race the
+    # server moves below on stale reads (two primaries, a move computed from a
+    # group the row had already left). The lock serialises them; the second
+    # save's reads, all after this, see the first one's commit.
+    row = await db.get(Appliance, appliance_id, with_for_update=True)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
     if row.state != APPLIANCE_STATE_APPROVED:
@@ -4141,6 +4354,8 @@ async def update_appliance_roles(
             status.HTTP_409_CONFLICT,
             f"Cannot assign roles to appliance in state {row.state!r}; approve it first.",
         )
+    moved_servers: list[dict[str, Any]] = []
+    retired_servers: list[str] = []
 
     if body.roles is not None:
         # Reject unknown role tokens explicitly so a typo on the API
@@ -4209,27 +4424,44 @@ async def update_appliance_roles(
             # appliance's own DNS server(s) with it, through #934's move, in this
             # transaction; a move it refuses (a name clash, a mixed-driver group)
             # refuses the whole PUT, so the pointer and the server can't disagree.
-            from app.models.dns import DNSServer
             from app.services.dns.server_move import ServerMoveError, move_server_to_group
 
-            for server in (
-                (await db.execute(select(DNSServer).where(DNSServer.appliance_id == row.id)))
-                .scalars()
-                .all()
-            ):
+            own_dns = await _appliance_own_dns_servers(db, row)
+            if any(srv.group_id != dns_group.id for srv in own_dns):
+                # #1715 — the appliance's own dead row of a previous engine
+                # would block the move on name and driver; retire it first.
+                retired_servers = await _retire_stale_engine_rows(db, row, dns_group, current_user)
+            for server in own_dns:
                 try:
-                    await move_server_to_group(db, server, dns_group)
+                    result = await move_server_to_group(db, server, dns_group)
                 except ServerMoveError as exc:
                     raise HTTPException(
                         status_code=exc.status_code,
                         detail=f"Can't move this appliance's DNS server {server.name!r}: {exc.detail}",
                     ) from exc
+                if result is None:
+                    continue
+                moved_servers.append({"dns_server": str(server.id), "name": server.name})
+                db.add(
+                    AuditLog(
+                        user_id=current_user.id,
+                        user_display_name=current_user.display_name,
+                        auth_source=current_user.auth_source,
+                        action="update",
+                        resource_type="dns_server",
+                        resource_id=str(server.id),
+                        resource_display=server.name,
+                        changed_fields=["group_id"],
+                        new_value={**result.as_audit_value(), "via_appliance_id": str(row.id)},
+                        result="success",
+                    )
+                )
             row.assigned_dns_group_id = dns_group.id
     if "dhcp_group_id" in body.model_fields_set:
         if body.dhcp_group_id is None:
             row.assigned_dhcp_group_id = None
         else:
-            from app.models.dhcp import DHCPServer, DHCPServerGroup
+            from app.models.dhcp import DHCPServerGroup
 
             dhcp_group = await db.get(DHCPServerGroup, body.dhcp_group_id)
             if dhcp_group is None:
@@ -4248,11 +4480,7 @@ async def update_appliance_roles(
             )
             from app.core.agent_wake import collect_wake, dhcp_group_channel, dhcp_server_channel
 
-            for dserver in (
-                (await db.execute(select(DHCPServer).where(DHCPServer.appliance_id == row.id)))
-                .scalars()
-                .all()
-            ):
+            for dserver in await _appliance_own_dhcp_servers(db, row):
                 if dserver.server_group_id == dhcp_group.id:
                     continue
                 await _assert_driver_mix_allowed(
@@ -4265,6 +4493,25 @@ async def update_appliance_roles(
                 for gid in (old_gid, dhcp_group.id):
                     if gid is not None:
                         collect_wake(dhcp_group_channel(gid))
+                moved_servers.append({"dhcp_server": str(dserver.id), "name": dserver.name})
+                db.add(
+                    AuditLog(
+                        user_id=current_user.id,
+                        user_display_name=current_user.display_name,
+                        auth_source=current_user.auth_source,
+                        action="update",
+                        resource_type="dhcp_server",
+                        resource_id=str(dserver.id),
+                        resource_display=dserver.name,
+                        changed_fields=["server_group_id"],
+                        old_value={"server_group_id": str(old_gid) if old_gid else None},
+                        new_value={
+                            "server_group_id": str(dhcp_group.id),
+                            "via_appliance_id": str(row.id),
+                        },
+                        result="success",
+                    )
+                )
             row.assigned_dhcp_group_id = dhcp_group.id
 
     if body.tags is not None:
@@ -4319,6 +4566,8 @@ async def update_appliance_roles(
                     str(row.assigned_dhcp_group_id) if row.assigned_dhcp_group_id else None
                 ),
                 "tags": dict(row.tags or {}),
+                **({"moved_servers": moved_servers} if moved_servers else {}),
+                **({"retired_stale_dns_servers": retired_servers} if retired_servers else {}),
             },
         )
     )

@@ -35,6 +35,7 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -663,7 +664,32 @@ _CLUSTER_JOIN_STATE_SIDECAR = Path(
 # transition target — so re-driving against a different seed starts with a
 # fresh budget. ``reset_cluster_join_attempts()`` clears both ledgers
 # whenever the control plane stops asking for a role change.
-_CLUSTER_JOIN_MAX_ATTEMPTS = 3
+#
+# #1212 — a JOIN's re-fires are spaced too, and its ceiling is high enough
+# that its attempts outlast the backend's retry window. The backend keeps a
+# transiently failed member's desired role for 15 minutes (#961) so that the
+# join is retried once the path to the seed is back. The supervisor used to
+# re-fire on every heartbeat, with a ceiling of three and no spacing. An
+# attempt against an unreachable seed fails in ~20 s, so all three landed in
+# the first ~2.5 minutes of an outage and the rest of the window went unused:
+# a member whose path came back four minutes in stayed a standalone node.
+#
+# The next join against the same target now waits
+# ``_cluster_join_retry_delay_s()`` after the last fire, measured from the
+# ledger's timestamp: one minute, two, then every four. The first retry
+# still comes a minute after the first attempt; that is the retry #961's
+# concurrent-promote race needs. Eight attempts take about 23 minutes, past
+# the window, so for a transient failure the backend's clear, not this
+# ceiling, now ends the retries. The ceiling stays the backstop for a
+# control plane that never processes the failure: 8 wipes over ~23 minutes,
+# where it used to be 3 in ~2.5.
+_CLUSTER_JOIN_MAX_ATTEMPTS = 8
+_CLUSTER_JOIN_RETRY_BASE_S = 60.0
+_CLUSTER_JOIN_RETRY_MAX_S = 240.0
+# The leave is exactly as destructive, but the backend clears a failed
+# leave's desired role at once, so there is no window to span: it keeps the
+# original ceiling and no spacing.
+_CLUSTER_LEAVE_MAX_ATTEMPTS = 3
 
 # #590 — "this terminal verdict has already been delivered" marker.
 #
@@ -1685,7 +1711,22 @@ def _join_target_fingerprint(server_url: str, join_token: str) -> str:
     return digest.hexdigest()[:16]
 
 
-def _cluster_transition_should_fire(trigger_file: Path, fingerprint: str) -> bool:
+def _cluster_join_retry_delay_s(attempts: int) -> float:
+    """#1212 — how long after fire number ``attempts`` (>= 1) the next join
+    against the same target may fire: 60 s, 120 s, then 240 s each time."""
+    return min(
+        _CLUSTER_JOIN_RETRY_BASE_S * (2 ** max(0, attempts - 1)),
+        _CLUSTER_JOIN_RETRY_MAX_S,
+    )
+
+
+def _cluster_transition_should_fire(
+    trigger_file: Path,
+    fingerprint: str,
+    *,
+    max_attempts: int,
+    retry_delay_s: Callable[[int], float] | None = None,
+) -> bool:
     """#590 — bound the number of times a DESTRUCTIVE cluster transition
     re-fires against the same target.
 
@@ -1695,27 +1736,48 @@ def _cluster_transition_should_fire(trigger_file: Path, fingerprint: str) -> boo
     backend's clear-on-failed is the primary brake; this is the backstop
     for a control plane that never processes the failure.
 
+    #1212 — with ``retry_delay_s``, a re-fire against the same target also
+    waits ``retry_delay_s(attempts)`` after the last fire the ledger
+    recorded, so the attempts spread across the backend's retry window
+    instead of being spent in its first minutes. A ledger stamped in the
+    future (the clock stepped back) never holds a fire back: the ceiling
+    still bounds it.
+
     Reuses the module's hash-keyed fire-state ledger (``_read_fire_state``
     / ``_write_fire_state``), the same one the host-config planes use for
     their re-fire backoff. Budget is per fingerprint: a transition against
     a different target starts over.
     """
     fire_state = _fire_state_path(trigger_file)
-    prev_fingerprint, attempts, _last_at = _read_fire_state(fire_state)
+    prev_fingerprint, attempts, last_at = _read_fire_state(fire_state)
     if prev_fingerprint != fingerprint:
-        attempts = 0
-    if attempts >= _CLUSTER_JOIN_MAX_ATTEMPTS:
+        attempts, last_at = 0, None
+    if attempts >= max_attempts:
         log.error(
             "supervisor.cluster_transition.attempt_ceiling_reached",
             trigger=trigger_file.name,
             attempts=attempts,
-            max_attempts=_CLUSTER_JOIN_MAX_ATTEMPTS,
+            max_attempts=max_attempts,
             detail=(
                 "refusing to re-fire the destructive transition; see "
                 "/var/log/spatiumddi/cluster-join.log, then re-drive it to retry"
             ),
         )
         return False
+    if retry_delay_s is not None and attempts and last_at is not None:
+        if last_at.tzinfo is None:
+            last_at = last_at.replace(tzinfo=UTC)
+        elapsed = (datetime.now(UTC) - last_at).total_seconds()
+        wait = retry_delay_s(attempts) - elapsed
+        if elapsed >= 0 and wait > 0:
+            log.info(
+                "supervisor.cluster_transition.retry_deferred",
+                trigger=trigger_file.name,
+                attempts=attempts,
+                max_attempts=max_attempts,
+                next_attempt_in_s=round(wait),
+            )
+            return False
     return True
 
 
@@ -1827,9 +1889,15 @@ def maybe_fire_cluster_join(
     # trigger-file presence alone can't stop a doomed join from re-wiping this
     # node's k3s state on every heartbeat. Budget is per target: a promote
     # against a different seed (or a re-promote after the ledger is reset)
-    # starts over.
+    # starts over. #1212 — re-fires against the same target are spaced
+    # (1, 2, then 4 minutes apart), so they cover the backend's retry window.
     fingerprint = _join_target_fingerprint(server_url, join_token)
-    if not _cluster_transition_should_fire(_CLUSTER_JOIN_TRIGGER_FILE, fingerprint):
+    if not _cluster_transition_should_fire(
+        _CLUSTER_JOIN_TRIGGER_FILE,
+        fingerprint,
+        max_attempts=_CLUSTER_JOIN_MAX_ATTEMPTS,
+        retry_delay_s=_cluster_join_retry_delay_s,
+    ):
         return False
     try:
         _CLUSTER_JOIN_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1862,10 +1930,12 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
     #590 — the leave is exactly as destructive as the join (``do_leave``
     runs the same full ``backup_and_wipe_identity`` + k3s restart) and the
     runner renames a failed leave trigger to ``.failed.<ts>`` just like the
-    join. So it gets the same per-target attempt ceiling; without it a
-    demote that can never come Ready re-wipes this node's k3s state on
-    every heartbeat, forever, whenever the control plane isn't around to
-    clear the desired-state.
+    join. So it gets the same kind of per-target attempt ceiling (its own,
+    ``_CLUSTER_LEAVE_MAX_ATTEMPTS``, with none of the join's #1212 retry
+    spacing: the backend clears a failed leave at once, so there is no
+    window to spread attempts across); without it a demote that can never
+    come Ready re-wipes this node's k3s state on every heartbeat, forever,
+    whenever the control plane isn't around to clear the desired-state.
     """
     if detect_deployment_kind() != "appliance":
         return False
@@ -1883,7 +1953,9 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
     # A leave has no target coordinates, so the whole operation is one
     # fingerprint — the budget bounds "this node's demote", period.
     fingerprint = "leave"
-    if not _cluster_transition_should_fire(_CLUSTER_LEAVE_TRIGGER_FILE, fingerprint):
+    if not _cluster_transition_should_fire(
+        _CLUSTER_LEAVE_TRIGGER_FILE, fingerprint, max_attempts=_CLUSTER_LEAVE_MAX_ATTEMPTS
+    ):
         return False
     try:
         _CLUSTER_LEAVE_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)

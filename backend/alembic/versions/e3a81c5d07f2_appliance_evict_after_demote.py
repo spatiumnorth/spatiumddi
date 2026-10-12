@@ -12,7 +12,7 @@ No backfill: every eviction a pre-#1541 build stamped was a Replace, which
 is what ``false`` means.
 
 Revision ID: e3a81c5d07f2
-Revises: c2f7a94e1d58
+Revises: a3d9e5c17b42
 Create Date: 2026-10-11
 """
 
@@ -23,7 +23,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "e3a81c5d07f2"
-down_revision = "c2f7a94e1d58"
+down_revision = "a3d9e5c17b42"
 branch_labels = None
 depends_on = None
 

@@ -296,7 +296,7 @@ class CloudDNSDriverBase(DNSDriver):
         op: str,
         *,
         managed_records: list[RecordData] | None = None,
-    ) -> None:
+    ) -> bool:
         """Create / delete a hosted zone on the provider.
 
         Called by the zone-CRUD service helper for agentless drivers. ``op``
@@ -313,18 +313,31 @@ class CloudDNSDriverBase(DNSDriver):
         ``None`` means "no scoping information" — the provider must
         not delete ANY record on the way out, only attempt the zone
         delete itself.
+
+        Returns whether the call CHANGED the provider (#1537). ``False``
+        means the provider was already in the requested state — the zone
+        already existed on create, or was already gone on delete — and
+        the call did nothing. The caller's partial-failure compensation
+        must not undo a change that was never made: compensating a
+        create that found the zone already there would delete a zone
+        this request did not create, records and all.
         """
         if op not in {"create", "delete"}:
             raise ValueError(f"{self.name}.apply_zone_change: unsupported op {op!r}")
         creds = self._load_credentials(server)
-        await self._apply_zone(server, creds, zone, op, managed_records=managed_records)
+        result = await self._apply_zone(server, creds, zone, op, managed_records=managed_records)
+        # ``None`` = a driver that does not report the distinction; treat
+        # it as a change, which is what every driver did before #1537.
+        changed = result is not False
         logger.info(
             "cloud_dns.apply_zone_change",
             driver=self.name,
             server=str(getattr(server, "id", "")),
             zone=getattr(zone, "name", ""),
             op=op,
+            changed=changed,
         )
+        return changed
 
     # ── Zone / record reads (import + drift sync) ───────────────────────
     async def pull_zones_from_server(self, server: Any) -> list[dict[str, Any]]:
@@ -440,12 +453,14 @@ class CloudDNSDriverBase(DNSDriver):
         op: str,
         *,
         managed_records: list[RecordData] | None = None,
-    ) -> None:
+    ) -> bool | None:
         """Create / delete one hosted zone on the provider.
 
         ``managed_records`` is threaded through from
         :meth:`apply_zone_change` — see its docstring for the
-        delete-scoping contract.
+        delete-scoping contract. Return ``False`` when the provider was
+        already in the requested state and nothing was changed (#1537);
+        ``True`` or ``None`` when the zone was created / deleted.
         """
 
     @abstractmethod
