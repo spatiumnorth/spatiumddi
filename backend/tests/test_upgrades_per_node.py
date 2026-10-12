@@ -1257,7 +1257,11 @@ async def test_single_node_upgrade_passes_cnpg_cluster_to_the_count_waits(
     assert result.ok is True
     cnpg = {"cnpg_cluster_name": "pg-cluster", "cnpg_namespace": "spatium"}
     assert seen["preflight"] == cnpg
-    assert seen["cluster_verify"] == {**cnpg, "control_plane_release": "spatium-control"}
+    assert seen["cluster_verify"] == {
+        **cnpg,
+        "control_plane_release": "spatium-control",
+        "control_plane_namespace": None,
+    }
     assert seen["convergence"] == {}
 
 
@@ -1575,3 +1579,62 @@ async def test_chain_control_plane_timeout_fails_node(
     assert result.ok is False
     assert result.failed_at == "cluster_verify"
     assert "cp-api" in result.error
+
+
+@pytest.mark.asyncio
+async def test_cluster_verify_fails_when_no_deployment_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A selector that matches nothing must not read as "skipped": the
+    orchestrator runs inside the release, so an empty list means the
+    selector or namespace is wrong and the gate would be silently off."""
+    seen = _patch_cp(monkeypatch, [[]])
+    step = await per_node._step_cluster_verify(
+        "2026.06.01-1",
+        control_plane_release="spatium-control",
+        control_plane_namespace="spatium",
+        control_plane_timeout_s=60.0,
+    )
+    assert step.ok is False
+    assert "no Deployments match" in step.error
+    assert len(seen) == 1  # failed at once, did not poll to the timeout
+
+
+@pytest.mark.parametrize("code", [401, 403, 404])
+@pytest.mark.asyncio
+async def test_cluster_verify_fails_fast_on_refused_list(
+    monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    """Missing RBAC (or a wrong namespace) is not polled for ten minutes
+    and is not reported as skipped."""
+    calls: list[str] = []
+
+    def _list(selector: str, namespace: str | None = None) -> tuple[int, list[dict[str, Any]]]:
+        calls.append(selector)
+        return code, []
+
+    monkeypatch.setattr(per_node.k8s, "get_config", lambda: object())
+    monkeypatch.setattr(per_node.k8s, "list_deployments", _list)
+    monkeypatch.setattr(per_node, "_POLL_INTERVAL_S", 0.0)
+    step = await per_node._step_cluster_verify(
+        "2026.06.01-1", control_plane_release="spatium-control", control_plane_timeout_s=60.0
+    )
+    assert step.ok is False
+    assert str(code) in step.error and "RBAC" in step.error
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cluster_verify_not_settled_before_controller_observes_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A just-patched Deployment whose status still describes the previous
+    generation is not settled, even though its counters look complete."""
+    stale = _dep("cp-api")
+    stale["metadata"]["generation"] = 4  # status.observedGeneration is 3
+    _patch_cp(monkeypatch, [[stale]])
+    step = await per_node._step_cluster_verify(
+        "2026.06.01-1", control_plane_release="spatium-control", control_plane_timeout_s=0.05
+    )
+    assert step.ok is False
+    assert "cp-api" in step.error

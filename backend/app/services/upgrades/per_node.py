@@ -296,8 +296,15 @@ async def _wait_control_plane_ready(
     A single-replica Deployment is briefly at zero available while a
     retire-first rollout (#1659) replaces its pod: that is not-ready, so the
     wait continues through it until ``timeout_s``. ``ok`` (skipped) with no
-    release name, no kubeapi, or no matching Deployment (a shape without the
-    chart); kubeapi errors keep polling.
+    release name or no kubeapi (a shape without the chart).
+
+    Fails at once, without polling, on two answers that waiting cannot
+    change: 401 / 403 / 404 from the list call (missing RBAC or a wrong
+    namespace), and a successful list matching NO Deployment. The second
+    matters because the orchestrator itself runs inside the release, so
+    an empty result means the selector or namespace is wrong; reporting it
+    as "skipped" would turn the gate off without anyone noticing. Other
+    kubeapi errors (5xx, unreachable) keep polling until ``timeout_s``.
     """
     if not release:
         return True, {"control_plane_wait": "skipped: no release"}
@@ -313,11 +320,37 @@ async def _wait_control_plane_ready(
             status, items, last = 0, [], f"kubeapi unavailable: {exc}"
         if status == 200:
             if not items:
-                return True, {"control_plane_wait": f"skipped: no Deployments match {selector}"}
+                where = namespace or "the api's namespace"
+                logger.error(
+                    "upgrade_control_plane_no_deployments",
+                    selector=selector,
+                    namespace=namespace,
+                )
+                return False, {
+                    "control_plane_wait_error": (
+                        f"no Deployments match {selector} in {where}; the selector "
+                        "or namespace does not fit this install, so the gate "
+                        "cannot verify the control plane"
+                    ),
+                }
             pending = [r for r in (_deployment_settled(d) for d in items) if r]
             if not pending:
                 return True, {"control_plane_deployments": len(items)}
             last = "; ".join(pending)
+        elif status in (401, 403, 404):
+            logger.error(
+                "upgrade_control_plane_list_refused",
+                status=status,
+                selector=selector,
+                namespace=namespace,
+            )
+            return False, {
+                "control_plane_wait_error": (
+                    f"kubeapi answered {status} listing Deployments ({selector}); "
+                    "check the api ServiceAccount's RBAC (deployments: list) "
+                    "and the release namespace"
+                ),
+            }
         elif status:
             last = f"kubeapi status {status}"
         if time.monotonic() >= deadline:
@@ -1305,9 +1338,13 @@ async def _step_cluster_verify(
         return step.finish(
             False,
             error=(
-                f"control-plane Deployments not all available within "
-                f"{control_plane_timeout_s:.0f}s after uncordon: "
-                f"{cp_detail.get('control_plane_wait_error')}"
+                (
+                    f"control-plane Deployments not all available within "
+                    f"{control_plane_timeout_s:.0f}s after uncordon: "
+                    f"{cp_detail.get('control_plane_wait_error')}"
+                )
+                if "control_plane_wait_timeout_s" in cp_detail
+                else f"control-plane Deployments: {cp_detail.get('control_plane_wait_error')}"
             ),
             **cp_detail,
         )
@@ -1339,6 +1376,7 @@ async def single_node_upgrade(
     lease_holder: str | None = None,
     mirror_deployment: str | None = None,
     control_plane_release: str | None = None,
+    control_plane_namespace: str | None = None,
 ) -> SingleNodeResult:
     """Drive one node through the 12-step rolling-upgrade primitive.
 
@@ -1369,6 +1407,8 @@ async def single_node_upgrade(
         control_plane_release: Helm release whose Deployments must be
             available before the node is reported done (#1544); defaults
             to the default release.
+        control_plane_namespace: namespace those Deployments live in;
+            defaults to the api's own namespace.
     """
     steps_in_order: list[StepName] = list(CHAIN)
     if start_step is not None:
@@ -1543,6 +1583,7 @@ async def single_node_upgrade(
             cnpg_cluster_name=cnpg_cluster_name,
             cnpg_namespace=cnpg_namespace,
             control_plane_release=control_plane_release or chart_bump.DEFAULT_CHART_NAME,
+            control_plane_namespace=control_plane_namespace,
         ),
     ):
         # The node is already uncordoned and its window cleared by the
