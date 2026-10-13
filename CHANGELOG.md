@@ -96,6 +96,23 @@ the formatter handles the rest.
   reads each side by its own driver: the managed rows the way the managed
   zone's group serves them, the Windows pull the way Windows reports it.
 
+- **An appliance with an uppercase hostname was invisible to the demote quorum gate, the cordon and the eviction (#1757).** The installer accepts `Ddi-Member-1`; k3s lowercases the host's name for its k8s Node (RFC 1123, `GetHostnameAndIPs`) and names its etcd member `<lowercase name>-<8 hex>`; `Appliance.hostname` keeps what was typed. Every Node lookup by hostname therefore missed: the quorum gate read the member as having "no k8s Node" and refused the demote, the demote cordon found nothing, and the eviction told the seed a name its Node delete could not find (a 404, which counts as success), so a stale Node stayed. Lookups now go through one `k8s_node_name()` (lowercase, trailing dot dropped) in `services/appliance/ownership.py`: the quorum gate, the cordon and uncordon, the names and addresses the heartbeat hands the seed to evict (and the names it reports back), the rolling upgrade's Node-to-appliance match (now approved rows only, and none rather than a guess when two match, so a revoked duplicate left by a re-pair no longer crashes the step), and the Cluster tab's per-node host state. Deleting an appliance now finds its DNS and DHCP servers by the shared ownership rule (#1715 / #1749) instead of a bare hostname match: the FK, or an agent-registered row with no FK whose host matches case-blind (a DNS agent on k3s registers the lowercase Node name), and only while no other approved appliance shares the hostname. So two appliances whose hostnames differ only in case, or a re-paired duplicate, never delete each other's servers. On the host, `spatium-etcd-evict` matches members by the lowercase name and also treats the lowercase spelling of its own hostname as its own, and the supervisor's Node delete lowercases the name it is given. Stored hostnames are unchanged.
+
+- **A rolling upgrade waits for the control-plane Deployments before it
+  moves to the next node (#1544).** The other half of the gate that
+  already waits for CNPG: after each node's uncordon, the per-node
+  step waits (up to 10 minutes) until every Deployment of the release
+  (found by the chart's `app.kubernetes.io/name` and `/instance`
+  labels, so a Deployment the chart adds later is covered) has
+  available replicas equal to desired and no old pod still draining.
+  A single-replica Deployment passing through its retire-first
+  rollout is waited through, not failed. If it never settles the node
+  step fails and the run stops before the next node's drain; the node
+  is already uncordoned by then, so there is nothing to release. A
+  label selector that matches no Deployment, or a list call refused
+  for missing RBAC, fails the step at once instead of turning the
+  gate off.
+
 - **DNSSEC is refused on a multi-server group, and the DS report is group-scoped (#1762).** Each agent server (BIND9, PowerDNS, Technitium) signs with keys it generated, so a signed zone on a group with two servers was served with two DNSKEY sets against one published DS, and validating resolvers got SERVFAIL from whichever server it did not match. Signing (the sign endpoint, `dnssec_enabled` on zone create and update, and both Copilot paths) now returns 422 when the group has more than one agent server. Adding or moving a server into a group that holds signed zones is refused too: server create, server move, a Fleet group change, and the Copilot `assign_appliance_role`. So is moving a signed zone into a multi-server group. **Disabled servers count**: a disabled agent still receives the bundle, so a disabled BIND9 server still signs with its own keys, and a disabled PowerDNS or Technitium server serves the zone unsigned under the DS. These checks lock the group row, so two concurrent requests cannot both pass. An agent that auto-registers into a signed group is not refused, because refusing would break its bootstrap. Instead it is logged and audited, and it trips the same flag as zones signed before this fix: `dnssec_multi_signer` on the zone and on `…/dnssec/info`, a red **DNSSEC: multiple signers** badge and a warning on the DNSSEC card, and a new default-on, critical `dnssec_multi_signer` alert. Those zones are not unsigned automatically. `/dns/agents/dnssec-state` now matches zones only within the reporting server's group, so same-named zones in different groups no longer collide. On a multi-server group it keeps one server's report (the primary's, or the oldest signer's when the group has no primary), which ends the last-writer-wins DS flapping.
 
 - **DNSSEC signing is no longer offered on Technitium (#1783).** The sign
@@ -490,6 +507,39 @@ the formatter handles the rest.
   the count cannot recover while the node is cordoned. An earlier
   version of this fix waited before the uncordon and timed out on the
   first node holding an instance, which ended the run.
+
+- **The Technitium agent's structural reconcile no longer rewrites
+  records on every pass or silently deletes PTRs (#1768).** It
+  fingerprinted the daemon's raw record data and fixed any difference by
+  deleting and re-adding, so records Technitium stores differently from
+  how they are sent were rewritten each time: a set with mixed TTLs
+  (Technitium keeps one per set), IDN targets (the derived `*Idn` keys),
+  CAA tags with capitals, and URIs it normalises. Each A/AAAA delete also
+  made Technitium delete the matching PTR in a reverse zone SpatiumDDI
+  manages on the same server. Now both sides are normalised to what the
+  daemon reads back, the set's minimum TTL is stamped (Technitium only),
+  a TTL-only change or a record disabled in the console is fixed with
+  `zones/records/update` in place, reverse zones are reconciled after
+  forward zones so a deleted PTR is re-added, and an apex NS TTL change
+  reaches the daemon. A second pass over an unchanged bundle sends no
+  writes. BIND9 and PowerDNS are untouched.
+- **Technitium's "CNAME record already exists" refusal is no longer
+  counted as success (#1770).** Both Technitium drivers treated any
+  error containing "already exists" as an idempotent no-op, so adding a
+  CNAME or DNAME beside other data at a name, which Technitium refuses
+  with `Cannot add record: CNAME record already exists for the same
+  name.`, was marked applied while the server kept serving the old data.
+  The drivers now match Technitium's exact no-op messages (record
+  already exists, no such record to delete, zone already exists), so
+  the conflict surfaces as a failed op with Technitium's message.
+  `Record already exists. Use overwrite option …` is a failure too: it
+  is raised when a CNAME or DNAME with any value holds the name, so it
+  does not mean ours is there. A Technitium release that rewords one of
+  these messages now fails the op rather than reading it as applied.
+  The forward-zone upstream reconciler (#1764) reads the same exact
+  messages: an identical upstream answering "record already exists" is
+  applied and no longer holds back removing a stale one, while the
+  overwrite-option refusal still keeps the old upstream.
 
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the

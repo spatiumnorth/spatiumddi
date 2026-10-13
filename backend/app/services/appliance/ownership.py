@@ -41,6 +41,22 @@ def norm_host(value: str) -> str:
     return value.strip().rstrip(".").lower()
 
 
+def k8s_node_name(hostname: str | None) -> str:
+    """The k8s Node name (and etcd-member prefix) k3s gives a host called
+    ``hostname`` (#1757). k3s lowercases the hostname to satisfy RFC 1123
+    (``pkg/util/net.go`` ``GetHostnameAndIPs``) and names the etcd member
+    ``<node name>-<8 hex>``, but the installer accepts an uppercase hostname and
+    ``Appliance.hostname`` stores it as typed. Every lookup of a Node, or of
+    an appliance by Node name, goes through this so the two spellings meet."""
+    return norm_host(hostname or "")
+
+
+def hostname_sql(column: Any) -> Any:
+    """SQL form of :func:`norm_host` for ``column`` (trim, drop the trailing
+    dot, lowercase) — compare it with a :func:`norm_host`-ed value."""
+    return sa_func.lower(sa_func.rtrim(sa_func.trim(column), "."))
+
+
 async def hostname_is_unambiguous(db: AsyncSession, appliance: Appliance) -> bool:
     """True when no OTHER approved appliance shares this one's hostname
     (case-insensitively)."""
