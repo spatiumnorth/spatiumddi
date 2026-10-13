@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The app shell stops asking routes its user cannot read (#1864).**
+  The maintenance banner (every 15 s), the first-boot setup banner and
+  the sidebar approvals badge (every 30 s) polled
+  `/appliance/system/info`, `/appliance/system/setup` and
+  `/change-requests?state=pending` for whoever was signed in. A user
+  without `read` on `appliance` or `approve` on `change_request` was
+  refused all three, each console 403 was an error, and each refused
+  appliance read wrote a `denied` row to the audit log: about four a
+  minute per open tab, none of them an access attempt the user made.
+  Each query is now enabled only for a user who holds the grant its
+  route needs, and stops polling once a read is refused.
+
 - **An editor whose write an approval policy queued can see, and
   cancel, its own change request (#1863).** The list, `?mine=true` and
   `GET /change-requests/{id}` all demanded `read` on `change_request`
