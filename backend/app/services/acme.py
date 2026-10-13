@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 
 import structlog
 from sqlalchemy import and_, delete, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.db import AsyncSessionLocal
@@ -383,6 +383,7 @@ async def wait_for_op_applied(
     *,
     timeout: float = DEFAULT_APPLY_TIMEOUT_SECONDS,
     poll_interval: float = APPLY_POLL_INTERVAL_SECONDS,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> str:
     """Block until the op's state transitions to ``applied`` / ``failed``.
 
@@ -394,10 +395,16 @@ async def wait_for_op_applied(
     after it applies the op it posts an ACK in its next heartbeat,
     which writes ``state=applied`` on the row. Polling is simple,
     correct, and usually converges in <5 seconds on a healthy pair.
+
+    ``session_factory`` defaults to the shared ``AsyncSessionLocal``, which
+    is right in a request handler. A Celery task must pass one from
+    ``app.db.task_sessionmaker()``: the shared engine's pooled connections
+    are bound to an earlier task's closed event loop (#1687).
     """
+    open_session = session_factory or AsyncSessionLocal
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        async with AsyncSessionLocal() as fresh_db:
+        async with open_session() as fresh_db:
             row = await fresh_db.get(DNSRecordOp, op_id)
             if row is None:
                 # Op row vanished — treat as applied so the client
@@ -414,20 +421,24 @@ async def wait_for_ops_applied(
     op_ids: list[uuid.UUID],
     *,
     timeout: float = DEFAULT_APPLY_TIMEOUT_SECONDS,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> dict[uuid.UUID, str]:
     """Fan-out wait helper for the delete path (one op per evicted record).
 
     Uses a shared deadline — all ops are waited on concurrently rather
     than sequentially, so a 2-record delete doesn't double the
-    perceived latency.
+    perceived latency. ``session_factory`` as for
+    :func:`wait_for_op_applied`: a Celery task (the embedded client's
+    ``dns01.solve``) must pass a per-task one (#1687).
     """
     if not op_ids:
         return {}
+    open_session = session_factory or AsyncSessionLocal
     deadline = asyncio.get_running_loop().time() + timeout
     remaining = set(op_ids)
     result: dict[uuid.UUID, str] = {}
     while remaining and asyncio.get_running_loop().time() < deadline:
-        async with AsyncSessionLocal() as fresh_db:
+        async with open_session() as fresh_db:
             rows = (
                 (
                     await fresh_db.execute(
