@@ -91,8 +91,12 @@ the formatter handles the rest.
   on commit, wrote 3600 onto it so it stopped following the zone. The
   import diff now compares effective TTLs: a row inheriting the zone
   default is unchanged when the file carries that same value, and stays
-  inherited even when only its priority or weight changes. An explicit TTL
-  in a foreign file that differs from the zone default still updates.
+  inherited even when only its priority or weight changes. An RRset whose
+  members carry different TTLs no longer has its members rewritten to the
+  lowest of them either: the zone file reports one TTL per RRset, so a
+  member is unchanged when that TTL is the RRset's existing lowest one,
+  which is what it is served with. An explicit TTL in a foreign file that
+  differs still updates.
 
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single

@@ -1153,6 +1153,17 @@ element:
 - Export zone as standard zone file
 - Record diff view before pushing changes to server
 
+**TTLs on import are compared as effective TTLs (#1727).** A record with no
+TTL of its own inherits the zone default, and the export writes it without a
+TTL column, so the file hands back the zone's `$TTL`. A zone file cannot say
+whether a TTL was written out or inherited, so an import treats a file TTL
+equal to the zone default as no change for an inheriting record, and the
+record keeps inheriting. A file TTL that differs updates it, as before. The
+parser also reports one TTL per RRset (the lowest among its members, which is
+what the RRset is served with), so a member whose file TTL equals its RRset's
+existing lowest effective TTL is unchanged too. Re-importing a zone's own
+export changes nothing.
+
 ### Zone Health Indicators
 - Last successful sync timestamp
 - Serial number displayed

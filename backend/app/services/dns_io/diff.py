@@ -56,14 +56,43 @@ def diff_records(
     against NULL read every inherited record as changed, and committing it
     pinned the TTL. A foreign file's explicit TTL that differs from the zone
     default still differs and updates as before.
+
+    The parser also reports one TTL per RRset: dnspython collapses members
+    of one (name, type) to the lowest TTL among them, as RFC 2181 §5.2
+    requires of an RRset. So an RRset whose members carry different TTLs
+    (an inherited member beside an explicit ``300``, say) parses back with
+    every member at that minimum. The minimum is also what the RRset is
+    served with (``services.dns.rrset``), so a member whose parsed TTL
+    equals the RRset's existing effective minimum is unchanged too.
+    Otherwise the round trip would pin the inherited member, and lower an
+    explicit higher one, to a value the file never stated for it.
     """
+    existing_list = list(existing)
+    parsed_list = list(parsed)
     existing_by_key: dict[tuple[str, str, str], DNSRecord] = {
-        _record_key(r.name, r.record_type, r.value): r for r in existing
+        _record_key(r.name, r.record_type, r.value): r for r in existing_list
     }
+
+    def _effective(row: DNSRecord) -> int | None:
+        if row.ttl is None:
+            return zone_default_ttl
+        return row.ttl
+
+    # Lowest effective TTL among the existing rows the file names, per RRset:
+    # what the file's collapsed TTL reads back as when nothing changed.
+    rrset_min: dict[tuple[str, str], int] = {}
+    for p in parsed_list:
+        row = existing_by_key.get(_record_key(p.name, p.record_type, p.value))
+        eff = _effective(row) if row is not None else None
+        if eff is None:
+            continue
+        rk = (p.name.lower(), p.record_type.upper())
+        rrset_min[rk] = min(eff, rrset_min.get(rk, eff))
+
     diff = ZoneDiff()
     seen_keys: set[tuple[str, str, str]] = set()
 
-    for p in parsed:
+    for p in parsed_list:
         key = _record_key(p.name, p.record_type, p.value)
         seen_keys.add(key)
         existing_row = existing_by_key.get(key)
@@ -86,14 +115,16 @@ def diff_records(
             ttl_changed = p.ttl is not None and p.ttl != zone_default_ttl
         else:
             ttl_changed = (p.ttl or 0) != (existing_row.ttl or 0)
+        if ttl_changed and p.ttl == rrset_min.get((p.name.lower(), p.record_type.upper())):
+            ttl_changed = False
         meta_changed = (
             p.priority != existing_row.priority
             or p.weight != existing_row.weight
             or p.port != existing_row.port
         )
-        # An update that is only about priority/weight/port must not pin a
-        # TTL the row inherits (the commit writes ``change.ttl`` verbatim).
-        keep_inherited = existing_row.ttl is None and zone_default_ttl is not None
+        # An update that is only about priority/weight/port must not touch the
+        # TTL: the commit writes ``change.ttl`` verbatim, so it would pin a TTL
+        # the row inherits, or collapse an explicit one to the RRset minimum.
         if ttl_changed or meta_changed:
             diff.to_update.append(
                 RecordChange(
@@ -101,7 +132,7 @@ def diff_records(
                     name=p.name,
                     record_type=p.record_type,
                     value=p.value,
-                    ttl=None if keep_inherited and not ttl_changed else p.ttl,
+                    ttl=p.ttl if ttl_changed else existing_row.ttl,
                     priority=p.priority,
                     weight=p.weight,
                     port=p.port,
