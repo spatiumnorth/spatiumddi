@@ -240,7 +240,8 @@ async def test_vrf_write_only_cannot_bulk_delete_but_delete_can(
 
     denied = await client.post("/api/v1/vrfs/bulk-delete", json={"ids": [vid]}, headers=writer)
     assert denied.status_code == 403
-    assert (await client.delete(f"/api/v1/vrfs/{vid}", headers=writer)).status_code == 403
+    single = await client.delete(f"/api/v1/vrfs/{vid}", headers=writer)
+    assert single.status_code == 403
 
     ok = await client.post("/api/v1/vrfs/bulk-delete", json={"ids": [vid]}, headers=deleter)
     assert ok.status_code == 200, ok.text
