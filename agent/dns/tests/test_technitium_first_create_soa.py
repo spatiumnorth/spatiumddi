@@ -23,6 +23,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from spatium_dns_agent.drivers.technitium import _HELD_ZONES_FILE, TechnitiumDriver
 
 from .test_technitium_reconcile_churn import FORWARD, REVERSE, _ZoneTypedFake
@@ -273,10 +275,9 @@ def test_killed_pass_is_released_by_the_next_pass(tmp_path: Path) -> None:
 
     d._reconcile_zone_apex = kill  # type: ignore[method-assign]
     d._release_zone = kill  # type: ignore[method-assign]
-    try:
+    # The agent dies mid-pass, after the hold and before the release.
+    with pytest.raises(Killed):
         d._reconcile_zones("tok-1", payload)
-    except Killed:
-        pass
     assert fake.access["example.com"] == "Deny"
     assert d._load_held_zones() == {"example.com"}
 
