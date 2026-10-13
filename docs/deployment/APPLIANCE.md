@@ -3047,6 +3047,18 @@ so a first-time operator never gets stuck looking for the upload.
    `aborted`). Lease is released. The OS Versions tab shows the new
    default slot on every node.
 
+**When a node's upgrade fails.** If a step fails after the run has
+cordoned the node or set the CNPG maintenance window, the orchestrator
+releases the node before it stops: it uncordons it (unless the node was
+already cordoned before the upgrade, which is left as the operator set
+it) and clears the window. If that release fails too, the node is left
+held and needs a manual release. The run's `cluster-upgrade-failed`
+alert then carries category `release_failed` instead of the step's own
+category, its message says "Still held after the failed release:"
+followed by `cordon` and/or `maintenance_window`, and the node's progress records
+`release_failed` with the error, what is still held, and the category
+the step failure itself had (#1542).
+
 **Rolling back, and why a Kubernetes minor is different (#974).**
 
 For a same-minor release an **A/B slot revert is a rollback**: boot the

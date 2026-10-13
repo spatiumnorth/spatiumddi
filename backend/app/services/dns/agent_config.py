@@ -38,6 +38,7 @@ from app.core.crypto import decrypt_str
 from app.drivers.dns.base import TsigKey
 from app.models.appliance import ApplianceCertificate
 from app.models.dns import (
+    DEFAULT_ALLOW_RECURSION,
     DNSAcl,
     DNSRecord,
     DNSRecordOp,
@@ -915,6 +916,18 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             # emits a zone-level clause only for a non-None value, because in
             # BIND a zone-level allow-transfer shadows the options one.
             "allow_transfer": getattr(z, "allow_transfer", None),
+            # #1523 — per-zone NOTIFY / query overrides. Same stored-but-
+            # never-shipped class as #734: accepted, validated (#1316) and
+            # persisted, but absent from the bundle, so neither agent could
+            # render them. None means "inherit the server options"; the
+            # BIND9 agent emits a zone clause only for a non-None value and
+            # the PowerDNS agent folds the effective values into the zone
+            # kind + ALSO-NOTIFY metadata. Shipping them here also puts
+            # them inside the structural fingerprint (zones_structural
+            # derives from zone_payload), so an edit re-renders.
+            "allow_query": getattr(z, "allow_query", None),
+            "also_notify": getattr(z, "also_notify", None),
+            "notify_enabled": getattr(z, "notify_enabled", None),
             # #1153 — the zone's SOA MNAME / RNAME, and its NS when it has no
             # NS records of its own. Settable and persisted, never shipped, so
             # the BIND9 agent served the placeholder ``ns1.<zone>`` (glued to
@@ -1033,6 +1046,16 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "dnssec_validation": (getattr(opts, "dnssec_validation", "auto") if opts else "auto"),
         "allow_query": getattr(opts, "allow_query", ["any"]) if opts else ["any"],
         "allow_transfer": (getattr(opts, "allow_transfer", ["none"]) if opts else ["none"]),
+        # NOTIFY behaviour (#1523). Settable in the UI / API, validated
+        # (#1316) and persisted, but never shipped, so `notify no` (a
+        # stealth primary) still sent NOTIFY from BIND9 (whose default is
+        # yes), also-notify targets were never notified, and PowerDNS
+        # zones stayed Native (which never notifies). The agents render
+        # these now; shipping them here puts them inside the structural
+        # fingerprint via options_block.
+        "notify_enabled": (getattr(opts, "notify_enabled", "yes") if opts else "yes"),
+        "also_notify": (list(getattr(opts, "also_notify", []) or []) if opts else []),
+        "allow_notify": (list(getattr(opts, "allow_notify", []) or []) if opts else []),
         # Query logging — surfaced to BIND9's named.conf via template
         # render and to PowerDNS's pdns.conf via the agent's
         # ``_render_conf``. Keep ``query_log_enabled`` in the
@@ -1089,11 +1112,14 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "forward_tls_hostname": (getattr(opts, "forward_tls_hostname", None) if opts else None),
         "forward_tls_verify": (bool(getattr(opts, "forward_tls_verify", True)) if opts else True),
     }
-    if server.driver == "technitium":
-        # #1761: only Technitium reads this (the BIND9 agent renders a bare
-        # ``recursion yes|no``), so no other driver's etag moves with it.
+    if server.driver in ("technitium", "bind9"):
+        # #1761 / #1786: Technitium and BIND9 read this (the BIND9 agent
+        # renders ``allow-recursion`` from it, literally, #1817), so
+        # PowerDNS's etag does not move with it.
         options_block["allow_recursion"] = (
-            list(getattr(opts, "allow_recursion", None) or []) if opts else []
+            list(opts.allow_recursion if opts.allow_recursion is not None else [])
+            if opts
+            else list(DEFAULT_ALLOW_RECURSION)
         )
     if server.driver == "powerdns":
         # PowerDNS ALIAS expansion (#1353): the group's own plain-DNS

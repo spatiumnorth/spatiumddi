@@ -57,19 +57,21 @@ _VALUES = [
 
 
 def test_bare_and_quoted_txt_key_the_same() -> None:
-    assert _normalize_value("TXT", "v=spf1 -all", _ZONE) == _normalize_value(
-        "TXT", '"v=spf1 -all"', _ZONE
+    assert _normalize_value("TXT", "v=spf1 -all", _ZONE, relative_targets=True) == _normalize_value(
+        "TXT", '"v=spf1 -all"', _ZONE, relative_targets=True
     )
 
 
 def test_txt_case_is_significant() -> None:
-    a = _key(RecordData(name="@", record_type="TXT", value='"AbC"'), _ZONE)
-    b = _key(RecordData(name="@", record_type="TXT", value='"abc"'), _ZONE)
+    a = _key(RecordData(name="@", record_type="TXT", value='"AbC"'), _ZONE, relative_targets=True)
+    b = _key(RecordData(name="@", record_type="TXT", value='"abc"'), _ZONE, relative_targets=True)
     assert a != b
 
 
 def test_split_strings_are_not_merged() -> None:
-    assert _normalize_value("TXT", '"a" "b"', _ZONE) != _normalize_value("TXT", '"ab"', _ZONE)
+    assert _normalize_value("TXT", '"a" "b"', _ZONE, relative_targets=True) != _normalize_value(
+        "TXT", '"ab"', _ZONE, relative_targets=True
+    )
 
 
 @pytest.mark.parametrize("value", _VALUES)
@@ -79,7 +81,9 @@ def test_dnspython_presentation_form_canonicalises_to_the_stored_value(value: st
     import dns.rdata
 
     rdata = dns.rdata.from_text("IN", "TXT", quote_txt(value))
-    assert _normalize_value("TXT", rdata.to_text(), _ZONE) == _normalize_value("TXT", value, _ZONE)
+    assert _normalize_value(
+        "TXT", rdata.to_text(), _ZONE, relative_targets=True
+    ) == _normalize_value("TXT", value, _ZONE, relative_targets=True)
 
 
 async def test_bind9_axfr_reads_back_the_key_the_db_row_has(
@@ -108,7 +112,9 @@ async def test_bind9_axfr_reads_back_the_key_the_db_row_has(
     by_name = {r.name: r for r in on_wire if r.record_type == "TXT"}
     for i, value in enumerate(_VALUES):
         db = RecordData(name=f"t{i}", record_type="TXT", value=value)
-        assert _key(by_name[f"t{i}"], _ZONE) == _key(db, _ZONE), value
+        assert _key(by_name[f"t{i}"], _ZONE, relative_targets=True) == _key(
+            db, _ZONE, relative_targets=True
+        ), value
     # A simple record still reads back as the plain text it is stored as.
     assert by_name["t0"].value == "v=spf1 -all"
     assert by_name["t2"].value == '"v=DKIM1; k=rsa; p=AAA" "BBB"'
@@ -137,7 +143,7 @@ def test_technitium_api_write_reads_back_in_sync(value: str) -> None:
     sent = record_params("TXT", value)["characterStringsBase64"].split(",")
     wire = _technitium_holds([base64.b64decode(s) for s in sent])
     db = RecordData(name="@", record_type="TXT", value=value)
-    assert _key(wire, _ZONE) == _key(db, _ZONE)
+    assert _key(wire, _ZONE, relative_targets=True) == _key(db, _ZONE, relative_targets=True)
 
 
 def _zone() -> DNSZone:
@@ -165,9 +171,9 @@ def test_sync_does_not_import_a_pre_1760_txt_as_a_new_row() -> None:
     zone = _zone()
     rows = [_row(zone, v) for v in [*_BROKEN, "google-site-verification=abc"]]
     on_wire = [_technitium_holds(_legacy_strings(r.value)) for r in rows]
-    db_keys = {_key(r, zone.name) for r in rows}
+    db_keys = {_key(r, zone.name, relative_targets=True) for r in rows}
     # Each broken record is served wrong: not in sync, so the push replaces it.
-    assert sum(_key(w, zone.name) in db_keys for w in on_wire) == 1
+    assert sum(_key(w, zone.name, relative_targets=True) in db_keys for w in on_wire) == 1
 
     primary = SimpleNamespace(id=uuid.uuid4(), driver="technitium_api")
     result = _additive_import(
@@ -176,6 +182,7 @@ def test_sync_does_not_import_a_pre_1760_txt_as_a_new_row() -> None:
         on_wire,
         db_keys,
         apply=False,
+        relative_targets=True,
         not_importable=_not_importable(primary, rows, zone.name),
     )
     assert result.imported == 0

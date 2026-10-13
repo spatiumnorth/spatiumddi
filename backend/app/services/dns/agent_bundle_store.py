@@ -76,7 +76,14 @@ _MAX_ERROR = 2000
 # 7 (#1759): a Technitium server's bundle also carries ``name_target_rule``, and
 #   its CNAME / DNAME / NS / PTR / MX / SRV / NAPTR targets the trailing dot
 #   migration d6b2f81a3c57 wrote.
-RENDERER_REVISION = 7
+# 8 (#1523): the bundle ships the NOTIFY fields (server options
+#   ``notify_enabled`` / ``also_notify`` / ``allow_notify`` and the zone
+#   ``allow_query`` / ``also_notify`` / ``notify_enabled`` overrides).
+# 9 (#1786): a BIND9 server's bundle carries ``allow_recursion`` (the agent now
+#   renders ``allow-recursion``).
+# 10 (#1817): the BIND9 agent renders ``allow_recursion`` literally and its
+#   stored default is local + private networks (migration b8e41c7a2d95).
+RENDERER_REVISION = 10
 
 
 def _serves(revision: int | None) -> bool:

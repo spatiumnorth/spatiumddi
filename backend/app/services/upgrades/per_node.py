@@ -39,6 +39,7 @@ Step shape (one row per step in the issue body; ``CHAIN`` is the order):
    12. convergence                    — node Ready + DaemonSet pod Ready
    13. uncordon + clear window        — uncordon_node + maintenance off
    14. cluster verify                 — wait for the CNPG instance count
+                                        and the control-plane Deployments
                                         (#1544), then re-run a small slice
                                         of preflight
 
@@ -86,9 +87,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent_wake import appliance_channel, publish_wake
-from app.models.appliance import Appliance
+from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
 from app.services.appliance import k8s
+from app.services.appliance.ownership import hostname_sql, k8s_node_name
 from app.services.appliance.reboot import request_reboot
 from app.services.appliance.slot_image_target import (
     SlotImageArchitectureMismatch,
@@ -156,6 +158,9 @@ DEFAULT_CNPG_READY_TIMEOUT_S = 900.0  # 15 min — an evicted instance reschedul
 # 10 min — the mirror's pod back on its node after that node's reboot: its
 # migrate-wait init container, then the api image cold-starting.
 DEFAULT_MIRROR_READY_TIMEOUT_S = 600.0
+# 10 min — the control-plane Deployments settled after a node rejoins (#1544):
+# a pod rescheduled onto it, or a single-replica rollout's retire-first gap.
+DEFAULT_CONTROL_PLANE_READY_TIMEOUT_S = 600.0
 
 # Poll cadence — gentle on kubeapi + the appliance row. Slow enough
 # that 30 min worth of polls is ~600 calls, fast enough that step
@@ -245,6 +250,115 @@ async def _wait_cnpg_instances_ready(
             }
         if time.monotonic() >= deadline:
             return False, {"cnpg_wait_error": check.message, "cnpg_wait_timeout_s": timeout_s}
+        await asyncio.sleep(_POLL_INTERVAL_S)
+
+
+# ── Control-plane Deployments wait (#1544) ───────────────────────────
+
+
+def control_plane_selector(release: str) -> str:
+    """Label selector for the release's own Deployments: the chart stamps
+    ``app.kubernetes.io/name`` (the chart name) and ``/instance`` (the
+    release) on every workload it renders, which leaves subchart workloads
+    (their ``name`` differs) out and picks up a Deployment the chart adds
+    later without a code change."""
+    return f"app.kubernetes.io/name=spatiumddi,app.kubernetes.io/instance={release}"
+
+
+def _deployment_settled(dep: dict[str, Any]) -> str | None:
+    """None when the Deployment is fully available with no rollout in
+    progress, else a short reason. Stricter than ``deployment_is_rolled_out``
+    (``kubectl rollout status``): ``status.replicas`` above the desired count
+    means an old ReplicaSet's pod is still draining."""
+    name = (dep.get("metadata") or {}).get("name", "?")
+    spec_replicas = int((dep.get("spec") or {}).get("replicas") or 0)
+    if spec_replicas == 0:
+        return None
+    status = dep.get("status") or {}
+    if not k8s.deployment_is_rolled_out(dep):
+        return (
+            f"{name}: available={int(status.get('availableReplicas') or 0)}"
+            f"/{spec_replicas}, updated={int(status.get('updatedReplicas') or 0)}"
+        )
+    if int(status.get("replicas") or 0) > spec_replicas:
+        return f"{name}: rollout in progress ({status.get('replicas')} pods for {spec_replicas})"
+    return None
+
+
+async def _wait_control_plane_ready(
+    release: str,
+    namespace: str | None,
+    *,
+    timeout_s: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Poll until every control-plane Deployment of ``release`` reads
+    available == desired with no rollout in progress.
+
+    A single-replica Deployment is briefly at zero available while a
+    retire-first rollout (#1659) replaces its pod: that is not-ready, so the
+    wait continues through it until ``timeout_s``. ``ok`` (skipped) with no
+    release name or no kubeapi (a shape without the chart).
+
+    Fails at once, without polling, on two answers that waiting cannot
+    change: 401 / 403 / 404 from the list call (missing RBAC or a wrong
+    namespace), and a successful list matching NO Deployment. The second
+    matters because the orchestrator itself runs inside the release, so
+    an empty result means the selector or namespace is wrong; reporting it
+    as "skipped" would turn the gate off without anyone noticing. Other
+    kubeapi errors (5xx, unreachable) keep polling until ``timeout_s``.
+    """
+    if not release:
+        return True, {"control_plane_wait": "skipped: no release"}
+    if k8s.get_config() is None:
+        return True, {"control_plane_wait": "skipped: kubeapi not reachable from here"}
+    selector = control_plane_selector(release)
+    deadline = time.monotonic() + timeout_s
+    last = "not read yet"
+    while True:
+        try:
+            status, items = k8s.list_deployments(selector, namespace=namespace)
+        except k8s.KubeapiUnavailableError as exc:
+            status, items, last = 0, [], f"kubeapi unavailable: {exc}"
+        if status == 200:
+            if not items:
+                where = namespace or "the api's namespace"
+                logger.error(
+                    "upgrade_control_plane_no_deployments",
+                    selector=selector,
+                    namespace=namespace,
+                )
+                return False, {
+                    "control_plane_wait_error": (
+                        f"no Deployments match {selector} in {where}; the selector "
+                        "or namespace does not fit this install, so the gate "
+                        "cannot verify the control plane"
+                    ),
+                }
+            pending = [r for r in (_deployment_settled(d) for d in items) if r]
+            if not pending:
+                return True, {"control_plane_deployments": len(items)}
+            last = "; ".join(pending)
+        elif status in (401, 403, 404):
+            logger.error(
+                "upgrade_control_plane_list_refused",
+                status=status,
+                selector=selector,
+                namespace=namespace,
+            )
+            return False, {
+                "control_plane_wait_error": (
+                    f"kubeapi answered {status} listing Deployments ({selector}); "
+                    "check the api ServiceAccount's RBAC (deployments: list) "
+                    "and the release namespace"
+                ),
+            }
+        elif status:
+            last = f"kubeapi status {status}"
+        if time.monotonic() >= deadline:
+            return False, {
+                "control_plane_wait_error": last,
+                "control_plane_wait_timeout_s": timeout_s,
+            }
         await asyncio.sleep(_POLL_INTERVAL_S)
 
 
@@ -619,7 +733,9 @@ async def _step_mirror_ready(
     await db.commit()
     appliance = await _resolve_appliance(db, node_name)
     if appliance is None:
-        return step.finish(False, error=f"no Appliance row with hostname={node_name!r}")
+        return step.finish(
+            False, error=f"no single approved Appliance row with hostname={node_name!r}"
+        )
     await db.refresh(appliance)
     if appliance.installed_appliance_version == target_version:
         return step.finish(True, skipped=True, reason="already running the target")
@@ -673,8 +789,21 @@ async def _resolve_appliance(db: AsyncSession, node_name: str) -> Appliance | No
     name by default). A future polish can grow an explicit
     ``Appliance.k8s_node_name`` column if operators rename either.
     """
-    stmt = select(Appliance).where(Appliance.hostname == node_name)
-    return (await db.execute(stmt)).scalar_one_or_none()
+    # Case-blind: k3s lowercases the host's name for the Node (#1757). Only an
+    # APPROVED row, and only when exactly one matches: a revoked row keeps its
+    # hostname (a re-paired box leaves one behind), and the case-blind match
+    # also meets ``Ddi-1`` and ``ddi-1``. ``scalar_one_or_none`` raised on
+    # either; picking one would stamp the upgrade onto the wrong appliance.
+    stmt = (
+        select(Appliance)
+        .where(
+            hostname_sql(Appliance.hostname) == k8s_node_name(node_name),
+            Appliance.state == APPLIANCE_STATE_APPROVED,
+        )
+        .limit(2)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return rows[0] if len(rows) == 1 else None
 
 
 async def _step_trigger_slot_apply(
@@ -690,7 +819,9 @@ async def _step_trigger_slot_apply(
     )
     appliance = await _resolve_appliance(db, node_name)
     if appliance is None:
-        return step.finish(False, error=f"no Appliance row with hostname={node_name!r}")
+        return step.finish(
+            False, error=f"no single approved Appliance row with hostname={node_name!r}"
+        )
     # Stamps all four desired_* columns, not just version + URL. Setting
     # only those two is what made every per-node apply of an uploaded
     # image fetch our own self-signed cert with verification on, and left
@@ -1154,8 +1285,14 @@ async def _step_release_node(
     else:
         ok, err = k8s.uncordon_node(node_name)
         if not ok:
+            # The window clear is not attempted after a failed uncordon, so
+            # a window this run set is still on as well (#1542).
+            stuck = ["cordon"] + (["maintenance_window"] if clear_window and cluster_name else [])
             return step.finish(
-                False, error=f"compensating uncordon failed: {err}", uncordon_ok=False
+                False,
+                error=f"compensating uncordon failed: {err}",
+                uncordon_ok=False,
+                stuck=stuck,
             )
         done["uncordon_ok"] = True
     if not (clear_window and cluster_name):
@@ -1171,6 +1308,7 @@ async def _step_release_node(
         return step.finish(
             False,
             error=f"{prefix}compensating maintenance-window clear failed: {err}",
+            stuck=["maintenance_window"],
             **done,
         )
     return step.finish(True, maintenance_window_cleared=True, **done)
@@ -1185,8 +1323,12 @@ async def _step_cluster_verify(
     cnpg_cluster_name: str = "",
     cnpg_namespace: str | None = None,
     cnpg_timeout_s: float = DEFAULT_CNPG_READY_TIMEOUT_S,
+    control_plane_release: str = "",
+    control_plane_namespace: str | None = None,
+    control_plane_timeout_s: float = DEFAULT_CONTROL_PLANE_READY_TIMEOUT_S,
 ) -> StepResult:
-    """Wait for the node's Postgres instance, then re-run the cheap subset
+    """Wait for the node's Postgres instance and the control-plane
+    Deployments (#1544), then re-run the cheap subset
     of preflight: replication lag + quorum.
 
     #1544 — runs after the uncordon, so the instance this node's drain
@@ -1214,6 +1356,24 @@ async def _step_cluster_verify(
             **cnpg_detail,
         )
     step.detail.update(cnpg_detail)
+    ok, cp_detail = await _wait_control_plane_ready(
+        control_plane_release, control_plane_namespace, timeout_s=control_plane_timeout_s
+    )
+    if not ok:
+        return step.finish(
+            False,
+            error=(
+                (
+                    f"control-plane Deployments not all available within "
+                    f"{control_plane_timeout_s:.0f}s after uncordon: "
+                    f"{cp_detail.get('control_plane_wait_error')}"
+                )
+                if "control_plane_wait_timeout_s" in cp_detail
+                else f"control-plane Deployments: {cp_detail.get('control_plane_wait_error')}"
+            ),
+            **cp_detail,
+        )
+    step.detail.update(cp_detail)
     repl = await preflight.check_replication_lag()
     quorum = preflight.check_quorum()
     results = {"replication_lag": repl.level, "quorum": quorum.level}
@@ -1240,6 +1400,8 @@ async def single_node_upgrade(
     start_step: StepName | None = None,
     lease_holder: str | None = None,
     mirror_deployment: str | None = None,
+    control_plane_release: str | None = None,
+    control_plane_namespace: str | None = None,
 ) -> SingleNodeResult:
     """Drive one node through the 12-step rolling-upgrade primitive.
 
@@ -1267,6 +1429,11 @@ async def single_node_upgrade(
         mirror_deployment: the slot-image mirror Deployment that serves an
             uploaded image; defaults to the default release's
             (``slot_image_mirror_deployment``).
+        control_plane_release: Helm release whose Deployments must be
+            available before the node is reported done (#1544); defaults
+            to the default release.
+        control_plane_namespace: namespace those Deployments live in;
+            defaults to the api's own namespace.
     """
     steps_in_order: list[StepName] = list(CHAIN)
     if start_step is not None:
@@ -1326,8 +1493,15 @@ async def single_node_upgrade(
             except Exception as exc:  # noqa: BLE001 — never mask the real failure
                 # The compensation is best-effort: an exception here must
                 # not escape and replace the step failure being reported.
+                # What the crash left held is unknown, so name everything
+                # this run took (#1542).
+                crash_stuck = (["cordon"] if skip is None else []) + (
+                    ["maintenance_window"] if window_set else []
+                )
                 comp = StepResult(name="release_node", started_at=_now_iso()).finish(
-                    False, error=f"compensating release crashed: {exc}"
+                    False,
+                    error=f"compensating release crashed: {exc}",
+                    stuck=crash_stuck,
                 )
             results.append(comp)
             if not comp.ok:
@@ -1440,6 +1614,8 @@ async def single_node_upgrade(
             target_version,
             cnpg_cluster_name=cnpg_cluster_name,
             cnpg_namespace=cnpg_namespace,
+            control_plane_release=control_plane_release or chart_bump.DEFAULT_CHART_NAME,
+            control_plane_namespace=control_plane_namespace,
         ),
     ):
         # The node is already uncordoned and its window cleared by the
