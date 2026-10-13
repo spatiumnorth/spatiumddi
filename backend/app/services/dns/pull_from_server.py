@@ -92,7 +92,7 @@ _IMPORTABLE_TYPES = {
     "TXT",
     "SRV",
     "PTR",
-    "NS",  # non-apex NS only; the driver filters apex NS already
+    "NS",  # non-apex NS only; apex NS is dropped upstream of the importer
     "TLSA",
 }
 
@@ -351,6 +351,39 @@ def without_agent_ns_glue(
     return [r for r in on_wire if _key(r, zone_name, relative_targets=rel) != glue]
 
 
+def without_server_apex_ns(
+    on_wire: list[RecordData],
+    server: Any,
+    zone_name: str,
+    db_keys: set[RecordKey],
+) -> list[RecordData]:
+    """``on_wire`` minus the apex NS Technitium writes into every primary zone it creates.
+
+    The agentless ``technitium_api`` pull returns it as an ordinary record
+    (``@ NS <the server's own name>``, #1696 / #1809), though it is the same
+    class of apparatus as the apex SOA and NS the AXFR helper drops: nobody
+    created it. Left in, Sync with Servers imports it as an operator-owned row
+    and drift lists it as extra on the server forever, so the zone never reads
+    in sync. An apex NS the DB really holds is compared like any other record
+    (and so is the Technitium default if the DB holds that exact value); only
+    apex NS the DB does not hold is dropped. Every other driver is untouched:
+    the AXFR helper already drops the apex for BIND9 and the agent-managed
+    Technitium driver, and a delegation below the apex always passes through.
+    """
+    if getattr(server, "driver", None) != "technitium_api":
+        return on_wire
+    rel = targets_are_relative(server)
+    return [
+        r
+        for r in on_wire
+        if not (
+            r.record_type.upper() == "NS"
+            and (r.name or "").strip() in ("@", "")
+            and _key(r, zone_name, relative_targets=rel) not in db_keys
+        )
+    ]
+
+
 async def _resolve_primary_and_driver(
     db: AsyncSession, zone: DNSZone, server: Any | None = None
 ) -> tuple[Any, Any, list[TsigKey | None], str | None]:
@@ -543,6 +576,7 @@ async def pull_zone_from_server(
     rel = targets_are_relative(primary)
     db_keys = {_key(r, zone.name, relative_targets=rel) for r in db_rows}
     on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
+    on_wire = without_server_apex_ns(on_wire, primary, zone.name, db_keys)
 
     result = _additive_import(
         db,
@@ -819,6 +853,7 @@ async def sync_zone_with_server(
     rel = targets_are_relative(primary)
     db_keys = {_key(r, zone.name, relative_targets=rel) for r in db_rows}
     on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
+    on_wire = without_server_apex_ns(on_wire, primary, zone.name, db_keys)
 
     pull_result = _additive_import(
         db,

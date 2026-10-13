@@ -1214,6 +1214,7 @@ The UI surfaces per-server results with zones-imported / zones-pushed / errors, 
 
 **Each zone is synced with the server being walked (#1697).** The per-zone sync reads and writes the server named on that row, not the zone's primary, so a server whose API or transfer is unreachable shows its zones as failed instead of repeating the primary's result. (The per-zone *Sync with server* button on a zone still syncs with the zone's primary.)
 
+**Technitium's own apex NS is not imported (#1696, #1809).** The agentless `technitium_api` pull returns the NS Technitium writes at the apex of every primary zone it creates; Sync leaves it out and drift does not list it as extra. An apex NS the zone really holds in SpatiumDDI is still compared like any other record, and an NS below the apex (a delegation) is always handled normally.
 
 **Name targets are read the way the driver reads them (#1794).** A CNAME / DNAME / NS / PTR / MX / SRV / NAPTR / SVCB / HTTPS target with no trailing dot is relative to the zone on BIND9, Technitium (both drivers) and Windows without WinRM credentials, so `a.b` means `a.b.<zone>.`; on the cloud drivers and Windows over WinRM the name is taken as given, so `a.b` is already absolute. Drift and sync compare on that reading, so neither reports a false difference nor imports a duplicate.
 

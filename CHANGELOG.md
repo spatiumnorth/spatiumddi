@@ -90,6 +90,11 @@ the formatter handles the rest.
   unreachable server was listed as succeeded with the primary's counts
   and a secondary was never compared. The zone sync now takes the server
   being walked.
+- **Technitium's own apex NS is no longer imported by Sync or listed by
+  drift (#1696, #1809).** The `technitium_api` pull returned the NS
+  Technitium writes at every new primary zone's apex, so the first Sync
+  turned it into an operator-owned record and drift never read in sync.
+  It is dropped unless the zone's SpatiumDDI records hold that NS.
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and
