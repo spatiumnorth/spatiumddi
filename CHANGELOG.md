@@ -84,6 +84,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A rolling upgrade whose own cleanup fails now raises a distinct
+  alert (#1542).** When an upgrade fails after cordoning a node, the
+  orchestrator uncordons it and clears the CNPG maintenance window; if
+  that release itself fails the node stays held and an operator must
+  act, but the alert was the same as any other failed step. The
+  existing `cluster-upgrade-failed` event now carries category
+  `release_failed`, names what is still held (`cordon`,
+  `maintenance_window`) in its message and `stuck` detail, and the
+  per-node progress records `release_failed` with the error, what is
+  held and the step's own category. The Cluster upgrade tab labels the
+  node "Release failed — node held" and lists what is still held. The
+  run still stops. No new rule or migration: the rule is already
+  critical, the highest severity.
+
 - **A new Technitium zone is no longer served under the daemon's default SOA (#1758).** `zones/create` takes no SOA, so a Primary created by the agent answered with Technitium's default (`hostadmin@<zone>`, TTL and minimum 900 s, which is the negative-cache TTL) until its own SOA and records landed: 8-11 s after a group move or any fresh agent start. A resolver could cache an NXDOMAIN from that window for up to 15 minutes. The agent now holds a Primary straight after creating it, or converting a Forwarder into one, by setting its `queryAccess` to `Deny`, and applies the zone's real options, query access included, once its records and apex SOA/NS are reconciled. A held zone answers REFUSED, which no resolver caches. It is deliberately not disabled: a disabled zone is not authoritative, so on a group that allows recursion the query is resolved upstream instead, giving `corp.lan` the root's NXDOMAIN (negative TTL one day) and an internal copy of a public zone its public answers. A zone that already exists is never held, so a second pass still writes nothing. If the agent dies before the release, or the release is refused, the zone is remembered in `technitium-zones-held.json` in the agent state dir and released on the next pass.
 
 - **The PowerDNS agent stops serving zones wrong in three ways
