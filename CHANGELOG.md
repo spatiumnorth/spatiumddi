@@ -84,6 +84,12 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Sync with Servers on a group syncs each server, not the primary once
+  per server (#1697).** The per-server loop called the per-zone sync with
+  no server, which resolved the zone's primary every time, so an
+  unreachable server was listed as succeeded with the primary's counts
+  and a secondary was never compared. The zone sync now takes the server
+  being walked.
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and

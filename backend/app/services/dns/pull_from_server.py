@@ -352,7 +352,7 @@ def without_agent_ns_glue(
 
 
 async def _resolve_primary_and_driver(
-    db: AsyncSession, zone: DNSZone
+    db: AsyncSession, zone: DNSZone, server: Any | None = None
 ) -> tuple[Any, Any, list[TsigKey | None], str | None]:
     """Shared preamble for both pull and sync: find the zone's primary,
     sanity-check the driver supports pulling records, and resolve the TSIG
@@ -368,8 +368,12 @@ async def _resolve_primary_and_driver(
     copy goes first (#920) — without it the transfer matches no view, or the
     wrong one — and the group key follows for an agent that predates it. The
     fourth element is that view's name, or None.
+
+    ``server`` (#1697) names the one server to sync with when the caller is
+    walking a group's servers; it takes the primary's place for everything
+    below. Without it the zone's primary is used.
     """
-    primary = await resolve_primary_server(db, zone)
+    primary = server if server is not None else await resolve_primary_server(db, zone)
     if primary is None:
         raise ValueError(
             "No primary DNS server is configured in this zone's group. "
@@ -784,8 +788,13 @@ async def sync_zone_with_server(
     zone: DNSZone,
     *,
     apply: bool = True,
+    server: Any | None = None,
 ) -> SyncResult:
     """Bi-directional additive sync between DB and the zone's primary server.
+
+    ``server`` (#1697) syncs with that server instead of the primary, so a
+    group-level Sync walks each server's own copy rather than the primary's
+    once per server.
 
     1. AXFR the server once.
     2. Pull phase: import on-wire records missing from DB.
@@ -794,7 +803,7 @@ async def sync_zone_with_server(
     Never deletes. Returns counts for both phases so the UI can surface
     them in one pass.
     """
-    primary, driver, keys, view_name = await _resolve_primary_and_driver(db, zone)
+    primary, driver, keys, view_name = await _resolve_primary_and_driver(db, zone, server)
 
     on_wire, _key_used = await pull_zone_records_signed(
         driver, primary, zone.name, keys, view_name=view_name
