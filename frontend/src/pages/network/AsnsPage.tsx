@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Building2,
   Loader2,
@@ -348,7 +349,11 @@ export function AsnsPage() {
     return p;
   }, [kindFilter, registryFilter, whoisFilter, search, tagFilters]);
 
-  const { data, isFetching } = useQuery({
+  const {
+    data,
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["asns", queryParams],
     queryFn: () => asnsApi.list(queryParams),
     // #278 follow-up — a freshly-created ASN's RDAP/RPKI data lands a few
@@ -512,7 +517,9 @@ export function AsnsPage() {
             <div className="flex flex-col items-center gap-2 p-10 text-center">
               <Building2 className="h-8 w-8 text-muted-foreground" />
               <p className="text-sm text-muted-foreground">
-                No ASNs tracked yet — add one to start the registry.
+                <ListEmpty error={listError} what="ASNs">
+                  No ASNs tracked yet — add one to start the registry.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}

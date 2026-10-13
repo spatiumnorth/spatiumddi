@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   ClipboardList,
   ChevronLeft,
@@ -131,7 +132,7 @@ export function AuditPage() {
     source_ip: colFilters.ip || undefined,
   };
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ["audit", queryParams],
     queryFn: () => auditApi.list(queryParams),
   });
@@ -173,7 +174,9 @@ export function AuditPage() {
             {exportPdfMut.isPending ? "Exporting…" : "Export PDF"}
           </button>
           <span className="text-sm text-muted-foreground">
-            {total.toLocaleString()} {total === 1 ? "event" : "events"}
+            {error
+              ? "—"
+              : `${total.toLocaleString()} ${total === 1 ? "event" : "events"}`}
           </span>
         </div>
 
@@ -326,7 +329,9 @@ export function AuditPage() {
                     colSpan={8}
                     className="px-3 py-8 text-center text-muted-foreground"
                   >
-                    No audit events found
+                    <ListEmpty error={error} what="the audit log">
+                      No audit events found
+                    </ListEmpty>
                   </td>
                 </tr>
               ) : (

@@ -5,6 +5,7 @@ import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
 import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { ListReadError } from "@/components/ui/list-read-error";
 import {
   Globe,
   Plus,
@@ -9449,7 +9450,11 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   // effect that clears entries once the row's last_synced_at advances.
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set());
 
-  const { data: lists = [], isFetching } = useQuery({
+  const {
+    data: lists = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["dns-blocklists"],
     queryFn: () => dnsBlocklistApi.list(),
     // While any row is mid-refresh, poll every 3s so the entry_count
@@ -9777,13 +9782,26 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
         <p className="text-sm text-muted-foreground">Loading…</p>
       )}
 
+      {/* A refused or failed read is not "None." in both sections (#1865). */}
+      {listError && lists.length === 0 && (
+        <p className="text-sm">
+          <ListReadError error={listError} what="blocking lists" />
+        </p>
+      )}
+
       {/* No ``assigned`` flag on the section any more: since #876 a row can
           sit in the applied section purely because a VIEW of this group
           scopes it, so per-row controls key off ``groupAssigned(l)``. */}
-      {[
-        { label: "Applied to this group or one of its views", rows: applied },
-        { label: "Available (not applied)", rows: other },
-      ].map((section) => {
+      {(listError && lists.length === 0
+        ? []
+        : [
+            {
+              label: "Applied to this group or one of its views",
+              rows: applied,
+            },
+            { label: "Available (not applied)", rows: other },
+          ]
+      ).map((section) => {
         const sectionIds = section.rows.map((r) => r.id);
         const sectionAllSel =
           sectionIds.length > 0 &&

@@ -84,6 +84,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A list a scoped user may not read says so instead of showing as
+  empty (#1865).** Audit Log, Conformity, VRFs, Requests, the
+  integration pages (Kubernetes, Docker, Proxmox, Tailscale, UniFi,
+  Meraki, NetBird, OPNsense, PAN-OS, Fortinet, Cloud), Circuits, ASNs,
+  Overlays, Multicast groups, Network devices, TLS certificate targets,
+  Firewall feeds, Logs, Wake schedules, DNS blocking lists and Nmap
+  scans rendered a refused list read as their empty state ("No audit
+  events found", "No policies yet", "No VRFs yet.") over lists that hold
+  rows. They now share one `ListEmpty` wrapper around the empty copy
+  that shows "You don't have permission to see ..." for a refusal and
+  "Couldn't load ..." for any other failure. Requests also no longer
+  invites a user who cannot submit to ask for an IP, and its poll and
+  Nmap's stop once refused.
+
 - **The app shell stops asking routes its user cannot read (#1864).**
   The maintenance banner (every 15 s), the first-boot setup banner and
   the sidebar approvals badge (every 30 s) polled

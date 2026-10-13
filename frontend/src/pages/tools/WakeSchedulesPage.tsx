@@ -1,5 +1,6 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   ArrowDownCircle,
   ArrowUpCircle,
@@ -566,8 +567,10 @@ function SchedulesTab() {
                   colSpan={6}
                   className="px-3 py-8 text-center text-muted-foreground"
                 >
-                  No wake schedules yet. Create one to wake a tagged fleet on a
-                  recurring, holiday-aware schedule.
+                  <ListEmpty error={schedulesQ.error} what="wake schedules">
+                    No wake schedules yet. Create one to wake a tagged fleet on
+                    a recurring, holiday-aware schedule.
+                  </ListEmpty>
                 </td>
               </tr>
             )}

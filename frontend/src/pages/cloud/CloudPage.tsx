@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Check,
   Cloud,
@@ -107,7 +108,11 @@ export function CloudPage() {
     NEEDS_SUPERADMIN,
   );
   const qc = useQueryClient();
-  const { data: endpoints = [], isFetching } = useQuery({
+  const {
+    data: endpoints = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["cloud-endpoints"],
     queryFn: cloudApi.listEndpoints,
     refetchInterval: 30_000,
@@ -197,7 +202,9 @@ export function CloudPage() {
           {endpoints.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No cloud accounts configured yet.
+                <ListEmpty error={listError} what="cloud accounts">
+                  No cloud accounts configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
