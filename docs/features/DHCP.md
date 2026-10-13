@@ -968,15 +968,19 @@ only past a number of packets).
 
 ### What actually helps
 
-Two things do not, and it is worth knowing why before reaching for them:
+Two things do not help with *sustained* overload, and it is worth knowing why
+before reaching for them:
 
 * **A bigger socket receive buffer** removes the drops and replaces them with
   latency. Measured under #952: with 8 MiB of buffer the drops vanish and a
   DORA takes **34 s instead of 1.5 s**, because Kea then works through a
   backlog answering requests whole retransmit rounds late.
-* **A bigger `packet-queue-size`** does nothing at all. 64 → 2048 (32x)
-  changed neither throughput nor drops; that queue sits *behind* the receive
-  thread, and the bottleneck is the receive thread not being scheduled.
+* **A bigger `packet-queue-size`** does not raise throughput. At 12,000
+  relayed pkt/s offered, 64 → 2048 (32x) changed neither throughput nor
+  socket drops. That queue sits *behind* the receive thread, and no queue
+  holds a rate the workers cannot serve. A short burst is a different case,
+  and there the queue does matter: see
+  [the queue below](#keas-packet-queue).
 
 What helps is giving the receive thread the CPU. The chart already ships a
 500m CPU request on the Kea pod (#953 / #967 — see
@@ -1035,6 +1039,43 @@ you whether you are at the knee where it is worth it.
 > Kea logs at INFO — plus `DHCP4_CONFIG_COMPLETE`, `DHCP4_STARTED` and
 > `DHCP4_MULTI_THREADING_INFO`, the last being the line that reports whether
 > the pool size above took effect.
+
+#### Kea's packet queue
+
+**`packet-queue-size` is rendered as 1024, not left at Kea's 64 (#1283).**
+
+*What the queue does.* Under multi-threading, Kea's receive thread puts
+each packet on a queue that the workers take from. When a burst fills the
+queue, Kea evicts the oldest packet to make room. The only trace is a
+debug-level log line. `pkt4-received` is counted by the worker, so an
+evicted request appears in no statistic and no drop counter, and its client
+simply retransmits 4 s later.
+
+*What we measured.* A three-node cluster's relayed load ramp: kea-dhcp4
+3.0.3, a pool of 1, arrival bursts of 2-4 s. Only the queue size changed
+between runs:
+
+| `packet-queue-size` | requests evicted, counted nowhere | handshakes re-sent | answer latency p99 / max |
+|---|---|---|---|
+| 64 (Kea's default) | 2,286 | 35.1 % | 0.14 s / 0.33 s |
+| **1024** | **0** | 15.1 % | 1.17 s / 1.21 s |
+| 4096 | 0 | 7.8 % | 1.37 s / 1.39 s |
+
+*Why 1024.* The cost of a bigger queue is the wait in it: at most its size
+divided by the rate the workers serve at.
+- At 1024 the queue's deepest point was about 570, so those bursts fit with
+  room to spare.
+- At the roughly 470 packets/s one worker served there, a full queue drains
+  in about 2 s, inside the client's first retransmit.
+- At 4096 it would take over 8 s. Kea would then answer requests their
+  clients have already re-sent, the shape #952 measured as a 34 s DORA.
+
+The size is not scaled by `kea_thread_pool_size`, because more workers only
+drain the queue faster.
+
+*What is left.* The re-sends at 1024 and 4096 match the kernel's drops on
+Kea's raw socket in those runs: 1,042 and 505. Those drops are counted:
+they are `socket_drop` (above).
 
 ---
 

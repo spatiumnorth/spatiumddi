@@ -84,6 +84,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A burst of DHCP requests is queued, not silently evicted
+  (#1283).**
+  - Left unset, Kea 3.0's multi-threading `packet-queue-size` is 64.
+    When a burst of relayed requests outran the worker, Kea evicted
+    the oldest queued packets and counted them nowhere. Clients
+    retransmitted, and every product surface stayed green.
+  - On a three-node cluster's load ramp, 2,286 requests were lost this
+    way and 35.1 % of handshakes needed a retransmit.
+  - The agent, and the backend's config preview, now render
+    `packet-queue-size: 1024`, for kea-dhcp4 and kea-dhcp6. On the same
+    ramp none was evicted, with an answer latency p99 of 1.17 s,
+    against the client's 4 s retransmit.
+  - The re-sends left over follow the kernel's drops on Kea's raw
+    socket, which `socket_drop` now counts (below).
 - **`socket_drop` counts the socket Kea serves from in raw mode
   (#1283).**
   - With `dhcp-socket-type: raw` (`dhcp_socket_mode: direct`, the
