@@ -9,11 +9,12 @@ at 4.37 and 4.63 GiB free; member-3, the node left to upgrade, at 8.22 GiB.
 The chain's preflight for member-3 failed on ``disk_headroom`` and the run
 ended with member-3 stranded on the old version.
 
-The contract: Plan still judges every approved appliance; a node's preflight
-in the chain judges only the run's nodes still to upgrade (this one and those
-after it), so an upgraded node, or an approved row that is not part of the run
-(a replaced member's leftover row), is not asked for room the run will never
-use there.
+The contract: Plan still judges every approved appliance (except a node
+already on the target, test_plan_disk_headroom_on_target_1709); a node's
+preflight in the chain judges only the run's nodes still to upgrade (this one
+and those after it), so an upgraded node, or an approved row that is not part
+of the run (a replaced member's leftover row), is not asked for room the run
+will never use there.
 """
 
 from __future__ import annotations
@@ -67,7 +68,7 @@ async def _the_walks_fleet(db: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
-async def test_plan_still_judges_every_approved_appliance(db_session: AsyncSession) -> None:
+async def test_with_no_node_list_every_approved_row_is_judged(db_session: AsyncSession) -> None:
     await _the_walks_fleet(db_session)
 
     result = await preflight.check_node_disk_headroom()
