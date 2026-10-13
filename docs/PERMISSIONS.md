@@ -141,12 +141,17 @@ on inactive.
 ### Bulk deletes need `delete`
 
 Router-level gates derive the action from the HTTP method (GET `read`,
-POST/PUT/PATCH `write`, DELETE `delete`). A `POST .../bulk-delete` removes
-rows exactly as `DELETE` does, so it requires `delete` on the same resource
-type as the single-row route, not `write`. A role holding `write` without
-`delete` is refused on both. Routes with their own gate (domains, nmap, pcap)
-require `delete` explicitly. `tests/test_bulk_delete_requires_delete_action.py`
-walks the route table to keep this true for new routes.
+POST/PUT/PATCH `write`, DELETE `delete`). A POST that removes many rows at
+once — every `POST .../bulk-delete`, and `POST /ipam/subnets/{id}/orphans/purge`
+— removes them exactly as `DELETE` does, so it requires `delete` on the same
+resource type as the single-row route, not `write`. A role holding `write`
+without `delete` is refused on both. The list lives in
+`MULTI_ROW_DELETE_SUFFIXES` in `app/core/permissions.py`. Routes with their own
+gate (domains, nmap, pcap) require `delete` explicitly.
+`tests/test_bulk_delete_requires_delete_action.py` walks the route table: it
+checks every listed route against a write-only role, and fails on a POST route
+named like a multi-row delete (`purge`, `prune`, `clear`, `remove`, …) that is
+neither on the list nor reviewed as something else.
 
 ## Built-in roles (seeded on first start)
 

@@ -90,11 +90,15 @@ the formatter handles the rest.
   `DELETE /x/{id}` yet could remove up to 500 rows through
   `POST /x/bulk-delete` (ASNs, VRFs, overlays, multicast groups,
   circuits, services, customers, sites, providers, DNS records and IPAM
-  addresses). The gates now treat a `POST` ending in `/bulk-delete` as
-  `delete`. IPAM's per-subnet and address-set write checks on each row
-  are unchanged. A role that relied on `write` alone for bulk delete
-  needs `delete` added. A test walks the route table so a new
-  bulk-delete route without the check fails CI.
+  addresses). IPAM's Clean Orphans (`POST
+  /ipam/subnets/{id}/orphans/purge`) permanently deletes addresses the
+  same way and was gated the same. The gates now treat these POSTs as
+  `delete`, and IPAM's Bulk delete and Clean Orphans buttons ask for
+  `delete` before offering themselves. IPAM's per-subnet and
+  address-set write checks on each row are unchanged. A role that
+  relied on `write` alone for bulk delete needs `delete` added. A test
+  walks the route table so a new multi-row delete route without the
+  check fails CI.
 
 - **The DICOM AE, OT device and IPAM CSV imports read a file with classic
   Mac line endings (#1370, #1637, #1711).** Each importer read the

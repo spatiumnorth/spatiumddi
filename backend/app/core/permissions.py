@@ -618,19 +618,30 @@ _METHOD_TO_ACTION = {
     "DELETE": "delete",
 }
 
-# A ``POST .../bulk-delete`` removes rows exactly as ``DELETE`` does, so the
-# router-level gates require ``delete`` for it, not the ``write`` POST implies.
-_BULK_DELETE_SUFFIX = "/bulk-delete"
+# POST routes that remove many rows at once. Each removes rows exactly as the
+# single-row ``DELETE`` does, so the router-level gates require ``delete`` for
+# them, not the ``write`` a POST otherwise implies. Matched as a suffix of the
+# request path (the route's last segments are literals, so no path parameter
+# can make a request match one of these without being that route).
+# ``tests/test_bulk_delete_requires_delete_action.py`` fails on a POST route
+# named like a multi-row delete that this list does not cover.
+MULTI_ROW_DELETE_SUFFIXES: tuple[str, ...] = (
+    "/bulk-delete",
+    # ``POST /ipam/subnets/{id}/orphans/purge`` permanently deletes the given
+    # orphaned addresses, as ``DELETE /ipam/addresses/{id}?permanent=true``.
+    "/orphans/purge",
+)
 
 
 def action_for_request(request: Request) -> str:
     """Return the action a router-level gate requires for ``request``.
 
-    The HTTP method decides, except that a bulk delete (a POST whose path ends
-    in ``/bulk-delete``) needs the same ``delete`` action as deleting one row.
+    The HTTP method decides, except that a multi-row delete (a POST whose path
+    ends in one of :data:`MULTI_ROW_DELETE_SUFFIXES`) needs the same ``delete``
+    action as deleting one row.
     """
     method = request.method.upper()
-    if method == "POST" and request.url.path.rstrip("/").endswith(_BULK_DELETE_SUFFIX):
+    if method == "POST" and request.url.path.rstrip("/").endswith(MULTI_ROW_DELETE_SUFFIXES):
         return "delete"
     return _METHOD_TO_ACTION.get(method, "write")
 
@@ -639,7 +650,8 @@ def require_resource_permission(resource_type: str) -> Callable[..., Awaitable[U
     """Router-level dependency that enforces permissions by HTTP method.
 
     The mapping is: GET/HEAD/OPTIONS → ``read``, POST/PUT/PATCH → ``write``,
-    DELETE → ``delete``. Attach at the router scope::
+    DELETE → ``delete``, and a multi-row delete POST → ``delete`` (see
+    :func:`action_for_request`). Attach at the router scope::
 
         router = APIRouter(dependencies=[Depends(require_resource_permission("ip_space"))])
 
@@ -794,6 +806,7 @@ KNOWN_MANAGE_PERMISSIONS: frozenset[str] = frozenset(
 __all__ = [
     "action_for_request",
     "KNOWN_MANAGE_PERMISSIONS",
+    "MULTI_ROW_DELETE_SUFFIXES",
     "caller_can_grant",
     "effective_grants",
     "is_effective_superadmin",
