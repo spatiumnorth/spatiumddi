@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DICOM AE, OT device and IPAM CSV imports read a file with classic
+  Mac line endings (#1370, #1637, #1711).** Each importer read the
+  pasted or uploaded text without handing its line endings to the csv
+  reader, so a carriage return not followed by a line feed (a file
+  saved with CR-only line endings, or a paste that keeps them) reached
+  it inside a field. The reader refused it, and DICOM AE import, OT
+  device import and all four IPAM import routes (subnets and
+  addresses, preview and commit) answered 500 with nothing saying the
+  line endings were the problem. The three importers now open the
+  text through one shared reader that takes `\n`, `\r\n` and a bare
+  `\r` alike, and anything else the csv reader refuses (a cell over
+  its size limit, say) is a 422 that gives the reason.
+
 - **The Appliance tabs offer a read-only user none of the appliance's
   actions (#1342).** The built-in Viewer was offered Reboot host, every
   pod's Restart and Stop (Stop has no confirm), maintenance mode and

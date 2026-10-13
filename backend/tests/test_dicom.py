@@ -21,6 +21,7 @@ importer, and the ``network.dicom`` feature-module gate.
 
 from __future__ import annotations
 
+import csv
 import uuid
 
 import pytest
@@ -632,6 +633,54 @@ async def test_blank_tls_cell_does_not_clear_a_stored_true(
     assert resp.status_code == 201, resp.text
     row = (await client.get("/api/v1/dicom/aes", headers=headers)).json()["items"][0]
     assert row["tls_enabled"] is False
+
+
+@pytest.mark.parametrize("eol", ["\n", "\r\n", "\r"], ids=["LF", "CRLF", "CR"])
+async def test_import_reads_every_line_ending(
+    eol: str, client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A table saved with classic Mac line endings (a bare carriage return
+    between rows) imports like any other (#1370). The CR reached the csv
+    reader inside an unquoted field, and preview and commit answered 500."""
+    _, token = await _make_superadmin(db_session)
+    await db_session.commit()
+    headers = _auth(token)
+    body = {
+        "csv_text": eol.join(["AE Title,Vendor", "CT1,Siemens", "MR1,GE"]) + eol,
+        "column_map": {"ae_title": "AE Title", "vendor": "Vendor"},
+    }
+
+    preview = await client.post("/api/v1/dicom/aes/import/preview", headers=headers, json=body)
+    assert preview.status_code == 200, preview.text
+    assert [(r["ae_title"], r["action"]) for r in preview.json()["rows"]] == [
+        ("CT1", "create"),
+        ("MR1", "create"),
+    ]
+
+    commit = await client.post("/api/v1/dicom/aes/import/commit", headers=headers, json=body)
+    assert commit.status_code == 201, commit.text
+    rows = (await client.get("/api/v1/dicom/aes", headers=headers)).json()["items"]
+    assert {r["ae_title"]: r["vendor"] for r in rows} == {"CT1": "Siemens", "MR1": "GE"}
+
+
+async def test_import_answers_422_when_the_csv_reader_refuses_the_text(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Whatever else the csv reader refuses is a 422 that says why, not a
+    500 (#1370): here a cell over the reader's field size limit, well
+    inside the body cap."""
+    _, token = await _make_superadmin(db_session)
+    await db_session.commit()
+    resp = await client.post(
+        "/api/v1/dicom/aes/import/preview",
+        headers=_auth(token),
+        json={
+            "csv_text": "AE Title,Notes\nCT1," + "x" * (csv.field_size_limit() + 1) + "\n",
+            "column_map": {"ae_title": "AE Title"},
+        },
+    )
+    assert resp.status_code == 422, resp.text[:300]
+    assert resp.json()["detail"].startswith("CSV could not be read"), resp.json()["detail"]
 
 
 # ── Permissions + module gate ────────────────────────────────────────

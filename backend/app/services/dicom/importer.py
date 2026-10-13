@@ -37,8 +37,6 @@ No network I/O, and no PHI: the columns below are network identity only.
 
 from __future__ import annotations
 
-import csv
-import io
 import ipaddress
 import re
 import uuid
@@ -58,6 +56,7 @@ from app.models.dicom import (
     DICOMApplicationEntity,
 )
 from app.models.ipam import IPAddress, Subnet
+from app.services.csv_text import CSVReadError, read_csv_table
 from app.services.dicom.titles import AETitleError, validate_ae_title
 
 logger = structlog.get_logger(__name__)
@@ -431,8 +430,8 @@ def parse_rows(
     ``tls_enabled`` cell is left alone rather than read as ``false``.
 
     Raises :class:`DICOMImportError` for whole-request problems (empty
-    body, missing mapped column, over the row cap). Per-row problems are
-    reported on the row.
+    body, missing mapped column, over the row cap, text the CSV reader
+    cannot read). Per-row problems are reported on the row.
     """
     if len(csv_text) > MAX_CSV_CHARS:
         raise DICOMImportError(f"CSV body exceeds {MAX_CSV_CHARS} characters")
@@ -442,11 +441,18 @@ def parse_rows(
     if not body:
         raise DICOMImportError("CSV body is empty")
 
-    reader = csv.DictReader(io.StringIO(body), delimiter=delimiter)
-    headers = _resolve_headers(reader.fieldnames, column_map)
+    # The shared reader handles \n, \r\n and a bare \r alike, and raises
+    # anything else the csv module refuses (a cell over its field size
+    # limit, say) as CSVReadError: a property of the file, so a 422 that
+    # says why rather than a 500 (#1370).
+    try:
+        table = read_csv_table(body, delimiter=delimiter)
+    except CSVReadError as exc:
+        raise DICOMImportError(str(exc)) from exc
+    headers = _resolve_headers(table.fieldnames, column_map)
 
     rows: list[ParsedRow] = []
-    for line, raw_row in enumerate(reader, start=1):
+    for line, raw_row in enumerate(table.rows, start=1):
         if line > MAX_IMPORT_ROWS:
             raise DICOMImportError(
                 f"CSV has more than {MAX_IMPORT_ROWS} data rows; split the table by department"
