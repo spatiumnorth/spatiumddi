@@ -778,9 +778,9 @@ async def _drive_loop(
             # instance count, DS pods NotReady cluster-wide) doesn't
             # silently report success. The per-node chain already waited
             # for the CNPG count after each node's uncordon, the last
-            # node's included (#1544, ``cluster_verify``); this single
-            # read re-confirms it after the chart bump rolled the
-            # control-plane Deployments.
+            # node's included (#1544, ``cluster_verify``); this re-confirms
+            # it after the chart bump rolled the control-plane Deployments,
+            # waiting (bounded) for an instance still rejoining (#1829).
             verify_results = await safety.verify_post_upgrade(
                 cnpg_cluster_name=cnpg_name,
                 cnpg_namespace=cnpg_namespace,

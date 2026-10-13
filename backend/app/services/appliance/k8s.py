@@ -1435,6 +1435,32 @@ def get_job(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any
     return status, None
 
 
+def list_jobs(
+    label_selector: str, namespace: str | None = None
+) -> tuple[int, list[dict[str, Any]]]:
+    """List batch/v1 Jobs matching ``label_selector`` (#1829).
+
+    Returns ``(status, items)``; ``items`` is empty on any non-200. The chart
+    names its migrate Job ``<release>-migrate-r<revision>``, a new name on
+    every helm upgrade, so the chart bump finds it by its labels.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = (
+        f"/apis/batch/v1/namespaces/{quote(ns)}/jobs"
+        f"?labelSelector={quote(label_selector, safe='')}"
+    )
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, list(json.loads(body.decode("utf-8")).get("items") or [])
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            return status, []
+    return status, []
+
+
 def job_terminal_state(job: dict[str, Any]) -> str | None:
     """``'succeeded'`` / ``'failed'`` / ``None`` (still running).
 
@@ -1468,6 +1494,7 @@ __all__ = [
     "is_node_ready",
     "job_terminal_state",
     "list_daemonsets",
+    "list_jobs",
     "list_nodes",
     "list_pods",
     "list_pods_on_node",
