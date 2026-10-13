@@ -87,9 +87,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent_wake import appliance_channel, publish_wake
-from app.models.appliance import Appliance
+from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
 from app.services.appliance import k8s
+from app.services.appliance.ownership import hostname_sql, k8s_node_name
 from app.services.appliance.reboot import request_reboot
 from app.services.appliance.slot_image_target import (
     SlotImageArchitectureMismatch,
@@ -732,7 +733,9 @@ async def _step_mirror_ready(
     await db.commit()
     appliance = await _resolve_appliance(db, node_name)
     if appliance is None:
-        return step.finish(False, error=f"no Appliance row with hostname={node_name!r}")
+        return step.finish(
+            False, error=f"no single approved Appliance row with hostname={node_name!r}"
+        )
     await db.refresh(appliance)
     if appliance.installed_appliance_version == target_version:
         return step.finish(True, skipped=True, reason="already running the target")
@@ -786,8 +789,21 @@ async def _resolve_appliance(db: AsyncSession, node_name: str) -> Appliance | No
     name by default). A future polish can grow an explicit
     ``Appliance.k8s_node_name`` column if operators rename either.
     """
-    stmt = select(Appliance).where(Appliance.hostname == node_name)
-    return (await db.execute(stmt)).scalar_one_or_none()
+    # Case-blind: k3s lowercases the host's name for the Node (#1757). Only an
+    # APPROVED row, and only when exactly one matches: a revoked row keeps its
+    # hostname (a re-paired box leaves one behind), and the case-blind match
+    # also meets ``Ddi-1`` and ``ddi-1``. ``scalar_one_or_none`` raised on
+    # either; picking one would stamp the upgrade onto the wrong appliance.
+    stmt = (
+        select(Appliance)
+        .where(
+            hostname_sql(Appliance.hostname) == k8s_node_name(node_name),
+            Appliance.state == APPLIANCE_STATE_APPROVED,
+        )
+        .limit(2)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return rows[0] if len(rows) == 1 else None
 
 
 async def _step_trigger_slot_apply(
@@ -803,7 +819,9 @@ async def _step_trigger_slot_apply(
     )
     appliance = await _resolve_appliance(db, node_name)
     if appliance is None:
-        return step.finish(False, error=f"no Appliance row with hostname={node_name!r}")
+        return step.finish(
+            False, error=f"no single approved Appliance row with hostname={node_name!r}"
+        )
     # Stamps all four desired_* columns, not just version + URL. Setting
     # only those two is what made every per-node apply of an uploaded
     # image fetch our own self-signed cert with verification on, and left
