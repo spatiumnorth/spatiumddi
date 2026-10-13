@@ -84,6 +84,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Re-importing a zone's own export no longer pins every inherited TTL
+  (#1727).** A record with no TTL of its own inherits the zone default and
+  is exported without one, so the re-import read the file's `$TTL` back
+  as 3600 against a stored NULL, listed the record under `to_update` and,
+  on commit, wrote 3600 onto it so it stopped following the zone. The
+  import diff now compares effective TTLs: a row inheriting the zone
+  default is unchanged when the file carries that same value, and stays
+  inherited even when only its priority or weight changes. An RRset whose
+  members carry different TTLs no longer has its members rewritten to the
+  lowest of them either: the zone file reports one TTL per RRset, so a
+  member is unchanged when that TTL is the RRset's existing lowest one,
+  which is what it is served with. An explicit TTL in a foreign file that
+  differs still updates.
+
 - **Bulk delete requires the `delete` action, like deleting one row
   does.** The router-level permission gates mapped every `POST` to
   `write`, so a role holding `write` but not `delete` was refused
