@@ -119,6 +119,7 @@ def test_pull_imports_caa_when_the_driver_advertises_it() -> None:
         on_wire,
         set(),
         apply=False,
+        relative_targets=True,
         importable_types=_syncable_types(get_driver("route53"), _IMPORTABLE_TYPES),
     )
     assert result.imported == 1
@@ -135,6 +136,7 @@ def test_pull_still_skips_caa_for_a_driver_that_lacks_it() -> None:
         on_wire,
         set(),
         apply=False,
+        relative_targets=True,
         importable_types=_syncable_types(get_driver("windows_dns"), _IMPORTABLE_TYPES),
     )
     assert result.imported == 0
