@@ -1211,6 +1211,8 @@ Every DNS server group has a **Sync with Servers** button on its detail header. 
 
 The UI surfaces per-server results with zones-imported / zones-pushed / errors, plus a per-zone table.
 
+**Name targets are read the way the driver reads them (#1794).** A CNAME / DNAME / NS / PTR / MX / SRV / NAPTR / SVCB / HTTPS target with no trailing dot is relative to the zone on BIND9, Technitium (both drivers) and Windows without WinRM credentials, so `a.b` means `a.b.<zone>.`; on the cloud drivers and Windows over WinRM the name is taken as given, so `a.b` is already absolute. Drift and sync compare on that reading, so neither reports a false difference nor imports a duplicate.
+
 Manual drift checks from the subnet / block / space side use **Check DNS Sync** which only covers IPAM-managed records (A/AAAA/PTR). The group-level reconciliation covers everything in a zone.
 
 ---
@@ -1782,8 +1784,8 @@ operator key referenced in a clause is always defined.
 ### 19.5 Drift — ingest-back (Alt.1)
 
 A dynamic zone accepts records the control plane didn't create; those live
-only in the daemon journal and would be dropped on a full re-render (cold
-boot, from-scratch re-seed). The BIND9 agent closes the loop: it AXFRs
+only in the daemon and would be dropped on a full re-render (cold
+boot, from-scratch re-seed). The agent closes the loop: the BIND9 agent AXFRs
 each dynamic zone from loopback (signed with the group loopback key — the
 zone stanza grants `allow-transfer { key … }` for exactly this, nothing is
 opened to the network) and POSTs the live record set to
@@ -1791,6 +1793,13 @@ opened to the network) and POSTs the live record set to
 it doesn't already manage as an ordinary `DNSRecord` stamped
 `import_source="ddns_external"`, so externally-injected records become
 UI/IPAM-visible and survive a re-render.
+
+The PowerDNS agent runs the same loop (issue #1524) reading each dynamic
+zone back over the loopback REST API (`GET /zones/{zone}`, with the API key
+the driver manages) instead of an AXFR. Before that, the loop ran for BIND9
+only: RFC 2136 records written to a PowerDNS zone never appeared in
+SpatiumDDI, and an external value sharing a `(name, record_type)` with a
+managed rrset was silently REPLACEd away by the next reconcile.
 
 **Conflict rule: control-plane-managed names win.** An incoming record
 whose `(name, record_type)` collides with a managed row is skipped; only

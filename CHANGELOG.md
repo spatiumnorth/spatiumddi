@@ -98,6 +98,53 @@ the formatter handles the rest.
   run still stops. No new rule or migration: the rule is already
   critical, the highest severity.
 
+- **A new Technitium zone is no longer served under the daemon's default SOA (#1758).** `zones/create` takes no SOA, so a Primary created by the agent answered with Technitium's default (`hostadmin@<zone>`, TTL and minimum 900 s, which is the negative-cache TTL) until its own SOA and records landed: 8-11 s after a group move or any fresh agent start. A resolver could cache an NXDOMAIN from that window for up to 15 minutes. The agent now holds a Primary straight after creating it, or converting a Forwarder into one, by setting its `queryAccess` to `Deny`, and applies the zone's real options, query access included, once its records and apex SOA/NS are reconciled. A held zone answers REFUSED, which no resolver caches. It is deliberately not disabled: a disabled zone is not authoritative, so on a group that allows recursion the query is resolved upstream instead, giving `corp.lan` the root's NXDOMAIN (negative TTL one day) and an internal copy of a public zone its public answers. A zone that already exists is never held, so a second pass still writes nothing. If the agent dies before the release, or the release is refused, the zone is remembered in `technitium-zones-held.json` in the agent state dir and released on the next pass.
+
+- **The PowerDNS agent stops serving zones wrong in three ways
+  (#1520, #1521, #1522).** Pool member address deletes were applied
+  as no-ops and acked ok — the record-op fallback ignored the rrset
+  action — so a removed member's address stayed served; deletes now
+  delete. Zone type was ignored: secondaries are now created as
+  Slave with their masters (a secondary without masters, and a
+  forward zone — which has no PowerDNS equivalent — are skipped
+  loudly instead of silently vanishing or being served as a primary
+  copy). And served zones now carry the zone's own Primary NS,
+  Admin Email, SOA timers and serial instead of daemon defaults,
+  with the served serial reported back.
+
+- **NOTIFY settings and zone allow-query now reach the agents
+  (#1523).** The server options `notify_enabled` / `also_notify` /
+  `allow_notify` and the zone-level `also_notify` / `notify_enabled` /
+  `allow_query` overrides were saved but never shipped in the agent
+  bundle. They ship now (renderer revision 8): the BIND9 agent renders
+  them in the options block and zone stanzas, and the PowerDNS agent
+  folds the effective notify setting into the zone kind (Master when
+  notifying — Native never sends NOTIFY) and applies the targets as
+  ALSO-NOTIFY metadata. A PowerDNS group cannot enforce allow-query
+  (the authoritative server has no query ACL); the agent logs that
+  loudly instead of letting the setting look applied.
+
+- **Records written to PowerDNS zones over RFC 2136 are ingested back
+  (#1524).** The ingest-back worker that mirrors externally written
+  records into SpatiumDDI ran only for BIND9, so dynamic records on
+  PowerDNS were invisible — and were silently overwritten where they
+  shared a name with managed records. The PowerDNS agent now reads
+  dynamic zones back over its loopback REST API on the same interval
+  and ships them to the same ingest endpoint.
+
+- **Drift and Sync with Servers read a dot-less name target the way
+  the driver does (#1794).** A target such as `a.b` is `a.b.<zone>.`
+  on BIND9, Technitium and Windows without WinRM credentials, where only
+  a trailing dot makes a name absolute, but the shared record key read it
+  as the absolute `a.b.`. A relative multi-label CNAME, DNAME, NS, PTR,
+  MX, SRV, NAPTR replacement or SVCB / HTTPS target therefore drifted
+  against the absolute name an AXFR returns, and Sync imported it again as
+  a duplicate. The cloud drivers and Windows over WinRM take the name as
+  given, so there `a.b` stays absolute. The Windows cutover parity check
+  reads each side by its own driver: the managed rows the way the managed
+  zone's group serves them, the Windows pull the way Windows reports it.
+
+- **An appliance with an uppercase hostname was invisible to the demote quorum gate, the cordon and the eviction (#1757).** The installer accepts `Ddi-Member-1`; k3s lowercases the host's name for its k8s Node (RFC 1123, `GetHostnameAndIPs`) and names its etcd member `<lowercase name>-<8 hex>`; `Appliance.hostname` keeps what was typed. Every Node lookup by hostname therefore missed: the quorum gate read the member as having "no k8s Node" and refused the demote, the demote cordon found nothing, and the eviction told the seed a name its Node delete could not find (a 404, which counts as success), so a stale Node stayed. Lookups now go through one `k8s_node_name()` (lowercase, trailing dot dropped) in `services/appliance/ownership.py`: the quorum gate, the cordon and uncordon, the names and addresses the heartbeat hands the seed to evict (and the names it reports back), the rolling upgrade's Node-to-appliance match (now approved rows only, and none rather than a guess when two match, so a revoked duplicate left by a re-pair no longer crashes the step), and the Cluster tab's per-node host state. Deleting an appliance now finds its DNS and DHCP servers by the shared ownership rule (#1715 / #1749) instead of a bare hostname match: the FK, or an agent-registered row with no FK whose host matches case-blind (a DNS agent on k3s registers the lowercase Node name), and only while no other approved appliance shares the hostname. So two appliances whose hostnames differ only in case, or a re-paired duplicate, never delete each other's servers. On the host, `spatium-etcd-evict` matches members by the lowercase name and also treats the lowercase spelling of its own hostname as its own, and the supervisor's Node delete lowercases the name it is given. Stored hostnames are unchanged.
 
 - **A rolling upgrade waits for the control-plane Deployments before it
   moves to the next node (#1544).** The other half of the gate that

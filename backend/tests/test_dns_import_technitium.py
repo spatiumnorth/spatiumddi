@@ -260,13 +260,16 @@ def test_pull_normalize_value_uri_and_aaaa() -> None:
     """The drift key folds the same canonicalisations (#1513)."""
     from app.services.dns.pull_from_server import _normalize_value
 
-    assert _normalize_value("URI", "1 1 https://example.test/", "example.test.") == (
-        "1 1 https://example.test"
+    assert _normalize_value(
+        "URI", "1 1 https://example.test/", "example.test.", relative_targets=True
+    ) == ("1 1 https://example.test")
+    assert _normalize_value(
+        "URI", "1 1 https://example.test/path/", "example.test.", relative_targets=True
+    ) == ("1 1 https://example.test/path/")
+    assert (
+        _normalize_value("AAAA", "2001:DB8:0:0::1", "example.test.", relative_targets=True)
+        == "2001:db8::1"
     )
-    assert _normalize_value("URI", "1 1 https://example.test/path/", "example.test.") == (
-        "1 1 https://example.test/path/"
-    )
-    assert _normalize_value("AAAA", "2001:DB8:0:0::1", "example.test.") == "2001:db8::1"
 
 
 # ── #1513 / #1698: SVCB/HTTPS compare canonically ──────────────────────
@@ -276,7 +279,7 @@ def _key_of(value: str, rtype: str = "SVCB", zone: str = "example.net."):
     from app.drivers.dns.base import RecordData
     from app.services.dns.pull_from_server import _key
 
-    return _key(RecordData(name="svc", record_type=rtype, value=value), zone)
+    return _key(RecordData(name="svc", record_type=rtype, value=value), zone, relative_targets=True)
 
 
 def test_svcb_quoting_is_one_record() -> None:
