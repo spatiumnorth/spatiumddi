@@ -30,8 +30,8 @@ data:
   default.conf.template: |
     # ── Reverse proxy in front of this nginx (#1868) ─────────────────
     # See frontend/default.conf.template for the full reasoning; the two
-    # must not diverge. TRUSTED_PROXY_CIDRS comes from the frontend pod's
-    # env (values: frontend.trustedProxyCidrs) and is rendered into the
+    # must not diverge. FRONTEND_TRUSTED_PROXY_CIDRS comes from the frontend
+    # pod's env (values: frontend.trustedProxyCidrs) and is rendered into the
     # ${SPATIUM_*} blocks by the image's 16-trusted-proxies.envsh. Empty =
     # no trusted proxy = a client-supplied X-Forwarded-* is never believed.
     geo $realip_remote_addr $spatium_proxy_trusted {

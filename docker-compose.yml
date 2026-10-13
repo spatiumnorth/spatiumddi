@@ -217,15 +217,15 @@ services:
       - "${HTTP_PORT:-8077}:80"
     depends_on:
       - api
-    # #1868 — the reverse proxy in front of this container, if any. The same
-    # TRUSTED_PROXY_CIDRS the api reads: the frontend nginx then takes the real
-    # client address and scheme from that proxy's X-Forwarded-For / -Proto
-    # instead of overwriting them. EMPTY (unset) = trust no proxy, today's
-    # behaviour. The list must also cover this
-    # container's own network, or the api stops believing the frontend.
+    # #1868 — the reverse proxy in front of this container, if any (its
+    # address, or the network it connects from). The frontend nginx then takes
+    # the real client address and scheme from that proxy's X-Forwarded-For /
+    # -Proto instead of overwriting them. EMPTY (unset) = trust no proxy,
+    # today's behaviour. Separate from the api's TRUSTED_PROXY_CIDRS on
+    # purpose: the api's peer is this container, the frontend's is the proxy.
     # docs/deployment/REVERSE_PROXY.md.
     environment:
-      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
+      FRONTEND_TRUSTED_PROXY_CIDRS: ${FRONTEND_TRUSTED_PROXY_CIDRS:-}
 
   # ── Migrations (runs once at startup) ──────────────────────────────────────
   migrate:

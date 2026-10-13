@@ -38,38 +38,44 @@ browser ──https──> your proxy ──http──> SpatiumDDI frontend (ngi
 | Setting | Value | Why |
 |---|---|---|
 | **Settings > General > External URL** | the public URL, `https://ddi.example.com` | **Mandatory for OIDC and SAML** (callback / ACS URLs are built from it), recommended always. Empty means the URL is rebuilt from each request; the api logs `sso_external_url_not_set` when it falls back |
-| `TRUSTED_PROXY_CIDRS` | the proxy's address **plus** the network the frontend runs in | Lets the real client IP and scheme through, so the login throttle, audit log, `last_login_ip`, the Web UI allow-list and ACME source checks see the user, not the proxy |
+| `FRONTEND_TRUSTED_PROXY_CIDRS` (Helm: `frontend.trustedProxyCidrs`) | the proxy's address, and nothing else | Lets the real client IP and scheme through, so the login throttle, audit log, `last_login_ip`, the Web UI allow-list and ACME source checks see the user, not the proxy, and the api sees `https` |
 | `TRUSTED_HOSTS` | leave **unset**, or list the exact `Host` the proxy forwards | A proxy that rewrites `Host` to its upstream name gets `400` on every call; the api logs `trusted_hosts_refused_host` |
 
-### `TRUSTED_PROXY_CIDRS`
+### `FRONTEND_TRUSTED_PROXY_CIDRS`
 
-The same variable configures both the api and the frontend nginx, and it
-means "the TCP peers whose forwarded headers are believed":
-
-- The **frontend nginx** believes `X-Forwarded-For` and `X-Forwarded-Proto`
-  only from a peer in the list, and walks `X-Forwarded-For` from the right
-  past every listed hop, so an address a client invents is never reached.
-  **Unset or empty means no proxy is trusted**, which is exactly the
-  behaviour of an install with no proxy.
-- The **api** believes `X-Real-IP` and `X-Forwarded-Proto` only from a peer in
-  the list. It receives them from the frontend nginx, so the list **must also
-  cover the frontend's own network**, or every user shares the frontend
-  container's address again.
-  The api's default is the private ranges, which already covers it.
-
-So set it to the proxy plus the compose / pod network:
+The frontend nginx believes `X-Forwarded-For` and `X-Forwarded-Proto` only
+from a TCP peer in this list (comma-separated addresses or CIDRs). It walks
+`X-Forwarded-For` from the right, skipping listed hops, and takes the first
+address that is not listed, so an address a client puts at the front of the
+header is never reached. It then hands the api that address in `X-Real-IP`,
+which it always writes itself and never passes through. **Unset or empty
+means no proxy is trusted**, which is exactly the behaviour of an install
+with no proxy. An entry that is not an address or CIDR stops the frontend
+container at start, with the entry named in its log.
 
 ```bash
-# .env (Docker Compose). Proxy at 192.168.10.5, compose network in 172.16/12:
-TRUSTED_PROXY_CIDRS=192.168.10.5/32,172.16.0.0/12
+# .env (Docker Compose). Proxy at 192.168.10.5:
+FRONTEND_TRUSTED_PROXY_CIDRS=192.168.10.5/32
 ```
 
-If the proxy sits in a private range and you are happy to trust the private
-ranges, use the default list from `.env.example`. Only do that when the
-frontend port is reachable by nothing but the proxy (firewall it): a client
-inside a trusted range that can reach the frontend directly could choose the
-address recorded for it. `*` trusts every peer and is only safe when nothing
-but the proxy can reach the frontend.
+- **List only the proxy.** Every listed peer chooses the client address the
+  api records, so a listed address that is not your proxy can make each
+  request look like it came from somewhere new: past the login throttle, and
+  into the audit log under an address of its choosing. Do not list whole
+  private ranges unless nothing in them but the proxy can reach the
+  frontend's port.
+- **A proxy on the Docker host itself** usually connects from the compose
+  network's gateway (for example `172.18.0.1`), not `127.0.0.1`. The
+  frontend's access log (`docker compose logs frontend`) shows the address
+  the proxy's requests arrive from before you set the variable.
+- **`*` trusts every peer.** Then any client that can reach the frontend
+  directly picks its own recorded address and scheme. Use it only when a
+  firewall or network policy guarantees that nothing but the proxy reaches
+  the frontend, and prefer a real address when you can.
+- **This is not the api's `TRUSTED_PROXY_CIDRS`**, and that one needs no
+  change. The api's TCP peer is always the frontend nginx, which its
+  default (the private ranges) already covers. If you have narrowed the
+  api's list, it must still cover the frontend's own address, as before.
 
 ## 3. Headers the proxy must send
 
@@ -218,8 +224,8 @@ To limit this to the streams instead, add custom locations for
 `/api/v1/ai/chat`, `/api/v1/appliance/cluster/health/stream` and
 `/api/v1/appliance/containers` with the same forward target, and put the
 snippet in each location's gear icon. NPM's own container must be in a
-network that can reach the frontend, and its address (or its Docker network)
-goes in `TRUSTED_PROXY_CIDRS`.
+network that can reach the frontend, and its address on that network goes in
+`FRONTEND_TRUSTED_PROXY_CIDRS`.
 
 ### Kubernetes Ingress
 
@@ -230,7 +236,8 @@ See [Helm and Kubernetes](#helm-and-kubernetes) below and
 
 ```yaml
 # values.yaml
-trustedProxyCidrs: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10"
+frontend:
+  trustedProxyCidrs: "10.42.0.0/16"   # the ingress controller's pod network
 ingress:
   enabled: true
   className: nginx
@@ -248,29 +255,32 @@ ingress:
     nginx.ingress.kubernetes.io/proxy-body-size: "4g"
 ```
 
-- `trustedProxyCidrs` sets `TRUSTED_PROXY_CIDRS` on both the api and the
-  frontend pods. Narrow it to your ingress controller's pod network plus the
-  network the frontend pods use, if you know them.
+- `frontend.trustedProxyCidrs` sets `FRONTEND_TRUSTED_PROXY_CIDRS` on the
+  frontend pods. Use the ingress controller's pod network (`10.42.0.0/16` is
+  the k3s default; `kubectl get pods -n ingress-nginx -o wide` shows yours),
+  and keep `frontend.service.type=ClusterIP` so only the ingress reaches the
+  frontend: NodePort or LoadBalancer traffic can arrive SNAT'd to a node
+  address inside that same range, and would then be trusted.
+- The api needs nothing: its own default already trusts the frontend pods.
 - ingress-nginx forwards `Host`, `X-Forwarded-For`, `X-Forwarded-Proto` and
   `X-Real-IP` itself. Other controllers: check theirs.
 - Keep `frontend.tls.enabled=false` behind an Ingress. With it enabled the
   frontend's port 80 answers `301` to https for everyone **except** a request
-  a trusted proxy marks `X-Forwarded-Proto: https`; with `trustedProxyCidrs`
-  empty the redirect is unconditional, so a TLS-terminating proxy that talks
-  http loops.
+  a trusted proxy marks `X-Forwarded-Proto: https`; with
+  `frontend.trustedProxyCidrs` empty the redirect is unconditional, so a
+  TLS-terminating proxy that talks http loops.
 - Plain Kubernetes manifests (`k8s/base/`): uncomment the
-  `TRUSTED_PROXY_CIDRS` env in `frontend.yaml` and set the same value on the
-  api Deployment.
+  `FRONTEND_TRUSTED_PROXY_CIDRS` env in `frontend.yaml`.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Redirect loop (`ERR_TOO_MANY_REDIRECTS`) | Helm `frontend.tls.enabled=true` behind a TLS-terminating proxy that talks http to port 80, with no trusted proxy | Set `trustedProxyCidrs` to the proxy and send `X-Forwarded-Proto: https`, or set `frontend.tls.enabled=false` |
+| Redirect loop (`ERR_TOO_MANY_REDIRECTS`) | Helm `frontend.tls.enabled=true` behind a TLS-terminating proxy that talks http to port 80, with no trusted proxy | Set `frontend.trustedProxyCidrs` to the proxy and send `X-Forwarded-Proto: https`, or set `frontend.tls.enabled=false` |
 | `400 Invalid host header` on every call | `TRUSTED_HOSTS` is set and the proxy forwards a different `Host` (nginx `proxy_pass` without `proxy_set_header Host`) | Preserve `Host`, or add the name the proxy sends to `TRUSTED_HOSTS`, or unset it. The api log names the refused host |
 | SSO `redirect_uri mismatch`; SAML `Destination` error or `saml_requires_https` | External URL is empty, so the callback is built as `http://` from the request | Set **Settings > General > External URL** to the public `https://` URL |
-| Signed out on every reload | The refresh cookie is `Secure` but the browser is on an `http://` page, or the proxy is not sending `X-Forwarded-Proto: https` from a trusted address | Serve the public side over https; check `TRUSTED_PROXY_CIDRS` covers the proxy |
-| `429 Too many login attempts` for everyone | Every user arrives from one address: the proxy is not in `TRUSTED_PROXY_CIDRS` (frontend), or the frontend's network is not (api) | Set `TRUSTED_PROXY_CIDRS` to cover both; check Audit Log source IPs show real clients |
+| Signed out on every reload | The refresh cookie is `Secure` but the browser is on an `http://` page, or the proxy is not sending `X-Forwarded-Proto: https` from a trusted address | Serve the public side over https; check `FRONTEND_TRUSTED_PROXY_CIDRS` covers the proxy |
+| `429 Too many login attempts` for everyone | Every user arrives from one address: the proxy is not in `FRONTEND_TRUSTED_PROXY_CIDRS`, or (if you narrowed it) the api's `TRUSTED_PROXY_CIDRS` no longer covers the frontend | Set `FRONTEND_TRUSTED_PROXY_CIDRS` to the address the proxy connects from; check Audit Log source IPs show real clients |
 | AI chat or log view hangs or stays empty | The proxy buffers responses or times out after 60 s | `proxy_buffering off`, read timeout of an hour or more (section 4) |
 | Blank page, or 404 on `/assets/...` | Served under a sub-path | Not supported: use a hostname of its own |
 | Backup restore or slot-image upload fails with 413 | Proxy body-size limit | Raise it (`client_max_body_size 4g`) |

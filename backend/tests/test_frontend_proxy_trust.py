@@ -5,8 +5,8 @@ Before, every ``/api/`` location set ``X-Forwarded-Proto $scheme`` and
 ``X-Real-IP $remote_addr``, so behind an operator's TLS-terminating proxy the
 api saw ``http`` and the proxy's own address: SSO callbacks built as http://,
 and one shared login-throttle bucket for the whole organisation. The fix is a
-trust map plus ``real_ip_*`` driven by ``TRUSTED_PROXY_CIDRS``, rendered by
-``frontend/16-trusted-proxies.envsh``. These pin the renderer (it is run, not
+trust map plus ``real_ip_*`` driven by ``FRONTEND_TRUSTED_PROXY_CIDRS``,
+rendered by ``frontend/16-trusted-proxies.envsh``. These pin the renderer (it is run, not
 read) and that no ``/api`` location can bypass the map.
 """
 
@@ -30,12 +30,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _render(cidrs: str | None) -> tuple[int, str, str, str]:
+def _render(cidrs: str | None, **extra: str) -> tuple[int, str, str, str]:
     """Source the entrypoint script the way nginx's entrypoint does; return
     (rc, SPATIUM_REAL_IP_FROM, SPATIUM_TRUSTED_GEO, stderr)."""
-    env = {"PATH": "/usr/bin:/bin:/usr/local/bin"}
+    env = {"PATH": "/usr/bin:/bin:/usr/local/bin", **extra}
     if cidrs is not None:
-        env["TRUSTED_PROXY_CIDRS"] = cidrs
+        env["FRONTEND_TRUSTED_PROXY_CIDRS"] = cidrs
     proc = subprocess.run(
         [
             "sh",
@@ -59,6 +59,17 @@ def test_unset_or_empty_trusts_no_proxy(cidrs: str | None) -> None:
     assert (rc, real, geo) == (0, "", "")
 
 
+def test_the_apis_trusted_proxy_list_is_not_the_frontends() -> None:
+    """The api's TRUSTED_PROXY_CIDRS names the frontend (its peer); the
+    frontend's list names the operator's proxy (ITS peer). Reading the api's
+    list here would make the frontend trust the whole compose / pod network,
+    and on an install that had uncommented the api's private-range default,
+    every private address: any LAN client reaching the frontend directly could
+    then choose the address the login throttle and audit rows record."""
+    rc, real, geo, _ = _render(None, TRUSTED_PROXY_CIDRS="10.0.0.0/8,172.16.0.0/12")
+    assert (rc, real, geo) == (0, "", "")
+
+
 def test_each_entry_becomes_one_directive_per_line() -> None:
     rc, real, geo, _ = _render("10.0.0.0/8, 192.168.1.5 ,fd00::/8")
     assert rc == 0
@@ -78,13 +89,22 @@ def test_star_trusts_every_peer_in_both_families() -> None:
 
 
 @pytest.mark.parametrize(
-    "cidrs", ["10.0.0.0/8;x", "10.0.0.0/8, evil.example.com", "1.2.3.4 } server {", "$(id)"]
+    "cidrs",
+    [
+        "10.0.0.0/8;x",
+        "10.0.0.0/8, evil.example.com",
+        "1.2.3.4 } server {",
+        "$(id)",
+        "10.0.0.0/8\nreal_ip_header X-Real-IP",
+        "10.0.0.0/8\tdeny",
+        "10.0.0.0/8 #",
+    ],
 )
 def test_an_entry_that_is_not_an_address_refuses_to_start(cidrs: str) -> None:
     """The entries are written into nginx config: anything but address
     characters must fail the container, never reach the config."""
     rc, real, geo, stderr = _render(cidrs)
-    assert rc != 0 and "TRUSTED_PROXY_CIDRS" in stderr
+    assert rc != 0 and "FRONTEND_TRUSTED_PROXY_CIDRS" in stderr
     assert (real, geo) == ("", "")
 
 

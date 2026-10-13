@@ -72,7 +72,8 @@ Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if 
 | `HTTP_PORT` | `8077` | Host port for the frontend |
 | `API_PORT` | `8000` | Host port for the API |
 | `API_BIND` | `127.0.0.1` | Host address the API port is published on. Widening it (e.g. `0.0.0.0`) lets LAN clients reach the API directly; if you do, narrow `TRUSTED_PROXY_CIDRS` to the frontend's address, since the API believes `X-Real-IP` from those peers (#1221) |
-| `TRUSTED_PROXY_CIDRS` | private, loopback, CGNAT and ULA ranges | Peers whose `X-Real-IP` / `X-Forwarded-Proto` the API applies. `*` trusts every peer. Also passed to the frontend nginx (unset there = trust no proxy). Behind your own reverse proxy list the proxy **and** the compose network: see [`REVERSE_PROXY.md`](REVERSE_PROXY.md) |
+| `TRUSTED_PROXY_CIDRS` | private, loopback, CGNAT and ULA ranges | Peers whose `X-Real-IP` / `X-Forwarded-Proto` the API applies. `*` trusts every peer |
+| `FRONTEND_TRUSTED_PROXY_CIDRS` | unset (trust no proxy) | Your own reverse proxy in front of the frontend: the frontend nginx keeps its `X-Forwarded-Proto` and takes the client address from its `X-Forwarded-For`. List only the proxy. See [`REVERSE_PROXY.md`](REVERSE_PROXY.md) |
 | `DATABASE_URL` | auto-constructed | Override only if using an external PostgreSQL |
 | `REDIS_URL` | `redis://redis:6379/0` | Override to point at an external Redis |
 | `DEBUG` | `false` | Enable FastAPI debug mode |
@@ -117,7 +118,7 @@ EOF
 Options A and B put a reverse proxy in front of the frontend. Whatever proxy
 you use, read [`REVERSE_PROXY.md`](REVERSE_PROXY.md) too: it covers the
 settings that make sign-in, SSO and the login throttle work behind one
-(External URL, `TRUSTED_PROXY_CIDRS`, streaming), with examples for nginx,
+(External URL, `FRONTEND_TRUSTED_PROXY_CIDRS`, streaming), with examples for nginx,
 Caddy, Traefik, HAProxy and Nginx Proxy Manager.
 
 ### Option A: Terminate TLS at the host with nginx (recommended for VMs)
@@ -146,10 +147,11 @@ server {
 }
 ```
 
-Then set `TRUSTED_PROXY_CIDRS` in `.env` to the proxy's address plus the
-compose network (for example `127.0.0.1/32,172.16.0.0/12` for a proxy on the
-same host) and set **Settings > General > External URL** to the public
-`https://` URL. Without the first the frontend nginx overwrites the proxy's
+Then set `FRONTEND_TRUSTED_PROXY_CIDRS` in `.env` to the address the proxy
+connects from (a proxy on the Docker host itself usually arrives from the
+compose network's gateway, e.g. `172.18.0.1`; the frontend's access log shows
+it) and set **Settings > General > External URL** to the public `https://`
+URL. Without the first the frontend nginx overwrites the proxy's
 `X-Forwarded-Proto` and client address, so every user shares one login
 throttle bucket and SSO callbacks are built as `http://`.
 

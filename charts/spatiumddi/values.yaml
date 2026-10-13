@@ -78,21 +78,6 @@ auth:
   # generated on first install and kept across upgrades, like secretKey.
   metricsToken: ""
 
-# ── Reverse proxy / ingress in front of the frontend (#1868) ────────────────
-# Comma-separated CIDRs (or addresses) of the proxies whose forwarded headers
-# are believed: set on BOTH the api (TRUSTED_PROXY_CIDRS) and the frontend
-# nginx. The frontend then takes the real client address and scheme from the
-# proxy's X-Forwarded-For / X-Forwarded-Proto, so the login throttle, audit
-# rows and the Secure refresh cookie describe the user and not the ingress.
-# Empty (default) keeps today's behaviour: the api trusts its private-range
-# default for the frontend pods, and the frontend trusts no proxy at all.
-# When you set it, the list must cover the ingress pods AND the frontend
-# pods' own network (the api believes X-Real-IP only from a listed peer),
-# e.g. "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10". ``*`` trusts
-# every peer: only safe when nothing but the proxy can reach the frontend.
-# See docs/deployment/REVERSE_PROXY.md.
-trustedProxyCidrs: ""
-
 # ── API ──────────────────────────────────────────────────────────────────────
 api:
   replicas: 2
@@ -452,6 +437,22 @@ frontend:
   # Off-appliance K8s deployments leave this false + run an Ingress
   # in front instead.
   hostNetwork: false
+  # ── Reverse proxy / ingress in front of the frontend (#1868) ─────────────
+  # Comma-separated CIDRs (or addresses) of the proxy / ingress controller
+  # whose X-Forwarded-For and X-Forwarded-Proto the frontend nginx believes
+  # (FRONTEND_TRUSTED_PROXY_CIDRS). It then takes the real client address and
+  # scheme from them, so the login throttle, audit rows, the Secure refresh
+  # cookie and SSO callback URLs describe the user and not the ingress.
+  # Empty (default) trusts no proxy: today's behaviour. List ONLY the proxy
+  # (for ingress-nginx, its pod network): every listed peer can choose the
+  # client address it reports, so a private-range catch-all lets anything in
+  # those ranges that can reach the frontend Service spoof it. Keep the
+  # frontend Service ClusterIP when you list a pod network, since NodePort /
+  # LoadBalancer traffic can be SNAT'd to a node address in that range.
+  # ``*`` trusts every peer. The api needs nothing here: its own TRUSTED_PROXY_CIDRS
+  # default (private ranges) already covers the frontend pods.
+  # See docs/deployment/REVERSE_PROXY.md.
+  trustedProxyCidrs: ""
   # Phase 11 wave 3 (#183) — TLS termination at the frontend nginx.
   # When enabled, the frontend pod mounts a ConfigMap with a
   # TLS-aware nginx template (templates/frontend-tls-config.yaml)
@@ -465,10 +466,10 @@ frontend:
     enabled: false
     secretName: spatium-appliance-tls
     # With tls.enabled the :80 listener 301s to https UNLESS a proxy listed in
-    # ``trustedProxyCidrs`` sends ``X-Forwarded-Proto: https`` (#1868): a
-    # TLS-terminating proxy that talks plain http to :80 is served directly
-    # instead of looping. With trustedProxyCidrs empty the redirect is
-    # unconditional, as before. The simplest proxy setup is still
+    # ``frontend.trustedProxyCidrs`` sends ``X-Forwarded-Proto: https``
+    # (#1868): a TLS-terminating proxy that talks plain http to :80 is served
+    # directly instead of looping. With trustedProxyCidrs empty the redirect
+    # is unconditional, as before. The simplest proxy setup is still
     # tls.enabled=false (see docs/deployment/REVERSE_PROXY.md).
   # Issue #176: the frontend nginx proxies ``/api/`` to the api Service
   # using a runtime-substituted upstream. The Docker image defaults to

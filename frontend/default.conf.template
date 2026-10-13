@@ -26,22 +26,25 @@
 #                             explicitly.
 
 # ── Reverse proxy in front of this nginx (#1868) ───────────────────
-# TRUSTED_PROXY_CIDRS (the api's own setting; rendered into the two
-# ${...} blocks below by 16-trusted-proxies.envsh) names the TCP peers that
-# are an operator's reverse proxy. UNSET = none, which keeps the behaviour
-# of a direct install: the proxy_set_header lines below describe THIS
-# nginx's own peer and a client-supplied X-Forwarded-* is never believed.
+# FRONTEND_TRUSTED_PROXY_CIDRS (rendered into the two ${...} blocks below by
+# 16-trusted-proxies.envsh) names the TCP peers that are an operator's
+# reverse proxy. It is NOT the api's TRUSTED_PROXY_CIDRS (the api's peer is
+# this nginx; this nginx's peer is the proxy). UNSET = none, which keeps the
+# behaviour of a direct install: the proxy_set_header lines below describe
+# THIS nginx's own peer and a client-supplied X-Forwarded-* is never believed.
 #
 #   * set_real_ip_from / real_ip_header / real_ip_recursive make
 #     $remote_addr the real client when the TCP peer is a listed proxy,
-#     walking X-Forwarded-For from the right past every listed hop, so an
-#     address a client prepends is never reached. The api then sees the
-#     real client in X-Real-IP and its login throttle buckets per user,
-#     not per proxy.
+#     walking X-Forwarded-For from the right past every listed hop and
+#     stopping at the first unlisted one, so an address a client prepends
+#     is never reached. The api then sees the real client in X-Real-IP
+#     (always written below, never passed through) and its login throttle
+#     buckets per user, not per proxy.
 #   * $spatium_forwarded_proto is the outer proxy's X-Forwarded-Proto, but
-#     only when the peer is listed, else this server's own scheme. Behind
-#     an https-terminating proxy the api therefore builds https URLs
-#     (OIDC redirect_uri, SAML ACS) and marks the refresh cookie Secure.
+#     only when the TCP peer ($realip_remote_addr, before real_ip rewrites
+#     it) is listed, else this server's own scheme. Behind an
+#     https-terminating proxy the api therefore builds https URLs (OIDC
+#     redirect_uri, SAML ACS) and marks the refresh cookie Secure.
 #
 # Must not diverge from charts/spatiumddi/templates/frontend-tls-config.yaml.
 geo $realip_remote_addr $spatium_proxy_trusted {

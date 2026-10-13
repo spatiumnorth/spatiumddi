@@ -92,13 +92,16 @@ the formatter handles the rest.
   empty, and every user shared one login-throttle bucket (a busy morning
   returned `429` to the organisation; audit rows, `last_login_ip` and the
   allow-list guards recorded the proxy). **nginx header change:** the
-  frontend now takes `TRUSTED_PROXY_CIDRS` (the api's own variable, passed
-  through by the Compose files and the chart's new `trustedProxyCidrs`) and
-  keeps an outer proxy's `X-Forwarded-Proto`, with the client address from
+  frontend reads a new `FRONTEND_TRUSTED_PROXY_CIDRS` (Compose `.env`, the
+  chart's `frontend.trustedProxyCidrs`, `k8s/base/frontend.yaml`) and keeps
+  an outer proxy's `X-Forwarded-Proto`, with the client address from
   `X-Forwarded-For` (`real_ip_recursive`), only from a listed peer. **Unset
-  keeps today's behaviour**: no proxy is trusted. A list narrowed to the
-  proxy must also cover the frontend's own network, since the api believes
-  `X-Real-IP` only from a listed peer. The Helm TLS frontend (one server for
+  keeps today's behaviour**: no proxy is trusted. It is deliberately not the
+  api's `TRUSTED_PROXY_CIDRS`, which names the frontend (the api's peer) and
+  needs no change: sharing one list would make the frontend trust the
+  compose / pod network, and any install that had set the api's list to the
+  private ranges would have let a LAN client choose its own recorded address
+  on upgrade. The Helm TLS frontend (one server for
   :80 and :443) no longer 301s a request a trusted proxy marks
   `X-Forwarded-Proto: https`, which looped behind a TLS-terminating proxy,
   and gains the AI-chat stream location it lacked. The cluster-health,

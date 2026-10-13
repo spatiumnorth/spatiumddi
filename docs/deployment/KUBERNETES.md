@@ -146,7 +146,7 @@ non-default topologies (separate namespace, custom api Service name, or a
 pinned external resolver). Full details:
 [chart README → Exposing the UI](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#exposing-the-ui).
 
-Behind an Ingress or any TLS-terminating proxy, also set `trustedProxyCidrs`
+Behind an Ingress or any TLS-terminating proxy, also set `frontend.trustedProxyCidrs`
 and add the streaming annotations (`proxy-buffering: "off"`,
 `proxy-read-timeout: "3600"`); without them the login throttle keys on the
 ingress address and the AI chat stream hangs. See

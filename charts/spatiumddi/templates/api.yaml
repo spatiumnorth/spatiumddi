@@ -123,14 +123,6 @@ spec:
             - name: SERVICE_CONTROL_ENABLED
               value: "true"
             {{- end }}
-            {{- with .Values.trustedProxyCidrs }}
-            # #1868 — the TCP peers whose X-Real-IP / X-Forwarded-Proto the
-            # api believes. Same value the frontend pod gets, so the two
-            # cannot disagree about who a proxy is. Unset keeps the api's
-            # built-in private-range default.
-            - name: TRUSTED_PROXY_CIDRS
-              value: {{ . | quote }}
-            {{- end }}
             {{- with .Values.api.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

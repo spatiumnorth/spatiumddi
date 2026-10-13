@@ -62,7 +62,7 @@ COPY default.conf.template /etc/nginx/templates/default.conf.template
 # respects an operator-supplied NGINX_LOCAL_RESOLVERS so the resolver
 # IP can be pinned via env var. See the script's header comment.
 COPY 15-local-resolvers.envsh /docker-entrypoint.d/15-local-resolvers.envsh
-# Renders TRUSTED_PROXY_CIDRS into nginx's set_real_ip_from lines + the
+# Renders FRONTEND_TRUSTED_PROXY_CIDRS into nginx's set_real_ip_from lines + the
 # X-Forwarded-Proto trust map (#1868). Unset = trust no proxy.
 COPY 16-trusted-proxies.envsh /docker-entrypoint.d/16-trusted-proxies.envsh
 

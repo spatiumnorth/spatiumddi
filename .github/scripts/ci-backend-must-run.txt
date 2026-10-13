@@ -148,7 +148,7 @@ docs/PRIVACY.md
 # Editing either must therefore run the suite that contains that assertion.
 frontend/default.conf.template
 
-# test_frontend_proxy_trust.py (#1868) executes the TRUSTED_PROXY_CIDRS renderer
+# test_frontend_proxy_trust.py (#1868) executes the FRONTEND_TRUSTED_PROXY_CIDRS renderer
 # and pins that every proxy_set_header X-Forwarded-Proto in both shipped nginx
 # templates goes through the trust map rather than overwriting an outer
 # proxy's value with $scheme.

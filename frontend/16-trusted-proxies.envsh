@@ -1,6 +1,6 @@
 #!/bin/sh
-# Render TRUSTED_PROXY_CIDRS into the two nginx fragments the template
-# interpolates (spatiumddi #1868):
+# Render FRONTEND_TRUSTED_PROXY_CIDRS into the two nginx fragments the
+# template interpolates (spatiumddi #1868):
 #
 #   * SPATIUM_REAL_IP_FROM   one ``set_real_ip_from <cidr>;`` per entry
 #   * SPATIUM_TRUSTED_GEO    one ``<cidr> 1;`` per entry, for the ``geo``
@@ -12,18 +12,20 @@
 # multi-line variables. This file is SOURCED by the nginx entrypoint (the
 # .envsh suffix), so the exports reach the envsubst step that follows.
 #
-# TRUSTED_PROXY_CIDRS is the api's own setting (comma-separated CIDRs or
-# addresses, ``*`` for any peer). UNSET or EMPTY means "trust no proxy" here,
-# which is today's behaviour for a direct install: nginx overwrites
-# X-Real-IP / X-Forwarded-Proto from its own TCP peer. This is deliberately
-# NOT the api's private-range default. A LAN client that reaches this nginx
-# directly sits in those ranges, and trusting it would let any such client
-# choose the address the login throttle and audit rows record. Setting the
-# variable is the operator saying "this peer is my proxy".
+# FRONTEND_TRUSTED_PROXY_CIDRS names the operator's reverse proxy in FRONT of
+# this nginx (comma-separated CIDRs or addresses, ``*`` for any peer). It is
+# deliberately NOT the api's TRUSTED_PROXY_CIDRS. The two name different
+# hops: the api's peer is always this nginx, which the api's private-range
+# default already covers, while this nginx's peer is the browser or the
+# operator's proxy. Sharing one list forces both to trust the union, so the
+# frontend would trust the whole compose / pod network (and, for anyone who
+# had uncommented the api's private-range default, every private address),
+# letting a LAN client that reaches this nginx directly choose the address
+# the login throttle and audit rows record.
 #
-# The api needs the FRONTEND's address in the same list (it believes
-# X-Real-IP only from a trusted peer), so a list narrowed to the outer proxy
-# must still cover the container network. See docs/deployment/REVERSE_PROXY.md.
+# UNSET or EMPTY means "trust no proxy", which is today's behaviour for a
+# direct install: nginx overwrites X-Real-IP / X-Forwarded-Proto from its own
+# TCP peer. See docs/deployment/REVERSE_PROXY.md.
 
 set -eu
 
@@ -32,11 +34,12 @@ _spatium_trusted_geo=""
 _spatium_nl='
 '
 
-_cidrs="${TRUSTED_PROXY_CIDRS:-}"
+_cidrs="${FRONTEND_TRUSTED_PROXY_CIDRS:-}"
 # Entries are written into nginx config, so accept only what an address or
-# CIDR can contain. Anything else fails the container start, the way the api
-# refuses to boot on a bad entry, instead of rendering a config nginx would
-# reject (or one that smuggles a directive in).
+# CIDR can contain. Anything else (a ``;``, a newline, a brace, a hostname)
+# fails the container start, the way the api refuses to boot on a bad entry,
+# instead of rendering a config nginx would reject or one that smuggles a
+# directive in.
 _old_ifs="$IFS"
 set -f   # a bare * must reach the loop as a word, not as a glob
 IFS=','
@@ -50,7 +53,7 @@ for _entry in $_cidrs; do
     else
         case "$_entry" in
             *[!0-9a-fA-F:./]*)
-                echo "16-trusted-proxies: TRUSTED_PROXY_CIDRS entry '$_entry' is not an address or CIDR" >&2
+                echo "16-trusted-proxies: FRONTEND_TRUSTED_PROXY_CIDRS entry '$_entry' is not an address or CIDR" >&2
                 exit 1
                 ;;
         esac
