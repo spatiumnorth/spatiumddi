@@ -161,6 +161,32 @@ def txt_strings(value: str) -> list[bytes]:
     return [chunk for string in strings for chunk in _chunk_octets(string)]
 
 
+def quote_strings(strings: list[bytes]) -> str:
+    """Render character-strings (octets) as RFC 1035 presentation form:
+    the inverse of ``txt_strings`` for a value already split into strings
+    (a server's read-back, #1760)."""
+    return " ".join(f'"{_escape_octets(c)}"' for c in strings)
+
+
+def txt_value(strings: list[bytes]) -> str:
+    """The stored value that stands for a server's character-strings.
+
+    The bare text when that round-trips through ``txt_strings`` to the very
+    same strings (one string, or a long one cut where ``txt_strings`` cuts
+    it), otherwise the presentation form from ``quote_strings``. So a simple
+    record reads back as the plain text it has always been stored as, while
+    an explicit split, a non-UTF-8 or control octet, or text that itself
+    starts with a quote keeps its exact strings (#1760).
+    """
+    try:
+        bare = b"".join(strings).decode("utf-8")
+    except UnicodeDecodeError:
+        return quote_strings(strings)
+    if strings and txt_strings(bare) == list(strings):
+        return bare
+    return quote_strings(strings)
+
+
 def quote_txt(value: str) -> str:
     """Render a stored TXT value as RFC 1035 presentation form.
 

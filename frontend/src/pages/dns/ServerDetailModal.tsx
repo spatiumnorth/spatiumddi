@@ -110,6 +110,14 @@ export function ServerDetailModal({
           <span className="rounded border px-1.5 py-0.5 text-[10px]">
             {server.driver}
           </span>
+          {server.driver === "technitium_api" && (
+            <span
+              className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400"
+              title="technitium_api is experimental in 1.0: one server per group, zones SpatiumDDI creates, no DNS pools, no group or zone options."
+            >
+              Experimental
+            </span>
+          )}
           <span className="rounded border px-1.5 py-0.5 text-[10px] font-mono">
             {server.host}:{server.port}
           </span>

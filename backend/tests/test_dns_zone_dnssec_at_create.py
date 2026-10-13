@@ -2,7 +2,7 @@
 
 ``dnssec_enabled=true`` used to set the flag and stop there. On BIND9 that is
 enough — it signs inline from the rendered config bundle — but PowerDNS and
-Technitium sign only in response to the ``dnssec_sign`` record op, which
+Technitium (until #1783) sign only in response to the ``dnssec_sign`` record op, which
 neither the REST ``create_zone`` nor the Copilot's ``create_dns_zone``
 enqueued. The zone read as DNSSEC-enabled in the UI, in ``GET /zones/{id}``
 and in the audit row, and was unsigned on the wire until someone clicked
@@ -209,7 +209,7 @@ async def _zone_via_api(
 @pytest.mark.asyncio
 async def test_update_flip_on_enqueues_sign(client: AsyncClient, db_session: AsyncSession) -> None:
     headers = await _headers(db_session)
-    grp = await _group(db_session, "technitium")
+    grp = await _group(db_session, "powerdns")
     zone_id, zone_name = await _zone_via_api(client, db_session, headers, grp, dnssec=False)
 
     resp = await client.put(

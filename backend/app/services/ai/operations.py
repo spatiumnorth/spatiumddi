@@ -2331,8 +2331,8 @@ class CreateDNSZoneArgs(BaseModel):
             "``technitium_api`` (agentless, an install the operator "
             "already runs), or ``windows_dns``. Pair it with "
             "``dnssec_enabled=true`` to auto-select a group whose driver "
-            "can sign online (``bind9``, ``powerdns`` and ``technitium`` "
-            "all can; ``windows_dns`` and ``technitium_api`` cannot). "
+            "can sign (``bind9`` and ``powerdns``; ``technitium``, "
+            "``technitium_api`` and ``windows_dns`` cannot, #1783). "
             "When ``group_id`` is set, this is validated against the "
             "group's actual driver mix."
         ),
@@ -2374,6 +2374,28 @@ class CreateDNSZoneArgs(BaseModel):
         ge=60,
         le=604_800,
     )
+
+
+def _technitium_api_zone_arg_conflict(args: CreateDNSZoneArgs, drivers: set[str]) -> str | None:
+    """#1784 — the REST zone-create scope gate for an experimental
+    ``technitium_api`` group, applied to the Copilot's create too: the
+    Copilot fronts the REST API and must not be a way around its 422s.
+    Shared by preview and apply, like the DNSSEC gate above."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.services.dns import technitium_api_scope  # noqa: PLC0415
+
+    if technitium_api_scope.DRIVER not in drivers:
+        return None
+    try:
+        technitium_api_scope.refuse_non_primary(args.zone_type)
+        technitium_api_scope.refuse_unapplied_zone_changes(
+            {"ttl": args.ttl, "primary_ns": args.primary_ns, "admin_email": args.admin_email},
+            None,
+        )
+    except HTTPException as exc:
+        return str(exc.detail)
+    return None
 
 
 def _normalize_zone_name(raw: str) -> str:
@@ -2498,6 +2520,17 @@ async def _preview_create_dns_zone(
     conflict = _gated_zone_arg_conflict(args, drivers, grp.name)
     if conflict is not None:
         return PreviewResult(ok=False, detail=conflict)
+    conflict = _technitium_api_zone_arg_conflict(args, drivers)
+    if conflict is not None:
+        return PreviewResult(ok=False, detail=conflict)
+    if args.dnssec_enabled:
+        # #1762 — single-signer rule; read-only here, re-checked under lock
+        # at apply.
+        from app.services.dns.dnssec_signers import sign_refusal  # noqa: PLC0415
+
+        refusal = await sign_refusal(db, grp.id, lock=False)
+        if refusal is not None:
+            return PreviewResult(ok=False, detail=refusal)
 
     existing = (
         await db.execute(
@@ -2563,6 +2596,17 @@ async def _apply_create_dns_zone(
     conflict = _gated_zone_arg_conflict(args, drivers, grp.name)
     if conflict is not None:
         raise ValueError(conflict)
+    conflict = _technitium_api_zone_arg_conflict(args, drivers)
+    if conflict is not None:
+        raise ValueError(conflict)
+    # #1762 — the single-signer rule the REST create applies, re-checked at
+    # apply (a server can join between proposal and approval).
+    if args.dnssec_enabled:
+        from app.services.dns.dnssec_signers import sign_refusal  # noqa: PLC0415
+
+        refusal = await sign_refusal(db, grp.id)
+        if refusal is not None:
+            raise ValueError(refusal)
 
     zone = DNSZone(
         group_id=grp.id,
@@ -3648,6 +3692,12 @@ async def _preview_assign_appliance_role(
     group_problem = await _assign_role_group_problem(db, args)
     if group_problem is not None:
         return PreviewResult(ok=False, detail=group_problem)
+    catalog_problem = await _assign_role_catalog_problem(db, row, args)
+    if catalog_problem is not None:
+        return PreviewResult(ok=False, detail=catalog_problem)
+    signer_problem = await _assign_role_signer_problem(db, row, args, lock=False)
+    if signer_problem is not None:
+        return PreviewResult(ok=False, detail=signer_problem)
 
     preview_lines = [
         f"Assign roles to **{row.hostname}** ({appliance_uuid})",
@@ -3699,6 +3749,80 @@ async def _assign_role_group_problem(db: AsyncSession, args: AssignApplianceRole
     return None
 
 
+async def _assign_role_signer_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs, *, lock: bool
+) -> str | None:
+    """#1762 — the single-signer refusal the REST role-assign route applies.
+
+    Pointing a DNS appliance at a group that already has a DNS server and
+    holds signed zones makes it a second independent signer (its agent
+    registers into the group). Refused on a pointer change only, like REST,
+    so re-proposing an unchanged assignment is never refused. When the
+    appliance's own DNS server already sits in the target group it adds no
+    signer.
+    """
+    from app.models.dns import DNSServer, DNSServerGroup  # noqa: PLC0415
+    from app.services.dns.dnssec_signers import second_signer_refusal  # noqa: PLC0415
+
+    if not args.dns_group_id or "dns_group_id" not in args.model_fields_set:
+        return None
+    engines = _APPL_DNS_ROLES.intersection(args.roles)
+    if not engines:
+        return None
+    try:
+        target_id = UUID(args.dns_group_id)
+    except ValueError:
+        return None  # _assign_role_group_problem reports it
+    if row.assigned_dns_group_id == target_id:
+        return None
+    group = await db.get(DNSServerGroup, target_id)
+    if group is None:
+        return None
+    driver = next(iter(engines)).removeprefix("dns-")
+    own = (
+        await db.execute(
+            select(DNSServer.id).where(
+                DNSServer.group_id == target_id,
+                func.lower(DNSServer.name) == (row.hostname or "").lower(),
+                DNSServer.driver == driver,
+            )
+        )
+    ).first()
+    if own is not None:
+        return None
+    return await second_signer_refusal(db, group, driver=driver, lock=lock)
+
+
+async def _assign_role_catalog_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#1782 — same refusal as the REST role-assign route: a Technitium
+    appliance must not be pointed at a catalog-enabled DNS group (#1766).
+    Only on a change, so a pre-existing assignment can still be re-saved."""
+    from app.models.dns import DNSServerGroup  # noqa: PLC0415
+    from app.services.dns.server_move import catalog_unsupported_message  # noqa: PLC0415
+
+    if "dns-technitium" not in args.roles:
+        return None
+    if "dns_group_id" in args.model_fields_set:
+        try:
+            group_id = UUID(args.dns_group_id) if args.dns_group_id else None
+        except ValueError:
+            return None  # _assign_role_group_problem reports the bad UUID
+    else:
+        group_id = row.assigned_dns_group_id
+    if group_id is None:
+        return None
+    if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
+        return None
+    group = await db.get(DNSServerGroup, group_id)
+    if group is None or not group.catalog_zones_enabled:
+        return None
+    return f"DNS server group {group.name!r} has catalog zones enabled. " + (
+        catalog_unsupported_message({"technitium"})
+    )
+
+
 async def _apply_assign_appliance_role(
     db: AsyncSession, user: User, args: AssignApplianceRoleArgs
 ) -> dict[str, Any]:
@@ -3719,6 +3843,12 @@ async def _apply_assign_appliance_role(
     group_problem = await _assign_role_group_problem(db, args)
     if group_problem is not None:
         raise ValueError(group_problem)
+    catalog_problem = await _assign_role_catalog_problem(db, row, args)
+    if catalog_problem is not None:
+        raise ValueError(catalog_problem)
+    signer_problem = await _assign_role_signer_problem(db, row, args, lock=True)
+    if signer_problem is not None:
+        raise ValueError(signer_problem)
     row.assigned_roles = list(args.roles)
     # #1562 — same contract as the REST roles endpoint: a group field
     # present in the payload with a null value unassigns the group; an

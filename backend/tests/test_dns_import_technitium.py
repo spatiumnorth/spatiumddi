@@ -38,11 +38,20 @@ def test_classify_zone_detects_reverse() -> None:
     [
         ("A", {"ipAddress": "10.0.0.1"}, "10.0.0.1"),
         ("AAAA", {"ipAddress": "2001:db8::1"}, "2001:db8::1"),
-        ("CNAME", {"cname": "www.example.net"}, "www.example.net"),
-        ("DNAME", {"dname": "other.example.net"}, "other.example.net"),
-        ("NS", {"nameServer": "ns1.example.net"}, "ns1.example.net"),
-        ("PTR", {"ptrName": "host.example.net"}, "host.example.net"),
+        ("CNAME", {"cname": "www.example.net"}, "www.example.net."),
+        ("DNAME", {"dname": "other.example.net"}, "other.example.net."),
+        ("NS", {"nameServer": "ns1.example.net"}, "ns1.example.net."),
+        ("PTR", {"ptrName": "host.example.net"}, "host.example.net."),
+        # #1760: no characterStringsBase64 (an older server) falls back to
+        # the joined ``text``, as content; a simple record reads back plain,
+        # an explicit split or a literal quote as presentation form.
         ("TXT", {"text": "v=spf1 -all"}, "v=spf1 -all"),
+        ("TXT", {"text": '"v=spf1 -all"'}, '"\\"v=spf1 -all\\""'),
+        (
+            "TXT",
+            {"text": "ab.", "characterStringsBase64": ["YQ==", "Yi4="]},
+            '"a" "b."',
+        ),
         (
             "CAA",
             {"flags": 0, "tag": "issue", "value": "letsencrypt.org"},
@@ -79,12 +88,12 @@ def test_rdata_to_value_hoists_structured_fields() -> None:
     """MX/SRV carry priority (and weight/port) as columns, not in the
     value string."""
     value, extra = _rdata_to_value("MX", {"exchange": "mail.example.net", "preference": 20})
-    assert (value, extra) == ("mail.example.net", {"priority": 20})
+    assert (value, extra) == ("mail.example.net.", {"priority": 20})
 
     value, extra = _rdata_to_value(
         "SRV", {"target": "sip.example.net", "priority": 10, "weight": 20, "port": 5060}
     )
-    assert value == "sip.example.net"
+    assert value == "sip.example.net."
     assert extra == {"priority": 10, "weight": 20, "port": 5060}
 
 
@@ -251,13 +260,16 @@ def test_pull_normalize_value_uri_and_aaaa() -> None:
     """The drift key folds the same canonicalisations (#1513)."""
     from app.services.dns.pull_from_server import _normalize_value
 
-    assert _normalize_value("URI", "1 1 https://example.test/", "example.test.") == (
-        "1 1 https://example.test"
+    assert _normalize_value(
+        "URI", "1 1 https://example.test/", "example.test.", relative_targets=True
+    ) == ("1 1 https://example.test")
+    assert _normalize_value(
+        "URI", "1 1 https://example.test/path/", "example.test.", relative_targets=True
+    ) == ("1 1 https://example.test/path/")
+    assert (
+        _normalize_value("AAAA", "2001:DB8:0:0::1", "example.test.", relative_targets=True)
+        == "2001:db8::1"
     )
-    assert _normalize_value("URI", "1 1 https://example.test/path/", "example.test.") == (
-        "1 1 https://example.test/path/"
-    )
-    assert _normalize_value("AAAA", "2001:DB8:0:0::1", "example.test.") == "2001:db8::1"
 
 
 # ── #1513 / #1698: SVCB/HTTPS compare canonically ──────────────────────
@@ -267,7 +279,7 @@ def _key_of(value: str, rtype: str = "SVCB", zone: str = "example.net."):
     from app.drivers.dns.base import RecordData
     from app.services.dns.pull_from_server import _key
 
-    return _key(RecordData(name="svc", record_type=rtype, value=value), zone)
+    return _key(RecordData(name="svc", record_type=rtype, value=value), zone, relative_targets=True)
 
 
 def test_svcb_quoting_is_one_record() -> None:

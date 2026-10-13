@@ -983,6 +983,30 @@ def uncordon_node(name: str) -> tuple[bool, str | None]:
     return False, f"kubeapi status {status}: {body[:200]!r}"
 
 
+def patch_node(name: str, patch: dict[str, Any]) -> tuple[int, str | None]:
+    """Strategic-merge PATCH a Node. Returns ``(status, error)``; ``error``
+    is None on 200/201, and status is 0 when kubeapi was not reached. A
+    ``null`` annotation value removes that key.
+
+    Unlike :func:`cordon_node` the status comes back, so a caller can tell
+    a Node that is gone (404) from a PATCH that failed."""
+    if get_config() is None:
+        return 0, "ServiceAccount not mounted"
+    path = f"/api/v1/nodes/{quote(name)}"
+    try:
+        status, body = _request(
+            "PATCH",
+            path,
+            body=json.dumps(patch).encode("utf-8"),
+            content_type="application/strategic-merge-patch+json",
+        )
+    except KubeapiUnavailableError as exc:
+        return 0, str(exc)
+    if status in (200, 201):
+        return status, None
+    return status, f"kubeapi status {status}: {body[:200]!r}"
+
+
 def is_node_ready(node: dict[str, Any]) -> bool:
     """True if the node's ``Ready`` condition is ``True``.
 
@@ -1026,6 +1050,23 @@ def pod_is_owned_by_daemonset(pod: dict[str, Any]) -> bool:
     """
     owners = (pod.get("metadata") or {}).get("ownerReferences") or []
     return any(o.get("kind") == "DaemonSet" for o in owners)
+
+
+def pod_has_controller(pod: dict[str, Any]) -> bool:
+    """True if the pod has a controller ownerReference.
+
+    A pod is controller-owned when one of its ``ownerReferences``
+    either carries ``controller: true`` (what the apiserver sets for
+    the managing controller) or names a workload controller kind
+    (ReplicaSet / StatefulSet / DaemonSet / Job /
+    ReplicationController). A bare pod — created directly, with no
+    controller — has neither, and nothing re-creates it if it is
+    deleted. Drain uses this to refuse evicting such pods (#1546),
+    matching ``kubectl drain`` without ``--force``.
+    """
+    owners = (pod.get("metadata") or {}).get("ownerReferences") or []
+    controller_kinds = {"ReplicaSet", "StatefulSet", "DaemonSet", "Job", "ReplicationController"}
+    return any(o.get("controller") or o.get("kind") in controller_kinds for o in owners)
 
 
 def pod_is_terminal(pod: dict[str, Any]) -> bool:
@@ -1277,6 +1318,32 @@ def get_deployment(name: str, namespace: str | None = None) -> tuple[int, dict[s
         except (ValueError, UnicodeDecodeError):
             return status, None
     return status, None
+
+
+def list_deployments(
+    label_selector: str, namespace: str | None = None
+) -> tuple[int, list[dict[str, Any]]]:
+    """List Deployments matching ``label_selector`` (#1544).
+
+    Returns ``(status, items)``; ``items`` is empty on any non-200. Lets a
+    caller find a release's Deployments by label instead of carrying a
+    name list that goes stale when the chart adds one.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = (
+        f"/apis/apps/v1/namespaces/{quote(ns)}/deployments"
+        f"?labelSelector={quote(label_selector, safe='')}"
+    )
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, list(json.loads(body.decode("utf-8")).get("items") or [])
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            return status, []
+    return status, []
 
 
 def deployment_is_rolled_out(deployment: dict[str, Any]) -> bool:

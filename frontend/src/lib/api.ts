@@ -4971,6 +4971,9 @@ export interface ZoneMovePreview {
    *  doesn't define (#1316). Non-empty means the commit refuses, for the
    *  same reason as ``acl_names_lost``. */
   key_names_lost: string[];
+  /** #1784 — why the experimental technitium_api target refuses this zone.
+   *  Non-null means the commit refuses — not waivable by acknowledgement. */
+  technitium_api_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -5001,6 +5004,13 @@ export interface DNSServerGroup {
    *  was mixed through the create path, which doesn't enforce homogeneity.
    *  Lets the move picker tell which groups a server can actually go to. */
   server_drivers?: string[];
+  /** #1782 — set when catalog zones are on for a group with a driver that
+   *  cannot do them (Technitium). */
+  catalog_unsupported_warning?: string | null;
+  /** #1784 — set for a group holding the experimental `technitium_api`
+   *  driver; says where an existing group falls outside its supported scope
+   *  (second server, pools). Empty for every other group. */
+  scope_warnings?: string[];
   created_at: string;
   modified_at: string;
 }
@@ -5461,6 +5471,8 @@ export interface DNSServerOptions {
   forward_tls_verify: boolean;
   trust_anchors: DNSTrustAnchor[];
   modified_at: string;
+  // Stored values a Technitium server in this group will not apply (#1763).
+  technitium_warnings?: string[];
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the
@@ -5587,6 +5599,11 @@ export interface DNSZone {
   linked_subnet_id: string | null;
   domain_id?: string | null;
   dnssec_enabled: boolean;
+  // #1762 — signed on a group with more than one DNS server, each signing
+  // with its own keys (validating resolvers SERVFAIL on the mismatch).
+  dnssec_multi_signer?: boolean;
+  /** #1783 - signed on a Technitium group; SpatiumDDI won't keep it signed (#1767). */
+  dnssec_unmanaged_warning?: boolean;
   auto_tls_probe?: boolean;
   dnssec_policy_id?: string | null;
   // Dynamic-update (RFC 2136) ACL toggle (issue #641). ACL rows are
@@ -5931,6 +5948,12 @@ export interface ZoneDnssecInfo {
   dnssec_ds_records: string[];
   dnssec_synced_at: string | null;
   keys: DNSKeyState[];
+  // #1762 — see Zone.dnssec_multi_signer; signing_servers is the group's count.
+  dnssec_multi_signer?: boolean;
+  signing_servers?: number;
+  // #1783 - the group runs Technitium; sign / re-sign are refused (#1767).
+  signing_unmanaged?: boolean;
+  dnssec_unmanaged_warning?: boolean;
 }
 
 /** A reusable BIND9 dnssec-policy definition (issue #49). */

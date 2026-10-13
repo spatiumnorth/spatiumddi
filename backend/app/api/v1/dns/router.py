@@ -95,6 +95,7 @@ from app.services.appliance.group_names import (
     group_name_problem,
 )
 from app.services.approvals.gate import gate_or_execute
+from app.services.dns import dnssec_signers, technitium_api_scope
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
     APEX_CNAME_DETAIL,
@@ -142,10 +143,18 @@ from app.services.dns.resolver_presets import (
 )
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.server_move import (
+    CATALOG_UNSUPPORTED_DRIVERS,
     ServerMoveError,
+    catalog_unsupported_message,
+    ensure_group_catalog_compatible,
     ensure_group_single_driver,
     move_server_to_group,
 )
+from app.services.dns.technitium_options import (
+    allow_transfer_problem as technitium_transfer_problem,
+)
+from app.services.dns.technitium_options import refusals as technitium_option_refusals
+from app.services.dns.technitium_options import stored_warnings as technitium_stored_warnings
 from app.services.dns.tld_registry import (
     SOURCE_URL,
     TldFetchError,
@@ -256,11 +265,18 @@ _DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
 # online via REST and BIND9 needs the manual ``dnssec-keygen``
 # dance that's #49's umbrella scope.
 _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
-    # PowerDNS (online signing), BIND9 (inline-signing via dnssec-policy,
-    # issue #49) and Technitium (online signing, issue #740) all support
-    # sign/unsign. Windows DNS does not.
-    "dnssec_sign": frozenset({"powerdns", "bind9", "technitium"}),
-    "dnssec_unsign": frozenset({"powerdns", "bind9", "technitium"}),
+    # PowerDNS (online signing) and BIND9 (inline-signing via dnssec-policy,
+    # issue #49) can sign; the set lives in ``dnssec_signers`` so the
+    # single-signer rule (#1762) and zone move read the same one. Technitium
+    # is deliberately NOT in it (#1783): its
+    # signing is one-shot (never re-signed on a new server, a re-created zone
+    # or a lost volume, policy ignored, key state reported only while signed),
+    # so SpatiumDDI would show a zone signed that is not. Full support is
+    # #1767. Windows DNS cannot sign.
+    "dnssec_sign": dnssec_signers.SIGNING_DRIVERS,
+    # UNSIGN stays allowed on Technitium so an operator can turn a zone that
+    # was signed before #1783 back off; the flip-off path is ungated.
+    "dnssec_unsign": dnssec_signers.PER_SERVER_SIGNING_DRIVERS,
     # Manual key rollover is BIND9-only (rndc dnssec -rollover); PowerDNS
     # rolls on its own schedule + Windows DNS isn't supported.
     "dnssec_rollover": frozenset({"bind9"}),
@@ -358,13 +374,26 @@ class ServerGroupResponse(BaseModel):
     # Exposed so a client can tell which groups a given server may move into
     # without fetching every group's server list to find out.
     server_drivers: list[str] = []
+    # #1782 — set when catalog zones are on for a group that has a driver
+    # which cannot do them (Technitium). Existing groups keep rendering as
+    # before; this is the visible warning.
+    catalog_unsupported_warning: str | None = None
+    # #1784 — set when the group holds an experimental ``technitium_api``
+    # server, and says where an already-existing group falls outside the
+    # supported scope (second server, pools). Empty for every other group.
+    scope_warnings: list[str] = []
     created_at: datetime
     modified_at: datetime
 
     model_config = {"from_attributes": True}
 
     @classmethod
-    def from_model(cls, g: DNSServerGroup, drivers: list[str] | None = None) -> ServerGroupResponse:
+    def from_model(
+        cls,
+        g: DNSServerGroup,
+        drivers: list[str] | None = None,
+        warnings: list[str] | None = None,
+    ) -> ServerGroupResponse:
         return cls(
             id=g.id,
             name=g.name,
@@ -376,6 +405,12 @@ class ServerGroupResponse(BaseModel):
             catalog_zone_name=g.catalog_zone_name,
             is_public_facing=g.is_public_facing,
             server_drivers=sorted(drivers or []),
+            catalog_unsupported_warning=(
+                catalog_unsupported_message(drivers or [])
+                if g.catalog_zones_enabled and set(drivers or []) & CATALOG_UNSUPPORTED_DRIVERS
+                else None
+            ),
+            scope_warnings=list(warnings or []),
             created_at=g.created_at,
             modified_at=g.modified_at,
         )
@@ -905,6 +940,9 @@ class ServerOptionsResponse(BaseModel):
     forward_tls_verify: bool
     trust_anchors: list[TrustAnchorResponse]
     modified_at: datetime
+    # Stored values a Technitium server in this group will not apply (#1763).
+    # Empty for a group with no agent-managed Technitium server.
+    technitium_warnings: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -1296,6 +1334,10 @@ class ZoneResponse(BaseModel):
     linked_subnet_id: uuid.UUID | None
     domain_id: uuid.UUID | None = None
     dnssec_enabled: bool
+    # #1762 — True when the zone is signed on a group with >1 agent DNS server
+    # (each signs with its own keys; disabled ones too — they still serve the
+    # bundle). Derived in ``_zones_out``; never stored.
+    dnssec_multi_signer: bool = False
     auto_tls_probe: bool = False
     dnssec_policy_id: uuid.UUID | None = None
     dynamic_update_enabled: bool = False
@@ -1336,6 +1378,10 @@ class ZoneResponse(BaseModel):
     # the create handlers; empty everywhere else. A later delete removes the
     # zone from those servers too, so the operator should know it was found.
     adopted_existing_on: list[str] = Field(default_factory=list)
+    # #1783 — True when the zone is flagged signed on a group with a Technitium
+    # server: signed before SpatiumDDI stopped claiming Technitium signing, and
+    # SpatiumDDI will not keep it signed (#1767). Derived at serialisation.
+    dnssec_unmanaged_warning: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -1356,11 +1402,19 @@ async def _zones_out(db: DB, zones: Sequence[DNSZone]) -> list[ZoneResponse]:
     if not zones:
         return []
     registry = await effective_registry(db)
+    multi = await dnssec_signers.multi_signer_group_ids(
+        db, {z.group_id for z in zones if z.dnssec_enabled}
+    )
+    unmanaged = await dnssec_signers.unmanaged_signing_group_ids(
+        db, {z.group_id for z in zones if z.dnssec_enabled}
+    )
     out: list[ZoneResponse] = []
     for z in zones:
         scope = classify_zone_name(z.name, tlds=registry.tlds)
         row = ZoneResponse.model_validate(z)
         row.name_scope = scope.scope
+        row.dnssec_multi_signer = bool(z.dnssec_enabled) and z.group_id in multi
+        row.dnssec_unmanaged_warning = bool(z.dnssec_enabled) and z.group_id in unmanaged
         row.name_scope_detail = ZoneNameScopeDetail(
             scope=scope.scope,
             reason=scope.reason,
@@ -1694,7 +1748,8 @@ async def list_groups(db: DB, _: CurrentUser) -> list[ServerGroupResponse]:
     result = await db.execute(select(DNSServerGroup).order_by(DNSServerGroup.name))
     groups = list(result.scalars().all())
     drivers = await _drivers_by_group(db, [g.id for g in groups])
-    return [ServerGroupResponse.from_model(g, drivers.get(g.id)) for g in groups]
+    warns = await technitium_api_scope.scope_warnings_by_group(db, [g.id for g in groups])
+    return [ServerGroupResponse.from_model(g, drivers.get(g.id), warns.get(g.id)) for g in groups]
 
 
 @router.post("/groups", response_model=ServerGroupResponse, status_code=status.HTTP_201_CREATED)
@@ -1737,7 +1792,8 @@ async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> ServerGroupR
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
     drivers = await _drivers_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id))
+    warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
 
 
 @router.put("/groups/{group_id}", response_model=ServerGroupResponse)
@@ -1763,6 +1819,17 @@ async def update_group(
             "is_public_facing",
         },
     )
+    # #1784 — only turning catalog zones ON is refused: turning an
+    # unapplied setting OFF is the way out of it, and a re-save of the
+    # stored value must keep working.
+    if (
+        changes.get("catalog_zones_enabled") is True
+        and not group.catalog_zones_enabled
+        and await technitium_api_scope.group_is_technitium_api(db, group.id)
+    ):
+        raise technitium_api_scope.refusal(
+            "catalog zones are not written to the Technitium server."
+        )
     # #1468 — an appliance's supervisor gets this group by NAME and drops a
     # name it won't put in its role env, so don't rename an assigned group
     # into one. Only on an actual change: re-saving a legacy name is fine.
@@ -1775,6 +1842,13 @@ async def update_group(
         problem = group_name_problem("dns", new_name)
         if problem is not None:
             raise HTTPException(status_code=422, detail=problem)
+    # #1782 — refuse turning catalog zones ON for a group running a driver
+    # that cannot do them. Only the False -> True transition: re-saving an
+    # already-enabled legacy group must keep working (it gets a warning).
+    if changes.get("catalog_zones_enabled") is True and not group.catalog_zones_enabled:
+        group_drivers = (await _drivers_by_group(db, [group.id])).get(group.id, [])
+        if set(group_drivers) & CATALOG_UNSUPPORTED_DRIVERS:
+            raise HTTPException(status_code=422, detail=catalog_unsupported_message(group_drivers))
     for k, v in changes.items():
         setattr(group, k, v)
 
@@ -1795,7 +1869,8 @@ async def update_group(
     await db.commit()
     await db.refresh(group)
     drivers = await _drivers_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id))
+    warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
 
 
 @router.post("/groups/{group_id}/group-tsig-key/rotate", response_model=ServerGroupResponse)
@@ -1831,7 +1906,8 @@ async def rotate_group_key(
     await db.commit()
     await db.refresh(group)
     drivers = await _drivers_by_group(db, [group.id])
-    return ServerGroupResponse.from_model(group, drivers.get(group.id))
+    warns = await technitium_api_scope.scope_warnings_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id), warns.get(group.id))
 
 
 @router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1994,8 +2070,10 @@ async def create_server(
             group_name=group.name,
             hint=f"create it in a {body.driver}-only group, or an empty one.",
         )
+        await ensure_group_catalog_compatible(db, group, body.driver)
     except ServerMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    await _refuse_second_signer(db, group, driver=body.driver)
     existing = await db.execute(
         select(DNSServer).where(DNSServer.group_id == group_id, DNSServer.name == body.name)
     )
@@ -2074,6 +2152,19 @@ async def create_server(
     return ServerResponse.from_model(server)
 
 
+async def _refuse_second_signer(
+    db: DB, group: DNSServerGroup, *, driver: str, exclude: uuid.UUID | None = None
+) -> None:
+    """#1762 — 422 when a server joining ``group`` would be a second
+    independent DNSSEC signer for zones that are already signed there. A
+    disabled server counts: it still receives and serves the bundle."""
+    refusal = await dnssec_signers.second_signer_refusal(
+        db, group, driver=driver, exclude_server_id=exclude
+    )
+    if refusal is not None:
+        raise HTTPException(status_code=422, detail=refusal)
+
+
 @router.put("/groups/{group_id}/servers/{server_id}", response_model=ServerResponse)
 async def update_server(
     group_id: uuid.UUID,
@@ -2107,6 +2198,7 @@ async def update_server(
                 ),
                 exclude_server_id=server.id,
             )
+            await ensure_group_catalog_compatible(db, group, body.driver)
         except ServerMoveError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     # #1563 — explicit null clears api_port; null for a NOT NULL column
@@ -3325,12 +3417,24 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
     # Every encrypted transport needs a name, not just DoT.
     #
     # For bind9 (tls) it is what ``remote-hostname`` validates against, so
-    # the requirement is conditional on verification being on. For
-    # technitium it is stricter: the daemon rejects an IP outright
-    # ("Address must be a domain name") for tls/https/quic, so without a
-    # hostname the agent has nothing to send and skips the forwarder apply
-    # entirely — leaving whatever forwarders were there before. Requiring
-    # it up front turns that silent staleness into a 422.
+    # the requirement is conditional on verification being on. Technitium
+    # validates the upstream certificate against the name unconditionally and
+    # pairs it with each forwarder IP as "name (ip)" (#1764), so for a group
+    # with a Technitium server the name is required for tls whatever
+    # ``forward_tls_verify`` says (the agent refuses to send bare IPs over
+    # Tls, since they fail wherever the certificate has no IP SAN).
+    if (
+        opts.forward_transport == "tls"
+        and not opts.forward_tls_hostname
+        and "technitium" in drivers
+    ):
+        raise HTTPException(
+            422,
+            "forward_tls_hostname is required when forwarding over TLS in a group "
+            "with a Technitium server: Technitium always validates the upstream "
+            "certificate, against that name. Set the provider's DoT hostname (e.g. "
+            "dns.quad9.net).",
+        )
     if opts.forward_transport in ("https", "quic") and not opts.forward_tls_hostname:
         raise HTTPException(
             422,
@@ -3447,8 +3551,51 @@ async def _load_options(group_id: uuid.UUID, db: DB) -> DNSServerOptions | None:
     return result.scalar_one_or_none()
 
 
+async def _options_response(
+    db: DB, group_id: uuid.UUID, opts: DNSServerOptions
+) -> ServerOptionsResponse:
+    out = ServerOptionsResponse.model_validate(opts)
+    if "technitium" in await _group_driver_names(db, group_id):
+        acls = await _group_acl_definitions(db, group_id)
+        out.technitium_warnings = technitium_stored_warnings(opts, acls)
+        # Zone-level overrides saved before the gate (#1765).
+        zones = (
+            await db.execute(
+                select(DNSZone.name, DNSZone.allow_transfer).where(
+                    DNSZone.group_id == group_id, DNSZone.allow_transfer.is_not(None)
+                )
+            )
+        ).all()
+        for name, allow_transfer in zones:
+            if problem := technitium_transfer_problem(allow_transfer, acls):
+                out.technitium_warnings.append(
+                    f"zone {name}: {problem}; zone transfer is left as the daemon has it"
+                )
+    return out
+
+
+async def _group_acl_definitions(db: DB, group_id: uuid.UUID) -> dict[str, list[tuple[str, bool]]]:
+    """The group's named ACLs as ``name -> [(value, negate)]``, for the
+    Technitium address-match translation (#1765)."""
+    rows = (
+        (
+            await db.execute(
+                select(DNSAcl)
+                .where(DNSAcl.group_id == group_id)
+                .options(selectinload(DNSAcl.entries))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        a.name: [(e.value, bool(e.negate)) for e in sorted(a.entries, key=lambda x: x.order)]
+        for a in rows
+    }
+
+
 @router.get("/groups/{group_id}/options", response_model=ServerOptionsResponse)
-async def get_options(group_id: uuid.UUID, db: DB, _: CurrentUser) -> DNSServerOptions:
+async def get_options(group_id: uuid.UUID, db: DB, _: CurrentUser) -> ServerOptionsResponse:
     await _require_group(group_id, db)
     opts = await _load_options(group_id, db)
     if not opts:
@@ -3457,7 +3604,8 @@ async def get_options(group_id: uuid.UUID, db: DB, _: CurrentUser) -> DNSServerO
         db.add(opts)
         await db.commit()
         opts = await _load_options(group_id, db)
-    return opts  # type: ignore[return-value]
+    assert opts is not None
+    return await _options_response(db, group_id, opts)
 
 
 async def _validated_option_changes(
@@ -3528,6 +3676,21 @@ async def _validated_zone_named_conf_fields(
         and (zone is None or v != getattr(zone, k, None))
     }
     cleaned = await _validated_option_changes(group_id, fields, zone, db) if fields else {}
+    if (
+        "allow_transfer" in cleaned
+        and "technitium" in await _group_driver_names(db, group_id)
+        and (
+            problem := technitium_transfer_problem(
+                cleaned["allow_transfer"], await _group_acl_definitions(db, group_id)
+            )
+        )
+    ):
+        raise HTTPException(
+            422,
+            "This group has a Technitium server, which cannot apply this zone's "
+            f"{problem}. Move the Technitium server to its own group, or use addresses, "
+            "'!' exclusions, 'key <name>' on its own, or a defined ACL.",
+        )
     zone_type = changes.get("zone_type") or (zone.zone_type if zone is not None else None)
     if zone_type != "forward":
         return cleaned
@@ -3603,9 +3766,10 @@ async def _refuse_if_alias_records_lose_resolver(group_id: uuid.UUID, db: DB) ->
 @router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
 async def update_options(
     group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB, current_user: SuperAdmin
-) -> DNSServerOptions:
+) -> ServerOptionsResponse:
     await _require_group(group_id, db)
     opts = await _load_options(group_id, db)
+    stored_opts = opts
     if not opts:
         opts = DNSServerOptions(group_id=group_id)
         db.add(opts)
@@ -3631,7 +3795,23 @@ async def update_options(
     ):
         if field in body.model_fields_set and getattr(body, field) is None:
             changes[field] = None
+    if await technitium_api_scope.group_is_technitium_api(db, group_id):
+        technitium_api_scope.refuse_unapplied_option_changes(changes, stored_opts)
     changes.update(await _validated_option_changes(group_id, changes, opts, db))
+    # Options the agent-managed Technitium driver cannot apply (#1763): refuse
+    # rather than store a value the daemon will silently ignore. Same subset
+    # semantics as the transport gates: any Technitium server in the group.
+    if "technitium" in await _group_driver_names(db, group_id):
+        if refused := technitium_option_refusals(
+            changes, opts, await _group_acl_definitions(db, group_id)
+        ):
+            raise HTTPException(
+                422,
+                "This group has a Technitium server, which cannot apply: "
+                + "; ".join(refused)
+                + ". Move the Technitium server to its own group, or leave these at "
+                "their defaults.",
+            )
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     for k, v in changes.items():
         setattr(opts, k, v)
@@ -3700,7 +3880,8 @@ async def update_options(
         await _collect_appliance_wakes_for_dns_group(db, group_id)
     await db.commit()
     reloaded = await _load_options(group_id, db)
-    return reloaded  # type: ignore[return-value]
+    assert reloaded is not None
+    return await _options_response(db, group_id, reloaded)
 
 
 @router.post(
@@ -4572,11 +4753,27 @@ async def _assert_forward_zone_serviceable(
         )
 
 
+async def _enforce_technitium_api_zone_scope(
+    db: DB, group_id: uuid.UUID, changes: dict[str, Any], current: DNSZone | None
+) -> None:
+    """422 zone settings the experimental ``technitium_api`` driver can't apply (#1784).
+
+    No-op for every other driver. ``current`` is the stored zone on update,
+    so only a CHANGED value is refused and an unchanged re-save passes.
+    """
+    if not await technitium_api_scope.group_is_technitium_api(db, group_id):
+        return
+    if current is None or ("zone_type" in changes and changes["zone_type"] != current.zone_type):
+        technitium_api_scope.refuse_non_primary(changes.get("zone_type", "primary"))
+    technitium_api_scope.refuse_unapplied_zone_changes(changes, current)
+
+
 @router.post("/groups/{group_id}/zones", response_model=ZoneResponse, status_code=201)
 async def create_zone(
     group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: SuperAdmin
 ) -> ZoneResponse:
     await _require_group(group_id, db)
+    await _enforce_technitium_api_zone_scope(db, group_id, body.model_dump(), None)
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
@@ -5295,6 +5492,7 @@ async def update_zone(
     # nor empty the masters on an existing secondary.
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
+    await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
     changes.update(await _validated_zone_named_conf_fields(zone.group_id, changes, zone, db))
     effective_zone_type = changes.get("zone_type", zone.zone_type)
     await _assert_forward_zone_serviceable(
@@ -6031,6 +6229,15 @@ class ZoneDNSSECInfo(BaseModel):
     dnssec_ds_records: list[str] = []
     dnssec_synced_at: datetime | None = None
     keys: list[DNSSECKeyState] = []
+    # #1762 — the zone is signed and its group has more than one DNS server,
+    # each signing with its own keys; ``signing_servers`` is that count.
+    dnssec_multi_signer: bool = False
+    signing_servers: int = 0
+    # #1783 — the group runs a driver SpatiumDDI no longer signs on
+    # (Technitium); sign / re-sign are refused there (#1767). With
+    # ``dnssec_enabled`` this is a zone signed before the withdrawal.
+    signing_unmanaged: bool = False
+    dnssec_unmanaged_warning: bool = False
 
 
 class ZoneTemplateParameter(BaseModel):
@@ -6116,8 +6323,14 @@ async def get_zone_dnssec_info(
         .scalars()
         .all()
     )
+    signers = await dnssec_signers.signing_server_count(db, zone.group_id)
+    unmanaged = bool(await dnssec_signers.unmanaged_signing_group_ids(db, {zone.group_id}))
     return ZoneDNSSECInfo.model_validate(
         {
+            "dnssec_multi_signer": bool(zone.dnssec_enabled) and signers > 1,
+            "signing_servers": signers,
+            "signing_unmanaged": unmanaged,
+            "dnssec_unmanaged_warning": bool(zone.dnssec_enabled) and unmanaged,
             "zone_id": str(zone.id),
             "zone_name": zone.name,
             "dnssec_enabled": zone.dnssec_enabled,
@@ -6356,6 +6569,9 @@ class ZoneMovePreviewResponse(BaseModel):
     acl_names_remapped: list[str]
     acl_names_lost: list[str]
     key_names_lost: list[str]
+    #: #1784 — the experimental technitium_api target refuses this zone;
+    #: non-null means the commit refuses, not waivable by acknowledgement.
+    technitium_api_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -6392,6 +6608,7 @@ class ZoneMovePreviewResponse(BaseModel):
             acl_names_remapped=plan.acl_names_remapped,
             acl_names_lost=plan.acl_names_lost,
             key_names_lost=plan.key_names_lost,
+            technitium_api_refusal=plan.technitium_api_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
@@ -7440,6 +7657,7 @@ async def update_record(
     )
     before_name, before_value = record.name, record.value
     before_view = record.view_id
+    before_op = record_op_payload(record)
     for k, v in changes.items():
         setattr(record, k, v)
     # #424 — validate the merged per-type fields (record_type is immutable on
@@ -7503,21 +7721,44 @@ async def update_record(
     target_serial = bump_zone_serial(zone) if zone is not None else None
     op = None
     if zone is not None:
-        op = await enqueue_record_op(
-            db,
-            zone,
-            "update",
-            {
-                "name": record.name,
-                "type": record.record_type,
-                "value": record.value,
-                "ttl": record.ttl,
-                "priority": record.priority,
-                "weight": record.weight,
-                "port": record.port,
-            },
-            target_serial=target_serial,
-        )
+        new_payload = {
+            "name": record.name,
+            "type": record.record_type,
+            "value": record.value,
+            "ttl": record.ttl,
+            "priority": record.priority,
+            "weight": record.weight,
+            "port": record.port,
+        }
+        if name_changed:
+            # #1773 — a rename is delete-at-old-name + create-at-new-name: an
+            # "update" replaces the RRset AT the new name and never touches
+            # the old one, so the old name stayed served (#492 fixed only the
+            # IPAM path). One batch, delete first (#1489): agentless drivers
+            # get both in one apply_record_changes call, agents get two
+            # ordered rows. record_type is immutable on update, so a rename is
+            # the only identity change an edit can make.
+            ops = await enqueue_record_ops_batch(
+                db,
+                zone,
+                [
+                    {"op": "delete", "record": before_op, "target_serial": target_serial},
+                    {
+                        "op": "create",
+                        "record": {**new_payload, "record_id": str(record.id)},
+                        "target_serial": target_serial,
+                    },
+                ],
+            )
+            # Surface a failure of either half: a failed delete leaves the old
+            # name live, which is the very bug being fixed.
+            op = next((o for o in ops if o is not None and o.last_error), None) or (
+                ops[-1] if ops else None
+            )
+        else:
+            op = await enqueue_record_op(
+                db, zone, "update", new_payload, target_serial=target_serial
+            )
     # #1538 — as create: a failed first agentless attempt is surfaced, not
     # silently audited as success.
     provider_warning = _agentless_op_warning(op)
@@ -8634,6 +8875,25 @@ async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) ->
     if not drivers:
         return
     incompatible = drivers - allowed
+    if op == "dnssec_sign" and incompatible & dnssec_signers.UNMANAGED_SIGNING_DRIVERS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "DNSSEC signing is not supported on Technitium servers: "
+                "SpatiumDDI cannot keep a Technitium zone signed (it is signed "
+                "once and never re-signed on a new server, a re-created zone "
+                "or a lost volume, and the zone's DNSSEC policy is ignored). "
+                "Use a BIND9 or PowerDNS group for signed zones; full "
+                "Technitium support is tracked in #1767."
+            ),
+        )
+    if not incompatible and op == "dnssec_sign":
+        # #1762 — every engine signs per server with its own keys. Counts
+        # disabled servers too (they still serve the bundle) and locks the
+        # group so a concurrent server add cannot slip in.
+        refusal = await dnssec_signers.sign_refusal(db, group_id)
+        if refusal is not None:
+            raise HTTPException(status_code=422, detail=refusal)
     if incompatible:
         raise HTTPException(
             status_code=422,

@@ -381,6 +381,11 @@ def test_a_leave_starts_k3s_with_the_manifest_unskipped(tmp_path: Path) -> None:
     proc_stat = tmp_path / "stat"
     proc_stat.write_text(f"btime {BOOTED}\n")
     started = tmp_path / "k3s-started-with"
+    # #1541: the leave first asks etcd to remove this member; stub that as
+    # granted so the test reaches the restart it is about.
+    evict = tmp_path / "spatium-etcd-evict"
+    evict.write_text("#!/bin/sh\nexit 0\n")
+    evict.chmod(0o755)
     stubs = (
         # systemd runs the ExecStartPre lines, then k3s: record what k3s sees
         "systemctl() {\n"
@@ -411,7 +416,8 @@ def test_a_leave_starts_k3s_with_the_manifest_unskipped(tmp_path: Path) -> None:
              "SPATIUM_K3S_MANIFESTS_DIR": str(manifests),
              "SPATIUM_K3S_DB_DIR": str(server / "db"),
              "SPATIUM_FIRSTBOOT_STAMP": str(done),
-             "SPATIUM_PROC_STAT": str(proc_stat)},
+             "SPATIUM_PROC_STAT": str(proc_stat),
+             "SPATIUM_ETCD_EVICT": str(evict)},
         capture_output=True,
         text=True,
         check=False,
@@ -434,5 +440,7 @@ def test_a_failed_join_keeps_the_marker() -> None:
     assert f'rm -f "$K3S_MANIFESTS/{MANIFEST}.skip"' not in join
     restore = leave.index('mv -f "$MANIFESTS_ASIDE"/*.yaml* "$K3S_MANIFESTS/"')
     drop = leave.index(f'rm -f "$K3S_MANIFESTS/{MANIFEST}.skip"')
-    start = leave.index("systemctl start k3s")
+    # The LAST start is the restart onto the new datastore; an earlier one
+    # belongs to the #1541 path that refuses the leave and keeps the old one.
+    start = leave.rindex("systemctl start k3s")
     assert restore < drop < start
