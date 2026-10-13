@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS agent no longer copies its whole config cache through memory
+  on each apply (#1705).** `save_config` built the bundle as one string
+  and encoded it again, and `commit_config` read `current.json` and
+  wrote it back through memory, each adding about twice the config to
+  the agent's peak (about 237 MiB at 124 MB, the Family filter). The
+  cache is now streamed to disk, compact, fsynced before its rename, and
+  promoted to `previous.json` with a file copy. The ingest sweep also stops
+  re-parsing the cache every 180 s when it has not changed.
+
 - **An IPAM template apply lists only the columns it changed (#1634).**
   `fields_written`, in the response and in the apply's audit row, named
   every column that was empty on the target, including ones the template
