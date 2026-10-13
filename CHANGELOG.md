@@ -93,6 +93,12 @@ the formatter handles the rest.
   field is gone from the pool form; clearing an old value with null
   still works. Changes the DHCP pool API and form, not the served Kea
   config.
+- **Renew / rebind timers (options 58 / 59) are no longer documented as
+  settable, and a Kea import says it drops them (#1690).** The API has
+  always refused them; the docs claimed otherwise. T1 / T2 are derived
+  from each lease (50% / 87.5%). Importing a Kea config whose subnet
+  carries `renew-timer` or `rebind-timer` now adds a `parse_warnings`
+  entry saying so instead of dropping them silently.
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and

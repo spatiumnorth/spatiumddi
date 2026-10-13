@@ -240,6 +240,16 @@ def _parse_subnet(
     scope_options = _parse_option_data(entry.get("option-data"), address_family=address_family)
     options = {**global_options, **scope_options}
 
+    # #1690 — SpatiumDDI has no per-scope T1/T2 setting (Kea is rendered with
+    # calculate-tee-times), so say what the import drops instead of dropping it.
+    dropped_timers = [k for k in ("renew-timer", "rebind-timer") if entry.get(k) is not None]
+    if dropped_timers:
+        parse_warnings.append(
+            f"{' and '.join(dropped_timers)} ({', '.join(str(entry[k]) for k in dropped_timers)} s) "
+            "not imported — renew/rebind times (options 58/59) are derived from each lease "
+            "(50% / 87.5% of its lifetime) and cannot be set per scope."
+        )
+
     lease_time = int(entry.get("valid-lifetime") or global_lease_time or 86400)
     min_lt = entry.get("min-valid-lifetime")
     max_lt = entry.get("max-valid-lifetime")
