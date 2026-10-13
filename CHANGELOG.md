@@ -84,6 +84,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Changing an address's IP inside one reverse zone retracts the old
+  PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
+  `update` at the new name, which replaces the RRset at its own name and
+  never touches the old one. The old PTR stayed served: until the next
+  structural render on an agent engine, indefinitely on `technitium_api`,
+  Windows and the cloud drivers. A PTR whose name changes now queues a
+  `delete` of the old name and value, then a `create` at the new name, as
+  one batch (an agentless primary gets both in a single
+  `apply_record_changes` call), the same shape the record PUT uses (#1773).
+  A hostname rename keeps the PTR name and stays one `update`. The forward
+  A/AAAA side already did delete-then-create on a rename. The old-name
+  delete is a deliberate retraction, so the Technitium re-assert (#1800)
+  does not bring it back.
+
 - **Deleting a large blocklist, opening its entries page and bulk-adding
   entries no longer load the whole list into the api (#1724).** Delete
   hydrated every entry (~2.4 KB each; a 582k catalog list OOM-killed the
