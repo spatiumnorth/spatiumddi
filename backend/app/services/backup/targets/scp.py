@@ -451,7 +451,7 @@ def _load_supplied_host_keys(client, known: str) -> None:
     the same host raised, was skipped too, and the server was refused
     as "not found in known_hosts" with the right key pinned (#1692).
     """
-    revoked: set[tuple[str, str]] = set()
+    revoked: set[bytes] = set()
     pins: list[tuple[list[str], str, str]] = []
     for line in known.splitlines():
         line = line.strip()
@@ -465,32 +465,45 @@ def _load_supplied_host_keys(client, known: str) -> None:
             continue
         hostfield, keytype, key_b64 = parts[0], parts[1], parts[2]
         if marker == "@revoked":
-            revoked.add((keytype, key_b64))
+            # Keyed on the key BLOB, not on the line's spelling of it, so
+            # a revoked key cannot slip through because the pin wrote its
+            # base64 or its type field differently.
+            revoked.update(_key_identities(keytype, key_b64))
             continue
         if marker is not None:
             # ``@cert-authority`` pins a CA that signs host certificates,
             # not a host key, and paramiko verifies no host certificates.
             # Loading its key as a plain pin would trust a key OpenSSH
             # treats as a CA, so the line is dropped: the host is refused
-            # unless it has a plain line of its own (fail closed).
+            # unless it has a plain line of its own (fail closed). An
+            # unknown marker is an error line to OpenSSH, so it is too.
             continue
         # The host field is a comma-separated pattern list (sshd(8),
         # SSH_KNOWN_HOSTS FILE FORMAT): ``host,ip``, ``[host]:port``, or
         # one hashed ``|1|salt|hash`` entry. paramiko's HostKeys.add takes
-        # ONE name, so each is added under its own (#1728). Wildcard and
-        # ``!`` negated patterns are dropped: this store compares names
-        # literally, so one could never match.
+        # ONE name, so each is added under its own (#1728). This store
+        # compares names literally, so a wildcard can never match and is
+        # dropped. A ``!`` negation cannot be stored either, but it still
+        # binds the line: OpenSSH never matches a host that a negated
+        # pattern on the line matches, so a literal name it covers is
+        # dropped rather than pinned.
+        fields = [n for n in hostfield.split(",") if n]
+        negated = [n[1:] for n in fields if n.startswith("!") and len(n) > 1]
         names = [
             n
-            for n in hostfield.split(",")
-            if n and not n.startswith("!") and "*" not in n and "?" not in n
+            for n in fields
+            if not n.startswith("!")
+            and "*" not in n
+            and "?" not in n
+            and not any(_ssh_pattern_matches(n, neg) for neg in negated)
         ]
         if names:
             pins.append((names, keytype, key_b64))
     for names, keytype, key_b64 in pins:
-        # A key revoked anywhere in the file is refused everywhere, as
-        # OpenSSH does.
-        if (keytype, key_b64) in revoked:
+        # A key revoked anywhere in the file is refused everywhere. That is
+        # stricter than OpenSSH, which scopes ``@revoked`` to its host
+        # patterns, and is the fail-closed reading.
+        if revoked & _key_identities(keytype, key_b64):
             continue
         try:
             decoded = _decode_pubkey(keytype, key_b64)
@@ -500,6 +513,35 @@ def _load_supplied_host_keys(client, known: str) -> None:
                 client._host_keys.add(name, keytype, decoded)  # noqa: SLF001
         except Exception:  # noqa: BLE001 — a bad line pins nothing
             continue
+
+
+def _ssh_pattern_matches(name: str, pattern: str) -> bool:
+    """OpenSSH ``match_pattern``: ``*`` and ``?`` are the only
+    metacharacters (``[`` is literal, as in ``[host]:port``), and host
+    names compare case-insensitively."""
+    import re  # noqa: PLC0415
+
+    rx = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern.lower())
+    return re.fullmatch(rx, name.lower(), flags=re.DOTALL) is not None
+
+
+def _key_identities(keytype: str, key_b64: str) -> set[bytes]:
+    """The forms a known_hosts key is compared by: the decoded wire blob
+    and, when paramiko can parse it, its canonical re-encoding."""
+    import base64  # noqa: PLC0415
+
+    out: set[bytes] = set()
+    try:
+        out.add(base64.b64decode(key_b64))
+    except Exception:  # noqa: BLE001 — undecodable: nothing to compare by
+        return out
+    decoded = _decode_pubkey(keytype, key_b64)
+    if decoded is not None:
+        try:
+            out.add(decoded.asbytes())
+        except Exception:  # noqa: BLE001 — the raw blob above still counts
+            pass
+    return out
 
 
 def _load_private_key(pem: str, passphrase: str | None):

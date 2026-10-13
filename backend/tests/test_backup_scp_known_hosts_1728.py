@@ -13,7 +13,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import os
+import socket
+import threading
 
 import paramiko
 import pytest
@@ -106,3 +109,127 @@ def test_negated_name_in_a_list_is_not_added() -> None:
 @pytest.mark.parametrize("line", ["sftp.example,", ",", "sftp.example ssh-ed25519", "@revoked", ""])
 def test_malformed_lines_pin_nothing(line: str) -> None:
     assert _load(line + "\n").get_host_keys().lookup("sftp.example") is None
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "sftp.example,!sftp.example",
+        "sftp.example,!*.example",
+        "SFTP.example,!sftp.EXAMPLE",
+        "[sftp.example]:2222,![sftp.example]:2222",
+    ],
+)
+def test_a_negation_that_covers_a_name_on_its_line_withholds_it(field: str) -> None:
+    # OpenSSH never matches a host a negated pattern on the line matches.
+    # Dropping only the ``!`` entry would pin the name it was there to
+    # exclude.
+    keytype, b64 = _pub()
+    hk = _load(f"{field} {keytype} {b64}\n").get_host_keys()
+    for name in field.split(","):
+        if not name.startswith("!"):
+            assert hk.lookup(name) is None, name
+
+
+def test_a_revoked_key_is_matched_by_blob_not_by_spelling() -> None:
+    # The pin carries a character the base64 decoder discards, so the two
+    # lines differ as strings and still name the same key.
+    keytype, b64 = _pub()
+    respelled = b64[:20] + "\x00" + b64[20:]
+    assert (
+        _load(f"sftp.example {keytype} {respelled}\n").get_host_keys().lookup("sftp.example")
+    )  # control: the respelled pin is a working pin on its own
+    text = f"sftp.example {keytype} {respelled}\n@revoked * {keytype} {b64}\n"
+    assert _load(text).get_host_keys().lookup("sftp.example") is None
+
+
+# --- the connect path: a real SSH handshake against an in-process server ---
+
+
+class _Server(paramiko.ServerInterface):
+    def check_auth_password(self, username: str, password: str) -> int:
+        return paramiko.AUTH_SUCCESSFUL
+
+    def get_allowed_auths(self, username: str) -> str:
+        return "password"
+
+
+@pytest.fixture
+def ssh_server():  # type: ignore[no-untyped-def]
+    host_key = paramiko.Ed25519Key.from_private_key(
+        io.StringIO(
+            ed25519.Ed25519PrivateKey.generate()
+            .private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.OpenSSH,
+                serialization.NoEncryption(),
+            )
+            .decode()
+        )
+    )
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(4)
+    sock.settimeout(10)
+    transports: list[paramiko.Transport] = []
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = sock.accept()
+            except OSError:
+                return
+            t = paramiko.Transport(conn)
+            t.add_server_key(host_key)
+            transports.append(t)
+            try:
+                t.start_server(server=_Server())
+            except Exception:  # noqa: BLE001 — the client refused the key
+                continue
+
+    threading.Thread(target=serve, daemon=True).start()
+    yield sock.getsockname()[1], f"{host_key.get_name()} {host_key.get_base64()}"
+    sock.close()
+    for t in transports:
+        t.close()
+
+
+def _connect(port: int, known_hosts: str):  # type: ignore[no-untyped-def]
+    from app.services.backup.targets.scp import ScpDestination
+
+    return ScpDestination()._connect(  # noqa: SLF001
+        {
+            "host": "127.0.0.1",
+            "port": port,
+            "username": "u",
+            "password": "p",
+            "remote_path": "/x",
+            "known_hosts": known_hosts,
+        }
+    )
+
+
+def test_connect_accepts_a_host_ip_list_pin(ssh_server) -> None:  # type: ignore[no-untyped-def]
+    port, key = ssh_server
+    _connect(port, f"[sftp.example]:{port},[127.0.0.1]:{port} {key}\n").close()
+
+
+@pytest.mark.parametrize(
+    "known",
+    [
+        "* {key}\n",
+        "*:{port} {key}\n[*]:{port} {key}\n",
+        "@cert-authority * {key}\n",
+        "[127.0.0.1]:{port},![127.0.0.1]:{port} {key}\n",
+        "[127.0.0.1]:{port} {key}\n@revoked * {key}\n",
+        "# nothing pinned\n",
+    ],
+)
+def test_connect_refuses_when_nothing_pins_the_host(ssh_server, known: str) -> None:  # type: ignore[no-untyped-def]
+    # An empty or unusable store must be a refusal (RejectPolicy), never
+    # an accept-any.
+    from app.services.backup.targets.base import BackupDestinationError
+
+    port, key = ssh_server
+    with pytest.raises(BackupDestinationError, match="not found in known_hosts"):
+        _connect(port, known.format(key=key, port=port))

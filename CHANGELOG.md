@@ -91,8 +91,11 @@ the formatter handles the rest.
   name and Test connection answered "not found in known_hosts" with the
   right key pinned. Each comma-separated name now finds the key. Fails
   closed: `@cert-authority` lines pin nothing, a key listed `@revoked` is
-  refused wherever else it appears, and wildcard or `!` patterns (which
-  this store cannot honour) match nothing.
+  refused wherever else it appears (compared by key, not by how the line
+  spells it), wildcard patterns (which this store cannot honour) match
+  nothing, and a `!` pattern still withholds every name on its line that
+  it covers, as OpenSSH does — `sftp.example,!*.example` pins nothing. A
+  `known_hosts` left with no usable pin refuses the server.
 
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
