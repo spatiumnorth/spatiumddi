@@ -8,6 +8,7 @@ import {
 import { HeaderButton } from "@/components/ui/header-button";
 import { cn } from "@/lib/utils";
 import { Loader2, Play } from "lucide-react";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const PRESETS: { id: NmapPreset; label: string; hint: string }[] = [
   {
@@ -81,6 +82,13 @@ export function NmapScanForm({
   lockTarget,
   onScanStarted,
 }: NmapScanFormProps) {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'manage_nmap_scans'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_nmap_scans"),
+    "Requires write permission on nmap scans",
+  );
   const [targetIp, setTargetIp] = useState(defaultTargetIp);
   const [preset, setPreset] = useState<NmapPreset>(defaultPreset);
   const [portSpec, setPortSpec] = useState("");
@@ -205,7 +213,12 @@ export function NmapScanForm({
       )}
 
       <div className="flex justify-end">
-        <HeaderButton variant="primary" onClick={submit} disabled={submitting}>
+        <HeaderButton
+          variant="primary"
+          onClick={submit}
+          disabled={submitting}
+          {...writeGate}
+        >
           {submitting ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
           ) : (

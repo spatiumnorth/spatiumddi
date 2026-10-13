@@ -15,13 +15,14 @@ that the importer consumes.
 
 from __future__ import annotations
 
-import csv
 import io
 import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import HTTPException, status
+
+from app.services.csv_text import CSVReadError, read_csv_table
 
 
 @dataclass
@@ -183,10 +184,20 @@ def _csv_is_address_payload(headers: list[str]) -> bool:
 
 def parse_csv(data: bytes) -> ParsedPayload:
     text = data.decode("utf-8-sig", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
+    # The shared reader handles \n, \r\n and a bare \r alike; a file saved
+    # with classic Mac line endings answered 500 here (#1637). Anything else
+    # the csv module refuses is the file's problem: a 422 with its reason,
+    # as parse_json answers for JSON it cannot read.
+    try:
+        table = read_csv_table(text)
+    except CSVReadError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
     payload = ParsedPayload()
-    is_addresses = _csv_is_address_payload(list(reader.fieldnames or []))
-    for row in reader:
+    is_addresses = _csv_is_address_payload(table.fieldnames)
+    for row in table.rows:
         if not any((v or "").strip() for v in row.values() if isinstance(v, str)):
             continue
         if is_addresses:
