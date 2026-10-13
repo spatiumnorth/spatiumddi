@@ -929,6 +929,42 @@ REDIS_RESULT_STORE_RETRIES = 2
 # The worker's broker reconnect waits 1 s, then 2 s every time (kombu's own
 # default grows 2, 4, 6 ... up to 30 s).
 CONSUMER_RECONNECT_INTERVAL_MAX_S = 2.0
+# Name resolution is not bounded by any socket timeout (#1754). The worker
+# pods run with ``dnsConfig`` options ``timeout:2 attempts:2``
+# (charts/spatiumddi/templates/worker.yaml, k8s/base/worker.yaml; glibc, the
+# image is python:3.12-slim). The pod has one nameserver, the cluster DNS
+# Service, and glibc retries a query on the SAME socket, so kube-proxy's
+# conntrack sends both attempts to the same CoreDNS endpoint: a dead one
+# costs timeout x attempts = 4 s per query. A name that times out is tried
+# against one more search-list candidate (a new socket, so a fresh endpoint
+# pick) before glibc gives up, so a lookup stalls <= 2 x 4 = 8 s. The glibc
+# default (5 s x 2 attempts x 2 candidates) is the ~20 s per lookup measured
+# on the #1717 walk.
+# Both the Sentinel names and the master's name resolve: Sentinel runs with
+# ``announce-hostnames yes``, so the master address it returns is the pod's
+# FQDN, not an IP. In a no-master window the master name is only connected to
+# until Sentinel marks it s_down (down-after 5 s), which is before a result
+# write's first retry (it follows the write's 5 s stale-socket read), so each
+# retry pays at most one stalled resolution: the reconnect to the lost node's
+# Sentinel.
+# Trade-off, kept deliberately small: CoreDNS's forward plugin gives up on an
+# upstream after 5 s (2 s per exchange, so its last answer can land at ~6 s).
+# A client that waits 4 s gives up on a cold external lookup the upstream
+# takes 4-6 s to resolve, where the default 10 s would have heard the answer.
+# A reply to the first attempt is still accepted during the second (same
+# socket, same query id), so anything CoreDNS answers inside 4 s succeeds;
+# and CoreDNS caches the late answer, so the task's next attempt hits it.
+DNS_RESOLVER_TIMEOUT_S = 2
+DNS_RESOLVER_ATTEMPTS = 2
+DNS_SEARCH_CANDIDATES = 2
+DNS_LOOKUP_STALL_S = DNS_RESOLVER_TIMEOUT_S * DNS_RESOLVER_ATTEMPTS * DNS_SEARCH_CANDIDATES
+# ``terminationGracePeriodSeconds`` of the worker pod (chart value
+# ``worker.terminationGracePeriodSeconds`` and k8s/base/worker.yaml). The
+# worst-case warm shutdown estimate in test_celery_redis_transport.py must
+# stay under it, and it must stay under the upgrade orchestrator's drain
+# timeout (DEFAULT_DRAIN_TIMEOUT_S, 120 s, services/upgrades/per_node.py),
+# which waits for a terminating worker pod to be gone.
+WORKER_TERMINATION_GRACE_S = 90
 
 
 def _redis_keepalive_options() -> dict[int, int]:
@@ -971,7 +1007,7 @@ def build_redis_transport_options(
         # exponential backoff, applied BOTH around the command and around the
         # connect inside it. Against an unreachable Sentinel that nests to
         # 10 s + 3 x (4 x 5 s connects + backoff), about 100 s for ONE master
-        # lookup — measured holding a warm shutdown past its 60 s grace on a
+        # lookup — measured holding a warm shutdown past its grace on a
         # single ``srem``. With no retry a lookup costs one socket or connect
         # timeout, and the caller's own retry (kombu's reconnect loop, the
         # publish retry policy) asks again, on a fresh connection. The
@@ -1073,6 +1109,14 @@ if settings.celery_broker_url.startswith(
         # lookup (<= 3 s) plus a connect to the master Sentinel still names
         # (<= 2 s) plus <= 0.5 s backoff: 5 + 2 x 5.5 = 16 s (it was ~40 s
         # with 3 retries and 10 s timeouts, ddi-pg walk of #1717).
+        # Plus name resolution (#1754): each Sentinel lookup can also stall in
+        # getaddrinfo, ~20 s with the default resolver options, which took a
+        # warm shutdown to 54.5 s / 59.2 s of a 60 s grace. With the worker
+        # pod's ``timeout:2 attempts:2`` it is <= DNS_LOOKUP_STALL_S (8 s), so
+        # a write is <= 5 + 2 x (5.5 + 8) = 32 s; twice on a warm shutdown plus
+        # Channel.close()'s two 10 s broker reads is 84 s, inside
+        # WORKER_TERMINATION_GRACE_S (90 s). With the default resolver options
+        # the same sum is 132 s.
         # A result write is a SET of the same value, so a retry is idempotent.
         celery_app.conf.result_backend_always_retry = True
         celery_app.conf.result_backend_max_retries = REDIS_RESULT_STORE_RETRIES

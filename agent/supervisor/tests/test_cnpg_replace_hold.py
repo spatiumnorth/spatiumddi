@@ -1,7 +1,8 @@
 """#1059 — the CloudNativePG size hold a dead-node replace arms (heartbeat._ReplaceHold).
 
-Only ``/replace`` sets ``evict_requested`` (a demote is a ``leaving`` row), so an
-eviction tick is a replace tick. From it the seed must not scale CNPG down until
+An eviction tick that names a Replace (``replace_node_names``; #1541 — a
+demote's cleanup eviction never arms it, see ``test_cnpg_demote_shrink``) is a
+replace tick. From it the seed must not scale CNPG down until
 the committed count is back at the size CNPG has, or the operator shrinks the
 control plane below the count the eviction carried. The backend settles the
 evicted row before it answers the next heartbeat, so only the eviction tick

@@ -416,6 +416,7 @@ async def preview_dns_zone_move(
         "dnssec_unsupported_drivers": plan.dnssec_unsupported_drivers,
         "acl_names_lost": plan.acl_names_lost,
         "key_names_lost": plan.key_names_lost,
+        "technitium_api_refusal": plan.technitium_api_refusal,
         "warnings": plan.warnings,
         "required_acknowledgements": plan.required_acknowledgements,
     }
@@ -962,11 +963,27 @@ async def find_zone_dnssec_info(
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None or not token_allows_zone(user, zone.id):
         return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}
+    from app.services.dns.dnssec_signers import (  # noqa: PLC0415
+        signing_server_count,
+        unmanaged_signing_group_ids,
+    )
+
     keys = (await db.execute(select(DNSKey).where(DNSKey.zone_id == zone.id))).scalars().all()
+    signers = await signing_server_count(db, zone.group_id)
+    unmanaged = bool(await unmanaged_signing_group_ids(db, {zone.group_id}))
     return {
         "zone_id": str(zone.id),
         "name": zone.name,
         "dnssec_enabled": zone.dnssec_enabled,
+        # #1762 — signed on a group whose servers each sign with their own
+        # keys: the DS shown is one server's, and the others' do not match it.
+        "dnssec_multi_signer": bool(zone.dnssec_enabled) and signers > 1,
+        "signing_servers": signers,
+        # #1783 — the group runs Technitium: SpatiumDDI will not sign or
+        # re-sign here (#1767), so do not propose it. With dnssec_enabled,
+        # the zone was signed before that and is not kept signed.
+        "signing_unmanaged": unmanaged,
+        "dnssec_unmanaged_warning": bool(zone.dnssec_enabled) and unmanaged,
         "dnssec_policy_id": (str(zone.dnssec_policy_id) if zone.dnssec_policy_id else None),
         "dnssec_ds_records": zone.dnssec_ds_records,
         "dnssec_synced_at": (zone.dnssec_synced_at.isoformat() if zone.dnssec_synced_at else None),

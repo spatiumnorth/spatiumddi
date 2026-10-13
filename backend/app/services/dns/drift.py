@@ -27,7 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.drivers.dns import get_driver
 from app.drivers.dns.base import RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSServer, DNSZone
-from app.services.dns.pull_from_server import _key, without_agent_ns_glue
+from app.services.dns.pull_from_server import (
+    _key,
+    targets_are_relative,
+    without_agent_ns_glue,
+)
 from app.services.dns.tsig import (
     is_view_transfer_key,
     pull_zone_records_signed,
@@ -101,7 +105,6 @@ async def compute_zone_drift(
     db_rows = list(
         (await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))).scalars().all()
     )
-    db_by_key = {_key(r, zone.name): r for r in db_rows}
 
     servers = list(
         (
@@ -199,8 +202,12 @@ async def compute_zone_drift(
             return entry
 
         view_addressed[entry.server_id] = is_view_transfer_key(used)
+        # #1794 — a dot-less name target is relative on a zone-file driver and
+        # absolute on a cloud one, so the DB side is keyed per server.
+        rel = targets_are_relative(srv)
+        db_by_key = {_key(r, zone.name, relative_targets=rel): r for r in db_rows}
         on_wire = without_agent_ns_glue(on_wire, srv, zone.name, set(db_by_key))
-        wire_by_key = {_key(r, zone.name): r for r in on_wire}
+        wire_by_key = {_key(r, zone.name, relative_targets=rel): r for r in on_wire}
         entry.extra_on_server = [
             _to_drift_record(r) for k, r in wire_by_key.items() if k not in db_by_key
         ]

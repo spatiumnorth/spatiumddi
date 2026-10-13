@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
+from fastapi import HTTPException
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select, text
 from sqlalchemy import update as sa_update
@@ -53,6 +54,8 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.dns import technitium_api_scope
+from app.services.dns.dnssec_signers import SIGNING_DRIVERS, lock_group, signing_server_count
 from app.services.dns.named_conf_validation import is_name_reference, key_reference
 from app.services.dns.pool_geo import build_geo_steering
 from app.services.dns.record_ops import (
@@ -75,12 +78,13 @@ ACK_VIEW_WIDENING = "view_widening"
 ACK_DNSSEC_ROLLOVER = "dnssec_rollover"
 ACK_LOST_UPDATE_GRANTS = "lost_update_grants"
 
-#: Drivers whose agents can actually sign a zone. Mirrors the router's
-#: ``_DRIVER_GATED_OPERATIONS["dnssec_sign"]`` gate, which every other
+#: Drivers whose agents can actually sign a zone: the same set as the router's
+#: ``_DRIVER_GATED_OPERATIONS["dnssec_sign"]`` gate (both read
+#: ``dnssec_signers.SIGNING_DRIVERS``), which every other
 #: path into a signed zone goes through — a move that skipped it would
 #: leave the row saying ``dnssec_enabled`` while the zone is served
 #: unsigned, indefinitely and with nothing to notice it.
-DNSSEC_SIGN_DRIVERS = frozenset({"bind9", "powerdns"})
+DNSSEC_SIGN_DRIVERS = SIGNING_DRIVERS
 
 
 class ZoneMoveError(Exception):
@@ -171,6 +175,9 @@ class ZoneMovePlan:
     #: onto one is refused rather than warned: the row keeps saying
     #: ``dnssec_enabled`` while the zone is served unsigned forever.
     dnssec_unsupported_drivers: list[str] = field(default_factory=list)
+    #: Signing agent servers in the target, when the zone is signed (#1762).
+    #: More than one is refused: each would sign with its own keys.
+    dnssec_target_signers: int = 0
     #: Named ACLs cited in the zone's own address-match lists
     #: (``allow_query`` / ``allow_transfer`` / ``also_notify``). ``DNSAcl``
     #: is group-scoped, so a name that exists in the source and not the
@@ -183,6 +190,11 @@ class ZoneMovePlan:
     #: ``key {}`` is group-scoped too, so a key the target does not define
     #: is the same undefined symbol and the same whole-group failure.
     key_names_lost: list[str] = field(default_factory=list)
+    #: #1784 — why the experimental ``technitium_api`` driver in the target
+    #: cannot take this zone (non-Primary, settings it never writes, pools).
+    #: Set by the plan so the preview reports the same refusal the commit
+    #: raises; ``None`` when the target is not such a group or the zone fits.
+    technitium_api_refusal: str | None = None
 
     warnings: list[str] = field(default_factory=list)
     #: Acknowledgement keys the commit will demand.
@@ -417,9 +429,25 @@ async def assemble_move_plan(
     if plan.dnssec_signed:
         allowed = DNSSEC_SIGN_DRIVERS
         plan.dnssec_unsupported_drivers = sorted(set(plan.target_drivers) - allowed)
+        plan.dnssec_target_signers = await signing_server_count(db, target_group.id)
 
     # ── Named ACLs cited by the zone's own address-match lists ────────
     _scan_acl_references(plan, zone, source_acls, target_acls)
+
+    # ── Experimental technitium_api target (#1784, a refusal) ─────────
+    if technitium_api_scope.DRIVER in plan.target_drivers:
+        try:
+            technitium_api_scope.refuse_non_primary(zone.zone_type)
+            technitium_api_scope.refuse_unapplied_zone_changes(
+                {f: getattr(zone, f) for f in technitium_api_scope.ZONE_UNAPPLIED_DEFAULTS},
+                None,
+            )
+            if plan.pools_repointed:
+                raise technitium_api_scope.refusal(
+                    "DNS pools are not supported; this zone has pools."
+                )
+        except HTTPException as exc:
+            plan.technitium_api_refusal = str(exc.detail)
 
     _fill_warnings(plan)
     return plan
@@ -541,6 +569,12 @@ def _fill_warnings(plan: ZoneMovePlan) -> None:
             "publish the new one, and the zone will fail validation in the interval."
         )
         plan.required_acknowledgements.append(ACK_DNSSEC_ROLLOVER)
+        if plan.dnssec_target_signers > 1:
+            plan.warnings.append(
+                f"The target group has {plan.dnssec_target_signers} DNS servers, each of which "
+                f"would sign this zone with its own keys. The move is refused until the zone "
+                f"is unsigned or the target has a single DNS server (#1762)."
+            )
 
     if plan.acl_keys_lost:
         plan.warnings.append(
@@ -639,6 +673,9 @@ async def commit_move(
             status_code=423,
         )
 
+    if zone.dnssec_enabled:
+        # #1762 — serialise with a concurrent server add to the target.
+        await lock_group(db, target_group.id)
     plan = await assemble_move_plan(db, zone, target_group)
 
     # Hard refusals that no acknowledgement can waive, because none of them
@@ -649,6 +686,19 @@ async def commit_move(
             f"{plan.dnssec_unsupported_drivers}, which cannot sign. The zone would keep "
             f"reporting as signed while being served unsigned. Unsign it first, or pick a "
             f"group running one of {sorted(DNSSEC_SIGN_DRIVERS)}.",
+            status_code=422,
+        )
+    if plan.technitium_api_refusal:
+        # #1784 — refused, not warned: the zone would read as configured on
+        # a server that ignores the config. Derived in the plan so the
+        # preview shows the same refusal.
+        raise ZoneMoveError(plan.technitium_api_refusal, status_code=422)
+    if plan.dnssec_signed and plan.dnssec_target_signers > 1:
+        raise ZoneMoveError(
+            f"This zone is DNSSEC-signed and '{target_group.name}' has "
+            f"{plan.dnssec_target_signers} DNS servers; each would sign it with its own "
+            f"keys, so resolvers would see DNSKEYs the published DS does not match "
+            f"(#1762). Unsign it first, or pick a group with a single DNS server.",
             status_code=422,
         )
     if plan.acl_names_lost:

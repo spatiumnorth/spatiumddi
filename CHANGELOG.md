@@ -114,6 +114,495 @@ the formatter handles the rest.
     rendered for Kea.
   - The Stats tab, the InfluxDB export and the `dhcp_packets_dropped`
     alert now get the right number, with no change of their own.
+- **The PowerDNS agent stops serving zones wrong in three ways
+  (#1520, #1521, #1522).** Pool member address deletes were applied
+  as no-ops and acked ok — the record-op fallback ignored the rrset
+  action — so a removed member's address stayed served; deletes now
+  delete. Zone type was ignored: secondaries are now created as
+  Slave with their masters (a secondary without masters, and a
+  forward zone — which has no PowerDNS equivalent — are skipped
+  loudly instead of silently vanishing or being served as a primary
+  copy). And served zones now carry the zone's own Primary NS,
+  Admin Email, SOA timers and serial instead of daemon defaults,
+  with the served serial reported back.
+
+- **NOTIFY settings and zone allow-query now reach the agents
+  (#1523).** The server options `notify_enabled` / `also_notify` /
+  `allow_notify` and the zone-level `also_notify` / `notify_enabled` /
+  `allow_query` overrides were saved but never shipped in the agent
+  bundle. They ship now (renderer revision 8): the BIND9 agent renders
+  them in the options block and zone stanzas, and the PowerDNS agent
+  folds the effective notify setting into the zone kind (Master when
+  notifying — Native never sends NOTIFY) and applies the targets as
+  ALSO-NOTIFY metadata. A PowerDNS group cannot enforce allow-query
+  (the authoritative server has no query ACL); the agent logs that
+  loudly instead of letting the setting look applied.
+
+- **Records written to PowerDNS zones over RFC 2136 are ingested back
+  (#1524).** The ingest-back worker that mirrors externally written
+  records into SpatiumDDI ran only for BIND9, so dynamic records on
+  PowerDNS were invisible — and were silently overwritten where they
+  shared a name with managed records. The PowerDNS agent now reads
+  dynamic zones back over its loopback REST API on the same interval
+  and ships them to the same ingest endpoint.
+
+- **Drift and Sync with Servers read a dot-less name target the way
+  the driver does (#1794).** A target such as `a.b` is `a.b.<zone>.`
+  on BIND9, Technitium and Windows without WinRM credentials, where only
+  a trailing dot makes a name absolute, but the shared record key read it
+  as the absolute `a.b.`. A relative multi-label CNAME, DNAME, NS, PTR,
+  MX, SRV, NAPTR replacement or SVCB / HTTPS target therefore drifted
+  against the absolute name an AXFR returns, and Sync imported it again as
+  a duplicate. The cloud drivers and Windows over WinRM take the name as
+  given, so there `a.b` stays absolute. The Windows cutover parity check
+  reads each side by its own driver: the managed rows the way the managed
+  zone's group serves them, the Windows pull the way Windows reports it.
+
+- **An appliance with an uppercase hostname was invisible to the demote quorum gate, the cordon and the eviction (#1757).** The installer accepts `Ddi-Member-1`; k3s lowercases the host's name for its k8s Node (RFC 1123, `GetHostnameAndIPs`) and names its etcd member `<lowercase name>-<8 hex>`; `Appliance.hostname` keeps what was typed. Every Node lookup by hostname therefore missed: the quorum gate read the member as having "no k8s Node" and refused the demote, the demote cordon found nothing, and the eviction told the seed a name its Node delete could not find (a 404, which counts as success), so a stale Node stayed. Lookups now go through one `k8s_node_name()` (lowercase, trailing dot dropped) in `services/appliance/ownership.py`: the quorum gate, the cordon and uncordon, the names and addresses the heartbeat hands the seed to evict (and the names it reports back), the rolling upgrade's Node-to-appliance match (now approved rows only, and none rather than a guess when two match, so a revoked duplicate left by a re-pair no longer crashes the step), and the Cluster tab's per-node host state. Deleting an appliance now finds its DNS and DHCP servers by the shared ownership rule (#1715 / #1749) instead of a bare hostname match: the FK, or an agent-registered row with no FK whose host matches case-blind (a DNS agent on k3s registers the lowercase Node name), and only while no other approved appliance shares the hostname. So two appliances whose hostnames differ only in case, or a re-paired duplicate, never delete each other's servers. On the host, `spatium-etcd-evict` matches members by the lowercase name and also treats the lowercase spelling of its own hostname as its own, and the supervisor's Node delete lowercases the name it is given. Stored hostnames are unchanged.
+
+- **A rolling upgrade waits for the control-plane Deployments before it
+  moves to the next node (#1544).** The other half of the gate that
+  already waits for CNPG: after each node's uncordon, the per-node
+  step waits (up to 10 minutes) until every Deployment of the release
+  (found by the chart's `app.kubernetes.io/name` and `/instance`
+  labels, so a Deployment the chart adds later is covered) has
+  available replicas equal to desired and no old pod still draining.
+  A single-replica Deployment passing through its retire-first
+  rollout is waited through, not failed. If it never settles the node
+  step fails and the run stops before the next node's drain; the node
+  is already uncordoned by then, so there is nothing to release. A
+  label selector that matches no Deployment, or a list call refused
+  for missing RBAC, fails the step at once instead of turning the
+  gate off.
+
+- **DNSSEC is refused on a multi-server group, and the DS report is group-scoped (#1762).** Each agent server (BIND9, PowerDNS, Technitium) signs with keys it generated, so a signed zone on a group with two servers was served with two DNSKEY sets against one published DS, and validating resolvers got SERVFAIL from whichever server it did not match. Signing (the sign endpoint, `dnssec_enabled` on zone create and update, and both Copilot paths) now returns 422 when the group has more than one agent server. Adding or moving a server into a group that holds signed zones is refused too: server create, server move, a Fleet group change, and the Copilot `assign_appliance_role`. So is moving a signed zone into a multi-server group. **Disabled servers count**: a disabled agent still receives the bundle, so a disabled BIND9 server still signs with its own keys, and a disabled PowerDNS or Technitium server serves the zone unsigned under the DS. These checks lock the group row, so two concurrent requests cannot both pass. An agent that auto-registers into a signed group is not refused, because refusing would break its bootstrap. Instead it is logged and audited, and it trips the same flag as zones signed before this fix: `dnssec_multi_signer` on the zone and on `…/dnssec/info`, a red **DNSSEC: multiple signers** badge and a warning on the DNSSEC card, and a new default-on, critical `dnssec_multi_signer` alert. Those zones are not unsigned automatically. `/dns/agents/dnssec-state` now matches zones only within the reporting server's group, so same-named zones in different groups no longer collide. On a multi-server group it keeps one server's report (the primary's, or the oldest signer's when the group has no primary), which ends the last-writer-wins DS flapping.
+
+- **DNSSEC signing is no longer offered on Technitium (#1783).** The sign
+  endpoint, `dnssec_enabled` on zone create or update, and the Copilot now
+  answer 422 for a Technitium group, and the driver stops advertising
+  signing. Signing there is one-shot: the zone is not re-signed on a new
+  server, a re-created zone or a lost volume, its DNSSEC policy is ignored,
+  and key state is re-reported only while signed, so SpatiumDDI could show
+  a zone signed that was not. Zones already signed on Technitium keep
+  serving, can still be unsigned, and now carry `dnssec_unmanaged_warning`
+  (on the zone, on `…/dnssec/info` and in the Copilot's
+  `find_zone_dnssec_info`) plus a "DNSSEC not managed" badge; the DNSSEC
+  card disables Sign and Re-sign on a Technitium group. Technitium servers
+  still count towards the one-signer-per-group rule (#1762), since a zone
+  signed there before is held with per-server keys. Full support is tracked
+  in #1767.
+
+- **Group options the Options tab offers for every driver are no longer
+  silently ignored on Technitium (#1763).** The bundle carried
+  `dnssec_validation`, `allow_query` and the rest, and the Technitium
+  agent read none of them, so `dnssec_validation = no` behind a
+  DNSSEC-stripping upstream kept validating and SERVFAILed signed names,
+  and a group's `allow_query` left every authoritative zone answering
+  anyone. The agent now sends `dnssecValidation` and maps `allow_query`
+  onto each served zone's `queryAccess` / `queryAccessNetworkACL`
+  (addresses, CIDRs, `!` negation, `any`, `none`), forwarder zones
+  included. The options Technitium has no setting for
+  (`minimal_responses`, `tcp_clients`, `clients_per_query`,
+  `max_clients_per_query`, and an `allow_query` using `localnets`, `key`
+  or ACL names) now answer 422 when changed to a non-default value on a
+  group with a Technitium server, and the Options tab disables them with
+  the reason. Re-saving a stored value stays allowed, and a value stored
+  before this, or before a Technitium server joined the group, is listed
+  in the options response's `technitium_warnings` and shown on the tab.
+  BIND9 and PowerDNS bundles are unchanged.
+
+- **Technitium zone transfer: the ACL is translated, secondaries sign,
+  and every TSIG algorithm is installed (#1765).** `allow_transfer` was
+  validated as a BIND address-match list and then guessed at:
+  `["!10.1.0.0/16", "any"]` became `Allow` and lost the exclusion, while
+  `key X`, ACL names and `localnets` became a network ACL Technitium
+  refuses, leaving the old policy in place. One translator now serves
+  `allow_query` and `allow_transfer`: `!` exclusions stay in order under
+  `UseSpecifiedNetworkACL`, `any` becomes `0.0.0.0/0,::/0`, `localhost`
+  loopback, `key X` the zone's TSIG key names and a named ACL is expanded
+  from the bundle. What has no exact equivalent (`localnets`, an address
+  beside a key, a negated key or ACL, `!localhost`) answers 422 on a group
+  with a Technitium server, for group options and zone `allow_transfer`,
+  when changed; stored values are reported in `technitium_warnings` and as
+  an apply failure. Secondary and catalog-consumer zones were created
+  without a TSIG key, so a signed-only SpatiumDDI primary refused every
+  transfer and the zone expired to SERVFAIL; the bundle now names a key
+  the managed master grants and the agent sends `tsigKeyName` /
+  `primaryZoneTransferTsigKeyName` (a master SpatiumDDI does not manage
+  gets none; Technitium has no key for a Stub zone). **Only a key the
+  secondary's own group already holds is named**: a master in the same
+  group signs with the group key, and a master in *another* group needs a
+  TSIG key the operator adds to both groups with the same name, algorithm
+  and secret. No group's secret is shipped to another group's agent — the
+  master group's own key is also the unrestricted `allow-update` grant on
+  every zone it serves. Without a shared key the zone is created, and the
+  apply reports that its transfers will be refused. `none` is now read as
+  BIND reads it, a deny-everyone match (`!any`), so `["none", "10.0.0.0/8"]`
+  admits nobody instead of 10/8; an IPv4-mapped prefix is refused.
+  `hmac-sha224`, `hmac-sha384-192` and `hmac-sha512-256` are installed
+  instead of skipped, and a key still skipped is an apply failure and is
+  no longer pinned on every zone. BIND9 and PowerDNS bundles are unchanged.
+
+- **Technitium forwarding no longer sends DoH as cleartext, drops
+  upstreams, or defeats its own encryption (#1764).** A forward zone was
+  created with `forwarder=<first>` and no `protocol`, so Technitium used
+  `Udp` and re-derived the address: `https://dns.quad9.net/dns-query`
+  went out as plain `dns.quad9.net:53`, a `host:853` entry failed, the
+  other upstreams were dropped and `dnssecValidation` stayed off. The
+  agent now derives `protocol` from the scheme or port, sends the group's
+  DNSSEC setting, and keeps every upstream as an apex FWD record with a
+  `forwarderPriority` (an existing zone is converged the same way).
+  Server-level DoT/DoH/DoQ forwarding used to replace the operator's IPs
+  with the TLS hostname, which Technitium then resolved by plaintext
+  recursion from the root; it now sends `name (ip)` per IP, so the IP is
+  dialled and the name validated. A zone's plain-IP upstreams follow the
+  group's encrypted transport, as on BIND9, instead of going out as
+  cleartext UDP, and a neutral `ip@port` forwarder is sent as `ip:port`.
+  **Upgrade note:** in a Technitium group forwarding over DoT / DoH / DoQ
+  with a TLS hostname, a forward zone whose upstream is a plain IP (an
+  internal domain controller, say) now queries it over that transport, and
+  fails if the upstream does not speak it. Write the upstream as
+  `udp://<ip>` to keep it on plain DNS.
+  Technitium validates upstream certificates unconditionally, so
+  `forward_tls_verify = false` (accepted, then refused by the agent on
+  every apply) now answers 422 on a group with a Technitium server, as
+  does `tls` without `forward_tls_hostname`; `forward_policy` may only move
+  to `only`, which is what Technitium does with forwarders. BIND9 and
+  PowerDNS bundles are unchanged.
+
+- **A Technitium record target is read the way a zone file reads it, and
+  imported targets keep their dot (#1759).** Both Technitium drivers
+  (the agent and the agentless `technitium_api`) stripped the trailing
+  dot from a CNAME, DNAME, NS, PTR, MX exchange, SRV target or NAPTR
+  replacement and sent what was left as an absolute name, while
+  everywhere else in SpatiumDDI, BIND9 included, a name without a
+  trailing dot is relative to the zone. So `www CNAME web` was served as
+  `web.`, a delegation `sub NS ns1` pointed at `ns1.`, and `MX 10 @`
+  was refused. One rule now applies to every one of those types on both
+  drivers: `@` is the zone, a trailing dot is absolute, anything else is
+  `value.zone`, and `.` is sent as `"."`, so a Null MX (`0 .`) and a
+  "no service" SRV are accepted instead of refused as an empty
+  parameter. The other direction is fixed too: the Technitium importer
+  and the Sync-with-Servers pull now store every target with its
+  trailing dot, because Technitium reports absolute names, and a
+  dot-less value stored from them was served as `target.<zone>.` as soon
+  as the zone moved to BIND9. Sync and drift compare DNAME and NAPTR
+  canonically, and read their AXFR targets absolute, so they stop
+  reporting a difference that is not one. A Technitium server's bundle
+  carries `name_target_rule` (renderer revision 7); a bundle without it,
+  such as one the agent has cached, keeps the old absolute reading.
+  **Migration `d6b2f81a3c57` changes what BIND9 and PowerDNS groups
+  serve** for records the Technitium importer created: their dot-less
+  targets are made absolute, so `www CNAME web.example.net` is served as
+  `web.example.net.` as it was on Technitium, instead of the wrong
+  `web.example.net.<zone>.`. The migration queues the record update
+  that takes the corrected answer to the BIND9 or PowerDNS servers,
+  since a changed row alone never reaches them. A record whose value
+  you have edited since the import is left as you typed it. Check
+  imported zones you have since moved.
+
+- **Technitium no longer claims catalog-zone support (#1782).** Both
+  roles are broken: producer member zones inherit the catalog zone's
+  transfer Deny / notify None (undoing the #734 grant, so drift, Sync
+  with Servers and NOTIFY stop), and the consumer's `SecondaryCatalog`
+  has no TSIG and stays empty. The `technitium` driver now reports
+  `catalog_zones: False`; turning catalog zones on for a group with a
+  `technitium` / `technitium_api` server, or putting such a server into a
+  catalog-enabled group (server create, driver change, server move, or a
+  Fleet / Copilot role assignment pointing a `dns-technitium` appliance
+  at one), is a 422 naming #1766 (the 1.1.0 fix). An agent
+  auto-registering straight into a catalog group is logged, not refused,
+  since a refused registration loops. A group that already has it on
+  keeps rendering as before and shows a `catalog_unsupported_warning` on
+  the API and in the group editor.
+  `DNS_DRIVERS.md`, `DNS.md`, `GETTING_STARTED.md`, `TOPOLOGIES.md` and the
+  README no longer say both roles work.
+
+- **Agentless Technitium servers now serve TXT records as written
+  (#1760).** The #1694 fix reached only the agent-managed driver. The
+  agentless `technitium_api` driver still sent a TXT value as
+  Technitium's `text` parameter after stripping a trailing dot, so a
+  quoted SPF, DMARC or DKIM value (`"v=spf1 -all"`, the form the UI
+  suggests) was served with its quote characters and receivers found
+  no policy, a DKIM key split into two strings was merged into one,
+  and `Hello.` lost its full stop. Reading back joined the strings
+  too, so drift reported these records in sync. The driver now sends
+  and reads `characterStringsBase64`, the strings themselves. The
+  same pass fixed TXT on the AXFR pull path (BIND9, agent-managed
+  Technitium, Windows without WinRM): the reader joined a record's
+  strings, so a DKIM key stored as two quoted strings was permanent
+  drift and Sync with Servers imported a merged duplicate. Drift and
+  Sync now compare TXT by its strings, case kept, so a DKIM edit that
+  only changes case is no longer invisible. Sync's push now sends the
+  whole record set at a name, as an ordinary edit does, so repairing
+  one TXT no longer removes the in-sync TXT beside it on a
+  Technitium or Windows server.
+
+  **After upgrading, repair existing TXT records on `technitium_api`
+  servers.** Records written before this release are still served in
+  the broken form. Either run Sync with Servers on each affected
+  zone, or open each TXT record and save it unchanged. Sync no longer
+  imports the broken form as a new record: it recognises it as the
+  stored record served wrong and pushes the stored value, which
+  replaces the whole TXT set at that name. Until a zone is repaired,
+  its drift report lists each affected TXT as both missing and extra.
+
+- **The agentless `technitium_api` driver is marked experimental
+  for 1.0 and its supported scope is enforced.** It writes into a
+  Technitium server SpatiumDDI does not own and has no reconcile loop,
+  so pools, SOA / ACL / option settings and a second server were
+  accepted and silently not applied, and a same-name Secondary or
+  populated zone was adopted and later deleted with its records. Now
+  the API refuses (422, naming "technitium_api is experimental in
+  1.0") a second server per group (create, driver change, move), DNS
+  pools, non-Primary zones, zone and group settings the driver never
+  writes (only a changed value; re-saving a stored one or putting it
+  back to the default still works), turning catalog zones on, and
+  blocklist assignment; the Copilot's zone create is held to the same
+  rules, and the zone-move preview shows the refusal the commit
+  raises. Zone create adopts an existing zone only if it is an empty
+  Primary (a delegation below the apex counts as content). The UI
+  hides the zone SOA / TTL fields, non-Primary types, the group
+  Options tab and *New Pool* on such a group. A group that already
+  breaks the scope keeps serving and shows a warning
+  (`scope_warnings`). Capability flag `experimental`, an
+  Experimental label in the UI, and `DNS_DRIVERS.md` §4C.7a list what
+  is supported. Full support is tracked for 1.1.0 (#1769, #1771,
+  #1774, #1775). (#1784)
+
+- **Moving an appliance's own DNS server repoints the appliance
+  (#1749).** The DNS server PUT (the #934 move) repointed
+  `assigned_dns_group_id` only when the row had `appliance_id`, which
+  agents never set, so the supervisor kept rendering `AGENT_GROUP` and
+  the DoT/DoH/DoQ firewall ports for the group the agent had left. The
+  owning appliance is now found the way Fleet finds its servers
+  (#1715): by FK, else by hostname, never when two approved appliances
+  share it, and for a hostname match only on a row of the appliance's
+  current DNS engine. It is repointed only if it still named the
+  group being left, and its supervisor is woken. The DHCP server PUT
+  had the same gap and worse (it never repointed, not even by FK), so
+  the supervisor kept rendering the old group's `AGENT_GROUP`, network
+  mode and Kea HA listener; it now repoints `assigned_dhcp_group_id`
+  under the same rule, for an appliance holding the `dhcp` role.
+  Clearing a DHCP server's group never clears the appliance's, since a
+  NULL group idles its DHCP role.
+
+- **Technitium now follows the group's recursion and rate-limit
+  settings (#1761).** The agent never sent `recursion` or
+  `qpmPrefixLimits*`, so the daemon's own defaults stayed in force:
+  recursion for every private network even on an authoritative-only
+  group, and 600 queries/min per client with rate limiting shown as off,
+  which dropped a busy downstream resolver's answers. Recursion off
+  (or `is_recursive=false`) now sends `Deny`. An explicit
+  `allow_recursion` list sends `UseSpecifiedNetworkACL` with the list as
+  CIDRs, failing closed to `Deny` when no entry is usable. The stored
+  default `["any"]`, like an empty list, keeps Technitium's
+  private-networks-only recursion: SpatiumDDI does not open recursion on
+  Technitium through the default, because the BIND9 agent never renders
+  `allow_recursion` either (#1786) and `["any"]` cannot be told apart
+  from an untouched group. So recursion-enabled groups see no change on
+  upgrade. RRL off sends empty QPM limits; RRL on derives a per-client
+  limit from `rrl_responses_per_second`, the window from `rrl_window`,
+  the truncation share from `rrl_slip`, and `rrl_exempt_clients` as the
+  bypass list. **Behaviour change on upgrade:** `rrl_enabled` defaults
+  to off, so every Technitium group with RRL off loses the daemon's
+  built-in 600 qpm per-client limit (and the /24 and IPv6 prefix limits
+  beside it). That is the fix; turn RRL on to rate-limit. The bundle
+  gains `allow_recursion` for Technitium only.
+
+- **Renaming a DNS record now retracts the old name (#1773).** The
+  record PUT queued a single `update` carrying only the new name, which
+  replaces the RRset at the new name and never touches the old one. On
+  agent engines the old name stayed served until the next structural
+  render (and since #1373 a record change no longer triggers one); on
+  agentless drivers (technitium_api, Windows, cloud) it stayed served
+  for good and drift showed it as extra. #492 had fixed only the IPAM
+  path. A rename is now a `delete` of the old name followed by a
+  `create` of the new one, queued in order in one transaction (#1489);
+  agentless drivers get both in one `apply_record_changes` call. A
+  value-only edit is still a single `update`.
+
+- **A demote cordons the leaving node so nothing new lands on it
+  (#1750).** The leave never cordoned its node, so the scheduler could
+  still place pods there until k3s stopped. In a drill the replaced
+  `helm-install-spatiumddi-appliance` Job pod landed on the leaver and
+  stuck; when the eviction deleted the Node the Job re-ran on the seed
+  and dns-bind9 and dhcp-kea were gone for about 4.5 minutes. The
+  control plane now cordons each target once the demote's refusals have
+  passed, before the leave is stamped. It is cordon only, no drain: the
+  node's teardown and the Node eviction reschedule what already runs
+  there. A cordon that fails (no ServiceAccount, kubeapi down) is
+  logged and never fails the demote. A leave that fails, or a demote
+  cleared with clear-cluster-state, uncordons the node again. The cordon
+  marks the Node (`spatium.io/demote-cordoned`) and only a marked Node is
+  ever uncordoned, so a node you had already cordoned before the demote
+  stays cordoned when its leave fails. A leave that crashes part-way
+  reports neither result, so it stays cordoned until clear-cluster-state.
+
+- **Demoting control-plane members no longer costs the seed its quorum
+  (#1541).** A demoted node reset itself to a fresh single-node seed
+  without leaving etcd, and nobody removed its member or its k8s Node
+  from the seed. From three members the odd-count rule allows only one
+  demote, of both non-seed members, so the seed was left with three
+  voters, two of them gone for good: it lost quorum and its control
+  plane wedged. From five, the cluster kept two ghost voters and no
+  fault tolerance, and a demoted node could not be promoted again under
+  its hostname. Now the leave runner removes the node's own etcd member
+  while it still votes (`spatium-etcd-evict --leave-self`), stops k3s,
+  and resets the node once the removal is done. etcd accepting the
+  removal is the removal (a member change commits through the quorum);
+  the node it joined is asked too, and only a survivor that answers and
+  still lists the member refuses the leave, leaving the node a working
+  member. A survivor that cannot be reached does not: refusing there
+  restarted k3s on a node whose member was already gone, which rejoined
+  it as a new member and left the control plane on two voters. Its
+  `left` report then hands the row to the seed's
+  eviction (the path Replace uses), which deletes the stale Node and
+  confirms etcd agrees before the row settles `left`. This does not
+  clean up ghost voters an earlier demote already left behind: a
+  cluster that lost quorum to one needs the etcd restore path, and one
+  that kept it (five down to three) still carries them until they are
+  removed by hand.
+
+  Two follow-ups from the three-node drills. **A demote now scales the
+  control plane down.** The seed treated the demote's eviction as a
+  Replace and armed #1059's size hold on it, and neither of the hold's
+  releases can fire after a demote, so a cluster demoted to one node
+  kept three Postgres instances and three api / frontend / worker /
+  redis replicas, with their pods Pending on the lone seed. The row now
+  carries `evict_after_demote`; the seed holds the size only for a
+  Replace, and for a demote lets the scale-down past CloudNativePG's
+  readiness deferral, which would otherwise have held it too (the
+  departed nodes' instances never report ready again). It never asks for
+  fewer instances than are ready, so it cannot make CloudNativePG remove
+  a healthy one. **A demote is refused (409) while a control-plane member
+  is unhealthy** — a heartbeat older than 90 s, or a k8s Node that is
+  NotReady or absent — naming the member, unless that member is itself
+  being demoted and a majority of the voters stays live at every step of
+  the leave. A leave's removal goes to the leaver's own etcd, a follower
+  whose view of its peers can be minutes stale: with one member powered
+  off and both demoted, it accepted its own removal and left the seed one
+  live voter of two. The check narrows that window, it does not close
+  it: a member that dies within the 40–50 s before its Node turns NotReady,
+  or during the leave itself, is not seen. The refusal names every
+  unhealthy member, each marked as staying or being demoted, and on k3s
+  the seed is judged by its Node alone: a member's sudden loss stalls the
+  seed's own heartbeat for about two minutes (#1805), and the first cut
+  then named the healthy seed instead of the member that was off.
+
+  Three more from the gate walk of a 3 → 1 demote. **The api and worker
+  rollouts no longer wedge.** The one-replica render switched both to a
+  surge-first rollout, but the one surviving old pod still carried the
+  3-node spec's required anti-affinity, which keeps the new pod off the
+  only node; the rollout timed out and the old 3-node pods, three redis
+  sentinels in their env, served on. Under the appliance's `hard`
+  anti-affinity both now retire an old pod first at any replica count, so
+  a one-node control plane takes a brief api / worker outage on each
+  rollout, as its frontend already did with `Recreate`. **The slot-image
+  mirror's volume is reclaimed** with Redis's and Postgres's when the seed
+  deletes an evicted node; the mirror sat Pending for good on a volume
+  pinned to the removed node. Nothing re-creates that claim on its own, so
+  the seed re-creates it once the old one has gone, and the mirror starts
+  empty on a live node (the images it held were on the removed node).
+
+- **Changing a zone's type now reaches Technitium (#1457).** The agent
+  creates zones with `zones/create` and treats "already exists" as
+  success, re-applying only the upstream, so the type of an existing
+  zone was never compared. A zone switched from forward to primary in
+  SpatiumDDI stayed a Forwarder on every Technitium server: names that
+  were not a local record were still forwarded to the old upstream and
+  answered with that server's stale data, while SpatiumDDI showed the
+  zone as primary and the agents reported every record op as applied.
+  The agent now reads the live type (`zones/options/get`) when the zone
+  already exists and converts it in place with `zones/convert`, before
+  the upstream is re-applied. Verified against Technitium 15.4.0:
+  Forwarder to Primary keeps the zone's records, and Primary to
+  Forwarder works too. Technitium refuses a conversion to Secondary or
+  Stub ("not supported"); that is logged at error as
+  `technitium_zone_type_mismatch` and reported as a partial apply
+  (#1516) rather than worked around with a delete, since the agent
+  never deletes zones on its own. A refused forwarder change is
+  reported the same way.
+  A forward zone's upstream is now written as the zone's FWD record
+  instead of through `zones/options/set`, which has no `forwarder`
+  parameter (it answers `ok` and stores nothing). So a zone converted to
+  forward gets its forwarder, and changing an existing forward zone's
+  forwarder reaches the server too (#1647). A zone converted from
+  forward to primary drops the Forwarder's placeholder SOA (responsible
+  person `invalid`, TTL 0) for the one a new primary gets.
+
+- **A Celery worker's warm shutdown has room for a stalled cluster-DNS
+  lookup (#1754).** With a Redis master lost, a shutdown mid-result-write
+  exited at 54.5 s and 59.2 s of a 60 s grace: socket timeouts do not
+  bound `getaddrinfo`, and while the dead node's CoreDNS pod was still
+  behind the cluster DNS Service each lookup stalled about 20 s. The worker
+  pod now carries `dnsConfig` options `timeout:2` and `attempts:2`
+  (glibc; `ndots` untouched), about 8 s per stalled lookup, and
+  `terminationGracePeriodSeconds` is 90 (chart value
+  `worker.terminationGracePeriodSeconds`, and `k8s/base/worker.yaml`).
+  The api and beat are unchanged. The one cost: a worker now waits 4 s for
+  CoreDNS, where it waited 10 s, so a cold external lookup that the
+  upstream resolver takes 4 to 6 s to answer fails once instead of
+  succeeding slowly (CoreDNS itself gives up at about 6 s either way, and
+  caches the late answer for the task's next attempt).
+
+- **Rolling upgrades no longer strand nodes or skip their safety
+  checks (#1542, #1545, #1546, #1544).** A failure at any step after
+  the cordon (the reboot step included, and in a run resumed past the
+  cordon) now runs a compensating release — uncordon the node and
+  clear the CNPG maintenance window this run set — instead of leaving
+  the node cordoned with the window on. A failure at the cordon itself,
+  after the window was set, clears the window without uncordoning a
+  node the run never cordoned; and a node that was already cordoned
+  before the upgrade is left cordoned. When the run has no CNPG
+  cluster (none configured and none detected), the maintenance-window
+  clear at uncordon time is skipped instead of failing every node's
+  uncordon. The drain step refuses to evict pods with no controller
+  owner, honouring the no-force rule (a bare pod would never be
+  re-created). And no node is drained while the CNPG cluster is short
+  an instance: after each node's uncordon, the chain waits (up to
+  15 minutes) for `readyInstances` to reach `spec.instances` before it
+  reports the node done, the last node included, and each node's
+  preflight waits for the same count before its cordon. The wait comes
+  after the uncordon on purpose: the node's own drain evicts its
+  Postgres instance, whose local-path volume pins it to that node, so
+  the count cannot recover while the node is cordoned. An earlier
+  version of this fix waited before the uncordon and timed out on the
+  first node holding an instance, which ended the run.
+
+- **The Technitium agent's structural reconcile no longer rewrites
+  records on every pass or silently deletes PTRs (#1768).** It
+  fingerprinted the daemon's raw record data and fixed any difference by
+  deleting and re-adding, so records Technitium stores differently from
+  how they are sent were rewritten each time: a set with mixed TTLs
+  (Technitium keeps one per set), IDN targets (the derived `*Idn` keys),
+  CAA tags with capitals, and URIs it normalises. Each A/AAAA delete also
+  made Technitium delete the matching PTR in a reverse zone SpatiumDDI
+  manages on the same server. Now both sides are normalised to what the
+  daemon reads back, the set's minimum TTL is stamped (Technitium only),
+  a TTL-only change or a record disabled in the console is fixed with
+  `zones/records/update` in place, reverse zones are reconciled after
+  forward zones so a deleted PTR is re-added, and an apex NS TTL change
+  reaches the daemon. A second pass over an unchanged bundle sends no
+  writes. BIND9 and PowerDNS are untouched.
+- **Technitium's "CNAME record already exists" refusal is no longer
+  counted as success (#1770).** Both Technitium drivers treated any
+  error containing "already exists" as an idempotent no-op, so adding a
+  CNAME or DNAME beside other data at a name, which Technitium refuses
+  with `Cannot add record: CNAME record already exists for the same
+  name.`, was marked applied while the server kept serving the old data.
+  The drivers now match Technitium's exact no-op messages (record
+  already exists, no such record to delete, zone already exists), so
+  the conflict surfaces as a failed op with Technitium's message.
+  `Record already exists. Use overwrite option …` is a failure too: it
+  is raised when a CNAME or DNAME with any value holds the name, so it
+  does not mean ours is there. A Technitium release that rewords one of
+  these messages now fails the op rather than reading it as applied.
+  The forward-zone upstream reconciler (#1764) reads the same exact
+  messages: an identical upstream answering "record already exists" is
+  applied and no longer holds back removing a stale one, while the
+  overwrite-option refusal still keeps the old upstream.
+
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents
@@ -465,6 +954,21 @@ the formatter handles the rest.
   integration owns, and a record type a server in the group cannot
   serve (SVCB, HTTPS and DNAME on a hosted-DNS or Windows group)
   answer 422 before anything is written.
+
+- **A demoted control-plane member comes back as a working appliance
+  (#1682).** The leave reset a member to a fresh single-node cluster but
+  kept two things from the old one. Flannel's routes to the old peers'
+  pod subnets stayed in the kernel, and the fresh cluster takes the
+  seed's subnet for itself, so every reply to the node's own pods went
+  to the seed. And the 6443 bootstrap firewall rule a multi-node member
+  retires stayed retired, so the input chain dropped the node's pods on
+  their way to its own API. Either one kept the bootstrap chart from
+  installing, so no supervisor started, the `left` report never came,
+  and the row read `leaving` for good. The leave now removes every
+  gateway route into the pod network while k3s is stopped (cni0's own
+  route has none, and a route another owner installed, `proto static`
+  or `proto dhcp`, is kept), and puts the bootstrap rule back before k3s
+  starts, validating the merged firewall first.
 
 - **A record change no longer re-renders and reloads its zone on a DNS
   group without views (#1373).** The BIND9 agent re-renders and reloads
@@ -2933,6 +3437,24 @@ the formatter handles the rest.
   zone-file reading of a dot-less target does not re-point them.
   Downgrade is a no-op: the dotted value means the same under either
   reading.
+- `e3a81c5d07f2` — #1541: `appliance.evict_after_demote`, a boolean,
+  NOT NULL, default false. No backfill: every eviction an older build
+  stamped was a Replace, which is what false means. Downgrade drops the
+  column.
+- `d6b2f81a3c57` — #1759, data-only: CNAME / DNAME / NS / PTR / MX /
+  SRV / NAPTR records in groups running a Technitium driver whose target
+  has two or more labels and no trailing dot get the dot they were
+  already served with, so the zone-file reading of a dot-less target
+  does not re-point them. Rows the Technitium importer stamped
+  (`import_source = 'technitium'`) are made absolute in every group,
+  single labels included, which **changes what BIND9 and PowerDNS
+  groups serve** for them, except rows whose value was edited after the
+  import (an `update` audit row naming `value`). Bumps
+  `bundle_dirty_seq` on affected servers, rewrites queued record ops
+  (matched to their row by `record_id`), and for the BIND9 / PowerDNS
+  rows queues a whole-RRset update op per agent server and bumps the
+  zone serial. Agentless groups other than `technitium_api` get the row
+  change and no push. Downgrade is a no-op.
 
 ## 2026.10.02-1 — 2026-10-02
 

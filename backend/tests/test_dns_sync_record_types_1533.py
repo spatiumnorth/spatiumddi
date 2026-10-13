@@ -59,6 +59,14 @@ class _RecordingDriver:
         return [RecordChangeResult(ok=True, change=c) for c in changes]
 
 
+class _NoRowsSession:
+    """The push stamps each op with its RRset (#1760), which reads the DB;
+    these tests have no rows beside the one pushed."""
+
+    async def execute(self, _stmt: Any) -> Any:
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+
+
 def _zone() -> DNSZone:
     return DNSZone(id=uuid.uuid4(), name="example.com", group_id=uuid.uuid4())
 
@@ -111,6 +119,7 @@ def test_pull_imports_caa_when_the_driver_advertises_it() -> None:
         on_wire,
         set(),
         apply=False,
+        relative_targets=True,
         importable_types=_syncable_types(get_driver("route53"), _IMPORTABLE_TYPES),
     )
     assert result.imported == 1
@@ -127,6 +136,7 @@ def test_pull_still_skips_caa_for_a_driver_that_lacks_it() -> None:
         on_wire,
         set(),
         apply=False,
+        relative_targets=True,
         importable_types=_syncable_types(get_driver("windows_dns"), _IMPORTABLE_TYPES),
     )
     assert result.imported == 0
@@ -141,7 +151,9 @@ async def test_push_sends_caa_to_a_driver_that_advertises_it() -> None:
     row = _caa_row(zone)
     driver = _RecordingDriver(["A", "CAA", "SOA"])
     primary = SimpleNamespace(id=uuid.uuid4(), driver="route53")
-    result = await _additive_push(None, primary, driver, zone, [], [row], apply=True)
+    result = await _additive_push(
+        _NoRowsSession(), primary, driver, zone, [], [row], apply=True  # type: ignore[arg-type]
+    )
     assert result.candidates == 1
     assert result.pushed == 1
     assert [c.record.record_type for c in driver.applied] == ["CAA"]
@@ -152,7 +164,9 @@ async def test_push_never_sends_caa_to_windows() -> None:
     row = _caa_row(zone)
     driver = _RecordingDriver(list(_PUSHABLE_TYPES))
     primary = SimpleNamespace(id=uuid.uuid4(), driver="windows_dns")
-    result = await _additive_push(None, primary, driver, zone, [], [row], apply=True)
+    result = await _additive_push(
+        _NoRowsSession(), primary, driver, zone, [], [row], apply=True  # type: ignore[arg-type]
+    )
     assert result.candidates == 0
     assert result.pushed == 0
     assert driver.applied == []
