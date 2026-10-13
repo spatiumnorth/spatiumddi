@@ -100,6 +100,25 @@ the formatter handles the rest.
   walks the route table so a new multi-row delete route without the
   check fails CI.
 
+- **An ACME order's teardown no longer fails with "Event loop is
+  closed" in the worker (#1687, #1726).** `run_order`'s `finally`
+  removed the DNS-01 challenge TXT records and the http-01 tokens
+  through the shared engine's session factory. That runs inside a
+  Celery task's own event loop, where a pooled connection left by an
+  earlier task is bound to a closed loop, so on a reused connection
+  the cleanup failed with only a warning. The challenge TXT then
+  stayed in the zone until the 24 h stale sweep, or for good without
+  it, and http-01 tokens stayed in the database. The teardown now
+  opens its sessions with `task_session()`, as the order itself does.
+  The same flaw sat in the DNS-01 solve: its wait for the agents to
+  apply the challenge TXT polled through the shared factory, so in a
+  worker that had run a task before, the first poll raised and the
+  order ended `invalid` with `unexpected: Event loop is closed`. The
+  wait helpers now take a session factory, and the solve passes one
+  from the new `task_sessionmaker()` (one per-task engine for the
+  whole poll loop). The acme-dns provider's API path still uses the
+  shared factory, which is correct in a request handler.
+
 - **The DICOM AE, OT device and IPAM CSV imports read a file with classic
   Mac line endings (#1370, #1637, #1711).** Each importer read the
   pasted or uploaded text without handing its line endings to the csv
