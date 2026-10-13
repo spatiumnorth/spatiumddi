@@ -354,7 +354,8 @@ DNSServerOptions.allow_recursion: list[str]     -- CIDR list; who may use this s
                                                 --   "any" or "none" are also valid literals
 ```
 
-- **BIND9:** `recursion yes|no;` + `allow-recursion { <acl>; };` in `options {}` or per-view
+- **BIND9:** `recursion yes|no;` + `allow-recursion { <acl>; };` in `options {}`, rendered **literally** (#1786, #1817). The stored default is local + private networks, `["localhost", "localnets", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10"]`, so a recursive group nobody configured is not an open resolver. The private ranges are part of it because `localnets` is the subnets of the interfaces `named` sees: on the plain appliance BIND9 runs on host networking and that is the LAN, but behind the appliance DNS VIP, in the umbrella Helm chart, the `k8s/` manifests and Docker Compose it runs on a pod or bridge network, so `localnets` alone matches only that network. A client on a public address (a routed public subnet, or globally routable IPv6 on a pod-network shape) or a CGNAT / Tailscale address (`100.64.0.0/10` is deliberately not in the default) is refused until you add its network. An explicit `["any"]` renders `any` and really opens recursion (an open resolver, deliberately). `["none"]` refuses everyone. Saving the field blank stores the default (the group-options PUT normalises `[]`); a stored empty list that reaches the agent anyway renders `none` (fail closed), not an omitted line: an omitted `allow-recursion` inherits `allow-query` (BIND 9.20 `server.c`), which the agent renders as `any` by default. Recursion off renders no line. Upgrading rewrites groups stored as exactly `["any"]` (or empty) to the new default (migration `b8e41c7a2d95`); set the client networks or `any` to keep wider recursion. An explicit list applies to every view, and the view's own `allow-query-cache` inherits it unless set. Elements named-checkconf would refuse (malformed, or an ACL not defined in the group) are dropped by the agent; if none survive the line renders as `none` (fail closed). Named ACLs must exist in the group (§8.2), and an ACL the server options cite cannot be deleted or renamed.
+- **Technitium** follows the same values (#1817): the default maps to `UseSpecifiedNetworkACL` with one deduplicated ACL of loopback plus the RFC 1918 + ULA + link-local ranges, `["any"]` to `Allow`, empty to `Deny`. The one difference is `localnets`: BIND's is the server's directly attached subnets, Technitium has no equivalent, so it uses the private ranges (the same set as its own private-networks default).
 - Authoritative-only servers must have `recursion_enabled: false` + `allow_recursion: ["none"]`
 
 ### 3.3 DNSSEC Resolution
@@ -1784,8 +1785,8 @@ operator key referenced in a clause is always defined.
 ### 19.5 Drift — ingest-back (Alt.1)
 
 A dynamic zone accepts records the control plane didn't create; those live
-only in the daemon journal and would be dropped on a full re-render (cold
-boot, from-scratch re-seed). The BIND9 agent closes the loop: it AXFRs
+only in the daemon and would be dropped on a full re-render (cold
+boot, from-scratch re-seed). The agent closes the loop: the BIND9 agent AXFRs
 each dynamic zone from loopback (signed with the group loopback key — the
 zone stanza grants `allow-transfer { key … }` for exactly this, nothing is
 opened to the network) and POSTs the live record set to
@@ -1793,6 +1794,13 @@ opened to the network) and POSTs the live record set to
 it doesn't already manage as an ordinary `DNSRecord` stamped
 `import_source="ddns_external"`, so externally-injected records become
 UI/IPAM-visible and survive a re-render.
+
+The PowerDNS agent runs the same loop (issue #1524) reading each dynamic
+zone back over the loopback REST API (`GET /zones/{zone}`, with the API key
+the driver manages) instead of an AXFR. Before that, the loop ran for BIND9
+only: RFC 2136 records written to a PowerDNS zone never appeared in
+SpatiumDDI, and an external value sharing a `(name, record_type)` with a
+managed rrset was silently REPLACEd away by the next reconcile.
 
 **Conflict rule: control-plane-managed names win.** An incoming record
 whose `(name, record_type)` collides with a managed row is skipped; only

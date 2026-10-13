@@ -54,6 +54,41 @@ class _FakeResponse:
         return self._body
 
 
+def _without_create_hold(
+    calls: list[tuple[str, str, str, dict[str, Any]]],
+) -> list[tuple[str, str, str, dict[str, Any]]]:
+    """``calls`` minus ``zones/create`` and the #1758 hold around a created
+    Primary. These generic fakes answer "ok" to a create, so each such zone
+    is held (``queryAccess=Deny``) and released by its options call, which
+    with no options in the bundle is exactly ``queryAccess`` +
+    ``queryAccessNetworkACL``. Only those exact shapes are dropped, and only
+    as one hold, then one release, per created zone: anything else, an
+    options call carrying more than the query access included, stays in the
+    list the test asserts on."""
+    out = []
+    created: list[str] = []
+    state: dict[str, str] = {}
+    for c in calls:
+        path, params = c[2], c[3]
+        zone = params.get("zone")
+        keys = set(params) - {"zone"}
+        if path == "zones/create":
+            created.append(zone)
+            continue
+        if path == "zones/options/set" and zone in created:
+            if keys == {"queryAccess"} and params["queryAccess"] == "Deny":
+                assert zone not in state, f"{zone} held twice"
+                state[zone] = "held"
+                continue
+            if "queryAccess" in keys and state.get(zone) == "held":
+                state[zone] = "released"
+                if keys == {"queryAccess", "queryAccessNetworkACL"}:
+                    continue
+        out.append(c)
+    assert all(v == "released" for v in state.values()), state
+    return out
+
+
 def _install_fake_request(
     driver: TechnitiumDriver,
     responder: Any,
@@ -309,7 +344,7 @@ def test_reconcile_is_a_noop_for_txt_served_as_entered(tmp_path: Path) -> None:
             _txt_desired("long", chr(0xE9) * 200),
         ],
     )
-    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[2] for c in _without_create_hold(calls)] == ["zones/records/get"]
 
 
 def _record_calls(calls: list[tuple[str, str, str, dict[str, Any]]]) -> list[tuple[str, str]]:
@@ -338,7 +373,7 @@ def test_reconcile_replaces_a_txt_served_without_its_full_stop(tmp_path: Path) -
                    "rData": _txt_rdata(b"a full stop.")}],
         desired=desired,
     )
-    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[2] for c in _without_create_hold(calls)] == ["zones/records/get"]
 
 
 def test_reconcile_replaces_a_txt_served_with_its_quotes_once(tmp_path: Path) -> None:
@@ -375,7 +410,7 @@ def test_reconcile_replaces_a_txt_served_with_its_quotes_once(tmp_path: Path) ->
         ],
         desired=desired,
     )
-    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[2] for c in _without_create_hold(calls)] == ["zones/records/get"]
 
 
 def test_apply_record_op_sends_each_txt_member_as_its_strings(tmp_path: Path) -> None:
@@ -732,7 +767,7 @@ def test_reconcile_is_a_noop_when_already_in_sync(tmp_path: Path) -> None:
              "ipAddress": "10.0.0.1"}
         ],
     )
-    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[2] for c in _without_create_hold(calls)] == ["zones/records/get"]
 
 
 def test_reconcile_tolerates_numeric_vs_string_rdata(tmp_path: Path) -> None:
@@ -751,7 +786,7 @@ def test_reconcile_tolerates_numeric_vs_string_rdata(tmp_path: Path) -> None:
              "exchange": "mail.example.com", "preference": "10"}
         ],
     )
-    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[2] for c in _without_create_hold(calls)] == ["zones/records/get"]
 
 
 def test_reconcile_never_deletes_daemon_managed_apex(tmp_path: Path) -> None:
@@ -3042,7 +3077,7 @@ _WANTED_APEX = {
 def test_reconcile_apex_rewrites_daemon_soa_and_ns(tmp_path: Path) -> None:
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _apex_reconcile(d, _DAEMON_APEX, _WANTED_APEX)
-    writes = [(c[2], c[3]) for c in calls if c[2] != "zones/create" and c[2] != "zones/records/get"]
+    writes = [(c[2], c[3]) for c in _without_create_hold(calls) if c[2] != "zones/records/get"]
 
     soa = [p for path, p in writes if path == "zones/records/update"]
     assert len(soa) == 1
@@ -3074,7 +3109,7 @@ def test_reconcile_apex_is_a_noop_when_converged(tmp_path: Path) -> None:
                    "refresh": 3600, "retry": 600, "expire": 604800, "minimum": 300}},
     ]
     calls = _apex_reconcile(d, converged, _WANTED_APEX)
-    assert [c[2] for c in calls if c[2] != "zones/create"] == [
+    assert [c[2] for c in _without_create_hold(calls)] == [
         "zones/records/get",  # the zone's records
         "zones/records/get",  # its apex
     ]
@@ -3092,7 +3127,7 @@ def test_reconcile_apex_untouched_without_apex(tmp_path: Path) -> None:
     nothing): the daemon's own SOA and NS are not even read."""
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _apex_reconcile(d, _DAEMON_APEX, None)  # type: ignore[arg-type]
-    assert [c[2] for c in calls if c[2] != "zones/create"] == ["zones/records/get"]
+    assert [c[2] for c in _without_create_hold(calls)] == ["zones/records/get"]
     assert [c[3].get("listZone") for c in calls if c[2] == "zones/records/get"] == ["true"]
 
 
@@ -3491,7 +3526,15 @@ def test_untranslatable_allow_query_is_reported_and_never_guessed(tmp_path: Path
     )
     d.validate()
     d.swap_and_reload()
-    assert _query_access_calls(calls) == {}
+    # Nothing translated: the only query access sent is the #1758 hold on a
+    # created Primary and its release to the daemon's create default.
+    sent = [c[3] for c in calls if c[2] == "zones/options/set" and "queryAccess" in c[3]]
+    assert {(c["zone"], c["queryAccess"], c.get("queryAccessNetworkACL")) for c in sent} == {
+        ("a.test", "Deny", None),
+        ("a.test", "Allow", ""),
+        ("b.test", "Deny", None),
+        ("b.test", "Allow", ""),
+    }
     # One refusal for the one group option, naming how many zones it left
     # alone, not one per zone burying every other refusal.
     refused = [r for r in d._refused_zones if "allow_query" in r]

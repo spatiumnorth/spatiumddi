@@ -26,6 +26,17 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
 
+#: Stored default of ``DNSServerOptions.allow_recursion`` (#1817).
+DEFAULT_ALLOW_RECURSION: tuple[str, ...] = (
+    "localhost",
+    "localnets",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "fc00::/7",
+    "fe80::/10",
+)
+
 
 class DNSServerZoneState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """Per-server zone-loaded-serial snapshot.
@@ -627,7 +638,13 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # Recursion
     recursion_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    allow_recursion: Mapped[list] = mapped_column(JSONB, nullable=False, default=lambda: ["any"])
+    # #1817: local + private networks, not ``any`` — a group nobody
+    # configured is not an open resolver. Rendered literally by every driver.
+    allow_recursion: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: list(DEFAULT_ALLOW_RECURSION),
+    )
 
     # DNSSEC — auto | yes | no
     dnssec_validation: Mapped[str] = mapped_column(String(10), nullable=False, default="auto")

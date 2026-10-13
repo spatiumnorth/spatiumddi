@@ -83,6 +83,25 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "4f6e1693cdc51817e42e0e4bd45060a8ffddce72ab6ac343e382235bb9581811",
         "views": "f76b076ee933fc8a82a303ec95e417641820daa18e4fe75af5cf14954b560d8f",
     },
+    # 8 (#1523): the bundle ships the NOTIFY fields — server options
+    # notify_enabled / also_notify / allow_notify + zone allow_query /
+    # also_notify / notify_enabled.
+    8: {
+        "plain": "f7d933cc7f7d4194cbc0afab5f56e878fa547debfeb0455702f08bb76ab5cc19",
+        "views": "3e94415136b79039793de83663d182e3a0e329d962c73e2306fc786ba0c178b1",
+    },
+    # #1786: a BIND9 server's options carry ``allow_recursion``, on top of
+    # 8's NOTIFY fields.
+    9: {
+        "plain": "b0c88e0ffd0dadc9aa87f42812916763a1d1d78a58b41e6d440dbbfed030d422",
+        "views": "352e73b9717507d9654ad019bf677f81ca8f739ef61aa3e5ee29640d352d9bde",
+    },
+    # #1817: the same field, now the local + private networks default for
+    # groups that never set it (the fixtures' options rows).
+    10: {
+        "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
+        "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
+    },
 }
 
 
