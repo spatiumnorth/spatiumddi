@@ -6765,7 +6765,7 @@ function TSIGKeyModal({
   );
 }
 
-function RevealedSecretModal({
+export function RevealedSecretModal({
   name,
   algorithm,
   secret,
@@ -6785,7 +6785,9 @@ function RevealedSecretModal({
           This is the only time the plaintext secret for{" "}
           <code className="font-mono">{name}</code> will be shown. Copy it into
           your <code>nsupdate</code> client / secondary-server config before
-          closing — it is hashed at rest and can't be recovered.
+          closing. SpatiumDDI keeps it encrypted at rest (it has to, to sign DNS
+          updates), but the UI never shows it again — rotate the key to get a
+          new one.
         </p>
         <div className="rounded border bg-muted/30 p-3 font-mono text-xs">
           <div className="mb-1 text-muted-foreground">{algorithm}</div>
