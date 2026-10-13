@@ -50,7 +50,7 @@ async def _audit(outcome: RewrapOutcome) -> None:
     from app.db import task_session  # noqa: PLC0415 — needs the DB, not at import
     from app.models.audit import AuditLog  # noqa: PLC0415
 
-    async with task_session() as db:
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         db.add(
             AuditLog(
                 user_display_name="<cli: rotate_secret_key>",

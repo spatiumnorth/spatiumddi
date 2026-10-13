@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A lost CNPG primary no longer hangs a Celery task for ~15 minutes
+  (#1719).** `task_session()`'s per-task engine set no asyncpg bounds, so a
+  query to a black-holed primary waited out the kernel's TCP retransmit
+  timeout while the worker completed nothing and its liveness probe passed.
+  It now carries the api engine's connect bound (`TASK_DB_CONNECT_TIMEOUT`,
+  5 s) and a per-statement `TASK_DB_COMMAND_TIMEOUT` (120 s, the pre-ping
+  included). The prune, trash-purge, chain-verify, recount, schema-check,
+  backup-sweep and key-rotation tasks use `TASK_DB_LONG_COMMAND_TIMEOUT`
+  (900 s) because a single statement of theirs can legitimately run long.
+
 - **A rolling upgrade whose own cleanup fails now raises a distinct
   alert (#1542).** When an upgrade fails after cordoning a node, the
   orchestrator uncordons it and clears the CNPG maintenance window; if

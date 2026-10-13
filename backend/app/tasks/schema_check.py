@@ -193,7 +193,7 @@ async def _async_check_and_alert() -> dict:
     _strict_cache.checked_at = monotonic()
     _strict_cache.behind = not result.ok
 
-    async with task_session() as db:
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         rule = (
             await db.execute(select(AlertRule).where(AlertRule.name == _RULE_NAME))
         ).scalar_one_or_none()

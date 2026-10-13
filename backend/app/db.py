@@ -105,9 +105,26 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 # cadence (seconds, not milliseconds).
 
 
+def task_connect_args(command_timeout: float | None = None) -> dict[str, float]:
+    """asyncpg ``connect_args`` for the per-task engine (#1719)."""
+    return {
+        "timeout": settings.task_db_connect_timeout,
+        "command_timeout": (
+            command_timeout if command_timeout is not None else settings.task_db_command_timeout
+        ),
+    }
+
+
 @asynccontextmanager
-async def task_session() -> AsyncGenerator[AsyncSession, None]:
-    """Per-Celery-task DB session — fresh engine, fresh loop binding."""
+async def task_session(
+    *, command_timeout: float | None = None
+) -> AsyncGenerator[AsyncSession, None]:
+    """Per-Celery-task DB session — fresh engine, fresh loop binding.
+
+    ``command_timeout`` overrides the per-statement bound
+    (``settings.task_db_command_timeout``); tasks whose single statements are
+    legitimately slow pass ``settings.task_db_long_command_timeout``.
+    """
 
     # A task needs exactly one connection; bound the pool to 1 (no
     # overflow) so a burst of N concurrent scheduled tasks opens N
@@ -125,6 +142,12 @@ async def task_session() -> AsyncGenerator[AsyncSession, None]:
         # replaces a dead connection between transactions, as the module
         # engine above already does.
         pool_pre_ping=True,
+        # #1719 — the same black-hole bound the module engine carries (#590).
+        # Without it a task holding a connection to a primary whose node died
+        # sat in epoll_wait for ~15 min (the kernel's TCP retransmit timeout)
+        # while its worker completed nothing and the liveness probe passed.
+        # The pre-ping is a command too, so this bounds it as well.
+        connect_args=task_connect_args(command_timeout),
     )
     factory = async_sessionmaker(task_engine, class_=AsyncSession, expire_on_commit=False)
     try:

@@ -90,6 +90,15 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://spatiumddi:changeme@postgres:5432/spatiumddi"
     database_pool_size: int = 10
     database_max_overflow: int = 20
+    # Celery ``task_session()`` engine bounds (#1719). A lost CNPG primary is
+    # a black hole; unbounded, a task waits out the kernel's TCP retransmit
+    # timeout (~15 min). ``connect`` bounds a fresh connect, ``command`` every
+    # statement (the pre-ping included); ``long_command`` is for the handful
+    # of tasks with legitimately slow single statements (prunes, chain verify,
+    # key rotation).
+    task_db_connect_timeout: float = 5
+    task_db_command_timeout: float = 120
+    task_db_long_command_timeout: float = 900
 
     # Redis
     redis_url: str = "redis://redis:6379/0"
