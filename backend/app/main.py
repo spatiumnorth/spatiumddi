@@ -287,7 +287,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "verify the underlying evidence without making changes.",
         [
             {"action": "read", "resource_type": "conformity"},
-            {"action": "read", "resource_type": "audit"},
+            {"action": "read", "resource_type": "audit_log"},
             {"action": "read", "resource_type": "subnet"},
             {"action": "read", "resource_type": "ip_address"},
             {"action": "read", "resource_type": "dns_zone"},
@@ -302,7 +302,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "operational config.",
         [
             {"action": "admin", "resource_type": "conformity"},
-            {"action": "read", "resource_type": "audit"},
+            {"action": "read", "resource_type": "audit_log"},
             {"action": "read", "resource_type": "subnet"},
             {"action": "read", "resource_type": "ip_address"},
             {"action": "read", "resource_type": "dns_zone"},

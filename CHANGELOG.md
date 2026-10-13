@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The built-in Auditor and Compliance Editor could not read the
+  audit log (#1862).** Both roles were granted `read` on `audit`, a
+  resource type no route checks, while every audit-log route (the
+  list, the PDF export and the integrity check) requires `read` on
+  `audit_log`. An Auditor opening Administration, Audit Log was told
+  "0 events" with the log full, and the role's own description ("read
+  on audit log") was false. Both roles now carry `read` on
+  `audit_log`. Built-in roles are re-written from code on every api
+  start, so existing installs pick this up on upgrade with no
+  migration. A new test walks every route's required permission and
+  fails when a built-in role holds a grant that no route checks.
+
 - **The DICOM AE, OT device and IPAM CSV imports read a file with classic
   Mac line endings (#1370, #1637, #1711).** Each importer read the
   pasted or uploaded text without handing its line endings to the csv
