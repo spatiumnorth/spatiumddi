@@ -85,14 +85,23 @@ the formatter handles the rest.
 ### Fixed
 
 - **A lost CNPG primary no longer hangs a Celery task for ~15 minutes
-  (#1719).** `task_session()`'s per-task engine set no asyncpg bounds, so a
-  query to a black-holed primary waited out the kernel's TCP retransmit
-  timeout while the worker completed nothing and its liveness probe passed.
-  It now carries the api engine's connect bound (`TASK_DB_CONNECT_TIMEOUT`,
-  5 s) and a per-statement `TASK_DB_COMMAND_TIMEOUT` (120 s, the pre-ping
-  included). The prune, trash-purge, chain-verify, recount, schema-check,
-  backup-sweep and key-rotation tasks use `TASK_DB_LONG_COMMAND_TIMEOUT`
-  (900 s) because a single statement of theirs can legitimately run long.
+  (#1719).** No Celery-side database engine set asyncpg bounds: neither
+  `task_session()` nor the ~55 per-task `create_async_engine` calls the
+  lease pulls, DNS / IPAM syncs, health sweeps, integration mirrors and the
+  event outbox build directly. A query to a black-holed primary therefore
+  waited out the kernel's TCP retransmit timeout while the worker completed
+  nothing and its liveness probe passed. Every task and service engine on
+  the app database now carries the api engine's connect bound
+  (`TASK_DB_CONNECT_TIMEOUT`, 5 s) and a per-statement
+  `TASK_DB_COMMAND_TIMEOUT` (120 s, the pre-ping included), through one
+  helper, `app.db.task_connect_args()`; a test fails any new engine that
+  omits it. Tasks with a single statement that can legitimately run long use
+  `TASK_DB_LONG_COMMAND_TIMEOUT` (900 s): the prunes (metrics, logs,
+  internal errors, lease history, stale ARP), trash purge, audit-chain
+  verify, utilization recount, backup sweep, the DNS threat rollup and the
+  DNS agent bundle render, whose records query on a million-row group is
+  the #1111 case. The backup drill's scratch-database engine and the backup
+  migration helper's explicit-URL engine are deliberately unbounded.
 
 - **A rolling upgrade whose own cleanup fails now raises a distinct
   alert (#1542).** When an upgrade fails after cordoning a node, the

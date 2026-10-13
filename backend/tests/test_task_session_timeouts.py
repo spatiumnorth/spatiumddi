@@ -72,3 +72,111 @@ async def test_unroutable_primary_fails_within_connect_bound():
             **{"timeout": app_db.task_connect_args()["timeout"]},
         )
     assert time.monotonic() - start < app_db.task_connect_args()["timeout"] + 5
+
+
+# ── Every task / service engine on the app database is bounded ──────────
+
+_APP_ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent / "app"
+
+# Engines that do NOT point at ``settings.database_url`` and are exempt by
+# design: the backup drill builds its own engine on a scratch database, and
+# the backup migration helper takes an explicit URL from its caller.
+_EXEMPT = {
+    "services/backup/drill.py",
+    "services/backup/migrations.py",
+}
+
+
+def _engine_calls():
+    """Yield ``(relpath, lineno, call)`` for each ``create_async_engine``."""
+    import ast
+
+    for sub in ("tasks", "services"):
+        for path in sorted((_APP_ROOT / sub).rglob("*.py")):
+            rel = path.relative_to(_APP_ROOT).as_posix()
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                fn = node.func
+                name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+                if name == "create_async_engine":
+                    yield rel, node.lineno, node
+
+
+def test_every_app_db_engine_in_tasks_and_services_is_bounded():
+    """#1719 — a per-task engine with no ``connect_args`` hangs ~15 min on
+    a black-holed CNPG primary. Every ``create_async_engine`` on the app
+    database in ``app/tasks`` and ``app/services`` must pass
+    ``connect_args=task_connect_args(...)``."""
+    import ast
+
+    seen = 0
+    unbounded = []
+    for rel, lineno, call in _engine_calls():
+        if rel in _EXEMPT:
+            continue
+        seen += 1
+        kw = {k.arg: k.value for k in call.keywords if k.arg}
+        ca = kw.get("connect_args")
+        ok = (
+            isinstance(ca, ast.Call)
+            and getattr(ca.func, "id", getattr(ca.func, "attr", None)) == "task_connect_args"
+        )
+        if not ok:
+            unbounded.append(f"{rel}:{lineno}")
+    # Guard against the scan silently matching nothing.
+    assert seen > 30, seen
+    assert not unbounded, f"engines without connect_args=task_connect_args(): {unbounded}"
+
+
+def test_exempt_engines_still_exist():
+    """Keep the allowlist honest: drop an entry once its engine is gone."""
+    found = {rel for rel, _, _ in _engine_calls()}
+    assert _EXEMPT <= found, _EXEMPT - found
+
+
+@pytest.mark.parametrize(
+    "module,needle",
+    [
+        # The 1.09 M-row records query (#1111) runs past 120 s on big groups.
+        (
+            "app.tasks.agent_bundles",
+            "task_session(command_timeout=settings.task_db_long_command_timeout)",
+        ),
+        (
+            "app.tasks.dns_threat",
+            "task_session(command_timeout=settings.task_db_long_command_timeout)",
+        ),
+        (
+            "app.tasks.snmp_poll",
+            "task_connect_args(command_timeout=settings.task_db_long_command_timeout)",
+        ),
+    ],
+)
+def test_long_statement_tasks_use_long_bound(module, needle):
+    import importlib
+    import inspect
+
+    src = inspect.getsource(importlib.import_module(module))
+    assert needle in src
+
+
+@pytest.mark.asyncio
+async def test_agent_bundle_render_session_gets_long_bound(monkeypatch, db_session):  # noqa: ARG001
+    """Behavioural: the render's engine carries the 900 s command bound."""
+    import uuid
+
+    from app.tasks import agent_bundles
+
+    seen = {}
+    real = app_db.create_async_engine
+
+    def spy(*a, **kw):
+        seen.update(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(app_db, "create_async_engine", spy)
+    result = await agent_bundles._render_once(uuid.uuid4())
+    assert result == {"status": "gone"}
+    assert seen["connect_args"]["command_timeout"] == settings.task_db_long_command_timeout

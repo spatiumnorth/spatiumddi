@@ -106,7 +106,12 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 def task_connect_args(command_timeout: float | None = None) -> dict[str, float]:
-    """asyncpg ``connect_args`` for the per-task engine (#1719)."""
+    """asyncpg ``connect_args`` for every Celery-side engine (#1719).
+
+    ``task_session()`` uses it, and so must every ``create_async_engine`` on
+    ``settings.database_url`` in ``app/tasks`` and ``app/services``
+    (``tests/test_task_session_timeouts.py`` fails any that omits it).
+    """
     return {
         "timeout": settings.task_db_connect_timeout,
         "command_timeout": (

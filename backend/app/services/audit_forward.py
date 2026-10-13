@@ -55,6 +55,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.config import settings as _app_settings
+from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.settings import PlatformSettings
@@ -1011,7 +1012,9 @@ async def _ephemeral_session() -> AsyncIterator[AsyncSession]:
     ("another operation is in progress"). An ephemeral engine with
     ``NullPool`` has no loop-bound pool state to leak.
     """
-    engine = create_async_engine(_app_settings.database_url, poolclass=NullPool)
+    engine = create_async_engine(
+        _app_settings.database_url, poolclass=NullPool, connect_args=task_connect_args()
+    )
     try:
         async with AsyncSession(engine, expire_on_commit=False) as session:
             yield session
