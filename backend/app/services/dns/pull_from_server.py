@@ -22,6 +22,7 @@ a TSIG-signed AXFR (#734), the rest over their own authenticated API.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,7 +30,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.drivers.dns import get_driver
+from app.drivers.dns import CLOUD_DNS_DRIVERS, get_driver
 from app.drivers.dns._txt import quote_txt, txt_value
 from app.drivers.dns.base import RecordChange, RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSZone
@@ -167,13 +168,45 @@ def _syncable_types(driver: Any, fallback: frozenset[str] | set[str]) -> frozens
 _NAME_VALUED_TYPES = frozenset({"CNAME", "DNAME", "NS", "PTR", "MX", "SRV"})
 
 
-def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
+def targets_are_relative(server: Any) -> bool:
+    """How ``server``'s driver reads a name target with no trailing dot (#1794).
+
+    True for the zone-file drivers: BIND9 and both Technitium drivers
+    store and serve the value as a zone file would, so ``a.b`` is
+    ``a.b.<zone>.`` and only a trailing dot makes a name absolute. The
+    agentless Windows driver without WinRM credentials (Path A) is one too:
+    its writes are RFC 2136 updates parsed against the zone origin.
+    PowerDNS falls through to True as well, but its answer is never
+    consulted: it implements no record pull, so drift and sync never reach
+    a comparison for it (its HTTP API does not read content zone-file style).
+
+    False for the drivers whose API takes the name as given, so a dot-less
+    name holding a dot is already absolute: the cloud providers, and Windows
+    Path B (``-HostNameAlias 'a.b'``). A single label stays relative on both.
+
+    Both sides of a comparison are read the same way: the wire side is
+    absolute (trailing dot) on every driver but the cloud ones, whose
+    dot-less pulls are absolute names, so one flag per server is enough.
+    """
+    driver = getattr(server, "driver", None)
+    if driver in CLOUD_DNS_DRIVERS:
+        return False
+    if driver == "windows_dns":
+        return not getattr(server, "credentials_encrypted", None)
+    return True
+
+
+def _normalize_value(rtype: str, value: str, zone_name: str, *, relative_targets: bool) -> str:
     """Canonicalise a record value for dedup.
 
-    * Name-valued types: lowercase, ensure trailing dot, and expand bare
-      labels against the zone origin. "aaa", "aaa.", "AAA.ZONE.LOCAL." and
-      "aaa.zone.local" all collapse to "aaa.zone.local." once the zone is
-      "zone.local.".
+    * Name-valued types: lowercase, ensure trailing dot, and expand a name
+      with no trailing dot against the zone origin. "aaa", "aaa.",
+      "AAA.ZONE.LOCAL." and "aaa.zone.local" collapse to "aaa.zone.local."
+      once the zone is "zone.local." — except that with
+      ``relative_targets`` False a dot-less name holding a dot
+      (``aaa.zone.local``) is already absolute, and with it True
+      (``a.b``) is ``a.b.zone.local.`` (#1794; see
+      :func:`targets_are_relative`).
     * Everything else: stripped + lowercased (fine for A/AAAA/IP literals
       where case doesn't matter either).
     """
@@ -194,7 +227,10 @@ def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
         # written relative / absolute are all one record. Given the value
         # as stored, not ``v``: ``ech`` base64 is case-sensitive, and the
         # canonical form already folds what is case-insensitive.
-        return svcb_canonical((value or "").strip(), zone_name)
+        text = (value or "").strip()
+        if not relative_targets:
+            text = _absolute_svcb_target(text)
+        return svcb_canonical(text, zone_name)
     if rtype == "NAPTR":
         # #1759: the replacement is the last token and a name like any
         # other, so ``web`` / ``web.`` / ``web.<zone>.`` are one record. The
@@ -202,29 +238,45 @@ def _normalize_value(rtype: str, value: str, zone_name: str) -> str:
         head, sep, replacement = v.rpartition(" ")
         if not sep:
             return v
-        return f"{head} {_normalize_name(replacement, zone_name)}"
+        return f"{head} {_normalize_name(replacement, zone_name, relative_targets)}"
     if rtype == "URI":
         # #1513: fold away the bare-authority trailing slash a server
         # may append when storing the record; a path's slash stays.
         return strip_bare_authority_slash(v)
     if rtype not in _NAME_VALUED_TYPES:
         return v
-    return _normalize_name(v, zone_name)
+    return _normalize_name(v, zone_name, relative_targets)
 
 
-def _normalize_name(v: str, zone_name: str) -> str:
+_SVCB_TARGET = re.compile(r"^(\s*\d+\s+)([^\s\"=]+)(?=\s|$)")
+
+
+def _absolute_svcb_target(text: str) -> str:
+    """``text`` with a dot-less SVCB / HTTPS target holding a dot made
+    absolute. ``svcb_canonical`` always reads zone-file style; a driver that
+    takes the name as given needs ``svc.example.net`` kept absolute."""
+
+    def _dot(m: re.Match[str]) -> str:
+        tgt = m.group(2)
+        return m.group(1) + (tgt + "." if "." in tgt and not tgt.endswith(".") else tgt)
+
+    return _SVCB_TARGET.sub(_dot, text, count=1)
+
+
+def _normalize_name(v: str, zone_name: str, relative_targets: bool) -> str:
     """A lower-cased name target in its one comparison form: absolute, with
     its trailing dot. ``@`` and the empty string are the zone."""
+    zone = zone_name.lower().rstrip(".") + "."
     # "@" means the zone apex.
     if v == "@" or v == "":
-        return zone_name.lower()
+        return zone
     # Already absolute.
     if v.endswith("."):
         return v
-    # Bare label (no dot or not fully qualified) → append zone.
-    if "." not in v:
-        return f"{v}.{zone_name}".lower()
-    # Qualified but missing trailing dot → add it.
+    # No trailing dot: relative to the zone, unless the driver takes a name
+    # with a dot in it as given (#1794).
+    if relative_targets or "." not in v:
+        return f"{v}.{zone}".lower()
     return f"{v}.".lower()
 
 
@@ -235,7 +287,7 @@ def _normalize_name(v: str, zone_name: str) -> str:
 RecordKey = tuple[str, str, str, int | None, int | None, int | None]
 
 
-def _key(r: RecordData | DNSRecord, zone_name: str) -> RecordKey:
+def _key(r: RecordData | DNSRecord, zone_name: str, *, relative_targets: bool) -> RecordKey:
     """Identity key for dedup: (name, type, canonical-value, priority,
     weight, port). TTL-only differences don't count — neither does
     relative-vs-FQDN storage for name-valued records.
@@ -256,7 +308,12 @@ def _key(r: RecordData | DNSRecord, zone_name: str) -> RecordKey:
         )
     else:
         struct = (None, None, None)
-    return (name, rtype, _normalize_value(rtype, r.value, zone_name), *struct)
+    return (
+        name,
+        rtype,
+        _normalize_value(rtype, r.value, zone_name, relative_targets=relative_targets),
+        *struct,
+    )
 
 
 #: The address record the BIND9 agent writes into every primary zone file,
@@ -287,10 +344,11 @@ def without_agent_ns_glue(
     """
     if getattr(server, "driver", None) != "bind9" or getattr(server, "agent_id", None) is None:
         return on_wire
-    glue = _key(_AGENT_NS_GLUE, zone_name)
+    rel = targets_are_relative(server)
+    glue = _key(_AGENT_NS_GLUE, zone_name, relative_targets=rel)
     if glue in db_keys:
         return on_wire
-    return [r for r in on_wire if _key(r, zone_name) != glue]
+    return [r for r in on_wire if _key(r, zone_name, relative_targets=rel) != glue]
 
 
 async def _resolve_primary_and_driver(
@@ -344,7 +402,9 @@ async def _resolve_primary_and_driver(
     return primary, driver, [view_key, tsig], view_name
 
 
-def _legacy_technitium_txt_keys(db_rows: list[DNSRecord], zone_name: str) -> set[RecordKey]:
+def _legacy_technitium_txt_keys(
+    db_rows: list[DNSRecord], zone_name: str, *, relative_targets: bool
+) -> set[RecordKey]:
     """What a ``technitium_api`` server holds for each DB TXT row written
     before #1760, keyed like the wire.
 
@@ -363,8 +423,12 @@ def _legacy_technitium_txt_keys(db_rows: list[DNSRecord], zone_name: str) -> set
             continue
         raw = (row.value or "").rstrip(".").encode("utf-8")
         served = txt_value([raw[i : i + 255] for i in range(0, len(raw), 255)])
-        legacy = _key(RecordData(name=row.name, record_type="TXT", value=served), zone_name)
-        if legacy != _key(row, zone_name):
+        legacy = _key(
+            RecordData(name=row.name, record_type="TXT", value=served),
+            zone_name,
+            relative_targets=relative_targets,
+        )
+        if legacy != _key(row, zone_name, relative_targets=relative_targets):
             out.add(legacy)
     return out
 
@@ -376,6 +440,7 @@ def _additive_import(
     db_keys: set[RecordKey],
     *,
     apply: bool,
+    relative_targets: bool,
     importable_types: frozenset[str] | None = None,
     not_importable: set[RecordKey] | None = None,
 ) -> PullResult:
@@ -399,7 +464,7 @@ def _additive_import(
         if rtype not in importable_types:
             skipped_unsupported += 1
             continue
-        key = _key(rec, zone_name)
+        key = _key(rec, zone_name, relative_targets=relative_targets)
         if key in db_keys:
             existing += 1
             continue
@@ -447,7 +512,9 @@ def _not_importable(primary: Any, db_rows: list[DNSRecord], zone_name: str) -> s
     agentless Technitium driver ever wrote the pre-#1760 TXT form."""
     if getattr(primary, "driver", None) != "technitium_api":
         return set()
-    return _legacy_technitium_txt_keys(db_rows, zone_name)
+    return _legacy_technitium_txt_keys(
+        db_rows, zone_name, relative_targets=targets_are_relative(primary)
+    )
 
 
 async def pull_zone_from_server(
@@ -469,7 +536,8 @@ async def pull_zone_from_server(
 
     db_rows_res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))
     db_rows = list(db_rows_res.scalars().all())
-    db_keys = {_key(r, zone.name) for r in db_rows}
+    rel = targets_are_relative(primary)
+    db_keys = {_key(r, zone.name, relative_targets=rel) for r in db_rows}
     on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
 
     result = _additive_import(
@@ -478,6 +546,7 @@ async def pull_zone_from_server(
         on_wire,
         db_keys,
         apply=apply,
+        relative_targets=rel,
         importable_types=_syncable_types(driver, _IMPORTABLE_TYPES),
         not_importable=_not_importable(primary, db_rows, zone.name),
     )
@@ -527,7 +596,8 @@ async def _additive_push(
     sequential loop for agent-based drivers (BIND9) where the control
     plane never calls the record writer anyway.
     """
-    on_wire_keys = {_key(r, zone.name) for r in on_wire}
+    rel = targets_are_relative(primary)
+    on_wire_keys = {_key(r, zone.name, relative_targets=rel) for r in on_wire}
 
     pushed_records: list[dict[str, Any]] = []
     push_errors: list[str] = []
@@ -544,7 +614,7 @@ async def _additive_push(
         rtype = row.record_type.upper()
         if rtype not in pushable_types:
             continue
-        if _key(row, zone.name) in on_wire_keys:
+        if _key(row, zone.name, relative_targets=rel) in on_wire_keys:
             continue
         candidate_rows.append(row)
 
@@ -737,7 +807,8 @@ async def sync_zone_with_server(
     # out keeps the push count honest.
     db_rows_res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))
     db_rows = list(db_rows_res.scalars().all())
-    db_keys = {_key(r, zone.name) for r in db_rows}
+    rel = targets_are_relative(primary)
+    db_keys = {_key(r, zone.name, relative_targets=rel) for r in db_rows}
     on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
 
     pull_result = _additive_import(
@@ -746,6 +817,7 @@ async def sync_zone_with_server(
         on_wire,
         db_keys,
         apply=apply,
+        relative_targets=rel,
         importable_types=_syncable_types(driver, _IMPORTABLE_TYPES),
         not_importable=_not_importable(primary, db_rows, zone.name),
     )
