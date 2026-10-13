@@ -566,6 +566,32 @@ def _qualified_name(zone_name: str, name: str) -> str:
     return f"{bare}.{zone}"
 
 
+def _shadowing_zone(domain: str, zone: str, hosted: Any) -> str | None:
+    """The hosted zone that answers ``domain`` instead of ``zone``, or None (#1712).
+
+    Technitium files a record under the CLOSEST zone it hosts for the name,
+    whatever ``zone`` the add call names (verified against 15.4.0; see
+    ``_retire_dropped_zones``). So a parent's record at a name inside a child
+    zone on the same daemon is written into the child, and ``overwrite=true``
+    there clears the child's own RRset. The child owns that name; the parent's
+    record cannot be served from this daemon, and writing it is destructive.
+    ``hosted`` is every zone name the bundle carries (lower-case, no trailing
+    dot); returns the deepest one that is a strict descendant of ``zone`` and
+    contains ``domain``.
+    """
+    zone = zone.rstrip(".").lower()
+    domain = domain.rstrip(".").lower()
+    best: str | None = None
+    for cand in hosted or ():
+        cand = str(cand).rstrip(".").lower()
+        if cand == zone or not cand.endswith("." + zone):
+            continue
+        if domain == cand or domain.endswith("." + cand):
+            if best is None or len(cand) > len(best):
+                best = cand
+    return best
+
+
 def _canonical_ip(value: str) -> str:
     """Canonical form of an A/AAAA value via ``ipaddress`` (#1513).
 
@@ -2184,6 +2210,17 @@ class TechnitiumDriver(DriverBase):
                     if rtype in _DAEMON_MANAGED_APEX_TYPES:
                         continue
                     name = _qualified_name(zname, rec.get("name") or "@")
+                    shadow = _shadowing_zone(name, zname, bundle_zone_names)
+                    if shadow is not None:
+                        # #1712: the child zone owns this name on the daemon.
+                        log.warning(
+                            "technitium_record_shadowed_by_child_zone",
+                            zone=zname,
+                            name=name,
+                            type=rtype,
+                            child_zone=shadow,
+                        )
+                        continue
                     if rtype == "NS" and name == zname:
                         # Apex NS is reconciled with the SOA, as a set
                         # (``_zone_apex`` / ``_reconcile_zone_apex``), not
@@ -2813,6 +2850,19 @@ class TechnitiumDriver(DriverBase):
         rec = op["record"]
         rtype = (rec.get("type") or "").upper()
         name = _qualified_name(zone, rec.get("name") or "@")
+        shadow = _shadowing_zone(name, zone, self._hosted_zone_names())
+        if shadow is not None:
+            # #1712: Technitium would file this under the child zone and, with
+            # ``overwrite=true``, clear the child's own RRset at the name.
+            log.warning(
+                "technitium_record_op_shadowed_by_child_zone",
+                zone=zone,
+                name=name,
+                type=rtype,
+                op=op_kind,
+                child_zone=shadow,
+            )
+            return None
         # Absence, not falsiness — a TTL of 0 is legal ("never cache this") and
         # ``or`` silently turned it into an hour. Matches bind9's driver, which
         # has always tested for None here.
@@ -2916,6 +2966,20 @@ class TechnitiumDriver(DriverBase):
                 op=op_kind,
             )
         return None
+
+    def _hosted_zone_names(self) -> list[str]:
+        """Zone names of the bundle last rendered, or [] when unreadable.
+
+        Read from the rendered snapshot rather than held in memory so a record
+        op arriving after an agent restart, before any new render, still knows
+        the zone layout.
+        """
+        try:
+            state = json.loads((self.state_dir / "rendered" / "server.json").read_text())
+        except (OSError, ValueError):
+            return []
+        names = state.get("bundle_zone_names") if isinstance(state, dict) else None
+        return [str(n) for n in names] if isinstance(names, list) else []
 
     def _record_call(
         self,

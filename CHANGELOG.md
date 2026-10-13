@@ -95,6 +95,15 @@ the formatter handles the rest.
   Technitium writes at every new primary zone's apex, so the first Sync
   turned it into an operator-owned record and drift never read in sync.
   It is dropped unless the zone's SpatiumDDI records hold that NS.
+- **A Technitium parent zone's record at a name inside a child zone on
+  the same server is no longer written into the child (#1712).**
+  Technitium files a record under the closest zone it hosts, so the
+  parent's record landed in the child and its `overwrite=true` cleared
+  the child's own RRset. The agent now skips such a record, in the
+  structural render and in record ops, and logs
+  `technitium_record_shadowed_by_child_zone`; the child's own value is
+  served and any copy the parent's record left in the child is removed
+  by the child's next reconcile.
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and
