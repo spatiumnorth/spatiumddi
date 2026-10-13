@@ -383,7 +383,8 @@ class SocketDropCounter:
       (kea-dhcp6 has no raw mode). The port-67 UDP sockets are left out:
       in this mode they are fallbacks whose packets kea reads only to
       discard, so their drops are copies of packets the AF_PACKET socket
-      also received, or also dropped.
+      also received, or also dropped. If fallbacks are open and no raw
+      socket of kea's is found, the sample is unknown, not 0.
     * ``None`` (unknown): all of them, so no loss is left out.
 
     A change of mode restarts the baseline. The set of sockets being
@@ -432,7 +433,16 @@ class SocketDropCounter:
             # A partial read counts as no read, as for the two procfs files.
             # In raw mode the UDP half alone does not measure kea-dhcp4 at all.
             packet = self._packet_drops()
-            current = None if packet is None else {**current, **packet}
+            if packet is None:
+                current = None
+            elif mode == "raw" and not packet and read_socket_drops(paths, ports & {_DHCP4_PORT}):
+                # Kea opens its raw socket beside every :67 fallback, and
+                # closes the fallback if the raw open fails. So fallbacks
+                # with no raw socket of kea's found mean its raw sockets
+                # could not be told apart. That is unknown, never a 0.
+                current = None
+            else:
+                current = {**current, **packet}
         if current is None:
             self._prev = None
             return None

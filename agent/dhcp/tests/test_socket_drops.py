@@ -445,6 +445,35 @@ def test_an_unknown_mode_counts_every_socket(tmp_path):
     assert out == [None, 7 + 3 + 261]
 
 
+def test_raw_mode_fallbacks_with_no_raw_socket_found_are_unknown_not_zero(tmp_path):
+    """Kea opens its AF_PACKET socket beside every :67 fallback, and closes
+    the fallback if the raw open fails. So fallbacks with no raw socket of
+    kea's found mean kea's sockets could not be told apart, for example if
+    kea and the agent ever ran as different users. That sample is unknown:
+    reading DHCPv4 as 0 would be the false all-clear #980 exists to prevent."""
+    out, _asked = _counter_with_packets(
+        tmp_path,
+        [
+            ([_row("0043", "1", 40), _row("0223", "2", 2)], {}, "raw"),
+            ([_row("0043", "1", 47), _row("0223", "2", 5)], {}, "raw"),
+        ],
+    )
+    assert out == [None, None]
+
+
+def test_raw_mode_with_no_dhcp4_socket_at_all_is_a_real_zero(tmp_path):
+    """Kea starting, or not serving DHCPv4: no fallback and no raw socket. That
+    is a real answer, and the DHCPv6 sockets still count."""
+    out, _asked = _counter_with_packets(
+        tmp_path,
+        [
+            ([_row("0223", "2", 2)], {}, "raw"),
+            ([_row("0223", "2", 5)], {}, "raw"),
+        ],
+    )
+    assert out == [None, 3]
+
+
 def test_a_socket_mode_change_restarts_the_baseline(tmp_path):
     """Switching mode changes which sockets are summed. Diffing against the
     old baseline would charge the :67 socket's whole-lifetime count (450) to
