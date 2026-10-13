@@ -24,6 +24,11 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 
 // Full poll URL for a feed — prefix the server-relative poll_path with
 // the current origin so operators can paste it straight into a
@@ -35,6 +40,12 @@ function fullPollUrl(pollPath: string): string {
 // ── Page ─────────────────────────────────────────────────────────────
 
 export function FirewallFeedsPage() {
+  // #1341 — every write on this page takes a superadmin (its handlers
+  // take SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const { data: feeds = [], isFetching } = useQuery({
     queryKey: ["firewall-feeds"],
@@ -101,6 +112,7 @@ export function FirewallFeedsPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowCreate(true)}
+              {...superadminGate}
             >
               New feed
             </HeaderButton>
@@ -117,7 +129,8 @@ export function FirewallFeedsPage() {
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...superadminGate}
               >
                 <Plus className="h-3 w-3" /> New feed
               </button>
@@ -189,29 +202,33 @@ export function FirewallFeedsPage() {
                       <td className="whitespace-nowrap px-3 py-2 text-right">
                         <button
                           onClick={() => setReveal(f)}
-                          className="rounded p-1 text-muted-foreground hover:text-foreground"
+                          className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Reveal poll URL"
+                          {...superadminGate}
                         >
                           <Eye className="h-3.5 w-3.5" />
                         </button>
                         <button
                           onClick={() => setRotate(f)}
-                          className="rounded p-1 text-muted-foreground hover:text-foreground"
+                          className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Rotate token"
+                          {...superadminGate}
                         >
                           <RotateCw className="h-3.5 w-3.5" />
                         </button>
                         <button
                           onClick={() => setEdit(f)}
-                          className="rounded p-1 text-muted-foreground hover:text-foreground"
+                          className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Edit"
+                          {...superadminGate}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
                         <button
                           onClick={() => setDel(f)}
-                          className="rounded p-1 text-muted-foreground hover:text-destructive"
+                          className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                           title="Delete"
+                          {...superadminGate}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>

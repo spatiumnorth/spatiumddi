@@ -9,6 +9,7 @@ import {
 } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 /**
  * Parsed-summary panel for a finished nmap scan.
@@ -51,6 +52,12 @@ function MultiHostResult({
   scan: NmapScanRead;
   hosts: NmapHostResult[];
 }) {
+  // Stamping writes IPAM rows: the route asks write on 'ip_address'
+  // (nmap/router.py), not the scan permission.
+  const stampGate = permissionGate(
+    usePermissions().can("write", "ip_address"),
+    "Requires write permission on IP addresses",
+  );
   const alive = hosts.filter((h) => h.host_state === "up");
   const aliveAddrs = alive
     .map((h) => h.address)
@@ -95,8 +102,9 @@ function MultiHostResult({
             <button
               type="button"
               onClick={() => setConfirmStamp(true)}
-              className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/5 px-2 py-0.5 text-[11px] text-emerald-700 hover:bg-emerald-500/10 dark:text-emerald-400"
+              className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/5 px-2 py-0.5 text-[11px] text-emerald-700 hover:bg-emerald-500/10 disabled:cursor-not-allowed disabled:opacity-50 dark:text-emerald-400"
               title="Create / refresh IPAM rows for the alive hosts"
+              {...stampGate}
             >
               <MapPin className="h-3 w-3" />
               Stamp alive hosts → IPAM
