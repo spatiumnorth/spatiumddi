@@ -7,19 +7,28 @@ has:
 * a human-readable ``label``
 * a confirmation ``phrase`` the operator must re-type to commit
 * a ``kind`` describing how the wipe runs:
-  - ``truncate`` — straight ``TRUNCATE TABLE … CASCADE`` over the
-    declared tables. The bulk of sections.
+  - ``truncate`` — wipes the declared tables. Never
+    ``TRUNCATE … CASCADE`` (#1835): see :mod:`.fk_graph` — a table
+    nothing outside the wipe references is truncated, the rest are
+    ``DELETE``d so ``ON DELETE SET NULL`` keys null instead of
+    emptying the referencing table. The bulk of sections.
   - ``auth_rbac`` — partial wipe that preserves the calling user's
     row, group memberships, role assignments, and the platform
     builtin roles.
   - ``settings_reset`` — UPDATE the singleton ``platform_settings``
     row to its defaults. Doesn't touch any other table.
 * a ``tables`` list (for ``truncate`` kind) — what gets wiped.
+* ``cascade_dependents`` — tables OUTSIDE ``tables`` whose rows a
+  ``DELETE`` of ``tables`` removes through ``ON DELETE CASCADE`` keys
+  (a row that cannot exist without its parent). The preview names
+  them with counts; ``tests/test_factory_reset_fk_cascade.py`` fails
+  when this list and the schema's foreign keys disagree, so a new
+  CASCADE key cannot widen a reset without somebody declaring it.
 
 Sections deliberately overlap in some places — e.g. DNS query log
 is in both DNS and Observability logs. That's intentional: an
 operator wiping DNS expects the query log to go too; an operator
-wiping observability expects DNS data to stay. TRUNCATE is
+wiping observability expects DNS data to stay. The wipe is
 idempotent so the overlap is safe.
 
 Tables NOT mentioned in any section are intentionally untouchable
@@ -56,7 +65,29 @@ class FactorySection:
     phrase: str
     kind: Literal["truncate", "auth_rbac", "settings_reset", "everything"]
     tables: tuple[str, ...] = field(default_factory=tuple)
+    cascade_dependents: tuple[str, ...] = field(default_factory=tuple)
 
+
+# Tables the ``auth_rbac`` section deletes from (partial deletes —
+# see ``_execute_auth_rbac``) and the ones it removes through CASCADE.
+AUTH_RBAC_TABLES: tuple[str, ...] = (
+    "user_session",
+    "api_token",
+    "auth_group_mapping",
+    "auth_provider",
+    "group_role",
+    "user_group",
+    "group",
+    "role",
+    "user",
+)
+AUTH_RBAC_CASCADE_DEPENDENTS: tuple[str, ...] = (
+    "ai_chat_message",
+    "ai_chat_session",
+    "ai_operation_proposal",
+    "saved_view",
+    "time_bound_grant",
+)
 
 # Sections in the order they'll render on the UI page. Sequence
 # follows the issue body exactly.
@@ -67,8 +98,14 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         description=(
             "IP spaces, blocks, subnets, IP addresses, NAT mappings, "
             "VLANs, VRFs, ASNs, IPAM templates, custom-field "
-            "definitions. Cascading FKs sweep dependent DNS-record "
-            "↔ IP and DHCP-static ↔ IP links to NULL."
+            "definitions. DNS records and DHCP statics that point at "
+            "an IP address are KEPT and their IP link cleared; "
+            "but a DHCP scope cannot exist without its subnet, so "
+            "the scopes, pools and static assignments of every "
+            "subnet are removed with it (as are vertical-registry "
+            "rows keyed on an address or subnet). The preview "
+            "lists them. Refused while an integration still "
+            "points at an IP space — reset Integrations first."
         ),
         phrase="DESTROY-IPAM",
         kind="truncate",
@@ -90,6 +127,23 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "custom_field_definition",
             "ip_mac_history",
         ),
+        cascade_dependents=(
+            "address_set",
+            "av_reserved_range",
+            "bacnet_device",
+            "bgp_hijack_detection",
+            "bgp_tracked_prefix",
+            "dhcp_phone_profile_scope",
+            "dhcp_pool",
+            "dhcp_scope",
+            "dhcp_static_assignment",
+            "erl_binding",
+            "multicast_membership",
+            "ot_device",
+            "ot_zone",
+            "subnet_domain",
+            "subnet_utilization_history",
+        ),
     ),
     FactorySection(
         key="dns",
@@ -97,7 +151,9 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         description=(
             "DNS server groups, servers, zones, records, blocking "
             "lists, GSLB pools, TSIG keys, ACLs, DNS query log, "
-            "trust anchors. The dns_record_op queue is also flushed."
+            "trust anchors. The dns_record_op queue is also flushed. "
+            "Zone-owned ACME accounts, DNSSEC keys and update ACLs "
+            "go with their zones; IP addresses are kept."
         ),
         phrase="DESTROY-DNS",
         kind="truncate",
@@ -130,6 +186,12 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "subnet_domain",
             "domain",
         ),
+        cascade_dependents=(
+            "acme_account",
+            "dns_agent_bundle",
+            "dns_zone_update_acl",
+            "dnssec_key",
+        ),
     ),
     FactorySection(
         key="dhcp",
@@ -138,7 +200,10 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "DHCP server groups, servers, scopes, pools, static "
             "assignments, client classes, option templates, MAC "
             "blocks, PXE profiles, leases + lease history, the "
-            "config-ops queue."
+            "config-ops queue. Failover relationships, observed-"
+            "responder rows and device policies hang off a server "
+            "group and go with it; IP addresses and subnets are "
+            "kept."
         ),
         phrase="DESTROY-DHCP",
         kind="truncate",
@@ -161,6 +226,15 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "dhcp_metric_sample",
             "dhcp_config_op",
             "dhcp_fingerprint",
+        ),
+        cascade_dependents=(
+            "dhcp_device_policy",
+            "dhcp_failover_relationship",
+            "dhcp_observed_responder",
+            "dhcp_responder_allowlist",
+            "dhcp_server_scope_state",
+            "ra_observed_router",
+            "ra_router_allowlist",
         ),
     ),
     FactorySection(
@@ -208,6 +282,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "provider",
             "application_category",
         ),
+        cascade_dependents=("erl_binding",),
     ),
     FactorySection(
         key="integrations",
@@ -216,8 +291,9 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "Kubernetes / Docker / Proxmox / Tailscale / UniFi "
             "endpoints + their mirrored network discovery rows "
             "(ARP, FDB, neighbours, interfaces, routers, ACME "
-            "accounts). FK cascade clears any IPAM rows still "
-            "owned by an integration."
+            "accounts). IPAM rows (blocks, subnets, addresses, "
+            "zones, records) owned by an integration are removed "
+            "with it; everything else in IPAM / DNS is kept."
         ),
         phrase="DESTROY-INTEGRATIONS",
         kind="truncate",
@@ -227,6 +303,12 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "proxmox_node",
             "tailscale_tenant",
             "unifi_controller",
+            "cloud_endpoint",
+            "fortinet_firewall",
+            "meraki_org",
+            "netbird_instance",
+            "opnsense_router",
+            "panos_firewall",
             "network_arp_entry",
             "network_fdb_entry",
             "network_neighbour",
@@ -235,6 +317,34 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "router_zone",
             "router",
             "acme_account",
+        ),
+        cascade_dependents=(
+            "address_set",
+            "bacnet_device",
+            "dhcp_phone_profile_scope",
+            "dhcp_pool",
+            "dhcp_scope",
+            "dhcp_static_assignment",
+            "dns_pool",
+            "dns_pool_member",
+            "dns_record",
+            "dns_server_zone_state",
+            "dns_zone",
+            "dns_zone_update_acl",
+            "dnssec_key",
+            "erl_binding",
+            "firewall_endpoint_object",
+            "ip_address",
+            "ip_block",
+            "ip_mac_history",
+            "multicast_membership",
+            "nat_mapping",
+            "ot_device",
+            "ot_zone",
+            "subnet",
+            "subnet_domain",
+            "subnet_utilization_history",
+            "vlan",
         ),
     ),
     FactorySection(
@@ -303,9 +413,10 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         key="tools",
         label="Tools",
         description=(
-            "nmap scan history + per-IP fingerprint state. The "
-            "DHCP-fingerprint catalog (separate from device "
-            "profiles) lives under DHCP."
+            "nmap scan history. IP addresses keep their last-"
+            "profiled timestamp; only the link to the deleted scan "
+            "is cleared. The DHCP-fingerprint catalog (separate "
+            "from device profiles) lives under DHCP."
         ),
         phrase="DESTROY-TOOLS",
         kind="truncate",

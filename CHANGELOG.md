@@ -84,6 +84,34 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A Factory Reset of Tools, or of any section, emptied far more than
+  its card said (#1835).** Every section wiped its tables with
+  `TRUNCATE … CASCADE`, which empties every table holding a foreign
+  key into a truncated one whatever the key's `ON DELETE` rule. So a
+  Tools reset (`nmap_scan`, 0 rows in the preview) took
+  `ip_address.last_profile_scan_id` (`SET NULL`) as a reason to empty
+  `ip_address`, and through it every DNS record, DHCP static, NAT
+  mapping, MAC history row, TLS-certificate target and pinned DNSBL
+  address, then answered `deleted_rows_total: 0`. IPAM, DNS, DHCP,
+  Network modeling and Integrations had the same reach into 46 to 86
+  tables each. The reset now never cascades: a table nothing outside
+  the wipe references is `TRUNCATE`d (the big log tables stay fast),
+  every other one is `DELETE`d children-first so `ON DELETE SET NULL`
+  keys are nulled and the referencing rows survive. The only rows that
+  leave with a section besides its own are those a foreign key
+  declares cannot exist without it (a DHCP scope without its subnet);
+  each section lists them in `cascade_dependents`, and the preview and
+  the impact total now count them. The whole reset runs in one
+  transaction, and a reset a `RESTRICT` key would break (IPAM while an
+  integration still points at an IP space) is refused with a 409
+  before anything is deleted. `Everything` now orders the wipe by the
+  foreign keys, and the Integrations section covers the six
+  integration tables (`cloud_endpoint`, `fortinet_firewall`,
+  `meraki_org`, `netbird_instance`, `opnsense_router`,
+  `panos_firewall`) it had never listed. A test computes each
+  section's `ON DELETE CASCADE` reach from the model metadata and
+  fails when it differs from what the section declares.
+
 - **The DICOM AE, OT device and IPAM CSV imports read a file with classic
   Mac line endings (#1370, #1637, #1711).** Each importer read the
   pasted or uploaded text without handing its line endings to the csv
