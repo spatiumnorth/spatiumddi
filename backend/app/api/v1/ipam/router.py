@@ -822,6 +822,16 @@ async def _enforce_zone_token_scope(
             )
 
 
+def _is_uuid(value: Any) -> bool:
+    if not value:
+        return False
+    try:
+        uuid.UUID(str(value))
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
 def _require_static_delete(user: Any, statics: list[DHCPStaticAssignment], what: str) -> None:
     """403 when an IPAM delete would remove DHCP reservations the caller may
     not delete (GHSA-hxpx-gjqf-6p4f).
@@ -9882,6 +9892,10 @@ class IPAddressBulkDeleteResponse(BaseModel):
     deleted_count: int
     not_found: list[uuid.UUID] = []
     skipped: list[uuid.UUID] = []  # system rows (network/broadcast) or already-orphaned
+    # Why a row in ``skipped`` was skipped, keyed by id (#1714). Only the
+    # reservation refusal is itemised today; other skips keep the generic
+    # meaning documented above.
+    skipped_reasons: dict[str, str] = {}
 
 
 @router.post("/addresses/bulk-delete", response_model=IPAddressBulkDeleteResponse)
@@ -9909,6 +9923,7 @@ async def bulk_delete_addresses(
     not_found = [i for i in body.ip_ids if i not in found_ids]
     deleted = 0
     skipped: list[uuid.UUID] = []
+    skipped_reasons: dict[str, str] = {}
     subnets_touched: set[uuid.UUID] = set()
     # Address-set write delegation (#103): resolve writable ranges once per
     # distinct subnet so a per-IP check is cheap.
@@ -9921,6 +9936,32 @@ async def bulk_delete_addresses(
                 await _load_writable_set_ranges(db, current_user, sid),
             )
         return set_gate_cache[sid]
+
+    # Linked DHCP reservations, gathered once (#1714). The single delete
+    # removes them with the row and refuses a caller without ``delete`` on
+    # ``dhcp_static`` (#1656); the bulk path must do exactly the same, or the
+    # reservation outlives the row and stays served.
+    link_ids = [ip.id for ip in rows]
+    static_ids = [
+        uuid.UUID(str(ip.static_assignment_id))
+        for ip in rows
+        if _is_uuid(ip.static_assignment_id)
+    ]
+    statics_by_ip: dict[uuid.UUID, dict[uuid.UUID, DHCPStaticAssignment]] = {}
+    if rows:
+        conds: list[Any] = [DHCPStaticAssignment.ip_address_id.in_(link_ids)]
+        if static_ids:
+            conds.append(DHCPStaticAssignment.id.in_(static_ids))
+        all_statics = list(
+            (await db.execute(select(DHCPStaticAssignment).where(or_(*conds)))).scalars().all()
+        )
+        for ip in rows:
+            sid_link = str(ip.static_assignment_id) if ip.static_assignment_id else None
+            for st in all_statics:
+                if st.ip_address_id == ip.id or (sid_link is not None and str(st.id) == sid_link):
+                    statics_by_ip.setdefault(ip.id, {})[st.id] = st
+    removed_statics: dict[uuid.UUID, DHCPStaticAssignment] = {}
+    can_delete_static = user_has_permission(current_user, "delete", "dhcp_static")
 
     for ip in rows:
         if ip.status in ("network", "broadcast"):
@@ -9949,6 +9990,16 @@ async def bulk_delete_addresses(
         ):
             skipped.append(ip.id)
             continue
+        row_statics = list(statics_by_ip.get(ip.id, {}).values())
+        if row_statics and not can_delete_static:
+            skipped.append(ip.id)
+            skipped_reasons[str(ip.id)] = (
+                f"Address {ip.address} is linked to {len(row_statics)} DHCP reservation(s); "
+                "removing them needs 'delete' permission on DHCP reservations (dhcp_static)."
+            )
+            continue
+        for st in row_statics:
+            removed_statics[st.id] = st
         subnet = await db.get(Subnet, ip.subnet_id)
         if subnet is not None:
             try:
@@ -9985,6 +10036,15 @@ async def bulk_delete_addresses(
         subnets_touched.add(ip.subnet_id)
         deleted += 1
 
+    if removed_statics:
+        # Push the removal to the servers first (one batch per server), so a
+        # refusal raises before anything commits, as the single delete does.
+        statics_list = list(removed_statics.values())
+        await push_statics_bulk_delete(db, statics_list)
+        for static in statics_list:
+            audit_static_removed(db, current_user, static)
+            await db.delete(static)
+
     await db.flush()
     for sid in subnets_touched:
         await _update_utilization(db, sid)
@@ -10000,7 +10060,12 @@ async def bulk_delete_addresses(
         deleted=deleted,
         permanent=body.permanent,
     )
-    return IPAddressBulkDeleteResponse(deleted_count=deleted, not_found=not_found, skipped=skipped)
+    return IPAddressBulkDeleteResponse(
+        deleted_count=deleted,
+        not_found=not_found,
+        skipped=skipped,
+        skipped_reasons=skipped_reasons,
+    )
 
 
 _IP_BULK_ALLOWED_STATUSES = {

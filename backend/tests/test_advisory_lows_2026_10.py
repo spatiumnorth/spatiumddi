@@ -366,3 +366,81 @@ def test_redact_matches_a_mixture_of_encodings() -> None:
 
 def test_redact_leaves_unrelated_text_alone() -> None:
     assert redact("all good here", "Bearer QA1636+E7/TOK=v2") == "all good here"
+
+
+# ── #1714: bulk delete applies the single delete's reservation rule ──────────
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_refuses_a_reservation_linked_row_for_an_ipam_only_user(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, headers = await _user_with_perms(db_session, _IPAM_WRITE)
+    row_id, subnet_id = await _linked_row(db_session)
+    plain = IPAddress(subnet_id=subnet_id, address="10.82.0.60", status="allocated")
+    db_session.add(plain)
+    await db_session.flush()
+    plain_id = plain.id
+    await db_session.commit()
+
+    for permanent in (False, True):
+        r = await client.post(
+            "/api/v1/ipam/addresses/bulk-delete",
+            headers=headers,
+            json={"ip_ids": [str(row_id)], "permanent": permanent},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["deleted_count"] == 0
+        assert body["skipped"] == [str(row_id)]
+        assert "dhcp_static" in body["skipped_reasons"][str(row_id)]
+    db_session.expire_all()
+    assert len(await _statics(db_session)) == 1
+    row = await db_session.get(IPAddress, row_id)
+    assert row is not None and row.status == "static_dhcp"
+
+    # Mixed selection: the plain row is still deleted, the linked one skipped.
+    r = await client.post(
+        "/api/v1/ipam/addresses/bulk-delete",
+        headers=headers,
+        json={"ip_ids": [str(row_id), str(plain_id)], "permanent": True},
+    )
+    body = r.json()
+    assert body["deleted_count"] == 1
+    assert body["skipped"] == [str(row_id)]
+    assert len(await _statics(db_session)) == 1
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_removes_the_reservation_for_a_dhcp_static_deleter(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, headers = await _user_with_perms(
+        db_session, [*_IPAM_WRITE, {"action": "delete", "resource_type": "dhcp_static"}]
+    )
+    row_id, _ = await _linked_row(db_session)
+    static_id = (await _statics(db_session))[0].id
+
+    r = await client.post(
+        "/api/v1/ipam/addresses/bulk-delete",
+        headers=headers,
+        json={"ip_ids": [str(row_id)], "permanent": True},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted_count"] == 1
+    assert r.json()["skipped_reasons"] == {}
+    assert await _statics(db_session) == []
+    audits = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.resource_type == "dhcp_static_assignment",
+                    AuditLog.resource_id == str(static_id),
+                    AuditLog.action == "delete",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(audits) == 1

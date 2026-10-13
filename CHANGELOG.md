@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **IPAM bulk delete no longer leaves a DHCP reservation behind (#1714).**
+  `POST /ipam/addresses/bulk-delete` ran none of the reservation handling
+  the single delete has had since #1656: an IPAM Editor could bulk-delete a
+  `static_dhcp` row the single delete answers 403 for, leaving the
+  reservation served with `ip_address_id` null (permanent) or linked to an
+  orphan (soft). It now applies the same rule per row. A caller without
+  `delete` on `dhcp_static` has those rows skipped, each with a reason in the
+  new `skipped_reasons` map (shown in the bulk dialog); a caller with it has
+  the reservations removed on the server and audited, as the single delete
+  does. Other rows in the selection are still deleted.
+
 - **The PowerDNS agent stops serving zones wrong in three ways
   (#1520, #1521, #1522).** Pool member address deletes were applied
   as no-ops and acked ok — the record-op fallback ignored the rrset

@@ -1926,6 +1926,8 @@ export const ipamApi = {
         deleted_count: number;
         not_found: string[];
         skipped: string[];
+        /** Per-row reason for skips that are not system rows (#1714). */
+        skipped_reasons?: Record<string, string>;
       }>(`/ipam/addresses/bulk-delete`, data)
       .then((r) => r.data),
   bulkEditAddresses: (data: {
