@@ -672,7 +672,7 @@ def seed_ipam_templates(a: Api, dns_group_id: str | None, dhcp_group_id: str | N
         "tags": {},
         "custom_fields": {},
         "ddns_enabled": True,
-        "ddns_hostname_policy": "leave_unchanged",
+        "ddns_hostname_policy": "client_or_generated",
         "child_layout": {
             "children": [
                 {"prefix": 27, "name_template": "Staff-{n}", "description": ""},
@@ -688,7 +688,7 @@ def seed_ipam_templates(a: Api, dns_group_id: str | None, dhcp_group_id: str | N
         "tags": {},
         "custom_fields": {},
         "ddns_enabled": True,
-        "ddns_hostname_policy": "leave_unchanged",
+        "ddns_hostname_policy": "client_or_generated",
     }
     if dns_group_id:
         block_template["dns_group_id"] = dns_group_id

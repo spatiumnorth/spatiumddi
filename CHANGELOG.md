@@ -84,6 +84,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **`seed_demo.py` seeds its IPAM templates (#1465).** Both templates
+  sent `ddns_hostname_policy: leave_unchanged`, a value the API has never
+  accepted, so each POST answered 422 and the run still ended with
+  "Seed complete" and no templates. They now send `client_or_generated`.
+  A test builds both payloads from the script and validates them against
+  the template create model.
+
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and
