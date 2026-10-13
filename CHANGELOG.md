@@ -103,6 +103,85 @@ the formatter handles the rest.
   whole poll loop). The acme-dns provider's API path still uses the
   shared factory, which is correct in a request handler.
 
+- **A DHCP pool's lease-time override is refused instead of silently
+  ignored (#1689).** `lease_time_override` was stored, echoed and shown
+  in the UI but never sent to the agent, and Kea has no per-pool lease
+  time (a client class can carry one, but only for clients matching its
+  test, which would also restrict who may use the pool), so every pool
+  served the scope's lease. **API change:** `POST
+  /api/v1/dhcp/scopes/{id}/pools` and `PUT /api/v1/dhcp/pools/{id}` now
+  answer 422 for a non-null `lease_time_override`; an explicit `null`
+  still clears an old value, and the field is still returned. A value
+  stored before this release stays until cleared, and has never had any
+  effect. The field is gone from the pool form, and saving a pool that
+  has one clears it. What Kea serves does not change.
+
+- **Renew / rebind timers (options 58 / 59) are no longer documented as
+  settable, and a Kea import says it drops them (#1690).** The API has
+  always refused them; the docs claimed otherwise. T1 / T2 are derived
+  from each lease (v4: 50% / 87.5% of it; v6: 50% / 80% of the preferred
+  lifetime). Importing a Kea config that carries
+  `renew-timer` or `rebind-timer` now says it drops them instead of
+  dropping them silently: a subnet's in that scope's `parse_warnings`,
+  a global one in the preview's `warnings`.
+
+- **The docs site now says it tracks `main` (#1164).** Both Pages
+  sites publish `main`, so a reader on a release could not tell the
+  page might describe unreleased behaviour. Every page now carries a
+  banner naming that, linking the changelog and releases page. The
+  published copy also names the commit, date and latest release,
+  stamped into `_data/build.yml` by `docs-publish.yml`; the project
+  site and a local `jekyll build` get the generic form.
+
+- **Allocate IP offers only the statuses it can allocate with (#1422).**
+  Its Type / Status menu offered `discovered`, but both of its requests
+  ("Next available" and "Specific IP") accept only the operator-settable
+  statuses and `dhcp`, so picking it always ended in a 422. `discovered`
+  is stamped by the nmap "Stamp alive hosts" action and is no longer
+  offered there; the inline status edit and Edit address, whose update
+  accepts every status, keep it.
+
+- **One typo in the MFA disable or recovery-code dialog costs one
+  attempt, not two (#1371).** `POST /auth/mfa/disable` and
+  `/auth/mfa/recovery-codes/regenerate` answered a wrong password or
+  TOTP code with 401. The console reads a 401 from anything but sign-in
+  as an expired session: it rotated the session and sent the request
+  again, which failed the same way. One typo spent two of the five
+  step-up attempts the account gets per 15 minutes and checked the
+  answer twice, so the third typo locked MFA changes. Both now answer
+  403 with the same message, as enrolment does.
+
+- **A burst of DHCP requests is queued, not silently evicted
+  (#1283).**
+  - Left unset, Kea 3.0's multi-threading `packet-queue-size` is 64.
+    When a burst of relayed requests outran the worker, Kea evicted
+    the oldest queued packets and counted them nowhere. Clients
+    retransmitted, and every product surface stayed green.
+  - On a three-node cluster's load ramp, 2,286 requests were lost this
+    way and 35.1 % of handshakes needed a retransmit.
+  - The agent, and the backend's config preview, now render
+    `packet-queue-size: 1024`, for kea-dhcp4 and kea-dhcp6. On the same
+    ramp none was evicted, with an answer latency p99 of 1.17 s,
+    against the client's 4 s retransmit.
+  - The re-sends left over follow the kernel's drops on Kea's raw
+    socket, which `socket_drop` now counts (below).
+- **`socket_drop` counts the socket Kea serves from in raw mode
+  (#1283).**
+  - With `dhcp-socket-type: raw` (`dhcp_socket_mode: direct`, the
+    default), kea-dhcp4 reads every DHCPv4 packet from an AF_PACKET
+    socket, relayed unicast included. It only drains and discards the
+    copy on its UDP :67 fallback socket.
+  - `socket_drop` read that fallback. So it counted copies Kea would
+    have thrown away, and missed the drops that cost a client a
+    retransmit. On relayed bursts it read 0 against 41 real drops in
+    one run, and 300 against 505 in another.
+  - The agent now reads the AF_PACKET sockets' drops through sock_diag
+    in raw mode, which needs no privilege. In `udp` mode it reads the
+    UDP sockets as before. It takes the mode from the config it
+    rendered for Kea.
+  - The Stats tab, the InfluxDB export and the `dhcp_packets_dropped`
+    alert now get the right number, with no change of their own.
+
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and

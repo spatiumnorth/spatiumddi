@@ -731,9 +731,14 @@ inform, receive_drop, socket_drop)`. Retention is enforced by the
 
 Two of those DHCP columns are about packets *not* handled, and they do not
 come from the same place or mean the same thing (issue #980).
-`socket_drop` is the kernel's per-socket `sk_drops` from `/proc/net/udp`,
-read by the agent directly: packets discarded because Kea's receive buffer
-was full, so Kea never saw them and no counter it keeps can report them.
+`socket_drop` is the kernel's per-socket `sk_drops` on the sockets Kea
+serves from, read by the agent directly. Normally those are the DHCP-port
+UDP sockets in `/proc/net/udp`. With `dhcp-socket-type: raw`, kea-dhcp4
+serves from AF_PACKET sockets, relayed traffic included. Their drops are
+read through sock_diag, in place of its UDP :67 fallback, whose copies Kea
+discards (#1283). Either way, these are packets the kernel discarded because
+Kea's receive buffer was full. Kea never saw them, so no counter it keeps can
+report them.
 On a node short of CPU only this one moves, and it is the one the alert
 and the dashboard treat as loss.
 
@@ -744,7 +749,8 @@ increments it once per packet, and a `DROP` class is exactly what the shipped
 DHCP MAC blocklist renders. See [`DHCP.md` §4c](features/DHCP.md).
 
 **Both are nullable, and NULL means UNMEASURED.** An agent older than #980,
-or one whose runtime cannot read `/proc/net/udp`, reports no `socket_drop`.
+or one whose runtime cannot read `/proc/net/udp` (or, in raw mode, Kea's
+AF_PACKET sockets), reports no `socket_drop`.
 Readers must render that as unknown — a 0 would say "this server has dropped
 nothing", which is exactly the false reassurance #980 was filed about. The
 ingest endpoint therefore stores an omitted field as NULL rather than
