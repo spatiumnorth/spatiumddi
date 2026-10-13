@@ -325,7 +325,8 @@ DHCPPool
     -- excluded:  range exists in subnet but DHCP will NOT offer these IPs
     -- reserved:  range held for static assignments only (not auto-assigned)
   class_restriction: str (nullable)   -- Kea client class
-  lease_time_override: int (nullable) -- overrides scope lease_time for this pool
+  lease_time_override: int (nullable) -- NOT SUPPORTED (#1689): Kea has no per-pool lease time, so
+                                         a value is refused with a 422; null only (kept so an old row can be cleared)
   options_override: JSONB (nullable)  -- additional options for this pool only
 ```
 
@@ -1366,7 +1367,7 @@ DHCP_AGENT_MAX_CACHE_AGE_HOURS=72   # Alert if cache older than this
 
 ## 11. DHCP Options Reference
 
-The following standard DHCP options can be configured at the scope, pool, or host level. All options are configurable in the UI and via API. Parent scope options are inherited by child pools unless overridden.
+The following standard DHCP options can be configured at the scope, pool, or host level. Most options are configurable in the UI and via API; options 58 and 59 are not (see below). Parent scope options are inherited by child pools unless overridden.
 
 | Option Code | Name | Description |
 |---|---|---|
@@ -1378,12 +1379,14 @@ The following standard DHCP options can be configured at the scope, pool, or hos
 | 28 | Broadcast Address | Auto-computed |
 | 43 | Vendor Specific | Raw hex or vendor-specific encapsulated options |
 | 51 | IP Address Lease Time | Seconds; default lease time |
-| 58 | Renewal Time | T1 (default: 50% of lease time) |
-| 59 | Rebinding Time | T2 (default: 87.5% of lease time) |
+| 58 | Renewal Time | T1 — derived from each lease (50% of its lifetime); **not settable** |
+| 59 | Rebinding Time | T2 — derived from each lease (87.5% of its lifetime); **not settable** |
 | 66 | TFTP Server Name | Boot server hostname (PXE) |
 | 67 | Bootfile Name | PXE bootfile path |
 | 119 | Domain Search | Multiple search domains |
 | 150 | TFTP Server Address | Cisco VoIP boot server IP |
+
+**Renewal / rebind timers (58 / 59)** cannot be set (#1690): the API refuses `dhcp-renewal-time`, `dhcp-rebinding-time` and `code:58` / `code:59` with a 422. Kea is rendered with `calculate-tee-times` so every lease gets T1 / T2 at 50% / 87.5% of its own lifetime (v6: 50% / 80% of the preferred lifetime). A Kea import drops `renew-timer` / `rebind-timer` and says so: a subnet's in that scope's `parse_warnings`, a global one in the preview's `warnings`.
 
 **Min/Max lease times**: Configured as `min_lease_time` / `max_lease_time` on the DHCPScope. Clients requesting shorter/longer leases are clamped to this range.
 

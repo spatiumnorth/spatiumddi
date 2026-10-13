@@ -84,6 +84,28 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DHCP pool's lease-time override is refused instead of silently
+  ignored (#1689).** `lease_time_override` was stored, echoed and shown
+  in the UI but never sent to the agent, and Kea has no per-pool lease
+  time (a client class can carry one, but only for clients matching its
+  test, which would also restrict who may use the pool), so every pool
+  served the scope's lease. **API change:** `POST
+  /api/v1/dhcp/scopes/{id}/pools` and `PUT /api/v1/dhcp/pools/{id}` now
+  answer 422 for a non-null `lease_time_override`; an explicit `null`
+  still clears an old value, and the field is still returned. A value
+  stored before this release stays until cleared, and has never had any
+  effect. The field is gone from the pool form, and saving a pool that
+  has one clears it. What Kea serves does not change.
+
+- **Renew / rebind timers (options 58 / 59) are no longer documented as
+  settable, and a Kea import says it drops them (#1690).** The API has
+  always refused them; the docs claimed otherwise. T1 / T2 are derived
+  from each lease (v4: 50% / 87.5% of it; v6: 50% / 80% of the preferred
+  lifetime). Importing a Kea config that carries
+  `renew-timer` or `rebind-timer` now says it drops them instead of
+  dropping them silently: a subnet's in that scope's `parse_warnings`,
+  a global one in the preview's `warnings`.
+
 - **The docs site now says it tracks `main` (#1164).** Both Pages
   sites publish `main`, so a reader on a release could not tell the
   page might describe unreleased behaviour. Every page now carries a
