@@ -8,10 +8,13 @@
        (20-envsubst-on-templates.sh) substitutes ${API_UPSTREAM_*}
        + ${NGINX_LOCAL_RESOLVERS} from env, same as the default.
 
-       Two server blocks:
+       One server block listening on both ports:
 
-       * ``:80``  — 301 → https. Operators bookmarking the bare
-                    IP land on TLS without thinking.
+       * ``:80``  — 301 → https for a direct client, so operators
+                    bookmarking the bare IP land on TLS. NOT for a request
+                    a trusted proxy (``frontend.trustedProxyCidrs``) says
+                    already arrived over https — see the redirect map
+                    below (#1868). Probes + the ACME challenge are exempt.
        * ``:443`` — real TLS-terminated frontend. Cert + key
                     paths line up with the Secret mount at
                     /etc/nginx/tls/ (subPath=tls.crt + tls.key,
@@ -25,52 +28,58 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "frontend") .) | nindent 4 }}
 data:
   default.conf.template: |
-    # Plain HTTP — redirect to HTTPS. Single permanent (301) so
-    # browsers cache it; operators hitting :80 once never have to
-    # think about it again.
+    # ── Reverse proxy in front of this nginx (#1868) ─────────────────
+    # See frontend/default.conf.template for the full reasoning; the two
+    # must not diverge. TRUSTED_PROXY_CIDRS comes from the frontend pod's
+    # env (values: frontend.trustedProxyCidrs) and is rendered into the
+    # ${SPATIUM_*} blocks by the image's 16-trusted-proxies.envsh. Empty =
+    # no trusted proxy = a client-supplied X-Forwarded-* is never believed.
+    geo $realip_remote_addr $spatium_proxy_trusted {
+        default 0;
+    ${SPATIUM_TRUSTED_GEO}}
+
+    map "$spatium_proxy_trusted:$http_x_forwarded_proto" $spatium_forwarded_proto {
+        default $scheme;
+        "~*^1:https" https;
+        "~*^1:http" http;
+    }
+
+    # Plain-HTTP requests get a 301 to https UNLESS a trusted proxy says the
+    # client's own connection was already https (``X-Forwarded-Proto: https``
+    # from a listed peer): a TLS-terminating proxy that talks http to :80 would
+    # otherwise loop forever. The kubelet probe and the ACME http-01 challenge
+    # are exempt, as before. $spatium_forwarded_proto is this server's own
+    # scheme whenever no trusted proxy speaks, so a direct install is unchanged.
+    map $request_uri $spatium_plain_exempt {
+        default 0;
+        "~^/nginx-health" 1;
+        "~^/\.well-known/acme-challenge/" 1;
+    }
+    map "$spatium_forwarded_proto:$spatium_plain_exempt" $spatium_redirect_to_https {
+        default 0;
+        "http:0" 1;
+    }
+
+    # One server for both ports (was two, a :80 redirect-only block and
+    # this one): the :80 listener has to serve the whole application for a
+    # proxy that terminates TLS and talks http, and two copies of every
+    # location would drift.
     server {
         listen 80 default_server;
         listen [::]:80 default_server;
-        server_name _;
-        resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
-
-        # ACME http-01 challenge (issue #438) — served over plain HTTP so
-        # the CA reaches it before the HTTPS redirect. In its own location
-        # (not the server-level return) so location matching wins.
-        location /.well-known/acme-challenge/ {
-            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
-            proxy_pass         $api_upstream;
-            proxy_set_header   Host $http_host;
-            proxy_http_version 1.1;
-            proxy_set_header   Connection "";
-        }
-
-        # nginx-local healthcheck — the frontend Deployment's liveness +
-        # readiness probes target this (#767). Declared explicitly rather
-        # than leaning on the 301 below happening to count as a probe
-        # success: this container's health is nginx's, and it must stay
-        # answerable while the api is down.
-        location = /nginx-health {
-            access_log off;
-            default_type text/plain;
-            return 200 "ok\n";
-        }
-
-        location / {
-            return 301 https://$host$request_uri;
-        }
-    }
-
-    # HTTPS — same routing the image's default template has,
-    # wrapped in TLS termination using the cert mounted by the
-    # secret volume at /etc/nginx/tls/.
-    server {
         listen 443 ssl default_server;
         listen [::]:443 ssl default_server;
         http2 on;
         server_name _;
         root /usr/share/nginx/html;
         index index.html;
+
+        real_ip_header X-Forwarded-For;
+        real_ip_recursive on;
+    ${SPATIUM_REAL_IP_FROM}
+        if ($spatium_redirect_to_https) {
+            return 301 https://$host$request_uri;
+        }
 
         ssl_certificate     /etc/nginx/tls/tls.crt;
         ssl_certificate_key /etc/nginx/tls/tls.key;
@@ -170,6 +179,62 @@ data:
             return 502 '{"detail":"The api is not reachable right now; retry shortly."}';
         }
 
+        # Operator Copilot streaming endpoint (issue #90). SSE responses
+        # need three things nginx defaults get wrong:
+        #   1. ``proxy_buffering off`` — otherwise nginx holds the entire
+        #      response until upstream closes, defeating the point of SSE.
+        #   2. ``proxy_http_version 1.1`` + cleared ``Connection`` header
+        #      — nginx defaults to HTTP/1.0 to upstream, which doesn't
+        #      support chunked transfer-encoding well and forces buffering.
+        #   3. A long ``proxy_read_timeout`` — slow local LLMs (Ollama on a
+        #      cold start, llama.cpp with a big model) easily take >60 s
+        #      to first token. 10 minutes is plenty without being silly.
+        # Must come before the broader /api/ location since nginx picks
+        # the most specific prefix match.
+        location /api/v1/ai/chat {
+            error_page 502 504 @api_unavailable;
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass            $api_upstream;
+            proxy_set_header      Host $http_host;
+            proxy_set_header      X-Real-IP $remote_addr;
+            proxy_set_header      X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header      X-Forwarded-Proto $spatium_forwarded_proto;
+            proxy_http_version    1.1;
+            proxy_set_header      Connection "";
+            proxy_buffering       off;
+            proxy_cache           off;
+            proxy_read_timeout    600s;
+            proxy_send_timeout    600s;
+            # Tell the X-Accel-Buffering: no header from upstream to win
+            # in case it sneaks back on through a different path.
+            proxy_set_header      X-Accel-Buffering no;
+        }
+
+        # Long-lived streams (#1868). The same three needs as the Copilot chat
+        # above: no buffering, HTTP/1.1 to the upstream, and a read timeout
+        # longer than the quietest gap in the stream, or the generic /api/ block's
+        # 60 s closes a healthy stream. Covers the appliance cluster-health
+        # stream, the container / workload log follow streams, and the nmap scan
+        # progress stream. An outer proxy needs the same treatment; see
+        # docs/deployment/REVERSE_PROXY.md. Must not diverge from
+        # charts/spatiumddi/templates/frontend-tls-config.yaml.
+        location ~ ^/api/v1/(appliance/cluster/health/stream|appliance/containers/.+/logs/stream|nmap/scans/[^/]+/stream)$ {
+            error_page 502 504 @api_unavailable;
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass            $api_upstream;
+            proxy_set_header      Host $http_host;
+            proxy_set_header      X-Real-IP $remote_addr;
+            proxy_set_header      X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header      X-Forwarded-Proto $spatium_forwarded_proto;
+            proxy_http_version    1.1;
+            proxy_set_header      Connection "";
+            proxy_buffering       off;
+            proxy_cache           off;
+            proxy_read_timeout    3600s;
+            proxy_send_timeout    3600s;
+            proxy_set_header      X-Accel-Buffering no;
+        }
+
         # Large request bodies for the backup endpoint — keep the
         # same shape the default template uses.
         location /api/v1/backup/ {
@@ -179,7 +244,7 @@ data:
             proxy_set_header         Host $http_host;
             proxy_set_header         X-Real-IP $remote_addr;
             proxy_set_header         X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header         X-Forwarded-Proto $scheme;
+            proxy_set_header         X-Forwarded-Proto $spatium_forwarded_proto;
             proxy_http_version       1.1;
             proxy_set_header         Connection "";
             client_max_body_size     2g;
@@ -200,7 +265,7 @@ data:
             proxy_set_header         Host $http_host;
             proxy_set_header         X-Real-IP $remote_addr;
             proxy_set_header         X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header         X-Forwarded-Proto $scheme;
+            proxy_set_header         X-Forwarded-Proto $spatium_forwarded_proto;
             proxy_http_version       1.1;
             proxy_set_header         Connection "";
             client_max_body_size     4g;
@@ -232,7 +297,7 @@ data:
             proxy_set_header   Host $http_host;
             proxy_set_header   X-Real-IP $remote_addr;
             proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Forwarded-Proto $spatium_forwarded_proto;
             proxy_http_version 1.1;
             proxy_set_header   Connection "";
             proxy_read_timeout 120s;
@@ -256,7 +321,7 @@ data:
             proxy_set_header   Host $http_host;
             proxy_set_header   X-Real-IP $remote_addr;
             proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Forwarded-Proto $spatium_forwarded_proto;
             proxy_http_version 1.1;
             proxy_set_header   Connection "";
             proxy_read_timeout 60s;
@@ -274,7 +339,7 @@ data:
             proxy_set_header   Host $http_host;
             proxy_set_header   X-Real-IP $remote_addr;
             proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Forwarded-Proto $spatium_forwarded_proto;
             proxy_http_version 1.1;
             proxy_set_header   Connection "";
             proxy_read_timeout 60s;
@@ -287,7 +352,7 @@ data:
             proxy_set_header   Host $http_host;
             proxy_set_header   X-Real-IP $remote_addr;
             proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Forwarded-Proto $spatium_forwarded_proto;
             proxy_http_version 1.1;
             proxy_set_header   Connection "";
             proxy_read_timeout 60s;
@@ -305,7 +370,7 @@ data:
             proxy_set_header   Host $http_host;
             proxy_set_header   X-Real-IP $remote_addr;
             proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Forwarded-Proto $spatium_forwarded_proto;
             proxy_http_version 1.1;
             proxy_set_header   Connection "";
             proxy_read_timeout 60s;

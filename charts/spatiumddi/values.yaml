@@ -78,6 +78,21 @@ auth:
   # generated on first install and kept across upgrades, like secretKey.
   metricsToken: ""
 
+# ── Reverse proxy / ingress in front of the frontend (#1868) ────────────────
+# Comma-separated CIDRs (or addresses) of the proxies whose forwarded headers
+# are believed: set on BOTH the api (TRUSTED_PROXY_CIDRS) and the frontend
+# nginx. The frontend then takes the real client address and scheme from the
+# proxy's X-Forwarded-For / X-Forwarded-Proto, so the login throttle, audit
+# rows and the Secure refresh cookie describe the user and not the ingress.
+# Empty (default) keeps today's behaviour: the api trusts its private-range
+# default for the frontend pods, and the frontend trusts no proxy at all.
+# When you set it, the list must cover the ingress pods AND the frontend
+# pods' own network (the api believes X-Real-IP only from a listed peer),
+# e.g. "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10". ``*`` trusts
+# every peer: only safe when nothing but the proxy can reach the frontend.
+# See docs/deployment/REVERSE_PROXY.md.
+trustedProxyCidrs: ""
+
 # ── API ──────────────────────────────────────────────────────────────────────
 api:
   replicas: 2
@@ -449,6 +464,12 @@ frontend:
   tls:
     enabled: false
     secretName: spatium-appliance-tls
+    # With tls.enabled the :80 listener 301s to https UNLESS a proxy listed in
+    # ``trustedProxyCidrs`` sends ``X-Forwarded-Proto: https`` (#1868): a
+    # TLS-terminating proxy that talks plain http to :80 is served directly
+    # instead of looping. With trustedProxyCidrs empty the redirect is
+    # unconditional, as before. The simplest proxy setup is still
+    # tls.enabled=false (see docs/deployment/REVERSE_PROXY.md).
   # Issue #176: the frontend nginx proxies ``/api/`` to the api Service
   # using a runtime-substituted upstream. The Docker image defaults to
   # ``api:8000`` (the Compose service name) which doesn't resolve on
@@ -576,7 +597,9 @@ ingress:
   enabled: false
   className: nginx
   annotations: {}
+    # nginx.ingress.kubernetes.io/proxy-buffering: "off"      # SSE: AI chat, cluster health, logs (#1868)
     # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    # nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     # cert-manager.io/cluster-issuer: letsencrypt-prod
   hosts:
     - host: spatiumddi.example.com

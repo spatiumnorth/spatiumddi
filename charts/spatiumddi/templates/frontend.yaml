@@ -126,6 +126,15 @@ spec:
             - name: NGINX_LOCAL_RESOLVERS
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.trustedProxyCidrs }}
+            # #1868 — the reverse proxy / ingress in front of this pod.
+            # The image's 16-trusted-proxies.envsh renders it into nginx's
+            # set_real_ip_from + the X-Forwarded-Proto trust map. Unset
+            # (the default) = trust no proxy: a client-supplied
+            # X-Forwarded-* is never believed.
+            - name: TRUSTED_PROXY_CIDRS
+              value: {{ . | quote }}
+            {{- end }}
             # nginx >=1.30's upstream 15-local-resolvers.envsh script
             # is gated on this var being set — without it the script
             # returns early and ``NGINX_LOCAL_RESOLVERS`` is never
