@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An editor whose write an approval policy queued can see, and
+  cancel, its own change request (#1863).** The list, `?mine=true` and
+  `GET /change-requests/{id}` all demanded `read` on `change_request`
+  before the read rule that scopes a requester to the rows it made, and
+  only the built-in Change Approver holds that grant, so the editor was
+  told "Nothing waiting for approval" while the server let it cancel the
+  request it could not read. The grant is no longer a precondition: the
+  own-rows scope on the list and the 404 on get are the access rule, as
+  the router's own read rule always said. Seeing every row still takes
+  `approve` (or superadmin).
+
 - **The DICOM AE, OT device and IPAM CSV imports read a file with classic
   Mac line endings (#1370, #1637, #1711).** Each importer read the
   pasted or uploaded text without handing its line endings to the csv

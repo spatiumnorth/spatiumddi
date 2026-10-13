@@ -458,6 +458,38 @@ async def test_read_only_user_404_on_another_users_request(
 
 
 @pytest.mark.asyncio
+async def test_requester_without_read_grant_sees_own_requests_only(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1863: an editor whose write a policy queued holds no
+    ``read,change_request`` (only Change Approver does) and must still see the
+    request it made — list, ``?mine=true`` and get/{id} — and nobody else's."""
+    await _enable_module(db_session)
+    subnet_a = await _subnet(db_session, "10.23.1.0/24")
+    subnet_b = await _subnet(db_session, "10.23.2.0/24")
+    editor, etok = await _user(
+        db_session,
+        name="editor",
+        permissions=[{"action": "delete", "resource_type": "subnet"}],
+    )
+    other, _ = await _user(db_session, name="other3")
+    mine = await _pending_cr(db_session, subnet_a, editor, display="mine")
+    theirs = await _pending_cr(db_session, subnet_b, other, display="theirs")
+    await db_session.commit()
+
+    for url in ("/api/v1/change-requests", "/api/v1/change-requests?mine=true"):
+        r = await client.get(url, headers=_auth(etok))
+        assert r.status_code == 200, (url, r.text)
+        ids = {row["id"] for row in r.json()}
+        assert ids == {str(mine.id)}, url
+
+    r = await client.get(f"/api/v1/change-requests/{mine.id}", headers=_auth(etok))
+    assert r.status_code == 200, r.text
+    r = await client.get(f"/api/v1/change-requests/{theirs.id}", headers=_auth(etok))
+    assert r.status_code == 404, r.text
+
+
+@pytest.mark.asyncio
 async def test_approve_holder_sees_all_requests(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
