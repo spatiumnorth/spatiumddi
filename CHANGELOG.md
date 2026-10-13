@@ -88,6 +88,9 @@ the formatter handles the rest.
   sent `ddns_hostname_policy: leave_unchanged`, a value the API has never
   accepted, so each POST answered 422 and the run still ended with
   "Seed complete" and no templates. They now send `client_or_generated`.
+  The script also records every refused request (409, the re-run path,
+  excepted), lists them at the end and exits 2 instead of printing "Seed
+  complete", so a section that seeds nothing no longer passes unnoticed.
   A test builds both payloads from the script and validates them against
   the template create model.
 
