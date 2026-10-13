@@ -84,6 +84,34 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Running behind your own reverse proxy now works, and is documented
+  (#1868).** The frontend nginx wrote `X-Forwarded-Proto $scheme` and
+  `X-Real-IP $remote_addr` on every `/api/` location, so behind a
+  TLS-terminating proxy the api always saw `http` and the proxy's address:
+  OIDC / SAML callbacks were built as `http://` while External URL was
+  empty, and every user shared one login-throttle bucket (a busy morning
+  returned `429` to the organisation; audit rows, `last_login_ip` and the
+  allow-list guards recorded the proxy). **nginx header change:** the
+  frontend now takes `TRUSTED_PROXY_CIDRS` (the api's own variable, passed
+  through by the Compose files and the chart's new `trustedProxyCidrs`) and
+  keeps an outer proxy's `X-Forwarded-Proto`, with the client address from
+  `X-Forwarded-For` (`real_ip_recursive`), only from a listed peer. **Unset
+  keeps today's behaviour**: no proxy is trusted. A list narrowed to the
+  proxy must also cover the frontend's own network, since the api believes
+  `X-Real-IP` only from a listed peer. The Helm TLS frontend (one server for
+  :80 and :443) no longer 301s a request a trusted proxy marks
+  `X-Forwarded-Proto: https`, which looped behind a TLS-terminating proxy,
+  and gains the AI-chat stream location it lacked. The cluster-health,
+  container-log and nmap streams are served unbuffered with a one hour
+  timeout. The api now logs `sso_external_url_not_set` when an SSO endpoint
+  falls back to the request URL, `trusted_hosts_refused_host` for the Host a
+  `TRUSTED_HOSTS` 400 refused, and `reverse_proxy_sub_path_unsupported` for
+  `X-Forwarded-Prefix`. New [`REVERSE_PROXY.md`](docs/deployment/REVERSE_PROXY.md)
+  covers the topology (sub-paths unsupported), required settings and headers,
+  streaming, nginx / Caddy / Traefik / HAProxy / Nginx Proxy Manager /
+  Ingress examples and a troubleshooting table; DOCKER.md Option C no longer
+  mounts a file over the entrypoint's rendered `default.conf`, and a stale
+  `X-Forwarded-Host` comment is corrected.
 - **The DICOM AE, OT device and IPAM CSV imports read a file with classic
   Mac line endings (#1370, #1637, #1711).** Each importer read the
   pasted or uploaded text without handing its line endings to the csv
