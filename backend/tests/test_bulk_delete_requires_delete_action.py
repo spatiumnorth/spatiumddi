@@ -256,9 +256,11 @@ async def test_dns_record_bulk_delete_needs_delete(
     deleter = await _headers(db_session, ["write", "delete"])
     url = f"/api/v1/dns/groups/{uuid.uuid4()}/zones/{uuid.uuid4()}/records/bulk-delete"
     body = {"record_ids": [str(uuid.uuid4())]}
-    assert (await client.post(url, json=body, headers=writer)).status_code == 403
+    resp_1 = await client.post(url, json=body, headers=writer)
+    assert resp_1.status_code == 403
     # Past the gate: the zone does not exist, which is a 404, not a refusal.
-    assert (await client.post(url, json=body, headers=deleter)).status_code == 404
+    resp_2 = await client.post(url, json=body, headers=deleter)
+    assert resp_2.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -285,7 +287,8 @@ async def test_orphan_purge_needs_delete(client: AsyncClient, db_session: AsyncS
     url = f"/api/v1/ipam/subnets/{subnet.id}/orphans/purge"
     body = {"ip_ids": [str(ip.id)]}
 
-    assert (await client.post(url, json=body, headers=writer)).status_code == 403
+    resp_3 = await client.post(url, json=body, headers=writer)
+    assert resp_3.status_code == 403
     single = await client.delete(
         f"/api/v1/ipam/addresses/{ip.id}", params={"permanent": "true"}, headers=writer
     )
