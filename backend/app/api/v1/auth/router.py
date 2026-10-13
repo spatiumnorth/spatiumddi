@@ -1479,7 +1479,23 @@ async def _app_base_url(db: DB, request: Request) -> str:
     configured = (row.app_base_url if row else "").rstrip("/")
     if configured:
         return configured
-    return str(request.base_url).rstrip("/")
+    # #1868 — the URL is rebuilt from this request's own Host and scheme. Behind
+    # a reverse proxy that is whatever the proxy forwarded (``http://`` if the
+    # proxy is not in TRUSTED_PROXY_CIDRS), so the IdP is handed a callback it
+    # will reject, and the operator sees only the IdP's error. Say so here, at
+    # the one place that knows the fallback was taken.
+    fallback = str(request.base_url).rstrip("/")
+    logger.warning(
+        "sso_external_url_not_set",
+        built_url=fallback,
+        path=request.url.path,
+        hint=(
+            "Settings > General > External URL is empty, so the OIDC redirect_uri / "
+            "SAML ACS is built from the incoming request. Behind a reverse proxy "
+            "set it to the public https:// URL (docs/deployment/REVERSE_PROXY.md)."
+        ),
+    )
+    return fallback
 
 
 def _oidc_callback_url(base: str, provider_id: uuid.UUID) -> str:

@@ -6406,11 +6406,13 @@ async def schedule_appliance_upgrade(
     # multi-node rolling orchestrator cannot drift apart on what the host
     # is told to fetch (#787) — the drift that re-introduced #386 there.
     #
-    # The URL is composed against ``request.base_url``: the operator-facing
-    # scheme + host the frontend reached us on (X-Forwarded-Host / -Proto
-    # when nginx is in front), which is necessarily reachable from the
-    # appliance subnet because that is where the supervisor already
-    # heartbeats.
+    # The URL is composed against ``request.base_url``: the scheme + Host the
+    # request carried. The Host header is passed through verbatim by the
+    # frontend nginx and by any proxy that preserves it; the scheme is the
+    # TCP peer's, or a trusted proxy's X-Forwarded-Proto (TrustedProxyMiddleware).
+    # X-Forwarded-Host is NOT read anywhere, so a proxy that rewrites Host
+    # changes this URL. It is necessarily reachable from the appliance subnet
+    # because that is where the supervisor already heartbeats.
     try:
         target = await resolve_slot_image_target(
             db,

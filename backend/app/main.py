@@ -9,7 +9,6 @@ import structlog.contextvars
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.acme_well_known import router as acme_well_known_router
 from app.api.docs import install_api_docs
@@ -19,7 +18,7 @@ from app.api.v1.router import api_v1_router
 from app.config import settings
 from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
-from app.core.request_meta import TrustedProxyMiddleware
+from app.core.request_meta import LoggingTrustedHostMiddleware, TrustedProxyMiddleware
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
 from app.services.feature_modules import require_module
@@ -984,7 +983,7 @@ def create_app() -> FastAPI:
     # lock the API to their real hostnames. (TrustedHostMiddleware
     # short-circuits ``["*"]`` so there's no per-request cost when open.)
     app.add_middleware(
-        TrustedHostMiddleware,
+        LoggingTrustedHostMiddleware,
         allowed_hosts=settings.trusted_hosts_list,
     )
 
