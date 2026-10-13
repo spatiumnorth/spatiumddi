@@ -618,6 +618,22 @@ _METHOD_TO_ACTION = {
     "DELETE": "delete",
 }
 
+# A ``POST .../bulk-delete`` removes rows exactly as ``DELETE`` does, so the
+# router-level gates require ``delete`` for it, not the ``write`` POST implies.
+_BULK_DELETE_SUFFIX = "/bulk-delete"
+
+
+def action_for_request(request: Request) -> str:
+    """Return the action a router-level gate requires for ``request``.
+
+    The HTTP method decides, except that a bulk delete (a POST whose path ends
+    in ``/bulk-delete``) needs the same ``delete`` action as deleting one row.
+    """
+    method = request.method.upper()
+    if method == "POST" and request.url.path.rstrip("/").endswith(_BULK_DELETE_SUFFIX):
+        return "delete"
+    return _METHOD_TO_ACTION.get(method, "write")
+
 
 def require_resource_permission(resource_type: str) -> Callable[..., Awaitable[User]]:
     """Router-level dependency that enforces permissions by HTTP method.
@@ -636,7 +652,7 @@ def require_resource_permission(resource_type: str) -> Callable[..., Awaitable[U
         current_user: CurrentUser,
         db: Annotated[AsyncSession, Depends(get_db)],
     ) -> User:
-        action = _METHOD_TO_ACTION.get(request.method.upper(), "write")
+        action = action_for_request(request)
         if user_has_permission(current_user, action, resource_type):
             return current_user
         await _record_denial(db, current_user, request, action, resource_type, None)
@@ -664,7 +680,7 @@ def require_any_resource_permission(
         current_user: CurrentUser,
         db: Annotated[AsyncSession, Depends(get_db)],
     ) -> User:
-        action = _METHOD_TO_ACTION.get(request.method.upper(), "write")
+        action = action_for_request(request)
         for rt in resource_types:
             if user_has_permission(current_user, action, rt):
                 return current_user
@@ -736,7 +752,7 @@ def require_any_resource_or_scoped(
         current_user: CurrentUser,
         db: Annotated[AsyncSession, Depends(get_db)],
     ) -> User:
-        action = _METHOD_TO_ACTION.get(request.method.upper(), "write")
+        action = action_for_request(request)
         for rt in unscoped_types:
             if user_has_permission(current_user, action, rt):
                 return current_user
@@ -776,6 +792,7 @@ KNOWN_MANAGE_PERMISSIONS: frozenset[str] = frozenset(
 
 
 __all__ = [
+    "action_for_request",
     "KNOWN_MANAGE_PERMISSIONS",
     "caller_can_grant",
     "effective_grants",

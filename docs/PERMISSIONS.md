@@ -138,6 +138,16 @@ on inactive.
    to their own group to escalate. Superadmins (either path in the section
    above) are exempt by rule 1.
 
+### Bulk deletes need `delete`
+
+Router-level gates derive the action from the HTTP method (GET `read`,
+POST/PUT/PATCH `write`, DELETE `delete`). A `POST .../bulk-delete` removes
+rows exactly as `DELETE` does, so it requires `delete` on the same resource
+type as the single-row route, not `write`. A role holding `write` without
+`delete` is refused on both. Routes with their own gate (domains, nmap, pcap)
+require `delete` explicitly. `tests/test_bulk_delete_requires_delete_action.py`
+walks the route table to keep this true for new routes.
+
 ## Built-in roles (seeded on first start)
 
 | Role           | Permissions                                                  |

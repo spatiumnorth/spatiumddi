@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Bulk delete requires the `delete` action, like deleting one row
+  does.** The router-level permission gates mapped every `POST` to
+  `write`, so a role holding `write` but not `delete` was refused
+  `DELETE /x/{id}` yet could remove up to 500 rows through
+  `POST /x/bulk-delete` (ASNs, VRFs, overlays, multicast groups,
+  circuits, services, customers, sites, providers, DNS records and IPAM
+  addresses). The gates now treat a `POST` ending in `/bulk-delete` as
+  `delete`. IPAM's per-subnet and address-set write checks on each row
+  are unchanged. A role that relied on `write` alone for bulk delete
+  needs `delete` added. A test walks the route table so a new
+  bulk-delete route without the check fails CI.
+
 - **The DICOM AE, OT device and IPAM CSV imports read a file with classic
   Mac line endings (#1370, #1637, #1711).** Each importer read the
   pasted or uploaded text without handing its line endings to the csv
