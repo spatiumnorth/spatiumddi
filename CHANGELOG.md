@@ -84,6 +84,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Technitium token and auth lifecycle (#1772).** The agentless
+  `technitium_api` setup text said Zones: Modify + DnsClient: View, which
+  cannot delete zones and sees no pre-existing zone; the form, API
+  docstring and docs now say to use a user in DNS Administrators, and the
+  connection test warns when it sees 0 zones. A pre-15.0 server (no Bearer
+  auth) is now reported as such by the test instead of "recreate the
+  token". The Technitium agent now names `bad-credentials`,
+  `2fa-required` and `locked-out` when it cannot re-mint its API token, and
+  stops presenting the password: one attempt per 15 minutes, instead of
+  one per apply retry and per record op, which kept the agent's address
+  under Technitium's 5-failure login block. Such an apply reports
+  `reverted` with that reason, not `revert_failed`, because no call reached
+  the daemon.
+
 - **The BIND9 agent now renders `allow-recursion` (#1786).** The
   group's `allow_recursion` was stored and shipped in the bundle but
   never written to `named.conf`. An explicit list now renders in

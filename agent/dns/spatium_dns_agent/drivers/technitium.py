@@ -88,6 +88,17 @@ _API_TIMEOUT = 10.0
 _ADMIN_PASSWORD_FILE = "technitium-admin-password"
 _API_TOKEN_FILE = "technitium-api.token"
 _TOKEN_NAME = "spatiumddi-agent"
+# #1772: set after Technitium REFUSES the bootstrap credentials, so the agent
+# stops presenting them. ``AuthManager.cs`` counts failed logins per client
+# address (the agent's is loopback) with NO time window: the count only resets
+# on a successful login or when a block expires, and every 5th failure blocks
+# that address for 5 minutes (MAX_LOGIN_ATTEMPTS / BLOCK_NETWORK_INTERVAL).
+# Without this marker the apply loop and every record op re-presented the
+# dead password, keeping the agent's address blocked almost continuously.
+_CREDS_REJECTED_FILE = "technitium-credentials-rejected.json"
+# One attempt per window: at most one 5-minute loopback block per ~75 minutes
+# while the credentials stay wrong, and never a standing one.
+_CREDS_RETRY_SECONDS = 15 * 60
 # Zones this agent created from a bundle — the only ones it may delete when
 # the bundle drops them (see ``_retire_dropped_zones``).
 _MANAGED_ZONES_FILE = "technitium-managed-zones.json"
@@ -1968,6 +1979,54 @@ def _record_params(
     # so the API's own error message tells us what's missing, rather than
     # silently dropping the record.
     return {"value": value}
+
+
+class TechnitiumCredentialsError(RuntimeError):
+    """Technitium refused the agent's admin credentials (#1772).
+
+    ``reason`` is ``bad-credentials`` or ``2fa-required``. The text is what
+    reaches the control plane as the #882 apply-status ``error``, so it
+    names the cause and the way out rather than "no API token available".
+    """
+
+    #: Raised before any authenticated call succeeds — every call in an apply
+    #: carries the same token — so the daemon has taken nothing from this
+    #: apply and there is nothing to revert (see ``ConfigApplyError``).
+    daemon_untouched = True
+
+    def __init__(self, reason: str, detail: str = ""):
+        self.reason = reason
+        super().__init__(_creds_message(reason, detail))
+
+
+def _creds_message(reason: str, detail: str = "") -> str:
+    if reason == "2fa-required":
+        what = (
+            "Technitium requires a two-factor code for the 'admin' account "
+            "(2fa-required), so the agent cannot mint a new API token"
+        )
+    elif reason == "locked-out":
+        what = (
+            "Technitium has blocked logins from the agent's address after "
+            "repeated failures (locked-out), so the agent cannot mint a new "
+            "API token; the block lifts after 5 minutes"
+        )
+    else:
+        what = (
+            "Technitium rejected the agent's stored admin password "
+            "(bad-credentials), so the agent cannot mint a new API token"
+        )
+    fix = (
+        "Recovery: disable TOTP on 'admin', or make the two passwords agree — "
+        "write Technitium's current 'admin' password into "
+        "technitium-admin-password in the agent state directory (the file is "
+        "regenerated if the state volume was lost), or set 'admin' in "
+        "Technitium to the password in that file. Changing that file, or "
+        "deleting technitium-credentials-rejected.json beside it, retries at "
+        "once; otherwise the agent retries at most every 15 minutes to stay "
+        "clear of Technitium's 5-attempt login lockout"
+    )
+    return f"{what}. {fix}." + (f" Technitium said: {detail}" if detail else "")
 
 
 class TechnitiumDriver(DriverBase):
@@ -4524,6 +4583,7 @@ class TechnitiumDriver(DriverBase):
         orphaned tokens on the server).
         """
         password = self.admin_bootstrap_password()
+        self._raise_if_creds_cooling_down()
         try:
             # A form body, never query parameters: a URL is logged (httpx
             # writes every request line at INFO) and the password must not be
@@ -4538,14 +4598,83 @@ class TechnitiumDriver(DriverBase):
             log.error("technitium_create_token_failed", error=str(exc))
             return None
         if body.get("status") != "ok" or not body.get("token"):
-            log.error(
-                "technitium_create_token_rejected", error=body.get("errorMessage")
-            )
+            detail = str(body.get("errorMessage") or "")
+            log.error("technitium_create_token_rejected", error=detail or None)
+            # Verified against APIDOCS.md ("2fa-required" status) and
+            # AuthManager.cs: a wrong password answers "Invalid username or
+            # password for user: …" and TOTP-enabled users get 2fa-required.
+            # Both are verdicts about the credentials, not transient faults.
+            # A blocked address answers "Max limit of 5 attempts exceeded"
+            # before the password is even checked (not counted, but the
+            # agent would otherwise retry it on every op).
+            reason = None
+            if body.get("status") == "2fa-required":
+                reason = "2fa-required"
+            elif "invalid username or password" in detail.lower():
+                reason = "bad-credentials"
+            elif detail.lower().startswith("max limit of"):
+                reason = "locked-out"
+            if reason is not None:
+                self._record_creds_rejected(reason, detail)
+                raise TechnitiumCredentialsError(reason, detail)
             return None
         token = body["token"]
         self._write_secret(self._api_token_path(), token)
         log.info("technitium_api_token_created")
         return token
+
+    def _creds_rejected_path(self) -> Path:
+        return self.state_dir / _CREDS_REJECTED_FILE
+
+    def _password_file_identity(self) -> str:
+        """Which version of the admin password file is on disk.
+
+        Inode, size and mtime, so a rewritten file lifts the hold, without
+        storing anything derived from the password itself: a fast hash of it
+        in the state directory could be guessed offline (#1772, CodeQL).
+        Empty when the file is missing.
+        """
+        try:
+            st = self._admin_password_path().stat()
+        except OSError:
+            return ""
+        return f"{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
+
+    def _record_creds_rejected(self, reason: str, detail: str) -> None:
+        # ``detail`` is kept so the suppressed attempts report the same error
+        # text as the real one: a steady apply-status error, not one that
+        # changes shape after the first failure.
+        write_private(
+            self._creds_rejected_path(),
+            json.dumps(
+                {
+                    "reason": reason,
+                    "detail": detail,
+                    "at": time.time(),
+                    "pw_file": self._password_file_identity(),
+                }
+            ),
+        )
+
+    def _raise_if_creds_cooling_down(self) -> None:
+        """Refuse to present credentials Technitium has already refused.
+
+        Lifted by a changed password file, by the retry window elapsing, or
+        by deleting the marker; an unreadable marker never blocks.
+        """
+        path = self._creds_rejected_path()
+        try:
+            rec = json.loads(path.read_text())
+            reason = str(rec["reason"])
+            detail = str(rec.get("detail") or "")
+            at = float(rec["at"])
+            same_pw = rec.get("pw_file") == self._password_file_identity()
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        if same_pw and time.time() - at < _CREDS_RETRY_SECONDS:
+            log.warning("technitium_create_token_suppressed", reason=reason)
+            raise TechnitiumCredentialsError(reason, detail)
+        path.unlink(missing_ok=True)
 
     @staticmethod
     def _write_secret(path: Path, value: str) -> None:
