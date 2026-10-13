@@ -84,6 +84,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Roles API accepted every action but `approve`, so a cloned Change
+  Approver could not be saved (#1631).** The validator allow-listed `read`,
+  `write`, `delete`, `admin` and `*`, while the builtin Change Approver role
+  (and every approval check) uses `approve` on `change_request`; saving a
+  clone 422d. `approve` is now accepted by the Roles and time-bound-grant
+  APIs and offered in the role editor, and a test pins the allow-list against
+  every action the builtin roles and permission checks use.
+
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and

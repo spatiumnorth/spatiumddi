@@ -19,7 +19,14 @@ import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
 // sync. A role can hold more than these lists name — the built-in roles do
 // (`approve`, `appliance`, `change_request`, …) — so each select also offers
 // the value its row holds (`withHeld`), and shows it (#1394).
-const ACTIONS = ["read", "write", "delete", "admin", "*"] as const;
+const ACTIONS = [
+  "read",
+  "write",
+  "delete",
+  "admin",
+  "approve",
+  "*",
+] as const;
 const RESOURCE_TYPES = [
   "*",
   "ip_space",
