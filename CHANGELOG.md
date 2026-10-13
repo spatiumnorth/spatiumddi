@@ -84,6 +84,8 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A new Technitium zone is no longer served under the daemon's default SOA (#1758).** `zones/create` takes no SOA, so a Primary created by the agent answered with Technitium's default (`hostadmin@<zone>`, TTL and minimum 900 s, which is the negative-cache TTL) until its own SOA and records landed: 8-11 s after a group move or any fresh agent start. A resolver could cache an NXDOMAIN from that window for up to 15 minutes. The agent now holds a Primary straight after creating it, or converting a Forwarder into one, by setting its `queryAccess` to `Deny`, and applies the zone's real options, query access included, once its records and apex SOA/NS are reconciled. A held zone answers REFUSED, which no resolver caches. It is deliberately not disabled: a disabled zone is not authoritative, so on a group that allows recursion the query is resolved upstream instead, giving `corp.lan` the root's NXDOMAIN (negative TTL one day) and an internal copy of a public zone its public answers. A zone that already exists is never held, so a second pass still writes nothing. If the agent dies before the release, or the release is refused, the zone is remembered in `technitium-zones-held.json` in the agent state dir and released on the next pass.
+
 - **The PowerDNS agent stops serving zones wrong in three ways
   (#1520, #1521, #1522).** Pool member address deletes were applied
   as no-ops and acked ok — the record-op fallback ignored the rrset
