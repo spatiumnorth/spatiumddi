@@ -26,7 +26,7 @@ _TEMPLATES = (
 )
 
 pytestmark = pytest.mark.skipif(
-    not _SCRIPT.exists(), reason="frontend/ not present in this checkout (dev container)"
+    not _TEMPLATES[0].exists(), reason="frontend/ not present in this checkout (dev container)"
 )
 
 
