@@ -2050,11 +2050,43 @@ async def _sync_dns_record(
                 ip.reverse_zone_id = rev_zone.id
                 await _enqueue_dns_op(db, rev_zone, "create", ptr_name, "PTR", ptr_value, ttl)
             else:
-                changed = record.value != ptr_value or record.name != ptr_name
+                old_ptr_name, old_ptr_value = record.name, record.value
+                name_changed = old_ptr_name != ptr_name
+                changed = record.value != ptr_value or name_changed
                 record.name = ptr_name
                 record.fqdn = rev_pointer_full
                 record.value = ptr_value
-                if changed:
+                if name_changed:
+                    # #1822 — the address moved inside the same reverse zone:
+                    # the PTR's owner name changed. An "update" replaces the
+                    # RRset AT the new name and never touches the old one, so
+                    # the old PTR stayed served (agentless: indefinitely).
+                    # Retract the old name first, then create the new one
+                    # (#1489 order) — the same delete + create the forward
+                    # rename and the record PUT (#1773) emit, as ONE batch so
+                    # an agentless primary gets both in a single
+                    # apply_record_changes call. Inside a bulk
+                    # ``_batched_dns_ops`` block the outer collector already
+                    # batches per zone, so only open our own when none is
+                    # active. A value-only change (hostname rename) stays a
+                    # single update.
+                    async with contextlib.AsyncExitStack() as stack:
+                        if _dns_op_collector.get() is None:
+                            await stack.enter_async_context(_batched_dns_ops(db))
+                        await _enqueue_dns_op(
+                            db,
+                            rev_zone,
+                            "delete",
+                            old_ptr_name,
+                            "PTR",
+                            old_ptr_value,
+                            record.ttl,
+                            record_id=record.id,
+                        )
+                        await _enqueue_dns_op(
+                            db, rev_zone, "create", ptr_name, "PTR", ptr_value, record.ttl
+                        )
+                elif changed:
                     await _enqueue_dns_op(
                         db, rev_zone, "update", ptr_name, "PTR", ptr_value, record.ttl
                     )
