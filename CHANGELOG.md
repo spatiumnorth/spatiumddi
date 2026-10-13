@@ -84,6 +84,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An IPAM template apply lists only the columns it changed (#1634).**
+  `fields_written`, in the response and in the apply's audit row, named
+  every column that was empty on the target, including ones the template
+  has no value for (a DDNS-only template listed `tags`, `custom_fields`,
+  the zones and the domain override). A column now counts as written
+  only when its value changed; `force` lists the columns it overwrote
+  with a different value.
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and
