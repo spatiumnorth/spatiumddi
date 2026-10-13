@@ -100,6 +100,14 @@ the formatter handles the rest.
   walks the route table so a new multi-row delete route without the
   check fails CI.
 
+- **An IPAM template apply lists only the columns it changed (#1634).**
+  `fields_written`, in the response and in the apply's audit row, named
+  every column that was empty on the target, including ones the template
+  has no value for (a DDNS-only template listed `tags`, `custom_fields`,
+  the zones and the domain override). A column now counts as written
+  only when its value changed; `force` lists the columns it overwrote
+  with a different value.
+
 - **An ACME order's teardown no longer fails with "Event loop is
   closed" in the worker (#1687, #1726).** `run_order`'s `finally`
   removed the DNS-01 challenge TXT records and the http-01 tokens
