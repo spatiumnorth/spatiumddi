@@ -79,7 +79,9 @@ _MAX_ERROR = 2000
 # 8 (#1523): the bundle ships the NOTIFY fields (server options
 #   ``notify_enabled`` / ``also_notify`` / ``allow_notify`` and the zone
 #   ``allow_query`` / ``also_notify`` / ``notify_enabled`` overrides).
-RENDERER_REVISION = 8
+# 9 (#1786): a BIND9 server's bundle carries ``allow_recursion`` (the agent now
+#   renders ``allow-recursion``).
+RENDERER_REVISION = 9
 
 
 def _serves(revision: int | None) -> bool:

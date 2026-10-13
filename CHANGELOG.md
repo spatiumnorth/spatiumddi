@@ -84,6 +84,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The BIND9 agent now renders `allow-recursion` (#1786).** The
+  group's `allow_recursion` was stored and shipped in the bundle but
+  never written to `named.conf`. An explicit list now renders in
+  `options {}` (named ACLs resolve to the `acl {}` blocks from #899;
+  the API validates the entries like `allow_query`). The agent drops
+  any stored element `named-checkconf` would refuse, including an ACL
+  that no longer exists, and renders `none` if nothing survives, so one
+  bad element cannot stop the group converging and a broken
+  restriction fails closed. An ACL cited by the server options can no
+  longer be deleted or renamed. **What the default means:** the stored
+  default `["any"]`, an empty list, and recursion off render no
+  `allow-recursion` line. BIND then derives recursion from
+  `allow-query`, which the agent always renders (default `any`), so a
+  default recursive BIND9 group is an open resolver, as it has been
+  all along (the issue's "BIND ran `localnets; localhost;`" was wrong;
+  verified against BIND 9.20). This change keeps that, rather than cut
+  off resolvers serving routed clients; set `allow_recursion` or
+  `allow_query` to restrict it. Technitium maps the same default to
+  private networks only (#1761), so the two engines differ on it. The
+  bundle change is renderer revision 9. Every BIND9 group's etag shifts
+  once on upgrade (one re-apply); `named.conf` is byte-identical unless
+  `allow_recursion` is explicit.
+
 - **A rolling upgrade whose own cleanup fails now raises a distinct
   alert (#1542).** When an upgrade fails after cordoning a node, the
   orchestrator uncordons it and clears the CNPG maintenance window; if

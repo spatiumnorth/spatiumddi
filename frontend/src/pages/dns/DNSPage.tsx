@@ -7284,6 +7284,11 @@ function OptionsTab({ groupId }: { groupId: string }) {
             }}
             placeholder="any"
           />
+          <p className="text-xs text-muted-foreground">
+            &quot;any&quot; (the default) or blank: on BIND9 recursion is as
+            wide as allow-query; on Technitium, private networks only. List
+            networks to restrict it.
+          </p>
         </Field>
       </div>
 
