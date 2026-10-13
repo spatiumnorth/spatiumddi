@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DHCP pool's lease-time override is refused instead of silently
+  ignored (#1689).** `lease_time_override` was stored, echoed and shown
+  in the UI but never sent to the agent, and Kea has no per-pool lease
+  time (a client class can carry one, but only for clients matching its
+  test, which would also restrict who may use the pool), so every pool
+  served the scope's lease. Setting a value now answers 422 and the
+  field is gone from the pool form; clearing an old value with null
+  still works. Changes the DHCP pool API and form, not the served Kea
+  config.
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and

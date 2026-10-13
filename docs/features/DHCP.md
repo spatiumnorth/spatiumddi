@@ -325,7 +325,8 @@ DHCPPool
     -- excluded:  range exists in subnet but DHCP will NOT offer these IPs
     -- reserved:  range held for static assignments only (not auto-assigned)
   class_restriction: str (nullable)   -- Kea client class
-  lease_time_override: int (nullable) -- overrides scope lease_time for this pool
+  lease_time_override: int (nullable) -- NOT SUPPORTED (#1689): Kea has no per-pool lease time, so
+                                         a value is refused with a 422; null only (kept so an old row can be cleared)
   options_override: JSONB (nullable)  -- additional options for this pool only
 ```
 
