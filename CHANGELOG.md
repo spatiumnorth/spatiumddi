@@ -84,6 +84,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting an appliance only removes servers provably its own
+  (#1810).** The hostname match on agent-registered DNS / DHCP rows now
+  applies only to an approved appliance, judged on the state it is deleted
+  from. A pending or revoked duplicate (a re-imaged box's stale entry)
+  claims its FK-owned rows only, so deleting it, or previewing the
+  delete, can no longer take a live appliance's servers, with their
+  settings such as the Kea `ha_peer_url`.
 - **The PowerDNS agent stops serving zones wrong in three ways
   (#1520, #1521, #1522).** Pool member address deletes were applied
   as no-ops and acked ok — the record-op fallback ignored the rrset
