@@ -662,8 +662,9 @@ export function AlertsPage() {
           <div className="flex shrink-0 gap-2">
             <button
               onClick={() => evaluate.mutate()}
-              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
               disabled={evaluate.isPending}
+              {...superadminGate}
             >
               <Play className="h-3.5 w-3.5" />
               {evaluate.isPending ? "Evaluating…" : "Evaluate now"}
@@ -783,7 +784,8 @@ export function AlertsPage() {
                         {!ev.resolved_at && (
                           <button
                             onClick={() => resolve.mutate(ev.id)}
-                            className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+                            className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                            {...superadminGate}
                           >
                             Resolve
                           </button>

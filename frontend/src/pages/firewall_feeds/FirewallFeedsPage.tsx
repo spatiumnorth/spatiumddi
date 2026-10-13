@@ -202,15 +202,17 @@ export function FirewallFeedsPage() {
                       <td className="whitespace-nowrap px-3 py-2 text-right">
                         <button
                           onClick={() => setReveal(f)}
-                          className="rounded p-1 text-muted-foreground hover:text-foreground"
+                          className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Reveal poll URL"
+                          {...superadminGate}
                         >
                           <Eye className="h-3.5 w-3.5" />
                         </button>
                         <button
                           onClick={() => setRotate(f)}
-                          className="rounded p-1 text-muted-foreground hover:text-foreground"
+                          className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Rotate token"
+                          {...superadminGate}
                         >
                           <RotateCw className="h-3.5 w-3.5" />
                         </button>

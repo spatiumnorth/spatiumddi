@@ -313,6 +313,10 @@ export function DomainsPage() {
     perms.can("write", "manage_domains"),
     "Requires write permission on domains",
   );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_domains"),
+    "Requires delete permission on domains",
+  );
   const qc = useQueryClient();
   const [editing, setEditing] = useState<Domain | null>(null);
   const [showCreate, setShowCreate] = useState(false);
@@ -487,7 +491,8 @@ export function DomainsPage() {
               <button
                 onClick={() => bulkRefresh.mutate(Array.from(selected))}
                 disabled={bulkRefresh.isPending}
-                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent"
+                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...writeGate}
               >
                 <RefreshCw
                   className={cn(
@@ -508,7 +513,8 @@ export function DomainsPage() {
                   }
                 }}
                 disabled={bulkDel.isPending}
-                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-red-950/30"
+                {...deleteGate}
               >
                 <Trash2 className="h-3.5 w-3.5" />
                 Bulk delete

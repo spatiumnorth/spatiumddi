@@ -4,6 +4,7 @@ import { Loader2, Radar, Trash2 } from "lucide-react";
 import { type NmapScanRead, nmapApi } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { NmapScanForm } from "./NmapScanForm";
 import { NmapScanLiveViewer } from "./NmapScanLiveViewer";
 import { NmapResultPanel } from "./NmapResultPanel";
@@ -225,6 +226,12 @@ function ResultTab({
 
 function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
   const qc = useQueryClient();
+  // Cancel and delete (single and bulk) take delete on 'manage_nmap_scans'
+  // (nmap/router.py).
+  const deleteGate = permissionGate(
+    usePermissions().can("delete", "manage_nmap_scans"),
+    "Requires delete permission on nmap scans",
+  );
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [pendingSingle, setPendingSingle] = useState<NmapScanRead | null>(null);
   const [pendingBulk, setPendingBulk] = useState<NmapScanRead[] | null>(null);
@@ -327,6 +334,7 @@ function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
               onClick={() => setPendingBulk(selectedItems)}
               disabled={bulkDelete.isPending}
               className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-0.5 text-[11px] text-destructive hover:bg-destructive/10 disabled:opacity-60"
+              {...deleteGate}
             >
               <Trash2 className="h-3 w-3" />
               Delete {selected.size}
@@ -404,6 +412,7 @@ function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
                       disabled={singleDelete.isPending}
                       onClick={() => setPendingSingle(s)}
                       className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

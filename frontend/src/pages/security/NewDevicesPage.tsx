@@ -380,6 +380,7 @@ export function NewDevicesPage() {
                 setActionError(null);
                 setShowAddAllowlist(true);
               }}
+              {...writeGate}
             >
               Add to allowlist
             </HeaderButton>
@@ -390,6 +391,7 @@ export function NewDevicesPage() {
                 setActionError(null);
                 setShowBlock(true);
               }}
+              {...writeGate}
             >
               Block
             </HeaderButton>
@@ -594,6 +596,12 @@ function SummaryCard({
 // ── Allowlist management modal ────────────────────────────────────────
 function AllowlistModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
+  // Allowlist writes take write on 'ip_address' (new_devices/router.py);
+  // the list itself stays readable.
+  const writeGate = permissionGate(
+    usePermissions().can("write", "ip_address"),
+    "Requires write permission on IP addresses",
+  );
   const [mac, setMac] = useState("");
   const [oui, setOui] = useState("");
   const [note, setNote] = useState("");
@@ -682,6 +690,7 @@ function AllowlistModal({ onClose }: { onClose: () => void }) {
             type="submit"
             disabled={addMut.isPending || (!mac.trim() && !oui.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 sm:col-span-1"
+            {...writeGate}
           >
             Add
           </button>
@@ -692,6 +701,7 @@ function AllowlistModal({ onClose }: { onClose: () => void }) {
             icon={Plus}
             onClick={() => virtMut.mutate()}
             disabled={virtMut.isPending}
+            {...writeGate}
           >
             Add common virtualization OUIs
           </HeaderButton>
@@ -741,8 +751,9 @@ function AllowlistModal({ onClose }: { onClose: () => void }) {
                     <td className="px-3 py-2 text-right">
                       <button
                         onClick={() => setDel(en)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
                         title="Remove"
+                        {...writeGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>

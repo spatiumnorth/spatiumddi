@@ -637,6 +637,12 @@ function GroupDetailView({
 // known-but-external one (allowlists it so the rogue alert auto-resolves).
 function RespondersTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
+  // Acknowledging allowlists the source: a POST the router gates as
+  // write on dhcp_server (no SuperAdmin on the handler).
+  const ackGate = permissionGate(
+    usePermissions().can("write", "dhcp_server"),
+    "Requires write permission on DHCP servers",
+  );
   const { data: responders = [], isFetching } = useQuery({
     queryKey: ["dhcp-responders", groupId],
     queryFn: () => dhcpApi.listResponders(groupId),
@@ -715,7 +721,8 @@ function RespondersTab({ groupId }: { groupId: string }) {
                     <button
                       onClick={() => ack.mutate(r.id)}
                       disabled={ack.isPending}
-                      className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                      className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                      {...ackGate}
                     >
                       Acknowledge
                     </button>
@@ -736,6 +743,12 @@ function RespondersTab({ groupId }: { groupId: string }) {
 // that allowlists an expected router so the rogue_ra alert auto-resolves.
 function RouterAdvertisementsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
+  // Acknowledging allowlists the source: a POST the router gates as
+  // write on dhcp_server (no SuperAdmin on the handler).
+  const ackGate = permissionGate(
+    usePermissions().can("write", "dhcp_server"),
+    "Requires write permission on DHCP servers",
+  );
   const { data: preview } = useQuery({
     queryKey: ["ra-config", groupId],
     queryFn: () => dhcpApi.raConfigPreview(groupId),
@@ -887,7 +900,8 @@ function RouterAdvertisementsTab({ groupId }: { groupId: string }) {
                       <button
                         onClick={() => ack.mutate(r.id)}
                         disabled={ack.isPending}
-                        className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                        className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                        {...ackGate}
                       >
                         Acknowledge
                       </button>
@@ -1005,6 +1019,20 @@ function GroupServersList({
         </div>
       )}
 
+      {resumeMut.isError && (
+        <div className="mb-3 flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <span>
+            Resume failed: {formatApiError(resumeMut.error, "request failed")}
+          </span>
+          <button
+            type="button"
+            onClick={() => resumeMut.reset()}
+            className="rounded border px-2 py-0.5 hover:bg-muted"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       <div className="flex items-center justify-between mb-4">
         <div>
           <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
@@ -1280,6 +1308,11 @@ function ScopeDeleteModal({
 
 function ServerScopesTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
+  // #1339 — scope create, edit and delete take a superadmin (scopes.py).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const [tagFilters, setTagFilters] = useState<string[]>([]);
   const { data: subnets = [] } = useQuery({
     queryKey: ["subnets"],
@@ -1363,6 +1396,7 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
               e.target.value = "";
             }}
             title="Pick the IPAM subnet you want this DHCP server to serve leases from."
+            {...superadminGate}
           >
             <option value="">+ Serve leases on subnet…</option>
             {subnets
@@ -1473,13 +1507,15 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                             />
                             <button
                               onClick={() => setEditScope(sc)}
-                              className="rounded p-1 text-muted-foreground hover:text-foreground"
+                              className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                              {...superadminGate}
                             >
                               <Pencil className="h-3.5 w-3.5" />
                             </button>
                             <button
                               onClick={() => setDelScope(sc)}
-                              className="rounded p-1 text-muted-foreground hover:text-destructive"
+                              className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
+                              {...superadminGate}
                             >
                               <Trash2 className="h-3.5 w-3.5" />
                             </button>
@@ -1490,12 +1526,16 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                     <ContextMenuContent>
                       <ContextMenuLabel>{sc.name}</ContextMenuLabel>
                       <ContextMenuSeparator />
-                      <ContextMenuItem onSelect={() => setEditScope(sc)}>
+                      <ContextMenuItem
+                        onSelect={() => setEditScope(sc)}
+                        {...superadminGate}
+                      >
                         Edit Scope…
                       </ContextMenuItem>
                       <ContextMenuItem
                         destructive
                         onSelect={() => setDelScope(sc)}
+                        {...superadminGate}
                       >
                         Delete Scope…
                       </ContextMenuItem>
@@ -2785,6 +2825,12 @@ function ServerDetailView({
   onDelete: () => void;
   onSelectGroup?: (group: DHCPServerGroup) => void;
 }) {
+  // #1339 — every DHCP server group, server and Kea-tab write takes a
+  // superadmin (the DHCP routers' handlers take SuperAdmin).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   // For Kea servers attached to a Kea-managed group, scopes / pools /
   // statics / classes / option templates / MAC blocks all live on the
@@ -2957,6 +3003,7 @@ function ServerDetailView({
                 onClick={() => approveMut.mutate()}
                 disabled={approveMut.isPending}
                 className="bg-emerald-600 text-white hover:bg-emerald-700"
+                {...superadminGate}
               >
                 Approve
               </HeaderButton>
@@ -2971,6 +3018,7 @@ function ServerDetailView({
                 }}
                 disabled={leaseSyncMut.isPending}
                 title="Poll this server for active leases and mirror them into DHCP + IPAM"
+                {...superadminGate}
               >
                 Sync Leases
               </HeaderButton>
@@ -2980,17 +3028,19 @@ function ServerDetailView({
                 iconClassName={syncMut.isPending ? "animate-spin" : ""}
                 onClick={() => syncMut.mutate(false)}
                 disabled={syncMut.isPending}
+                {...superadminGate}
               >
                 Force Sync
               </HeaderButton>
             )}
-            <HeaderButton icon={Pencil} onClick={onEdit}>
+            <HeaderButton icon={Pencil} onClick={onEdit} {...superadminGate}>
               Edit
             </HeaderButton>
             <HeaderButton
               variant="destructive"
               icon={Trash2}
               onClick={onDelete}
+              {...superadminGate}
             >
               Delete
             </HeaderButton>

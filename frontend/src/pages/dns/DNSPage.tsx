@@ -787,6 +787,7 @@ function ConfirmSingleModal({
   onClose,
   isPending,
   confirmLabel = "Delete",
+  error,
 }: {
   title: string;
   description: React.ReactNode;
@@ -794,11 +795,15 @@ function ConfirmSingleModal({
   onClose: () => void;
   isPending?: boolean;
   confirmLabel?: string;
+  /** The server's reason when the action was refused, so a refused
+   *  delete says why instead of leaving the dialog as it was. */
+  error?: string | null;
 }) {
   return (
     <Modal title={title} onClose={onClose}>
       <div className="space-y-4">
         <p className="text-sm text-muted-foreground">{description}</p>
+        {error && <p className="text-sm text-destructive">{error}</p>}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -4385,6 +4390,7 @@ function ZoneDetailView({
                   onChange={(e) =>
                     autoTlsProbeMutation.mutate(e.target.checked)
                   }
+                  {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                 />
                 <span>
                   Auto-discover &amp; probe every A/AAAA record in this zone
@@ -4428,7 +4434,8 @@ function ZoneDetailView({
             </button>
             <button
               onClick={() => setConfirmBulkDelete(true)}
-              className="flex items-center gap-1 rounded-md border border-destructive/40 px-2 py-1 text-destructive hover:bg-destructive/10"
+              className="flex items-center gap-1 rounded-md border border-destructive/40 px-2 py-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+              {...permissionGate(canDeleteRecords, NEEDS_DNS_DELETE)}
             >
               <Trash2 className="h-3 w-3" /> Delete selected
             </button>
@@ -4492,7 +4499,9 @@ function ZoneDetailView({
                         return (
                           <input
                             type="checkbox"
-                            disabled={manualIds.length === 0}
+                            disabled={
+                              manualIds.length === 0 || !canDeleteRecords
+                            }
                             checked={allSel}
                             onChange={() => {
                               setSelectedRecords((prev) => {
@@ -4878,12 +4887,20 @@ function ZoneDetailView({
             </>
           }
           isPending={deleteRecord.isPending}
+          error={
+            deleteRecord.isError
+              ? formatApiError(deleteRecord.error, "Delete failed")
+              : null
+          }
           onConfirm={() =>
             deleteRecord.mutate(confirmDeleteRecord, {
               onSuccess: () => setConfirmDeleteRecord(null),
             })
           }
-          onClose={() => setConfirmDeleteRecord(null)}
+          onClose={() => {
+            deleteRecord.reset();
+            setConfirmDeleteRecord(null);
+          }}
         />
       )}
       {confirmBulkDelete && (
@@ -5346,6 +5363,20 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
 
   return (
     <div>
+      {resumeMut.isError && (
+        <div className="mb-3 flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <span>
+            Resume failed: {formatApiError(resumeMut.error, "request failed")}
+          </span>
+          <button
+            type="button"
+            onClick={() => resumeMut.reset()}
+            className="rounded border px-2 py-0.5 hover:bg-muted"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {servers.length > 0 && (
         <div className="mb-4 rounded-md border bg-card p-3">
           <div className="flex items-center gap-4 flex-wrap text-xs">
@@ -6791,6 +6822,8 @@ function RevealedSecretModal({
 
 function OptionsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
+  // Server options take a superadmin (dns/router.py).
+  const { isSuperadmin } = useDnsGrants();
   const { data: opts, isLoading } = useQuery({
     queryKey: ["dns-options", groupId],
     queryFn: () => dnsApi.getOptions(groupId),
@@ -7133,6 +7166,7 @@ function OptionsTab({ groupId }: { groupId: string }) {
           disabled={!dirty || saveMut.isPending}
           onClick={save}
           className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm disabled:opacity-50 ${saved ? "border text-emerald-600" : "bg-primary text-primary-foreground hover:bg-primary/90"}`}
+          {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
         >
           {saved ? (
             <>
@@ -8143,6 +8177,7 @@ function RecordsTab({
   onSelectZone: (z: DNSZone) => void;
 }) {
   const qc = useQueryClient();
+  const { canWriteRecords, canDeleteRecords } = useDnsGrants();
   // Server-side pagination + search (#455). `groupRecordSearch` matches
   // name / fqdn / value / type / zone on the server; the per-column filters
   // below stay client-side refinements over the current page.
@@ -8566,6 +8601,7 @@ function RecordsTab({
                               ? "Auto-managed — edit the source IP/lease"
                               : "Edit"
                           }
+                          {...permissionGate(canWriteRecords, NEEDS_DNS_WRITE)}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
@@ -8578,6 +8614,10 @@ function RecordsTab({
                               ? "Auto-managed — delete the source IP/lease"
                               : "Delete"
                           }
+                          {...permissionGate(
+                            canDeleteRecords,
+                            NEEDS_DNS_DELETE,
+                          )}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
@@ -8642,9 +8682,17 @@ function RecordsTab({
               </span>
               ? This cannot be undone.
             </p>
+            {deleteMut.isError && (
+              <p className="text-sm text-destructive">
+                {formatApiError(deleteMut.error, "Delete failed")}
+              </p>
+            )}
             <div className="flex justify-end gap-2">
               <button
-                onClick={() => setConfirmDelete(null)}
+                onClick={() => {
+                  deleteMut.reset();
+                  setConfirmDelete(null);
+                }}
                 className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
               >
                 Cancel
@@ -10136,6 +10184,8 @@ function BlocklistDetail({
   onBack: () => void;
 }) {
   const qc = useQueryClient();
+  // Every blocklist write takes a superadmin (blocklist_router.py).
+  const blGate = permissionGate(useDnsGrants().isSuperadmin, NEEDS_SUPERADMIN);
   const [q, setQ] = useState("");
   const [limit] = useState(50);
   const [offset, setOffset] = useState(0);
@@ -10276,6 +10326,7 @@ function BlocklistDetail({
             className="ml-auto flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
             onClick={() => refresh.mutate()}
             disabled={refresh.isPending}
+            {...blGate}
           >
             <RefreshCw className="h-3 w-3" />
             {refresh.isPending ? "Queuing…" : "Refresh from feed"}
@@ -10345,12 +10396,14 @@ function BlocklistDetail({
               className="flex-shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-accent"
               onClick={() => addEntry.mutate()}
               disabled={!newDomain}
+              {...blGate}
             >
               Add
             </button>
             <button
               className="flex-shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-accent"
               onClick={() => setShowBulk(true)}
+              {...blGate}
             >
               Bulk add
             </button>
@@ -10423,6 +10476,7 @@ function BlocklistDetail({
                             setEditEntryWildcard(e.is_wildcard);
                           }}
                           title="Edit domain"
+                          {...blGate}
                         >
                           <Pencil className="h-3 w-3" />
                         </button>
@@ -10435,6 +10489,7 @@ function BlocklistDetail({
                             ? "Remove entry"
                             : "Remove (will return on next feed refresh)"
                         }
+                        {...blGate}
                       >
                         <Trash2 className="h-3 w-3" />
                       </button>
@@ -10498,6 +10553,7 @@ function BlocklistDetail({
             className="flex-shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-accent"
             onClick={() => addException.mutate()}
             disabled={!excDomain}
+            {...blGate}
           >
             Add
           </button>
@@ -10536,6 +10592,7 @@ function BlocklistDetail({
                           setEditExcReason(ex.reason ?? "");
                         }}
                         title="Edit exception"
+                        {...blGate}
                       >
                         <Pencil className="h-3 w-3" />
                       </button>
@@ -10543,6 +10600,7 @@ function BlocklistDetail({
                         className="text-muted-foreground hover:text-destructive"
                         onClick={() => deleteException.mutate(ex.id)}
                         title="Remove exception"
+                        {...blGate}
                       >
                         <Trash2 className="h-3 w-3" />
                       </button>

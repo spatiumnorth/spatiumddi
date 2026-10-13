@@ -234,6 +234,7 @@ function recentlySeen(iso: string | null | undefined): boolean {
 
 function FirewallLogsSection() {
   const qc = useQueryClient();
+  const applianceGate = useApplianceAdminGate();
   const { data: enf } = useQuery({
     queryKey: ["firewall", "enforcement"],
     queryFn: firewallApi.getEnforcement,
@@ -338,8 +339,9 @@ function FirewallLogsSection() {
           type="button"
           onClick={() => setLogging.mutate(!loggingOn)}
           disabled={setLogging.isPending}
+          {...applianceGate}
           className={cn(
-            "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm",
+            "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-50",
             loggingOn
               ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
               : "bg-background hover:bg-accent",
@@ -1239,6 +1241,7 @@ function RuleEditorModal({
 
 function AliasesSection() {
   const qc = useQueryClient();
+  const applianceGate = useApplianceAdminGate();
   const { data: aliases, isLoading } = useQuery({
     queryKey: ["firewall", "aliases"],
     queryFn: firewallApi.listAliases,
@@ -1261,7 +1264,8 @@ function AliasesSection() {
         <button
           type="button"
           onClick={() => setShowNew(true)}
-          className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+          className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...applianceGate}
         >
           <Plus className="h-3.5 w-3.5" /> New alias
         </button>
@@ -1295,6 +1299,7 @@ function AliasesSection() {
                       disabled={a.is_builtin}
                       onClick={() => del.mutate(a.id)}
                       className="rounded-md border px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
+                      {...applianceGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

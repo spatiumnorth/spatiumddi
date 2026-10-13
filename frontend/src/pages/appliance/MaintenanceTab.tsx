@@ -8,7 +8,7 @@ import {
   Wrench,
 } from "lucide-react";
 
-import { applianceSystemApi } from "@/lib/api";
+import { applianceSystemApi, formatApiError } from "@/lib/api";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 
@@ -66,6 +66,16 @@ export function MaintenanceTab() {
           a host-side service with a 10-second grace.
         </p>
       </div>
+
+      {/* A refused toggle or reboot used to say nothing (#1342). */}
+      {(toggleMaint.isError || reboot.isError) && (
+        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+          {formatApiError(
+            toggleMaint.error ?? reboot.error,
+            "Maintenance action failed",
+          )}
+        </div>
+      )}
 
       {data?.reboot_scheduled && (
         <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-xs">

@@ -2396,7 +2396,10 @@ the formatter handles the rest.
   appliance, as its route does, and is otherwise disabled with the
   reason. The first-boot setup banner is shown only to a user who can
   finish setup, and Network & Host no longer says the firewall editor is
-  still to come.
+  still to come. The firewall log toggle and the aliases (New alias,
+  Delete) are gated the same way, and a refused Reboot host, pod action,
+  maintenance toggle or Reboot now shows the server's reason instead of
+  leaving the dialog or page as it was.
 
 - **Administration, Tools and the IPAM side pages offer a read-only user
   no write it would be refused (#1341).** The built-in Viewer was
@@ -2408,7 +2411,13 @@ the formatter handles the rest.
   filled in. Each control now asks what its route asks (a superadmin, or
   admin / write / delete on its resource type) and, denied, stays in
   place, disabled, with the reason as its tooltip. A role opens read-only
-  for a user who may not edit roles, as a built-in role already did.
+  for a user who may not edit roles, as a built-in role already did. The
+  same goes for the row and toolbar actions beside them: Alerts' Evaluate
+  now and Resolve, a firewall feed's Reveal and Rotate, the Domains bulk
+  refresh and bulk delete, New Devices' Add to allowlist, Block and the
+  allowlist editor, nmap and packet-capture Cancel / Stop and delete,
+  stamping an nmap scan's hosts into IPAM, and the Subnet Planner
+  editor's Save, Reopen and Apply.
 
 - **The Network and integration pages offer a read-only user no write it
   would be refused (#1340).** 26 of the 30 pages offered the built-in
@@ -2419,7 +2428,8 @@ the formatter handles the rest.
   Tailscale, UniFi, PAN-OS) with their rows' Test, Sync Now, Edit and
   Delete. Each control now asks what its router asks, as AV, BACnet,
   DICOM and OT already did: write (or delete) on the registry's own
-  resource type, or a superadmin for an integration.
+  resource type, or a superadmin for an integration. Dragging a site to a
+  new parent, which re-parents it as Move does, asks write on sites too.
 
 - **The DHCP page offers a read-only user no write it would be refused
   (#1339).** A user whose only role is the built-in Viewer was offered
@@ -2428,7 +2438,12 @@ the formatter handles the rest.
   Template, Block MAC, New Phone Profile and New Policy (with their rows'
   Edit and Delete), each refused only after the form was filled in. Every
   one of those routes takes a superadmin, and each control now says so:
-  disabled, with the reason as its tooltip, for any other user.
+  disabled, with the reason as its tooltip, for any other user. That
+  includes the server page's own Approve, Sync, Edit and Delete, a
+  group's scope rows, and the Windows failover relationship actions,
+  which a user who is not a superadmin no longer sees. Acknowledging a
+  rogue DHCP responder or router advertisement asks write on DHCP
+  servers, as its route does. A refused Resume now says why.
 
 - **The DNS page offers a read-only user no write it would be refused
   (#1338).** A user whose only role is the built-in Viewer was offered
@@ -2440,6 +2455,11 @@ the formatter handles the rest.
   blocking lists, TSIG keys and zones, and write (or delete) on a DNS
   resource type for records. A control the user may not use stays where
   it is, disabled, with the reason as its tooltip, as IPAM's do (#1155).
+  The records table's select-all and Delete selected, the group Records
+  tab's Edit and Delete, the server Options Save, a zone's certificate
+  auto-probe switch, blocking-list entries and exceptions, and the DNS
+  pools are gated the same way, and a refused record delete or Resume
+  now says why.
 
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`

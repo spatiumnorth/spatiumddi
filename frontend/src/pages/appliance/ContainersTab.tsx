@@ -89,6 +89,12 @@ export function ContainersTab() {
           {formatApiError(error)}
         </div>
       )}
+      {/* A refused Restart / Stop / Start used to say nothing (#1342). */}
+      {action.isError && (
+        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+          {formatApiError(action.error, "Pod action failed")}
+        </div>
+      )}
 
       {isLoading ? (
         <div className="py-12 text-center text-sm text-muted-foreground">

@@ -440,7 +440,7 @@ function SiteTreeRow({
     listeners,
     setNodeRef: dragRef,
     isDragging,
-  } = useDraggable({ id: site.id });
+  } = useDraggable({ id: site.id, disabled: !perms.can("write", "site") });
   const { setNodeRef: dropRef, isOver } = useDroppable({
     id: site.id,
     disabled: isBlocked,
@@ -469,7 +469,10 @@ function SiteTreeRow({
           {...listeners}
           {...attributes}
           title="Drag to re-parent"
-          className="cursor-grab rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground active:cursor-grabbing"
+          className="cursor-grab rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-40"
+          // Dropping re-parents the site: a PUT the router asks write on
+          // 'site' for, the same as the Move button.
+          {...writeGate}
         >
           <GripVertical className="h-3.5 w-3.5" />
         </button>

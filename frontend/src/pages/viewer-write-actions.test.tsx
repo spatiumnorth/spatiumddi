@@ -893,3 +893,103 @@ describe("#1342 the Appliance tabs", () => {
     }
   });
 });
+
+// ── Rows and toolbars the first pass left open ────────────────────────────────
+
+const FEED = {
+  id: "feed-1",
+  name: "viewer-feed",
+  description: "",
+  enabled: true,
+  kind: "ip",
+  poll_path: "/feeds/x/blocklist.txt",
+  last_polled_at: null,
+  last_polled_ip: null,
+  poll_count: 0,
+  created_at: "2026-10-01T00:00:00Z",
+  modified_at: "2026-10-01T00:00:00Z",
+};
+
+const CLOUD_ENDPOINT = {
+  id: "cloud-1",
+  name: "viewer-cloud",
+  description: "",
+  enabled: true,
+  provider: "aws",
+  credentials_present: true,
+  provider_config: {},
+  regions: [],
+  ipam_space_id: "space-1",
+  public_space_id: null,
+  dns_group_id: null,
+  mirror_load_balancers: false,
+  mirror_stopped_instances: false,
+  sync_interval_seconds: 300,
+  last_synced_at: null,
+  last_sync_error: null,
+  provider_account_id: null,
+  network_count: null,
+  instance_count: null,
+  last_discovery: null,
+  created_at: "2026-10-01T00:00:00Z",
+  modified_at: "2026-10-01T00:00:00Z",
+};
+
+describe("rows and toolbars the first pass left open", () => {
+  async function rowButtons(text: string) {
+    const row = (await screen.findByText(text)).closest("tr")!;
+    await permissionsLoaded();
+    return Array.from(row.querySelectorAll("button"));
+  }
+
+  it("offers a Viewer none of a firewall feed's row actions, Reveal and Rotate included", async () => {
+    signInAs(VIEWER);
+    answers.firewallFeedsApi = { list: async () => [FEED] };
+    await openPage(
+      "/security/firewall-feeds",
+      "firewall_feeds/FirewallFeedsPage",
+      "FirewallFeedsPage",
+    );
+    const buttons = await rowButtons("viewer-feed");
+    expect(buttons.length).toBeGreaterThanOrEqual(4);
+    for (const b of buttons) {
+      expect([b.title, b.disabled]).toEqual([SUPERADMIN, true]);
+    }
+  });
+
+  it("offers a superadmin a firewall feed's row actions", async () => {
+    signInAs("superadmin");
+    answers.firewallFeedsApi = { list: async () => [FEED] };
+    await openPage(
+      "/security/firewall-feeds",
+      "firewall_feeds/FirewallFeedsPage",
+      "FirewallFeedsPage",
+    );
+    for (const b of await rowButtons("viewer-feed")) {
+      expect(b.disabled, b.title).toBe(false);
+    }
+  });
+
+  it("offers a Viewer none of a cloud endpoint's row actions, Sync now included", async () => {
+    signInAs(VIEWER);
+    answers.cloudApi = { listEndpoints: async () => [CLOUD_ENDPOINT] };
+    await openPage("/cloud", "cloud/CloudPage", "CloudPage");
+    const buttons = await rowButtons("viewer-cloud");
+    expect(buttons.length).toBeGreaterThanOrEqual(4);
+    for (const b of buttons) {
+      expect([b.title, b.disabled]).toEqual([SUPERADMIN, true]);
+    }
+  });
+
+  it("offers a Viewer no alert evaluation", async () => {
+    signInAs(VIEWER);
+    answers.alertsApi = {
+      listRules: async () => [],
+      listEvents: async () => [],
+    };
+    await openPage("/admin/alerts", "admin/AlertsPage", "AlertsPage");
+    await screen.findByRole("button", { name: /Evaluate now/ });
+    await permissionsLoaded();
+    expectDenied([/Evaluate now/], SUPERADMIN);
+  });
+});

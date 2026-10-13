@@ -6,6 +6,7 @@ import { NmapScanForm } from "./NmapScanForm";
 import { NmapScanLiveViewer } from "./NmapScanLiveViewer";
 import { ConfirmDeleteScanModal } from "./ConfirmDeleteScanModal";
 import { humanTime } from "@/pages/network/_shared";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { History, Trash2 } from "lucide-react";
 
 export interface NmapScanModalProps {
@@ -87,6 +88,11 @@ function PastScans({
   onSelect: (s: NmapScanRead) => void;
 }) {
   const qc = useQueryClient();
+  // Cancel and delete take delete on 'manage_nmap_scans' (nmap/router.py).
+  const deleteGate = permissionGate(
+    usePermissions().can("delete", "manage_nmap_scans"),
+    "Requires delete permission on nmap scans",
+  );
   const [pendingDelete, setPendingDelete] = useState<NmapScanRead | null>(null);
   const { data, isLoading, isError } = useQuery({
     queryKey: ["nmap-scans", { ipAddressId, targetIp }],
@@ -169,6 +175,7 @@ function PastScans({
                     disabled={deleteMut.isPending}
                     onClick={() => setPendingDelete(s)}
                     className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
+                    {...deleteGate}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
