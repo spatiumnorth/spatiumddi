@@ -84,6 +84,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The docs site now says it tracks `main` (#1164).** Both Pages
+  sites publish `main`, so a reader on a release could not tell the
+  page might describe unreleased behaviour. Every page now carries a
+  banner naming that, linking the changelog and releases page. The
+  published copy also names the commit, date and latest release,
+  stamped into `_data/build.yml` by `docs-publish.yml`; the project
+  site and a local `jekyll build` get the generic form.
+
 - **Allocate IP offers only the statuses it can allocate with (#1422).**
   Its Type / Status menu offered `discovered`, but both of its requests
   ("Next available" and "Specific IP") accept only the operator-settable
