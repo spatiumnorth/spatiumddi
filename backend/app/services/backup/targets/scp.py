@@ -451,20 +451,54 @@ def _load_supplied_host_keys(client, known: str) -> None:
     the same host raised, was skipped too, and the server was refused
     as "not found in known_hosts" with the right key pinned (#1692).
     """
+    revoked: set[tuple[str, str]] = set()
+    pins: list[tuple[list[str], str, str]] = []
     for line in known.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+        parts = line.split()
+        marker = None
+        if parts and parts[0].startswith("@"):
+            marker, parts = parts[0], parts[1:]
+        if len(parts) < 3:
+            continue
+        hostfield, keytype, key_b64 = parts[0], parts[1], parts[2]
+        if marker == "@revoked":
+            revoked.add((keytype, key_b64))
+            continue
+        if marker is not None:
+            # ``@cert-authority`` pins a CA that signs host certificates,
+            # not a host key, and paramiko verifies no host certificates.
+            # Loading its key as a plain pin would trust a key OpenSSH
+            # treats as a CA, so the line is dropped: the host is refused
+            # unless it has a plain line of its own (fail closed).
+            continue
+        # The host field is a comma-separated pattern list (sshd(8),
+        # SSH_KNOWN_HOSTS FILE FORMAT): ``host,ip``, ``[host]:port``, or
+        # one hashed ``|1|salt|hash`` entry. paramiko's HostKeys.add takes
+        # ONE name, so each is added under its own (#1728). Wildcard and
+        # ``!`` negated patterns are dropped: this store compares names
+        # literally, so one could never match.
+        names = [
+            n
+            for n in hostfield.split(",")
+            if n and not n.startswith("!") and "*" not in n and "?" not in n
+        ]
+        if names:
+            pins.append((names, keytype, key_b64))
+    for names, keytype, key_b64 in pins:
+        # A key revoked anywhere in the file is refused everywhere, as
+        # OpenSSH does.
+        if (keytype, key_b64) in revoked:
+            continue
         try:
-            parts = line.split()
-            if len(parts) < 3:
-                continue
-            hostnames, keytype, key_b64 = parts[0], parts[1], parts[2]
             decoded = _decode_pubkey(keytype, key_b64)
             if decoded is None:
                 continue
-            client._host_keys.add(hostnames, keytype, decoded)  # noqa: SLF001
-        except Exception:  # noqa: BLE001
+            for name in names:
+                client._host_keys.add(name, keytype, decoded)  # noqa: SLF001
+        except Exception:  # noqa: BLE001 — a bad line pins nothing
             continue
 
 

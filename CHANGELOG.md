@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **SCP backup target: a `known_hosts` line naming its host as `host,ip`
+  was never matched (#1728).** The loader passed the whole host field to
+  paramiko as one name, so `sftp.example,192.0.2.10 ssh-ed25519 AAAA...`
+  (what OpenSSH before 8.5 wrote to `~/.ssh/known_hosts`) matched neither
+  name and Test connection answered "not found in known_hosts" with the
+  right key pinned. Each comma-separated name now finds the key. Fails
+  closed: `@cert-authority` lines pin nothing, a key listed `@revoked` is
+  refused wherever else it appears, and wildcard or `!` patterns (which
+  this store cannot honour) match nothing.
+
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and
