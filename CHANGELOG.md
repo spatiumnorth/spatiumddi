@@ -93,7 +93,12 @@ the formatter handles the rest.
   `delete` on `dhcp_static` has those rows skipped, each with a reason in the
   new `skipped_reasons` map (shown in the bulk dialog); a caller with it has
   the reservations removed on the server and audited, as the single delete
-  does. Other rows in the selection are still deleted.
+  does. Other rows in the selection are still deleted. Both paths (and the
+  orphan purge) now find the linked reservations and word the refusal through
+  one shared helper, so they cannot drift; the purge also catches a
+  reservation linked only from the row's `static_assignment_id` (#1628). As
+  in the single delete, the reservation push runs before any DNS teardown, and
+  a server refusing it aborts the whole request with 502.
 
 - **The PowerDNS agent stops serving zones wrong in three ways
   (#1520, #1521, #1522).** Pool member address deletes were applied

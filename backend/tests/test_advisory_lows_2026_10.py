@@ -444,3 +444,151 @@ async def test_bulk_delete_removes_the_reservation_for_a_dhcp_static_deleter(
         .all()
     )
     assert len(audits) == 1
+
+
+# ── #1714 validation: single and bulk delete agree, row for row ──────────────
+
+
+async def _single_delete(
+    client: AsyncClient, headers: dict[str, str], row_id: uuid.UUID, permanent: bool
+) -> tuple[int, str]:
+    r = await client.delete(
+        f"/api/v1/ipam/addresses/{row_id}?permanent={str(permanent).lower()}", headers=headers
+    )
+    return r.status_code, (r.json().get("detail", "") if r.content else "")
+
+
+async def _bulk_delete(
+    client: AsyncClient, headers: dict[str, str], row_id: uuid.UUID, permanent: bool
+) -> tuple[int, str]:
+    r = await client.post(
+        "/api/v1/ipam/addresses/bulk-delete",
+        headers=headers,
+        json={"ip_ids": [str(row_id)], "permanent": permanent},
+    )
+    assert r.status_code in (200, 502), r.text
+    if r.status_code == 502:
+        return 502, r.json()["detail"]
+    return r.json()["deleted_count"], r.json()["skipped_reasons"].get(str(row_id), "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_single_and_bulk_refuse_with_the_same_text(
+    client: AsyncClient, db_session: AsyncSession, permanent: bool
+) -> None:
+    _, headers = await _user_with_perms(db_session, _IPAM_WRITE)
+    row_id, _ = await _linked_row(db_session)
+
+    code, single_text = await _single_delete(client, headers, row_id, permanent)
+    assert code == 403
+    deleted, bulk_text = await _bulk_delete(client, headers, row_id, permanent)
+    assert deleted == 0
+    assert bulk_text == single_text and "dhcp_static" in bulk_text
+    assert len(await _statics(db_session)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["single", "bulk"])
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_single_and_bulk_leave_the_same_state_for_a_dhcp_static_deleter(
+    client: AsyncClient, db_session: AsyncSession, path: str, permanent: bool
+) -> None:
+    """Soft delete removes the reservation too, on both paths — the single
+    delete has always done so, and restoring an orphan does not re-create it."""
+    _, headers = await _user_with_perms(
+        db_session, [*_IPAM_WRITE, {"action": "delete", "resource_type": "dhcp_static"}]
+    )
+    row_id, _ = await _linked_row(db_session)
+    static_id = (await _statics(db_session))[0].id
+
+    if path == "single":
+        code, _ = await _single_delete(client, headers, row_id, permanent)
+        assert code == 204
+    else:
+        deleted, _ = await _bulk_delete(client, headers, row_id, permanent)
+        assert deleted == 1
+
+    assert await _statics(db_session) == []
+    row = await db_session.get(IPAddress, row_id)
+    if permanent:
+        assert row is None
+    else:
+        assert row is not None and row.status == "orphan"
+    audits = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.resource_type == "dhcp_static_assignment",
+                    AuditLog.resource_id == str(static_id),
+                    AuditLog.action == "delete",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(audits) == 1
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_finds_a_reservation_linked_only_from_the_row(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1628 back-link: the reservation's ``ip_address_id`` was never stamped,
+    only the row's ``static_assignment_id``. Both paths must still see it."""
+    _, headers = await _user_with_perms(db_session, _IPAM_WRITE)
+    row_id, _ = await _linked_row(db_session)
+    static = (await _statics(db_session))[0]
+    row = await db_session.get(IPAddress, row_id)
+    assert row is not None
+    row.static_assignment_id = static.id
+    static.ip_address_id = None
+    await db_session.commit()
+
+    code, _ = await _single_delete(client, headers, row_id, True)
+    assert code == 403
+    deleted, reason = await _bulk_delete(client, headers, row_id, True)
+    assert deleted == 0 and "dhcp_static" in reason
+    assert len(await _statics(db_session)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["single", "bulk"])
+async def test_a_failed_reservation_push_aborts_before_any_change(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    """A server refusing the reservation removal aborts the whole request
+    with 502 on both paths, before DNS teardown, leaving row and
+    reservation untouched."""
+    from app.api.v1.ipam import router as ipam_router
+    from app.services.dhcp.windows_writethrough import WindowsPushError
+
+    async def _refuse(db: AsyncSession, statics: object) -> None:
+        raise WindowsPushError("server said no")
+
+    dns_calls: list[str] = []
+
+    async def _record_dns(db: AsyncSession, ip: IPAddress, subnet: Subnet, **kw: object) -> None:
+        dns_calls.append(str(ip.address))
+
+    monkeypatch.setattr(ipam_router, "push_statics_bulk_delete", _refuse)
+    monkeypatch.setattr(ipam_router, "_sync_dns_record", _record_dns)
+
+    _, headers = await _user_with_perms(
+        db_session, [*_IPAM_WRITE, {"action": "delete", "resource_type": "dhcp_static"}]
+    )
+    row_id, _ = await _linked_row(db_session)
+
+    if path == "single":
+        code, detail = await _single_delete(client, headers, row_id, True)
+    else:
+        code, detail = await _bulk_delete(client, headers, row_id, True)
+    assert code == 502 and "server said no" in detail
+    assert dns_calls == []
+    assert len(await _statics(db_session)) == 1
+    row = await db_session.get(IPAddress, row_id)
+    assert row is not None and row.status == "static_dhcp"
