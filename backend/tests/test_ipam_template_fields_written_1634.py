@@ -106,3 +106,79 @@ async def test_force_lists_only_columns_that_changed(
     assert resp.status_code == 200, resp.text
     # ddns_ttl is already 120 and the other empty columns stay empty.
     assert resp.json()["fields_written"] == ["tags"]
+    await db_session.refresh(subnet)
+    # force still stamps: the changed column holds the template's value.
+    assert subnet.tags == {"a": "2"}
+    assert subnet.ddns_ttl == 120
+
+
+@pytest.mark.asyncio
+async def test_reapply_lists_nothing(client: AsyncClient, db_session: AsyncSession) -> None:
+    """A second apply of the same template changes nothing, so lists nothing."""
+    hdr = await _headers(db_session)
+    subnet = await _subnet(db_session, "10.83.0.0/24")
+    template = IPAMTemplate(
+        name=f"t-{uuid.uuid4().hex[:6]}",
+        applies_to="subnet",
+        ddns_enabled=True,
+        ddns_hostname_policy="always_generate",
+        ddns_ttl=120,
+    )
+    db_session.add(template)
+    await db_session.commit()
+
+    url = f"/api/v1/ipam/templates/{template.id}/apply"
+    first = await client.post(url, headers=hdr, json={"subnet_id": str(subnet.id)})
+    assert first.status_code == 200, first.text
+    # The issue's case: a default (inheriting) subnet. Only DDNS columns the
+    # template sets, plus the #1421 inheritance lock, are listed.
+    assert first.json()["fields_written"] == [
+        "ddns_enabled",
+        "ddns_hostname_policy",
+        "ddns_ttl",
+        "ddns_inherit_settings",
+    ]
+
+    second = await client.post(url, headers=hdr, json={"subnet_id": str(subnet.id)})
+    assert second.status_code == 200, second.text
+    assert second.json()["fields_written"] == []
+
+    forced = await client.post(url, headers=hdr, json={"subnet_id": str(subnet.id), "force": True})
+    assert forced.status_code == 200, forced.text
+    assert forced.json()["fields_written"] == []
+
+
+@pytest.mark.asyncio
+async def test_block_apply_lists_only_changed_columns(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    hdr = await _headers(db_session)
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    # An empty-string override is the same "unset" as None to every reader
+    # (resolve_effective_ddns, _resolve_override_zone_id), so force writing
+    # the template's None over it is not a change worth listing.
+    block = IPBlock(
+        space_id=space.id,
+        network="10.84.0.0/16",
+        name="b",
+        ddns_inherit_settings=False,
+        ddns_domain_override="",
+    )
+    db_session.add(block)
+    template = IPAMTemplate(
+        name=f"t-{uuid.uuid4().hex[:6]}",
+        applies_to="block",
+        custom_fields={"owner": "net"},
+    )
+    db_session.add(template)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/ipam/templates/{template.id}/apply",
+        headers=hdr,
+        json={"block_id": str(block.id), "force": True},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["fields_written"] == ["custom_fields"]
