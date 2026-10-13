@@ -84,6 +84,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The docs site now says it tracks `main` (#1164).** Both Pages
+  sites publish `main`, so a reader on a release could not tell the
+  page might describe unreleased behaviour. Every page now carries a
+  banner naming that, linking the changelog and releases page. The
+  published copy also names the commit, date and latest release,
+  stamped into `_data/build.yml` by `docs-publish.yml`; the project
+  site and a local `jekyll build` get the generic form.
+
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and
