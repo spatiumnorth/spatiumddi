@@ -1624,6 +1624,29 @@ DNSSEC_ALGORITHMS: frozenset[str] = frozenset(
     }
 )
 
+# IANA DNS Security Algorithm Numbers → mnemonic. ``DNSKey.algorithm`` stores
+# the number (#1812); the mnemonic is derived for display, never stored.
+DNSSEC_ALGORITHM_NAMES: dict[int, str] = {
+    1: "RSAMD5",
+    3: "DSA",
+    5: "RSASHA1",
+    6: "DSA-NSEC3-SHA1",
+    7: "RSASHA1-NSEC3-SHA1",
+    8: "RSASHA256",
+    10: "RSASHA512",
+    12: "ECC-GOST",
+    13: "ECDSAP256SHA256",
+    14: "ECDSAP384SHA384",
+    15: "ED25519",
+    16: "ED448",
+}
+
+
+def dnssec_algorithm_name(algorithm: int | None) -> str | None:
+    """IANA mnemonic for a DNSSEC algorithm number, or None when unknown."""
+    return None if algorithm is None else DNSSEC_ALGORITHM_NAMES.get(algorithm)
+
+
 # Per-key lifecycle states BIND reports via ``rndc dnssec -status`` (the
 # RFC 7583 key-timing "states"). Stored verbatim on DNSKey.state.
 DNSKEY_STATES: frozenset[str] = frozenset(

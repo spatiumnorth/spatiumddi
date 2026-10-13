@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **`GET .../zones/{id}/dnssec/info` no longer 500s once an agent has
+  reported keys (#1812).** `DNSKey.algorithm` is the IANA number (13 =
+  ECDSAP256SHA256) but the response model typed it `str`, which Pydantic
+  does not coerce, so the endpoint failed for every signed zone with
+  reported keys. `algorithm` is now an integer and the new
+  `algorithm_name` carries the mnemonic (null for an unknown number); the
+  `find_zone_dnssec_info` Copilot tool gains the same field and the zone
+  DNSSEC card shows `ECDSAP256SHA256 (13)`.
+
 - **The PowerDNS agent stops serving zones wrong in three ways
   (#1520, #1521, #1522).** Pool member address deletes were applied
   as no-ops and acked ok — the record-op fallback ignored the rrset

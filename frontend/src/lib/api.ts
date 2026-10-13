@@ -5932,7 +5932,10 @@ export interface PropagationCheckResult {
 export interface DNSKeyState {
   key_tag: number;
   key_type: "ksk" | "zsk" | "csk";
+  /** IANA DNSSEC algorithm number (13 = ECDSAP256SHA256). */
   algorithm: number;
+  /** IANA mnemonic; null for a number the server does not know. */
+  algorithm_name?: string | null;
   state: string;
   ds_records: string[];
   timing?: Record<string, string>;
