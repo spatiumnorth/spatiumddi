@@ -1212,7 +1212,7 @@ Every DNS server group has a **Sync with Servers** button on its detail header. 
 
 The UI surfaces per-server results with zones-imported / zones-pushed / errors, plus a per-zone table.
 
-**Each zone is synced with the server being walked (#1697).** The per-zone sync reads and writes the server named on that row, not the zone's primary, so a server whose API or transfer is unreachable shows its zones as failed instead of repeating the primary's result. (The per-zone *Sync with server* button on a zone still syncs with the zone's primary.)
+**Each zone is synced with the server being walked (#1697).** The per-zone sync reads and writes the server named on that row, not the zone's primary, so a server whose API or transfer is unreachable shows its zones as failed instead of repeating the primary's result. The single-server sync (`POST /dns/groups/{gid}/servers/{sid}/sync-from-server`) runs the same loop, so it now syncs with that server too. The per-zone *Sync with server* button on a zone, and the scheduled pull, still sync with the zone's primary.
 
 **Technitium's own apex NS is not imported (#1696, #1809).** The agentless `technitium_api` pull returns the NS Technitium writes at the apex of every primary zone it creates; Sync leaves it out and drift does not list it as extra. An apex NS the zone really holds in SpatiumDDI is still compared like any other record, and an NS below the apex (a delegation) is always handled normally.
 

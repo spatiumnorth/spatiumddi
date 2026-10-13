@@ -18,6 +18,7 @@ from app.drivers.dns.base import RecordChangeResult, RecordData
 from app.drivers.dns.technitium_api import TechnitiumAPIDriver
 from app.models.dns import DNSRecord, DNSZone
 from app.services.dns.pull_from_server import _additive_push
+from app.services.technitium.rdata import record_params
 
 _ZONE = "example.com."
 
@@ -37,16 +38,20 @@ class _FakeTechnitium:
     """The one Technitium rule that matters: ``overwrite=true`` clears the
     RRset at (domain, type) before the write."""
 
+    _NOT_RDATA = {"domain", "zone", "type", "ttl", "overwrite"}
+
     def __init__(self) -> None:
-        self.rrsets: dict[tuple[str, str], list[str]] = {}
+        # (domain, type) -> the rdata params of each member, as sent.
+        self.rrsets: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
     async def call(self, client: Any, path: str, what: str, params: dict[str, Any]) -> Any:
         assert path == "zones/records/add"
         key = (params["domain"], params["type"])
-        value = params["ipAddress"]
         if params["overwrite"] == "true":
             self.rrsets[key] = []
-        self.rrsets.setdefault(key, []).append(str(value))
+        self.rrsets.setdefault(key, []).append(
+            {k: v for k, v in params.items() if k not in self._NOT_RDATA}
+        )
         return {}
 
 
@@ -73,7 +78,7 @@ class _ViaApiDriver:
         )
 
     def capabilities(self) -> dict[str, Any]:
-        return {"record_types": ["A"]}
+        return {"record_types": ["A", "TXT"]}
 
     async def apply_record_changes(self, server: Any, changes: list[Any]) -> list[Any]:
         out = []
@@ -91,28 +96,46 @@ class _Ctx:
         return False
 
 
+@pytest.mark.parametrize(
+    ("rtype", "values"),
+    [
+        ("A", ["192.0.2.1", "192.0.2.2"]),
+        # The issue's own shape: two TXT strings at one name.
+        ("TXT", ['"qa1613 one"', '"qa1613 two"']),
+    ],
+)
 async def test_two_missing_records_at_one_name_both_land_and_stay(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, rtype: str, values: list[str]
 ) -> None:
     zone = _zone()
-    one = _row(zone, "qa", "A", "192.0.2.1")
-    two = _row(zone, "qa", "A", "192.0.2.2")
+    rows = [_row(zone, "qa", rtype, v) for v in values]
     daemon = _FakeTechnitium()
     driver = _ViaApiDriver(daemon, monkeypatch)
     server = SimpleNamespace(id=uuid.uuid4(), driver="technitium_api")
 
+    def _sent(value: str) -> dict[str, Any]:
+        return record_params(rtype, value, origin=_ZONE.rstrip("."))
+
+    # The daemon holds rdata params; read them back as the values they encode.
+    by_params = {repr(sorted(_sent(v).items())): v for v in values}
+
     for _ in range(3):
+        served = daemon.rrsets.get(("qa.example.com", rtype), [])
         wire = [
-            RecordData(name="qa", record_type="A", value=v, ttl=300)
-            for v in daemon.rrsets.get(("qa.example.com", "A"), [])
+            RecordData(
+                name="qa", record_type=rtype, value=by_params[repr(sorted(p.items()))], ttl=300
+            )
+            for p in served
         ]
         await _additive_push(
-            _Session([one, two]),  # type: ignore[arg-type]
+            _Session(rows),  # type: ignore[arg-type]
             server,
             driver,
             zone,
             wire,
-            [one, two],
+            rows,
             apply=True,
         )
-        assert sorted(daemon.rrsets[("qa.example.com", "A")]) == ["192.0.2.1", "192.0.2.2"]
+        assert sorted(
+            by_params[repr(sorted(p.items()))] for p in daemon.rrsets[("qa.example.com", rtype)]
+        ) == sorted(values)

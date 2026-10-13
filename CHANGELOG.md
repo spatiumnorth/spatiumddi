@@ -89,7 +89,7 @@ the formatter handles the rest.
   no server, which resolved the zone's primary every time, so an
   unreachable server was listed as succeeded with the primary's counts
   and a secondary was never compared. The zone sync now takes the server
-  being walked.
+  being walked, which also fixes the single-server Sync on a server row.
 - **Technitium's own apex NS is no longer imported by Sync or listed by
   drift (#1696, #1809).** The `technitium_api` pull returned the NS
   Technitium writes at every new primary zone's apex, so the first Sync
@@ -102,8 +102,10 @@ the formatter handles the rest.
   the child's own RRset. The agent now skips such a record, in the
   structural render and in record ops, and logs
   `technitium_record_shadowed_by_child_zone`; the child's own value is
-  served and any copy the parent's record left in the child is removed
-  by the child's next reconcile.
+  served, as on BIND9, and any copy the parent's record left in the child
+  is removed by the child's next reconcile. A record at the child's apex
+  (a delegation NS) is still written: Technitium keeps the parent's side
+  of the cut apart.
 - **Regression guard for #1695.** Two records of one type at one name,
   both missing from a `technitium_api` server, are both put back by Sync
   and stay: each pushed change carries the complete desired set (since

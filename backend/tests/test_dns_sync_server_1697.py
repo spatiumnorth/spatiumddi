@@ -11,9 +11,12 @@ import uuid
 from typing import Any
 
 import pytest
+from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import create_access_token, hash_password
 from app.drivers.dns.base import RecordChangeResult, RecordData
+from app.models.auth import User
 from app.models.dns import DNSServer, DNSServerGroup, DNSZone
 from app.services.dns import pull_from_server as pfs
 from app.services.dns.pull_from_server import sync_zone_with_server
@@ -81,3 +84,61 @@ async def test_sync_zone_with_a_named_server_reads_that_server(
     with pytest.raises(RuntimeError, match="connection refused"):
         await sync_zone_with_server(db_session, zone, apply=False, server=down)
     assert fake.pulled_from == ["down"]
+
+
+async def _admin_headers(db: AsyncSession) -> dict[str, str]:
+    user = User(
+        username=f"u-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        display_name="Test",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db.add(user)
+    await db.flush()
+    return {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+
+async def test_group_sync_reports_each_servers_own_result(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The issue's reproduction, through the endpoint: the server whose API
+    is down is listed with the zone failed, not with the primary's counts."""
+    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add(group)
+    await db_session.flush()
+    for name, primary in (("primary", True), ("down", False)):
+        db_session.add(
+            DNSServer(
+                group_id=group.id,
+                name=name,
+                driver="technitium_api",
+                host=f"{name}.example.net",
+                port=53,
+                is_enabled=True,
+                is_primary=primary,
+            )
+        )
+    db_session.add(DNSZone(group_id=group.id, name=_ZONE, zone_type="primary", kind="forward"))
+    headers = await _admin_headers(db_session)
+    await db_session.commit()
+
+    fake = _PerServerDriver()
+    monkeypatch.setattr(pfs, "get_driver", lambda name: fake)
+
+    resp = await client.post(
+        f"/api/v1/dns/groups/{group.id}/sync-with-servers",
+        params={"import_new_zones": "false"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    by_server = {i["server_name"]: i["result"] for i in resp.json()["items"]}
+    assert sorted(fake.pulled_from) == ["down", "primary"]
+
+    (down_zone,) = by_server["down"]["items"]
+    assert "connection refused" in (down_zone["error"] or "")
+    assert by_server["down"]["zones_succeeded"] == 0
+
+    (primary_zone,) = by_server["primary"]["items"]
+    assert primary_zone["error"] is None
+    assert primary_zone["imported"] == 1
