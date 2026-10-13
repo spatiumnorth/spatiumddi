@@ -104,6 +104,10 @@ the formatter handles the rest.
   `technitium_record_shadowed_by_child_zone`; the child's own value is
   served and any copy the parent's record left in the child is removed
   by the child's next reconcile.
+- **Regression guard for #1695.** Two records of one type at one name,
+  both missing from a `technitium_api` server, are both put back by Sync
+  and stay: each pushed change carries the complete desired set (since
+  #1760), which the driver replays with only member 0 overwriting.
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and
