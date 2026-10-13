@@ -174,3 +174,79 @@ async def test_the_restore_drill_reports_a_damaged_archive_as_unreadable(
     assert outcome.state == "failed"
     assert readable.status == drill_mod.FAIL
     assert readable.detail.startswith("archive is malformed: "), readable.detail
+
+
+# ── The issue's own damage, and a sweep around it ───────────────────────────
+
+
+def _flip(archive: bytes, member: str, at: int, length: int = 16) -> bytes:
+    """Invert ``length`` bytes of ``member``'s compressed data, ``at`` bytes
+    in: the issue's "16 bytes flipped 16 bytes into database.dump's
+    compressed bytes"."""
+    buf = bytearray(archive)
+    start = _data_offset(archive, member) + at
+    for i in range(start, start + length):
+        buf[i] ^= 0xFF
+    return bytes(buf)
+
+
+def _raw_read_error(archive: bytes, member: str) -> type[BaseException] | None:
+    """What zipfile itself raises reading ``member``, before our handling."""
+    try:
+        zipfile.ZipFile(io.BytesIO(archive)).read(member)
+    except Exception as exc:  # noqa: BLE001 — the type is the answer
+        return type(exc)
+    return None
+
+
+@pytest.mark.asyncio
+async def test_restore_answers_400_for_the_issues_flipped_bytes(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The exact damage the issue reproduced live: 16 bytes inverted 16 bytes
+    into the dump's deflate stream. zipfile raises ``zlib.error`` for it (the
+    precondition proves the archive really reaches the decompression error
+    rather than the CRC check), and the restore answers 400 with the reason."""
+    import zlib
+
+    damaged = _flip(_archive(), "database.dump", 16)
+    assert _raw_read_error(damaged, "database.dump") is zlib.error
+
+    admin = User(
+        username=f"bk-{uuid.uuid4().hex[:6]}",
+        email=f"{uuid.uuid4().hex[:6]}@example.test",
+        display_name="bk",
+        hashed_password=hash_password("x" * 12),
+        is_superadmin=True,
+    )
+    db_session.add(admin)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/backup/restore",
+        headers={"Authorization": f"Bearer {create_access_token(str(admin.id))}"},
+        files={"archive": ("backup.zip", damaged, "application/zip")},
+        data={"passphrase": "not-the-passphrase", "confirmation_phrase": "RESTORE-FROM-BACKUP"},
+    )
+
+    assert resp.status_code == 400, resp.text
+    detail = resp.json()["detail"]
+    assert detail.startswith("archive is malformed: "), detail
+    assert "decompressing" in detail, detail
+
+
+def test_no_damage_in_the_dumps_deflate_stream_escapes_as_anything_but_malformed() -> None:
+    """Every 16-byte inversion across the first 400 bytes of the dump's
+    deflate stream is refused as malformed. The sweep is only meaningful if it
+    reaches the decompression error, so it also asserts zipfile raised
+    ``zlib.error`` for some of them (on the base those all escaped)."""
+    import zlib
+
+    archive = _archive()
+    raw: set[type[BaseException] | None] = set()
+    for at in range(400):
+        damaged = _flip(archive, "database.dump", at)
+        raw.add(_raw_read_error(damaged, "database.dump"))
+        with pytest.raises(BackupArchiveError, match="^archive is malformed: "):
+            extract_archive_members(damaged)
+    assert zlib.error in raw
