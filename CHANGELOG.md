@@ -84,6 +84,45 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The BIND9 agent now renders `allow-recursion` (#1786).** The
+  group's `allow_recursion` was stored and shipped in the bundle but
+  never written to `named.conf`. An explicit list now renders in
+  `options {}` (named ACLs resolve to the `acl {}` blocks from #899;
+  the API validates the entries like `allow_query`). The agent drops
+  any stored element `named-checkconf` would refuse, including an ACL
+  that no longer exists, and renders `none` if nothing survives, so one
+  bad element cannot stop the group converging and a broken
+  restriction fails closed. An ACL cited by the server options can no
+  longer be deleted or renamed. **What the default means:** the stored
+  default `["any"]`, an empty list, and recursion off render no
+  `allow-recursion` line. BIND then derives recursion from
+  `allow-query`, which the agent always renders (default `any`), so a
+  default recursive BIND9 group is an open resolver, as it has been
+  all along (the issue's "BIND ran `localnets; localhost;`" was wrong;
+  verified against BIND 9.20). This change keeps that, rather than cut
+  off resolvers serving routed clients; set `allow_recursion` or
+  `allow_query` to restrict it. Technitium maps the same default to
+  private networks only (#1761), so the two engines differ on it. The
+  bundle change is renderer revision 9. Every BIND9 group's etag shifts
+  once on upgrade (one re-apply); `named.conf` is byte-identical unless
+  `allow_recursion` is explicit.
+
+- **A rolling upgrade whose own cleanup fails now raises a distinct
+  alert (#1542).** When an upgrade fails after cordoning a node, the
+  orchestrator uncordons it and clears the CNPG maintenance window; if
+  that release itself fails the node stays held and an operator must
+  act, but the alert was the same as any other failed step. The
+  existing `cluster-upgrade-failed` event now carries category
+  `release_failed`, names what is still held (`cordon`,
+  `maintenance_window`) in its message and `stuck` detail, and the
+  per-node progress records `release_failed` with the error, what is
+  held and the step's own category. The Cluster upgrade tab labels the
+  node "Release failed — node held" and lists what is still held. The
+  run still stops. No new rule or migration: the rule is already
+  critical, the highest severity.
+
+- **A new Technitium zone is no longer served under the daemon's default SOA (#1758).** `zones/create` takes no SOA, so a Primary created by the agent answered with Technitium's default (`hostadmin@<zone>`, TTL and minimum 900 s, which is the negative-cache TTL) until its own SOA and records landed: 8-11 s after a group move or any fresh agent start. A resolver could cache an NXDOMAIN from that window for up to 15 minutes. The agent now holds a Primary straight after creating it, or converting a Forwarder into one, by setting its `queryAccess` to `Deny`, and applies the zone's real options, query access included, once its records and apex SOA/NS are reconciled. A held zone answers REFUSED, which no resolver caches. It is deliberately not disabled: a disabled zone is not authoritative, so on a group that allows recursion the query is resolved upstream instead, giving `corp.lan` the root's NXDOMAIN (negative TTL one day) and an internal copy of a public zone its public answers. A zone that already exists is never held, so a second pass still writes nothing. If the agent dies before the release, or the release is refused, the zone is remembered in `technitium-zones-held.json` in the agent state dir and released on the next pass.
+
 - **The PowerDNS agent stops serving zones wrong in three ways
   (#1520, #1521, #1522).** Pool member address deletes were applied
   as no-ops and acked ok — the record-op fallback ignored the rrset
@@ -144,29 +183,6 @@ the formatter handles the rest.
   label selector that matches no Deployment, or a list call refused
   for missing RBAC, fails the step at once instead of turning the
   gate off.
-
-- **The BIND9 agent now renders `allow-recursion` (#1786).** The
-  group's `allow_recursion` was stored and shipped in the bundle but
-  never written to `named.conf`. An explicit list now renders in
-  `options {}` (named ACLs resolve to the `acl {}` blocks from #899;
-  the API validates the entries like `allow_query`). The agent drops
-  any stored element `named-checkconf` would refuse, including an ACL
-  that no longer exists, and renders `none` if nothing survives, so one
-  bad element cannot stop the group converging and a broken
-  restriction fails closed. An ACL cited by the server options can no
-  longer be deleted or renamed. **What the default means:** the stored
-  default `["any"]`, an empty list, and recursion off render no
-  `allow-recursion` line. BIND then derives recursion from
-  `allow-query`, which the agent always renders (default `any`), so a
-  default recursive BIND9 group is an open resolver, as it has been
-  all along (the issue's "BIND ran `localnets; localhost;`" was wrong;
-  verified against BIND 9.20). This change keeps that, rather than cut
-  off resolvers serving routed clients; set `allow_recursion` or
-  `allow_query` to restrict it. Technitium maps the same default to
-  private networks only (#1761), so the two engines differ on it. The
-  bundle change is renderer revision 9. Every BIND9 group's etag shifts
-  once on upgrade (one re-apply); `named.conf` is byte-identical unless
-  `allow_recursion` is explicit.
 
 - **DNSSEC is refused on a multi-server group, and the DS report is group-scoped (#1762).** Each agent server (BIND9, PowerDNS, Technitium) signs with keys it generated, so a signed zone on a group with two servers was served with two DNSKEY sets against one published DS, and validating resolvers got SERVFAIL from whichever server it did not match. Signing (the sign endpoint, `dnssec_enabled` on zone create and update, and both Copilot paths) now returns 422 when the group has more than one agent server. Adding or moving a server into a group that holds signed zones is refused too: server create, server move, a Fleet group change, and the Copilot `assign_appliance_role`. So is moving a signed zone into a multi-server group. **Disabled servers count**: a disabled agent still receives the bundle, so a disabled BIND9 server still signs with its own keys, and a disabled PowerDNS or Technitium server serves the zone unsigned under the DS. These checks lock the group row, so two concurrent requests cannot both pass. An agent that auto-registers into a signed group is not refused, because refusing would break its bootstrap. Instead it is logged and audited, and it trips the same flag as zones signed before this fix: `dnssec_multi_signer` on the zone and on `…/dnssec/info`, a red **DNSSEC: multiple signers** badge and a warning on the DNSSEC card, and a new default-on, critical `dnssec_multi_signer` alert. Those zones are not unsigned automatically. `/dns/agents/dnssec-state` now matches zones only within the reporting server's group, so same-named zones in different groups no longer collide. On a multi-server group it keeps one server's report (the primary's, or the oldest signer's when the group has no primary), which ends the last-writer-wins DS flapping.
 
