@@ -407,7 +407,7 @@ export function AsnsPage() {
               <Building2 className="h-5 w-5 text-muted-foreground" />
               <h1 className="text-lg font-semibold">ASNs</h1>
               <span className="text-xs text-muted-foreground">
-                {total} ASN{total === 1 ? "" : "s"}
+                {listError ? "—" : `${total} ASN${total === 1 ? "" : "s"}`}
                 {selected.size > 0 && (
                   <span className="ml-2 text-primary">
                     {selected.size} selected

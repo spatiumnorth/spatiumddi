@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
+import { pollUnlessRefused } from "@/lib/refusal";
 import {
   Check,
   Cloud,
@@ -115,7 +116,7 @@ export function CloudPage() {
   } = useQuery({
     queryKey: ["cloud-endpoints"],
     queryFn: cloudApi.listEndpoints,
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
 
   const [showCreate, setShowCreate] = useState(false);

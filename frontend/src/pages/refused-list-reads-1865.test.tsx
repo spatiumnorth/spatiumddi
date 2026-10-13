@@ -91,13 +91,24 @@ afterEach(() => {
   for (const fn of Object.values(lists)) fn.mockReset();
 });
 
-const REFUSED = [
+// `count` is the page's row counter where it has one: a refused read is not
+// "0 total" any more than it is "No VRFs yet." (the QA check names both).
+const REFUSED: {
+  name: string;
+  page: () => ReactNode;
+  fn: (typeof lists)[keyof typeof lists];
+  what: RegExp;
+  empty: RegExp;
+  count?: RegExp;
+  none: unknown;
+}[] = [
   {
     name: "Audit Log",
     page: () => <AuditPage />,
     fn: lists.audit,
     what: /the audit log/,
     empty: /No audit events found/,
+    count: /0 events/,
     none: { items: [], total: 0 },
   },
   {
@@ -114,6 +125,7 @@ const REFUSED = [
     fn: lists.vrfs,
     what: /VRFs/,
     empty: /No VRFs yet/,
+    count: /0 total/,
     none: [],
   },
   {
@@ -146,6 +158,7 @@ const REFUSED = [
     fn: lists.asns,
     what: /ASNs/,
     empty: /No ASNs tracked yet/,
+    count: /0 ASNs/,
     none: { items: [], total: 0 },
   },
   {
@@ -167,6 +180,7 @@ describe("a refused list read says so instead of showing the empty state", () =>
         new RegExp(`You don't have permission to see ${c.what.source}`),
       );
       expect(screen.queryByText(c.empty)).toBeNull();
+      if (c.count) expect(screen.queryByText(c.count)).toBeNull();
     });
   }
 });
@@ -178,6 +192,17 @@ describe("a list that really is empty still says so (control)", () => {
       show(c.page());
       await screen.findByText(c.empty);
       expect(screen.queryByText(/permission to see/)).toBeNull();
+      if (c.count) expect(screen.getByText(c.count)).toBeTruthy();
     });
   }
+});
+
+it("Audit Log offers no PDF export to a reader refused the log", async () => {
+  lists.audit.mockRejectedValue(refusal("Permission denied: need 'read'"));
+  show(<AuditPage />);
+  await screen.findByText(/You don't have permission to see the audit log/);
+  expect(
+    (screen.getByRole("button", { name: /Export PDF/ }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(true);
 });

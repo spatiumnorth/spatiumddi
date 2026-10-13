@@ -514,7 +514,7 @@ export function VRFsPage() {
           <RouteIcon className="h-5 w-5 text-muted-foreground" />
           <h1 className="text-base font-semibold">VRFs</h1>
           <span className="text-xs text-muted-foreground">
-            {vrfs.length} total
+            {listError ? "—" : `${vrfs.length} total`}
             {selected.size > 0 && (
               <span className="ml-2 text-primary">
                 {selected.size} selected

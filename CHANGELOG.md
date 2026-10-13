@@ -95,8 +95,11 @@ the formatter handles the rest.
   rows. They now share one `ListEmpty` wrapper around the empty copy
   that shows "You don't have permission to see ..." for a refusal and
   "Couldn't load ..." for any other failure. Requests also no longer
-  invites a user who cannot submit to ask for an IP, and its poll and
-  Nmap's stop once refused.
+  invites a user who cannot submit to ask for an IP, and its poll,
+  Nmap's and the Cloud page's stop once refused. The row counters that
+  sat over those lists ("0 events", "0 total", "0 ASNs") read "—" when
+  the read was refused, and Audit Log's Export PDF, which needs the same
+  grant, is disabled.
 
 - **The app shell stops asking routes its user cannot read (#1864).**
   The maintenance banner (every 15 s), the first-boot setup banner and
