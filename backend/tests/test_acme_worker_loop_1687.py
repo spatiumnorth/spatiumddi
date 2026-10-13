@@ -188,7 +188,7 @@ async def test_dns01_solve_waits_for_the_agents_in_a_used_worker(
         async with task_session() as db:
             acks = asyncio.create_task(_agent_acks())
             handle = await dns01.solve(db, "host.example.test", "token-1687")
-            await acks
+            await asyncio.wait_for(acks, timeout=30)
             await dns01.cleanup(db, handle)
 
     with patch.object(dns01, "publish_wake", new=AsyncMock()):
