@@ -46,9 +46,12 @@ from app.core.dns_names import (
 )
 from app.core.permissions import (
     _token_grants_for,
+    is_effective_superadmin,
     require_any_resource_permission,
+    require_permission,
     token_scope_allows,
     token_scoped_resource_ids,
+    user_has_permission,
 )
 from app.core.responses import DnsZoneResponse, ZipResponse
 from app.core.update_nulls import resolve_update_changes
@@ -4118,9 +4121,14 @@ async def list_acls(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSAcl]
     return list(result.scalars().all())
 
 
-@router.post("/groups/{group_id}/acls", response_model=AclResponse, status_code=201)
+@router.post(
+    "/groups/{group_id}/acls",
+    response_model=AclResponse,
+    status_code=201,
+    dependencies=[Depends(require_permission("write", "dns_group"))],
+)
 async def create_acl(
-    group_id: uuid.UUID, body: AclCreate, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID, body: AclCreate, db: DB, current_user: CurrentUser
 ) -> DNSAcl:
     await _require_group(group_id, db)
 
@@ -4172,13 +4180,17 @@ async def create_acl(
     return await _load_acl(group_id, acl.id, db)  # type: ignore[return-value]
 
 
-@router.put("/groups/{group_id}/acls/{acl_id}", response_model=AclResponse)
+@router.put(
+    "/groups/{group_id}/acls/{acl_id}",
+    response_model=AclResponse,
+    dependencies=[Depends(require_permission("write", "dns_group"))],
+)
 async def update_acl(
     group_id: uuid.UUID,
     acl_id: uuid.UUID,
     body: AclUpdate,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> DNSAcl:
     acl = await _require_acl(group_id, acl_id, db)
     # Exclude this ACL from the citable set: an entry naming its own ACL is
@@ -4239,9 +4251,13 @@ async def update_acl(
     return await _load_acl(group_id, acl_id, db)  # type: ignore[return-value]
 
 
-@router.delete("/groups/{group_id}/acls/{acl_id}", status_code=204)
+@router.delete(
+    "/groups/{group_id}/acls/{acl_id}",
+    status_code=204,
+    dependencies=[Depends(require_permission("delete", "dns_group"))],
+)
 async def delete_acl(
-    group_id: uuid.UUID, acl_id: uuid.UUID, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID, acl_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> None:
     acl = await _require_acl(group_id, acl_id, db)
     await _assert_acl_is_unreferenced(group_id, acl, db, action="delete")
@@ -4620,9 +4636,14 @@ async def _validated_view_fields(
     return changes
 
 
-@router.post("/groups/{group_id}/views", response_model=ViewResponse, status_code=201)
+@router.post(
+    "/groups/{group_id}/views",
+    response_model=ViewResponse,
+    status_code=201,
+    dependencies=[Depends(require_permission("write", "dns_group"))],
+)
 async def create_view(
-    group_id: uuid.UUID, body: ViewCreate, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID, body: ViewCreate, db: DB, current_user: CurrentUser
 ) -> DNSView:
     await _require_group(group_id, db)
     payload = body.model_dump()
@@ -4659,13 +4680,17 @@ async def create_view(
     return view
 
 
-@router.put("/groups/{group_id}/views/{view_id}", response_model=ViewResponse)
+@router.put(
+    "/groups/{group_id}/views/{view_id}",
+    response_model=ViewResponse,
+    dependencies=[Depends(require_permission("write", "dns_group"))],
+)
 async def update_view(
     group_id: uuid.UUID,
     view_id: uuid.UUID,
     body: ViewUpdate,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> DNSView:
     view = await _require_view(group_id, view_id, db)
     # #1563 — explicit null clears allow_query / allow_query_cache (null
@@ -4704,9 +4729,13 @@ async def update_view(
     return view
 
 
-@router.delete("/groups/{group_id}/views/{view_id}", status_code=204)
+@router.delete(
+    "/groups/{group_id}/views/{view_id}",
+    status_code=204,
+    dependencies=[Depends(require_permission("delete", "dns_group"))],
+)
 async def delete_view(
-    group_id: uuid.UUID, view_id: uuid.UUID, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID, view_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> None:
     view = await _require_view(group_id, view_id, db)
     db.add(
@@ -4796,11 +4825,17 @@ async def _enforce_technitium_api_zone_scope(
     technitium_api_scope.refuse_unapplied_zone_changes(changes, current)
 
 
-@router.post("/groups/{group_id}/zones", response_model=ZoneResponse, status_code=201)
+@router.post(
+    "/groups/{group_id}/zones",
+    response_model=ZoneResponse,
+    status_code=201,
+    dependencies=[Depends(require_permission("write", "dns_zone"))],
+)
 async def create_zone(
-    group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: CurrentUser
 ) -> ZoneResponse:
     await _require_group(group_id, db)
+    _refuse_superadmin_zone_fields(current_user, body.model_dump(), None)
     await _enforce_technitium_api_zone_scope(db, group_id, body.model_dump(), None)
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
@@ -5465,13 +5500,17 @@ async def get_server_rndc_status(
     )
 
 
-@router.put("/groups/{group_id}/zones/{zone_id}", response_model=ZoneResponse)
+@router.put(
+    "/groups/{group_id}/zones/{zone_id}",
+    response_model=ZoneResponse,
+    dependencies=[Depends(require_permission("write", "dns_zone"))],
+)
 async def update_zone(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
     body: ZoneUpdate,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> ZoneResponse:
     zone = await _require_zone(group_id, zone_id, db, current_user)
     _reject_if_synthesised_zone(zone, "edit")
@@ -5518,6 +5557,7 @@ async def update_zone(
     # the new zone_type/masters from this payload OR what's already on the
     # row — so an operator can't flip a zone to secondary without masters,
     # nor empty the masters on an existing secondary.
+    _refuse_superadmin_zone_fields(current_user, changes, zone)
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
@@ -6775,12 +6815,17 @@ async def move_zone_commit(
     return resp
 
 
-@router.delete("/groups/{group_id}/zones/{zone_id}", status_code=204, response_model=None)
+@router.delete(
+    "/groups/{group_id}/zones/{zone_id}",
+    status_code=204,
+    response_model=None,
+    dependencies=[Depends(require_permission("delete", "dns_zone"))],
+)
 async def delete_zone(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
     request: Request,
     permanent: bool = False,
 ) -> Any:
@@ -6796,13 +6841,20 @@ async def delete_zone(
     serving zone out from under live clients. Permanent delete still pushes
     the write-through first.
 
-    ``?permanent=true`` runs the legacy hard-delete path (super-admin only).
+    ``?permanent=true`` runs the legacy hard-delete path (super-admin only);
+    the default soft-delete takes ``delete`` on ``dns_zone`` (#1861).
 
     Two-person approval (#62): when the ``governance.approvals`` module is on
     and a ``delete:dns_zone`` policy matches, returns ``202`` with a pending
     change-request; otherwise executes inline via ``operation.apply`` exactly
-    as before (route stays SuperAdmin-gated).
+    as before.
     """
+    # 404 before 403, and a zone-bound API token (#374) may only delete its
+    # own zone.
+    await _require_zone(group_id, zone_id, db, current_user)
+    if permanent:
+        # Refused before a change request could be queued for it.
+        require_superadmin(current_user)
     op = get_operation("delete_zone")
     assert op is not None  # registered at import
     args = DeleteZoneArgs(group_id=group_id, zone_id=zone_id, permanent=permanent)
@@ -6873,9 +6925,10 @@ async def list_zone_templates(_: CurrentUser) -> ZoneTemplateCatalog:
     "/groups/{group_id}/zones/from-template",
     response_model=ZoneResponse,
     status_code=201,
+    dependencies=[Depends(require_permission("write", "dns_zone"))],
 )
 async def create_zone_from_template(
-    group_id: uuid.UUID, body: FromTemplateRequest, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID, body: FromTemplateRequest, db: DB, current_user: CurrentUser
 ) -> ZoneResponse:
     """Create a zone + materialise the template's records in one transaction."""
     await _require_group(group_id, db)
@@ -8468,13 +8521,14 @@ async def import_zone_preview(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/commit",
     response_model=ImportCommitResponse,
+    dependencies=[Depends(require_permission("write", "dns_record"))],
 )
 async def import_zone_commit(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
     body: ImportCommitRequest,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> ImportCommitResponse:
     """Apply a parsed zone file to the existing zone in a single transaction.
 
@@ -8501,6 +8555,15 @@ async def import_zone_commit(
 
     existing = await _load_zone_records(zone_id, db)
     diff = diff_records(parsed.records, existing)
+
+    # #1861 — the route takes ``write`` on ``dns_record``; a ``replace`` that
+    # would remove records also takes ``delete``, as the record DELETE does.
+    if diff.to_delete and body.conflict_strategy == "replace":
+        if not user_has_permission(current_user, "delete", "dns_record"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permission denied: need 'delete' on 'dns_record'",
+            )
 
     # #1683 — now that the import's changes reach the servers, it is refused
     # where the record API refuses them: a reconciler-owned zone (the next sync
@@ -8870,6 +8933,42 @@ def _zone_token_id_filter(user: Any) -> set[uuid.UUID] | None:
         except (ValueError, TypeError):
             continue
     return bound
+
+
+# #1861 — zone fields that stay superadmin-only although the zone itself is
+# editable on ``write`` on ``dns_zone``: DNSSEC key / policy management, the
+# dynamic-update switch (it lets a key or address rewrite the zone, like the
+# superadmin-only update-ACL route), and TLS probing (it arms outbound
+# connections). A request is refused only when it CHANGES one of them, so an
+# edit dialog that sends the current values back still saves.
+_SUPERADMIN_ZONE_FIELDS: dict[str, str] = {
+    "dnssec_enabled": "DNSSEC signing",
+    "dnssec_policy_id": "a zone's DNSSEC policy",
+    "dynamic_update_enabled": "dynamic updates",
+    "auto_tls_probe": "TLS certificate probing",
+}
+
+
+def _refuse_superadmin_zone_fields(
+    user: Any, changes: dict[str, Any], zone: DNSZone | None
+) -> None:
+    """403 when a non-superadmin changes a superadmin-only zone field.
+
+    ``zone`` is ``None`` on create, where a field counts as changed when it is
+    set at all (each defaults to off / unset).
+    """
+    if is_effective_superadmin(user):
+        return
+    for field, label in _SUPERADMIN_ZONE_FIELDS.items():
+        if field not in changes:
+            continue
+        new = changes[field]
+        changed = bool(new) if zone is None else new != getattr(zone, field)
+        if changed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Superadmin required to change {label}",
+            )
 
 
 async def _require_zone(

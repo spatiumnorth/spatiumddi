@@ -96,6 +96,38 @@ the formatter handles the rest.
   migration. A new test walks every route's required permission and
   fails when a built-in role holds a grant that no route checks.
 
+- **The DNS Editor and DHCP Editor roles now grant the writes they
+  always claimed to (#1861).** Both promised "Full CRUD", but 134 of
+  the 147 DNS and DHCP write routes also took `SuperAdmin`, so a DHCP
+  Editor could not create a scope and a DNS Editor could write records
+  and nothing else; the subnet's DHCP Pools panel offered Create Scope
+  and then refused the filled-in form with "Superadmin required". The
+  everyday data routes now check the role's own resource permission,
+  with `delete` for a delete. **This widens what both roles can do on
+  existing installs**, on purpose:
+  - DNS Editor: zones (create, from template, edit, delete), records,
+    zone-file import, views, named ACLs, and the entries and exceptions
+    of existing blocklists.
+  - DHCP Editor: scopes, pools, static assignments, client classes and
+    device policies, option templates (and applying one to a scope),
+    phone and PXE profiles, and MAC blocks.
+
+  Infrastructure stays superadmin-only: server groups and servers,
+  DNS server options, TSIG keys, DNSSEC signing and policies,
+  dynamic-update ACLs, zone moves, blocklist lists and their feeds and
+  assignments, DNS GSLB pools, Windows DHCP failover, lease deletion and
+  the importers. So do `?permanent=true` on a zone or scope delete and
+  changing a zone's DNSSEC, dynamic-update or TLS-probing settings. The
+  DNS Editor's grant on `manage_dns_pools` narrows from `admin` to
+  `read`, since every pool write stays superadmin-only. The console's
+  controls follow the same gates: an Editor gets them, a Viewer sees
+  them disabled with the reason, and the PXE profiles page, which had
+  no gate at all, now has one. `docs/PERMISSIONS.md` lists every gate,
+  and `test_builtin_roles_match_routes.py` now fails when a built-in
+  role is refused a route its description promises, holds a write grant
+  none of its promised routes use, or when a DNS / DHCP write route is
+  neither on the open list nor superadmin-only.
+
 - **The DICOM AE, OT device and IPAM CSV imports read a file with classic
   Mac line endings (#1370, #1637, #1711).** Each importer read the
   pasted or uploaded text without handing its line endings to the csv
