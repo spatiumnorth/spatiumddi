@@ -25,12 +25,44 @@
 #                             specific IP by setting this env var
 #                             explicitly.
 
+# ── Reverse proxy in front of this nginx (#1868) ───────────────────
+# TRUSTED_PROXY_CIDRS (the api's own setting; rendered into the two
+# ${...} blocks below by 16-trusted-proxies.envsh) names the TCP peers that
+# are an operator's reverse proxy. UNSET = none, which keeps the behaviour
+# of a direct install: the proxy_set_header lines below describe THIS
+# nginx's own peer and a client-supplied X-Forwarded-* is never believed.
+#
+#   * set_real_ip_from / real_ip_header / real_ip_recursive make
+#     $remote_addr the real client when the TCP peer is a listed proxy,
+#     walking X-Forwarded-For from the right past every listed hop, so an
+#     address a client prepends is never reached. The api then sees the
+#     real client in X-Real-IP and its login throttle buckets per user,
+#     not per proxy.
+#   * $spatium_forwarded_proto is the outer proxy's X-Forwarded-Proto, but
+#     only when the peer is listed, else this server's own scheme. Behind
+#     an https-terminating proxy the api therefore builds https URLs
+#     (OIDC redirect_uri, SAML ACS) and marks the refresh cookie Secure.
+#
+# Must not diverge from charts/spatiumddi/templates/frontend-tls-config.yaml.
+geo $realip_remote_addr $spatium_proxy_trusted {
+    default 0;
+${SPATIUM_TRUSTED_GEO}}
+
+map "$spatium_proxy_trusted:$http_x_forwarded_proto" $spatium_forwarded_proto {
+    default $scheme;
+    "~*^1:https" https;
+    "~*^1:http" http;
+}
+
 server {
     listen 80;
     server_name _;
     root /usr/share/nginx/html;
     index index.html;
 
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive on;
+${SPATIUM_REAL_IP_FROM}
     # ── Security response headers (SECURITY #400, L2) ──────────────
     # Applied at the server level so they cover the SPA, static
     # assets, and proxied /api responses. NOTE: nginx ``add_header``
@@ -192,7 +224,7 @@ server {
         proxy_set_header      Host $http_host;
         proxy_set_header      X-Real-IP $remote_addr;
         proxy_set_header      X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header      X-Forwarded-Proto $scheme;
+        proxy_set_header      X-Forwarded-Proto $spatium_forwarded_proto;
         proxy_http_version    1.1;
         proxy_set_header      Connection "";
         proxy_buffering       off;
@@ -201,6 +233,31 @@ server {
         proxy_send_timeout    600s;
         # Tell the X-Accel-Buffering: no header from upstream to win
         # in case it sneaks back on through a different path.
+        proxy_set_header      X-Accel-Buffering no;
+    }
+
+    # Long-lived streams (#1868). The same three needs as the Copilot chat
+    # above: no buffering, HTTP/1.1 to the upstream, and a read timeout
+    # longer than the quietest gap in the stream, or the generic /api/ block's
+    # 60 s closes a healthy stream. Covers the appliance cluster-health
+    # stream, the container / workload log follow streams, and the nmap scan
+    # progress stream. An outer proxy needs the same treatment; see
+    # docs/deployment/REVERSE_PROXY.md. Must not diverge from
+    # charts/spatiumddi/templates/frontend-tls-config.yaml.
+    location ~ ^/api/v1/(appliance/cluster/health/stream|appliance/containers/.+/logs/stream|nmap/scans/[^/]+/stream)$ {
+        error_page 502 504 @api_unavailable;
+        set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+        proxy_pass            $api_upstream;
+        proxy_set_header      Host $http_host;
+        proxy_set_header      X-Real-IP $remote_addr;
+        proxy_set_header      X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header      X-Forwarded-Proto $spatium_forwarded_proto;
+        proxy_http_version    1.1;
+        proxy_set_header      Connection "";
+        proxy_buffering       off;
+        proxy_cache           off;
+        proxy_read_timeout    3600s;
+        proxy_send_timeout    3600s;
         proxy_set_header      X-Accel-Buffering no;
     }
 
@@ -227,7 +284,7 @@ server {
         proxy_set_header         Host $http_host;
         proxy_set_header         X-Real-IP $remote_addr;
         proxy_set_header         X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header         X-Forwarded-Proto $scheme;
+        proxy_set_header         X-Forwarded-Proto $spatium_forwarded_proto;
         proxy_http_version       1.1;
         proxy_set_header         Connection "";
         client_max_body_size     2g;
@@ -252,7 +309,7 @@ server {
         proxy_set_header         Host $http_host;
         proxy_set_header         X-Real-IP $remote_addr;
         proxy_set_header         X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header         X-Forwarded-Proto $scheme;
+        proxy_set_header         X-Forwarded-Proto $spatium_forwarded_proto;
         proxy_http_version       1.1;
         proxy_set_header         Connection "";
         client_max_body_size     4g;
@@ -284,7 +341,7 @@ server {
         proxy_set_header   Host $http_host;
         proxy_set_header   X-Real-IP $remote_addr;
         proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   X-Forwarded-Proto $spatium_forwarded_proto;
         proxy_http_version 1.1;
         proxy_set_header   Connection "";
         proxy_read_timeout 120s;
@@ -311,7 +368,7 @@ server {
         proxy_set_header   Host $http_host;
         proxy_set_header   X-Real-IP $remote_addr;
         proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   X-Forwarded-Proto $spatium_forwarded_proto;
         proxy_http_version 1.1;
         proxy_set_header   Connection "";
         proxy_read_timeout 60s;
@@ -331,7 +388,7 @@ server {
         proxy_set_header   Host $http_host;
         proxy_set_header   X-Real-IP $remote_addr;
         proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   X-Forwarded-Proto $spatium_forwarded_proto;
         proxy_http_version 1.1;
         proxy_set_header   Connection "";
         proxy_read_timeout 60s;
@@ -348,7 +405,7 @@ server {
         proxy_set_header   Host $http_host;
         proxy_set_header   X-Real-IP $remote_addr;
         proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   X-Forwarded-Proto $spatium_forwarded_proto;
         proxy_http_version 1.1;
         proxy_set_header   Connection "";
         proxy_read_timeout 60s;
@@ -367,7 +424,7 @@ server {
         proxy_set_header   Host $http_host;
         proxy_set_header   X-Real-IP $remote_addr;
         proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   X-Forwarded-Proto $spatium_forwarded_proto;
         proxy_http_version 1.1;
         proxy_set_header   Connection "";
         proxy_read_timeout 60s;

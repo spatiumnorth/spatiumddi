@@ -97,6 +97,13 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         "frontend/default.conf.template",
         "charts/spatiumddi/templates/frontend-tls-config.yaml",
     ),
+    # #1868 — the frontend nginx trusts an outer proxy's X-Forwarded-Proto only
+    # from TRUSTED_PROXY_CIDRS; the renderer and both templates are read.
+    "test_frontend_proxy_trust.py": (
+        "frontend/default.conf.template",
+        "frontend/16-trusted-proxies.envsh",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
 }
 
 # ``parents[2]`` from backend/tests/x.py is the repo root; anything at that
