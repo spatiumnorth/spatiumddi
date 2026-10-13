@@ -134,9 +134,6 @@ upstream block with keepalive.
 ddi.example.com {
     reverse_proxy docker-host:8077 {
         flush_interval -1
-        transport http {
-            response_header_timeout 0
-        }
     }
 }
 ```
