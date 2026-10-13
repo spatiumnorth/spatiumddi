@@ -22,8 +22,7 @@ from app.services.appliance.slot_image_target import (
 )
 
 _SUPERVISOR = (
-    Path(__file__).resolve().parents[2]
-    / "agent/supervisor/spatium_supervisor/appliance_state.py"
+    Path(__file__).resolve().parents[2] / "agent/supervisor/spatium_supervisor/appliance_state.py"
 )
 
 
@@ -35,7 +34,9 @@ def test_plan_rejects_http_url() -> None:
 
 
 def test_plan_accepts_https_url() -> None:
-    assert PlanRequest(target_version="2026.10.13-1", slot_image_url="https://mirror.example/x.raw.xz").slot_image_url
+    assert PlanRequest(
+        target_version="2026.10.13-1", slot_image_url="https://mirror.example/x.raw.xz"
+    ).slot_image_url
 
 
 def test_plan_rejects_other_schemes_and_hostless() -> None:
@@ -70,3 +71,16 @@ def test_rule_matches_the_supervisors_allowed_schemes() -> None:
 def test_fragment_nonce_is_ignored() -> None:
     assert slot_image_url_problem("https://h/x.raw.xz#a=abc") is None
     assert slot_image_url_problem("HTTP://h/x#a=abc") is not None
+
+
+def test_rule_mirrors_the_supervisors_prefix_test() -> None:
+    # The supervisor tests ``startswith("https://" | "file://")`` on the
+    # stripped URL, not a parsed scheme: ``file:/x`` parses as ``file`` and
+    # is still refused there, so it must be refused here too.
+    assert slot_image_url_problem("file:///var/lib/x.raw.xz") is None
+    assert slot_image_url_problem("  https://h/x.raw.xz  ") is None
+    assert slot_image_url_problem("file:/var/lib/x.raw.xz") is not None
+    assert slot_image_url_problem("https:h/x.raw.xz") is not None
+    assert PlanRequest(
+        target_version="2026.10.13-1", slot_image_url="file:///var/lib/x.raw.xz"
+    ).slot_image_url

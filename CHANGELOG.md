@@ -92,9 +92,14 @@ the formatter handles the rest.
   minutes) with no error naming the cause. The scheme rule now lives in
   `slot_image_target.py` and is enforced by the Plan validator and by the
   resolver every scheduler goes through (the per-appliance schedule and the
-  rolling orchestrator), each answering 422 with the reason. A test pins the
-  rule against the supervisor's own `allowed_schemes`. Uploaded images are
-  unaffected: their URL is the control plane's own, proxied from the mirror.
+  rolling orchestrator), each answering 422 with the reason. It mirrors the
+  supervisor's test exactly — the URL must start with `https://` or
+  `file://` — so `file:/x`, which parses as a `file` URL, is refused as the
+  supervisor refuses it. A test pins the rule against the supervisor's own
+  `allowed_schemes`. Uploaded images are unaffected: their URL is composed
+  from the address the UI was reached on, the appliance's `https://`
+  listener. A run planned before the upgrade keeps the URL it was planned
+  with.
 
 - **A rolling upgrade whose own cleanup fails now raises a distinct
   alert (#1542).** When an upgrade fails after cordoning a node, the

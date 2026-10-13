@@ -116,29 +116,40 @@ class SlotImageTarget:
 # (#242: no cleartext ``http://`` OS-image fetch); a drift test pins the two.
 # The supervisor refuses anything else silently (a warning log, no trigger),
 # so a URL outside this set makes a rolling upgrade wait out its whole stage
-# timeout per node. Every place a slot image URL is accepted checks it here.
+# timeout per node. Every operator-supplied slot image URL is checked here
+# (the Plan validator and ``resolve_slot_image_target``). An uploaded image's
+# URL is composed from the address the UI was reached on, which on an
+# appliance is the frontend's https:// listener.
 SUPERVISOR_ALLOWED_URL_SCHEMES: tuple[str, ...] = ("https", "file")
 
 
 def slot_image_url_problem(url: str) -> str | None:
-    """Why the supervisor would refuse ``url``, or None when it would accept it."""
-    from urllib.parse import urlsplit  # noqa: PLC0415
+    """Why the supervisor would refuse ``url``, or None when it would accept it.
 
+    Mirrors the supervisor's own test exactly: the stripped, fragment-less URL
+    must START with ``https://`` or ``file://`` (case-insensitive). A parse of
+    the scheme is not the same test — ``file:/x`` parses as scheme ``file``
+    and the supervisor still refuses it.
+    """
     fetch_url = url.strip().split("#", 1)[0]
-    try:
-        parts = urlsplit(fetch_url)
-    except ValueError as exc:
-        return f"slot image URL is not parseable: {exc}"
-    scheme = parts.scheme.lower()
-    if scheme not in SUPERVISOR_ALLOWED_URL_SCHEMES:
+    lowered = fetch_url.lower()
+    if not any(lowered.startswith(f"{s}://") for s in SUPERVISOR_ALLOWED_URL_SCHEMES):
         allowed = " or ".join(f"{x}://" for x in SUPERVISOR_ALLOWED_URL_SCHEMES)
+        got = fetch_url.split(":", 1)[0][:32] if ":" in fetch_url else ""
         return (
-            f"slot image URL scheme must be {allowed} (got {scheme + '://' if scheme else 'none'}): "
-            "appliances refuse a cleartext http:// OS-image fetch, so the upgrade "
-            "would hang waiting for a download that never starts"
+            f"slot image URL must start with {allowed} (got {got + ':' if got else 'no scheme'}): "
+            "appliances refuse any other OS-image fetch, including cleartext http://, "
+            "so the upgrade would wait for a download that never starts"
         )
-    if scheme == "https" and not parts.netloc:
-        return "slot image URL must include a host"
+    if lowered.startswith("https://"):
+        from urllib.parse import urlsplit  # noqa: PLC0415
+
+        try:
+            host = urlsplit(fetch_url).hostname
+        except ValueError as exc:
+            return f"slot image URL is not parseable: {exc}"
+        if not host:
+            return "slot image URL must include a host"
     return None
 
 

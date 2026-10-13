@@ -44,6 +44,7 @@ from app.services.appliance.slot_image_target import (
     SlotImageTarget,
     new_refire_nonce,
     resolve_slot_image_target,
+    slot_image_url_problem,
 )
 from app.services.upgrades import mutex, orchestrator, preflight
 
@@ -189,30 +190,15 @@ class PlanRequest(BaseModel):
     @field_validator("slot_image_url")
     @classmethod
     def _validate_slot_image_url(cls, v: str | None) -> str | None:
-        # Review polish — catch operator typos at plan time rather than
-        # surfacing a confusing "unsupported scheme" error 30 min into
-        # the rolling upgrade when the host runner finally tries to
-        # GET the URL. Only the schemes the supervisor accepts pass.
+        # Catch it at plan time rather than as a node's stage step waiting
+        # out its whole timeout: the supervisor fetches only https:// (and
+        # file://) and refuses anything else with a log line and no trigger
+        # (#1752). One rule, shared with the resolver every scheduler uses.
         if v is None:
             return v
-        from urllib.parse import urlparse  # noqa: PLC0415
-
-        try:
-            parsed = urlparse(v)
-        except ValueError as exc:
-            raise ValueError(f"slot_image_url is not a parseable URL: {exc}") from exc
-        # #1752 — the supervisor fetches only https:// (and file://); an
-        # http:// URL is refused there with a log line and the step then
-        # waits out its whole timeout, so refuse it here, by the same rule.
-        from app.services.appliance.slot_image_target import (  # noqa: PLC0415
-            slot_image_url_problem,
-        )
-
         problem = slot_image_url_problem(v)
         if problem:
             raise ValueError(problem)
-        if not parsed.netloc and parsed.scheme != "file":
-            raise ValueError("slot_image_url must include a host")
         return v
 
     @model_validator(mode="after")
