@@ -84,6 +84,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Allocate IP offers only the statuses it can allocate with (#1422).**
+  Its Type / Status menu offered `discovered`, but both of its requests
+  ("Next available" and "Specific IP") accept only the operator-settable
+  statuses and `dhcp`, so picking it always ended in a 422. `discovered`
+  is stamped by the nmap "Stamp alive hosts" action and is no longer
+  offered there; the inline status edit and Edit address, whose update
+  accepts every status, keep it.
+
 - **One typo in the MFA disable or recovery-code dialog costs one
   attempt, not two (#1371).** `POST /auth/mfa/disable` and
   `/auth/mfa/recovery-codes/regenerate` answered a wrong password or
