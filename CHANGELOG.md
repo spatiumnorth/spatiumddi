@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An ACME order's teardown no longer fails with "Event loop is
+  closed" in the worker (#1687, #1726).** `run_order`'s `finally`
+  removed the DNS-01 challenge TXT records and the http-01 tokens
+  through the shared engine's session factory. That runs inside a
+  Celery task's own event loop, where a pooled connection left by an
+  earlier task is bound to a closed loop, so on a reused connection
+  the cleanup failed with only a warning. The challenge TXT then
+  stayed in the zone until the 24 h stale sweep, or for good without
+  it, and http-01 tokens stayed in the database. The teardown now
+  opens its sessions with `task_session()`, as the order itself does.
+
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and
