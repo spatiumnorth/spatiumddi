@@ -42,11 +42,20 @@ def _record_key(name: str, rtype: str, value: str) -> tuple[str, str, str]:
 def diff_records(
     parsed: Iterable[ParsedRecord],
     existing: Iterable[DNSRecord],
+    zone_default_ttl: int | None = None,
 ) -> ZoneDiff:
     """Compare ``parsed`` records against ``existing`` DB rows.
 
     Identity is (name, record_type, value). When that key matches but TTL
     or priority/weight/port differ, the change becomes an ``update``.
+
+    TTLs are compared as *effective* TTLs (#1727). A row whose ``ttl`` is NULL
+    inherits ``zone_default_ttl``; the parser cannot tell an inherited TTL from
+    an explicit one (``$TTL`` fills it in), and our own export omits the column
+    for such rows, so a re-import hands back the zone default. Comparing that
+    against NULL read every inherited record as changed, and committing it
+    pinned the TTL. A foreign file's explicit TTL that differs from the zone
+    default still differs and updates as before.
     """
     existing_by_key: dict[tuple[str, str, str], DNSRecord] = {
         _record_key(r.name, r.record_type, r.value): r for r in existing
@@ -73,12 +82,18 @@ def diff_records(
             )
             continue
 
-        ttl_changed = (p.ttl or 0) != (existing_row.ttl or 0)
+        if existing_row.ttl is None and zone_default_ttl is not None:
+            ttl_changed = p.ttl is not None and p.ttl != zone_default_ttl
+        else:
+            ttl_changed = (p.ttl or 0) != (existing_row.ttl or 0)
         meta_changed = (
             p.priority != existing_row.priority
             or p.weight != existing_row.weight
             or p.port != existing_row.port
         )
+        # An update that is only about priority/weight/port must not pin a
+        # TTL the row inherits (the commit writes ``change.ttl`` verbatim).
+        keep_inherited = existing_row.ttl is None and zone_default_ttl is not None
         if ttl_changed or meta_changed:
             diff.to_update.append(
                 RecordChange(
@@ -86,7 +101,7 @@ def diff_records(
                     name=p.name,
                     record_type=p.record_type,
                     value=p.value,
-                    ttl=p.ttl,
+                    ttl=None if keep_inherited and not ttl_changed else p.ttl,
                     priority=p.priority,
                     weight=p.weight,
                     port=p.port,

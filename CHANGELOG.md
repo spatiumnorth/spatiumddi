@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Re-importing a zone's own export no longer pins every inherited TTL
+  (#1727).** A record with no TTL of its own inherits the zone default and
+  is exported without one, so the re-import read the file's `$TTL` back
+  as 3600 against a stored NULL, listed the record under `to_update` and,
+  on commit, wrote 3600 onto it so it stopped following the zone. The
+  import diff now compares effective TTLs: a row inheriting the zone
+  default is unchanged when the file carries that same value, and stays
+  inherited even when only its priority or weight changes. An explicit TTL
+  in a foreign file that differs from the zone default still updates.
+
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and
