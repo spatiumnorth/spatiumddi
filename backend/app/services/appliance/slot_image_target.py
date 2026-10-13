@@ -111,6 +111,37 @@ class SlotImageTarget:
         )
 
 
+# #1752 — the schemes the supervisor will fetch a slot image over. MUST match
+# ``allowed_schemes`` in ``agent/supervisor/spatium_supervisor/appliance_state.py``
+# (#242: no cleartext ``http://`` OS-image fetch); a drift test pins the two.
+# The supervisor refuses anything else silently (a warning log, no trigger),
+# so a URL outside this set makes a rolling upgrade wait out its whole stage
+# timeout per node. Every place a slot image URL is accepted checks it here.
+SUPERVISOR_ALLOWED_URL_SCHEMES: tuple[str, ...] = ("https", "file")
+
+
+def slot_image_url_problem(url: str) -> str | None:
+    """Why the supervisor would refuse ``url``, or None when it would accept it."""
+    from urllib.parse import urlsplit  # noqa: PLC0415
+
+    fetch_url = url.strip().split("#", 1)[0]
+    try:
+        parts = urlsplit(fetch_url)
+    except ValueError as exc:
+        return f"slot image URL is not parseable: {exc}"
+    scheme = parts.scheme.lower()
+    if scheme not in SUPERVISOR_ALLOWED_URL_SCHEMES:
+        allowed = " or ".join(f"{x}://" for x in SUPERVISOR_ALLOWED_URL_SCHEMES)
+        return (
+            f"slot image URL scheme must be {allowed} (got {scheme + '://' if scheme else 'none'}): "
+            "appliances refuse a cleartext http:// OS-image fetch, so the upgrade "
+            "would hang waiting for a download that never starts"
+        )
+    if scheme == "https" and not parts.netloc:
+        return "slot image URL must include a host"
+    return None
+
+
 def supervisor_strips_url_fragment(row: Appliance) -> bool:
     """True if this appliance's runner strips a URL ``#fragment`` (≥ #386).
 
@@ -157,6 +188,9 @@ async def resolve_slot_image_target(
         raise SlotImageResolutionError("Pass exactly one of slot_image_id or slot_image_url.")
 
     if slot_image_url is not None:
+        problem = slot_image_url_problem(slot_image_url)
+        if problem:
+            raise SlotImageResolutionError(problem)
         return SlotImageTarget(url=slot_image_url)
 
     assert slot_image_id is not None  # narrowed by the check above

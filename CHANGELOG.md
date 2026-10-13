@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A rolling upgrade no longer accepts an `http://` slot image URL
+  that every appliance then refuses (#1752).** The Plan validator allowed
+  `http` or `https`; the supervisor fetches only `https://` or `file://`
+  (#242) and refuses anything else with a warning log and no trigger, so the
+  run started and each node's stage step waited out its whole timeout (50
+  minutes) with no error naming the cause. The scheme rule now lives in
+  `slot_image_target.py` and is enforced by the Plan validator and by the
+  resolver every scheduler goes through (the per-appliance schedule and the
+  rolling orchestrator), each answering 422 with the reason. A test pins the
+  rule against the supervisor's own `allowed_schemes`. Uploaded images are
+  unaffected: their URL is the control plane's own, proxied from the mirror.
+
 - **A rolling upgrade whose own cleanup fails now raises a distinct
   alert (#1542).** When an upgrade fails after cordoning a node, the
   orchestrator uncordons it and clears the CNPG maintenance window; if
