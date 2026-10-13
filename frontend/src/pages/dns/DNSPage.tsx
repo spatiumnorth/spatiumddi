@@ -2471,7 +2471,11 @@ function DnssecCard({
                 <tr key={`${k.key_type}-${k.key_tag}`} className="border-t">
                   <td className="py-0.5 pr-2 font-mono">{k.key_tag}</td>
                   <td className="py-0.5 pr-2 uppercase">{k.key_type}</td>
-                  <td className="py-0.5 pr-2">{k.algorithm}</td>
+                  <td className="py-0.5 pr-2">
+                    {k.algorithm_name
+                      ? `${k.algorithm_name} (${k.algorithm})`
+                      : k.algorithm}
+                  </td>
                   <td className="py-0.5 pr-2">{k.state}</td>
                   <td className="py-0.5 text-right">
                     <button

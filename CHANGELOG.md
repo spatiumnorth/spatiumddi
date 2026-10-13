@@ -84,6 +84,39 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Changing an address's IP inside one reverse zone retracts the old
+  PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
+  `update` at the new name, which replaces the RRset at its own name and
+  never touches the old one. The old PTR stayed served: until the next
+  structural render on an agent engine, indefinitely on `technitium_api`,
+  Windows and the cloud drivers. A PTR whose name changes now queues a
+  `delete` of the old name and value, then a `create` at the new name, as
+  one batch (an agentless primary gets both in a single
+  `apply_record_changes` call), the same shape the record PUT uses (#1773).
+  A hostname rename keeps the PTR name and stays one `update`. The forward
+  A/AAAA side already did delete-then-create on a rename. The old-name
+  delete is a deliberate retraction, so the Technitium re-assert (#1800)
+  does not bring it back.
+
+- **Deleting a large blocklist, opening its entries page and bulk-adding
+  entries no longer load the whole list into the api (#1724).** Delete
+  hydrated every entry (~2.4 KB each; a 582k catalog list OOM-killed the
+  api and never completed), the entries page loaded every matching row
+  to count it, and bulk-add read every existing domain on each call.
+  Delete now leaves the children to the FK's `ON DELETE CASCADE`
+  (`passive_deletes`), the total is a `COUNT(*)`, and bulk-add asks
+  only about the incoming domains. The audit trail is unchanged: one
+  `delete` row for the list.
+
+- **`GET .../zones/{id}/dnssec/info` no longer 500s once an agent has
+  reported keys (#1812).** `DNSKey.algorithm` is the IANA number (13 =
+  ECDSAP256SHA256) but the response model typed it `str`, which Pydantic
+  does not coerce, so the endpoint failed for every signed zone with
+  reported keys. `algorithm` is now an integer and the new
+  `algorithm_name` carries the mnemonic (null for an unknown number); the
+  `find_zone_dnssec_info` Copilot tool gains the same field and the zone
+  DNSSEC card shows `ECDSAP256SHA256 (13)`.
+
 - **Deleting an A/AAAA on Technitium no longer loses its PTR (#1800).**
   Technitium's web API deletes the matching PTR with the A/AAAA when the
   reverse zone is on the same server, and #1768 only repaired the structural
@@ -232,20 +265,6 @@ the formatter handles the rest.
   label selector that matches no Deployment, or a list call refused
   for missing RBAC, fails the step at once instead of turning the
   gate off.
-
-- **Changing an address's IP inside one reverse zone retracts the old
-  PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
-  `update` at the new name, which replaces the RRset at its own name and
-  never touches the old one. The old PTR stayed served: until the next
-  structural render on an agent engine, indefinitely on `technitium_api`,
-  Windows and the cloud drivers. A PTR whose name changes now queues a
-  `delete` of the old name and value, then a `create` at the new name, as
-  one batch (an agentless primary gets both in a single
-  `apply_record_changes` call), the same shape the record PUT uses (#1773).
-  A hostname rename keeps the PTR name and stays one `update`. The forward
-  A/AAAA side already did delete-then-create on a rename. The old-name
-  delete is a deliberate retraction, so the Technitium re-assert (#1800)
-  does not bring it back.
 
 - **DNSSEC is refused on a multi-server group, and the DS report is group-scoped (#1762).** Each agent server (BIND9, PowerDNS, Technitium) signs with keys it generated, so a signed zone on a group with two servers was served with two DNSKEY sets against one published DS, and validating resolvers got SERVFAIL from whichever server it did not match. Signing (the sign endpoint, `dnssec_enabled` on zone create and update, and both Copilot paths) now returns 422 when the group has more than one agent server. Adding or moving a server into a group that holds signed zones is refused too: server create, server move, a Fleet group change, and the Copilot `assign_appliance_role`. So is moving a signed zone into a multi-server group. **Disabled servers count**: a disabled agent still receives the bundle, so a disabled BIND9 server still signs with its own keys, and a disabled PowerDNS or Technitium server serves the zone unsigned under the DS. These checks lock the group row, so two concurrent requests cannot both pass. An agent that auto-registers into a signed group is not refused, because refusing would break its bootstrap. Instead it is logged and audited, and it trips the same flag as zones signed before this fix: `dnssec_multi_signer` on the zone and on `…/dnssec/info`, a red **DNSSEC: multiple signers** badge and a warning on the DNSSEC card, and a new default-on, critical `dnssec_multi_signer` alert. Those zones are not unsigned automatically. `/dns/agents/dnssec-state` now matches zones only within the reporting server's group, so same-named zones in different groups no longer collide. On a multi-server group it keeps one server's report (the primary's, or the oldest signer's when the group has no primary), which ends the last-writer-wins DS flapping.
 

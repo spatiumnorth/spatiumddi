@@ -1537,11 +1537,15 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         "DNSBlockListEntry",
         back_populates="blocklist",
         cascade="all, delete-orphan",
+        # The FK is ON DELETE CASCADE; never load a (catalog-sized) child
+        # collection into the session just to delete it (#1724).
+        passive_deletes=True,
     )
     exceptions: Mapped[list["DNSBlockListException"]] = relationship(
         "DNSBlockListException",
         back_populates="blocklist",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
     server_groups: Mapped[list["DNSServerGroup"]] = relationship(
@@ -1640,6 +1644,36 @@ DNSSEC_ALGORITHMS: frozenset[str] = frozenset(
         "rsasha512",
     }
 )
+
+# IANA "DNS Security Algorithm Numbers" registry → mnemonic, for every key
+# algorithm a DNSKEY can carry (deprecated ones included: an old zone can still
+# report them). ``DNSKey.algorithm`` stores the number (#1812); the mnemonic
+# is derived for display, never stored. Reserved / unassigned → None.
+DNSSEC_ALGORITHM_NAMES: dict[int, str] = {
+    1: "RSAMD5",
+    3: "DSA",
+    5: "RSASHA1",
+    6: "DSA-NSEC3-SHA1",
+    7: "RSASHA1-NSEC3-SHA1",
+    8: "RSASHA256",
+    10: "RSASHA512",
+    12: "ECC-GOST",
+    13: "ECDSAP256SHA256",
+    14: "ECDSAP384SHA384",
+    15: "ED25519",
+    16: "ED448",
+    17: "SM2SM3",
+    18: "MLDSA44",
+    23: "ECC-GOST12",
+    253: "PRIVATEDNS",
+    254: "PRIVATEOID",
+}
+
+
+def dnssec_algorithm_name(algorithm: int | None) -> str | None:
+    """IANA mnemonic for a DNSSEC algorithm number, or None when unknown."""
+    return None if algorithm is None else DNSSEC_ALGORITHM_NAMES.get(algorithm)
+
 
 # Per-key lifecycle states BIND reports via ``rndc dnssec -status`` (the
 # RFC 7583 key-timing "states"). Stored verbatim on DNSKey.state.
