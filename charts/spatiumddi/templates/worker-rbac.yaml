@@ -92,8 +92,10 @@ metadata:
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "worker") .) | nindent 4 }}
 rules:
+  # #1710 — DaemonSets too: the end-of-roll flip waits for the supervisor
+  # and agent DaemonSets it moves.
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "daemonsets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs"]

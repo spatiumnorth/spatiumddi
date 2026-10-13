@@ -1372,6 +1372,51 @@ def deployment_is_rolled_out(deployment: dict[str, Any]) -> bool:
     )
 
 
+def list_daemonsets(
+    label_selector: str = "", namespace: str | None = None
+) -> tuple[int, list[dict[str, Any]]]:
+    """List DaemonSets matching ``label_selector`` (every one when it is
+    empty). Returns ``(status, items)``; ``items`` is empty on any non-200.
+
+    The rolling upgrade's end-of-roll flip waits on the DaemonSets it moves
+    (the supervisor and the DNS / DHCP agents), not only the Deployments
+    (#1710).
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = (
+        f"/apis/apps/v1/namespaces/{quote(ns)}/daemonsets"
+        f"?labelSelector={quote(label_selector, safe='')}"
+    )
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, list(json.loads(body.decode("utf-8")).get("items") or [])
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            return status, []
+    return status, []
+
+
+def daemonset_is_rolled_out(daemonset: dict[str, Any]) -> bool:
+    """True when a DaemonSet's rolling update has finished, as
+    ``kubectl rollout status`` reads it: the controller has seen the latest
+    spec, and every scheduled pod is updated and available. A DaemonSet that
+    schedules no pod (its role is on no node) is trivially rolled out."""
+    meta = daemonset.get("metadata") or {}
+    status = daemonset.get("status") or {}
+    desired = int(status.get("desiredNumberScheduled") or 0)
+    if int(status.get("observedGeneration") or 0) < int(meta.get("generation") or 0):
+        return False
+    if desired == 0:
+        return True
+    return (
+        int(status.get("updatedNumberScheduled") or 0) >= desired
+        and int(status.get("numberAvailable") or 0) >= desired
+    )
+
+
 def get_job(name: str, namespace: str | None = None) -> tuple[int, dict[str, Any] | None]:
     """Read a batch/v1 Job. The migrate Job's ``status.succeeded`` /
     ``status.failed`` counters tell us whether the chart-bump's
@@ -1409,6 +1454,7 @@ __all__ = [
     "clear_lease_holder",
     "cordon_node",
     "create_lease",
+    "daemonset_is_rolled_out",
     "delete_pod",
     "deployment_is_rolled_out",
     "evict_pod",
@@ -1421,6 +1467,7 @@ __all__ = [
     "get_pod_logs",
     "is_node_ready",
     "job_terminal_state",
+    "list_daemonsets",
     "list_nodes",
     "list_pods",
     "list_pods_on_node",

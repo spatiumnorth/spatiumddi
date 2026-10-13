@@ -158,6 +158,7 @@ from app.services.appliance.storage_health import (
 from app.services.appliance.syslog import syslog_bundle
 from app.services.appliance.tls_pins import signed_pin_set
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
+from app.services.upgrades import shared_tags as upgrade_shared_tags
 from app.services.upgrades.safety import assert_no_upgrade_in_flight
 from app.services.upgrades.schema_rollback import check_release_can_run
 from app.services.upgrades.schema_rollback import enforce as enforce_schema_rollback
@@ -1752,6 +1753,14 @@ class SupervisorHeartbeatResponse(BaseModel):
     # mount a disk it cannot see. Empty-shape block still sent, because
     # an empty desired set is how an EJECT reaches the host.
     removable_settings: dict[str, Any] = Field(default_factory=dict)
+    # #1710 — a rolling upgrade holds the cluster's shared charts on the tag
+    # it runs until every node reports ``target_version``: ``{"run_id",
+    # "from_tag", "target_version"}`` while it does, for each node of the
+    # run, else null. A supervisor whose host already runs the target writes
+    # nothing to the shared role chart until the hold ends, so the agents on
+    # the nodes still on the old slot keep images they have. Absent from
+    # old control planes, which reads as no hold.
+    shared_chart_hold: dict[str, str] | None = None
 
 
 def _s(v: object, limit: int = 255) -> str | None:
@@ -2920,6 +2929,7 @@ async def supervisor_heartbeat(
         firewall_settings=firewall_block,
         removable_settings=removable_bundle_safe(row.desired_removable_mounts),
         long_poll=long_poll,
+        shared_chart_hold=await upgrade_shared_tags.heartbeat_hold(db, row.hostname),
     )
 
 

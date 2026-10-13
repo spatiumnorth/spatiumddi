@@ -188,6 +188,8 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     ("upgrade.failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.node_failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.chart_bump_failed", "system_upgrade_run"): "system.upgrade.failed",
+    # #1710 — the run could not hold the shared charts' image tag.
+    ("upgrade.shared_tag_hold_failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.post_upgrade_verify_failed", "system_upgrade_run"): "system.upgrade.failed",
     # Approval workflow lifecycle (#62). The service layer writes plain-verb
     # audit actions (requested / approved / …); without these explicit
