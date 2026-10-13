@@ -890,7 +890,7 @@ Three counters, and only one of them moves:
 
 | Counter | What it means | Moves here? |
 |---|---|---|
-| per-socket `sk_drops` (`/proc/net/udp`) | the kernel found the receive buffer full and discarded the datagram | **yes** |
+| per-socket `sk_drops` of the sockets Kea serves from (`/proc/net/udp`; with `dhcp-socket-type: raw`, kea-dhcp4's AF_PACKET sockets, #1283) | the kernel found the receive buffer full and discarded the datagram | **yes** |
 | `pkt4-receive-drop` / `pkt6-receive-drop` | Kea read the packet and discarded it (unparseable, `DROP` class, no subnet) | no |
 | `pkt4-discover-received` vs `pkt4-offer-sent` | Kea answering what it read | always equal |
 
@@ -918,7 +918,8 @@ only past a number of packets).
 
 > **`NULL` is not zero, anywhere in this chain.** An agent older than #980,
 > or one whose runtime cannot read `/proc/net/udp`, reports no `socket_drop`
-> and the column stays NULL. That renders as *loss not measured*, the alert
+> and the column stays NULL. So does one that, in raw mode, cannot read
+> Kea's AF_PACKET sockets. That renders as *loss not measured*, the alert
 > skips the server rather than vouching for it, and nothing folds it to 0 —
 > a wall of green zeros from an un-upgraded fleet is precisely the false
 > reassurance this section exists to remove. Every "was this measured?" test
@@ -935,12 +936,35 @@ only past a number of packets).
 > whose floor is one packet. (A file that is *absent* is different, and is
 > a valid partial answer: no IPv6 stack means no v6 sockets to miss.)
 >
-> One real blind spot: the AF_PACKET socket Kea opens for
-> `dhcp-socket-type: raw` is not covered. `/proc/net/packet` carries no drop
-> column and its statistics can only be read by the process that owns the
-> socket. Relayed traffic is unicast and therefore arrives on the UDP
-> fallback socket, which is fully covered; directly-attached broadcast
-> traffic is not.
+> **In raw mode the DHCPv4 count comes from the AF_PACKET socket (#1283).**
+> With `dhcp-socket-type: raw` (`dhcp_socket_mode: direct`, the default),
+> Kea reads every DHCPv4 packet from an AF_PACKET socket, relayed unicast
+> included. The copy that lands on its UDP :67 socket is LPF's fallback,
+> which Kea drains and discards. So in raw mode the drops that cost a client
+> a retransmit are on the AF_PACKET socket, and the fallback's drops are
+> copies.
+>
+> In that mode the agent counts the AF_PACKET socket in place of UDP :67. In
+> `udp` mode (`dhcp_socket_mode: relay`) it counts the UDP sockets, as
+> before. DHCPv6 has no raw mode, so its :547 sockets always count. The
+> agent takes the mode from the config it rendered for Kea. An unreadable
+> config counts both kinds rather than guess.
+>
+> Measured under relayed bursts on kea-dhcp4 3.0.3 (AF_PACKET socket against
+> UDP :67):
+> - 261 against 126;
+> - 41 against 0;
+> - 505 against 300. Here the 505 were exactly the requests Kea never
+>   received.
+>
+> How the agent reads it:
+> - `/proc/net/packet` has no drop column, so the count comes through
+>   sock_diag, which needs no privilege.
+> - Kea's fd table is closed to the agent. So the agent counts the raw
+>   `ETH_P_ALL` sockets owned by the pod's user that it does not hold itself.
+> - Another program's raw socket under the same numeric uid is counted too.
+>   On the appliance that is the host's lldpd, whose BPF filter keeps DHCP
+>   traffic out of its queues, so it adds 0.
 
 ### What actually helps
 

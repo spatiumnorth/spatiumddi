@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **`socket_drop` counts the socket Kea serves from in raw mode
+  (#1283).**
+  - With `dhcp-socket-type: raw` (`dhcp_socket_mode: direct`, the
+    default), kea-dhcp4 reads every DHCPv4 packet from an AF_PACKET
+    socket, relayed unicast included. It only drains and discards the
+    copy on its UDP :67 fallback socket.
+  - `socket_drop` read that fallback. So it counted copies Kea would
+    have thrown away, and missed the drops that cost a client a
+    retransmit. On relayed bursts it read 0 against 41 real drops in
+    one run, and 300 against 505 in another.
+  - The agent now reads the AF_PACKET sockets' drops through sock_diag
+    in raw mode, which needs no privilege. In `udp` mode it reads the
+    UDP sockets as before. It takes the mode from the config it
+    rendered for Kea.
+  - The Stats tab, the InfluxDB export and the `dhcp_packets_dropped`
+    alert now get the right number, with no change of their own.
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the
   group by selecting `appliance_id`, which nothing writes: agents
