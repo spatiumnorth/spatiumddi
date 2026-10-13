@@ -84,6 +84,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DHCP options editor's search box kept only the first digit of a
+  typed code (#1685).** Typing `4` then `3` left the box reading
+  "4 —3", matched nothing and made the row option 4, so option 43 (or
+  66) could not be reached by number. Each keystroke set the row's code
+  and an effect then rewrote the box to "<code> —" before the next
+  digit landed. The box no longer takes back the code it just pushed
+  into the row; it settles to "<code> — <name>" on blur, and a
+  catalogue pick or template apply still refreshes it.
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and

@@ -117,9 +117,15 @@ function CustomOptionRow({
   );
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
+  // The code this box itself last pushed into the row while the operator
+  // was typing. The effect below must not echo it back as "<code> —", or
+  // the second digit of "43" lands after the dash (#1685).
+  const typedCode = useRef<number | null>(null);
 
-  // Reflect external changes to opt.code (e.g. template apply).
+  // Reflect external changes to opt.code (e.g. template apply, a catalogue
+  // pick) — but not the row echoing what was just typed in this box.
   useEffect(() => {
+    if (typedCode.current !== null && typedCode.current === opt.code) return;
     setQuery(opt.code ? `${opt.code} — ${opt.name ?? ""}`.trim() : "");
   }, [opt.code, opt.name]);
 
@@ -157,6 +163,7 @@ function CustomOptionRow({
   );
 
   function pick(def: DHCPOptionCodeDef) {
+    typedCode.current = null;
     onChange({ ...opt, code: def.code, name: def.name });
     setQuery(`${def.code} — ${def.name}`);
     setOpen(false);
@@ -181,11 +188,19 @@ function CustomOptionRow({
               if (numMatch) {
                 const n = parseInt(numMatch[1], 10);
                 if (!Number.isNaN(n) && n !== opt.code) {
+                  typedCode.current = n;
                   onChange({ ...opt, code: n });
                 }
               }
             }}
             onFocus={() => setOpen(true)}
+            onBlur={() => {
+              // Typing is over: let the box settle to "<code> — <name>".
+              typedCode.current = null;
+              setQuery(
+                opt.code ? `${opt.code} — ${opt.name ?? ""}`.trim() : "",
+              );
+            }}
           />
           {open && matches.length > 0 && (
             <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-y-auto rounded-md border bg-popover shadow-md">
