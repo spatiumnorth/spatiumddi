@@ -13,6 +13,7 @@ client stays out of the test path.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 from spatium_dhcp_agent.config import AgentConfig
@@ -307,3 +308,16 @@ def test_one_run_iteration_samples_both_counters_together(tmp_path, monkeypatch)
     assert len(sink) == 1
     assert sink[0]["discover"] == 7
     assert sink[0]["socket_drop"] == 22
+
+
+def test_the_drop_counter_follows_the_rendered_socket_mode(tmp_path):
+    """#1283: the poller tells the drop counter kea-dhcp4's socket mode from
+    the config file this agent writes for kea (``kea_config_path``)."""
+    p = _poller(tmp_path)
+    assert p._socket._socket_type() is None  # nothing rendered yet: unknown
+    doc = {"Dhcp4": {"interfaces-config": {"dhcp-socket-type": "udp"}}}
+    (tmp_path / "kea.conf").write_text(json.dumps(doc))
+    assert p._socket._socket_type() == "udp"
+    doc["Dhcp4"]["interfaces-config"]["dhcp-socket-type"] = "raw"
+    (tmp_path / "kea.conf").write_text(json.dumps(doc))
+    assert p._socket._socket_type() == "raw"

@@ -1064,6 +1064,40 @@ _TEE_TIMES_V6: dict[str, Any] = {
 }
 
 
+# #1283 — Kea's multi-threading packet queue, between the thread that reads
+# the sockets and the worker pool. Left unset it holds 64 packets, and when a
+# burst outruns the workers Kea evicts the OLDEST queued packet to make room
+# for the newest. Nothing counts that: ``pkt4-received`` is incremented by the
+# worker that processes a packet, so an evicted packet reaches no statistic,
+# and the only trace is a debug-level log line. The server reports answering
+# everything it received while clients wait out a retransmit (4 s) each.
+#
+# The size bounds how long a request can sit in the queue: size divided by the
+# rate the pool serves at. It must hold an arrival burst, and a full queue must
+# still drain inside the client's first retransmit, or Kea spends the burst
+# answering requests their clients have already re-sent (#952 measured that
+# shape as a 34 s DORA). Measured on a three-node cluster's relayed load ramp
+# (kea-dhcp4 3.0.3, one worker), with only this value changed between runs:
+#
+#   size   evicted, counted nowhere   handshakes re-sent   answer latency p99 / max
+#   64     2,286                      35.1 %               0.14 s / 0.33 s
+#   1024   0                          15.1 %               1.17 s / 1.21 s
+#   4096   0                           7.8 %               1.37 s / 1.39 s
+#
+# At 1024 the queue's deepest point was about 570 by Kea's own 10-packet
+# average, so the bursts fit with room to spare. At the roughly 470 packets/s
+# one worker served there, a full queue drains in about 2 s. At 4096 it would
+# take over 8 s, past the first retransmit. The re-sends left at 1024 and at
+# 4096 match the kernel's drops on Kea's raw socket (1,042 and 505), which
+# ``socket_drop`` counts (``socket_drops.py``).
+#
+# Not scaled by ``thread-pool-size``: more workers drain the same queue
+# faster, so one size is only ever safer as the pool grows. The backend's
+# config preview renders the same value
+# (``app.drivers.dhcp.kea.KEA_PACKET_QUEUE_SIZE``).
+KEA_PACKET_QUEUE_SIZE = 1024
+
+
 def _multi_threading(server: dict[str, Any]) -> dict[str, Any]:
     """Render Kea's ``multi-threading`` block from the bundle (#980).
 
@@ -1094,11 +1128,15 @@ def _multi_threading(server: dict[str, Any]) -> dict[str, Any]:
     operator asked for auto-sizing" must not render the same way — the whole
     point is that auto is the wrong answer here. An explicit 0 IS honoured
     and hands sizing back to Kea.
+
+    ``packet-queue-size`` is rendered too (#1283); see
+    :data:`KEA_PACKET_QUEUE_SIZE` for why and why this number.
     """
     size = server.get("kea_thread_pool_size")
     return {
         "enable-multi-threading": True,
         "thread-pool-size": 1 if size is None else int(size),
+        "packet-queue-size": KEA_PACKET_QUEUE_SIZE,
     }
 
 

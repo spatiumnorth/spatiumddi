@@ -84,6 +84,55 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Allocate IP offers only the statuses it can allocate with (#1422).**
+  Its Type / Status menu offered `discovered`, but both of its requests
+  ("Next available" and "Specific IP") accept only the operator-settable
+  statuses and `dhcp`, so picking it always ended in a 422. `discovered`
+  is stamped by the nmap "Stamp alive hosts" action and is no longer
+  offered there; the inline status edit and Edit address, whose update
+  accepts every status, keep it.
+
+- **One typo in the MFA disable or recovery-code dialog costs one
+  attempt, not two (#1371).** `POST /auth/mfa/disable` and
+  `/auth/mfa/recovery-codes/regenerate` answered a wrong password or
+  TOTP code with 401. The console reads a 401 from anything but sign-in
+  as an expired session: it rotated the session and sent the request
+  again, which failed the same way. One typo spent two of the five
+  step-up attempts the account gets per 15 minutes and checked the
+  answer twice, so the third typo locked MFA changes. Both now answer
+  403 with the same message, as enrolment does.
+
+- **A burst of DHCP requests is queued, not silently evicted
+  (#1283).**
+  - Left unset, Kea 3.0's multi-threading `packet-queue-size` is 64.
+    When a burst of relayed requests outran the worker, Kea evicted
+    the oldest queued packets and counted them nowhere. Clients
+    retransmitted, and every product surface stayed green.
+  - On a three-node cluster's load ramp, 2,286 requests were lost this
+    way and 35.1 % of handshakes needed a retransmit.
+  - The agent, and the backend's config preview, now render
+    `packet-queue-size: 1024`, for kea-dhcp4 and kea-dhcp6. On the same
+    ramp none was evicted, with an answer latency p99 of 1.17 s,
+    against the client's 4 s retransmit.
+  - The re-sends left over follow the kernel's drops on Kea's raw
+    socket, which `socket_drop` now counts (below).
+- **`socket_drop` counts the socket Kea serves from in raw mode
+  (#1283).**
+  - With `dhcp-socket-type: raw` (`dhcp_socket_mode: direct`, the
+    default), kea-dhcp4 reads every DHCPv4 packet from an AF_PACKET
+    socket, relayed unicast included. It only drains and discards the
+    copy on its UDP :67 fallback socket.
+  - `socket_drop` read that fallback. So it counted copies Kea would
+    have thrown away, and missed the drops that cost a client a
+    retransmit. On relayed bursts it read 0 against 41 real drops in
+    one run, and 300 against 505 in another.
+  - The agent now reads the AF_PACKET sockets' drops through sock_diag
+    in raw mode, which needs no privilege. In `udp` mode it reads the
+    UDP sockets as before. It takes the mode from the config it
+    rendered for Kea.
+  - The Stats tab, the InfluxDB export and the `dhcp_packets_dropped`
+    alert now get the right number, with no change of their own.
+
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and
@@ -2386,14 +2435,6 @@ the formatter handles the rest.
   above, a trial boot now exits before the commit. The previous
   slot stays the durable default and the next reboot reverts to
   it, as with a failed host migration.
-
-- **Allocate IP offers only the statuses it can allocate with (#1422).**
-  Its Type / Status menu offered `discovered`, but both of its requests
-  ("Next available" and "Specific IP") accept only the operator-settable
-  statuses and `dhcp`, so picking it always ended in a 422. `discovered`
-  is stamped by the nmap "Stamp alive hosts" action and is no longer
-  offered there; the inline status edit and Edit address, whose update
-  accepts every status, keep it.
 
 - **Backup/restore concurrency guards, "latest" is a real backup,
   and dead runs recover (#1574, #1571, #1515).** `latest/download`
