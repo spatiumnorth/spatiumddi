@@ -268,9 +268,7 @@ async def test_reimporting_own_export_keeps_inherited_ttl_inherited(
     )
     assert commit.status_code == 200, commit.text
     assert commit.json()["updated"] == 0
-    row = (
-        await db_session.execute(select(DNSRecord).where(DNSRecord.name == "ctl1"))
-    ).scalar_one()
+    row = (await db_session.execute(select(DNSRecord).where(DNSRecord.name == "ctl1"))).scalar_one()
     await db_session.refresh(row)
     assert row.ttl is None
 
