@@ -11,7 +11,8 @@ Aggregates four security-relevant signals into one rollup:
   means never-expires (intentional for service tokens) and is
   excluded from the count.
 * **Failed-login bursts** — audit rows with ``action="login"`` and
-  ``result="denied"`` in the trailing 24 h, grouped by source IP +
+  ``result="failure"`` (what ``/auth/login`` writes for a bad
+  credential; ``"error"`` rows are provider outages, not guesses) in the trailing 24 h, grouped by source IP +
   username so brute-force runs surface as a single row.
 * **Recent permission changes** — audit rows touching ``role`` /
   ``group`` / ``user`` resources within the trailing 7 d. The
@@ -223,7 +224,7 @@ async def security_summary(db: DB, current_user: CurrentUser) -> SecurityDashboa
             await db.execute(
                 select(AuditLog)
                 .where(AuditLog.action == "login")
-                .where(AuditLog.result == "denied")
+                .where(AuditLog.result == "failure")
                 .where(AuditLog.timestamp >= failed_window_start)
             )
         )

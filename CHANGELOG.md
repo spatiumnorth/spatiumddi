@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Security dashboard counts failed sign-ins, and the TSIG reveal
+  stops calling the secret hashed (#1836, #1837).** The failed-login
+  panel filtered audit rows on `result="denied"`, but `/auth/login`
+  writes `"failure"` for a bad credential, so a real failed sign-in
+  never appeared; it now reads `"failure"`, matching the Copilot
+  health tool. Provider outages are written as `"error"` and stay out,
+  as they are not guesses. The TSIG key reveal said the secret was
+  "hashed at rest and can't be recovered"; it is Fernet-encrypted
+  (SpatiumDDI must read it to sign updates) and is simply not shown
+  again, so the copy now says that.
 - **The DICOM AE, OT device and IPAM CSV imports read a file with classic
   Mac line endings (#1370, #1637, #1711).** Each importer read the
   pasted or uploaded text without handing its line endings to the csv
