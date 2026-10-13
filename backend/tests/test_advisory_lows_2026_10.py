@@ -542,7 +542,7 @@ async def test_bulk_delete_finds_a_reservation_linked_only_from_the_row(
     static = (await _statics(db_session))[0]
     row = await db_session.get(IPAddress, row_id)
     assert row is not None
-    row.static_assignment_id = static.id
+    row.static_assignment_id = str(static.id)
     static.ip_address_id = None
     await db_session.commit()
 
@@ -575,13 +575,13 @@ async def test_a_failed_reservation_push_aborts_before_any_change(
     async def _record_dns(db: AsyncSession, ip: IPAddress, subnet: Subnet, **kw: object) -> None:
         dns_calls.append(str(ip.address))
 
-    monkeypatch.setattr(ipam_router, "push_statics_bulk_delete", _refuse)
-    monkeypatch.setattr(ipam_router, "_sync_dns_record", _record_dns)
-
     _, headers = await _user_with_perms(
         db_session, [*_IPAM_WRITE, {"action": "delete", "resource_type": "dhcp_static"}]
     )
     row_id, _ = await _linked_row(db_session)
+    # Patched only after setup: creating the linked row syncs its DNS too.
+    monkeypatch.setattr(ipam_router, "push_statics_bulk_delete", _refuse)
+    monkeypatch.setattr(ipam_router, "_sync_dns_record", _record_dns)
 
     if path == "single":
         code, detail = await _single_delete(client, headers, row_id, True)

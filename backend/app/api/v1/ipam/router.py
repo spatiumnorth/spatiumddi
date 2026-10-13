@@ -822,9 +822,7 @@ async def _enforce_zone_token_scope(
             )
 
 
-def _static_delete_refusal(
-    user: Any, statics: list[DHCPStaticAssignment], what: str
-) -> str | None:
+def _static_delete_refusal(user: Any, statics: list[DHCPStaticAssignment], what: str) -> str | None:
     """The refusal text when an IPAM delete would remove DHCP reservations
     the caller may not delete, else ``None`` (GHSA-hxpx-gjqf-6p4f).
 
@@ -8669,7 +8667,9 @@ async def purge_orphans(
     # loop catches older orphans created before that code existed.
     lingering_statics = list(
         {
-            st.id: st for linked in (await _linked_statics_by_ip(db, rows)).values() for st in linked
+            st.id: st
+            for linked in (await _linked_statics_by_ip(db, rows)).values()
+            for st in linked
         }.values()
     )
     _require_static_delete(current_user, lingering_statics, "This purge")

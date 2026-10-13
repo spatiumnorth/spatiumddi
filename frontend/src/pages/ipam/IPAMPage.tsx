@@ -10684,9 +10684,7 @@ function BulkDeleteAddressesModal({
         const reasons = Object.values(res.skipped_reasons ?? {});
         setError(
           `${res.deleted_count} deleted; ${res.skipped.length} skipped` +
-            (reasons.length > 0
-              ? `. ${reasons.join(" ")}`
-              : " (system rows)."),
+            (reasons.length > 0 ? `. ${reasons.join(" ")}` : " (system rows)."),
         );
         // #516 — give the operator time to read the skipped-rows report.
         setTimeout(onDone, 4500);
