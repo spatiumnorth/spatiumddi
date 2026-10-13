@@ -106,8 +106,11 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 @asynccontextmanager
-async def task_session() -> AsyncGenerator[AsyncSession, None]:
-    """Per-Celery-task DB session — fresh engine, fresh loop binding."""
+async def task_sessionmaker() -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
+    """Per-Celery-task session factory, for task code that opens several
+    sessions in turn (a poll loop) and must not reach for the shared
+    ``AsyncSessionLocal``. One throwaway engine bound to the current loop,
+    disposed at exit — so N sessions cost one engine, not N (#1687)."""
 
     # A task needs exactly one connection; bound the pool to 1 (no
     # overflow) so a burst of N concurrent scheduled tasks opens N
@@ -126,12 +129,18 @@ async def task_session() -> AsyncGenerator[AsyncSession, None]:
         # engine above already does.
         pool_pre_ping=True,
     )
-    factory = async_sessionmaker(task_engine, class_=AsyncSession, expire_on_commit=False)
     try:
-        async with factory() as session:
-            yield session
+        yield async_sessionmaker(task_engine, class_=AsyncSession, expire_on_commit=False)
     finally:
         await task_engine.dispose()
+
+
+@asynccontextmanager
+async def task_session() -> AsyncGenerator[AsyncSession, None]:
+    """Per-Celery-task DB session — fresh engine, fresh loop binding."""
+    async with task_sessionmaker() as factory:
+        async with factory() as session:
+            yield session
 
 
 # ── Global soft-delete filter ──────────────────────────────────────────────

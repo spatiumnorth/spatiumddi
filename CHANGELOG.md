@@ -94,6 +94,14 @@ the formatter handles the rest.
   stayed in the zone until the 24 h stale sweep, or for good without
   it, and http-01 tokens stayed in the database. The teardown now
   opens its sessions with `task_session()`, as the order itself does.
+  The same flaw sat in the DNS-01 solve: its wait for the agents to
+  apply the challenge TXT polled through the shared factory, so in a
+  worker that had run a task before, the first poll raised and the
+  order ended `invalid` with `unexpected: Event loop is closed`. The
+  wait helpers now take a session factory, and the solve passes one
+  from the new `task_sessionmaker()` (one per-task engine for the
+  whole poll loop). The acme-dns provider's API path still uses the
+  shared factory, which is correct in a request handler.
 
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single

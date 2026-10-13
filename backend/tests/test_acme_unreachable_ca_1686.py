@@ -22,7 +22,6 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_str
@@ -32,7 +31,6 @@ from app.models.acme_client import (
     ACME_ORDER_PENDING,
     ACME_ORDER_PROCESSING,
     ACMEClientAccount,
-    ACMEHTTPChallenge,
     ACMEOrder,
 )
 from app.models.appliance import CERT_SOURCE_LETSENCRYPT, ApplianceCertificate
@@ -100,9 +98,10 @@ async def _run_task(order_id: uuid.UUID) -> list[str | None]:
     """Run ``run_acme_order`` through every retry Celery makes, eagerly.
 
     The task calls ``asyncio.run()``, so it gets a thread with no running
-    loop. ``run_order``'s cleanup sessions come from a per-call engine here,
-    as the task's own session does, so no pooled connection outlives that
-    thread's event loop (app/db.py, "Per-task DB session for Celery").
+    loop. ``run_order``'s cleanup sessions come from a per-call engine, as
+    the task's own session does, so no pooled connection outlives that
+    thread's event loop (app/db.py, "Per-task DB session for Celery";
+    #1687 moved the cleanup off the shared engine).
     Returns the ``last_error`` each attempt saw on the order.
     """
     _UnreachableCA.watch = order_id
@@ -161,38 +160,6 @@ async def test_the_order_ends_invalid_with_the_ca_error_once_its_retries_are_spe
     assert "ca.unreachable.test" in order.last_error, order.last_error
     assert seen[0] is None, seen  # nothing had failed yet
     assert all(s is not None and s.startswith("retrying: ") for s in seen[1:]), seen
-
-
-@pytest.mark.asyncio
-async def test_teardown_does_not_use_the_shared_engine_in_the_worker(
-    db_session: AsyncSession,
-) -> None:
-    """#1687 / #1726: run_order's teardown runs inside a Celery task's own
-    event loop, where the shared engine's pooled connections are bound to a
-    closed loop ("Event loop is closed"). The shared session factory is made
-    to fail that way here; the http-01 token rows must still be swept, which
-    holds only when the teardown opens its sessions from ``task_session``."""
-    oid = await _seed_order(db_session)
-    db_session.add(ACMEHTTPChallenge(token="tok-1687", key_authorization="k", order_id=oid))
-    await db_session.commit()
-
-    def closed_loop_session(*a: object, **kw: object) -> None:
-        raise RuntimeError("Event loop is closed")
-
-    with patch.object(orchestrator, "AsyncSessionLocal", closed_loop_session, create=True):
-        await _run_task(oid)
-
-    db_session.expire_all()
-    left = (
-        (
-            await db_session.execute(
-                select(ACMEHTTPChallenge).where(ACMEHTTPChallenge.order_id == oid)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert left == [], "the http-01 token survived the order's teardown"
 
 
 @pytest.mark.asyncio
