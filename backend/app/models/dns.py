@@ -1624,8 +1624,10 @@ DNSSEC_ALGORITHMS: frozenset[str] = frozenset(
     }
 )
 
-# IANA DNS Security Algorithm Numbers → mnemonic. ``DNSKey.algorithm`` stores
-# the number (#1812); the mnemonic is derived for display, never stored.
+# IANA "DNS Security Algorithm Numbers" registry → mnemonic, for every key
+# algorithm a DNSKEY can carry (deprecated ones included: an old zone can still
+# report them). ``DNSKey.algorithm`` stores the number (#1812); the mnemonic
+# is derived for display, never stored. Reserved / unassigned → None.
 DNSSEC_ALGORITHM_NAMES: dict[int, str] = {
     1: "RSAMD5",
     3: "DSA",
@@ -1639,6 +1641,11 @@ DNSSEC_ALGORITHM_NAMES: dict[int, str] = {
     14: "ECDSAP384SHA384",
     15: "ED25519",
     16: "ED448",
+    17: "SM2SM3",
+    18: "MLDSA44",
+    23: "ECC-GOST12",
+    253: "PRIVATEDNS",
+    254: "PRIVATEOID",
 }
 
 

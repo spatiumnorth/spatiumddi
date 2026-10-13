@@ -58,3 +58,14 @@ async def test_dnssec_info_with_reported_keys(client: AsyncClient, db_session: A
     assert keys[1111]["algorithm_name"] == "ECDSAP256SHA256"
     assert keys[2222]["algorithm"] == 99
     assert keys[2222]["algorithm_name"] is None
+
+
+def test_algorithm_mnemonics_follow_the_iana_registry():
+    from app.models.dns import dnssec_algorithm_name
+
+    # Registry values (iana.org/assignments/dns-sec-alg-numbers).
+    for number, name in ((8, "RSASHA256"), (15, "ED25519"), (17, "SM2SM3"), (254, "PRIVATEOID")):
+        assert dnssec_algorithm_name(number) == name
+    # 0 is DELETE (a CDS/CDNSKEY sentinel, not a key) and 4 is reserved.
+    for number in (0, 4, 19, None):
+        assert dnssec_algorithm_name(number) is None
