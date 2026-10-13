@@ -540,9 +540,10 @@ def _raw_socket_or_skip():
     if not sys.platform.startswith("linux"):
         pytest.skip("AF_PACKET and sock_diag are Linux-only")
     try:
-        return socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+        raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
     except PermissionError:
         pytest.skip("opening an AF_PACKET socket needs CAP_NET_RAW")
+    return raw
 
 
 def test_sock_diag_reads_a_real_raw_sockets_drops():
