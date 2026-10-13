@@ -33,6 +33,13 @@ from app.drivers.dhcp.base import (
 
 logger = structlog.get_logger(__name__)
 
+# #1283 — Kea's multi-threading ``packet-queue-size``. The agent renders it
+# (``spatium_dhcp_agent.render_kea.KEA_PACKET_QUEUE_SIZE``, where the reasons
+# and the measurement live) because Kea's own 64 evicts queued requests, with
+# no counter, when an arrival burst outruns the workers. The preview shows the
+# same value so an operator reading it sees the queue the server runs.
+KEA_PACKET_QUEUE_SIZE = 1024
+
 
 # Map of SpatiumDDI option-name → Kea option-data ``name`` in the default
 # ``dhcp4`` option space. Kea accepts standard DHCPv4 options by their
@@ -572,9 +579,11 @@ class KeaDriver(DHCPDriver):
                 # the packet-worker pool from the machine's CPU count, not
                 # from the cgroup share the container holds. See
                 # ``DHCPServerGroup.kea_thread_pool_size`` for the numbers.
+                # #1283 — the queue size the agent renders, see the constant.
                 "multi-threading": {
                     "enable-multi-threading": True,
                     "thread-pool-size": bundle.kea_thread_pool_size,
+                    "packet-queue-size": KEA_PACKET_QUEUE_SIZE,
                 },
                 # Issue #365 — ``raw`` (group socket_mode "direct") receives
                 # broadcast DISCOVERs from directly-attached clients; ``udp``
@@ -626,6 +635,7 @@ class KeaDriver(DHCPDriver):
                 "multi-threading": {
                     "enable-multi-threading": True,
                     "thread-pool-size": bundle.kea_thread_pool_size,
+                    "packet-queue-size": KEA_PACKET_QUEUE_SIZE,
                 },
                 "lease-database": {
                     "type": "memfile",

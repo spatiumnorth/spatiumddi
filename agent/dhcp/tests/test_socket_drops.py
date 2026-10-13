@@ -10,16 +10,25 @@ not produce on demand (a socket vanishing, an inode reused, procfs absent).
 
 from __future__ import annotations
 
+import json
 import os
 import socket
+import struct
 import sys
+import time
 
 import pytest
 
 from spatium_dhcp_agent.socket_drops import (
     DHCP_PORTS,
+    PacketSocket,
     SocketDropCounter,
+    _packet_diag_request,
+    _parse_packet_diag,
     _parse_proc_udp,
+    dump_packet_sockets,
+    kea_socket_type,
+    read_packet_drops,
     read_socket_drops,
 )
 
@@ -160,7 +169,9 @@ def _counter_over(tmp_path, snapshots):
     like to it.
     """
     path = tmp_path / "udp"
-    counter = SocketDropCounter()
+    # ``udp`` socket mode, where the UDP sockets are the whole count: these
+    # tests are about them. Raw mode has its own tests below (#1283).
+    counter = SocketDropCounter(packet_drops=dict, socket_type=lambda: "udp")
 
     def tick(rows):
         # rows=None models procfs becoming unreadable: point the counter at a
@@ -243,3 +254,318 @@ def test_a_partial_read_is_not_a_sample(tmp_path):
     # A genuinely absent file is different and stays a valid partial answer:
     # no IPv6 stack means no v6 sockets to miss.
     assert read_socket_drops(paths=(v4, str(tmp_path / "gone"))) == {"1": 5}
+
+
+# ── kea's raw AF_PACKET sockets (#1283) ─────────────────────────────────────
+#
+# In ``dhcp-socket-type: raw``, kea-dhcp4 serves relayed unicast from an
+# AF_PACKET socket and drains and discards the UDP copy, so the drops that
+# cost a client a retransmit are on the raw socket. Measured on relayed
+# bursts (AF_PACKET against UDP :67):
+#   - +261 against +126;
+#   - 41 against 0;
+#   - +505 against +300, where the 505 were exactly the requests kea never
+#     received.
+# In all three, ``socket_drop`` reported only the UDP number.
+
+
+def _nlmsg(mtype: int, body: bytes) -> bytes:
+    length = 16 + len(body)
+    return struct.pack("=IHHII", length, mtype, 2, 1, 0) + body + b"\0" * (-length % 4)
+
+
+def _attr(atype: int, payload: bytes) -> bytes:
+    alen = 4 + len(payload)
+    return struct.pack("=HH", alen, atype) + payload + b"\0" * (-alen % 4)
+
+
+def _diag(inode, sock_type=3, proto=0x0003, uid=100, drops=0, meminfo=True):
+    """One packet_diag reply as the kernel lays it out: the message, then
+    PACKET_DIAG_INFO (0), PACKET_DIAG_UID (5) and PACKET_DIAG_MEMINFO (6)."""
+    msg = struct.pack("=BBHI2I", 17, sock_type, proto, inode, 0, 0)
+    attrs = _attr(0, struct.pack("=6I", 2, 0, 0, 0, 0, 0)) + _attr(5, struct.pack("=I", uid))
+    if meminfo:
+        attrs += _attr(6, struct.pack("=9I", 0, 212992, 0, 212992, 0, 0, 888, 0, drops))
+    return _nlmsg(20, msg + attrs)
+
+
+_DONE = _nlmsg(3, struct.pack("=i", 0))
+
+
+def test_the_dump_request_asks_for_info_and_meminfo():
+    length, mtype, flags, _seq, _pid = struct.unpack_from("=IHHII", _packet_diag_request())
+    family, _proto, _pad, _ino, show = struct.unpack_from("=BBHII", _packet_diag_request(), 16)
+    assert (length, mtype, flags) == (36, 20, 0x301)
+    assert (family, show) == (17, 0x11)
+
+
+def test_the_parser_reads_type_protocol_uid_and_drops():
+    rows, finished = _parse_packet_diag(_diag(386970, drops=302) + _diag(386972) + _DONE)
+    assert finished is True
+    assert rows == [
+        PacketSocket(386970, 3, 0x0003, 100, 302),
+        PacketSocket(386972, 3, 0x0003, 100, 0),
+    ]
+
+
+def test_a_dump_split_across_reads_is_not_finished_early():
+    rows, finished = _parse_packet_diag(_diag(1, drops=5))
+    assert (rows, finished) == ([PacketSocket(1, 3, 3, 100, 5)], False)
+
+
+def test_a_refused_dump_raises_with_the_kernels_errno():
+    with pytest.raises(OSError) as e:
+        _parse_packet_diag(_nlmsg(2, struct.pack("=i", -2) + b"\0" * 16))
+    assert e.value.errno == 2
+
+
+def _sockets(*rows):
+    return lambda: list(rows)
+
+
+def test_only_keas_raw_sockets_are_counted():
+    """kea's are the raw ETH_P_ALL sockets owned by this user that this
+    process does not hold itself. The agent's own sniffers (inode 2 here)
+    are threads of the agent; root's socket and any other shape are not
+    kea's."""
+    out = read_packet_drops(
+        dump=_sockets(
+            PacketSocket(1, 3, 0x0003, 100, 302),  # kea, enp1s0
+            PacketSocket(2, 3, 0x0003, 100, 50),  # the agent's own sniffer
+            PacketSocket(3, 3, 0x0003, 0, 9),  # someone else's, as root
+            PacketSocket(4, 2, 0x0003, 100, 7),  # SOCK_DGRAM
+            PacketSocket(5, 3, 0x0800, 100, 6),  # ETH_P_IP only
+        ),
+        own_inodes=lambda: {2},
+        uid=100,
+    )
+    assert out == {"packet:1": 302}
+
+
+def test_no_raw_socket_is_zero_not_unknown():
+    """Kea holding no raw socket (starting, or a raw open that failed) is a
+    real, empty answer."""
+    assert read_packet_drops(dump=_sockets(), own_inodes=set, uid=100) == {}
+
+
+def _refused():
+    raise OSError(2, "No such file or directory")
+
+
+def _proc_packet(tmp_path, *rows):
+    path = tmp_path / "packet"
+    head = "sk               RefCnt Type Proto  Iface R Rmem   User   Inode\n"
+    path.write_text(head + "".join(f"{r}\n" for r in rows))
+    return str(path)
+
+
+def test_unreadable_drops_with_a_kea_socket_open_are_unknown(tmp_path):
+    """Without sock_diag the raw socket's drops cannot be read. If kea holds
+    one, the sample is unknown: the UDP half alone would measure a copy."""
+    listed = _proc_packet(tmp_path, "ffff8b2d00000000 3      3    0003   2     1 0      100    1")
+    assert read_packet_drops(dump=_refused, own_inodes=set, proc_packet=listed, uid=100) is None
+
+
+def test_unreadable_drops_with_nothing_to_miss_keep_the_udp_answer(tmp_path):
+    """No raw socket of kea's open: nothing is missed, so a kernel without
+    packet_diag must not turn a valid sample into unknown."""
+    listed = _proc_packet(tmp_path, "ffff8b2d00000000 3      3    0003   2     1 0      0      3")
+    assert read_packet_drops(dump=_refused, own_inodes=set, proc_packet=listed, uid=100) == {}
+
+
+def test_a_socket_without_meminfo_is_unknown():
+    out = read_packet_drops(
+        dump=_sockets(PacketSocket(1, 3, 0x0003, 100, None)), own_inodes=set, uid=100
+    )
+    assert out is None
+
+
+def _counter_with_packets(tmp_path, ticks):
+    """A real SocketDropCounter over a UDP fixture, a scripted AF_PACKET read
+    and a scripted socket mode. ``ticks`` is
+    ``[(udp_rows, packet_answer, mode), ...]``. Returns each sample and
+    whether that sample asked for the AF_PACKET read."""
+    path = tmp_path / "udp"
+    now: dict = {}
+
+    def packet():
+        now["asked"] = True
+        return now["packet"]
+
+    counter = SocketDropCounter(packet_drops=packet, socket_type=lambda: now["mode"])
+    out, asked = [], []
+    for rows, answer, mode in ticks:
+        now.update(packet=answer, mode=mode, asked=False)
+        path.write_text(_proc(*rows))
+        out.append(counter.sample_from((str(path),)))
+        asked.append(now["asked"])
+    return out, asked
+
+
+def test_raw_mode_counts_keas_packet_socket_not_its_udp_fallback(tmp_path):
+    """The R64 run's shape. In raw mode the :67 socket is LPF's fallback. Its
+    drops (+7 here) are copies kea would have thrown away, and the loss is on
+    the AF_PACKET socket beside it (41 -> 302). DHCPv6's :547 socket is
+    kea-dhcp6's own, and still counts (+3)."""
+    out, _asked = _counter_with_packets(
+        tmp_path,
+        [
+            ([_row("0043", "1", 40), _row("0223", "2", 2)], {"packet:9": 41}, "raw"),
+            ([_row("0043", "1", 47), _row("0223", "2", 5)], {"packet:9": 302}, "raw"),
+        ],
+    )
+    assert out == [None, 261 + 3]
+
+
+def test_udp_mode_counts_the_udp_sockets_and_never_asks_sock_diag(tmp_path):
+    """In ``udp`` mode (``dhcp_socket_mode: relay``) kea serves from its UDP
+    sockets, so they are the whole count, as before #1283. The raw read is
+    not made at all, so a kernel without packet_diag costs nothing here."""
+    out, asked = _counter_with_packets(
+        tmp_path,
+        [
+            ([_row("0043", "1", 40), _row("0223", "2", 2)], None, "udp"),
+            ([_row("0043", "1", 47), _row("0223", "2", 5)], None, "udp"),
+        ],
+    )
+    assert out == [None, 7 + 3]
+    assert asked == [False, False]
+
+
+def test_an_unknown_mode_counts_every_socket(tmp_path):
+    """With no readable config, count both kinds rather than guess. No loss
+    is left out, though copies may be counted with it."""
+    out, _asked = _counter_with_packets(
+        tmp_path,
+        [
+            ([_row("0043", "1", 40), _row("0223", "2", 2)], {"packet:9": 41}, None),
+            ([_row("0043", "1", 47), _row("0223", "2", 5)], {"packet:9": 302}, None),
+        ],
+    )
+    assert out == [None, 7 + 3 + 261]
+
+
+def test_raw_mode_fallbacks_with_no_raw_socket_found_are_unknown_not_zero(tmp_path):
+    """Kea opens its AF_PACKET socket beside every :67 fallback, and closes
+    the fallback if the raw open fails. So fallbacks with no raw socket of
+    kea's found mean kea's sockets could not be told apart, for example if
+    kea and the agent ever ran as different users. That sample is unknown:
+    reading DHCPv4 as 0 would be the false all-clear #980 exists to prevent."""
+    out, _asked = _counter_with_packets(
+        tmp_path,
+        [
+            ([_row("0043", "1", 40), _row("0223", "2", 2)], {}, "raw"),
+            ([_row("0043", "1", 47), _row("0223", "2", 5)], {}, "raw"),
+        ],
+    )
+    assert out == [None, None]
+
+
+def test_raw_mode_with_no_dhcp4_socket_at_all_is_a_real_zero(tmp_path):
+    """Kea starting, or not serving DHCPv4: no fallback and no raw socket. That
+    is a real answer, and the DHCPv6 sockets still count."""
+    out, _asked = _counter_with_packets(
+        tmp_path,
+        [
+            ([_row("0223", "2", 2)], {}, "raw"),
+            ([_row("0223", "2", 5)], {}, "raw"),
+        ],
+    )
+    assert out == [None, 3]
+
+
+def test_a_socket_mode_change_restarts_the_baseline(tmp_path):
+    """Switching mode changes which sockets are summed. Diffing against the
+    old baseline would charge the :67 socket's whole-lifetime count (450) to
+    one bucket. So the sample at the change is unknown, and the next one
+    counts from it."""
+    out, _asked = _counter_with_packets(
+        tmp_path,
+        [
+            ([_row("0043", "1", 400)], {"packet:9": 10}, "raw"),
+            ([_row("0043", "1", 450)], {"packet:9": 15}, "raw"),
+            ([_row("0043", "1", 450)], None, "udp"),
+            ([_row("0043", "1", 452)], None, "udp"),
+        ],
+    )
+    assert out == [None, 5, None, 2]
+
+
+def test_kea_reopening_its_raw_socket_contributes_from_zero(tmp_path):
+    """kea reopens its sockets on reconfiguration: a new inode counts from 0."""
+    out, _asked = _counter_with_packets(
+        tmp_path,
+        [
+            ([_row("0043", "1", 0)], {"packet:9": 500}, "raw"),
+            ([_row("0043", "1", 0)], {"packet:10": 12}, "raw"),
+        ],
+    )
+    assert out == [None, 12]
+
+
+def test_an_unreadable_raw_half_fails_the_whole_sample(tmp_path):
+    """As for the two procfs files: a partial read is no read, and the next
+    sample must not diff against a stale baseline."""
+    out, _asked = _counter_with_packets(
+        tmp_path,
+        [
+            ([_row("0223", "1", 10)], {"packet:9": 10}, "raw"),
+            ([_row("0223", "1", 20)], None, "raw"),
+            ([_row("0223", "1", 900)], {"packet:9": 900}, "raw"),
+        ],
+    )
+    assert out == [None, None, None]
+
+
+def test_the_socket_mode_comes_from_the_rendered_config(tmp_path):
+    conf = tmp_path / "kea-dhcp4.conf"
+
+    def mode(doc):
+        conf.write_text(doc if isinstance(doc, str) else json.dumps(doc))
+        return kea_socket_type(conf)
+
+    assert mode({"Dhcp4": {"interfaces-config": {"dhcp-socket-type": "raw"}}}) == "raw"
+    assert mode({"Dhcp4": {"interfaces-config": {"dhcp-socket-type": "udp"}}}) == "udp"
+    # kea's own default for DHCPv4; its config-get leaves the key out for it
+    assert mode({"Dhcp4": {"interfaces-config": {"interfaces": ["*"], "re-detect": True}}}) == "raw"
+    assert mode({"Dhcp4": {}}) == "raw"
+    # unknown, never a guess
+    assert mode('{ "Dhcp4": { // a comment kea accepts and JSON does not') is None
+    assert mode({"Dhcp6": {}}) is None
+    assert mode({"Dhcp4": {"interfaces-config": {"dhcp-socket-type": "bpf"}}}) is None
+    assert kea_socket_type(tmp_path / "absent.conf") is None
+
+
+def _raw_socket_or_skip():
+    if not sys.platform.startswith("linux"):
+        pytest.skip("AF_PACKET and sock_diag are Linux-only")
+    try:
+        raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+    except PermissionError:
+        pytest.skip("opening an AF_PACKET socket needs CAP_NET_RAW")
+    return raw
+
+
+def test_sock_diag_reads_a_real_raw_sockets_drops():
+    """The load-bearing one, as for /proc/net/udp above: open a raw ETH_P_ALL
+    socket on lo with the smallest receive buffer, overrun it, and check that
+    the number sock_diag returns is the number the kernel counted on the
+    socket itself (``PACKET_STATISTICS``, which only the owner can read).
+    Only this can catch a wrong offset in the netlink structs."""
+    raw = _raw_socket_or_skip()
+    with raw:
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1)
+        raw.bind(("lo", 0))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tx:
+            for _ in range(200):
+                tx.sendto(b"x" * 512, ("127.0.0.1", 9))
+        time.sleep(0.2)
+        inode = os.fstat(raw.fileno()).st_ino
+        mine = [s for s in dump_packet_sockets() if s.inode == inode]
+        # PACKET_STATISTICS (SOL_PACKET 263, option 6): tp_packets, tp_drops.
+        _packets, tp_drops = struct.unpack("=II", raw.getsockopt(263, 6, 8))
+    assert len(mine) == 1
+    sock = mine[0]
+    assert (sock.sock_type, sock.protocol, sock.uid) == (3, 0x0003, os.geteuid())
+    assert sock.drops > 0
+    assert sock.drops == tp_drops

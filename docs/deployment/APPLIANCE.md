@@ -114,9 +114,13 @@ not the operator's:
   A larger socket receive buffer does not help: with 8 MiB of buffer the drops
   vanish but a DORA takes 34 s instead of 1.5 s, because Kea then answers
   stale requests whole retransmit rounds late. Nor does a larger Kea
-  `packet-queue-size`: 64 → 2048 changed neither throughput nor drops, because
-  that queue sits behind the receive thread and the problem is the receive
-  thread not being scheduled.
+  `packet-queue-size` raise throughput. 64 → 2048 changed neither throughput
+  nor drops at a sustained 12,000 pkt/s, because that queue sits behind the
+  receive thread and the problem is the receive thread not being scheduled.
+  Short bursts are different (spatiumddi#1283). Kea's default queue of 64
+  evicts the oldest requests, counted nowhere, when a burst outruns the
+  worker, so SpatiumDDI renders `packet-queue-size: 1024`. See
+  [`DHCP.md`](../features/DHCP.md#keas-packet-queue).
 - Kea's own packet-worker pool is sized from the **machine's** CPU count, not
   from the container's cgroup share, so on a 4 vCPU appliance it starts four
   workers that compete with the one thread draining the receive socket
