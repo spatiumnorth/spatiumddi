@@ -30,7 +30,7 @@ async def test_real_failed_signin_is_counted_on_security_dashboard(
     admin = User(
         username=f"adm-{uuid.uuid4().hex[:8]}",
         email=f"{uuid.uuid4().hex[:8]}@x.com",
-        display_name="Admin",
+        display_name=f"Admin {uuid.uuid4().hex[:6]}",
         hashed_password=hash_password(_PASSWORD),
         auth_source="local",
         is_active=True,
@@ -55,4 +55,6 @@ async def test_real_failed_signin_is_counted_on_security_dashboard(
     body = r.json()
     assert body["failed_login_total"] == 2
     rows = body["failed_login_top_sources"]
-    assert [(x["user_display_name"], x["failure_count"]) for x in rows] == [(admin.username, 2)]
+    # Grouped by the display name the failure row records, and the source IP.
+    assert [(x["user_display_name"], x["failure_count"]) for x in rows] == [(admin.display_name, 2)]
+    assert rows[0]["source_ip"]

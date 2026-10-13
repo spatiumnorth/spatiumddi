@@ -11,8 +11,10 @@ Aggregates four security-relevant signals into one rollup:
   means never-expires (intentional for service tokens) and is
   excluded from the count.
 * **Failed-login bursts** — audit rows with ``action="login"`` and
-  ``result="failure"`` (what ``/auth/login`` writes for a bad
-  credential; ``"error"`` rows are provider outages, not guesses) in the trailing 24 h, grouped by source IP +
+  ``result="failure"`` (what every sign-in path writes for a rejected
+  attempt: bad password, unknown user, locked or disabled account, bad
+  MFA code, external-provider rejection; ``"error"`` rows are provider
+  outages, not guesses) in the trailing 24 h, grouped by source IP +
   username so brute-force runs surface as a single row.
 * **Recent permission changes** — audit rows touching ``role`` /
   ``group`` / ``user`` resources within the trailing 7 d. The
