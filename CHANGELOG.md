@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting an A/AAAA on Technitium no longer loses its PTR (#1800).**
+  Technitium's web API deletes the matching PTR with the A/AAAA when the
+  reverse zone is on the same server, and #1768 only repaired the structural
+  reconcile. A record-op delete left the PTR gone until the next structural
+  pass. The control plane now queues a PTR create after the delete for any
+  PTR it still owns in a reverse zone of the group (`technitium` and
+  `technitium_api`, single, batch and bulk), decided against the database so
+  a PTR deleted earlier is not resurrected from a stale bundle. A delete that
+  fails and is retried after the PTR create applied re-asserts the PTR again
+  when its retry is acknowledged. Edits already
+  ride `update` ops, which do not touch the PTR (checked in the v15.4.0
+  source). A PTR in a reverse zone SpatiumDDI does not manage is still
+  removed with its A record; this is documented in `DNS_DRIVERS.md`. Also
+  corrects the Technitium CNAME-conflict text quoted in comments and docs: a
+  primary zone answers "a CNAME record cannot exists with other record types
+  for the same name", and both drivers count it as a failure (test added).
+
 - **Technitium token and auth lifecycle (#1772).** The agentless
   `technitium_api` setup text said Zones: Modify + DnsClient: View, which
   cannot delete zones and sees no pre-existing zone; the form, API

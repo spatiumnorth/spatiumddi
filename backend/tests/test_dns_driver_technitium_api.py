@@ -565,6 +565,8 @@ async def test_replayed_op_is_an_idempotent_noop(
     [
         "Cannot add record: CNAME record already exists for the same name.",
         "Cannot add record: DNAME record already exists for the same name.",
+        # The real primary-zone text (AuthZone.cs:135/145 TrySetRecords, v15.4.0).
+        "Cannot add record: a CNAME record cannot exists with other record types for the same name.",
         "Cannot add record: CNAME record already exists for the same name",
         # Raised for a CNAME/DNAME add with overwrite=false whatever the
         # existing record's value, so it does not prove ours is there.
@@ -580,7 +582,7 @@ async def test_conflict_refusal_is_a_failure_not_a_noop(
     means the record was NOT written; counting it as converged marks the op
     applied while the server keeps serving the old data."""
     drv, _ = _driver(monkeypatch, [_FakeResponse({"status": "error", "errorMessage": message})])
-    with pytest.raises(Exception, match="(?i)already exists|no such record"):
+    with pytest.raises(Exception, match="(?i)already exists|no such record|cannot exists"):
         await drv.apply_record_change(
             _Server({"api_url": "https://x.test", "api_token": "t"}),
             _change("create", rrset=_rrset("10.0.0.1")),

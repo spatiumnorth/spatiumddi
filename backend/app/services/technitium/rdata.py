@@ -816,9 +816,12 @@ __all__ = [
 # ── "Already in that state" answers (#1770) ────────────────────────────
 #
 # Exact messages, not a substring: the bare ``"already exists"`` also matched
-# the CNAME/DNAME conflict refusal "Cannot add record: CNAME record already
-# exists for the same name." (AuthZone.cs:817, v15.4.0), which is a failure
-# (the record does not exist; old data keeps being served). Upstream,
+# the CNAME/DNAME conflict refusals, which are failures (the record does not
+# exist; old data keeps being served). A primary zone answers "Cannot add
+# record: a CNAME record cannot exists with other record types for the same
+# name." (AuthZone.cs:135/145 ``TrySetRecords``, v15.4.0); "Cannot add record:
+# CNAME record already exists for the same name." is the base
+# ``AuthZone.SetRecords`` text (AuthZone.cs:817). Upstream,
 # TechnitiumSoftware/DnsServer v15.4.0:
 #   WebServiceZonesApi.cs:4229          "Cannot add record: record already exists."
 #   WebServiceZonesApi.cs:4336-4596     "Cannot delete record: no such record exists."

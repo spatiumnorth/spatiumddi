@@ -500,9 +500,13 @@ _TSIG_ALGORITHMS = frozenset(
 
 # Exact Technitium "the server is already in that state" answers (#1770).
 # Matching the bare substring "already exists" also swallowed Technitium's
-# CNAME/DNAME conflict refusal, "Cannot add record: CNAME record already
-# exists for the same name." (AuthZone.cs:817, v15.4.0), which is a REFUSAL:
-# the record does not exist and the server keeps serving the old data.
+# CNAME/DNAME conflict refusals, which are REFUSALS: the record does not exist
+# and the server keeps serving the old data. A PRIMARY zone answers "Cannot add
+# record: a CNAME record cannot exists with other record types for the same
+# name." (AuthZone.cs:135/145 ``TrySetRecords``, v15.4.0, no "already exists"
+# in it); "Cannot add record: CNAME record already exists for the same name."
+# is the base ``AuthZone.SetRecords`` text (AuthZone.cs:817), kept here as a
+# defensive case. Neither is in the no-op set below.
 # Upstream (TechnitiumSoftware/DnsServer v15.4.0):
 #   WebServiceZonesApi.cs:4229  "Cannot add record: record already exists."
 #   WebServiceZonesApi.cs:4336-4596  "Cannot delete record: no such record exists."
