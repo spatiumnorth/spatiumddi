@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Bulk delete requires the `delete` action, like deleting one row
+  does.** The router-level permission gates mapped every `POST` to
+  `write`, so a role holding `write` but not `delete` was refused
+  `DELETE /x/{id}` yet could remove up to 500 rows through
+  `POST /x/bulk-delete` (ASNs, VRFs, overlays, multicast groups,
+  circuits, services, customers, sites, providers, DNS records and IPAM
+  addresses). IPAM's Clean Orphans (`POST
+  /ipam/subnets/{id}/orphans/purge`) permanently deletes addresses the
+  same way and was gated the same. The gates now treat these POSTs as
+  `delete`, and IPAM's Bulk delete and Clean Orphans buttons ask for
+  `delete` before offering themselves. IPAM's per-subnet and
+  address-set write checks on each row are unchanged. A role that
+  relied on `write` alone for bulk delete needs `delete` added. A test
+  walks the route table so a new multi-row delete route without the
+  check fails CI.
+
 - **An IPAM template apply lists only the columns it changed (#1634).**
   `fields_written`, in the response and in the apply's audit row, named
   every column that was empty on the target, including ones the template
