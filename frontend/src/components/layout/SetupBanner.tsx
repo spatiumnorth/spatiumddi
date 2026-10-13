@@ -3,6 +3,7 @@ import { Link, useLocation } from "react-router-dom";
 import { ArrowRight, Sparkles } from "lucide-react";
 
 import { applianceSetupApi, versionApi } from "@/lib/api";
+import { usePermissions } from "@/hooks/usePermissions";
 
 /**
  * Phase 4g — first-boot setup-wizard banner.
@@ -18,6 +19,9 @@ import { applianceSetupApi, versionApi } from "@/lib/api";
  * polish steps.
  */
 export function SetupBanner() {
+  // #1342 — finishing first-boot setup takes `admin` on `appliance`;
+  // the call to action is for a user who can answer it.
+  const canFinishSetup = usePermissions().can("admin", "appliance");
   const location = useLocation();
 
   const version = useQuery({
@@ -35,6 +39,7 @@ export function SetupBanner() {
   });
 
   if (!version.data?.appliance_mode) return null;
+  if (!canFinishSetup) return null;
   if (!setup.data || setup.data.complete) return null;
   if (location.pathname.startsWith("/appliance/setup")) return null;
 

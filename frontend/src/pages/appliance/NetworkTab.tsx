@@ -51,9 +51,9 @@ export function NetworkTab() {
             Network &amp; Host
           </h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            Read-only snapshot for now. Hostname rename, static-IP toggle,
-            nftables firewall editor, and SSH key upload are deferred to a
-            follow-up — each needs a privileged host-side writer.
+            The host&apos;s hostname, addresses, uptime and version, with the
+            settings that belong to it below. The host firewall has its own tab,
+            and SSH keys theirs.
           </p>
         </div>
         <button

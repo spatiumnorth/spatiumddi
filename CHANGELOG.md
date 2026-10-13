@@ -103,6 +103,105 @@ the formatter handles the rest.
   whole poll loop). The acme-dns provider's API path still uses the
   shared factory, which is correct in a request handler.
 
+- **The DICOM AE, OT device and IPAM CSV imports read a file with classic
+  Mac line endings (#1370, #1637, #1711).** Each importer read the
+  pasted or uploaded text without handing its line endings to the csv
+  reader, so a carriage return not followed by a line feed (a file
+  saved with CR-only line endings, or a paste that keeps them) reached
+  it inside a field. The reader refused it, and DICOM AE import, OT
+  device import and all four IPAM import routes (subnets and
+  addresses, preview and commit) answered 500 with nothing saying the
+  line endings were the problem. The three importers now open the
+  text through one shared reader that takes `\n`, `\r\n` and a bare
+  `\r` alike, and anything else the csv reader refuses (a cell over
+  its size limit, say) is a 422 that gives the reason.
+
+- **The Appliance tabs offer a read-only user none of the appliance's
+  actions (#1342).** The built-in Viewer was offered Reboot host, every
+  pod's Restart and Stop (Stop has no confirm), maintenance mode and
+  Reboot now, the host firewall (enforcement, Web UI access, posture
+  presets, policies and their rules) and first-boot Finish setup, all
+  enabled, each refused by the server. Each now asks for admin on the
+  appliance, as its route does, and is otherwise disabled with the
+  reason. The first-boot setup banner is shown only to a user who can
+  finish setup, and Network & Host no longer says the firewall editor is
+  still to come. The firewall log toggle and the aliases (New alias,
+  Delete) are gated the same way, and a refused Reboot host, pod action,
+  maintenance toggle or Reboot now shows the server's reason instead of
+  leaving the dialog or page as it was.
+
+- **Administration, Tools and the IPAM side pages offer a read-only user
+  no write it would be refused (#1341).** The built-in Viewer was
+  offered New Role (and every role's Edit, Clone and Delete), New User,
+  New Group, New subscription, New rule, New template, New domain, the
+  Features page's module switches, New schedule, Start scan, Start
+  capture, Run baseline import, New block, New feed, New mapping, New
+  plan and Cutover's New plan, each refused only after the form was
+  filled in. Each control now asks what its route asks (a superadmin, or
+  admin / write / delete on its resource type) and, denied, stays in
+  place, disabled, with the reason as its tooltip. A role opens read-only
+  for a user who may not edit roles, as a built-in role already did. The
+  same goes for the row and toolbar actions beside them: Alerts' Evaluate
+  now and Resolve, a firewall feed's Reveal and Rotate, the Domains bulk
+  refresh and bulk delete, New Devices' Add to allowlist, Block and the
+  allowlist editor, nmap and packet-capture Cancel / Stop and delete,
+  stamping an nmap scan's hosts into IPAM, and the Subnet Planner
+  editor's Save, Reopen and Apply.
+
+- **The Network and integration pages offer a read-only user no write it
+  would be refused (#1340).** 26 of the 30 pages offered the built-in
+  Viewer their create, edit and delete controls: Customers, Providers,
+  Sites, Services, Circuits, Overlays, VRFs, VLANs, Multicast,
+  Certificates, Devices and ASNs, and all 11 integrations (Kubernetes,
+  Docker, Proxmox, OPNsense, FortiGate, Meraki, Cloud, NetBird,
+  Tailscale, UniFi, PAN-OS) with their rows' Test, Sync Now, Edit and
+  Delete. Each control now asks what its router asks, as AV, BACnet,
+  DICOM and OT already did: write (or delete) on the registry's own
+  resource type, or a superadmin for an integration. Dragging a site to a
+  new parent, which re-parents it as Move does, asks write on sites too.
+
+- **The DHCP page offers a read-only user no write it would be refused
+  (#1339).** A user whose only role is the built-in Viewer was offered
+  New group, Edit and Delete Group, Add Server, every server's Pause,
+  Resume, Edit and Delete, and the Kea tabs' New Client Class, New
+  Template, Block MAC, New Phone Profile and New Policy (with their rows'
+  Edit and Delete), each refused only after the form was filled in. Every
+  one of those routes takes a superadmin, and each control now says so:
+  disabled, with the reason as its tooltip, for any other user. That
+  includes the server page's own Approve, Sync, Edit and Delete, a
+  group's scope rows, and the Windows failover relationship actions,
+  which a user who is not a superadmin no longer sees. Acknowledging a
+  rogue DHCP responder or router advertisement asks write on DHCP
+  servers, as its route does. A refused Resume now says why.
+
+- **The DNS page offers a read-only user no write it would be refused
+  (#1338).** A user whose only role is the built-in Viewer was offered
+  every DNS write (New server group, Sync with Servers, Edit and Delete
+  Group, Add Zone, Add Server, New View, New ACL, New Blocking List, New
+  TSIG Key, Add Record and the whole Zone menu) and met "Permission
+  denied" only after filling in the form. Each control now asks what its
+  route asks: a superadmin for server groups, servers, views, ACLs,
+  blocking lists, TSIG keys and zones, and write (or delete) on a DNS
+  resource type for records. A control the user may not use stays where
+  it is, disabled, with the reason as its tooltip, as IPAM's do (#1155).
+  The records table's select-all and Delete selected, the group Records
+  tab's Edit and Delete, the server Options Save, a zone's certificate
+  auto-probe switch, blocking-list entries and exceptions, and the DNS
+  pools are gated the same way, and a refused record delete or Resume
+  now says why.
+
+- **A damaged backup archive is refused as malformed, never with a 500
+  (#1426).** Restore, the restore pre-flight and the restore drill read
+  an archive's members expecting only a broken zip or bad JSON. A
+  database dump corrupt inside its first deflate block raised a
+  decompression error that escaped as a bare 500 instead of
+  "archive is malformed", and so did a corrupt bzip2 or LZMA member,
+  a member compressed with an unsupported method, an encrypted member,
+  and a manifest that is not UTF-8. Each is now a 400 that names the
+  problem, and the restore drill fails its `archive_readable` check with
+  the reason instead of raising out of the run. Nothing was ever
+  applied in these cases.
+
 - **A DHCP pool's lease-time override is refused instead of silently
   ignored (#1689).** `lease_time_override` was stored, echoed and shown
   in the UI but never sent to the agent, and Kea has no per-pool lease
