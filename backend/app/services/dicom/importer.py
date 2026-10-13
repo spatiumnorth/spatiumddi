@@ -37,8 +37,6 @@ No network I/O, and no PHI: the columns below are network identity only.
 
 from __future__ import annotations
 
-import csv
-import io
 import ipaddress
 import re
 import uuid
@@ -58,6 +56,7 @@ from app.models.dicom import (
     DICOMApplicationEntity,
 )
 from app.models.ipam import IPAddress, Subnet
+from app.services.csv_text import CSVReadError, read_csv_table
 from app.services.dicom.titles import AETitleError, validate_ae_title
 
 logger = structlog.get_logger(__name__)
@@ -442,37 +441,34 @@ def parse_rows(
     if not body:
         raise DICOMImportError("CSV body is empty")
 
-    # ``newline=""`` leaves line endings to the csv module, which reads
-    # ``\n``, ``\r\n`` and a bare ``\r`` alike. The default splits on ``\n``
-    # only, so a file saved with classic Mac line endings reached the reader
-    # with a ``\r`` inside an unquoted field and the import answered 500
-    # (#1370).
-    reader = csv.DictReader(io.StringIO(body, newline=""), delimiter=delimiter)
-    rows: list[ParsedRow] = []
+    # The shared reader handles \n, \r\n and a bare \r alike, and raises
+    # anything else the csv module refuses (a cell over its field size
+    # limit, say) as CSVReadError: a property of the file, so a 422 that
+    # says why rather than a 500 (#1370).
     try:
-        headers = _resolve_headers(reader.fieldnames, column_map)
-        for line, raw_row in enumerate(reader, start=1):
-            if line > MAX_IMPORT_ROWS:
-                raise DICOMImportError(
-                    f"CSV has more than {MAX_IMPORT_ROWS} data rows; split the table by department"
-                )
-            if not any((v or "").strip() for v in raw_row.values() if isinstance(v, str)):
-                # Trailing blank lines are normal in exported files.
-                continue
-            rows.append(
-                _parse_one(
-                    line=line,
-                    raw_row=raw_row,
-                    headers=headers,
-                    default_port=default_port,
-                    default_department=default_department,
-                )
+        table = read_csv_table(body, delimiter=delimiter)
+    except CSVReadError as exc:
+        raise DICOMImportError(str(exc)) from exc
+    headers = _resolve_headers(table.fieldnames, column_map)
+
+    rows: list[ParsedRow] = []
+    for line, raw_row in enumerate(table.rows, start=1):
+        if line > MAX_IMPORT_ROWS:
+            raise DICOMImportError(
+                f"CSV has more than {MAX_IMPORT_ROWS} data rows; split the table by department"
             )
-    except csv.Error as exc:
-        # Anything else the reader refuses (a cell over its field size
-        # limit, say) is a property of the file: a 422 that says why, not
-        # a 500.
-        raise DICOMImportError(f"CSV could not be read: {exc}") from exc
+        if not any((v or "").strip() for v in raw_row.values() if isinstance(v, str)):
+            # Trailing blank lines are normal in exported files.
+            continue
+        rows.append(
+            _parse_one(
+                line=line,
+                raw_row=raw_row,
+                headers=headers,
+                default_port=default_port,
+                default_department=default_department,
+            )
+        )
     return rows
 
 
