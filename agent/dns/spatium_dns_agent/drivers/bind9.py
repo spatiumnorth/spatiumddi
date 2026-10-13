@@ -1632,9 +1632,9 @@ class Bind9Driver(DriverBase):
 
         if has_views:
             # Split-horizon (issue #24): every zone + RPZ lives inside its
-            # view block. Group-level blocklists (view_name=None) replicate
-            # into EVERY view; per-view blocklists land only in their own
-            # view. Files are namespaced per view (zones/<view>/...) so
+            # view block. Per-view blocklists land only in their own view;
+            # a group-level one (view_name=None) only in a view that has no
+            # zone of its own (#1706). Files are namespaced per view (zones/<view>/...) so
             # identical zone names across views don't collide. Views are
             # already ordered low→high by the control plane for first-match
             # precedence.
@@ -1645,9 +1645,12 @@ class Bind9Driver(DriverBase):
                     continue
                 match_clients = _render_match_clients(view, view_keys)
                 recursion_v = "yes" if view.get("recursion", True) else "no"
-                view_bls = [
-                    bl for bl in blocklists if bl.get("view_name") == vname
-                ] + global_bls
+                own_bls = [bl for bl in blocklists if bl.get("view_name") == vname]
+                # #1706 — a view's own zone already folds in the group's
+                # lists, so the group zone behind it would load the same
+                # entries a second time. Only a view with no zone of its own
+                # falls back to the group zone.
+                view_bls = own_bls if own_bls else list(global_bls)
                 body = ""
                 if view_bls:
                     zlist = "; ".join(
