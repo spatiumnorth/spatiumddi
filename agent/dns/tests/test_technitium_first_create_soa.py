@@ -278,7 +278,7 @@ def test_killed_pass_is_released_by_the_next_pass(tmp_path: Path) -> None:
     except Killed:
         pass
     assert fake.access["example.com"] == "Deny"
-    assert "example.com" in d._load_held_zones()
+    assert d._load_held_zones() == {"example.com"}
 
     d2 = _driver(tmp_path, fake)
     d2._reconcile_zones("tok-1", payload)
