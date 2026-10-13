@@ -163,3 +163,74 @@ def test_no_trigger_is_noop(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0
     assert _state(tmp_path) == ""
+
+
+# --- #1747: durable sidecar writes -------------------------------------------
+
+_HOST_RUNNERS = [
+    "spatiumddi-slot-upgrade",
+    "spatiumddi-slot-set-next-boot",
+    "spatiumddi-slot-set-default",
+    "spatiumddi-slot-rollback",
+]
+
+
+def _extract_atomic_write(script: str) -> str:
+    import re
+
+    text = (RUNNER.parent / script).read_text(encoding="utf-8")
+    m = re.search(r"^fsync_path\(\).*?^atomic_write\(\) \{.*?^\}\n", text, re.S | re.M)
+    assert m, f"{script} has no fsync_path/atomic_write helpers"
+    return m.group(0)
+
+
+def test_every_slot_runner_writes_state_durably() -> None:
+    """No runner may redirect straight into a ``.state`` file any more: a
+    power loss then leaves it NUL-filled and the node's heartbeats 422."""
+    for script in _HOST_RUNNERS:
+        text = (RUNNER.parent / script).read_text(encoding="utf-8")
+        assert '> "${TRIGGER}.state"' not in text, script
+        assert 'atomic_write "${TRIGGER}.state"' in text, script
+
+
+def test_atomic_write_replaces_via_temp_and_fsyncs(tmp_path: Path) -> None:
+    """Run the shipped helper under bash with a ``sync`` shim recording
+    which paths were fsynced and what the temp file held at that moment."""
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    trace = tmp_path / "trace"
+    (shim / "sync").write_text(
+        '#!/bin/bash\nfor p in "$@"; do\n'
+        f'  if [ -f "$p" ]; then echo "file:$p:$(cat "$p")" >> {trace}; '
+        f'else echo "dir:$p" >> {trace}; fi\ndone\n',
+        encoding="utf-8",
+    )
+    (shim / "sync").chmod(0o755)
+    for script in _HOST_RUNNERS:
+        trace.write_text("")
+        target = tmp_path / f"{script}.state"
+        target.write_text("old\n")
+        target.chmod(0o640)
+        src = _extract_atomic_write(script) + f'\natomic_write "{target}" "done X"\n'
+        r = subprocess.run(
+            ["bash", "-c", src],
+            env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr
+        assert target.read_text() == "done X\n"
+        assert (target.stat().st_mode & 0o777) == 0o640  # mode preserved
+        lines = trace.read_text().splitlines()
+        # temp file fsynced WITH its full content before the rename ...
+        assert any(
+            ln.startswith("file:")
+            and ln.endswith(":done X")
+            and str(target) + "." in ln
+            for ln in lines
+        ), lines
+        # ... then the directory.
+        assert lines[-1] == f"dir:{tmp_path}", lines
+        assert not [
+            p for p in tmp_path.iterdir() if p.name.startswith(target.name + ".")
+        ]

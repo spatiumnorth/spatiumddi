@@ -340,6 +340,22 @@ the formatter handles the rest.
     rendered for Kea.
   - The Stats tab, the InfluxDB export and the `dhcp_packets_dropped`
     alert now get the right number, with no change of their own.
+- **A power loss right after a slot apply no longer freezes the node's
+  Fleet row (#1747).** The slot-upgrade runners wrote their state and
+  progress sidecars with a plain redirect and no fsync, so a power loss
+  right after "apply succeeded" could leave `slot-upgrade.log` or a
+  sidecar as a run of NUL bytes. The supervisor sends the log tail on
+  every heartbeat, Postgres refuses a NUL in a text value, and the api
+  answered 422 to every heartbeat from that node until someone edited the
+  file by hand. The supervisor now strips NUL and other control
+  characters from the log tail and the progress sidecar and reads a
+  NUL-filled or truncated state or progress file as unknown. The host
+  runners (`spatiumddi-slot-upgrade`, `-slot-set-next-boot`,
+  `-slot-set-default`, `-slot-rollback`, `spatium-upgrade-slot`) write
+  their sidecars to a temp file, fsync it, rename it over the target and
+  fsync the directory, and the main runner fsyncs the log after the
+  apply. The supervisor's own in-place writes into the sticky
+  `release-state` directory are fsynced.
 
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
