@@ -1260,7 +1260,7 @@ async def test_single_node_upgrade_passes_cnpg_cluster_to_the_count_waits(
     cnpg = {"cnpg_cluster_name": "pg-cluster", "cnpg_namespace": "spatium"}
     # #1709 — and the run's uploaded image, for the mirror headroom check
     # (none here: the target is a URL).
-    assert seen["preflight"] == {**cnpg, "slot_image_id": None}
+    assert seen["preflight"] == {**cnpg, "slot_image_id": None, "disk_nodes": None}
     assert seen["cluster_verify"] == {
         **cnpg,
         "control_plane_release": "spatium-control",

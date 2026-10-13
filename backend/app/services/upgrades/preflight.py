@@ -411,10 +411,20 @@ def judge_node_disk_headroom(
 
 async def check_node_disk_headroom(
     *,
+    nodes: list[str] | None = None,
     slot_image_size_bytes: int = 4 * 1024 * 1024 * 1024,
     safety_margin_bytes: int = 1 * 1024 * 1024 * 1024,
 ) -> PreflightResult:
     """Per-node ``/var`` headroom for appliance fleets (#1234).
+
+    ``nodes`` narrows the judgement to those hostnames (case-insensitive):
+    a rolling run's chain passes the nodes it has still to upgrade. Upgrading
+    a node shrinks its ``/var`` (it keeps the old slot's images beside the
+    new ones), and a node the run has finished, or an approved row that is
+    not part of the run, never stages this image; judging them failed the
+    run's own next node (ddi-pg, nightly-20261012: both upgraded nodes short,
+    the node left to upgrade with 8 GiB free). A named node with no row is
+    unverified (``warn``). Plan passes nothing and judges every row.
 
     Falls back to :func:`check_disk_headroom` (the api container's own
     ``/var``) when there are no approved appliance rows — docker-compose /
@@ -447,11 +457,24 @@ async def check_node_disk_headroom(
             slot_image_size_bytes=slot_image_size_bytes,
             safety_margin_bytes=safety_margin_bytes,
         )
-    return judge_node_disk_headroom(
-        rows,
-        need_bytes=slot_image_size_bytes + safety_margin_bytes,
-        now=datetime.now(UTC),
-    )
+    need = slot_image_size_bytes + safety_margin_bytes
+    if nodes is not None:
+        wanted = {n.casefold() for n in nodes}
+        rows = [r for r in rows if (r.hostname or "").casefold() in wanted]
+        missing = sorted(wanted - {(r.hostname or "").casefold() for r in rows})
+        if missing:
+            result = judge_node_disk_headroom(rows, need_bytes=need, now=datetime.now(UTC))
+            if result.level == "fail":
+                return result
+            unknown = [{"node": n, "reason": "no appliance row"} for n in missing]
+            names = ", ".join(f"{e['node']} ({e['reason']})" for e in unknown)
+            return PreflightResult(
+                name="disk_headroom",
+                level="warn",
+                message=f"/var headroom unverified on {names}",
+                detail={**result.detail, "unverified": result.detail["unverified"] + unknown},
+            )
+    return judge_node_disk_headroom(rows, need_bytes=need, now=datetime.now(UTC))
 
 
 async def check_mirror_disk_headroom(
@@ -861,13 +884,15 @@ async def run_all(
     namespace: str | None = None,
     own_holder: str | None = None,
     slot_image_id: uuid.UUID | None = None,
+    disk_nodes: list[str] | None = None,
 ) -> PreflightReport:
     """Run every check + return the aggregate report.
 
     ``own_holder`` is passed by a run that already holds the upgrade
     lease (see :func:`check_inflight_conflict`); Plan passes nothing.
     ``slot_image_id`` is the run's target when it is an uploaded image
-    (#1709, :func:`check_mirror_disk_headroom`).
+    (#1709, :func:`check_mirror_disk_headroom`). ``disk_nodes`` is a
+    rolling run's nodes still to upgrade (:func:`check_node_disk_headroom`).
 
     Order doesn't matter (independent checks); we run them
     sequentially for now since none of them are slow. If any block
@@ -877,7 +902,7 @@ async def run_all(
     results: list[PreflightResult] = [
         check_inflight_conflict(namespace=namespace, own_holder=own_holder),
         await check_replication_lag(),
-        await check_node_disk_headroom(),
+        await check_node_disk_headroom(nodes=disk_nodes),
         await check_mirror_disk_headroom(slot_image_id=slot_image_id),
         check_version_path(target_version=target_version),
         check_quorum(),

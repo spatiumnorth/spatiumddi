@@ -882,6 +882,9 @@ async def _drive_loop(
             mirror_deployment=mirror_deployment,
             control_plane_release=release_name,
             control_plane_namespace=release_namespace,
+            # #1709 — the node's preflight asks for /var room only on the
+            # nodes the run has still to upgrade.
+            remaining_nodes=[n for n in plan_order if n not in completed_nodes],
         )
 
         per_node_progress[next_node] = {
