@@ -34,6 +34,26 @@ router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permiss
 # pd_prefix / delegated_length / excluded_prefix instead.
 VALID_POOL_TYPES = {"dynamic", "excluded", "reserved", "pd"}
 
+# #1689 — Kea has no per-pool lifetime: a ``pools`` entry takes ``pool``,
+# ``option-data``, ``client-classes`` and ``pool-id`` only (valid-lifetime
+# lives on the subnet, shared-network, global scope or a client class, and a
+# class's lifetime only applies to clients matching its test, which would also
+# restrict who may use the pool). The field used to be accepted, stored, echoed
+# and never rendered, so a "guest pool, 10 minute lease" quietly served the
+# scope's lease. Refuse a value rather than store a no-op; null (clear) stays
+# legal so an existing row can still be reset.
+LEASE_OVERRIDE_UNSUPPORTED = (
+    "lease_time_override is not supported: Kea has no per-pool lease time, so the "
+    "pool would be served the scope's lease_time. Set the lease on the scope "
+    "(or use a separate scope), or clear this field"
+)
+
+
+def _refuse_lease_override(v: int | None) -> int | None:
+    if v is not None:
+        raise ValueError(LEASE_OVERRIDE_UNSUPPORTED)
+    return v
+
 
 class PoolCreate(BaseModel):
     name: str = ""
@@ -56,6 +76,11 @@ class PoolCreate(BaseModel):
             raise ValueError(f"pool_type must be one of {sorted(VALID_POOL_TYPES)}")
         return v
 
+    @field_validator("lease_time_override")
+    @classmethod
+    def _no_lease_override(cls, v: int | None) -> int | None:
+        return _refuse_lease_override(v)
+
 
 class PoolUpdate(BaseModel):
     name: str | None = None
@@ -68,6 +93,11 @@ class PoolUpdate(BaseModel):
     pd_prefix: str | None = None
     delegated_length: int | None = None
     excluded_prefix: str | None = None
+
+    @field_validator("lease_time_override")
+    @classmethod
+    def _no_lease_override(cls, v: int | None) -> int | None:
+        return _refuse_lease_override(v)
 
 
 class PoolResponse(BaseModel):

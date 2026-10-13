@@ -21,6 +21,11 @@ import {
   type SiteRead,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { poolHealthCheckFields } from "@/lib/formPayloads";
 
 /**
@@ -43,6 +48,11 @@ export function PoolsView({
   group: DNSServerGroup;
   zone: DNSZone;
 }) {
+  // Every pool write takes a superadmin (dns/pool_router.py).
+  const poolGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const [showCreate, setShowCreate] = useState(false);
   // #1784 — the API refuses new pools / members on this driver.
@@ -86,7 +96,8 @@ export function PoolsView({
           <button
             type="button"
             onClick={() => setShowCreate(true)}
-            className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+            className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...poolGate}
           >
             <Plus className="h-3 w-3" /> New Pool
           </button>
@@ -173,6 +184,11 @@ function PoolCard({
   onDelete: () => void;
   onCheckNow: () => void;
 }) {
+  // Every pool write takes a superadmin (dns/pool_router.py).
+  const poolGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const fqdn =
     pool.record_name === "@"
       ? zone.name.replace(/\.$/, "")
@@ -219,6 +235,7 @@ function PoolCard({
             onClick={onCheckNow}
             className="rounded p-1 text-muted-foreground hover:text-foreground"
             title="Check now"
+            {...poolGate}
           >
             <RefreshCw className="h-3.5 w-3.5" />
           </button>
@@ -226,6 +243,7 @@ function PoolCard({
             onClick={onEdit}
             className="rounded p-1 text-muted-foreground hover:text-foreground"
             title="Edit"
+            {...poolGate}
           >
             <Pencil className="h-3.5 w-3.5" />
           </button>
@@ -233,6 +251,7 @@ function PoolCard({
             onClick={onDelete}
             className="rounded p-1 text-muted-foreground hover:text-destructive"
             title="Delete"
+            {...poolGate}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>
@@ -278,6 +297,11 @@ function PoolCard({
 }
 
 function MemberRow({ member }: { member: DNSPoolMember }) {
+  // Every pool write takes a superadmin (dns/pool_router.py).
+  const poolGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const toggle = useMutation({
     mutationFn: () =>
@@ -338,6 +362,7 @@ function MemberRow({ member }: { member: DNSPoolMember }) {
         <button
           type="button"
           onClick={() => toggle.mutate()}
+          {...poolGate}
           className={
             "rounded px-2 py-0.5 text-[10px] font-medium " +
             (member.enabled

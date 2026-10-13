@@ -91,6 +91,204 @@ the formatter handles the rest.
   the zones and the domain override). A column now counts as written
   only when its value changed; `force` lists the columns it overwrote
   with a different value.
+
+- **An ACME order's teardown no longer fails with "Event loop is
+  closed" in the worker (#1687, #1726).** `run_order`'s `finally`
+  removed the DNS-01 challenge TXT records and the http-01 tokens
+  through the shared engine's session factory. That runs inside a
+  Celery task's own event loop, where a pooled connection left by an
+  earlier task is bound to a closed loop, so on a reused connection
+  the cleanup failed with only a warning. The challenge TXT then
+  stayed in the zone until the 24 h stale sweep, or for good without
+  it, and http-01 tokens stayed in the database. The teardown now
+  opens its sessions with `task_session()`, as the order itself does.
+  The same flaw sat in the DNS-01 solve: its wait for the agents to
+  apply the challenge TXT polled through the shared factory, so in a
+  worker that had run a task before, the first poll raised and the
+  order ended `invalid` with `unexpected: Event loop is closed`. The
+  wait helpers now take a session factory, and the solve passes one
+  from the new `task_sessionmaker()` (one per-task engine for the
+  whole poll loop). The acme-dns provider's API path still uses the
+  shared factory, which is correct in a request handler.
+
+- **The DICOM AE, OT device and IPAM CSV imports read a file with classic
+  Mac line endings (#1370, #1637, #1711).** Each importer read the
+  pasted or uploaded text without handing its line endings to the csv
+  reader, so a carriage return not followed by a line feed (a file
+  saved with CR-only line endings, or a paste that keeps them) reached
+  it inside a field. The reader refused it, and DICOM AE import, OT
+  device import and all four IPAM import routes (subnets and
+  addresses, preview and commit) answered 500 with nothing saying the
+  line endings were the problem. The three importers now open the
+  text through one shared reader that takes `\n`, `\r\n` and a bare
+  `\r` alike, and anything else the csv reader refuses (a cell over
+  its size limit, say) is a 422 that gives the reason.
+
+- **The Appliance tabs offer a read-only user none of the appliance's
+  actions (#1342).** The built-in Viewer was offered Reboot host, every
+  pod's Restart and Stop (Stop has no confirm), maintenance mode and
+  Reboot now, the host firewall (enforcement, Web UI access, posture
+  presets, policies and their rules) and first-boot Finish setup, all
+  enabled, each refused by the server. Each now asks for admin on the
+  appliance, as its route does, and is otherwise disabled with the
+  reason. The first-boot setup banner is shown only to a user who can
+  finish setup, and Network & Host no longer says the firewall editor is
+  still to come. The firewall log toggle and the aliases (New alias,
+  Delete) are gated the same way, and a refused Reboot host, pod action,
+  maintenance toggle or Reboot now shows the server's reason instead of
+  leaving the dialog or page as it was.
+
+- **Administration, Tools and the IPAM side pages offer a read-only user
+  no write it would be refused (#1341).** The built-in Viewer was
+  offered New Role (and every role's Edit, Clone and Delete), New User,
+  New Group, New subscription, New rule, New template, New domain, the
+  Features page's module switches, New schedule, Start scan, Start
+  capture, Run baseline import, New block, New feed, New mapping, New
+  plan and Cutover's New plan, each refused only after the form was
+  filled in. Each control now asks what its route asks (a superadmin, or
+  admin / write / delete on its resource type) and, denied, stays in
+  place, disabled, with the reason as its tooltip. A role opens read-only
+  for a user who may not edit roles, as a built-in role already did. The
+  same goes for the row and toolbar actions beside them: Alerts' Evaluate
+  now and Resolve, a firewall feed's Reveal and Rotate, the Domains bulk
+  refresh and bulk delete, New Devices' Add to allowlist, Block and the
+  allowlist editor, nmap and packet-capture Cancel / Stop and delete,
+  stamping an nmap scan's hosts into IPAM, and the Subnet Planner
+  editor's Save, Reopen and Apply.
+
+- **The Network and integration pages offer a read-only user no write it
+  would be refused (#1340).** 26 of the 30 pages offered the built-in
+  Viewer their create, edit and delete controls: Customers, Providers,
+  Sites, Services, Circuits, Overlays, VRFs, VLANs, Multicast,
+  Certificates, Devices and ASNs, and all 11 integrations (Kubernetes,
+  Docker, Proxmox, OPNsense, FortiGate, Meraki, Cloud, NetBird,
+  Tailscale, UniFi, PAN-OS) with their rows' Test, Sync Now, Edit and
+  Delete. Each control now asks what its router asks, as AV, BACnet,
+  DICOM and OT already did: write (or delete) on the registry's own
+  resource type, or a superadmin for an integration. Dragging a site to a
+  new parent, which re-parents it as Move does, asks write on sites too.
+
+- **The DHCP page offers a read-only user no write it would be refused
+  (#1339).** A user whose only role is the built-in Viewer was offered
+  New group, Edit and Delete Group, Add Server, every server's Pause,
+  Resume, Edit and Delete, and the Kea tabs' New Client Class, New
+  Template, Block MAC, New Phone Profile and New Policy (with their rows'
+  Edit and Delete), each refused only after the form was filled in. Every
+  one of those routes takes a superadmin, and each control now says so:
+  disabled, with the reason as its tooltip, for any other user. That
+  includes the server page's own Approve, Sync, Edit and Delete, a
+  group's scope rows, and the Windows failover relationship actions,
+  which a user who is not a superadmin no longer sees. Acknowledging a
+  rogue DHCP responder or router advertisement asks write on DHCP
+  servers, as its route does. A refused Resume now says why.
+
+- **The DNS page offers a read-only user no write it would be refused
+  (#1338).** A user whose only role is the built-in Viewer was offered
+  every DNS write (New server group, Sync with Servers, Edit and Delete
+  Group, Add Zone, Add Server, New View, New ACL, New Blocking List, New
+  TSIG Key, Add Record and the whole Zone menu) and met "Permission
+  denied" only after filling in the form. Each control now asks what its
+  route asks: a superadmin for server groups, servers, views, ACLs,
+  blocking lists, TSIG keys and zones, and write (or delete) on a DNS
+  resource type for records. A control the user may not use stays where
+  it is, disabled, with the reason as its tooltip, as IPAM's do (#1155).
+  The records table's select-all and Delete selected, the group Records
+  tab's Edit and Delete, the server Options Save, a zone's certificate
+  auto-probe switch, blocking-list entries and exceptions, and the DNS
+  pools are gated the same way, and a refused record delete or Resume
+  now says why.
+
+- **A damaged backup archive is refused as malformed, never with a 500
+  (#1426).** Restore, the restore pre-flight and the restore drill read
+  an archive's members expecting only a broken zip or bad JSON. A
+  database dump corrupt inside its first deflate block raised a
+  decompression error that escaped as a bare 500 instead of
+  "archive is malformed", and so did a corrupt bzip2 or LZMA member,
+  a member compressed with an unsupported method, an encrypted member,
+  and a manifest that is not UTF-8. Each is now a 400 that names the
+  problem, and the restore drill fails its `archive_readable` check with
+  the reason instead of raising out of the run. Nothing was ever
+  applied in these cases.
+
+- **A DHCP pool's lease-time override is refused instead of silently
+  ignored (#1689).** `lease_time_override` was stored, echoed and shown
+  in the UI but never sent to the agent, and Kea has no per-pool lease
+  time (a client class can carry one, but only for clients matching its
+  test, which would also restrict who may use the pool), so every pool
+  served the scope's lease. **API change:** `POST
+  /api/v1/dhcp/scopes/{id}/pools` and `PUT /api/v1/dhcp/pools/{id}` now
+  answer 422 for a non-null `lease_time_override`; an explicit `null`
+  still clears an old value, and the field is still returned. A value
+  stored before this release stays until cleared, and has never had any
+  effect. The field is gone from the pool form, and saving a pool that
+  has one clears it. What Kea serves does not change.
+
+- **Renew / rebind timers (options 58 / 59) are no longer documented as
+  settable, and a Kea import says it drops them (#1690).** The API has
+  always refused them; the docs claimed otherwise. T1 / T2 are derived
+  from each lease (v4: 50% / 87.5% of it; v6: 50% / 80% of the preferred
+  lifetime). Importing a Kea config that carries
+  `renew-timer` or `rebind-timer` now says it drops them instead of
+  dropping them silently: a subnet's in that scope's `parse_warnings`,
+  a global one in the preview's `warnings`.
+
+- **The docs site now says it tracks `main` (#1164).** Both Pages
+  sites publish `main`, so a reader on a release could not tell the
+  page might describe unreleased behaviour. Every page now carries a
+  banner naming that, linking the changelog and releases page. The
+  published copy also names the commit, date and latest release,
+  stamped into `_data/build.yml` by `docs-publish.yml`; the project
+  site and a local `jekyll build` get the generic form.
+
+- **Allocate IP offers only the statuses it can allocate with (#1422).**
+  Its Type / Status menu offered `discovered`, but both of its requests
+  ("Next available" and "Specific IP") accept only the operator-settable
+  statuses and `dhcp`, so picking it always ended in a 422. `discovered`
+  is stamped by the nmap "Stamp alive hosts" action and is no longer
+  offered there; the inline status edit and Edit address, whose update
+  accepts every status, keep it.
+
+- **One typo in the MFA disable or recovery-code dialog costs one
+  attempt, not two (#1371).** `POST /auth/mfa/disable` and
+  `/auth/mfa/recovery-codes/regenerate` answered a wrong password or
+  TOTP code with 401. The console reads a 401 from anything but sign-in
+  as an expired session: it rotated the session and sent the request
+  again, which failed the same way. One typo spent two of the five
+  step-up attempts the account gets per 15 minutes and checked the
+  answer twice, so the third typo locked MFA changes. Both now answer
+  403 with the same message, as enrolment does.
+
+- **A burst of DHCP requests is queued, not silently evicted
+  (#1283).**
+  - Left unset, Kea 3.0's multi-threading `packet-queue-size` is 64.
+    When a burst of relayed requests outran the worker, Kea evicted
+    the oldest queued packets and counted them nowhere. Clients
+    retransmitted, and every product surface stayed green.
+  - On a three-node cluster's load ramp, 2,286 requests were lost this
+    way and 35.1 % of handshakes needed a retransmit.
+  - The agent, and the backend's config preview, now render
+    `packet-queue-size: 1024`, for kea-dhcp4 and kea-dhcp6. On the same
+    ramp none was evicted, with an answer latency p99 of 1.17 s,
+    against the client's 4 s retransmit.
+  - The re-sends left over follow the kernel's drops on Kea's raw
+    socket, which `socket_drop` now counts (below).
+- **`socket_drop` counts the socket Kea serves from in raw mode
+  (#1283).**
+  - With `dhcp-socket-type: raw` (`dhcp_socket_mode: direct`, the
+    default), kea-dhcp4 reads every DHCPv4 packet from an AF_PACKET
+    socket, relayed unicast included. It only drains and discards the
+    copy on its UDP :67 fallback socket.
+  - `socket_drop` read that fallback. So it counted copies Kea would
+    have thrown away, and missed the drops that cost a client a
+    retransmit. On relayed bursts it read 0 against 41 real drops in
+    one run, and 300 against 505 in another.
+  - The agent now reads the AF_PACKET sockets' drops through sock_diag
+    in raw mode, which needs no privilege. In `udp` mode it reads the
+    UDP sockets as before. It takes the mode from the config it
+    rendered for Kea.
+  - The Stats tab, the InfluxDB export and the `dhcp_packets_dropped`
+    alert now get the right number, with no change of their own.
+
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and

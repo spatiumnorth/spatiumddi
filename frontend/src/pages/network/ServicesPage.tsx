@@ -29,6 +29,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerChip } from "@/components/ownership/pickers";
 import { SavedViewsMenu } from "@/components/SavedViewsMenu";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -999,6 +1000,17 @@ function ServiceEditorModal({
 // ── Page ───────────────────────────────────────────────────────────
 
 export function ServicesPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the network_service router asks write (delete) on 'network_service'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "network_service"),
+    "Requires write permission on network services",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "network_service"),
+    "Requires delete permission on network services",
+  );
   const qc = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   // Reverse-lookup mode (#99): when both params are present we show only the
@@ -1164,6 +1176,7 @@ export function ServicesPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New service
             </HeaderButton>
@@ -1270,6 +1283,7 @@ export function ServicesPage() {
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
               }}
+              {...deleteGate}
             >
               Delete selected
             </HeaderButton>
@@ -1360,7 +1374,8 @@ export function ServicesPage() {
                       type="button"
                       title="Edit"
                       onClick={() => setEditing(s)}
-                      className="rounded p-1 hover:bg-muted"
+                      className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
@@ -1375,7 +1390,8 @@ export function ServicesPage() {
                           onConfirm: () => removeOne.mutate(s.id),
                         });
                       }}
-                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

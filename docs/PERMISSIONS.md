@@ -176,3 +176,21 @@ if not user_has_permission(current_user, "write", "subnet", subnet.id):
 ```
 
 See `backend/app/core/permissions.py` for the full API.
+
+## The console mirrors the server, it does not enforce
+
+The API is the enforcement point (non-negotiable #3). The console reads the
+caller's grants from `GET /api/v1/auth/me/permissions` through
+`usePermissions()` (`frontend/src/hooks/usePermissions.ts`) only so it does not
+offer a write the server would refuse: a control the user may not use stays in
+place, disabled, with the reason as its tooltip (`permissionGate()`, #1155), or
+is hidden where a whole surface is superadmin-only. Each gate asks exactly what
+its route asks — `can(action, resource_type)` for a router or handler permission
+check, `isSuperadmin` (reason `NEEDS_SUPERADMIN`) for a handler that takes
+`SuperAdmin` whatever the grants. One deliberate exception: a bulk delete is
+gated on `delete`, although most `POST …/bulk-delete` routes are admitted by the
+router's method gate as `write` (only Domains checks `delete` inline); the
+console asks what the action does rather than widen a delete to every writer. Appliance actions use
+`useApplianceAdminGate()` (`admin` on `appliance`). When you add a write control,
+gate it the same way, and give its mutation an error display so a refusal the
+console could not predict still says why (#1338–#1342).
