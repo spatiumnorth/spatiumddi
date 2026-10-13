@@ -230,17 +230,19 @@ async def plan_upgrade(
     # before/after picture even if the appliance row's
     # installed_appliance_version is updated mid-run.
     from app.models.appliance import Appliance  # noqa: PLC0415
+    from app.services.appliance.ownership import hostname_sql, k8s_node_name  # noqa: PLC0415
 
     source_versions: dict[str, str | None] = {}
     appliance_rows = (
         await db.execute(
             select(Appliance.hostname, Appliance.installed_appliance_version).where(
-                Appliance.hostname.in_(order)
+                hostname_sql(Appliance.hostname).in_([k8s_node_name(n) for n in order])
             )
         )
     ).all()
     for hostname, installed in appliance_rows:
-        source_versions[hostname] = installed
+        # Keyed by the Node name the plan and the per-node steps use (#1757).
+        source_versions[k8s_node_name(hostname)] = installed
 
     run = SystemUpgradeRun(
         kind="cluster_rolling",
@@ -633,9 +635,11 @@ async def _drive_loop(
     cnpg_namespace: str | None = run.plan.get("cnpg_namespace")
     # #1463 — every node waits for this release's slot-image mirror before
     # it is told to fetch an uploaded image.
-    mirror_deployment = per_node.slot_image_mirror_deployment(
-        run.plan.get("chart_name") or chart_bump.DEFAULT_CHART_NAME
-    )
+    release_name = run.plan.get("chart_name") or chart_bump.DEFAULT_CHART_NAME
+    mirror_deployment = per_node.slot_image_mirror_deployment(release_name)
+    # #1544 — the namespace the chart-bump poll reads the release's
+    # Deployments in; the per-node control-plane gate reads the same one.
+    release_namespace: str = run.plan.get("release_namespace") or chart_bump.DEFAULT_RELEASE_NS
 
     while True:
         if stop_event.is_set():
@@ -841,6 +845,8 @@ async def _drive_loop(
             cnpg_namespace=cnpg_namespace,
             lease_holder=run.lease_holder,
             mirror_deployment=mirror_deployment,
+            control_plane_release=release_name,
+            control_plane_namespace=release_namespace,
         )
 
         per_node_progress[next_node] = {

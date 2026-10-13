@@ -84,6 +84,67 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The PowerDNS agent stops serving zones wrong in three ways
+  (#1520, #1521, #1522).** Pool member address deletes were applied
+  as no-ops and acked ok — the record-op fallback ignored the rrset
+  action — so a removed member's address stayed served; deletes now
+  delete. Zone type was ignored: secondaries are now created as
+  Slave with their masters (a secondary without masters, and a
+  forward zone — which has no PowerDNS equivalent — are skipped
+  loudly instead of silently vanishing or being served as a primary
+  copy). And served zones now carry the zone's own Primary NS,
+  Admin Email, SOA timers and serial instead of daemon defaults,
+  with the served serial reported back.
+
+- **NOTIFY settings and zone allow-query now reach the agents
+  (#1523).** The server options `notify_enabled` / `also_notify` /
+  `allow_notify` and the zone-level `also_notify` / `notify_enabled` /
+  `allow_query` overrides were saved but never shipped in the agent
+  bundle. They ship now (renderer revision 8): the BIND9 agent renders
+  them in the options block and zone stanzas, and the PowerDNS agent
+  folds the effective notify setting into the zone kind (Master when
+  notifying — Native never sends NOTIFY) and applies the targets as
+  ALSO-NOTIFY metadata. A PowerDNS group cannot enforce allow-query
+  (the authoritative server has no query ACL); the agent logs that
+  loudly instead of letting the setting look applied.
+
+- **Records written to PowerDNS zones over RFC 2136 are ingested back
+  (#1524).** The ingest-back worker that mirrors externally written
+  records into SpatiumDDI ran only for BIND9, so dynamic records on
+  PowerDNS were invisible — and were silently overwritten where they
+  shared a name with managed records. The PowerDNS agent now reads
+  dynamic zones back over its loopback REST API on the same interval
+  and ships them to the same ingest endpoint.
+
+- **Drift and Sync with Servers read a dot-less name target the way
+  the driver does (#1794).** A target such as `a.b` is `a.b.<zone>.`
+  on BIND9, Technitium and Windows without WinRM credentials, where only
+  a trailing dot makes a name absolute, but the shared record key read it
+  as the absolute `a.b.`. A relative multi-label CNAME, DNAME, NS, PTR,
+  MX, SRV, NAPTR replacement or SVCB / HTTPS target therefore drifted
+  against the absolute name an AXFR returns, and Sync imported it again as
+  a duplicate. The cloud drivers and Windows over WinRM take the name as
+  given, so there `a.b` stays absolute. The Windows cutover parity check
+  reads each side by its own driver: the managed rows the way the managed
+  zone's group serves them, the Windows pull the way Windows reports it.
+
+- **An appliance with an uppercase hostname was invisible to the demote quorum gate, the cordon and the eviction (#1757).** The installer accepts `Ddi-Member-1`; k3s lowercases the host's name for its k8s Node (RFC 1123, `GetHostnameAndIPs`) and names its etcd member `<lowercase name>-<8 hex>`; `Appliance.hostname` keeps what was typed. Every Node lookup by hostname therefore missed: the quorum gate read the member as having "no k8s Node" and refused the demote, the demote cordon found nothing, and the eviction told the seed a name its Node delete could not find (a 404, which counts as success), so a stale Node stayed. Lookups now go through one `k8s_node_name()` (lowercase, trailing dot dropped) in `services/appliance/ownership.py`: the quorum gate, the cordon and uncordon, the names and addresses the heartbeat hands the seed to evict (and the names it reports back), the rolling upgrade's Node-to-appliance match (now approved rows only, and none rather than a guess when two match, so a revoked duplicate left by a re-pair no longer crashes the step), and the Cluster tab's per-node host state. Deleting an appliance now finds its DNS and DHCP servers by the shared ownership rule (#1715 / #1749) instead of a bare hostname match: the FK, or an agent-registered row with no FK whose host matches case-blind (a DNS agent on k3s registers the lowercase Node name), and only while no other approved appliance shares the hostname. So two appliances whose hostnames differ only in case, or a re-paired duplicate, never delete each other's servers. On the host, `spatium-etcd-evict` matches members by the lowercase name and also treats the lowercase spelling of its own hostname as its own, and the supervisor's Node delete lowercases the name it is given. Stored hostnames are unchanged.
+
+- **A rolling upgrade waits for the control-plane Deployments before it
+  moves to the next node (#1544).** The other half of the gate that
+  already waits for CNPG: after each node's uncordon, the per-node
+  step waits (up to 10 minutes) until every Deployment of the release
+  (found by the chart's `app.kubernetes.io/name` and `/instance`
+  labels, so a Deployment the chart adds later is covered) has
+  available replicas equal to desired and no old pod still draining.
+  A single-replica Deployment passing through its retire-first
+  rollout is waited through, not failed. If it never settles the node
+  step fails and the run stops before the next node's drain; the node
+  is already uncordoned by then, so there is nothing to release. A
+  label selector that matches no Deployment, or a list call refused
+  for missing RBAC, fails the step at once instead of turning the
+  gate off.
+
 - **DNSSEC is refused on a multi-server group, and the DS report is group-scoped (#1762).** Each agent server (BIND9, PowerDNS, Technitium) signs with keys it generated, so a signed zone on a group with two servers was served with two DNSKEY sets against one published DS, and validating resolvers got SERVFAIL from whichever server it did not match. Signing (the sign endpoint, `dnssec_enabled` on zone create and update, and both Copilot paths) now returns 422 when the group has more than one agent server. Adding or moving a server into a group that holds signed zones is refused too: server create, server move, a Fleet group change, and the Copilot `assign_appliance_role`. So is moving a signed zone into a multi-server group. **Disabled servers count**: a disabled agent still receives the bundle, so a disabled BIND9 server still signs with its own keys, and a disabled PowerDNS or Technitium server serves the zone unsigned under the DS. These checks lock the group row, so two concurrent requests cannot both pass. An agent that auto-registers into a signed group is not refused, because refusing would break its bootstrap. Instead it is logged and audited, and it trips the same flag as zones signed before this fix: `dnssec_multi_signer` on the zone and on `…/dnssec/info`, a red **DNSSEC: multiple signers** badge and a warning on the DNSSEC card, and a new default-on, critical `dnssec_multi_signer` alert. Those zones are not unsigned automatically. `/dns/agents/dnssec-state` now matches zones only within the reporting server's group, so same-named zones in different groups no longer collide. On a multi-server group it keeps one server's report (the primary's, or the oldest signer's when the group has no primary), which ends the last-writer-wins DS flapping.
 
 - **DNSSEC signing is no longer offered on Technitium (#1783).** The sign
@@ -2334,38 +2395,6 @@ the formatter handles the rest.
   saved enabled and silently skipped. Conformity events are no longer
   closed by the generic evaluator's auto-resolve passes; the
   conformity engine owns them.
-
-- **The PowerDNS agent stops serving zones wrong in three ways
-  (#1520, #1521, #1522).** Pool member address deletes were applied
-  as no-ops and acked ok — the record-op fallback ignored the rrset
-  action — so a removed member's address stayed served; deletes now
-  delete. Zone type was ignored: secondaries are now created as
-  Slave with their masters (a secondary without masters, and a
-  forward zone — which has no PowerDNS equivalent — are skipped
-  loudly instead of silently vanishing or being served as a primary
-  copy). And served zones now carry the zone's own Primary NS,
-  Admin Email, SOA timers and serial instead of daemon defaults,
-  with the served serial reported back.
-
-- **NOTIFY settings and zone allow-query now reach the agents
-  (#1523).** The server options `notify_enabled` / `also_notify` /
-  `allow_notify` and the zone-level `also_notify` / `notify_enabled` /
-  `allow_query` overrides were saved but never shipped in the agent
-  bundle. They ship now (renderer revision 8): the BIND9 agent renders
-  them in the options block and zone stanzas, and the PowerDNS agent
-  folds the effective notify setting into the zone kind (Master when
-  notifying — Native never sends NOTIFY) and applies the targets as
-  ALSO-NOTIFY metadata. A PowerDNS group cannot enforce allow-query
-  (the authoritative server has no query ACL); the agent logs that
-  loudly instead of letting the setting look applied.
-
-- **Records written to PowerDNS zones over RFC 2136 are ingested back
-  (#1524).** The ingest-back worker that mirrors externally written
-  records into SpatiumDDI ran only for BIND9, so dynamic records on
-  PowerDNS were invisible — and were silently overwritten where they
-  shared a name with managed records. The PowerDNS agent now reads
-  dynamic zones back over its loopback REST API on the same interval
-  and ships them to the same ingest endpoint.
 
 - **NFSv4 backups work on servers with a WRITE limit below 1 MiB, and a
   dropped NFS connection no longer crashes the api (#1500).** The `nfs`

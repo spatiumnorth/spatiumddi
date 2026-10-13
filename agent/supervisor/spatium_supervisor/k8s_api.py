@@ -494,7 +494,9 @@ def delete_node(name: str) -> tuple[bool, str | None]:
     never was a Node", and a node can be an etcd member without one (it
     became a voter before its Node registered), so the eviction is
     confirmed against etcd by etcd_evict, never by this answer."""
-    path = f"/api/v1/nodes/{quote(name)}"
+    # #1757 — k3s lowercases the host's name for its Node (RFC 1123); an old
+    # backend may still send the hostname as stored.
+    path = f"/api/v1/nodes/{quote(name.strip().rstrip('.').lower())}"
     try:
         status, resp = _request("DELETE", path)
     except RuntimeError as exc:

@@ -36,6 +36,7 @@ from app.db import AsyncSessionLocal
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.services.appliance import k8s
 from app.services.appliance.cluster_health import cluster_unavailable, get_cluster_health
+from app.services.appliance.ownership import k8s_node_name
 from app.services.appliance.storage_health import evaluate_storage, worst_severity
 
 logger = structlog.get_logger(__name__)
@@ -385,15 +386,16 @@ async def _merge_supervisor_host_state(db: AsyncSession, snap: dict[str, Any]) -
             continue
         parts = ch.get("host_disk_partitions")
         if isinstance(parts, list) and parts:
-            pmap[hostname] = parts
+            pmap[k8s_node_name(hostname)] = parts
         storage = ch.get("storage")
         if isinstance(storage, dict):
-            smap[hostname] = storage
+            smap[k8s_node_name(hostname)] = storage
     for node in snap["nodes"]:
-        if node["name"] in pmap:
-            node["host_disk_partitions"] = pmap[node["name"]]
-        if node["name"] in smap:
-            storage = dict(smap[node["name"]])
+        key = k8s_node_name(node["name"])
+        if key in pmap:
+            node["host_disk_partitions"] = pmap[key]
+        if key in smap:
+            storage = dict(smap[key])
             findings = evaluate_storage(storage)
             storage["findings"] = [
                 {

@@ -1320,6 +1320,32 @@ def get_deployment(name: str, namespace: str | None = None) -> tuple[int, dict[s
     return status, None
 
 
+def list_deployments(
+    label_selector: str, namespace: str | None = None
+) -> tuple[int, list[dict[str, Any]]]:
+    """List Deployments matching ``label_selector`` (#1544).
+
+    Returns ``(status, items)``; ``items`` is empty on any non-200. Lets a
+    caller find a release's Deployments by label instead of carrying a
+    name list that goes stale when the chart adds one.
+    """
+    cfg = get_config()
+    if cfg is None:
+        raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+    ns = namespace or cfg.namespace
+    path = (
+        f"/apis/apps/v1/namespaces/{quote(ns)}/deployments"
+        f"?labelSelector={quote(label_selector, safe='')}"
+    )
+    status, body = _request("GET", path)
+    if status == 200:
+        try:
+            return status, list(json.loads(body.decode("utf-8")).get("items") or [])
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            return status, []
+    return status, []
+
+
 def deployment_is_rolled_out(deployment: dict[str, Any]) -> bool:
     """True when a Deployment's rolling update has finished.
 

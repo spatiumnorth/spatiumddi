@@ -1101,7 +1101,8 @@ async def check_powerdns_lmdb_migration() -> PreflightResult:
                                  OR s.deployment_kind = 'appliance'
                                  OR EXISTS (
                                         SELECT 1 FROM appliance a
-                                        WHERE a.hostname = s.host
+                                        WHERE lower(rtrim(trim(a.hostname), '.'))
+                                            = lower(rtrim(trim(s.host), '.'))
                                     )
                               )
                             ORDER BY s.name
