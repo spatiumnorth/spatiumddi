@@ -66,6 +66,7 @@ from app.drivers.dns.windows import test_winrm_credentials
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.dns import (
+    DEFAULT_ALLOW_RECURSION,
     DNSSEC_ALGORITHMS,
     ZONE_DEFAULT_EXPIRE,
     ZONE_DEFAULT_MINIMUM,
@@ -85,6 +86,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
     DNSZoneUpdateAcl,
+    dnssec_algorithm_name,
 )
 from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
@@ -113,6 +115,7 @@ from app.services.dns.delegation import (
 )
 from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
 from app.services.dns.named_conf_validation import (
+    ADDRESS_MATCH_LIST_OPTIONS,
     AclCycleError,
     ViewValidationError,
     is_name_reference,
@@ -3775,6 +3778,13 @@ async def update_options(
         db.add(opts)
 
     changes = body.model_dump(exclude_none=True)
+    # #1817: a blank allow_recursion means "the default", not "nobody". An
+    # empty list would render ``allow-recursion { none; }`` / Technitium
+    # ``Deny`` and lock every client out of recursion, which is not what
+    # clearing the field in the UI looks like. ``["none"]`` is how to refuse
+    # everyone.
+    if "allow_recursion" in changes and not any(str(e).strip() for e in changes["allow_recursion"]):
+        changes["allow_recursion"] = list(DEFAULT_ALLOW_RECURSION)
     # NULL is a meaningful "clear back to BIND default" for the optional RRL /
     # amplification knobs, but exclude_none drops it — so re-inject when the
     # operator explicitly sent null (mirrors the update_zone color /
@@ -4028,9 +4038,10 @@ async def _assert_acl_is_unreferenced(
     declines the whole bundle, so the group stops converging rather than
     losing one statement.
 
-    Checks both directions a name can be cited: another ACL's entries, and
-    any view's ``match_clients`` / ``match_destinations`` /
-    ``allow_query`` / ``allow_query_cache``.
+    Checks every place a name can be cited: another ACL's entries, any
+    view's ``match_clients`` / ``match_destinations`` / ``allow_query`` /
+    ``allow_query_cache``, and the group's server options (``allow_query``,
+    ``allow_recursion``, …).
     """
     citing_acls = [
         a.name
@@ -4061,12 +4072,29 @@ async def _assert_acl_is_unreferenced(
             )
         )
     ]
-    if not citing_acls and not citing_views:
+    # The group's server options are address-match lists too, rendered
+    # verbatim into ``options {}`` (allow-recursion since #1786).
+    opts = (
+        await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
+    ).scalar_one_or_none()
+    citing_options = (
+        sorted(
+            field
+            for field in ADDRESS_MATCH_LIST_OPTIONS
+            if any(
+                is_name_reference(str(el)) == acl.name for el in getattr(opts, field, None) or []
+            )
+        )
+        if opts is not None
+        else []
+    )
+    if not citing_acls and not citing_views and not citing_options:
         return
     cited_by = ", ".join(
         [
             *(f"ACL '{n}'" for n in sorted(citing_acls)),
             *(f"view '{n}'" for n in sorted(citing_views)),
+            *(f"server option '{n}'" for n in citing_options),
         ]
     )
     raise HTTPException(
@@ -6214,7 +6242,10 @@ class DNSSECKeyState(BaseModel):
 
     key_tag: int | None = None
     key_type: str | None = None
-    algorithm: str | None = None
+    #: IANA DNSSEC algorithm number (13 = ECDSAP256SHA256) — #1812.
+    algorithm: int | None = None
+    #: IANA mnemonic for ``algorithm``; None for a number we do not know.
+    algorithm_name: str | None = None
     state: str | None = None
     ds_records: list[str] = []
     timing: dict[str, Any] = {}
@@ -6344,6 +6375,7 @@ async def get_zone_dnssec_info(
                     "key_tag": k.key_tag,
                     "key_type": k.key_type,
                     "algorithm": k.algorithm,
+                    "algorithm_name": dnssec_algorithm_name(k.algorithm),
                     "state": k.state,
                     "ds_records": k.ds_records or [],
                     "timing": k.timing or {},

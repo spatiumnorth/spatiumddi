@@ -1540,7 +1540,11 @@ async def _sync_dns_record(
             )
             .options(selectinload(DNSRecord.zone))
         )
-        records = list(result.scalars().all())
+        # #1800 — PTRs first. Technitium deletes the matching PTR with an
+        # A/AAAA, and the control plane re-asserts a PTR whose row is still
+        # live and whose delete is not yet queued; retracting the PTR first
+        # spares the wire a create the PTR's own delete then undoes.
+        records = sorted(result.scalars().all(), key=lambda r: r.record_type != "PTR")
         for record in records:
             zone = record.zone
             # #1419 — a zone IPAM does not author (a release before the fix

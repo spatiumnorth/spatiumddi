@@ -170,7 +170,16 @@ class ServerOptions:
     forwarders: tuple[str, ...] = ()
     forward_policy: str = "first"
     recursion_enabled: bool = True
-    allow_recursion: tuple[str, ...] = ("any",)
+    # #1817: local + private networks. Mirrors models.dns.DEFAULT_ALLOW_RECURSION.
+    allow_recursion: tuple[str, ...] = (
+        "localhost",
+        "localnets",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+    )
     dnssec_validation: str = "auto"
     notify_enabled: str = "yes"
     also_notify: tuple[str, ...] = ()

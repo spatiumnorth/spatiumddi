@@ -958,7 +958,7 @@ class FindZoneDNSSECInfoArgs(BaseModel):
 async def find_zone_dnssec_info(
     db: AsyncSession, user: User, args: FindZoneDNSSECInfoArgs
 ) -> dict[str, Any]:
-    from app.models.dns import DNSKey  # noqa: PLC0415
+    from app.models.dns import DNSKey, dnssec_algorithm_name  # noqa: PLC0415
 
     zone = await db.get(DNSZone, args.zone_id)
     if zone is None or not token_allows_zone(user, zone.id):
@@ -993,6 +993,7 @@ async def find_zone_dnssec_info(
                 "key_tag": k.key_tag,
                 "key_type": k.key_type,
                 "algorithm": k.algorithm,
+                "algorithm_name": dnssec_algorithm_name(k.algorithm),
                 "state": k.state,
                 "ds_records": k.ds_records or [],
             }

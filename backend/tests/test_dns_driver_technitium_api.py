@@ -60,6 +60,13 @@ class _FakeClient:
     async def __aexit__(self, *exc: Any) -> bool:
         return False
 
+    async def post(self, path: str, data: Any = None) -> _FakeResponse:
+        self.calls.append({"path": path, "method": "POST", "data": data or {}})
+        if not self._responses:
+            raise AssertionError(f"unexpected POST {path} (no queued response)")
+        item = self._responses.pop(0)
+        return item() if callable(item) else item
+
     async def get(self, path: str, params: Any = None) -> _FakeResponse:
         self.calls.append({"path": path, "params": params or {}})
         if not self._responses:
@@ -558,6 +565,8 @@ async def test_replayed_op_is_an_idempotent_noop(
     [
         "Cannot add record: CNAME record already exists for the same name.",
         "Cannot add record: DNAME record already exists for the same name.",
+        # The real primary-zone text (AuthZone.cs:135/145 TrySetRecords, v15.4.0).
+        "Cannot add record: a CNAME record cannot exists with other record types for the same name.",
         "Cannot add record: CNAME record already exists for the same name",
         # Raised for a CNAME/DNAME add with overwrite=false whatever the
         # existing record's value, so it does not prove ours is there.
@@ -573,7 +582,7 @@ async def test_conflict_refusal_is_a_failure_not_a_noop(
     means the record was NOT written; counting it as converged marks the op
     applied while the server keeps serving the old data."""
     drv, _ = _driver(monkeypatch, [_FakeResponse({"status": "error", "errorMessage": message})])
-    with pytest.raises(Exception, match="(?i)already exists|no such record"):
+    with pytest.raises(Exception, match="(?i)already exists|no such record|cannot exists"):
         await drv.apply_record_change(
             _Server({"api_url": "https://x.test", "api_token": "t"}),
             _change("create", rrset=_rrset("10.0.0.1")),
@@ -786,6 +795,70 @@ async def test_probe_reports_auth_failure_as_not_ok(
     result = await drv.probe(_Server({"api_url": "https://x.test", "api_token": "t"}))
     assert not result.ok
     assert "Create Token" in result.message
+
+
+@pytest.mark.asyncio
+async def test_probe_names_a_pre_15_server_instead_of_blaming_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 14.x server ignores the Bearer header and answers invalid-token for
+    a perfectly good token; telling the operator to re-create it never helps."""
+    drv, fake = _driver(
+        monkeypatch,
+        [
+            _FakeResponse({"status": "invalid-token"}),
+            _FakeResponse({"status": "ok", "info": {"version": "14.3"}}),
+        ],
+    )
+    result = await drv.probe(_Server({"api_url": "https://x.test", "api_token": "t"}))
+    assert not result.ok
+    assert "14.3" in result.message and "15.0 or later" in result.message
+    # The fallback token goes in a POST body, never a URL.
+    assert fake.calls[1]["method"] == "POST"
+    assert fake.calls[1]["data"] == {"token": "t"}
+
+
+@pytest.mark.asyncio
+async def test_probe_blames_the_token_when_the_server_is_15_or_later(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On 15.x a bad token is bad in the form field too, so the fallback must
+    not turn a real token problem into an "upgrade" message."""
+    drv, _fake = _driver(
+        monkeypatch,
+        [_FakeResponse({"status": "invalid-token"}), _FakeResponse({"status": "invalid-token"})],
+    )
+    result = await drv.probe(_Server({"api_url": "https://x.test", "api_token": "t"}))
+    assert not result.ok
+    assert "Create Token" in result.message
+    assert "predates" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_probe_does_not_call_a_restricted_token_an_old_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token whose user lacks a permission answers ``error``, not
+    ``invalid-token`` — no fallback call, no version claim."""
+    drv, fake = _driver(
+        monkeypatch,
+        [_FakeResponse({"status": "error", "errorMessage": "Access was denied."})],
+    )
+    result = await drv.probe(_Server({"api_url": "https://x.test", "api_token": "t"}))
+    assert not result.ok
+    assert "Access was denied" in result.message
+    assert "predates" not in result.message
+    assert [c["path"] for c in fake.calls] == ["/api/dnsClient/healthCheck"]
+
+
+@pytest.mark.asyncio
+async def test_probe_zero_zones_warns_about_permissions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drv, _fake = _driver(monkeypatch, [_ok({}), _ok({"totalPages": 1, "zones": []})])
+    result = await drv.probe(_Server({"api_url": "https://x.test", "api_token": "t"}))
+    assert result.ok and result.zone_count == 0
+    assert "DNS Administrators" in result.message
 
 
 @pytest.mark.asyncio

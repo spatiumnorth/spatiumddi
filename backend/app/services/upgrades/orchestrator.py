@@ -878,6 +878,27 @@ async def _drive_loop(
             category = upgrade_alerts.classify_per_node_failure(
                 failed_at=result.failed_at, error=result.error
             )
+            # #1542 — the compensating release failed too: the node is left
+            # cordoned and/or the CNPG window on. Worse than the original
+            # failure, so it gets its own category + alert text naming what
+            # is stuck. The run still stops.
+            stuck: list[str] | None = None
+            release_failed = upgrade_alerts.release_failure(result.steps)
+            if release_failed is not None:
+                release_error, stuck = release_failed
+                underlying_category = category
+                category = upgrade_alerts.CATEGORY_RELEASE_FAILED
+                run.last_error = (
+                    f"{run.last_error}; release of node {next_node} failed "
+                    f"(still held: {', '.join(stuck) or 'unknown'}): {release_error}"
+                )
+                per_node_progress[next_node]["release_failed"] = {
+                    "error": release_error,
+                    "stuck": stuck,
+                    # What the step failure would have been classified as,
+                    # so the original cause survives the override.
+                    "underlying_category": underlying_category,
+                }
             per_node_progress[next_node]["failure_category"] = category
             run.progress = {**run.progress, "per_node": per_node_progress}
             await upgrade_alerts.emit_upgrade_failed_alert(
@@ -886,6 +907,7 @@ async def _drive_loop(
                 failed_node=next_node,
                 failed_at_step=result.failed_at,
                 category=category,
+                stuck=stuck,
             )
             await _transition(
                 db,
