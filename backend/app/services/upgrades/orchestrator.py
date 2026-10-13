@@ -190,8 +190,11 @@ async def plan_upgrade(
         if cnpg_cluster_name:
             logger.info("upgrade_plan_cnpg_cluster_detected", cluster=cnpg_cluster_name)
 
-    # Preflight gate.
-    report = await preflight.run_all(target_version=target_version)
+    # Preflight gate. #1709 — an uploaded target the mirror holds needs no
+    # room on it.
+    report = await preflight.run_all(
+        target_version=target_version, slot_image_id=slot_image.image_id
+    )
     if report.overall == "fail":
         fails = [r.name for r in report.results if r.level == "fail"]
         raise OrchestratorError(f"preflight failed; refusing to plan: {', '.join(fails)}")
