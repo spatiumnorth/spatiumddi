@@ -11,6 +11,7 @@ import {
   type IPAMTemplateUpdate,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -555,6 +556,17 @@ function ReapplyConfirmModal({
 }
 
 export function IPAMTemplatesPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'manage_ipam_templates'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_ipam_templates"),
+    "Requires write permission on IPAM templates",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_ipam_templates"),
+    "Requires delete permission on IPAM templates",
+  );
   const qc = useQueryClient();
   const tplsQ = useQuery({
     queryKey: ["ipam-templates"],
@@ -688,7 +700,8 @@ export function IPAMTemplatesPage() {
               setEditorErr("");
               setEditor({ mode: "create", initial: { ...EMPTY } });
             }}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Plus className="h-4 w-4" /> New template
           </button>
@@ -777,6 +790,7 @@ export function IPAMTemplatesPage() {
                       disabled={t.applied_count === 0}
                       className="mr-1 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:opacity-40"
                       title="Reapply across all instances"
+                      {...writeGate}
                     >
                       <RefreshCw className="h-3 w-3" />
                     </button>
@@ -789,7 +803,8 @@ export function IPAMTemplatesPage() {
                           initial: formFromTemplate(t),
                         });
                       }}
-                      className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+                      className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                      {...writeGate}
                     >
                       <Pencil className="h-3 w-3" />
                     </button>
@@ -802,7 +817,8 @@ export function IPAMTemplatesPage() {
                         )
                           deleteMut.mutate(t.id);
                       }}
-                      className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:text-destructive hover:bg-accent"
+                      className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:text-destructive hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3 w-3" />
                     </button>

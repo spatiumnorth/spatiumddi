@@ -16,7 +16,7 @@ import {
   CHANGE_REQUEST_QUERY_KEY,
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
-import { usePermissions } from "@/hooks/usePermissions";
+import { NEEDS_SUPERADMIN, usePermissions } from "@/hooks/usePermissions";
 import { resolveEnabled } from "@/hooks/useFeatureModules";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { useSessionState } from "@/lib/useSessionState";
@@ -473,7 +473,14 @@ export function FeaturesPage() {
                           <Toggle
                             label={`${m.enabled ? "Disable" : "Enable"} ${m.label}`}
                             checked={m.enabled && !isBlocked}
-                            disabled={toggleMutation.isPending || isBlocked}
+                            disabled={
+                              toggleMutation.isPending ||
+                              isBlocked ||
+                              // #1341 — turning a module on or off takes a
+                              // superadmin (PATCH /admin/feature-modules).
+                              !isSuperadmin
+                            }
+                            title={isSuperadmin ? undefined : NEEDS_SUPERADMIN}
                             onChange={(v) => handleToggle(m, v)}
                           />
                         </div>

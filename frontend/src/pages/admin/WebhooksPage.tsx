@@ -36,6 +36,11 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { copyToClipboard } from "@/lib/clipboard";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -571,6 +576,12 @@ function DeliveryRow({
 // ── Page ───────────────────────────────────────────────────────────────────
 
 export function WebhooksPage() {
+  // #1341 — every write on this page takes a superadmin (its handlers
+  // take SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const [editing, setEditing] = useState<WebhookSubscription | null>(null);
   const [showCreate, setShowCreate] = useState(false);
@@ -634,7 +645,8 @@ export function WebhooksPage() {
           <button
             type="button"
             onClick={() => setShowCreate(true)}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...superadminGate}
           >
             <Plus className="h-4 w-4" />
             New subscription
@@ -700,13 +712,15 @@ export function WebhooksPage() {
                       onClick={() => test.mutate(s.id)}
                       className="inline-flex items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
                       title="Send a synthetic ``test.ping`` event through the same signing + transport path the worker uses"
+                      {...superadminGate}
                     >
                       <Send className="h-3 w-3" /> Test
                     </button>
                     <button
                       type="button"
                       onClick={() => setEditing(s)}
-                      className="inline-flex items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-accent"
+                      className="inline-flex items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                      {...superadminGate}
                     >
                       <Pencil className="h-3 w-3" /> Edit
                     </button>
@@ -718,7 +732,8 @@ export function WebhooksPage() {
                           onConfirm: () => del.mutate(s.id),
                         });
                       }}
-                      className="inline-flex items-center gap-1 rounded border border-rose-300 px-2 py-1 text-xs text-rose-600 hover:bg-rose-50 dark:border-rose-900 dark:hover:bg-rose-900/20"
+                      className="inline-flex items-center gap-1 rounded border border-rose-300 px-2 py-1 text-xs text-rose-600 hover:bg-rose-50 dark:border-rose-900 dark:hover:bg-rose-900/20 disabled:cursor-not-allowed disabled:opacity-50"
+                      {...superadminGate}
                     >
                       <Trash2 className="h-3 w-3" /> Delete
                     </button>

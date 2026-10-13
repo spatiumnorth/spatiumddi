@@ -92,6 +92,37 @@ def test_a_bundle_from_an_older_control_plane_gets_one_not_auto(daemon):
     assert out["multi-threading"]["thread-pool-size"] == 1
 
 
+# ── packet-queue-size (#1283) ───────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("daemon", ["Dhcp4", "Dhcp6"])
+def test_packet_queue_size_is_rendered_not_left_at_keas_64(daemon):
+    """Kea's multi-threading queue sits between the thread that reads the
+    socket and the worker. Left unset it holds 64 packets, and when a burst
+    outruns the worker Kea evicts the OLDEST queued packet to make room. No
+    statistic counts that: ``pkt4-received`` is incremented by the worker
+    that processes a packet, so an evicted one reaches no counter at all, and
+    the only trace is a debug-level log line. Every product surface then
+    shows a healthy server while clients retransmit, which is #1283.
+
+    Rendered for both daemons (kea-dhcp6 runs the same queue) and for every
+    bundle, including one from a control plane that predates the fix: this
+    is the agent's own default, not a group setting."""
+    out = render(_bundle())[daemon]
+    assert out["multi-threading"]["packet-queue-size"] == 1024
+
+
+@pytest.mark.parametrize("pool", [0, 1, 4])
+def test_packet_queue_size_does_not_scale_with_the_pool(pool):
+    """The queue is shared by the whole pool and its size is a bound on how
+    long a request may wait (size / service rate). More workers drain it
+    faster, so the same size is only ever safer; scaling it up with the pool
+    would let a large pool queue requests past the client's first retransmit
+    (4 s), which is the stale backlog #952 measured as a 34 s DORA."""
+    out = render(_bundle(kea_thread_pool_size=pool))["Dhcp4"]
+    assert out["multi-threading"]["packet-queue-size"] == 1024
+
+
 # ── per-packet logging ──────────────────────────────────────────────────────
 
 

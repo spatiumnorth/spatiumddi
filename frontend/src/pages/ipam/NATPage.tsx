@@ -11,6 +11,7 @@ import {
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const KIND_LABEL: Record<NATKind, string> = {
   "1to1": "1:1 NAT",
@@ -323,6 +324,17 @@ function NATMappingModal({
 // ─────────────────────────────────────────────────────────────────────
 
 export function NATPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'nat_mapping'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "nat_mapping"),
+    "Requires write permission on NAT mappings",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "nat_mapping"),
+    "Requires delete permission on NAT mappings",
+  );
   const qc = useQueryClient();
   const [kindFilter, setKindFilter] = useState<NATKind | "">("");
   const [search, setSearch] = useState("");
@@ -378,7 +390,8 @@ export function NATPage() {
           </div>
           <button
             onClick={() => setShowCreate(true)}
-            className="flex flex-shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="flex flex-shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Plus className="h-3.5 w-3.5" />
             New mapping
@@ -494,15 +507,17 @@ export function NATPage() {
                       <div className="flex justify-end gap-1">
                         <button
                           onClick={() => setEditing(m)}
-                          className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                          className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Edit"
+                          {...writeGate}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
                         <button
                           onClick={() => setConfirmDelete(m)}
-                          className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                          className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                           title="Delete"
+                          {...deleteGate}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
