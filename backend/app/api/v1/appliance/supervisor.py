@@ -4370,6 +4370,24 @@ async def update_appliance_roles(
                         f"capability {cap_key}=true; cannot assign role {r!r}."
                     ),
                 )
+
+    # #1427 — a control-plane cluster serves one DNS server group; refused
+    # before anything below changes the row or moves a server.
+    refusal = await _cluster_dns_group_refusal(
+        db,
+        row,
+        roles=list(body.roles) if body.roles is not None else list(row.assigned_roles or []),
+        group_id=(
+            body.dns_group_id
+            if "dns_group_id" in body.model_fields_set
+            else row.assigned_dns_group_id
+        ),
+        prev_roles=prev_dns_roles,
+        prev_group_id=prev_dns_group_id,
+    )
+    if refusal is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, refusal)
+    if body.roles is not None:
         row.assigned_roles = list(body.roles)
 
     # #1562 — presence in the payload decides, not non-None: an
@@ -4641,6 +4659,65 @@ async def _effective_cp_members(db: DB) -> list[Appliance]:
         .all()
     )
     return [r for r in rows if r.desired_cluster_role != DESIRED_CLUSTER_ROLE_NONE]
+
+
+async def _cluster_dns_group_refusal(
+    db: DB,
+    row: Appliance,
+    *,
+    roles: list[str],
+    group_id: uuid.UUID | None,
+    prev_roles: set[str],
+    prev_group_id: uuid.UUID | None,
+) -> str | None:
+    """Why ``row`` may not run DNS in ``group_id`` with ``roles``, or None
+    (#1427).
+
+    A control-plane cluster has ONE ``spatiumddi-appliance`` chart and so ONE
+    DNS agent group (``dnsBind9.serverGroupName``; the PowerDNS and Technitium
+    blocks carry the same value), set by whichever member holding a DNS role
+    wrote the chart last: with members in two groups, every DNS agent of the
+    cluster served the group of the last writer. So a member (or a joiner)
+    may run DNS only in the group the cluster's other DNS members are in.
+    Refused on a change only (gaining a DNS role, or a new group), so
+    re-saving what is there never is; dropping DNS never is; an appliance
+    outside the cluster has its own chart.
+    """
+    if group_id is None or not _DNS_ROLES.intersection(roles):
+        return None
+    if _DNS_ROLES.intersection(prev_roles) and group_id == prev_group_id:
+        return None
+    members = await _effective_cp_members(db)
+    if all(m.id != row.id for m in members):
+        return None
+    others = {
+        m.assigned_dns_group_id
+        for m in members
+        if m.id != row.id
+        and m.assigned_dns_group_id is not None
+        and _DNS_ROLES.intersection(m.assigned_roles or [])
+    }
+    if not others or others == {group_id}:
+        return None
+    from app.models.dns import DNSServerGroup
+
+    names = {
+        g.id: g.name
+        for g in (
+            await db.execute(
+                select(DNSServerGroup).where(DNSServerGroup.id.in_(others | {group_id}))
+            )
+        ).scalars()
+    }
+    if group_id not in names:
+        return None  # an unknown group: the existence check answers it
+    cluster = " and ".join(sorted(repr(names.get(g, str(g))) for g in others))
+    return (
+        f"Appliance {row.hostname!r} is a member of the control-plane cluster, and a "
+        f"cluster serves one DNS server group: its other DNS members are in {cluster}. "
+        f"It cannot run DNS in {names[group_id]!r}. Assign {cluster}, or take DNS off "
+        "the other members first."
+    )
 
 
 async def _committed_cp_count(db: DB) -> int:
