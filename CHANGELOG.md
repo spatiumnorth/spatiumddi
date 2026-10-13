@@ -94,6 +94,103 @@ the formatter handles the rest.
   only about the incoming domains. The audit trail is unchanged: one
   `delete` row for the list.
 
+- **`GET .../zones/{id}/dnssec/info` no longer 500s once an agent has
+  reported keys (#1812).** `DNSKey.algorithm` is the IANA number (13 =
+  ECDSAP256SHA256) but the response model typed it `str`, which Pydantic
+  does not coerce, so the endpoint failed for every signed zone with
+  reported keys. `algorithm` is now an integer and the new
+  `algorithm_name` carries the mnemonic (null for an unknown number); the
+  `find_zone_dnssec_info` Copilot tool gains the same field and the zone
+  DNSSEC card shows `ECDSAP256SHA256 (13)`.
+
+- **Deleting an A/AAAA on Technitium no longer loses its PTR (#1800).**
+  Technitium's web API deletes the matching PTR with the A/AAAA when the
+  reverse zone is on the same server, and #1768 only repaired the structural
+  reconcile. A record-op delete left the PTR gone until the next structural
+  pass. The control plane now queues a PTR create after the delete for any
+  PTR it still owns in a reverse zone of the group (`technitium` and
+  `technitium_api`, single, batch and bulk), decided against the database so
+  a PTR deleted earlier is not resurrected from a stale bundle. A delete that
+  fails and is retried after the PTR create applied re-asserts the PTR again
+  when its retry is acknowledged. Edits already
+  ride `update` ops, which do not touch the PTR (checked in the v15.4.0
+  source). A PTR in a reverse zone SpatiumDDI does not manage is still
+  removed with its A record; this is documented in `DNS_DRIVERS.md`. Also
+  corrects the Technitium CNAME-conflict text quoted in comments and docs: a
+  primary zone answers "a CNAME record cannot exists with other record types
+  for the same name", and both drivers count it as a failure (test added).
+
+- **Technitium token and auth lifecycle (#1772).** The agentless
+  `technitium_api` setup text said Zones: Modify + DnsClient: View, which
+  cannot delete zones and sees no pre-existing zone; the form, API
+  docstring and docs now say to use a user in DNS Administrators, and the
+  connection test warns when it sees 0 zones. A pre-15.0 server (no Bearer
+  auth) is now reported as such by the test instead of "recreate the
+  token". The Technitium agent now names `bad-credentials`,
+  `2fa-required` and `locked-out` when it cannot re-mint its API token, and
+  stops presenting the password: one attempt per 15 minutes, instead of
+  one per apply retry and per record op, which kept the agent's address
+  under Technitium's 5-failure login block. Such an apply reports
+  `reverted` with that reason, not `revert_failed`, because no call reached
+  the daemon.
+
+- **The BIND9 agent now renders `allow-recursion` (#1786).** The
+  group's `allow_recursion` was stored and shipped in the bundle but
+  never written to `named.conf`. An explicit list now renders in
+  `options {}` (named ACLs resolve to the `acl {}` blocks from #899;
+  the API validates the entries like `allow_query`). The agent drops
+  any stored element `named-checkconf` would refuse, including an ACL
+  that no longer exists, and renders `none` if nothing survives, so one
+  bad element cannot stop the group converging and a broken
+  restriction fails closed. An ACL cited by the server options can no
+  longer be deleted or renamed. The bundle change is renderer
+  revision 9. What the default is: see #1817 below.
+
+- **Recursive BIND9 groups on default settings are no longer open resolvers (#1817).**
+  The agent renders `allow-query { any; }` and an unset `allow-recursion`
+  inherits it (BIND 9.20 `server.c`), so a recursive group nobody had
+  configured answered recursive queries for the internet. The default
+  for `allow_recursion` is now local + private networks,
+  `["localhost", "localnets", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10"]`,
+  and every value renders literally: the default renders
+  `allow-recursion { localhost; localnets; 10.0.0.0/8; 172.16.0.0/12; 192.168.0.0/16; fc00::/7; fe80::/10; };`,
+  an explicit `any` renders `any` (open, deliberately), and a stored
+  empty list renders `none` (fail closed). Recursion off still renders no
+  line. The private ranges are in the default because `localnets` is the
+  subnets of the interfaces named sees: on the plain appliance BIND9 runs
+  on host networking and that is the LAN, but behind the appliance DNS VIP,
+  in the umbrella Helm chart, the `k8s/` manifests and Docker Compose it
+  runs on a pod or bridge network, where `localnets` alone would refuse
+  every LAN client. Saving the Options field blank now stores the default
+  (the group-options PUT normalises `allow_recursion: []`); `none` is the
+  way to refuse everyone. Technitium follows the same values: the default
+  maps to one deduplicated ACL of loopback plus the private ranges,
+  `any` to `Allow`, empty to `Deny`. A migration rewrites rows that are
+  exactly `["any"]` (or empty) to the new default and re-renders every
+  affected agent. **Upgrade note:** on any deployment shape, a recursive
+  group whose clients use public addresses (routed public subnets, or
+  globally routable IPv6 on a pod-network shape) or CGNAT / Tailscale
+  addresses (`100.64.0.0/10` is deliberately not in the default) loses
+  recursion until those networks are added to `allow_recursion`. `any`
+  restores fully open recursion. The bundle change is renderer
+  revision 10.
+
+- **A rolling upgrade whose own cleanup fails now raises a distinct
+  alert (#1542).** When an upgrade fails after cordoning a node, the
+  orchestrator uncordons it and clears the CNPG maintenance window; if
+  that release itself fails the node stays held and an operator must
+  act, but the alert was the same as any other failed step. The
+  existing `cluster-upgrade-failed` event now carries category
+  `release_failed`, names what is still held (`cordon`,
+  `maintenance_window`) in its message and `stuck` detail, and the
+  per-node progress records `release_failed` with the error, what is
+  held and the step's own category. The Cluster upgrade tab labels the
+  node "Release failed — node held" and lists what is still held. The
+  run still stops. No new rule or migration: the rule is already
+  critical, the highest severity.
+
+- **A new Technitium zone is no longer served under the daemon's default SOA (#1758).** `zones/create` takes no SOA, so a Primary created by the agent answered with Technitium's default (`hostadmin@<zone>`, TTL and minimum 900 s, which is the negative-cache TTL) until its own SOA and records landed: 8-11 s after a group move or any fresh agent start. A resolver could cache an NXDOMAIN from that window for up to 15 minutes. The agent now holds a Primary straight after creating it, or converting a Forwarder into one, by setting its `queryAccess` to `Deny`, and applies the zone's real options, query access included, once its records and apex SOA/NS are reconciled. A held zone answers REFUSED, which no resolver caches. It is deliberately not disabled: a disabled zone is not authoritative, so on a group that allows recursion the query is resolved upstream instead, giving `corp.lan` the root's NXDOMAIN (negative TTL one day) and an internal copy of a public zone its public answers. A zone that already exists is never held, so a second pass still writes nothing. If the agent dies before the release, or the release is refused, the zone is remembered in `technitium-zones-held.json` in the agent state dir and released on the next pass.
+
 - **The PowerDNS agent stops serving zones wrong in three ways
   (#1520, #1521, #1522).** Pool member address deletes were applied
   as no-ops and acked ok — the record-op fallback ignored the rrset
@@ -375,13 +472,8 @@ the formatter handles the rest.
   which dropped a busy downstream resolver's answers. Recursion off
   (or `is_recursive=false`) now sends `Deny`. An explicit
   `allow_recursion` list sends `UseSpecifiedNetworkACL` with the list as
-  CIDRs, failing closed to `Deny` when no entry is usable. The stored
-  default `["any"]`, like an empty list, keeps Technitium's
-  private-networks-only recursion: SpatiumDDI does not open recursion on
-  Technitium through the default, because the BIND9 agent never renders
-  `allow_recursion` either (#1786) and `["any"]` cannot be told apart
-  from an untouched group. So recursion-enabled groups see no change on
-  upgrade. RRL off sends empty QPM limits; RRL on derives a per-client
+  CIDRs, failing closed to `Deny` when no entry is usable. The default
+  list (#1817) maps to loopback plus the private ranges. RRL off sends empty QPM limits; RRL on derives a per-client
   limit from `rrl_responses_per_second`, the window from `rrl_window`,
   the truncation share from `rrl_slip`, and `rrl_exempt_clients` as the
   bypass list. **Behaviour change on upgrade:** `rrl_enabled` defaults
@@ -3371,6 +3463,12 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `b8e41c7a2d95` — #1817, data + server default:
+  `dns_server_options.allow_recursion` rows that are exactly `["any"]`
+  (or empty) become the local + private networks default, the column
+  default changes with them, and `bundle_dirty_seq` is bumped on the
+  affected groups' agent servers. Downgrade rewrites exactly that default
+  list back to `["any"]` and restores the old column default.
 - `5e6d56b39ab7` — #1356, data-only: every persistent `pairing_code`
   that is not revoked and has no expiry gets `expires_at` 30 days after
   the upgrade. Downgrade is a no-op: which codes were NULL is not

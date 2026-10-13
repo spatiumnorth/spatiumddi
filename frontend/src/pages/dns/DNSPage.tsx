@@ -385,7 +385,7 @@ const SELF_HOSTED_CRED_FIELDS: Record<string, CloudCredField[]> = {
       label: "API token",
       placeholder: "permanent API token",
       secret: true,
-      help: "Administration → Sessions → Create Token. Create it against a limited user (Zones: Modify + DnsClient: View), not the admin account — the token inherits that user's permissions.",
+      help: "Administration → Sessions → Create Token. Requires Technitium 15.0 or later. Create it against a dedicated user that is a member of the DNS Administrators group (not the admin account) — the token inherits that user's permissions, and Zones: Modify alone cannot delete zones or see zones that already existed.",
     },
     {
       key: "verify_tls",
@@ -2471,7 +2471,11 @@ function DnssecCard({
                 <tr key={`${k.key_type}-${k.key_tag}`} className="border-t">
                   <td className="py-0.5 pr-2 font-mono">{k.key_tag}</td>
                   <td className="py-0.5 pr-2 uppercase">{k.key_type}</td>
-                  <td className="py-0.5 pr-2">{k.algorithm}</td>
+                  <td className="py-0.5 pr-2">
+                    {k.algorithm_name
+                      ? `${k.algorithm_name} (${k.algorithm})`
+                      : k.algorithm}
+                  </td>
                   <td className="py-0.5 pr-2">{k.state}</td>
                   <td className="py-0.5 text-right">
                     <button
@@ -6758,7 +6762,9 @@ function OptionsTab({ groupId }: { groupId: string }) {
   const [forwarders, setForwarders] = useState("");
   const [forwardPolicy, setForwardPolicy] = useState("first");
   const [recursionEnabled, setRecursionEnabled] = useState(true);
-  const [allowRecursion, setAllowRecursion] = useState("any");
+  const [allowRecursion, setAllowRecursion] = useState(
+    "localhost, localnets, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7, fe80::/10",
+  );
   const [dnssecValidation, setDnssecValidation] = useState("auto");
   const [notifyEnabled, setNotifyEnabled] = useState("yes");
   const [allowQuery, setAllowQuery] = useState("any");
@@ -7282,8 +7288,14 @@ function OptionsTab({ groupId }: { groupId: string }) {
               setAllowRecursion(e.target.value);
               setDirty(true);
             }}
-            placeholder="any"
+            placeholder="blank = default (local + private networks)"
           />
+          <p className="text-xs text-muted-foreground">
+            Blank = default (local + private networks: localhost, localnets, RFC
+            1918, fc00::/7, fe80::/10); &quot;none&quot; refuses everyone. Add
+            public, CGNAT or Tailscale client networks explicitly, or
+            &quot;any&quot; to open recursion to everyone (an open resolver).
+          </p>
         </Field>
       </div>
 
