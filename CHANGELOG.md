@@ -98,6 +98,7 @@ the formatter handles the rest.
   run still stops. No new rule or migration: the rule is already
   critical, the highest severity.
 
+
 - **A rolling upgrade waits for the control-plane Deployments before it
   moves to the next node (#1544).** The other half of the gate that
   already waits for CNPG: after each node's uncordon, the per-node
@@ -507,6 +508,39 @@ the formatter handles the rest.
   the count cannot recover while the node is cordoned. An earlier
   version of this fix waited before the uncordon and timed out on the
   first node holding an instance, which ended the run.
+
+- **The Technitium agent's structural reconcile no longer rewrites
+  records on every pass or silently deletes PTRs (#1768).** It
+  fingerprinted the daemon's raw record data and fixed any difference by
+  deleting and re-adding, so records Technitium stores differently from
+  how they are sent were rewritten each time: a set with mixed TTLs
+  (Technitium keeps one per set), IDN targets (the derived `*Idn` keys),
+  CAA tags with capitals, and URIs it normalises. Each A/AAAA delete also
+  made Technitium delete the matching PTR in a reverse zone SpatiumDDI
+  manages on the same server. Now both sides are normalised to what the
+  daemon reads back, the set's minimum TTL is stamped (Technitium only),
+  a TTL-only change or a record disabled in the console is fixed with
+  `zones/records/update` in place, reverse zones are reconciled after
+  forward zones so a deleted PTR is re-added, and an apex NS TTL change
+  reaches the daemon. A second pass over an unchanged bundle sends no
+  writes. BIND9 and PowerDNS are untouched.
+- **Technitium's "CNAME record already exists" refusal is no longer
+  counted as success (#1770).** Both Technitium drivers treated any
+  error containing "already exists" as an idempotent no-op, so adding a
+  CNAME or DNAME beside other data at a name, which Technitium refuses
+  with `Cannot add record: CNAME record already exists for the same
+  name.`, was marked applied while the server kept serving the old data.
+  The drivers now match Technitium's exact no-op messages (record
+  already exists, no such record to delete, zone already exists), so
+  the conflict surfaces as a failed op with Technitium's message.
+  `Record already exists. Use overwrite option …` is a failure too: it
+  is raised when a CNAME or DNAME with any value holds the name, so it
+  does not mean ours is there. A Technitium release that rewords one of
+  these messages now fails the op rather than reading it as applied.
+  The forward-zone upstream reconciler (#1764) reads the same exact
+  messages: an identical upstream answering "record already exists" is
+  applied and no longer holds back removing a stale one, while the
+  overwrite-option refusal still keeps the old upstream.
 
 - **A Fleet group change now finds the appliance's own servers
   (#1715).** #1664 moved the appliance's DNS and DHCP servers with the

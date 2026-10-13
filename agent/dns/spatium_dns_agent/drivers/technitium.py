@@ -70,6 +70,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import httpx
 import structlog
@@ -471,6 +472,60 @@ _TSIG_ALGORITHMS = frozenset(
 )
 
 
+# Exact Technitium "the server is already in that state" answers (#1770).
+# Matching the bare substring "already exists" also swallowed Technitium's
+# CNAME/DNAME conflict refusal, "Cannot add record: CNAME record already
+# exists for the same name." (AuthZone.cs:817, v15.4.0), which is a REFUSAL:
+# the record does not exist and the server keeps serving the old data.
+# Upstream (TechnitiumSoftware/DnsServer v15.4.0):
+#   WebServiceZonesApi.cs:4229  "Cannot add record: record already exists."
+#   WebServiceZonesApi.cs:4336-4596  "Cannot delete record: no such record exists."
+#   WebServiceZonesApi.cs:1661-1877  "Zone already exists: <zone>"
+# Unchanged through v15.6.1. Compared whole (case-folded, trailing period
+# dropped), never as a substring.
+#
+# Deliberately NOT a no-op: "Record already exists. Use overwrite option if
+# you wish to overwrite existing record." (WebServiceZonesApi.cs:3932/4022/
+# 4183). It is raised for a CNAME / DNAME / APP add with overwrite=false when
+# ANY record of that type is at the name, whatever its value. This driver only
+# sends overwrite=false for a record the server lacks (reconcile adds, RRset
+# members after the first), so the answer means a different one holds the
+# name. Same set as ``app/services/technitium/rdata.py``; pinned by the
+# backend's test_technitium_svcb_parity.py.
+_RECORD_ABSENT_MESSAGE = "cannot delete record: no such record exists"
+_RECORD_NOOP_MESSAGES = frozenset(
+    {
+        "cannot add record: record already exists",
+        "cannot delete record: no such record exists",
+    }
+)
+
+
+# Keys of a record dict that are not part of its rdata: where it lives and
+# what state it is in. Everything else is the value params ``records/delete``
+# and ``records/update`` identify a record by.
+_RECORD_STATE_KEYS = ("domain", "type", "ttl", "zone", "disabled")
+
+
+def _is_reverse_zone(zone: Any) -> bool:
+    name = str(zone or "").rstrip(".").lower()
+    return name.endswith((".in-addr.arpa", ".ip6.arpa"))
+
+
+def _norm_error(message: Any) -> str:
+    return str(message or "").strip().lower().rstrip(".").strip()
+
+
+def _is_record_noop(message: Any) -> bool:
+    """True when Technitium says the record op was already satisfied."""
+    return _norm_error(message) in _RECORD_NOOP_MESSAGES
+
+
+def _is_zone_exists(message: Any) -> bool:
+    """True for ``Zone already exists: <zone>`` (zone create on an existing zone)."""
+    return _norm_error(message).startswith("zone already exists:")
+
+
 def _qualified_name(zone_name: str, name: str) -> str:
     """Compose the bare (no trailing dot) FQDN Technitium expects for a
     record's ``domain`` param."""
@@ -511,6 +566,98 @@ def _strip_bare_authority_slash(uri: str) -> str:
     if after_authority_marker.count("/") == 1:
         return uri[:-1]
     return uri
+
+
+_URI_DEFAULT_PORTS = {
+    "http": 80,
+    "https": 443,
+    "ftp": 21,
+    "gopher": 70,
+    "nntp": 119,
+    "telnet": 23,
+    "ldap": 389,
+    "ssh": 22,
+    "sftp": 22,
+    "ws": 80,
+    "wss": 443,
+}
+
+
+def _remove_dot_segments(path: str) -> str:
+    """RFC 3986 §5.2.4, the resolution ``System.Uri`` applies to a path."""
+    out: list[str] = []
+    segments = path.split("/")
+    for i, seg in enumerate(segments):
+        last = i == len(segments) - 1
+        if seg == ".":
+            if last:
+                out.append("")
+        elif seg == "..":
+            if len(out) > 1:
+                out.pop()
+            if last:
+                out.append("")
+        else:
+            out.append(seg)
+    return "/".join(out)
+
+
+_URI_UNRESERVED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
+_PCT_ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
+
+
+def _normalize_escapes(part: str, safe: str) -> str:
+    """RFC 3986 §6.2.2 on one URI component: a percent-escape of an
+    unreserved character is decoded and every other escape's hex is
+    upper-cased, as ``System.Uri`` reads it back; then whatever still needs
+    escaping is escaped. Applied to both sides, so ``/%41`` and ``/A`` (or
+    ``%2f`` and ``%2F``) are one record rather than a delete and add on
+    every pass."""
+
+    def _one(m: re.Match[str]) -> str:
+        ch = chr(int(m.group(1), 16))
+        return ch if ch in _URI_UNRESERVED else f"%{m.group(1).upper()}"
+
+    return quote(_PCT_ESCAPE.sub(_one, part), safe=safe)
+
+
+def _normalize_uri(uri: str) -> str:
+    """A URI as Technitium reads it back (#1768).
+
+    The record GET returns ``Uri.AbsoluteUri`` (WebServiceZonesApi.cs),
+    which lower-cases the scheme and host, drops a scheme's default port,
+    resolves ``.``/``..`` segments, percent-encodes what needs it and gives
+    a bare authority a ``/`` path. Both sides of the fingerprint go through
+    this, so ``https://Example.COM:443/a`` and its read-back
+    ``https://example.com/a`` are one record instead of a delete and add on
+    every structural pass. A value that does not parse as hierarchical is
+    left as typed.
+    """
+    try:
+        parts = urlsplit(uri)
+        port = parts.port
+    except ValueError:
+        return _strip_bare_authority_slash(uri)
+    if not parts.scheme or not parts.netloc or not parts.hostname:
+        return _strip_bare_authority_slash(uri)
+    scheme = parts.scheme.lower()
+    host = _ascii_domain(parts.hostname)
+    if ":" in host:
+        host = f"[{host}]"
+    userinfo = parts.netloc.rpartition("@")[0]
+    netloc = (f"{userinfo}@" if userinfo else "") + host
+    if port is not None and _URI_DEFAULT_PORTS.get(scheme) != port:
+        netloc += f":{port}"
+    pchar = "%:@!$&'()*+,;=-._~"
+    path = _normalize_escapes(_remove_dot_segments(parts.path), "/" + pchar) or "/"
+    out = f"{scheme}://{netloc}{path}"
+    if parts.query:
+        out += "?" + _normalize_escapes(parts.query, "/?" + pchar)
+    if parts.fragment:
+        out += "#" + _normalize_escapes(parts.fragment, "/?" + pchar)
+    return _strip_bare_authority_slash(out)
 
 
 # ── SVCB / HTTPS (RFC 9460) ────────────────────────────────────────────
@@ -893,6 +1040,12 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
     ``_record_params`` produces, so the two are comparable and so a
     delete built from it uses param names the API accepts."""
     out = dict(flat)
+    # The GET adds a derived Unicode twin of every punycode target
+    # (``cnameIdn``, ``nameServerIdn``, ...). It is never a parameter the
+    # record takes, so left in it made every IDN record read as changed on
+    # every pass (#1768).
+    for key in [k for k in out if k.endswith("Idn")]:
+        del out[key]
 
     if rtype in ("A", "AAAA") and out.get("ipAddress"):
         # #1513: canonicalise through ipaddress — the daemon returns
@@ -920,6 +1073,10 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
             val = out.pop(src)
             out[dst] = conv(val) if conv else val
 
+    if rtype == "CAA" and "tag" in out:
+        # Technitium stores the tag lower-cased (DnsCAARecordData); the
+        # desired side is folded the same way in ``_record_params`` (#1768).
+        out["tag"] = str(out["tag"]).lower()
     if rtype == "TLSA":
         _move("certificateUsage", "tlsaCertificateUsage", lambda v: _unmap(_TLSA_USAGE, v))
         _move("selector", "tlsaSelector", lambda v: _unmap(_TLSA_SELECTOR, v))
@@ -947,7 +1104,7 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
         # the record — but ONLY that one: a path's trailing slash is
         # significant (#1513).
         if "uri" in out:
-            out["uri"] = _strip_bare_authority_slash(str(out["uri"]))
+            out["uri"] = _normalize_uri(str(out["uri"]))
     elif rtype in ("SVCB", "HTTPS"):
         # Rebuild the exact params the desired side sends (#1513): the
         # daemon reports ``svcParams`` as ``key -> ToString()`` and the
@@ -1051,6 +1208,8 @@ def _zone_apex(zone_name: str, zone: dict[str, Any]) -> dict[str, Any] | None:
     """
     zname = zone_name.rstrip(".").lower()
     declared: list[str] = []
+    declared_ttls: list[int] = []
+    zone_ttl = zone.get("ttl")
     for rec in zone.get("records") or []:
         if (rec.get("type") or "").upper() != "NS":
             continue
@@ -1067,6 +1226,10 @@ def _zone_apex(zone_name: str, zone: dict[str, Any]) -> dict[str, Any] | None:
             host = _host_name(f"{value}.{zname}")
         if host and host not in declared:
             declared.append(host)
+        if host:
+            rec_ttl = rec.get("ttl") if rec.get("ttl") is not None else zone_ttl
+            if isinstance(rec_ttl, int) and not isinstance(rec_ttl, bool) and rec_ttl >= 0:
+                declared_ttls.append(rec_ttl)
 
     primary = _host_name(zone.get("primary_ns"))
     ns = declared or ([primary] if primary else [])
@@ -1086,6 +1249,10 @@ def _zone_apex(zone_name: str, zone: dict[str, Any]) -> dict[str, Any] | None:
             soa[field] = timer
     ttl = zone.get("ttl")
     apex: dict[str, Any] = {"ns": ns, "soa": soa}
+    if declared and declared_ttls:
+        # One TTL for the whole set (Technitium keeps one per RRset), the
+        # minimum, as the op path writes it (#1768).
+        apex["ns_ttl"] = min(declared_ttls)
     if isinstance(ttl, int) and not isinstance(ttl, bool) and ttl > 0:
         # The SOA record's own TTL caps negative caching together with
         # MINIMUM (RFC 2308), and BIND serves it at the zone's $TTL.
@@ -1697,8 +1864,12 @@ def _record_params(
         # reads an empty parameter as missing). ``name_origin`` is None for
         # a bundle that predates the rule: a dot-less target is absolute.
         if name_origin is None:
-            return name.rstrip(".").lower() or "."
-        return _zone_file_target(name, name_origin)
+            target = name.rstrip(".").lower() or "."
+        else:
+            target = _zone_file_target(name, name_origin)
+        # IDNA, as Technitium stores it, so an IDN target compares equal to
+        # its read-back instead of churning every pass (#1768).
+        return target if target == "." else _ascii_domain(target)
 
     if rtype in ("A", "AAAA"):
         # Canonicalised (#1513) so the desired side matches the daemon's
@@ -1733,7 +1904,8 @@ def _record_params(
         # value shape: "<flags> <tag> <target>", e.g. '0 issue "letsencrypt.org"'
         tokens = shlex.split(value)
         flags = int(tokens[0]) if tokens and tokens[0].isdigit() else 0
-        tag = tokens[1] if len(tokens) > 1 else "issue"
+        # Lower-cased: Technitium stores the tag that way (#1768).
+        tag = tokens[1].lower() if len(tokens) > 1 else "issue"
         target = tokens[2] if len(tokens) > 2 else ""
         return {"flags": flags, "tag": tag, "value": target}
     if rtype == "TLSA":
@@ -1775,9 +1947,7 @@ def _record_params(
             # Only a bare-authority trailing slash is stripped (#1513) —
             # Technitium appends one there when it stores the record,
             # but a path's trailing slash is part of the target.
-            "uri": (
-                _strip_bare_authority_slash(tokens[2]) if len(tokens) > 2 else ""
-            ),
+            "uri": _normalize_uri(tokens[2]) if len(tokens) > 2 else "",
         }
     # Unrecognised type — pass the raw value through under a best-guess key
     # so the API's own error message tells us what's missing, rather than
@@ -1967,6 +2137,19 @@ class TechnitiumDriver(DriverBase):
                             ),
                         }
                     )
+
+            # Technitium keeps ONE TTL per RRset: adding a record rewrites
+            # every sibling to the new record's TTL (AuthZone.AddRecord).
+            # The op path already writes the set minimum (``rrset.py``), so
+            # stamp it here too, or a set with mixed TTLs flips between its
+            # members' values on every structural pass (#1768). Technitium-
+            # only: BIND9 and PowerDNS render per-record TTLs unchanged.
+            set_ttl: dict[tuple[str, str], int] = {}
+            for r in records:
+                key = (r["domain"], r["type"])
+                set_ttl[key] = min(set_ttl.get(key, r["ttl"]), r["ttl"])
+            for r in records:
+                r["ttl"] = set_ttl[(r["domain"], r["type"])]
 
             entry: dict[str, Any] = {
                 "zone": zname,
@@ -2682,8 +2865,7 @@ class TechnitiumDriver(DriverBase):
         body = self._call(token, "POST", f"zones/records/{endpoint}", params).json()
         if body.get("status") != "error":
             return True
-        msg = (body.get("errorMessage") or "").lower()
-        if "already exists" in msg or "no such record" in msg:
+        if _is_record_noop(body.get("errorMessage")):
             log.info(
                 "technitium_record_op_idempotent_noop",
                 zone=zone,
@@ -3346,6 +3528,13 @@ class TechnitiumDriver(DriverBase):
         agent created and the bundle has since dropped is retired by
         ``_retire_dropped_zones``; a zone it never managed is left alone.
         """
+        # Reverse zones go LAST. Deleting an A/AAAA through the API also
+        # deletes the PTR it points from in a reverse zone on the same server
+        # (``DeleteRecord``, WebServiceZonesApi.cs, no flag turns it off), so a
+        # reverse zone reconciled before the forward zone that deletes would
+        # stay a PTR short until the next structural change. After them, its
+        # fresh read sees the hole and re-adds the PTR the bundle owns (#1768).
+        payload = sorted(payload, key=lambda z: _is_reverse_zone(z.get("zone")))
         for zone_payload in payload:
             zone = zone_payload["zone"]
             self._ensure_zone_exists(token, zone_payload)
@@ -3360,36 +3549,74 @@ class TechnitiumDriver(DriverBase):
             existing = self._get_zone_records(token, zone)
             desired = zone_payload.get("records") or []
 
-            def _fingerprint(rec: dict[str, Any]) -> tuple[Any, ...]:
+            def _identity(rec: dict[str, Any]) -> tuple[Any, ...]:
+                # Which record this is: owner, type and rdata. The TTL and
+                # the disabled flag are STATE of a record, not identity, so
+                # a change in either is an update in place (below) and never
+                # a delete and add (#1768). Values are str()-normalised —
+                # Technitium returns some rdata fields as numbers/enums where
+                # our add-params are strings, and a bare type mismatch would
+                # make every such record look "changed" on every pass.
                 extra = tuple(
                     sorted(
-                        (k, str(v))
-                        for k, v in rec.items()
-                        if k not in ("domain", "type", "ttl", "zone")
+                        (k, str(v)) for k, v in rec.items() if k not in _RECORD_STATE_KEYS
                     )
                 )
-                # TTL participates: a TTL-only edit is a real desired-state
-                # change, and this reconcile is the only path that can
-                # converge it (the incremental op path can't see the old
-                # value). Compared as int so a JSON "300" from the daemon
-                # doesn't read as different from a rendered 300. Values are
-                # str()-normalised for the same reason — Technitium returns
-                # some rdata fields as numbers/enums where our add-params
-                # are strings, and a bare type mismatch would make every
-                # such record look "changed" on every single pass.
+                return (rec.get("domain"), rec.get("type"), extra)
+
+            def _state(rec: dict[str, Any]) -> tuple[Any, ...]:
+                # Compared as int so a JSON "300" from the daemon doesn't
+                # read as different from a rendered 300. A record disabled
+                # in the console is not served, so it is not converged.
                 ttl = rec.get("ttl")
-                return (
-                    rec.get("domain"),
-                    rec.get("type"),
-                    int(ttl) if ttl is not None else None,
-                    extra,
-                )
+                return (int(ttl) if ttl is not None else None, bool(rec.get("disabled")))
 
-            existing_by_fp = {_fingerprint(r): r for r in existing}
-            desired_by_fp = {_fingerprint(r): r for r in desired}
+            existing_by_id = {_identity(r): r for r in existing}
+            desired_by_id = {_identity(r): r for r in desired}
 
-            to_delete = [r for fp, r in existing_by_fp.items() if fp not in desired_by_fp]
-            to_add = [r for fp, r in desired_by_fp.items() if fp not in existing_by_fp]
+            to_delete = [r for i, r in existing_by_id.items() if i not in desired_by_id]
+            to_add = [r for i, r in desired_by_id.items() if i not in existing_by_id]
+            # Same record, different TTL or disabled: one ``update``. Neither
+            # touches the owner's PTR the way a delete does, and an RRset
+            # keeps serving throughout. ``records/update`` takes the current
+            # value params and, with no ``new*`` param, keeps the value; it
+            # re-enables (``disable`` defaults false) and sets ``ttl``
+            # (APIDOCS "Update Record"; ``AuthZone.UpdateRecord`` is a
+            # zone-level delete + add, without the web API's PTR cleanup).
+            to_update = [
+                (existing_by_id[i], r)
+                for i, r in desired_by_id.items()
+                if i in existing_by_id and _state(existing_by_id[i]) != _state(r)
+            ]
+
+            updated = 0
+            for old, want in to_update:
+                body = self._call(
+                    token,
+                    "POST",
+                    "zones/records/update",
+                    {
+                        "domain": old["domain"],
+                        "zone": zone,
+                        "type": old["type"],
+                        **{k: v for k, v in old.items() if k not in _RECORD_STATE_KEYS},
+                        "ttl": want["ttl"],
+                        "disable": "false",
+                    },
+                ).json()
+                if body.get("status") == "error":
+                    log.warning(
+                        "technitium_reconcile_update_failed",
+                        zone=zone,
+                        record=old,
+                        error=body.get("errorMessage"),
+                    )
+                    self._note_apply_failure(
+                        f"{zone}: record update {old.get('domain')} {old.get('type')}: "
+                        f"{body.get('errorMessage')}"
+                    )
+                else:
+                    updated += 1
 
             deleted = 0
             for rec in to_delete:
@@ -3401,11 +3628,7 @@ class TechnitiumDriver(DriverBase):
                         "domain": rec["domain"],
                         "zone": zone,
                         "type": rec["type"],
-                        **{
-                            k: v
-                            for k, v in rec.items()
-                            if k not in ("domain", "type", "ttl", "zone")
-                        },
+                        **{k: v for k, v in rec.items() if k not in _RECORD_STATE_KEYS},
                     },
                 )
                 body = resp.json()
@@ -3414,7 +3637,7 @@ class TechnitiumDriver(DriverBase):
                     # not a deletion. Counting it (or the failure case) would
                     # report churn that never happened, which is the same
                     # phantom the apex-NS filter above exists to prevent.
-                    if "no such record" not in (body.get("errorMessage") or "").lower():
+                    if _norm_error(body.get("errorMessage")) != _RECORD_ABSENT_MESSAGE:
                         log.warning(
                             "technitium_reconcile_delete_failed",
                             zone=zone,
@@ -3440,7 +3663,7 @@ class TechnitiumDriver(DriverBase):
                 if body.get("status") == "error":
                     # "already exists" is a no-op, not an add — same
                     # reasoning as the delete branch above.
-                    if "already exists" not in (body.get("errorMessage") or "").lower():
+                    if not _is_record_noop(body.get("errorMessage")):
                         log.error(
                             "technitium_reconcile_add_failed",
                             zone=zone,
@@ -3453,12 +3676,13 @@ class TechnitiumDriver(DriverBase):
                         )
                     continue
                 added += 1
-            if added or deleted:
+            if added or deleted or updated:
                 log.info(
                     "technitium_zone_reconciled",
                     zone=zone,
                     added=added,
                     deleted=deleted,
+                    updated=updated,
                 )
             self._reconcile_zone_apex(token, zone, zone_payload.get("apex"))
 
@@ -3494,6 +3718,11 @@ class TechnitiumDriver(DriverBase):
             for r in at_apex
             if r.get("type") == "NS"
         ]
+        live_ns_ttl = {
+            str((r.get("rData") or {}).get("nameServer") or "").rstrip(".").lower(): r.get("ttl")
+            for r in at_apex
+            if r.get("type") == "NS"
+        }
 
         soa_changed = False
         desired_soa = apex.get("soa") or {}
@@ -3531,10 +3760,39 @@ class TechnitiumDriver(DriverBase):
 
         added: list[str] = []
         removed: list[str] = []
+        retimed: list[str] = []
         desired_ns = apex.get("ns") or []
+        # The set's TTL, when the zone declares one (#1768): without it a
+        # TTL-only change to the apex NS never reached the daemon, because a
+        # target already there was skipped whatever its TTL.
+        ns_ttl = apex.get("ns_ttl")
         if desired_ns:
             for target in desired_ns:
                 if target in live_ns:
+                    if ns_ttl is not None and live_ns_ttl.get(target) != ns_ttl:
+                        # In place: a delete and add would leave the zone
+                        # without that name server for a moment.
+                        body = self._call(
+                            token,
+                            "POST",
+                            "zones/records/update",
+                            {
+                                "zone": zone,
+                                "domain": zone,
+                                "type": "NS",
+                                "nameServer": target,
+                                "ttl": ns_ttl,
+                            },
+                        ).json()
+                        if body.get("status") == "ok":
+                            retimed.append(target)
+                        else:
+                            log.warning(
+                                "technitium_zone_apex_ns_ttl_failed",
+                                zone=zone,
+                                name_server=target,
+                                error=body.get("errorMessage"),
+                            )
                     continue
                 body = self._call(
                     token,
@@ -3544,7 +3802,7 @@ class TechnitiumDriver(DriverBase):
                         "zone": zone,
                         "domain": zone,
                         "type": "NS",
-                        "ttl": ttl or 3600,
+                        "ttl": ns_ttl if ns_ttl is not None else (ttl or 3600),
                         "nameServer": target,
                     },
                 ).json()
@@ -3577,13 +3835,14 @@ class TechnitiumDriver(DriverBase):
                             name_server=target,
                             error=body.get("errorMessage"),
                         )
-        if soa_changed or added or removed:
+        if soa_changed or added or removed or retimed:
             log.info(
                 "technitium_zone_apex_reconciled",
                 zone=zone,
                 soa_updated=soa_changed,
                 ns_added=added,
                 ns_removed=removed,
+                ns_retimed=retimed,
             )
 
     def _ensure_zone_exists(self, token: str, entry: dict[str, Any]) -> None:
@@ -3627,7 +3886,7 @@ class TechnitiumDriver(DriverBase):
         resp = self._call(token, "POST", "zones/create", params)
         body = resp.json()
         if body.get("status") == "error":
-            if "already exists" in (body.get("errorMessage") or "").lower():
+            if _is_zone_exists(body.get("errorMessage")):
                 # The create params carry the zone's UPSTREAM (a
                 # secondary/stub's primaries, a forwarder's target), and
                 # create is a no-op once the zone exists. Without this,
@@ -3825,7 +4084,14 @@ class TechnitiumDriver(DriverBase):
                 )
                 path = "zones/records/update"
             result = self._call(token, "POST", path, params).json()
-            if result.get("status") != "ok":
+            if result.get("status") != "ok" and _is_record_noop(result.get("errorMessage")):
+                # Technitium's exact "record already exists" (#1770): this
+                # upstream is in, under a spelling ``_norm_forwarder`` did not
+                # fold to ours. Applied, so it does not hold back the stale
+                # deletes below. The CNAME-style conflict answers are not in
+                # the no-op set and still count as refused.
+                log.info("technitium_zone_forwarder_set", zone=zone, forwarder=address)
+            elif result.get("status") != "ok":
                 log.warning(
                     "technitium_zone_forwarder_set_failed",
                     zone=zone,
@@ -3860,7 +4126,11 @@ class TechnitiumDriver(DriverBase):
                     "protocol": rdata.get("protocol") or "Udp",
                 },
             ).json()
-            if result.get("status") != "ok":
+            if result.get("status") != "ok" and (
+                _norm_error(result.get("errorMessage")) != _RECORD_ABSENT_MESSAGE
+            ):
+                # "no such record exists" (#1770): already gone, which is the
+                # state this delete wanted.
                 log.warning(
                     "technitium_zone_forwarder_remove_failed",
                     zone=zone,
@@ -4005,6 +4275,8 @@ class TechnitiumDriver(DriverBase):
                 continue
             flat = {"domain": rec.get("name"), "type": rtype, "ttl": rec.get("ttl")}
             flat.update(rec.get("rData") or {})
+            if rec.get("disabled"):
+                flat["disabled"] = True
             # Technitium's SVCB/HTTPS rData carries derived fields
             # (autoIpv4Hint/autoIpv6Hint) that never round-trip through our
             # add params — drop them so the fingerprint comparison in
