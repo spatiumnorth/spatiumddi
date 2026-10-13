@@ -246,8 +246,13 @@ def _parse_subnet(
     if dropped_timers:
         parse_warnings.append(
             f"{' and '.join(dropped_timers)} ({', '.join(str(entry[k]) for k in dropped_timers)} s) "
-            "not imported — renew/rebind times (options 58/59) are derived from each lease "
-            "(50% / 87.5% of its lifetime) and cannot be set per scope."
+            "not imported — renew/rebind times are derived from each lease "
+            + (
+                "(50% / 80% of its preferred lifetime)"
+                if address_family == "ipv6"
+                else "(options 58/59: 50% / 87.5% of its lifetime)"
+            )
+            + " and cannot be set per scope."
         )
 
     lease_time = int(entry.get("valid-lifetime") or global_lease_time or 86400)
@@ -376,6 +381,15 @@ def parse_kea_config(data: bytes) -> ImportPreview:
             warnings.append(
                 f"{wrapper}: {len(global_options)} global option(s) applied to every "
                 f"imported {af} scope (SpatiumDDI has no group-wide option surface on import)."
+            )
+        # #1690 — the global timers every subnet without its own inherits; the
+        # per-subnet ones are warned about in ``_parse_subnet``.
+        global_timers = [k for k in ("renew-timer", "rebind-timer") if block.get(k) is not None]
+        if global_timers:
+            warnings.append(
+                f"{wrapper}: global {' and '.join(global_timers)} "
+                f"({', '.join(str(block[k]) for k in global_timers)} s) not imported — "
+                "renew/rebind times are derived from each lease and cannot be set."
             )
         for raw_subnet in block.get(subnet_key) or []:
             if not isinstance(raw_subnet, dict):

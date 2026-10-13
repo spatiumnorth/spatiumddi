@@ -3,12 +3,17 @@ refused (422) instead of being stored, echoed and never rendered."""
 
 from __future__ import annotations
 
+import ast
 import uuid
+from pathlib import Path
 
+import pydantic
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.dhcp import agents
+from app.api.v1.dhcp.pools import PoolCreate
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPServerGroup
@@ -88,3 +93,29 @@ async def test_pool_update_refuses_value_but_allows_clearing(
     )
     assert r.status_code == 200, r.text
     assert r.json()["lease_time_override"] is None
+
+
+def test_every_accepted_pool_field_reaches_the_agent_or_is_refused() -> None:
+    """The guard #1689 asked for: this is the third pool field (after #430 and
+    #858) that the API accepted and the agent pool dict never carried. Every
+    field ``PoolCreate`` accepts must be a key of that dict, be refused, or be
+    listed here with the reason it is not rendered."""
+    tree = ast.parse(Path(agents.__file__).read_text())
+    pool_dicts = [
+        {k.value for k in node.keys if isinstance(k, ast.Constant)}
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        and any(isinstance(k, ast.Constant) and k.value == "pd_prefix" for k in node.keys)
+    ]
+    assert len(pool_dicts) == 1, "expected exactly one agent pool dict in agents.py"
+    sent = pool_dicts[0]
+
+    refused = {"lease_time_override"}  # 422 on a non-null value (#1689)
+    not_rendered = {"name"}  # a label for the UI; Kea pools have no name
+    missing = set(PoolCreate.model_fields) - sent - refused - not_rendered
+    assert not missing, f"pool fields accepted but never sent to the agent: {sorted(missing)}"
+    assert not (refused & sent), "a refused field is also sent; drop it from one list"
+    # ...and "refused" has to be true, not just a name on a list.
+    for field in refused:
+        with pytest.raises(pydantic.ValidationError):
+            PoolCreate(start_ip="10.0.0.1", end_ip="10.0.0.9", **{field: 600})

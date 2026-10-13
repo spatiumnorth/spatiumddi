@@ -89,16 +89,21 @@ the formatter handles the rest.
   in the UI but never sent to the agent, and Kea has no per-pool lease
   time (a client class can carry one, but only for clients matching its
   test, which would also restrict who may use the pool), so every pool
-  served the scope's lease. Setting a value now answers 422 and the
-  field is gone from the pool form; clearing an old value with null
-  still works. Changes the DHCP pool API and form, not the served Kea
-  config.
+  served the scope's lease. **API change:** `POST
+  /api/v1/dhcp/scopes/{id}/pools` and `PUT /api/v1/dhcp/pools/{id}` now
+  answer 422 for a non-null `lease_time_override`; an explicit `null`
+  still clears an old value, and the field is still returned. A value
+  stored before this release stays until cleared, and has never had any
+  effect. The field is gone from the pool form, and saving a pool that
+  has one clears it. What Kea serves does not change.
 - **Renew / rebind timers (options 58 / 59) are no longer documented as
   settable, and a Kea import says it drops them (#1690).** The API has
   always refused them; the docs claimed otherwise. T1 / T2 are derived
-  from each lease (50% / 87.5%). Importing a Kea config whose subnet
-  carries `renew-timer` or `rebind-timer` now adds a `parse_warnings`
-  entry saying so instead of dropping them silently.
+  from each lease (v4: 50% / 87.5% of it; v6: 50% / 80% of the preferred
+  lifetime). Importing a Kea config that carries
+  `renew-timer` or `rebind-timer` now says it drops them instead of
+  dropping them silently: a subnet's in that scope's `parse_warnings`,
+  a global one in the preview's `warnings`.
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single
   `update` at the new name, which replaces the RRset at its own name and

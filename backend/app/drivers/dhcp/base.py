@@ -48,6 +48,9 @@ class PoolDef:
     pool_type: str = "dynamic"  # dynamic | excluded | reserved | pd
     name: str = ""
     class_restriction: str | None = None
+    # Reserved, never rendered (#1689): Kea has no per-pool lifetime and no
+    # driver reads this. The API refuses a non-null value; the field stays
+    # so old rows still load and the bundle ETag does not shift on upgrade.
     lease_time_override: int | None = None
     options_override: dict[str, Any] | None = None
     # DHCPv6 prefix delegation (issue #368) — only for pool_type == "pd".

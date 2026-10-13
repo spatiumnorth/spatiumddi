@@ -72,3 +72,16 @@ def test_kea_import_warns_when_it_drops_timers() -> None:
 
 def test_kea_import_silent_without_timers() -> None:
     assert parse_kea_config(_kea({})).scopes[0].parse_warnings == []
+
+
+def test_kea_import_warns_when_it_drops_global_timers() -> None:
+    cfg = {
+        "Dhcp4": {
+            "renew-timer": 900,
+            "rebind-timer": 1800,
+            "subnet4": [{"subnet": "192.0.2.0/24", "pools": [{"pool": "192.0.2.10 - 192.0.2.50"}]}],
+        }
+    }
+    preview = parse_kea_config(json.dumps(cfg).encode())
+    joined = " ".join(preview.warnings)
+    assert "renew-timer" in joined and "rebind-timer" in joined and "900" in joined
