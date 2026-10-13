@@ -126,30 +126,82 @@ async def test_entries_page_counts_in_db(client: AsyncClient, db_session: AsyncS
     assert counts["load"] == 5 + 5 and counts["init"] == 0
 
 
+def _entry_domain_reads(statement: str) -> bool:
+    """A SELECT of entry domains (the bulk diff), as opposed to an INSERT."""
+    st = statement.lstrip().upper()
+    return st.startswith("SELECT") and "DNS_BLOCKLIST_ENTRY.DOMAIN" in st
+
+
+@contextlib.contextmanager
+def _capture_entry_reads(db: AsyncSession) -> Iterator[list[str]]:
+    reads: list[str] = []
+
+    def _before(conn, cursor, statement, params, context, executemany):  # type: ignore[no-untyped-def]
+        if _entry_domain_reads(statement):
+            reads.append(statement)
+
+    engine = db.get_bind()
+    sync_engine = getattr(engine, "sync_engine", engine)
+    event.listen(sync_engine, "before_cursor_execute", _before)
+    try:
+        yield reads
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", _before)
+
+
 @pytest.mark.asyncio
 async def test_bulk_add_diffs_only_incoming(client: AsyncClient, db_session: AsyncSession) -> None:
     headers = await _headers(db_session)
     bl = await _seed(db_session, 300)
-    reads: list[str] = []
-
-    def _before(conn, cursor, statement, params, context, executemany):  # type: ignore[no-untyped-def]
-        if "dns_blocklist_entry.domain" in statement and "IN (" in statement.replace("ANY", "IN ("):
-            reads.append(statement)
-
-    engine = db_session.get_bind()
-    sync_engine = getattr(engine, "sync_engine", engine)
-    event.listen(sync_engine, "before_cursor_execute", _before)
-    try:
+    with _capture_entry_reads(db_session) as reads:
         resp = await client.post(
             f"/api/v1/dns/blocklists/{bl.id}/entries/bulk",
             json={"domains": ["d1.example", "new1.example", "new2.example", "d2.example"]},
             headers=headers,
         )
-    finally:
-        event.remove(sync_engine, "before_cursor_execute", _before)
-    assert resp.status_code == 201 or resp.status_code == 200, resp.text
+    assert resp.status_code in (200, 201), resp.text
     assert resp.json()["added"] == 2
-    assert reads, "the diff must be an IN-filtered query, not a full-list read"
+    assert reads, "the diff must query the entries table"
+    # Every domain read is filtered to the incoming batch; none reads the list.
+    for st in reads:
+        assert " IN " in st.upper() or "ANY" in st.upper(), st
     refreshed = await db_session.get(DNSBlockList, bl.id)
     await db_session.refresh(refreshed)
     assert refreshed is not None and refreshed.entry_count == 302
+
+
+@pytest.mark.asyncio
+async def test_bulk_add_chunk_boundary_duplicates_and_case(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Existing domains past the first 5000-domain chunk are still found,
+    in-payload duplicates and case/trailing-dot variants collapse, and
+    ``entry_count`` moves by exactly the rows inserted."""
+    headers = await _headers(db_session)
+    bl = await _seed(db_session, 300)
+    fresh = [f"n{i}.example" for i in range(5100)]
+    # d5 / d250 sit after the 5000-domain chunk boundary in the payload.
+    payload = fresh[:5000] + ["D5.EXAMPLE.", "d250.example"] + fresh[5000:]
+    payload += ["N1.example", "n1.example.", "n5050.example"]  # dupes of fresh
+    with _capture_entry_reads(db_session) as reads:
+        resp = await client.post(
+            f"/api/v1/dns/blocklists/{bl.id}/entries/bulk",
+            json={"domains": payload},
+            headers=headers,
+        )
+    assert resp.status_code in (200, 201), resp.text
+    body = resp.json()
+    assert body["added"] == 5100
+    assert body["skipped"] == len(payload) - 5100
+    assert len(reads) == 2  # ceil(5102 / 5000) chunked reads
+    db_session.expunge_all()
+    total = (
+        await db_session.execute(
+            select(func.count())
+            .select_from(DNSBlockListEntry)
+            .where(DNSBlockListEntry.list_id == bl.id)
+        )
+    ).scalar_one()
+    assert total == 5400
+    refreshed = await db_session.get(DNSBlockList, bl.id)
+    assert refreshed is not None and refreshed.entry_count == 5400
