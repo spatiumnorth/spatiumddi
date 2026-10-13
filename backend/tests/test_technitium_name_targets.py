@@ -134,13 +134,17 @@ def test_a_pulled_value_round_trips_through_the_sender() -> None:
 
 def test_dname_and_naptr_compare_canonically() -> None:
     z = "example.com."
-    assert _normalize_value("DNAME", "other", z) == _normalize_value(
-        "DNAME", "other.example.com.", z
+    assert _normalize_value("DNAME", "other", z, relative_targets=True) == _normalize_value(
+        "DNAME", "other.example.com.", z, relative_targets=True
     )
-    a = _normalize_value("NAPTR", '100 10 "S" "SIP+D2U" "" _sip', z)
-    b = _normalize_value("NAPTR", '100 10 "S" "SIP+D2U" "" _sip.example.com.', z)
+    a = _normalize_value("NAPTR", '100 10 "S" "SIP+D2U" "" _sip', z, relative_targets=True)
+    b = _normalize_value(
+        "NAPTR", '100 10 "S" "SIP+D2U" "" _sip.example.com.', z, relative_targets=True
+    )
     assert a == b
-    other = _normalize_value("NAPTR", '100 10 "S" "SIP+D2U" "" _sip._udp.example.net.', z)
+    other = _normalize_value(
+        "NAPTR", '100 10 "S" "SIP+D2U" "" _sip._udp.example.net.', z, relative_targets=True
+    )
     assert other != a
 
 
@@ -148,10 +152,10 @@ def test_key_folds_dname_and_naptr() -> None:
     z = "example.com."
     dn = RecordData(name="d", record_type="DNAME", value="Other")
     dn2 = RecordData(name="d", record_type="DNAME", value="other.example.com.")
-    assert _key(dn, z) == _key(dn2, z)
+    assert _key(dn, z, relative_targets=True) == _key(dn2, z, relative_targets=True)
     np1 = RecordData(name="n", record_type="NAPTR", value='1 2 "" "" "" t')
     np2 = RecordData(name="n", record_type="NAPTR", value='1 2 "" "" "" t.example.com.')
-    assert _key(np1, z) == _key(np2, z)
+    assert _key(np1, z, relative_targets=True) == _key(np2, z, relative_targets=True)
 
 
 def test_bundle_marker_gates_the_new_types() -> None:

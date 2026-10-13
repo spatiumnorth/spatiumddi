@@ -81,6 +81,7 @@ async def _seed_dhcp_server(db: AsyncSession, hostname: str) -> DHCPServer:
         host=hostname,
         port=67,
         status="active",
+        agent_id=uuid.uuid4(),
     )
     db.add(server)
     await db.flush()

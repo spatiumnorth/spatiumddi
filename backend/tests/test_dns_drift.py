@@ -344,6 +344,20 @@ def test_key_ignores_struct_fields_for_other_types() -> None:
     from app.services.dns.pull_from_server import _key
 
     a = RecordData(name="www", record_type="A", value="10.0.0.1")
-    assert _key(a, "example.com.") == ("www", "A", "10.0.0.1", None, None, None)
+    assert _key(a, "example.com.", relative_targets=True) == (
+        "www",
+        "A",
+        "10.0.0.1",
+        None,
+        None,
+        None,
+    )
     mx = RecordData(name="@", record_type="MX", value="mail.example.com.", priority=10)
-    assert _key(mx, "example.com.") == ("@", "MX", "mail.example.com.", 10, None, None)
+    assert _key(mx, "example.com.", relative_targets=True) == (
+        "@",
+        "MX",
+        "mail.example.com.",
+        10,
+        None,
+        None,
+    )

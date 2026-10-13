@@ -83,8 +83,9 @@ async def _every_bind9_agent_renders(db: AsyncSession, group_id: uuid.UUID) -> b
     """No server of the group renders a BIND9 bundle with the literal.
 
     Counted: BIND9 servers an agent runs (``agent_id``) that are sent bundles
-    (enabled, approved). Not counted: other drivers (PowerDNS and Technitium
-    keep their own SOA; agentless servers get no bundle), a row no agent has
+    (enabled, approved). Not counted: other drivers (PowerDNS renders whatever
+    timers the bundle carries, #1522; Technitium keeps its own SOA; agentless
+    servers get no bundle), a row no agent has
     registered into, and a disabled or unapproved server, which is sent none.
     """
     lagging = await db.scalar(

@@ -45,6 +45,7 @@ from app.core.request_meta import get_trusted_client_ip
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.settings import PlatformSettings
 from app.services.appliance.access import Door, effective_doors
+from app.services.appliance.ownership import hostname_sql, k8s_node_name
 from app.services.feature_modules import require_module
 
 router = APIRouter()
@@ -217,7 +218,7 @@ async def get_appliance_info(db: DB) -> ApplianceInfo:
             await db.execute(
                 select(Appliance)
                 .where(
-                    Appliance.hostname == hostname,
+                    hostname_sql(Appliance.hostname) == k8s_node_name(hostname),
                     Appliance.state == APPLIANCE_STATE_APPROVED,
                 )
                 .order_by(Appliance.last_seen_at.desc().nullslast())
