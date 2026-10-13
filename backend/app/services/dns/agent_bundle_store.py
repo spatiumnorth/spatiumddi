@@ -81,7 +81,9 @@ _MAX_ERROR = 2000
 #   ``allow_query`` / ``also_notify`` / ``notify_enabled`` overrides).
 # 9 (#1786): a BIND9 server's bundle carries ``allow_recursion`` (the agent now
 #   renders ``allow-recursion``).
-RENDERER_REVISION = 9
+# 10 (#1817): the BIND9 agent renders ``allow_recursion`` literally and its
+#   stored default is local + private networks (migration b8e41c7a2d95).
+RENDERER_REVISION = 10
 
 
 def _serves(revision: int | None) -> bool:

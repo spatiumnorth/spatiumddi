@@ -1,7 +1,8 @@
 """The BIND9 agent renders ``allow-recursion`` (#1786).
 
 The group's ``allow_recursion`` was stored and shipped but never written to
-``named.conf``, so BIND always ran its built-in ``localnets; localhost;``.
+``named.conf``. Since #1817 every value renders literally and the default
+is local + private networks.
 Assertions are on the rendered ``named.conf`` text, not the stored option.
 """
 
@@ -39,14 +40,45 @@ def test_explicit_list_is_rendered_inside_options(tmp_path: Path) -> None:
     assert conf.index("options {") < conf.index("allow-recursion")
 
 
-def test_stored_default_any_is_treated_as_unset(tmp_path: Path) -> None:
-    """Omitted, BIND derives allow-recursion from the rendered allow-query.
+_DEFAULT_LINE = (
+    "allow-recursion { localhost; localnets; 10.0.0.0/8; 172.16.0.0/12; "
+    "192.168.0.0/16; fc00::/7; fe80::/10; };"
+)
 
-    That is what every group got before #1786. A literal ``any`` would widen
-    recursion past a restricted ``allow-query``.
+
+def test_default_renders_local_plus_private_networks(tmp_path: Path) -> None:
+    """The stored default (#1817): local + private networks, rendered explicitly.
+
+    ``localnets`` alone is the pod / bridge network wherever BIND is not on
+    host networking, so the private ranges are part of the default. A key
+    absent from the bundle (an older control plane) takes it too.
     """
-    for stored in (["any"], ["ANY"], [], None):
-        assert "allow-recursion" not in _conf(tmp_path, {"allow_recursion": stored})
+    stored_default = [
+        "localhost",
+        "localnets",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+    ]
+    for stored in (stored_default, None):
+        opts: dict[str, Any] = {} if stored is None else {"allow_recursion": stored}
+        conf = _conf(tmp_path, opts)
+        assert _DEFAULT_LINE in conf, stored
+
+
+def test_explicit_any_is_rendered_open(tmp_path: Path) -> None:
+    """An operator who asks for ``any`` gets an open resolver, on purpose."""
+    for stored in (["any"], ["ANY"]):
+        conf = _conf(tmp_path, {"allow_recursion": stored})
+        assert f"allow-recursion {{ {stored[0]}; }};" in conf
+
+
+def test_empty_list_fails_closed(tmp_path: Path) -> None:
+    """A stored empty list (the API saves blank as the default): omitting the
+    line would inherit allow-query (any), so it fails closed."""
+    assert "allow-recursion { none; };" in _conf(tmp_path, {"allow_recursion": []})
 
 
 def test_not_rendered_when_recursion_is_off(tmp_path: Path) -> None:

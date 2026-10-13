@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dns import DNSServer, DNSServerGroup, DNSServerOptions
+from app.models.dns import DEFAULT_ALLOW_RECURSION, DNSServer, DNSServerGroup, DNSServerOptions
 from app.services.dns.agent_config import render_bundle_body
 
 
@@ -77,3 +77,28 @@ async def test_bind9_bundle_carries_allow_recursion_and_etag_shifts(
     await db_session.commit()
     second = await render_bundle_body(db_session, server)
     assert second.etag != first.etag
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver", ["technitium", "bind9"])
+async def test_fresh_group_bundle_carries_the_non_open_default(
+    db_session: AsyncSession, driver: str
+) -> None:
+    """#1817: a group created with no options set ships local + private networks."""
+    server = await _server(db_session, driver)  # no allow_recursion given
+    body = (await render_bundle_body(db_session, server)).body
+    assert body["options"]["allow_recursion"] == list(DEFAULT_ALLOW_RECURSION)
+
+
+@pytest.mark.asyncio
+async def test_group_without_an_options_row_ships_the_default(
+    db_session: AsyncSession,
+) -> None:
+    group = DNSServerGroup(name=f"r-{uuid.uuid4().hex[:6]}", is_recursive=True)
+    db_session.add(group)
+    await db_session.flush()
+    server = DNSServer(group_id=group.id, name="s", driver="bind9", host="10.0.0.10")
+    db_session.add(server)
+    await db_session.commit()
+    body = (await render_bundle_body(db_session, server)).body
+    assert body["options"]["allow_recursion"] == list(DEFAULT_ALLOW_RECURSION)
