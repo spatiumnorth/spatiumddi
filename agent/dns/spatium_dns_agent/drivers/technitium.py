@@ -59,7 +59,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import hashlib
 import ipaddress
 import json
 import os
@@ -2945,7 +2944,7 @@ class TechnitiumDriver(DriverBase):
         orphaned tokens on the server).
         """
         password = self.admin_bootstrap_password()
-        self._raise_if_creds_cooling_down(password)
+        self._raise_if_creds_cooling_down()
         try:
             # A form body, never query parameters: a URL is logged (httpx
             # writes every request line at INFO) and the password must not be
@@ -2977,7 +2976,7 @@ class TechnitiumDriver(DriverBase):
             elif detail.lower().startswith("max limit of"):
                 reason = "locked-out"
             if reason is not None:
-                self._record_creds_rejected(password, reason, detail)
+                self._record_creds_rejected(reason, detail)
                 raise TechnitiumCredentialsError(reason, detail)
             return None
         token = body["token"]
@@ -2988,11 +2987,21 @@ class TechnitiumDriver(DriverBase):
     def _creds_rejected_path(self) -> Path:
         return self.state_dir / _CREDS_REJECTED_FILE
 
-    @staticmethod
-    def _password_fingerprint(password: str) -> str:
-        return hashlib.sha256(password.encode()).hexdigest()
+    def _password_file_identity(self) -> str:
+        """Which version of the admin password file is on disk.
 
-    def _record_creds_rejected(self, password: str, reason: str, detail: str) -> None:
+        Inode, size and mtime, so a rewritten file lifts the hold, without
+        storing anything derived from the password itself: a fast hash of it
+        in the state directory could be guessed offline (#1772, CodeQL).
+        Empty when the file is missing.
+        """
+        try:
+            st = self._admin_password_path().stat()
+        except OSError:
+            return ""
+        return f"{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
+
+    def _record_creds_rejected(self, reason: str, detail: str) -> None:
         # ``detail`` is kept so the suppressed attempts report the same error
         # text as the real one: a steady apply-status error, not one that
         # changes shape after the first failure.
@@ -3003,12 +3012,12 @@ class TechnitiumDriver(DriverBase):
                     "reason": reason,
                     "detail": detail,
                     "at": time.time(),
-                    "pw": self._password_fingerprint(password),
+                    "pw_file": self._password_file_identity(),
                 }
             ),
         )
 
-    def _raise_if_creds_cooling_down(self, password: str) -> None:
+    def _raise_if_creds_cooling_down(self) -> None:
         """Refuse to present credentials Technitium has already refused.
 
         Lifted by a changed password file, by the retry window elapsing, or
@@ -3020,7 +3029,7 @@ class TechnitiumDriver(DriverBase):
             reason = str(rec["reason"])
             detail = str(rec.get("detail") or "")
             at = float(rec["at"])
-            same_pw = rec.get("pw") == self._password_fingerprint(password)
+            same_pw = rec.get("pw_file") == self._password_file_identity()
         except (OSError, ValueError, KeyError, TypeError):
             return
         if same_pw and time.time() - at < _CREDS_RETRY_SECONDS:
