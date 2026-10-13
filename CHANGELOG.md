@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting a large blocklist, opening its entries page and bulk-adding
+  entries no longer load the whole list into the api (#1724).** Delete
+  hydrated every entry (~2.4 KB each; a 582k catalog list OOM-killed the
+  api and never completed), the entries page loaded every matching row
+  to count it, and bulk-add read every existing domain on each call.
+  Delete now leaves the children to the FK's `ON DELETE CASCADE`
+  (`passive_deletes`), the total is a `COUNT(*)`, and bulk-add asks
+  only about the incoming domains. The audit trail is unchanged: one
+  `delete` row for the list.
+
 - **The PowerDNS agent stops serving zones wrong in three ways
   (#1520, #1521, #1522).** Pool member address deletes were applied
   as no-ops and acked ok — the record-op fallback ignored the rrset

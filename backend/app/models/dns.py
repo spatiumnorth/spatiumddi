@@ -1520,11 +1520,15 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         "DNSBlockListEntry",
         back_populates="blocklist",
         cascade="all, delete-orphan",
+        # The FK is ON DELETE CASCADE; never load a (catalog-sized) child
+        # collection into the session just to delete it (#1724).
+        passive_deletes=True,
     )
     exceptions: Mapped[list["DNSBlockListException"]] = relationship(
         "DNSBlockListException",
         back_populates="blocklist",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
     server_groups: Mapped[list["DNSServerGroup"]] = relationship(
