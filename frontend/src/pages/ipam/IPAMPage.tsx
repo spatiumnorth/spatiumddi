@@ -3092,6 +3092,22 @@ const IP_STATUS_OPTIONS = [
   "discovered",
 ] as const;
 
+// Allocate IP's Type / Status: only what its requests accept (#1422).
+// "Next available" posts /subnets/{id}/next and "Specific IP" posts
+// /subnets/{id}/addresses, and both refuse (422) a status outside
+// IP_STATUSES_OPERATOR_SETTABLE | {"dhcp"} (backend models/ipam.py). So
+// "discovered", which the nmap "Stamp alive hosts" action stamps, is not
+// offered here. The inline status edit and Edit address go through the
+// update endpoint, which takes every status, and keep IP_STATUS_OPTIONS.
+const ALLOCATE_STATUS_OPTIONS = [
+  "available",
+  "allocated",
+  "reserved",
+  "dhcp",
+  "static_dhcp",
+  "deprecated",
+] as const;
+
 // Double-click-to-change status badge on the IP table (sibling of
 // InlineEditableText). Swallows single clicks so it doesn't open the row
 // detail; commit on select, Escape/blur cancels. Disabled on read-only rows.
@@ -3785,7 +3801,7 @@ export function AddAddressModal({
               value={ipStatus}
               onChange={(e) => setIpStatus(e.target.value)}
             >
-              {IP_STATUS_OPTIONS.map((s) => (
+              {ALLOCATE_STATUS_OPTIONS.map((s) => (
                 <option key={s} value={s}>
                   {s}
                 </option>

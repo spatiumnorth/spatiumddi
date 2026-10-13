@@ -21,15 +21,21 @@ in the network namespace — and the DHCP pod runs with host networking — so
 it cannot say the loss was ours.
 
 Only sockets bound to a DHCP service port are counted (67 for DHCPv4, 547
-for DHCPv6). The AF_PACKET socket Kea opens for ``dhcp-socket-type: raw``
-is *not* visible here — ``/proc/net/packet`` carries no drop column, and
-reading its statistics needs ``PACKET_STATISTICS`` on the socket itself,
-which only the owning process can do. That is a real blind spot for
-directly-attached broadcast traffic; relayed traffic, which is unicast and
-therefore arrives on the UDP fallback socket, is fully covered.
+for DHCPv6). One exception, since #1283: in ``dhcp-socket-type: raw``,
+kea-dhcp4 serves from AF_PACKET sockets, relayed traffic included. Its
+port-67 UDP sockets are then only fallbacks, whose packets it discards, so
+the AF_PACKET sockets are counted in their place. See
+:func:`read_packet_drops` and :class:`SocketDropCounter`.
 """
 
 from __future__ import annotations
+
+import json
+import os
+import socket
+import struct
+from collections.abc import Callable
+from typing import NamedTuple
 
 import structlog
 
@@ -38,6 +44,7 @@ log = structlog.get_logger(__name__)
 # DHCPv4 server port and DHCPv6 server port. ``/proc/net/udp`` prints the
 # local port in hex, so these are compared post-parse rather than as text.
 DHCP_PORTS = frozenset({67, 547})
+_DHCP4_PORT = 67
 
 _PROC_UDP = ("/proc/net/udp", "/proc/net/udp6")
 
@@ -117,6 +124,247 @@ def read_socket_drops(
     return merged if readable else None
 
 
+# ── AF_PACKET: the socket kea serves from in raw mode (#1283) ──────────────
+#
+# With ``dhcp-socket-type: raw`` (the default, #365) kea-dhcp4 opens, per
+# interface, an AF_PACKET socket (SOCK_RAW, ETH_P_ALL) whose BPF filter
+# admits UDP to port 67 sent to the broadcast address OR to the interface's
+# own address, so relayed unicast is read from it as well. Beside it sits a
+# UDP "fallback" socket on <address>:67 that kea drains and DISCARDS on
+# every receive, before reading one packet from the raw socket. So in raw
+# mode the UDP numbers above are drops of copies kea throws away, and the
+# drops that cost a client a retransmit are on the AF_PACKET socket. The
+# counter therefore reads the AF_PACKET sockets instead of the port-67 ones
+# in that mode (:class:`SocketDropCounter`). Which mode kea is in comes from
+# the config this agent rendered (:func:`kea_socket_type`). Kea's own
+# ``config-get`` leaves the key out when it holds kea's default, ``raw``.
+#
+# Its drop count is not in procfs (``/proc/net/packet`` has no drops column)
+# and ``PACKET_STATISTICS`` needs the socket itself. sock_diag reports it for
+# every AF_PACKET socket in the network namespace (``SK_MEMINFO_DROPS``, what
+# ``ss -0 -e -m`` prints as ``d``), and answers the agent's unprivileged user
+# (verified on the appliance). Which of those are kea's cannot be read from
+# ``/proc/<kea>/fd``: kea is started from a binary with file capabilities,
+# which makes it non-dumpable, and its fd table is closed to the agent and
+# even to root inside the container (verified). So they are told apart
+# instead: kea's are the raw ETH_P_ALL sockets owned by this user (the
+# entrypoint runs kea and the agent as the same one) that this process does
+# not hold itself (the agent's own sniffers are threads of this process).
+#
+# That rule also takes in another program's raw socket if its owner has the
+# same numeric uid. On the appliance one does: the host's lldpd runs as uid
+# 102, which is also the pod's ``spatium``. Its sockets carry a BPF filter
+# that keeps everything but discovery frames out of their queues, so their
+# drop counts stay 0 under DHCP load (verified: 0 on all ten while kea's
+# enp1s0 socket counted 302). Over-counting there is the safe direction for
+# a loss signal; leaving kea's raw socket out was not.
+
+_NETLINK_SOCK_DIAG = 4
+_SOCK_DIAG_BY_FAMILY = 20
+_NLM_F_REQUEST = 0x1
+_NLM_F_DUMP = 0x300
+_NLMSG_ERROR = 2
+_NLMSG_DONE = 3
+_AF_PACKET = 17
+_SOCK_RAW = 3
+_ETH_P_ALL = 0x0003
+_PACKET_SHOW_INFO = 0x01
+_PACKET_SHOW_MEMINFO = 0x10
+_PACKET_DIAG_UID = 5
+_PACKET_DIAG_MEMINFO = 6
+_SK_MEMINFO_DROPS = 8
+
+_NLMSG_HDR = struct.Struct("=IHHII")  # len, type, flags, seq, pid
+_PACKET_DIAG_REQ = struct.Struct("=BBHII2I")  # family, protocol, pad, ino, show, cookie
+_PACKET_DIAG_MSG = struct.Struct("=BBHI2I")  # family, type, num, ino, cookie
+_NLATTR = struct.Struct("=HH")  # len, type
+
+_PROC_PACKET = "/proc/net/packet"
+
+
+class PacketSocket(NamedTuple):
+    """One AF_PACKET socket as the kernel describes it."""
+
+    inode: int
+    sock_type: int
+    protocol: int  # host byte order, e.g. 0x0003 for ETH_P_ALL
+    uid: int | None
+    drops: int | None
+
+
+def _packet_diag_request(seq: int = 1) -> bytes:
+    body = _PACKET_DIAG_REQ.pack(
+        _AF_PACKET, 0, 0, 0, _PACKET_SHOW_INFO | _PACKET_SHOW_MEMINFO, 0, 0
+    )
+    flags = _NLM_F_REQUEST | _NLM_F_DUMP
+    head = _NLMSG_HDR.pack(_NLMSG_HDR.size + len(body), _SOCK_DIAG_BY_FAMILY, flags, seq, 0)
+    return head + body
+
+
+def _parse_packet_diag(data: bytes) -> tuple[list[PacketSocket], bool]:
+    """One ``recv()`` of a packet_diag dump -> ``(sockets, finished)``.
+
+    Raises ``OSError`` with the kernel's errno for an ``NLMSG_ERROR`` (the
+    dump was refused, e.g. a kernel without ``packet_diag``).
+    """
+    out: list[PacketSocket] = []
+    off = 0
+    while off + _NLMSG_HDR.size <= len(data):
+        length, mtype, _flags, _seq, _pid = _NLMSG_HDR.unpack_from(data, off)
+        if length < _NLMSG_HDR.size:
+            break
+        if mtype == _NLMSG_DONE:
+            return out, True
+        if mtype == _NLMSG_ERROR:
+            err = -struct.unpack_from("=i", data, off + _NLMSG_HDR.size)[0]
+            raise OSError(err, os.strerror(err))
+        body = data[off + _NLMSG_HDR.size : off + length]
+        if len(body) >= _PACKET_DIAG_MSG.size:
+            _family, sock_type, protocol, inode, _c0, _c1 = _PACKET_DIAG_MSG.unpack_from(body)
+            uid: int | None = None
+            drops: int | None = None
+            attr = _PACKET_DIAG_MSG.size
+            while attr + _NLATTR.size <= len(body):
+                alen, atype = _NLATTR.unpack_from(body, attr)
+                if alen < _NLATTR.size:
+                    break
+                payload = body[attr + _NLATTR.size : attr + alen]
+                if atype == _PACKET_DIAG_UID and len(payload) >= 4:
+                    uid = struct.unpack_from("=I", payload)[0]
+                elif atype == _PACKET_DIAG_MEMINFO and len(payload) >= 4 * (_SK_MEMINFO_DROPS + 1):
+                    drops = struct.unpack_from("=I", payload, 4 * _SK_MEMINFO_DROPS)[0]
+                attr += (alen + 3) & ~3
+            out.append(PacketSocket(inode, sock_type, protocol, uid, drops))
+        off += (length + 3) & ~3
+    return out, False
+
+
+def dump_packet_sockets(timeout: float = 2.0) -> list[PacketSocket]:
+    """Every AF_PACKET socket in this network namespace, via sock_diag."""
+    family = getattr(socket, "AF_NETLINK", None)
+    if family is None:  # not Linux
+        raise OSError("sock_diag needs AF_NETLINK")
+    with socket.socket(family, socket.SOCK_RAW, _NETLINK_SOCK_DIAG) as nl:
+        nl.settimeout(timeout)
+        nl.sendall(_packet_diag_request())
+        out: list[PacketSocket] = []
+        while True:
+            data = nl.recv(1 << 16)
+            if not data:
+                raise OSError("packet_diag dump ended without NLMSG_DONE")
+            rows, finished = _parse_packet_diag(data)
+            out.extend(rows)
+            if finished:
+                return out
+
+
+def _proc_packet_sockets(path: str = _PROC_PACKET) -> list[PacketSocket] | None:
+    """``/proc/net/packet``: every AF_PACKET socket, but with no drop count.
+
+    Columns: ``sk RefCnt Type Proto Iface R Rmem User Inode``. Absent means
+    no AF_PACKET support, so no sockets; unreadable means unknown (None).
+    """
+    try:
+        with open(path, encoding="ascii", errors="replace") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    out: list[PacketSocket] = []
+    for line in text.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 9:
+            continue
+        try:
+            out.append(PacketSocket(int(f[8]), int(f[2]), int(f[3], 16), int(f[7]), None))
+        except ValueError:
+            continue
+    return out
+
+
+def _own_socket_inodes(fd_dir: str = "/proc/self/fd") -> set[int]:
+    """Inodes of every socket this process holds (all of its threads)."""
+    inodes: set[int] = set()
+    for name in os.listdir(fd_dir):
+        try:
+            target = os.readlink(os.path.join(fd_dir, name))
+        except OSError:
+            continue  # closed between listdir and readlink
+        if target.startswith("socket:[") and target.endswith("]"):
+            inodes.add(int(target[8:-1]))
+    return inodes
+
+
+def _is_keas(sock: PacketSocket, uid: int, own: set[int]) -> bool:
+    return (
+        sock.sock_type == _SOCK_RAW
+        and sock.protocol == _ETH_P_ALL
+        and sock.uid == uid
+        and sock.inode not in own
+    )
+
+
+def read_packet_drops(
+    dump: Callable[[], list[PacketSocket]] = dump_packet_sockets,
+    own_inodes: Callable[[], set[int]] = _own_socket_inodes,
+    proc_packet: str = _PROC_PACKET,
+    uid: int | None = None,
+) -> dict[str, int] | None:
+    """Snapshot ``{"packet:<inode>": sk_drops}`` for kea's raw DHCPv4 sockets.
+
+    ``{}`` is a real answer: no raw socket of kea's is open, because kea is
+    starting or could not open one. ``None`` means they may exist and their
+    drops could not be read. The caller then reports the whole sample as
+    unknown, because in raw mode nothing else measures kea-dhcp4's intake.
+    When sock_diag is refused, ``/proc/net/packet`` still says whether there
+    was anything to miss: it lists the sockets, though not their drops.
+
+    The parameters exist only so the tests can drive this function over
+    fixtures; production passes none of them.
+    """
+    me = os.geteuid() if uid is None else uid
+    try:
+        own = own_inodes()
+    except OSError as e:
+        log.debug("packet_drops_own_fds_unreadable", error=str(e))
+        return None
+    try:
+        rows = dump()
+    except OSError as e:
+        listed = _proc_packet_sockets(proc_packet)
+        if listed is not None and not any(_is_keas(s, me, own) for s in listed):
+            return {}
+        log.debug("packet_drops_unreadable", error=str(e))
+        return None
+    out: dict[str, int] = {}
+    for s in rows:
+        if not _is_keas(s, me, own):
+            continue
+        if s.drops is None:
+            return None
+        out[f"packet:{s.inode}"] = s.drops
+    return out
+
+
+def kea_socket_type(path: str | os.PathLike[str]) -> str | None:
+    """``dhcp-socket-type`` of the kea-dhcp4 config at ``path``: raw or udp.
+
+    ``path`` is the file this agent renders and kea loads
+    (``KEA_CONFIG_PATH``). A missing key is ``raw``, kea's own default for
+    DHCPv4. ``None`` means unknown: the file cannot be read or parsed, or it
+    names a mode kea does not have.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        iface = doc["Dhcp4"].get("interfaces-config") or {}
+        mode = iface.get("dhcp-socket-type", "raw")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return mode if mode in ("raw", "udp") else None
+
+
 class SocketDropCounter:
     """Turns per-socket monotonic ``sk_drops`` into a per-bucket delta.
 
@@ -125,10 +373,37 @@ class SocketDropCounter:
     total: a socket that goes away must not make the fleet-wide sum fall
     (which would read as a counter reset), and a socket that appears
     contributes its own count from zero.
+
+    Which sockets are counted follows kea-dhcp4's socket mode (#1283),
+    which ``socket_type`` returns at every sample:
+
+    * ``udp``: the DHCP-port UDP sockets, v4 and v6. sock_diag is not
+      asked.
+    * ``raw``: kea's AF_PACKET sockets, and the UDP sockets on port 547
+      (kea-dhcp6 has no raw mode). The port-67 UDP sockets are left out:
+      in this mode they are fallbacks whose packets kea reads only to
+      discard, so their drops are copies of packets the AF_PACKET socket
+      also received, or also dropped. If fallbacks are open and no raw
+      socket of kea's is found, the sample is unknown, not 0.
+    * ``None`` (unknown): all of them, so no loss is left out.
+
+    A change of mode restarts the baseline. The set of sockets being
+    counted changes, and kea reopens its sockets on that reconfiguration
+    anyway.
+
+    ``packet_drops`` and ``socket_type`` are parameters so the tests can
+    script them. The metrics poller passes the rendered config's mode.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        packet_drops: Callable[[], dict[str, int] | None] | None = None,
+        socket_type: Callable[[], str | None] | None = None,
+    ) -> None:
         self._prev: dict[str, int] | None = None
+        self._mode: str | None = None
+        self._packet_drops = read_packet_drops if packet_drops is None else packet_drops
+        self._socket_type = (lambda: None) if socket_type is None else socket_type
 
     def sample(self) -> int | None:
         """Drops since the previous call, or ``None`` if not measurable."""
@@ -148,7 +423,26 @@ class SocketDropCounter:
         supplies the real procfs paths — the tests must not reimplement the
         arithmetic below, or they assert on a copy of it.
         """
-        current = read_socket_drops(paths, ports)
+        mode = self._socket_type()
+        if mode != self._mode:
+            self._prev = None
+            self._mode = mode
+        udp_ports = ports - {_DHCP4_PORT} if mode == "raw" else ports
+        current = read_socket_drops(paths, udp_ports)
+        if current is not None and mode != "udp":
+            # A partial read counts as no read, as for the two procfs files.
+            # In raw mode the UDP half alone does not measure kea-dhcp4 at all.
+            packet = self._packet_drops()
+            if packet is None:
+                current = None
+            elif mode == "raw" and not packet and read_socket_drops(paths, ports & {_DHCP4_PORT}):
+                # Kea opens its raw socket beside every :67 fallback, and
+                # closes the fallback if the raw open fails. So fallbacks
+                # with no raw socket of kea's found mean its raw sockets
+                # could not be told apart. That is unknown, never a 0.
+                current = None
+            else:
+                current = {**current, **packet}
         if current is None:
             self._prev = None
             return None
@@ -167,4 +461,12 @@ class SocketDropCounter:
         return total
 
 
-__all__ = ["DHCP_PORTS", "SocketDropCounter", "read_socket_drops"]
+__all__ = [
+    "DHCP_PORTS",
+    "PacketSocket",
+    "SocketDropCounter",
+    "dump_packet_sockets",
+    "kea_socket_type",
+    "read_packet_drops",
+    "read_socket_drops",
+]
