@@ -17,16 +17,10 @@ import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
 
 // What a new grant row offers: a mirror of docs/PERMISSIONS.md, keep these in
 // sync. A role can hold more than these lists name — the built-in roles do
-// (`approve`, `appliance`, `change_request`, …) — so each select also offers
-// the value its row holds (`withHeld`), and shows it (#1394).
-const ACTIONS = [
-  "read",
-  "write",
-  "delete",
-  "admin",
-  "approve",
-  "*",
-] as const;
+// (`appliance`, …) — so each select also offers the value its row holds
+// (`withHeld`), and shows it (#1394). `approve` only means anything on
+// `change_request` (#1631), so both are offered for a custom approver role.
+const ACTIONS = ["read", "write", "delete", "admin", "approve", "*"] as const;
 const RESOURCE_TYPES = [
   "*",
   "ip_space",
@@ -53,6 +47,7 @@ const RESOURCE_TYPES = [
   "manage_ipam_templates",
   "settings",
   "api_token",
+  "change_request",
 ] as const;
 
 /** A list's options plus the value a grant holds, when the list does not

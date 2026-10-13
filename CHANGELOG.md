@@ -89,8 +89,10 @@ the formatter handles the rest.
   `write`, `delete`, `admin` and `*`, while the builtin Change Approver role
   (and every approval check) uses `approve` on `change_request`; saving a
   clone 422d. `approve` is now accepted by the Roles and time-bound-grant
-  APIs and offered in the role editor, and a test pins the allow-list against
-  every action the builtin roles and permission checks use.
+  APIs, and the role editor offers it along with the `change_request`
+  resource type, so a custom approver role can be built there rather than
+  only cloned. A test pins the allow-list against every action the builtin
+  roles and permission checks use.
 
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single

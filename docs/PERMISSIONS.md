@@ -31,7 +31,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `write`  | POST / PUT / PATCH (create, update)                        |
 | `delete` | DELETE                                                     |
 | `admin`  | All of `read`, `write`, `delete` for the given resource    |
-| `approve` | The second-person decision on a queued change request (`change_request` only; does not imply `read`) |
+| `approve` | The second-person decision on a queued change request — only meaningful on `change_request`. Does not imply `read`, and `admin` does not imply it |
 | `*`      | Wildcard — match any action                                |
 
 ### Resource types
