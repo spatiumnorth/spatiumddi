@@ -66,6 +66,7 @@ from app.drivers.dns.windows import test_winrm_credentials
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.dns import (
+    DEFAULT_ALLOW_RECURSION,
     DNSSEC_ALGORITHMS,
     ZONE_DEFAULT_EXPIRE,
     ZONE_DEFAULT_MINIMUM,
@@ -3776,6 +3777,13 @@ async def update_options(
         db.add(opts)
 
     changes = body.model_dump(exclude_none=True)
+    # #1817: a blank allow_recursion means "the default", not "nobody". An
+    # empty list would render ``allow-recursion { none; }`` / Technitium
+    # ``Deny`` and lock every client out of recursion, which is not what
+    # clearing the field in the UI looks like. ``["none"]`` is how to refuse
+    # everyone.
+    if "allow_recursion" in changes and not any(str(e).strip() for e in changes["allow_recursion"]):
+        changes["allow_recursion"] = list(DEFAULT_ALLOW_RECURSION)
     # NULL is a meaningful "clear back to BIND default" for the optional RRL /
     # amplification knobs, but exclude_none drops it — so re-inject when the
     # operator explicitly sent null (mirrors the update_zone color /

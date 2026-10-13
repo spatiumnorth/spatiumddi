@@ -93,19 +93,37 @@ the formatter handles the rest.
   that no longer exists, and renders `none` if nothing survives, so one
   bad element cannot stop the group converging and a broken
   restriction fails closed. An ACL cited by the server options can no
-  longer be deleted or renamed. **What the default means:** the stored
-  default `["any"]`, an empty list, and recursion off render no
-  `allow-recursion` line. BIND then derives recursion from
-  `allow-query`, which the agent always renders (default `any`), so a
-  default recursive BIND9 group is an open resolver, as it has been
-  all along (the issue's "BIND ran `localnets; localhost;`" was wrong;
-  verified against BIND 9.20). This change keeps that, rather than cut
-  off resolvers serving routed clients; set `allow_recursion` or
-  `allow_query` to restrict it. Technitium maps the same default to
-  private networks only (#1761), so the two engines differ on it. The
-  bundle change is renderer revision 9. Every BIND9 group's etag shifts
-  once on upgrade (one re-apply); `named.conf` is byte-identical unless
-  `allow_recursion` is explicit.
+  longer be deleted or renamed. The bundle change is renderer
+  revision 9. What the default is: see #1817 below.
+
+- **Recursive BIND9 groups on default settings are no longer open resolvers (#1817).**
+  The agent renders `allow-query { any; }` and an unset `allow-recursion`
+  inherits it (BIND 9.20 `server.c`), so a recursive group nobody had
+  configured answered recursive queries for the internet. The default
+  for `allow_recursion` is now local + private networks,
+  `["localhost", "localnets", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10"]`,
+  and every value renders literally: the default renders
+  `allow-recursion { localhost; localnets; 10.0.0.0/8; 172.16.0.0/12; 192.168.0.0/16; fc00::/7; fe80::/10; };`,
+  an explicit `any` renders `any` (open, deliberately), and a stored
+  empty list renders `none` (fail closed). Recursion off still renders no
+  line. The private ranges are in the default because `localnets` is the
+  subnets of the interfaces named sees: on the plain appliance BIND9 runs
+  on host networking and that is the LAN, but behind the appliance DNS VIP,
+  in the umbrella Helm chart, the `k8s/` manifests and Docker Compose it
+  runs on a pod or bridge network, where `localnets` alone would refuse
+  every LAN client. Saving the Options field blank now stores the default
+  (the group-options PUT normalises `allow_recursion: []`); `none` is the
+  way to refuse everyone. Technitium follows the same values: the default
+  maps to one deduplicated ACL of loopback plus the private ranges,
+  `any` to `Allow`, empty to `Deny`. A migration rewrites rows that are
+  exactly `["any"]` (or empty) to the new default and re-renders every
+  affected agent. **Upgrade note:** on any deployment shape, a recursive
+  group whose clients use public addresses (routed public subnets, or
+  globally routable IPv6 on a pod-network shape) or CGNAT / Tailscale
+  addresses (`100.64.0.0/10` is deliberately not in the default) loses
+  recursion until those networks are added to `allow_recursion`. `any`
+  restores fully open recursion. The bundle change is renderer
+  revision 10.
 
 - **A rolling upgrade whose own cleanup fails now raises a distinct
   alert (#1542).** When an upgrade fails after cordoning a node, the
@@ -404,13 +422,8 @@ the formatter handles the rest.
   which dropped a busy downstream resolver's answers. Recursion off
   (or `is_recursive=false`) now sends `Deny`. An explicit
   `allow_recursion` list sends `UseSpecifiedNetworkACL` with the list as
-  CIDRs, failing closed to `Deny` when no entry is usable. The stored
-  default `["any"]`, like an empty list, keeps Technitium's
-  private-networks-only recursion: SpatiumDDI does not open recursion on
-  Technitium through the default, because the BIND9 agent never renders
-  `allow_recursion` either (#1786) and `["any"]` cannot be told apart
-  from an untouched group. So recursion-enabled groups see no change on
-  upgrade. RRL off sends empty QPM limits; RRL on derives a per-client
+  CIDRs, failing closed to `Deny` when no entry is usable. The default
+  list (#1817) maps to loopback plus the private ranges. RRL off sends empty QPM limits; RRL on derives a per-client
   limit from `rrl_responses_per_second`, the window from `rrl_window`,
   the truncation share from `rrl_slip`, and `rrl_exempt_clients` as the
   bypass list. **Behaviour change on upgrade:** `rrl_enabled` defaults
@@ -3400,6 +3413,12 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `b8e41c7a2d95` — #1817, data + server default:
+  `dns_server_options.allow_recursion` rows that are exactly `["any"]`
+  (or empty) become the local + private networks default, the column
+  default changes with them, and `bundle_dirty_seq` is bumped on the
+  affected groups' agent servers. Downgrade rewrites exactly that default
+  list back to `["any"]` and restores the old column default.
 - `5e6d56b39ab7` — #1356, data-only: every persistent `pairing_code`
   that is not revoked and has no expiry gets `expires_at` 30 days after
   the upgrade. Downgrade is a no-op: which codes were NULL is not

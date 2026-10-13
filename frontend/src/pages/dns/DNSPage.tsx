@@ -6758,7 +6758,9 @@ function OptionsTab({ groupId }: { groupId: string }) {
   const [forwarders, setForwarders] = useState("");
   const [forwardPolicy, setForwardPolicy] = useState("first");
   const [recursionEnabled, setRecursionEnabled] = useState(true);
-  const [allowRecursion, setAllowRecursion] = useState("any");
+  const [allowRecursion, setAllowRecursion] = useState(
+    "localhost, localnets, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7, fe80::/10",
+  );
   const [dnssecValidation, setDnssecValidation] = useState("auto");
   const [notifyEnabled, setNotifyEnabled] = useState("yes");
   const [allowQuery, setAllowQuery] = useState("any");
@@ -7282,12 +7284,13 @@ function OptionsTab({ groupId }: { groupId: string }) {
               setAllowRecursion(e.target.value);
               setDirty(true);
             }}
-            placeholder="any"
+            placeholder="blank = default (local + private networks)"
           />
           <p className="text-xs text-muted-foreground">
-            &quot;any&quot; (the default) or blank: on BIND9 recursion is as
-            wide as allow-query; on Technitium, private networks only. List
-            networks to restrict it.
+            Blank = default (local + private networks: localhost, localnets, RFC
+            1918, fc00::/7, fe80::/10); &quot;none&quot; refuses everyone. Add
+            public, CGNAT or Tailscale client networks explicitly, or
+            &quot;any&quot; to open recursion to everyone (an open resolver).
           </p>
         </Field>
       </div>

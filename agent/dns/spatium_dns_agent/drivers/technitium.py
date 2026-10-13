@@ -421,6 +421,17 @@ _RECURSION_MODES = frozenset(
 # ``!``-prefixed CIDR).
 _ACL_ANY = ("0.0.0.0/0", "::/0")
 _ACL_LOCALHOST = ("127.0.0.0/8", "::1/128")
+#: The stored ``allow_recursion`` default (#1817), mirroring the control
+#: plane's ``app.models.dns.DEFAULT_ALLOW_RECURSION``.
+_DEFAULT_ALLOW_RECURSION = (
+    "localhost",
+    "localnets",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "fc00::/7",
+    "fe80::/10",
+)
 _ACL_LOCALNETS = (
     "10.0.0.0/8",
     "172.16.0.0/12",
@@ -3313,24 +3324,32 @@ class TechnitiumDriver(DriverBase):
         """Pure mapping: bundle options → (``recursion`` mode, ACL entries).
 
         * ``recursion_enabled`` false → ``Deny``.
-        * ``allow_recursion`` absent, empty, or exactly ``["any"]`` →
-          ``AllowOnlyForPrivateNetworks``. ``["any"]`` is the model's stored
-          default and nothing distinguishes it from an explicit choice.
-          Mapping it to ``Allow`` would open recursion to the internet on
-          upgrade; the engine's private-network default is what Technitium
-          already did. ``Allow`` is therefore never sent. NOTE: this differs
-          from BIND9, where an omitted ``allow-recursion`` inherits the
-          rendered ``allow-query`` (``any`` by default), not localnets (#1786).
+        * ``allow_recursion`` absent (an older control plane) → the stored
+          default, local + private networks (#1817). Otherwise the list
+          is read literally, with no special case for any value:
+          ``["any"]`` → ``Allow`` (open, deliberately), ``none`` / empty →
+          ``Deny``.
+        * NOTE ``localnets`` differs from BIND's: BIND's is the server's
+          directly attached subnets, Technitium has no such notion, so it is
+          the RFC 1918 + ULA + link-local ranges (``_ACL_LOCALNETS``), which
+          is also what Technitium's own ``AllowOnlyForPrivateNetworks`` allows.
         * otherwise ``UseSpecifiedNetworkACL`` with the list translated to
           CIDRs. Unresolvable tokens (named ACLs, garbage) are dropped with
           a warning; if none survive the result is ``Deny`` — fail closed.
+        * the ACL is deduplicated, first occurrence kept: the default lists
+          ``localnets`` AND the private ranges it expands to here, and a
+          later duplicate can never fire in a first-match list anyway.
         """
         if not options.get("recursion_enabled", True):
             return "Deny", []
-        raw = [str(e).strip() for e in (options.get("allow_recursion") or []) if str(e).strip()]
-        if not raw or [e.lower() for e in raw] == ["any"]:
-            return "AllowOnlyForPrivateNetworks", []
+        stored = options.get("allow_recursion")
+        if stored is None:
+            stored = list(_DEFAULT_ALLOW_RECURSION)
+        raw = [str(e).strip() for e in stored if str(e).strip()]
+        if [e.lower() for e in raw] == ["any"]:
+            return "Allow", []
         acl: list[str] = []
+        seen: set[tuple[bool, str]] = set()
         for entry in raw:
             deny = entry.startswith("!")
             name = entry.lstrip("!").strip()
@@ -3350,7 +3369,11 @@ class TechnitiumDriver(DriverBase):
                     log.warning("technitium_allow_recursion_entry_dropped", entry=entry)
                     continue
                 cidrs = (name,)
-            acl.extend(("!" + c) if deny else c for c in cidrs)
+            for c in cidrs:
+                seen_key = (deny, str(ipaddress.ip_network(c, strict=False)))
+                if seen_key not in seen:
+                    seen.add(seen_key)
+                    acl.append(("!" + c) if deny else c)
         if not any(not a.startswith("!") for a in acl):
             return "Deny", []
         return "UseSpecifiedNetworkACL", acl
