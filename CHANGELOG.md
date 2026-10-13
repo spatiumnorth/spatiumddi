@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **`GET .../zones/{id}/dnssec/info` no longer 500s once an agent has
+  reported keys (#1812).** `DNSKey.algorithm` is the IANA number (13 =
+  ECDSAP256SHA256) but the response model typed it `str`, which Pydantic
+  does not coerce, so the endpoint failed for every signed zone with
+  reported keys. `algorithm` is now an integer and the new
+  `algorithm_name` carries the mnemonic (null for an unknown number); the
+  `find_zone_dnssec_info` Copilot tool gains the same field and the zone
+  DNSSEC card shows `ECDSAP256SHA256 (13)`.
+
 - **Deleting an A/AAAA on Technitium no longer loses its PTR (#1800).**
   Technitium's web API deletes the matching PTR with the A/AAAA when the
   reverse zone is on the same server, and #1768 only repaired the structural

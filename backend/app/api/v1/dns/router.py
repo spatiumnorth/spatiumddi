@@ -86,6 +86,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
     DNSZoneUpdateAcl,
+    dnssec_algorithm_name,
 )
 from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.spool_status import SpoolStatus
@@ -6241,7 +6242,10 @@ class DNSSECKeyState(BaseModel):
 
     key_tag: int | None = None
     key_type: str | None = None
-    algorithm: str | None = None
+    #: IANA DNSSEC algorithm number (13 = ECDSAP256SHA256) — #1812.
+    algorithm: int | None = None
+    #: IANA mnemonic for ``algorithm``; None for a number we do not know.
+    algorithm_name: str | None = None
     state: str | None = None
     ds_records: list[str] = []
     timing: dict[str, Any] = {}
@@ -6371,6 +6375,7 @@ async def get_zone_dnssec_info(
                     "key_tag": k.key_tag,
                     "key_type": k.key_type,
                     "algorithm": k.algorithm,
+                    "algorithm_name": dnssec_algorithm_name(k.algorithm),
                     "state": k.state,
                     "ds_records": k.ds_records or [],
                     "timing": k.timing or {},
