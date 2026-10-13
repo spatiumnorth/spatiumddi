@@ -475,9 +475,21 @@ async def test_requester_without_read_grant_sees_own_requests_only(
     other, _ = await _user(db_session, name="other3")
     mine = await _pending_cr(db_session, subnet_a, editor, display="mine")
     theirs = await _pending_cr(db_session, subnet_b, other, display="theirs")
+    # The editor's own self-service portal row (#696) shares the table; the
+    # gate queue must not serve it, grant or no grant.
+    portal = await _pending_cr(db_session, subnet_a, editor, display="portal")
+    portal.origin = "portal"
     await db_session.commit()
 
-    for url in ("/api/v1/change-requests", "/api/v1/change-requests?mine=true"):
+    # No query parameter widens the own-rows scope: not ``mine=false``, not a
+    # filter that matches the other user's row too.
+    for url in (
+        "/api/v1/change-requests",
+        "/api/v1/change-requests?mine=true",
+        "/api/v1/change-requests?mine=false",
+        "/api/v1/change-requests?state=pending&resource_type=subnet",
+        "/api/v1/change-requests?limit=500&offset=0",
+    ):
         r = await client.get(url, headers=_auth(etok))
         assert r.status_code == 200, (url, r.text)
         ids = {row["id"] for row in r.json()}
@@ -485,8 +497,10 @@ async def test_requester_without_read_grant_sees_own_requests_only(
 
     r = await client.get(f"/api/v1/change-requests/{mine.id}", headers=_auth(etok))
     assert r.status_code == 200, r.text
-    r = await client.get(f"/api/v1/change-requests/{theirs.id}", headers=_auth(etok))
-    assert r.status_code == 404, r.text
+    assert r.json()["preview_text"] == "Soft-delete subnet (mine)"
+    for cr_id in (theirs.id, portal.id):
+        r = await client.get(f"/api/v1/change-requests/{cr_id}", headers=_auth(etok))
+        assert r.status_code == 404, (cr_id, r.text)
 
 
 @pytest.mark.asyncio
