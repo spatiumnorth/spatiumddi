@@ -194,16 +194,17 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     agent-based zone, so those purge normally. Returns ``(purged, skipped)``.
     ``include_deleted`` because these rows are soft-deleted by definition.
 
-    Retry caveat (#632): the provider teardown is not transactional with the DB,
-    and the cloud / Windows drivers raise "zone not found" on a delete of an
-    already-absent zone (they resolve the provider zone-id first). So a zone that
-    was partially torn down (one agentless member deleted, another failed) — or
-    torn down just before a failed terminal ``_sweep`` commit — can stay
-    ``skipped`` every later sweep, lingering soft-deleted rather than orphaning at
-    the provider. That is the safe failure (the DB keeps the row; an operator can
-    permanent-delete it). Making the drivers treat absent-on-delete as success —
-    which also hardens the permanent zone-delete path — is the real fix, tracked
-    separately.
+    Retry (#632): the provider teardown is not transactional with the DB, so a
+    zone torn down just before a failed terminal ``_sweep`` commit, or torn down
+    on one agentless member while another failed, is pushed again on the next
+    sweep. Windows DNS, ``technitium_api``, Cloudflare, Route 53, Azure, Google
+    and Hetzner report a delete of an already-absent zone as a no-op (#1528,
+    #1537), so the retry converges. DigitalOcean, Linode and Vultr still raise
+    on an absent zone, so such a zone stays ``skipped`` every later sweep: the
+    safe failure (the row is kept, nothing is orphaned), but no delete path
+    can remove it until those drivers treat absence as done too. The Trash
+    page's permanent delete goes through the same helper and fails the same
+    way (#1830).
     """
     from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
 

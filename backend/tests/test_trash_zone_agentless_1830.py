@@ -17,7 +17,9 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.agent_wake import dns_group_channel
 from app.core.security import create_access_token, hash_password
+from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSZone
 from app.tasks.trash_purge import _purge_dns_zones
@@ -89,6 +91,34 @@ async def _trashed_zone(db: AsyncSession, age_days: int = 1) -> DNSZone:
     return zone
 
 
+async def _audit_rows(db: AsyncSession, zone_id: uuid.UUID) -> list[AuditLog]:
+    return list(
+        (
+            await db.execute(
+                select(AuditLog).where(
+                    AuditLog.resource_type == "dns_zone",
+                    AuditLog.resource_id == str(zone_id),
+                    AuditLog.action == "permanent_delete",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _record_count(db: AsyncSession, zone_id: uuid.UUID) -> int:
+    return len(
+        (
+            await db.execute(
+                select(DNSRecord.id)
+                .where(DNSRecord.zone_id == zone_id)
+                .execution_options(include_deleted=True)
+            )
+        ).all()
+    )
+
+
 async def _row(db: AsyncSession, zone_id: uuid.UUID) -> DNSZone | None:
     db.expire_all()
     return (
@@ -106,11 +136,22 @@ async def test_trash_permanent_delete_drives_agentless_driver(
     zone = await _trashed_zone(db_session)
     drv = _FakeAgentlessDriver()
     monkeypatch.setattr("app.drivers.dns.get_driver", lambda _n: drv)
+    woken: list[str] = []
 
-    r = await client.delete(f"/api/v1/admin/trash/dns_zone/{zone.id}", headers=headers)
+    async def _wake(channel: str) -> None:
+        woken.append(channel)
+
+    monkeypatch.setattr("app.api.v1.admin.trash.publish_wake", _wake)
+    zid, gid, name = zone.id, zone.group_id, zone.name
+
+    r = await client.delete(f"/api/v1/admin/trash/dns_zone/{zid}", headers=headers)
     assert r.status_code == 204, r.text
-    assert drv.calls == [(zone.name, "delete")]
-    assert await _row(db_session, zone.id) is None
+    assert drv.calls == [(name, "delete")]
+    assert await _row(db_session, zid) is None
+    assert await _record_count(db_session, zid) == 0, "records go with the zone"
+    audits = await _audit_rows(db_session, zid)
+    assert [a.result for a in audits] == ["success"]
+    assert woken == [dns_group_channel(gid)]
 
 
 @pytest.mark.asyncio
@@ -122,10 +163,19 @@ async def test_trash_permanent_delete_keeps_row_when_provider_fails(
     drv = _FakeAgentlessDriver(fail=True)
     monkeypatch.setattr("app.drivers.dns.get_driver", lambda _n: drv)
 
-    r = await client.delete(f"/api/v1/admin/trash/dns_zone/{zone.id}", headers=headers)
+    zid, name = zone.id, zone.name
+    r = await client.delete(f"/api/v1/admin/trash/dns_zone/{zid}", headers=headers)
     assert r.status_code in (409, 502), r.text
-    assert drv.calls == [(zone.name, "delete")]
-    assert await _row(db_session, zone.id) is not None, "failed teardown must not orphan the zone"
+    assert drv.calls == [(name, "delete")]
+    assert await _row(db_session, zid) is not None, "failed teardown must not orphan the zone"
+    assert await _record_count(db_session, zid) == 1
+    assert await _audit_rows(db_session, zid) == [], "nothing was deleted, so no audit row"
+
+    # Once the provider is back, the same request removes it.
+    drv.fail = False
+    r = await client.delete(f"/api/v1/admin/trash/dns_zone/{zid}", headers=headers)
+    assert r.status_code == 204, r.text
+    assert await _row(db_session, zid) is None
 
 
 @pytest.mark.asyncio
@@ -140,6 +190,22 @@ async def test_retention_sweep_drives_agentless_driver(
     assert (purged, skipped) == (1, 0)
     assert drv.calls == [(zone.name, "delete")]
     assert await _row(db_session, zone.id) is None
+
+
+@pytest.mark.asyncio
+async def test_retention_sweep_keeps_zone_when_provider_fails(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    zone = await _trashed_zone(db_session, age_days=40)
+    zid = zone.id
+    drv = _FakeAgentlessDriver(fail=True)
+    monkeypatch.setattr("app.drivers.dns.get_driver", lambda _n: drv)
+
+    purged, skipped = await _purge_dns_zones(db_session, datetime.now(UTC) - timedelta(days=30))
+    assert (purged, skipped) == (0, 1)
+    await db_session.commit()
+    assert await _row(db_session, zid) is not None, "left for the next sweep, not orphaned"
+    assert await _record_count(db_session, zid) == 1
 
 
 @pytest.mark.asyncio

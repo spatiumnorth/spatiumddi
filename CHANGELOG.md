@@ -91,10 +91,12 @@ the formatter handles the rest.
   page's per-row **Delete permanently** removed the row without driving
   the Windows DNS / cloud / `technitium_api` driver, leaving the zone
   served with no trace in SpatiumDDI; `?permanent=true` and the 30-day
-  sweep already pushed. All three now share one helper
-  (`services/dns/zone_purge.py`): the provider delete runs first, and a
-  failing provider keeps the zone in the Trash with a 409/502 so it can
-  be retried rather than orphaned.
+  sweep already pushed. The Trash delete and the sweep now share one
+  helper (`services/dns/zone_purge.py`): the provider delete runs first,
+  and a failing provider keeps the zone in the Trash with a 409/502 so it
+  can be retried rather than orphaned. A server disabled since the zone
+  was trashed is skipped, as on every other zone delete, so the zone stays
+  on it.
 
 - **Re-importing a zone's own export no longer pins every inherited TTL
   (#1727).** A record with no TTL of its own inherits the zone default and
