@@ -878,7 +878,7 @@ firehose is driven by **new-device arrivals**, not renewals — the morning arri
 surge is the DDNS write peak. Expiry/sweep produces the mirror DELETE cascade.
 
 **How the DNS generator stresses it (passive, driven by DHCP):** seed forward +
-matching reverse zones so DDNS has somewhere to write (`ensure_reverse_zone_for_subnet`,
+matching reverse zones so DDNS has somewhere to write (`ensure_reverse_zones_for_subnet`,
 `router.py:1098`); set test subnets to `always_generate`; drive the arrival rate
 past steady-state to find where `dns_zone` serial-UPDATE contention,
 `dns_record` INSERT rate, or the record-op pipeline knees.

@@ -91,6 +91,64 @@ the formatter handles the rest.
   route's own 409 was unreachable; renaming onto a taken name had the
   same shape. Both checks now select only the id. No other DHCP / DNS
   create or rename check loads a joined collection, so none shared it.
+
+- **The DHCP options editor's search box kept only the first digit of a
+  typed code (#1685).** Typing `4` then `3` left the box reading
+  "4 —3", matched nothing and made the row option 4. Each keystroke set
+  the row's code and an effect then rewrote the box to "`<code>` —"
+  before the next digit landed; and a prefix that is itself a standard
+  option (3, 6, 15, 42…) moved the row out of the custom list mid-code, so
+  no code starting with one (31, 60, 150…) could be typed at all. The box
+  now only searches while you type; the code is taken into the row on
+  blur, Enter or a catalogue pick, and its name follows it instead of the
+  previous code's name travelling along. Enter no longer submits the
+  dialog from that box, and a pick or a row delete no longer commits the
+  half-typed text first.
+
+- **A power loss right after a slot apply no longer freezes the node's
+  Fleet row (#1747).** The slot-upgrade runners wrote their state and
+  progress sidecars with a plain redirect and no fsync, so a power loss
+  right after "apply succeeded" could leave `slot-upgrade.log` or a
+  sidecar ending in, or made of, NUL bytes. The supervisor sends the log
+  tail on every heartbeat, Postgres refuses a NUL in a text value, and the
+  api answered 422 to every heartbeat from that node until someone edited
+  the file by hand.
+  - The supervisor strips NUL and other control characters from the log
+    tail and the progress sidecar, and strips NUL from every string in
+    the heartbeat body before sending it, so a NUL in any other field
+    read off a host file cannot freeze the row either.
+  - A NUL-filled, empty or truncated state or progress file reads as
+    unknown. Clearing a failed upgrade, and the passive heal when no
+    upgrade is desired, reset an unreadable state to `ready` the way they
+    already reset `failed`.
+  - The host runners (`spatiumddi-slot-upgrade`, `-slot-set-next-boot`,
+    `-slot-set-default`, `-slot-rollback`, `spatium-upgrade-slot`) write
+    their sidecars to a temp file, fsync it, rename it over the target
+    and fsync the directory. The main runner also fsyncs the log after
+    the apply and, on every exit, the log and the trigger's terminal
+    rename.
+
+- **A subnet wider than a /24 now gets a reverse zone for every /24 it
+  spans, so every address gets its PTR (#1840).** A /17–/23 was given
+  the zone of the /24 holding its network address, so in a /23 every
+  address past the first /24 had no zone and no PTR, with nothing
+  reported. It now gets one zone per /24 (a /23 two, a /20 sixteen, a
+  /17 128), never one enclosing zone, which would make SpatiumDDI
+  authoritative for space outside the subnet. A /9–/16 gets one per /16
+  it contains, and an IPv6 prefix one per nibble-aligned piece (a /55
+  gets both its /56 zones where it used to get only the first, a /45 its
+  eight /48s). The zones are a set: subnet delete trashes all of them
+  (and restore brings them back), a resize grow adds the new range's,
+  and the reverse-zone backfill creates the missing ones. Which zone
+  takes a PTR is decided per address by one shared lookup, also used by
+  the DNS drift check, whose preview now lists every reverse zone of the
+  subnet rather than the first, and which no longer reports another
+  subnet's orphaned PTRs because they share a /24 zone. The Windows
+  cutover checklist counts a wider reverse zone as covering its /24s
+  instead of reporting each one missing. An install's existing first-/24
+  zone keeps serving its addresses; the rest of the set is created on
+  the next allocation or backfill. No migration.
+
 - **Technitium: an hmac-sha224 TSIG key is refused instead of being
   installed and failing every signed transfer (#1858).** Technitium has
   no HMAC-SHA224 (`DnsDatagram.GetTsigMacSize` returns 0 for it), so a
