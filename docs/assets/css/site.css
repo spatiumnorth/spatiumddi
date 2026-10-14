@@ -422,6 +422,22 @@ kbd {
   padding: 44px 24px 90px;
 }
 
+/* Version banner (#1164) */
+.doc-versionbar {
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border);
+  color: var(--fg-muted);
+  font-size: 0.86rem;
+}
+.doc-versionbar-inner {
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: 8px 16px;
+}
+.doc-versionbar code {
+  font-size: 0.95em;
+}
+
 .doc-crumb {
   font-size: 0.86rem;
   color: var(--fg-faint);

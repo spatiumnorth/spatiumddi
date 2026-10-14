@@ -98,3 +98,8 @@ export function permissionGate(
 ): { disabled?: boolean; title?: string } {
   return allowed ? {} : { disabled: true, title: reason };
 }
+
+/** The reason on a control whose route takes a superadmin whatever the
+ *  caller's grants (the handler's `SuperAdmin` dependency, refused as
+ *  "Superadmin required"). Gate it on `isSuperadmin`, not on `can()`. */
+export const NEEDS_SUPERADMIN = "Requires superadmin";

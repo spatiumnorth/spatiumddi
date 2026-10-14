@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.models.dns import DNSBlockList
 from app.services.feature_modules import is_module_enabled
 
@@ -73,7 +74,9 @@ async def due_blocklist_ids(db: AsyncSession, now: datetime) -> list[str]:
 async def _dispatch_due_async() -> int:
     from app.tasks.dns import refresh_blocklist_feed
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with factory() as db:

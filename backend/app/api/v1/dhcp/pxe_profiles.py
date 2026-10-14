@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
@@ -217,7 +217,7 @@ async def create_profile(
     group_id: uuid.UUID,
     body: PXEProfileCreate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> PXEProfileResponse:
     grp = await db.get(DHCPServerGroup, group_id)
     if grp is None:
@@ -301,7 +301,7 @@ async def update_profile(
     profile_id: uuid.UUID,
     body: PXEProfileUpdate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> PXEProfileResponse:
     res = await db.execute(
         select(DHCPPXEProfile)
@@ -356,7 +356,7 @@ async def update_profile(
 
 
 @router.delete("/pxe-profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_profile(profile_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_profile(profile_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     prof = await db.get(DHCPPXEProfile, profile_id)
     if prof is None:
         raise HTTPException(status_code=404, detail="PXE profile not found")

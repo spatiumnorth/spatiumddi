@@ -43,6 +43,7 @@ import {
   type WolVerifyMethod,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // ─────────────────────────────────────────────────────────────────────
 // Scheduled Wake-on-LAN (#586 Phase 1) — Tools page.
@@ -400,6 +401,13 @@ function TabButton({
 // Schedules tab
 // ─────────────────────────────────────────────────────────────────────
 function SchedulesTab() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'use_network_tools'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "use_network_tools"),
+    "Requires write permission on wake schedules",
+  );
   const qc = useQueryClient();
   const schedulesQ = useQuery({
     queryKey: ["wol-schedules"],
@@ -509,6 +517,7 @@ function SchedulesTab() {
             variant="primary"
             icon={Plus}
             onClick={() => setEditing({ mode: "create" })}
+            {...writeGate}
           >
             New schedule
           </HeaderButton>
@@ -644,6 +653,17 @@ function ScheduleRow({
   onRunNow: () => void;
   onDelete: () => void;
 }) {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'use_network_tools'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "use_network_tools"),
+    "Requires write permission on wake schedules",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "use_network_tools"),
+    "Requires delete permission on wake schedules",
+  );
   // Live per-schedule target preview → "N hosts · M no-MAC".
   const previewQ = useQuery({
     queryKey: ["wol-schedule-preview", schedule.id],
@@ -715,6 +735,7 @@ function ScheduleRow({
             "relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50",
             schedule.enabled ? "bg-primary" : "bg-muted-foreground/30",
           )}
+          {...writeGate}
         >
           <span
             className={cn(
@@ -726,13 +747,18 @@ function ScheduleRow({
       </td>
       <td className="px-3 py-2">
         <div className="flex shrink-0 items-center justify-end gap-1">
-          <IconBtn title="Run now" onClick={onRunNow}>
+          <IconBtn title="Run now" onClick={onRunNow} {...writeGate}>
             <Play className="h-4 w-4" />
           </IconBtn>
-          <IconBtn title="Edit" onClick={onEdit}>
+          <IconBtn title="Edit" onClick={onEdit} {...writeGate}>
             <Pencil className="h-4 w-4" />
           </IconBtn>
-          <IconBtn title="Delete" tone="destructive" onClick={onDelete}>
+          <IconBtn
+            title="Delete"
+            tone="destructive"
+            onClick={onDelete}
+            {...deleteGate}
+          >
             <Trash2 className="h-4 w-4" />
           </IconBtn>
         </div>
@@ -745,23 +771,27 @@ function IconBtn({
   title,
   tone = "default",
   onClick,
+  disabled,
   children,
 }: {
   title: string;
   tone?: "default" | "destructive";
   onClick: () => void;
+  /** #1341 — set (with the reason as ``title``) when the caller may not. */
+  disabled?: boolean;
   children: ReactNode;
 }) {
   return (
     <button
       type="button"
       title={title}
+      disabled={disabled}
       onClick={(e) => {
         e.stopPropagation();
         onClick();
       }}
       className={cn(
-        "rounded p-1.5 hover:bg-muted",
+        "rounded p-1.5 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50",
         tone === "destructive"
           ? "text-muted-foreground hover:text-destructive"
           : "text-muted-foreground hover:text-foreground",
@@ -814,6 +844,17 @@ function ScheduleDetailModal({
   onToggle: () => void;
   onDelete: () => void;
 }) {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'use_network_tools'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "use_network_tools"),
+    "Requires write permission on wake schedules",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "use_network_tools"),
+    "Requires delete permission on wake schedules",
+  );
   // Same query key the row uses, so it's already warm — no extra fetch.
   const previewQ = useQuery({
     queryKey: ["wol-schedule-preview", schedule.id],
@@ -860,10 +901,20 @@ function ScheduleDetailModal({
 
         {/* Actions — mirror the row buttons, now with labels. */}
         <div className="flex flex-wrap items-center gap-2 border-b pb-3">
-          <button type="button" className={actionBtn} onClick={onRunNow}>
+          <button
+            type="button"
+            className={actionBtn}
+            onClick={onRunNow}
+            {...writeGate}
+          >
             <Play className="h-3.5 w-3.5" /> Run now
           </button>
-          <button type="button" className={actionBtn} onClick={onEdit}>
+          <button
+            type="button"
+            className={actionBtn}
+            onClick={onEdit}
+            {...writeGate}
+          >
             <Pencil className="h-3.5 w-3.5" /> Edit
           </button>
           <button
@@ -871,6 +922,7 @@ function ScheduleDetailModal({
             className={actionBtn}
             onClick={onToggle}
             disabled={busyToggle}
+            {...writeGate}
           >
             <Power className="h-3.5 w-3.5" />{" "}
             {schedule.enabled ? "Disable" : "Enable"}
@@ -882,6 +934,7 @@ function ScheduleDetailModal({
               "border-destructive/40 text-destructive hover:bg-destructive/10",
             )}
             onClick={onDelete}
+            {...deleteGate}
           >
             <Trash2 className="h-3.5 w-3.5" /> Delete
           </button>
@@ -1247,6 +1300,13 @@ function CalendarKindChip({ kind }: { kind: WolCalendarKind }) {
 }
 
 function CalendarsTab() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'use_network_tools'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "use_network_tools"),
+    "Requires write permission on calendars",
+  );
   const qc = useQueryClient();
   const calendarsQ = useQuery({
     queryKey: ["wol-calendars"],
@@ -1316,6 +1376,7 @@ function CalendarsTab() {
             variant="primary"
             icon={Plus}
             onClick={() => setEditing({ mode: "create" })}
+            {...writeGate}
           >
             New calendar
           </HeaderButton>
@@ -1427,6 +1488,17 @@ function CalendarRow({
   onEdit: () => void;
   onDelete: () => void;
 }) {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'use_network_tools'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "use_network_tools"),
+    "Requires write permission on calendars",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "use_network_tools"),
+    "Requires delete permission on calendars",
+  );
   return (
     <tr className="border-b last:border-0 align-top">
       <td className="px-3 py-2">
@@ -1474,17 +1546,22 @@ function CalendarRow({
       </td>
       <td className="px-3 py-2">
         <div className="flex shrink-0 items-center justify-end gap-1">
-          <IconBtn title="Sync now" onClick={onSync}>
+          <IconBtn title="Sync now" onClick={onSync} {...writeGate}>
             {syncing ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : (
               <RefreshCw className="h-4 w-4" />
             )}
           </IconBtn>
-          <IconBtn title="Edit" onClick={onEdit}>
+          <IconBtn title="Edit" onClick={onEdit} {...writeGate}>
             <Pencil className="h-4 w-4" />
           </IconBtn>
-          <IconBtn title="Delete" tone="destructive" onClick={onDelete}>
+          <IconBtn
+            title="Delete"
+            tone="destructive"
+            onClick={onDelete}
+            {...deleteGate}
+          >
             <Trash2 className="h-4 w-4" />
           </IconBtn>
         </div>

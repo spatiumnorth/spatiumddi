@@ -56,6 +56,7 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -83,6 +84,13 @@ type Selection =
   | null;
 
 export function VLANsPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'vlan'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "vlan"),
+    "Requires write permission on VLANs",
+  );
   const qc = useQueryClient();
   const [selection, setSelection] = useState<Selection>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -134,7 +142,8 @@ export function VLANsPage() {
             <button
               onClick={() => setShowCreateRouter(true)}
               title="New Router"
-              className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              {...writeGate}
             >
               <Plus className="h-4 w-4" />
             </button>
@@ -292,6 +301,17 @@ function RouterDetail({
   onSelectVlan: (vlanId: string, routerId: string) => void;
   onDeleted: () => void;
 }) {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'vlan'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "vlan"),
+    "Requires write permission on VLANs",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "vlan"),
+    "Requires delete permission on VLANs",
+  );
   const qc = useQueryClient();
   const [showEdit, setShowEdit] = useState(false);
   const [showCreateVlan, setShowCreateVlan] = useState(false);
@@ -349,7 +369,11 @@ function RouterDetail({
           <h1 className="text-lg font-semibold">{router.name}</h1>
         </div>
         <div className="flex items-center gap-2">
-          <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
+          <HeaderButton
+            icon={Pencil}
+            onClick={() => setShowEdit(true)}
+            {...writeGate}
+          >
             Edit
           </HeaderButton>
           <HeaderButton
@@ -360,6 +384,7 @@ function RouterDetail({
               setDeleteError(null);
               setDeleteStep(1);
             }}
+            {...deleteGate}
           >
             Delete
           </HeaderButton>
@@ -367,6 +392,7 @@ function RouterDetail({
             variant="primary"
             icon={Plus}
             onClick={() => setShowCreateVlan(true)}
+            {...writeGate}
           >
             New VLAN
           </HeaderButton>
@@ -587,6 +613,17 @@ function VLANDetail({
   routerId: string;
   onDeleted: () => void;
 }) {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'vlan'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "vlan"),
+    "Requires write permission on VLANs",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "vlan"),
+    "Requires delete permission on VLANs",
+  );
   const qc = useQueryClient();
   const [showEdit, setShowEdit] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -635,13 +672,18 @@ function VLANDetail({
           </h1>
         </div>
         <div className="flex items-center gap-2">
-          <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
+          <HeaderButton
+            icon={Pencil}
+            onClick={() => setShowEdit(true)}
+            {...writeGate}
+          >
             Edit
           </HeaderButton>
           <HeaderButton
             variant="destructive"
             icon={Trash2}
             onClick={() => setConfirmDelete(true)}
+            {...deleteGate}
           >
             Delete
           </HeaderButton>
