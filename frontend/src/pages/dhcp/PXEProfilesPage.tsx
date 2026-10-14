@@ -25,13 +25,20 @@ import {
   type PXEProfileUpdate,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
+// #1861 — PXE profiles ride on ``dhcp_scope`` (pxe_profiles.py): writes take
+// write and a delete takes delete. A read-only user is offered none of them.
+const NEEDS_PXE_WRITE = "Requires write permission on DHCP scopes";
+const NEEDS_PXE_DELETE = "Requires delete permission on DHCP scopes";
+
 export function PXEProfilesPage() {
   const { groupId = "" } = useParams<{ groupId: string }>();
   const qc = useQueryClient();
+  const perms = usePermissions();
   const [editing, setEditing] = useState<PXEProfile | null>(null);
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<PXEProfile | null>(null);
@@ -77,7 +84,11 @@ export function PXEProfilesPage() {
           </div>
           <button
             onClick={() => setCreating(true)}
-            className="inline-flex flex-shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="inline-flex flex-shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...permissionGate(
+              perms.can("write", "dhcp_scope"),
+              NEEDS_PXE_WRITE,
+            )}
           >
             <Plus className="h-3.5 w-3.5" />
             New profile
@@ -172,6 +183,7 @@ function ProfileCard({
   onEdit: () => void;
   onDelete: () => void;
 }) {
+  const perms = usePermissions();
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex items-center justify-between border-b px-4 py-2">
@@ -190,15 +202,23 @@ function ProfileCard({
         <div className="flex gap-1">
           <button
             onClick={onEdit}
-            className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+            className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
             title="Edit"
+            {...permissionGate(
+              perms.can("write", "dhcp_scope"),
+              NEEDS_PXE_WRITE,
+            )}
           >
             <Pencil className="h-3.5 w-3.5" />
           </button>
           <button
             onClick={onDelete}
-            className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+            className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
             title="Delete"
+            {...permissionGate(
+              perms.can("delete", "dhcp_scope"),
+              NEEDS_PXE_DELETE,
+            )}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>

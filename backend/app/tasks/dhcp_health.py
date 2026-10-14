@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import DHCPServer
 from app.services.feature_modules import is_module_enabled
@@ -43,7 +44,9 @@ logger = structlog.get_logger(__name__)
 
 
 async def _check_health(server_id: uuid.UUID) -> None:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -128,7 +131,9 @@ def check_dhcp_server_health(self: object, server_id: str) -> None:  # type: ign
 
 
 async def _enqueue_all() -> None:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:

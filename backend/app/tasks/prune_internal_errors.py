@@ -25,6 +25,7 @@ import structlog
 from sqlalchemy import delete
 
 from app.celery_app import celery_app
+from app.config import settings
 from app.db import task_session
 from app.models.diagnostics import InternalError
 
@@ -35,7 +36,7 @@ UNACKED_RETENTION_DAYS = 90
 
 
 async def _sweep() -> dict[str, int]:
-    async with task_session() as db:
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         now = datetime.now(UTC)
         acked_cutoff = now - timedelta(days=ACKED_RETENTION_DAYS)
         unacked_cutoff = now - timedelta(days=UNACKED_RETENTION_DAYS)
