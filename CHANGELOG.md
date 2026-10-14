@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DHCP group change made through the Operator Copilot now moves the
+  appliance's Kea server too (#1902).** `assign_appliance_role` (and the MCP
+  `propose_assign_role` that proposes it) set the appliance's DHCP group
+  pointer alone, so the Kea row stayed in the old group and its agent kept
+  serving there: the DHCP half of #1565, reachable only through the
+  Copilot. It now makes the same move the Fleet roles save does, with the
+  same refusals (a Kea and Windows DHCP mix, v6 scopes for Windows), which
+  preview reports and apply enforces before anything changes. A proposal
+  that changes both the DNS and the DHCP group moves both servers in one
+  transaction: a refusal of either applies neither, and the preview names
+  both refusals. The apply now also wakes the appliance's supervisor, as the
+  Fleet save does, instead of leaving the change to the next heartbeat.
+
 - **`seed_demo.py` seeds its IPAM templates (#1465).** Both templates
   sent `ddns_hostname_policy: leave_unchanged`, a value the API has never
   accepted, so each POST answered 422 and the run still ended with

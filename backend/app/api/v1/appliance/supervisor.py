@@ -4122,23 +4122,6 @@ _DNS_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium"}
 # Copilot's ``assign_appliance_role`` (#1856).
 
 
-async def _appliance_own_dhcp_servers(db: DB, appliance: Appliance) -> list[Any]:
-    """The appliance's agent-based (kea) dhcp_server rows (#1715); same
-    matching rules as ``_appliance_own_dns_servers``. ``dhcp_server.name``
-    is globally unique and kea is the only agent engine, so there is no
-    stale-engine row to retire on this side."""
-    from app.models.dhcp import DHCPServer  # noqa: PLC0415
-
-    if "dhcp" not in (appliance.assigned_roles or []):
-        return []
-    own = await _own_server_condition(db, appliance, DHCPServer)
-    return list(
-        (await db.execute(select(DHCPServer).where(own, DHCPServer.driver == "kea")))
-        .scalars()
-        .all()
-    )
-
-
 class ApplianceRolesUpdate(BaseModel):
     """Operator-driven role + group + tag assignment payload.
 
@@ -4375,45 +4358,12 @@ async def update_appliance_roles(
             if problem is not None:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
             # #1565 — likewise the appliance's DHCP server(s), with the checks
-            # the DHCP server PUT applies to a group change.
-            from app.api.v1.dhcp.servers import (
-                _assert_driver_mix_allowed,
-                _assert_no_v6_scopes_for_windows,
-            )
-            from app.core.agent_wake import collect_wake, dhcp_group_channel, dhcp_server_channel
+            # the DHCP server PUT applies to a group change (shared with the
+            # Copilot's assign_appliance_role, #1902).
+            from app.services.appliance.dhcp_group_move import move_appliance_dhcp_servers
 
-            for dserver in await _appliance_own_dhcp_servers(db, row):
-                if dserver.server_group_id == dhcp_group.id:
-                    continue
-                await _assert_driver_mix_allowed(
-                    db, dhcp_group.id, dserver.driver, exclude_server_id=dserver.id
-                )
-                await _assert_no_v6_scopes_for_windows(db, dhcp_group.id, dserver.driver)
-                old_gid = dserver.server_group_id
-                dserver.server_group_id = dhcp_group.id
-                collect_wake(dhcp_server_channel(dserver.id))
-                for gid in (old_gid, dhcp_group.id):
-                    if gid is not None:
-                        collect_wake(dhcp_group_channel(gid))
-                moved_servers.append({"dhcp_server": str(dserver.id), "name": dserver.name})
-                db.add(
-                    AuditLog(
-                        user_id=current_user.id,
-                        user_display_name=current_user.display_name,
-                        auth_source=current_user.auth_source,
-                        action="update",
-                        resource_type="dhcp_server",
-                        resource_id=str(dserver.id),
-                        resource_display=dserver.name,
-                        changed_fields=["server_group_id"],
-                        old_value={"server_group_id": str(old_gid) if old_gid else None},
-                        new_value={
-                            "server_group_id": str(dhcp_group.id),
-                            "via_appliance_id": str(row.id),
-                        },
-                        result="success",
-                    )
-                )
+            dhcp_move = await move_appliance_dhcp_servers(db, row, dhcp_group, current_user)
+            moved_servers.extend(dhcp_move.moved)
             row.assigned_dhcp_group_id = dhcp_group.id
 
     if body.tags is not None:
