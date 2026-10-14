@@ -3476,7 +3476,8 @@ function MoveZoneModal({
       preview.dnssec_unsupported_drivers.length > 0 ||
       preview.acl_names_lost.length > 0 ||
       preview.key_names_lost.length > 0 ||
-      !!preview.technitium_api_refusal);
+      !!preview.technitium_api_refusal ||
+      !!preview.tsig_algorithm_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -3535,6 +3536,11 @@ function MoveZoneModal({
             {preview.technitium_api_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.technitium_api_refusal}
+              </div>
+            )}
+            {preview.tsig_algorithm_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.tsig_algorithm_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
