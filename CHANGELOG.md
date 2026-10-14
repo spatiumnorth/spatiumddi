@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Roles API accepted every action but `approve`, so a cloned Change
+  Approver could not be saved (#1631).** The validator allow-listed `read`, The time-bound grant dialog (Groups → temporary access) now offers the same actions and resource types as the role editor, from one shared list, so a temporary `approve` on `change_request` can be granted from the page too.
+  `write`, `delete`, `admin` and `*`, while the builtin Change Approver role
+  (and every approval check) uses `approve` on `change_request`; saving a
+  clone 422d. `approve` is now accepted by the Roles and time-bound-grant
+  APIs, and the role editor offers it along with the `change_request`
+  resource type, so a custom approver role can be built there rather than
+  only cloned. A test pins the allow-list against every action the builtin
+  roles and permission checks use.
+
 - **A list a scoped user may not read says so instead of showing as
   empty (#1865).** Audit Log, Conformity, VRFs, Requests, the
   integration pages (Kubernetes, Docker, Proxmox, Tailscale, UniFi,

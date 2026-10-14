@@ -6,57 +6,18 @@ import { Modal } from "@/components/ui/modal";
 import { StepUpSection } from "@/components/StepUpSection";
 import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
+import {
+  GRANT_ACTIONS,
+  GRANT_RESOURCE_TYPES,
+} from "@/lib/permissionVocabulary";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
-// Static action vocabulary (docs/PERMISSIONS.md → Actions). 'admin'
-// implies read/write/delete on the type.
-const ACTIONS = ["read", "write", "delete", "admin", "*"] as const;
-
-// Static resource_type vocabulary mirrored from docs/PERMISSIONS.md.
-// No server enumeration endpoint by design — keep this list in sync
-// with the spec table when new resource_types land.
-const RESOURCE_TYPES: string[] = [
-  "*",
-  "ip_space",
-  "ip_block",
-  "subnet",
-  "ip_address",
-  "address_set",
-  "vlan",
-  "vrf",
-  "asn",
-  "domain",
-  "dns_zone",
-  "dns_record",
-  "dns_group",
-  "dns_blocklist",
-  "dhcp_server",
-  "dhcp_scope",
-  "dhcp_pool",
-  "dhcp_static",
-  "dhcp_client_class",
-  "audit_log",
-  "user",
-  "group",
-  "role",
-  "auth_provider",
-  "custom_field",
-  "manage_ipam_templates",
-  "settings",
-  "api_token",
-  "acme_account",
-  "customer",
-  "site",
-  "provider",
-  "circuit",
-  "network_service",
-  "overlay_network",
-  "routing_policy",
-  "application_category",
-  "conformity",
-];
+// The same vocabulary the role editor offers (lib/permissionVocabulary), so a
+// grant the role editor can make can also be made temporary (#1631).
+const ACTIONS = GRANT_ACTIONS;
+const RESOURCE_TYPES: readonly string[] = GRANT_RESOURCE_TYPES;
 
 function Field({
   label,
