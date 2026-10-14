@@ -13,10 +13,12 @@ two-person approval workflow (covered by ``test_approval_workflows.py``):
   router's coarse gate via a scoped ``{delete, address_set, <id>}`` grant
   (#103) must be able to soft-delete inline WITHOUT the factored ``apply()``
   403/500-ing on a permission re-check it shouldn't run.
-* **#8 — approve-path superadmin parity.** ``delete_zone`` / ``delete_scope``
-  / ``delete_group`` were fully ``SuperAdmin``-gated at the route, so their
-  ``apply()`` must require superadmin ALWAYS — the approve path (which
-  bypasses the route's dependency) relies on this.
+* **#8 — approve-path superadmin parity.** ``apply()`` must require
+  superadmin exactly where the route does — the approve path (which
+  bypasses the route's dependency) relies on this. ``delete_group`` is still
+  fully ``SuperAdmin``-gated, so its ``apply()`` requires superadmin ALWAYS;
+  ``delete_zone`` / ``delete_scope`` take the resource's ``delete`` since
+  #1861, so theirs require superadmin on the ``permanent`` branch only.
 * **#5 — fail-closed on a deleted requester.** When ``requested_by_user_id``
   is NULL (requester deleted), approval is REFUSED (409), not fail-open.
 * **#4 — non-gateable policy rejected.** Creating an approval policy with an
@@ -181,48 +183,52 @@ async def test_scoped_delegate_inline_delete_no_500(
     assert subnet.deleted_at is None
 
 
-# ── #8: apply() requires superadmin ALWAYS for zone / scope / group ────────────
+# ── #8: apply() requires superadmin where the route does ───────────────────────
 
 
 @pytest.mark.asyncio
-async def test_delete_zone_apply_requires_superadmin(db_session: AsyncSession) -> None:
-    """delete_zone.apply() raises 403 for a non-superadmin — the route was
-    fully SuperAdmin-gated, so the approve path (which bypasses the route's
-    SuperAdmin dependency) must enforce it inside apply() (#8). The superadmin
-    check runs before the zone lookup, so random ids suffice."""
+@pytest.mark.parametrize("permanent,status", [(True, 403), (False, 404)])
+async def test_delete_zone_apply_requires_superadmin_only_when_permanent(
+    db_session: AsyncSession, permanent: bool, status: int
+) -> None:
+    """delete_zone.apply() refuses a non-superadmin the permanent branch (#8),
+    checked before the zone lookup; the default soft-delete takes ``delete``
+    on ``dns_zone`` since #1861, so it reaches the lookup and 404s on a
+    random id instead."""
     from fastapi import HTTPException
 
     from app.services.ai.operations_risky import DeleteZoneArgs, _apply_delete_zone
 
     nonadmin, _ = await _user(
         db_session,
-        name="zone-editor",
+        name=f"zone-editor-{permanent}",
         permissions=[{"action": "delete", "resource_type": "dns_zone"}],
     )
-    args = DeleteZoneArgs(group_id=uuid.uuid4(), zone_id=uuid.uuid4(), permanent=False)
+    args = DeleteZoneArgs(group_id=uuid.uuid4(), zone_id=uuid.uuid4(), permanent=permanent)
     with pytest.raises(HTTPException) as ei:
         await _apply_delete_zone(db_session, nonadmin, args)
-    assert ei.value.status_code == 403
+    assert ei.value.status_code == status
 
 
 @pytest.mark.asyncio
-async def test_delete_scope_apply_requires_superadmin(db_session: AsyncSession) -> None:
-    """delete_scope.apply() requires superadmin always (#8)."""
+@pytest.mark.parametrize("permanent,status", [(True, 403), (False, 404)])
+async def test_delete_scope_apply_requires_superadmin_only_when_permanent(
+    db_session: AsyncSession, permanent: bool, status: int
+) -> None:
+    """delete_scope.apply(): superadmin on the permanent branch only (#8, #1861)."""
     from fastapi import HTTPException
 
     from app.services.ai.operations_risky import DeleteScopeArgs, _apply_delete_scope
 
     nonadmin, _ = await _user(
         db_session,
-        name="scope-editor",
+        name=f"scope-editor-{permanent}",
         permissions=[{"action": "delete", "resource_type": "dhcp_scope"}],
     )
-    # Missing scope would 404 — but superadmin is checked first, so a
-    # non-superadmin gets 403 before the lookup.
-    args = DeleteScopeArgs(scope_id=uuid.uuid4(), permanent=False)
+    args = DeleteScopeArgs(scope_id=uuid.uuid4(), permanent=permanent)
     with pytest.raises(HTTPException) as ei:
         await _apply_delete_scope(db_session, nonadmin, args)
-    assert ei.value.status_code == 403
+    assert ei.value.status_code == status
 
 
 @pytest.mark.asyncio
