@@ -217,6 +217,12 @@ exports (TIA Portal, Studio 5000). Rows key on IP address, and an address that
 does not already exist in IPAM is reported as a **row error rather than
 created** — this importer enriches inventory, it does not invent it.
 
+Both this importer and the DICOM one below read the text through one shared
+CSV reader (`app/services/csv_text.py`): `\n`, `\r\n` and a bare `\r` (classic
+Mac line endings) are all accepted, and text the csv module cannot read (a cell
+over its field size limit, say) is a 422 that gives the reason rather than a
+500 (#1370, #1711).
+
 ---
 
 ## DICOM — medical imaging (#723)

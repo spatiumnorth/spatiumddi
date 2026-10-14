@@ -65,7 +65,11 @@ import { CreateClientClassModal } from "./CreateClientClassModal";
 import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
 import { CreateStaticAssignmentModal } from "./CreateStaticAssignmentModal";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
-import { usePermissions } from "@/hooks/usePermissions";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { MacBlocksTab } from "./MacBlocksTab";
 import { DevicePoliciesTab } from "./DevicePoliciesTab";
 import { PhoneProfilesTab } from "./PhoneProfilesTab";
@@ -85,6 +89,25 @@ import {
   CHANGE_REQUEST_QUERY_KEY,
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
+
+// #1861 — the DHCP data surfaces (scopes, statics, client classes, option
+// templates) gate each control on the route's own resource permission; the
+// server, server-group and failover controls stay superadmin-only.
+const DHCP_LABELS: Record<string, string> = {
+  dhcp_scope: "DHCP scopes",
+  dhcp_static: "DHCP static assignments",
+  dhcp_client_class: "DHCP client classes",
+  dhcp_option_template: "DHCP option templates",
+};
+
+function useDhcpGate() {
+  const perms = usePermissions();
+  return (action: "write" | "delete", resourceType: string) =>
+    permissionGate(
+      perms.can(action, resourceType),
+      `Requires ${action} permission on ${DHCP_LABELS[resourceType] ?? resourceType}`,
+    );
+}
 
 type Selection =
   | { type: "group"; group: DHCPServerGroup }
@@ -115,6 +138,12 @@ function GroupSidebar({
   onSelect: (s: Selection) => void;
   onCreateGroup: () => void;
 }) {
+  // #1339 — every DHCP server group, server and Kea-tab write takes a
+  // superadmin (the DHCP routers' handlers take SuperAdmin).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const [expanded, setExpanded] = useSessionState<Set<string>>(
     "spatium.dhcp.expandedGroups",
@@ -160,9 +189,10 @@ function GroupSidebar({
             <RefreshCw className="h-3.5 w-3.5" />
           </button>
           <button
-            className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent"
+            className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
             onClick={onCreateGroup}
             title="New group"
+            {...superadminGate}
           >
             <Plus className="h-3.5 w-3.5" />
           </button>
@@ -180,8 +210,9 @@ function GroupSidebar({
               No server groups yet.
             </p>
             <button
-              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs mx-auto hover:bg-accent"
+              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs mx-auto hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
               onClick={onCreateGroup}
+              {...superadminGate}
             >
               <Plus className="h-3 w-3" /> Create Group
             </button>
@@ -408,6 +439,12 @@ function GroupDetailView({
   onEditServer: (s: DHCPServer) => void;
   onDeleteServer: (s: DHCPServer) => void;
 }) {
+  // #1339 — every DHCP server group, server and Kea-tab write takes a
+  // superadmin (the DHCP routers' handlers take SuperAdmin).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const navigate = useNavigate();
   // Per-group tab persistence keyed on group id so navigating between
@@ -486,13 +523,14 @@ function GroupDetailView({
             >
               PXE Profiles
             </HeaderButton>
-            <HeaderButton icon={Pencil} onClick={onEdit}>
+            <HeaderButton icon={Pencil} onClick={onEdit} {...superadminGate}>
               Edit Group
             </HeaderButton>
             <HeaderButton
               variant="destructive"
               icon={Trash2}
               onClick={onDelete}
+              {...superadminGate}
             >
               Delete Group
             </HeaderButton>
@@ -618,6 +656,12 @@ function GroupDetailView({
 // known-but-external one (allowlists it so the rogue alert auto-resolves).
 function RespondersTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
+  // Acknowledging allowlists the source: a POST the router gates as
+  // write on dhcp_server (no SuperAdmin on the handler).
+  const ackGate = permissionGate(
+    usePermissions().can("write", "dhcp_server"),
+    "Requires write permission on DHCP servers",
+  );
   const { data: responders = [], isFetching } = useQuery({
     queryKey: ["dhcp-responders", groupId],
     queryFn: () => dhcpApi.listResponders(groupId),
@@ -696,7 +740,8 @@ function RespondersTab({ groupId }: { groupId: string }) {
                     <button
                       onClick={() => ack.mutate(r.id)}
                       disabled={ack.isPending}
-                      className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                      className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                      {...ackGate}
                     >
                       Acknowledge
                     </button>
@@ -717,6 +762,12 @@ function RespondersTab({ groupId }: { groupId: string }) {
 // that allowlists an expected router so the rogue_ra alert auto-resolves.
 function RouterAdvertisementsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
+  // Acknowledging allowlists the source: a POST the router gates as
+  // write on dhcp_server (no SuperAdmin on the handler).
+  const ackGate = permissionGate(
+    usePermissions().can("write", "dhcp_server"),
+    "Requires write permission on DHCP servers",
+  );
   const { data: preview } = useQuery({
     queryKey: ["ra-config", groupId],
     queryFn: () => dhcpApi.raConfigPreview(groupId),
@@ -868,7 +919,8 @@ function RouterAdvertisementsTab({ groupId }: { groupId: string }) {
                       <button
                         onClick={() => ack.mutate(r.id)}
                         disabled={ack.isPending}
-                        className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                        className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                        {...ackGate}
                       >
                         Acknowledge
                       </button>
@@ -926,6 +978,12 @@ function GroupServersList({
   onEditServer: (s: DHCPServer) => void;
   onDeleteServer: (s: DHCPServer) => void;
 }) {
+  // #1339 — every DHCP server group, server and Kea-tab write takes a
+  // superadmin (the DHCP routers' handlers take SuperAdmin).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const pauseMutId = useRef<string | null>(null);
   // Pause / resume mutations — shared instance for every row so the
@@ -980,6 +1038,20 @@ function GroupServersList({
         </div>
       )}
 
+      {resumeMut.isError && (
+        <div className="mb-3 flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <span>
+            Resume failed: {formatApiError(resumeMut.error, "request failed")}
+          </span>
+          <button
+            type="button"
+            onClick={() => resumeMut.reset()}
+            className="rounded border px-2 py-0.5 hover:bg-muted"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       <div className="flex items-center justify-between mb-4">
         <div>
           <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
@@ -991,8 +1063,9 @@ function GroupServersList({
           </p>
         </div>
         <button
-          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           onClick={onAddServer}
+          {...superadminGate}
         >
           <Plus className="h-3 w-3" /> Add Server
         </button>
@@ -1100,6 +1173,7 @@ function GroupServersList({
                       disabled={pauseInFlight}
                       className="inline-flex items-center gap-1 rounded border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-400"
                       title="Resume — exit maintenance mode"
+                      {...superadminGate}
                     >
                       <Play className="h-3 w-3" />
                       {pauseInFlight ? "…" : "Resume"}
@@ -1111,30 +1185,33 @@ function GroupServersList({
                         e.stopPropagation();
                         setPausePrompt(s);
                       }}
-                      className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-1.5 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                      className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-1.5 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
                       title="Pause — enter maintenance mode"
+                      {...superadminGate}
                     >
                       <Pause className="h-3 w-3" />
                       Pause
                     </button>
                   )}
                   <button
-                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                     onClick={(e) => {
                       e.stopPropagation();
                       onEditServer(s);
                     }}
                     title="Edit server"
+                    {...superadminGate}
                   >
                     <Pencil className="h-3.5 w-3.5" />
                   </button>
                   <button
-                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                    className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                     onClick={(e) => {
                       e.stopPropagation();
                       onDeleteServer(s);
                     }}
                     title="Delete server"
+                    {...superadminGate}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
@@ -1250,6 +1327,9 @@ function ScopeDeleteModal({
 
 function ServerScopesTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
+  // #1339, #1861 — scope create / edit take write and delete takes delete on
+  // ``dhcp_scope`` (scopes.py).
+  const dhcpGate = useDhcpGate();
   const [tagFilters, setTagFilters] = useState<string[]>([]);
   const { data: subnets = [] } = useQuery({
     queryKey: ["subnets"],
@@ -1333,6 +1413,7 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
               e.target.value = "";
             }}
             title="Pick the IPAM subnet you want this DHCP server to serve leases from."
+            {...dhcpGate("write", "dhcp_scope")}
           >
             <option value="">+ Serve leases on subnet…</option>
             {subnets
@@ -1443,13 +1524,15 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                             />
                             <button
                               onClick={() => setEditScope(sc)}
-                              className="rounded p-1 text-muted-foreground hover:text-foreground"
+                              className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                              {...dhcpGate("write", "dhcp_scope")}
                             >
                               <Pencil className="h-3.5 w-3.5" />
                             </button>
                             <button
                               onClick={() => setDelScope(sc)}
-                              className="rounded p-1 text-muted-foreground hover:text-destructive"
+                              className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
+                              {...dhcpGate("delete", "dhcp_scope")}
                             >
                               <Trash2 className="h-3.5 w-3.5" />
                             </button>
@@ -1460,12 +1543,16 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                     <ContextMenuContent>
                       <ContextMenuLabel>{sc.name}</ContextMenuLabel>
                       <ContextMenuSeparator />
-                      <ContextMenuItem onSelect={() => setEditScope(sc)}>
+                      <ContextMenuItem
+                        onSelect={() => setEditScope(sc)}
+                        {...dhcpGate("write", "dhcp_scope")}
+                      >
                         Edit Scope…
                       </ContextMenuItem>
                       <ContextMenuItem
                         destructive
                         onSelect={() => setDelScope(sc)}
+                        {...dhcpGate("delete", "dhcp_scope")}
                       >
                         Delete Scope…
                       </ContextMenuItem>
@@ -1678,9 +1765,10 @@ function ServerPoolsOrStaticsTab({
 
   // Static reservations are created/edited here (issue #472). Creation is
   // group-centric — the operator picks which scope the reservation lands in.
-  // Backend create/update/delete are superadmin-gated, so gate the UI too.
+  // Backend create / update take write and delete takes delete on
+  // ``dhcp_static`` (#1861), so gate the UI the same way.
   const qc = useQueryClient();
-  const { isSuperadmin } = usePermissions();
+  const perms = usePermissions();
   const [showCreate, setShowCreate] = useState(false);
   const [createScopeId, setCreateScopeId] = useState("");
   const [editStatic, setEditStatic] = useState<StaticRow | null>(null);
@@ -1701,7 +1789,10 @@ function ServerPoolsOrStaticsTab({
       setDelStatic(null);
     },
   });
-  const canManageStatics = kind === "statics" && isSuperadmin;
+  const canManageStatics =
+    kind === "statics" && perms.can("write", "dhcp_static");
+  const canDeleteStatics =
+    kind === "statics" && perms.can("delete", "dhcp_static");
 
   return (
     <div className="space-y-3">
@@ -1894,20 +1985,22 @@ function ServerPoolsOrStaticsTab({
                             Copy Hostname
                           </ContextMenuItem>
                         )}
+                        {(canManageStatics || canDeleteStatics) && (
+                          <ContextMenuSeparator />
+                        )}
                         {canManageStatics && (
-                          <>
-                            <ContextMenuSeparator />
-                            <ContextMenuItem
-                              onSelect={() => setEditStatic({ scope, item: s })}
-                            >
-                              Edit…
-                            </ContextMenuItem>
-                            <ContextMenuItem
-                              onSelect={() => setDelStatic({ scope, item: s })}
-                            >
-                              Delete…
-                            </ContextMenuItem>
-                          </>
+                          <ContextMenuItem
+                            onSelect={() => setEditStatic({ scope, item: s })}
+                          >
+                            Edit…
+                          </ContextMenuItem>
+                        )}
+                        {canDeleteStatics && (
+                          <ContextMenuItem
+                            onSelect={() => setDelStatic({ scope, item: s })}
+                          >
+                            Delete…
+                          </ContextMenuItem>
                         )}
                       </ContextMenuContent>
                     </ContextMenu>
@@ -1950,6 +2043,9 @@ function ServerPoolsOrStaticsTab({
 }
 
 function ClientClassesTab({ groupId }: { groupId: string }) {
+  // #1339, #1861 — each write takes the tab's own resource permission, with
+  // the HTTP method's action (``delete`` for a delete).
+  const dhcpGate = useDhcpGate();
   const qc = useQueryClient();
   const { data: classes = [] } = useQuery({
     queryKey: ["dhcp-client-classes", groupId],
@@ -1984,7 +2080,8 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
       <div className="flex justify-end">
         <button
           onClick={() => setShowCreate(true)}
-          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...dhcpGate("write", "dhcp_client_class")}
         >
           <Plus className="h-3 w-3" /> New Client Class
         </button>
@@ -2028,13 +2125,15 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
                     <td className="px-3 py-2 text-right">
                       <button
                         onClick={() => setEdit(c)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                        {...dhcpGate("write", "dhcp_client_class")}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDel(c)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                        {...dhcpGate("delete", "dhcp_client_class")}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -2074,6 +2173,9 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
 }
 
 function OptionTemplatesTab({ groupId }: { groupId: string }) {
+  // #1339, #1861 — each write takes the tab's own resource permission, with
+  // the HTTP method's action (``delete`` for a delete).
+  const dhcpGate = useDhcpGate();
   const qc = useQueryClient();
   const { data: templates = [] } = useQuery({
     queryKey: ["dhcp-option-templates", groupId],
@@ -2113,7 +2215,8 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
         </p>
         <button
           onClick={() => setShowCreate(true)}
-          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...dhcpGate("write", "dhcp_option_template")}
         >
           <Plus className="h-3 w-3" /> New Template
         </button>
@@ -2157,13 +2260,15 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
                     <td className="px-3 py-2 text-right">
                       <button
                         onClick={() => setEdit(t)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                        {...dhcpGate("write", "dhcp_option_template")}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDel(t)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                        {...dhcpGate("delete", "dhcp_option_template")}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -2739,6 +2844,12 @@ function ServerDetailView({
   onDelete: () => void;
   onSelectGroup?: (group: DHCPServerGroup) => void;
 }) {
+  // #1339 — every DHCP server group, server and Kea-tab write takes a
+  // superadmin (the DHCP routers' handlers take SuperAdmin).
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   // For Kea servers attached to a Kea-managed group, scopes / pools /
   // statics / classes / option templates / MAC blocks all live on the
@@ -2911,6 +3022,7 @@ function ServerDetailView({
                 onClick={() => approveMut.mutate()}
                 disabled={approveMut.isPending}
                 className="bg-emerald-600 text-white hover:bg-emerald-700"
+                {...superadminGate}
               >
                 Approve
               </HeaderButton>
@@ -2925,6 +3037,7 @@ function ServerDetailView({
                 }}
                 disabled={leaseSyncMut.isPending}
                 title="Poll this server for active leases and mirror them into DHCP + IPAM"
+                {...superadminGate}
               >
                 Sync Leases
               </HeaderButton>
@@ -2934,17 +3047,19 @@ function ServerDetailView({
                 iconClassName={syncMut.isPending ? "animate-spin" : ""}
                 onClick={() => syncMut.mutate(false)}
                 disabled={syncMut.isPending}
+                {...superadminGate}
               >
                 Force Sync
               </HeaderButton>
             )}
-            <HeaderButton icon={Pencil} onClick={onEdit}>
+            <HeaderButton icon={Pencil} onClick={onEdit} {...superadminGate}>
               Edit
             </HeaderButton>
             <HeaderButton
               variant="destructive"
               icon={Trash2}
               onClick={onDelete}
+              {...superadminGate}
             >
               Delete
             </HeaderButton>

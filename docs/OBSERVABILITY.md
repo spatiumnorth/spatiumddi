@@ -470,13 +470,21 @@ deliver JSON and ignore this setting.
 | Format | Use case |
 |---|---|
 | `rfc5424_json` | Default. Modern SIEMs (Splunk, Elastic, Graylog) auto-parse the JSON body after the RFC 5424 header. |
-| `rfc5424_cef` | ArcSight + many commercial SIEMs. `CEF:0\|SpatiumDDI\|SpatiumDDI\|1.0\|<rtype:action>\|<display>\|<sev>` header + `act=`/`suser=`/`cs1=…` extensions. CEF severity mapped as info=3, error=6, denied=9. |
+| `rfc5424_cef` | ArcSight + many commercial SIEMs. `CEF:0\|SpatiumDDI\|SpatiumDDI\|1.0\|<rtype:action>\|<display>\|<sev>` header + `act=`/`suser=`/`cs1=…` extensions. CEF severity mapped as info=3, error=6, denied=9 (a failed sign-in is 9). |
 | `rfc5424_leef` | IBM QRadar native format. LEEF 2.0 with `^` field delimiter (safer over UDP than the default tab). |
 | `rfc3164` | Legacy BSD syslog: `<PRI>Mmm dd HH:MM:SS host tag: <JSON>`. For collectors that don't speak RFC 5424. |
 | `json_lines` | Bare JSON per line — no syslog framing. For raw Logstash / Fluentd / Vector inputs. |
 
 **Severity mapping** (RFC 5424): `result="success"` → 6 info,
-`result="denied"` → 4 warn, `result="failed"` / `"error"` → 3 err.
+`result="denied"` / `"forbidden"` → 4 warn, `result="failed"` /
+`"failure"` / `"error"` → 3 err — except that a **failed sign-in**
+(`action="login"`, `result="failure"`: bad password, bad MFA code, locked
+or disabled account) ranks with `denied`, so 4 warn, CEF / LEEF 9, and it
+clears every `min_severity` threshold including `denied`. A sign-in the
+system could not *evaluate* (the LDAP / RADIUS / TACACS+ server timed out
+or errored) is audited `error` and stays 3 err. Before #1874, `failure`
+and `forbidden` both fell through to info, so a target filtered above
+info dropped every failed sign-in.
 Facility is per-target and configurable 0–23 (default 16 = local0).
 
 **Three payload shapes go through one delivery path**, and until #1031
@@ -731,9 +739,14 @@ inform, receive_drop, socket_drop)`. Retention is enforced by the
 
 Two of those DHCP columns are about packets *not* handled, and they do not
 come from the same place or mean the same thing (issue #980).
-`socket_drop` is the kernel's per-socket `sk_drops` from `/proc/net/udp`,
-read by the agent directly: packets discarded because Kea's receive buffer
-was full, so Kea never saw them and no counter it keeps can report them.
+`socket_drop` is the kernel's per-socket `sk_drops` on the sockets Kea
+serves from, read by the agent directly. Normally those are the DHCP-port
+UDP sockets in `/proc/net/udp`. With `dhcp-socket-type: raw`, kea-dhcp4
+serves from AF_PACKET sockets, relayed traffic included. Their drops are
+read through sock_diag, in place of its UDP :67 fallback, whose copies Kea
+discards (#1283). Either way, these are packets the kernel discarded because
+Kea's receive buffer was full. Kea never saw them, so no counter it keeps can
+report them.
 On a node short of CPU only this one moves, and it is the one the alert
 and the dashboard treat as loss.
 
@@ -744,7 +757,8 @@ increments it once per packet, and a `DROP` class is exactly what the shipped
 DHCP MAC blocklist renders. See [`DHCP.md` §4c](features/DHCP.md).
 
 **Both are nullable, and NULL means UNMEASURED.** An agent older than #980,
-or one whose runtime cannot read `/proc/net/udp`, reports no `socket_drop`.
+or one whose runtime cannot read `/proc/net/udp` (or, in raw mode, Kea's
+AF_PACKET sockets), reports no `socket_drop`.
 Readers must render that as unknown — a 0 would say "this server has dropped
 nothing", which is exactly the false reassurance #980 was filed about. The
 ingest endpoint therefore stores an omitted field as NULL rather than

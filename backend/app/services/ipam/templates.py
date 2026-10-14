@@ -92,15 +92,25 @@ def _is_empty(value: Any) -> bool:
     return False
 
 
+def _differs(current: Any, new: Any) -> bool:
+    """Whether stamping ``new`` over ``current`` changes the column. ``None``,
+    ``{}``, ``[]`` and ``""`` are all "empty" and count as the same value."""
+    if _is_empty(current) and _is_empty(new):
+        return False
+    return bool(current != new)
+
+
 def _stamp(target: Any, name: str, template_value: Any, *, force: bool) -> bool:
     """Stamp ``template_value`` onto ``target.{name}`` per apply policy.
 
-    Returns True if the column was written.
+    Returns True only if the column's value changed: writing the template's
+    own empty value over an empty column changes nothing, and listing it as
+    written would name columns the apply never touched (#1634).
     """
     current = getattr(target, name, None)
     if force or _is_empty(current):
         setattr(target, name, template_value)
-        return True
+        return _differs(current, template_value)
     return False
 
 
@@ -115,12 +125,12 @@ def _stamp_dns_group_ids(target: Any, dns_group_id: uuid.UUID | None, *, force: 
         # force. Otherwise leave whatever the operator already set.
         if force:
             target.dns_group_ids = []
-            return True
+            return _differs(current, [])
         return False
     new_value = [str(dns_group_id)]
     if force or _is_empty(current):
         target.dns_group_ids = new_value
-        return True
+        return _differs(current, new_value)
     return False
 
 
@@ -130,7 +140,7 @@ def _stamp_dhcp_group(target: Any, dhcp_group_id: uuid.UUID | None, *, force: bo
     current = getattr(target, "dhcp_server_group_id", None)
     if force or current is None:
         target.dhcp_server_group_id = dhcp_group_id
-        return True
+        return bool(current != dhcp_group_id)
     return False
 
 

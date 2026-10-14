@@ -18,6 +18,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerChip } from "@/components/ownership/pickers";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -339,6 +340,17 @@ function OverlayEditorModal({
 // ── Page ───────────────────────────────────────────────────────────
 
 export function OverlaysPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the overlay_network router asks write (delete) on 'overlay_network'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "overlay_network"),
+    "Requires write permission on overlay networks",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "overlay_network"),
+    "Requires delete permission on overlay networks",
+  );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<OverlayStatus | "">("");
@@ -440,6 +452,7 @@ export function OverlaysPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New overlay
             </HeaderButton>
@@ -515,6 +528,7 @@ export function OverlaysPage() {
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
               }}
+              {...deleteGate}
             >
               Delete selected
             </HeaderButton>
@@ -612,7 +626,8 @@ export function OverlaysPage() {
                       type="button"
                       title="Edit"
                       onClick={() => setEditing(o)}
-                      className="rounded p-1 hover:bg-muted"
+                      className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
@@ -627,7 +642,8 @@ export function OverlaysPage() {
                           onConfirm: () => removeOne.mutate(o.id),
                         });
                       }}
-                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

@@ -21,9 +21,6 @@ export function CreatePoolModal({
   const [classRestriction, setClassRestriction] = useState(
     pool?.class_restriction ?? "",
   );
-  const [leaseOverride, setLeaseOverride] = useState(
-    pool?.lease_time_override != null ? String(pool.lease_time_override) : "",
-  );
   // DHCPv6 prefix delegation (#368) — only offered on v6 scopes.
   const isV6 = scope.address_family === "ipv6";
   const isPd = poolType === "pd";
@@ -67,9 +64,11 @@ export function CreatePoolModal({
             end_ip: endIp,
             pool_type: poolType,
             class_restriction: classRestriction || null,
-            lease_time_override: leaseOverride
-              ? parseInt(leaseOverride, 10)
-              : null,
+            // Kea has no per-pool lease time (#1689): clear any stored
+            // override instead of offering one the server would refuse.
+            ...(pool?.lease_time_override != null
+              ? { lease_time_override: null }
+              : {}),
           };
       return editing
         ? dhcpApi.updatePool(scope.id, pool!.id, data)
@@ -166,16 +165,6 @@ export function CreatePoolModal({
                 />
               </Field>
             </>
-          )}
-          {!isPd && (
-            <Field label="Lease Time Override (sec)">
-              <input
-                type="number"
-                className={inputCls}
-                value={leaseOverride}
-                onChange={(e) => setLeaseOverride(e.target.value)}
-              />
-            </Field>
           )}
           <Field label="Restrict to Client Class">
             <select

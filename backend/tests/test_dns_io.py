@@ -151,3 +151,107 @@ def test_write_zone_file_round_trip() -> None:
     assert ("www", "A", "192.0.2.10") in values
     assert any(r.record_type == "SRV" and r.priority == 10 for r in reparsed.records)
     assert any(r.record_type == "MX" and r.priority == 10 for r in reparsed.records)
+
+
+_TTL_ZONE = """\
+$ORIGIN example.com.
+$TTL 3600
+@\tIN\tSOA\tns1.example.com. hostmaster.example.com. ( 1 2 3 4 5 )
+"""
+
+
+def test_diff_meta_only_update_keeps_inherited_ttl() -> None:
+    """#1727: an SRV/MX change alone does not pin the TTL a row inherits."""
+    parsed = parse_zone_file(
+        _TTL_ZONE
+        + "_sip._tcp\tIN\tSRV\t20 70 5061 sip.example.com.\n"
+        + "@\tIN\tMX\t5 mail.example.com.\n",
+        "example.com",
+    )
+    existing = [
+        FakeRecord(
+            id="1",
+            name="_sip._tcp",
+            record_type="SRV",
+            value="sip.example.com.",
+            ttl=None,
+            priority=10,
+            weight=60,
+            port=5060,
+        ),
+        FakeRecord(
+            id="2", name="@", record_type="MX", value="mail.example.com.", ttl=None, priority=10
+        ),
+    ]
+
+    diff = diff_records(parsed.records, existing, zone_default_ttl=3600)  # type: ignore[arg-type]
+
+    by_id = {c.existing_id: c for c in diff.to_update}
+    assert set(by_id) == {"1", "2"}
+    assert (by_id["1"].priority, by_id["1"].weight, by_id["1"].port) == (20, 70, 5061)
+    assert by_id["1"].ttl is None
+    assert by_id["2"].priority == 5
+    assert by_id["2"].ttl is None
+
+
+def test_diff_inherited_row_with_a_different_file_ttl_updates() -> None:
+    parsed = parse_zone_file(_TTL_ZONE + "www\t120\tIN\tA\t192.0.2.1\n", "example.com")
+    existing = [FakeRecord(id="1", name="www", record_type="A", value="192.0.2.1", ttl=None)]
+
+    diff = diff_records(parsed.records, existing, zone_default_ttl=3600)  # type: ignore[arg-type]
+
+    assert [(c.existing_id, c.ttl) for c in diff.to_update] == [("1", 120)]
+
+
+def test_diff_mixed_ttl_rrset_round_trips_unchanged() -> None:
+    """#1727: an RRset whose members carry different TTLs parses back at the
+    lowest of them. Neither the inherited member nor the explicit higher one
+    may be rewritten to that minimum by a round trip of the zone's own export.
+    """
+
+    @dataclass
+    class FakeZone:
+        name: str = "example.com."
+        primary_ns: str = "ns1.example.com."
+        admin_email: str = "hostmaster.example.com."
+        ttl: int = 3600
+        refresh: int = 86400
+        retry: int = 7200
+        expire: int = 3600000
+        minimum: int = 3600
+        last_serial: int = 1
+
+    existing = [
+        FakeRecord(id="1", name="www", record_type="A", value="192.0.2.1", ttl=None),
+        FakeRecord(id="2", name="www", record_type="A", value="192.0.2.2", ttl=300),
+        FakeRecord(id="3", name="big", record_type="A", value="192.0.2.3", ttl=7200),
+        FakeRecord(id="4", name="big", record_type="A", value="192.0.2.4", ttl=None),
+    ]
+    text = write_zone_file(FakeZone(), existing)  # type: ignore[arg-type]
+    parsed = parse_zone_file(text, "example.com")
+    # The premise: the parser collapses each RRset to its lowest TTL.
+    assert {r.ttl for r in parsed.records if r.name == "www"} == {300}
+    assert {r.ttl for r in parsed.records if r.name == "big"} == {3600}
+
+    diff = diff_records(parsed.records, existing, zone_default_ttl=3600)  # type: ignore[arg-type]
+
+    assert diff.to_update == []
+    assert diff.to_create == []
+    assert diff.to_delete == []
+    assert len(diff.unchanged) == 4
+
+
+def test_diff_mixed_ttl_rrset_explicit_change_still_updates() -> None:
+    # The file lowers the whole RRset below its existing minimum: every member
+    # that does not already carry that TTL is an update.
+    parsed = parse_zone_file(
+        _TTL_ZONE + "www\t60\tIN\tA\t192.0.2.1\nwww\t60\tIN\tA\t192.0.2.2\n", "example.com"
+    )
+    existing = [
+        FakeRecord(id="1", name="www", record_type="A", value="192.0.2.1", ttl=None),
+        FakeRecord(id="2", name="www", record_type="A", value="192.0.2.2", ttl=300),
+    ]
+
+    diff = diff_records(parsed.records, existing, zone_default_ttl=3600)  # type: ignore[arg-type]
+
+    assert sorted((c.existing_id, c.ttl) for c in diff.to_update) == [("1", 60), ("2", 60)]

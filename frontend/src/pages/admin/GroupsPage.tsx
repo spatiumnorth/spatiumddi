@@ -16,6 +16,7 @@ import { Modal } from "@/components/ui/modal";
 import { StepUpSection } from "@/components/StepUpSection";
 import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { TimeBoundGrantsPanel } from "./TimeBoundGrantsPanel";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -309,6 +310,13 @@ function DeleteModal({
 }
 
 export function GroupsPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks admin on 'group'.
+  const perms = usePermissions();
+  const adminGate = permissionGate(
+    perms.can("admin", "group"),
+    "Requires admin permission on groups",
+  );
   const [showCreate, setShowCreate] = useState(false);
   const [editGroup, setEditGroup] = useState<InternalGroup | null>(null);
   const [deleteGroup, setDeleteGroup] = useState<InternalGroup | null>(null);
@@ -348,7 +356,8 @@ export function GroupsPage() {
           </div>
           <button
             onClick={() => setShowCreate(true)}
-            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...adminGate}
           >
             <Plus className="h-3.5 w-3.5" />
             New Group
@@ -415,15 +424,17 @@ export function GroupsPage() {
                     <div className="flex items-center justify-end gap-1">
                       <button
                         onClick={() => setEditGroup(group)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Edit"
+                        {...adminGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDeleteGroup(group)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         title="Delete"
+                        {...adminGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>

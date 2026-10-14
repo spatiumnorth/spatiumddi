@@ -22,6 +22,7 @@ import {
   fmtDateTime,
   tlsStateCls,
 } from "@/lib/tls-cert-state";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -437,6 +438,13 @@ function CertDetailModal({
   onClose: () => void;
   onEdit: () => void;
 }) {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'tls_cert'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "tls_cert"),
+    "Requires write permission on certificate targets",
+  );
   const qc = useQueryClient();
   const [showPem, setShowPem] = useState(false);
   // CT log is an off-prem call (leaks the hostname to crt.sh) — opt-in,
@@ -715,6 +723,7 @@ function CertDetailModal({
           disabled={probe.isPending}
           onClick={() => probe.mutate()}
           className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+          {...writeGate}
         >
           <RefreshCw
             className={cn("h-3.5 w-3.5", probe.isPending && "animate-spin")}
@@ -724,7 +733,8 @@ function CertDetailModal({
         <button
           type="button"
           onClick={onEdit}
-          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+          {...writeGate}
         >
           Edit
         </button>
@@ -743,6 +753,17 @@ function CertDetailModal({
 // ── Page ──────────────────────────────────────────────────────────────
 
 export function CertificatesPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'tls_cert'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "tls_cert"),
+    "Requires write permission on certificate targets",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "tls_cert"),
+    "Requires delete permission on certificate targets",
+  );
   const qc = useQueryClient();
   const { enabled, ready } = useFeatureModules();
   const moduleOn = enabled("security.tls_certs");
@@ -842,6 +863,7 @@ export function CertificatesPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New target
             </HeaderButton>
@@ -966,6 +988,7 @@ export function CertificatesPage() {
                       disabled={probeNow.isPending}
                       onClick={() => probeNow.mutate(t.id)}
                       className="ml-1 rounded p-1 hover:bg-muted disabled:opacity-50"
+                      {...writeGate}
                     >
                       <RefreshCw
                         className={cn(
@@ -980,7 +1003,8 @@ export function CertificatesPage() {
                       type="button"
                       title="Edit"
                       onClick={() => setEditing(t)}
-                      className="ml-1 rounded p-1 hover:bg-muted"
+                      className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
@@ -995,7 +1019,8 @@ export function CertificatesPage() {
                           onConfirm: () => removeOne.mutate(t.id),
                         });
                       }}
-                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

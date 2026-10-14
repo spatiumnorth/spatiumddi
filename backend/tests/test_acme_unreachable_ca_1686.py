@@ -98,18 +98,16 @@ async def _run_task(order_id: uuid.UUID) -> list[str | None]:
     """Run ``run_acme_order`` through every retry Celery makes, eagerly.
 
     The task calls ``asyncio.run()``, so it gets a thread with no running
-    loop. ``run_order``'s cleanup sessions come from a per-call engine here,
-    as the task's own session does, so no pooled connection outlives that
-    thread's event loop (app/db.py, "Per-task DB session for Celery").
+    loop. ``run_order``'s cleanup sessions come from a per-call engine, as
+    the task's own session does, so no pooled connection outlives that
+    thread's event loop (app/db.py, "Per-task DB session for Celery";
+    #1687 moved the cleanup off the shared engine).
     Returns the ``last_error`` each attempt saw on the order.
     """
     _UnreachableCA.watch = order_id
     _UnreachableCA.seen = []
     try:
-        with (
-            patch.object(orchestrator, "ACMEClient", _UnreachableCA),
-            patch.object(orchestrator, "AsyncSessionLocal", task_session),
-        ):
+        with patch.object(orchestrator, "ACMEClient", _UnreachableCA):
             await asyncio.to_thread(acme_tasks.run_acme_order.apply, args=[str(order_id)])
     finally:
         _UnreachableCA.watch = None
@@ -305,10 +303,7 @@ async def test_every_unreachable_ca_shape_ends_the_order_with_its_error(
 
     from app.services.acme_client import engine
 
-    with (
-        patch.object(engine.httpx, "AsyncClient", client_factory),
-        patch.object(orchestrator, "AsyncSessionLocal", task_session),
-    ):
+    with patch.object(engine.httpx, "AsyncClient", client_factory):
         await asyncio.to_thread(acme_tasks.run_acme_order.apply, args=[str(oid)])
 
     db_session.expire_all()

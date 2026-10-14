@@ -166,6 +166,35 @@ describe("DHCPSubnetPanel write controls (#1155)", () => {
     );
   });
 
+  it("offers the built-in DHCP Editor every write, which the server now accepts (#1861)", async () => {
+    // The role's grants: admin on every DHCP type. The scope and pool routes
+    // took SuperAdmin until #1861, so this role filled in New DHCP Scope and
+    // met "Superadmin required"; they now check the role's own grants.
+    await openPanel(
+      grants(
+        ["admin", "dhcp_server"],
+        ["admin", "dhcp_scope"],
+        ["admin", "dhcp_pool"],
+        ["admin", "dhcp_static"],
+        ["admin", "dhcp_client_class"],
+        ["admin", "dhcp_option_template"],
+        ["admin", "dhcp_mac_block"],
+      ),
+    );
+    await waitFor(() => expect(button(/Create Scope/).disabled).toBe(false));
+    for (const name of [
+      /Add Pool/,
+      "Edit scope",
+      "Delete scope",
+      "Edit pool",
+      "Delete pool",
+    ]) {
+      expect(button(name).disabled).toBe(false);
+    }
+    const toggle = screen.getByRole("checkbox", { name: /Enabled/ });
+    expect((toggle as HTMLInputElement).disabled).toBe(false);
+  });
+
   it("offers a superadmin everything", async () => {
     await openPanel({ is_superadmin: true, grants: [] } as MyPermissions);
     await waitFor(() => expect(button(/Create Scope/).disabled).toBe(false));

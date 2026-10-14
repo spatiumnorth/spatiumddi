@@ -325,7 +325,8 @@ DHCPPool
     -- excluded:  range exists in subnet but DHCP will NOT offer these IPs
     -- reserved:  range held for static assignments only (not auto-assigned)
   class_restriction: str (nullable)   -- Kea client class
-  lease_time_override: int (nullable) -- overrides scope lease_time for this pool
+  lease_time_override: int (nullable) -- NOT SUPPORTED (#1689): Kea has no per-pool lease time, so
+                                         a value is refused with a 422; null only (kept so an old row can be cleared)
   options_override: JSONB (nullable)  -- additional options for this pool only
 ```
 
@@ -890,7 +891,7 @@ Three counters, and only one of them moves:
 
 | Counter | What it means | Moves here? |
 |---|---|---|
-| per-socket `sk_drops` (`/proc/net/udp`) | the kernel found the receive buffer full and discarded the datagram | **yes** |
+| per-socket `sk_drops` of the sockets Kea serves from (`/proc/net/udp`; with `dhcp-socket-type: raw`, kea-dhcp4's AF_PACKET sockets, #1283) | the kernel found the receive buffer full and discarded the datagram | **yes** |
 | `pkt4-receive-drop` / `pkt6-receive-drop` | Kea read the packet and discarded it (unparseable, `DROP` class, no subnet) | no |
 | `pkt4-discover-received` vs `pkt4-offer-sent` | Kea answering what it read | always equal |
 
@@ -918,7 +919,8 @@ only past a number of packets).
 
 > **`NULL` is not zero, anywhere in this chain.** An agent older than #980,
 > or one whose runtime cannot read `/proc/net/udp`, reports no `socket_drop`
-> and the column stays NULL. That renders as *loss not measured*, the alert
+> and the column stays NULL. So does one that, in raw mode, cannot read
+> Kea's AF_PACKET sockets. That renders as *loss not measured*, the alert
 > skips the server rather than vouching for it, and nothing folds it to 0 —
 > a wall of green zeros from an un-upgraded fleet is precisely the false
 > reassurance this section exists to remove. Every "was this measured?" test
@@ -935,24 +937,51 @@ only past a number of packets).
 > whose floor is one packet. (A file that is *absent* is different, and is
 > a valid partial answer: no IPv6 stack means no v6 sockets to miss.)
 >
-> One real blind spot: the AF_PACKET socket Kea opens for
-> `dhcp-socket-type: raw` is not covered. `/proc/net/packet` carries no drop
-> column and its statistics can only be read by the process that owns the
-> socket. Relayed traffic is unicast and therefore arrives on the UDP
-> fallback socket, which is fully covered; directly-attached broadcast
-> traffic is not.
+> **In raw mode the DHCPv4 count comes from the AF_PACKET socket (#1283).**
+> With `dhcp-socket-type: raw` (`dhcp_socket_mode: direct`, the default),
+> Kea reads every DHCPv4 packet from an AF_PACKET socket, relayed unicast
+> included. The copy that lands on its UDP :67 socket is LPF's fallback,
+> which Kea drains and discards. So in raw mode the drops that cost a client
+> a retransmit are on the AF_PACKET socket, and the fallback's drops are
+> copies.
+>
+> In that mode the agent counts the AF_PACKET socket in place of UDP :67. In
+> `udp` mode (`dhcp_socket_mode: relay`) it counts the UDP sockets, as
+> before. DHCPv6 has no raw mode, so its :547 sockets always count. The
+> agent takes the mode from the config it rendered for Kea. An unreadable
+> config counts both kinds rather than guess.
+>
+> Measured under relayed bursts on kea-dhcp4 3.0.3 (AF_PACKET socket against
+> UDP :67):
+> - 261 against 126;
+> - 41 against 0;
+> - 505 against 300. Here the 505 were exactly the requests Kea never
+>   received.
+>
+> How the agent reads it:
+> - `/proc/net/packet` has no drop column, so the count comes through
+>   sock_diag, which needs no privilege.
+> - Kea's fd table is closed to the agent. So the agent counts the raw
+>   `ETH_P_ALL` sockets owned by the pod's user that it does not hold itself.
+> - Another program's raw socket under the same numeric uid is counted too.
+>   On the appliance that is the host's lldpd, whose BPF filter keeps DHCP
+>   traffic out of its queues, so it adds 0.
 
 ### What actually helps
 
-Two things do not, and it is worth knowing why before reaching for them:
+Two things do not help with *sustained* overload, and it is worth knowing why
+before reaching for them:
 
 * **A bigger socket receive buffer** removes the drops and replaces them with
   latency. Measured under #952: with 8 MiB of buffer the drops vanish and a
   DORA takes **34 s instead of 1.5 s**, because Kea then works through a
   backlog answering requests whole retransmit rounds late.
-* **A bigger `packet-queue-size`** does nothing at all. 64 → 2048 (32x)
-  changed neither throughput nor drops; that queue sits *behind* the receive
-  thread, and the bottleneck is the receive thread not being scheduled.
+* **A bigger `packet-queue-size`** does not raise throughput. At 12,000
+  relayed pkt/s offered, 64 → 2048 (32x) changed neither throughput nor
+  socket drops. That queue sits *behind* the receive thread, and no queue
+  holds a rate the workers cannot serve. A short burst is a different case,
+  and there the queue does matter: see
+  [the queue below](#keas-packet-queue).
 
 What helps is giving the receive thread the CPU. The chart already ships a
 500m CPU request on the Kea pod (#953 / #967 — see
@@ -1011,6 +1040,43 @@ you whether you are at the knee where it is worth it.
 > Kea logs at INFO — plus `DHCP4_CONFIG_COMPLETE`, `DHCP4_STARTED` and
 > `DHCP4_MULTI_THREADING_INFO`, the last being the line that reports whether
 > the pool size above took effect.
+
+#### Kea's packet queue
+
+**`packet-queue-size` is rendered as 1024, not left at Kea's 64 (#1283).**
+
+*What the queue does.* Under multi-threading, Kea's receive thread puts
+each packet on a queue that the workers take from. When a burst fills the
+queue, Kea evicts the oldest packet to make room. The only trace is a
+debug-level log line. `pkt4-received` is counted by the worker, so an
+evicted request appears in no statistic and no drop counter, and its client
+simply retransmits 4 s later.
+
+*What we measured.* A three-node cluster's relayed load ramp: kea-dhcp4
+3.0.3, a pool of 1, arrival bursts of 2-4 s. Only the queue size changed
+between runs:
+
+| `packet-queue-size` | requests evicted, counted nowhere | handshakes re-sent | answer latency p99 / max |
+|---|---|---|---|
+| 64 (Kea's default) | 2,286 | 35.1 % | 0.14 s / 0.33 s |
+| **1024** | **0** | 15.1 % | 1.17 s / 1.21 s |
+| 4096 | 0 | 7.8 % | 1.37 s / 1.39 s |
+
+*Why 1024.* The cost of a bigger queue is the wait in it: at most its size
+divided by the rate the workers serve at.
+- At 1024 the queue's deepest point was about 570, so those bursts fit with
+  room to spare.
+- At the roughly 470 packets/s one worker served there, a full queue drains
+  in about 2 s, inside the client's first retransmit.
+- At 4096 it would take over 8 s. Kea would then answer requests their
+  clients have already re-sent, the shape #952 measured as a 34 s DORA.
+
+The size is not scaled by `kea_thread_pool_size`, because more workers only
+drain the queue faster.
+
+*What is left.* The re-sends at 1024 and 4096 match the kernel's drops on
+Kea's raw socket in those runs: 1,042 and 505. Those drops are counted:
+they are `socket_drop` (above).
 
 ---
 
@@ -1301,7 +1367,7 @@ DHCP_AGENT_MAX_CACHE_AGE_HOURS=72   # Alert if cache older than this
 
 ## 11. DHCP Options Reference
 
-The following standard DHCP options can be configured at the scope, pool, or host level. All options are configurable in the UI and via API. Parent scope options are inherited by child pools unless overridden.
+The following standard DHCP options can be configured at the scope, pool, or host level. Most options are configurable in the UI and via API; options 58 and 59 are not (see below). Parent scope options are inherited by child pools unless overridden.
 
 | Option Code | Name | Description |
 |---|---|---|
@@ -1313,12 +1379,14 @@ The following standard DHCP options can be configured at the scope, pool, or hos
 | 28 | Broadcast Address | Auto-computed |
 | 43 | Vendor Specific | Raw hex or vendor-specific encapsulated options |
 | 51 | IP Address Lease Time | Seconds; default lease time |
-| 58 | Renewal Time | T1 (default: 50% of lease time) |
-| 59 | Rebinding Time | T2 (default: 87.5% of lease time) |
+| 58 | Renewal Time | T1 — derived from each lease (50% of its lifetime); **not settable** |
+| 59 | Rebinding Time | T2 — derived from each lease (87.5% of its lifetime); **not settable** |
 | 66 | TFTP Server Name | Boot server hostname (PXE) |
 | 67 | Bootfile Name | PXE bootfile path |
 | 119 | Domain Search | Multiple search domains |
 | 150 | TFTP Server Address | Cisco VoIP boot server IP |
+
+**Renewal / rebind timers (58 / 59)** cannot be set (#1690): the API refuses `dhcp-renewal-time`, `dhcp-rebinding-time` and `code:58` / `code:59` with a 422. Kea is rendered with `calculate-tee-times` so every lease gets T1 / T2 at 50% / 87.5% of its own lifetime (v6: 50% / 80% of the preferred lifetime). A Kea import drops `renew-timer` / `rebind-timer` and says so: a subnet's in that scope's `parse_warnings`, a global one in the preview's `warnings`.
 
 **Min/Max lease times**: Configured as `min_lease_time` / `max_lease_time` on the DHCPScope. Clients requesting shorter/longer leases are clamped to this range.
 

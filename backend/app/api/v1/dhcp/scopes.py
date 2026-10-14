@@ -19,7 +19,7 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser, require_superadmin
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
 from app.core.agent_wake import collect_wake, dhcp_group_channel
@@ -652,7 +652,7 @@ async def create_scope(
     subnet_id: uuid.UUID,
     body: ScopeCreate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
     adopt_existing: bool = False,
 ) -> ScopeResponse:
     """Create a scope.
@@ -825,7 +825,7 @@ async def update_scope(
     scope_id: uuid.UUID,
     body: ScopeUpdate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
     adopt_existing: bool = False,
 ) -> ScopeResponse:
     # ``adopt_existing``: same opt-in as create (#865) — an edit of a scope
@@ -950,7 +950,7 @@ async def update_scope(
 async def delete_scope(
     scope_id: uuid.UUID,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
     request: Request,
     permanent: bool = False,
 ) -> Any:
@@ -970,8 +970,12 @@ async def delete_scope(
     Two-person approval (#62): when the ``governance.approvals`` module is on
     and a ``delete:dhcp_scope`` policy matches, returns ``202`` with a pending
     change-request; otherwise executes inline via ``operation.apply`` exactly
-    as before (route stays SuperAdmin-gated).
+    as before. Gated on ``delete`` on ``dhcp_scope`` by the router (#1861);
+    ``?permanent=true`` stays superadmin-only, as on the IPAM deletes.
     """
+    if permanent:
+        # Refused before a change request could be queued for it.
+        require_superadmin(user)
     op = get_operation("delete_scope")
     assert op is not None  # registered at import
     args = DeleteScopeArgs(scope_id=scope_id, permanent=permanent)

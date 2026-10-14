@@ -16,6 +16,7 @@ import {
   errMsg,
   DeleteConfirmModal,
 } from "./_shared";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const REASON_LABELS: Record<DHCPMACBlockReason, string> = {
   rogue: "Rogue device",
@@ -85,6 +86,16 @@ function StatusPill({ block }: { block: DHCPMACBlock }) {
 }
 
 export function MacBlocksTab({ groupId }: { groupId: string }) {
+  // #1339, #1861 — writes take write, deletes delete, on ``dhcp_mac_block``.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "dhcp_mac_block"),
+    "Requires write permission on DHCP MAC blocks",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "dhcp_mac_block"),
+    "Requires delete permission on DHCP MAC blocks",
+  );
   const qc = useQueryClient();
   const { data: blocks = [], isFetching } = useQuery({
     queryKey: ["dhcp-mac-blocks", groupId],
@@ -158,7 +169,8 @@ export function MacBlocksTab({ groupId }: { groupId: string }) {
         </button>
         <button
           onClick={() => setShowCreate(true)}
-          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...writeGate}
         >
           <Plus className="h-3 w-3" /> Block MAC
         </button>
@@ -259,15 +271,17 @@ export function MacBlocksTab({ groupId }: { groupId: string }) {
                     <td className="whitespace-nowrap px-3 py-2 text-right">
                       <button
                         onClick={() => setEdit(b)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Edit"
+                        {...writeGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDel(b)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         title="Delete"
+                        {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
