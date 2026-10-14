@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A rolling upgrade no longer accepts an `http://` slot image URL
+  that every appliance then refuses (#1752).** The Plan validator allowed
+  `http` or `https`; the supervisor fetches only `https://` or `file://`
+  (#242) and refuses anything else with a warning log and no trigger, so the
+  run started and each node's stage step waited out its whole timeout (50
+  minutes) with no error naming the cause. The scheme rule now lives in
+  `slot_image_target.py` and is enforced by the Plan validator and by the
+  resolver every scheduler goes through (the per-appliance schedule and the
+  rolling orchestrator), each answering 422 with the reason. It mirrors the
+  supervisor's test exactly — the URL must start with `https://` or
+  `file://` — so `file:/x`, which parses as a `file` URL, is refused as the
+  supervisor refuses it. A test pins the rule against the supervisor's own
+  `allowed_schemes`. Uploaded images are unaffected: their URL is composed
+  from the address the UI was reached on, the appliance's `https://`
+  listener. A run planned before the upgrade keeps the URL it was planned
+  with.
+
 - **SCP backup target: a `known_hosts` line naming its host as `host,ip`
   was never matched (#1728).** The loader passed the whole host field to
   paramiko as one name, so `sftp.example,192.0.2.10 ssh-ed25519 AAAA...`

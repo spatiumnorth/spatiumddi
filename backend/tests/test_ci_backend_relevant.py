@@ -95,6 +95,11 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     # its own nginx location block in BOTH shipped templates or it falls
     # through to the SPA and a PBX asking where a phone is gets index.html.
     # The test reads both; both must therefore run this suite when edited.
+    # #1752: parity between the control plane's slot-image URL rule and
+    # the supervisor's own ``allowed_schemes``.
+    "test_slot_image_url_scheme_1752.py": (
+        "agent/supervisor/spatium_supervisor/appliance_state.py",
+    ),
     "test_e911_held.py": (
         "frontend/default.conf.template",
         "charts/spatiumddi/templates/frontend-tls-config.yaml",

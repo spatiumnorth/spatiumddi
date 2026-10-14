@@ -2998,7 +2998,11 @@ whereas pointing the bootloader at it cannot be undone remotely.
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches
-   independently.
+   independently. The URL must start with `https://` (or `file://`, for an
+   image already placed on every node): the supervisor refuses any other
+   scheme, cleartext `http://` included, so Plan — and the per-box
+   schedule — answer 422 for one rather than letting each node's stage step
+   wait out its timeout for a download that never starts (#1752).
 
 The tab's source toggle defaults to **Uploaded** when at least one
 image is on file; otherwise falls back to **URL**. The empty-state
