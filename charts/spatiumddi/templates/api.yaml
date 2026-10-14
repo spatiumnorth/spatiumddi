@@ -76,6 +76,7 @@ spec:
               containerPort: 8000
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
+            {{- include "spatiumddi.sharedEnv" . | nindent 12 }}
             {{- if $kubeletCA.enabled }}
             - name: SPATIUM_KUBELET_CA_PATH
               value: {{ $kubeletCA.mountPath | quote }}
@@ -98,23 +99,6 @@ spec:
             # the frontend Service uses for the LoadBalancer VIP.
             - name: APPLIANCE_EXTRA_CERT_SANS
               value: {{ .Values.frontend.controlPlaneVIP | quote }}
-            {{- end }}
-            {{- if .Values.slotImageMirror.enabled }}
-            # #296 Phase B — when the mirror Deployment is on, the api's
-            # slot-image upload + download + delete handlers proxy byte
-            # ops to the mirror Service instead of touching local FS.
-            # See backend/app/api/v1/appliance/slot_images.py for the
-            # branching logic. The URL is the mirror's ClusterIP Service,
-            # in-cluster reachable from every api replica; the X-Mirror-
-            # Auth shared secret defends against in-cluster cross-pod
-            # forgery on top of the network isolation.
-            - name: SLOT_IMAGE_MIRROR_URL
-              value: "http://{{ include "spatiumddi.fullname" . }}-slot-image-mirror.{{ .Release.Namespace }}.svc:8000"
-            - name: SLOT_IMAGE_MIRROR_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "spatiumddi.fullname" . }}-slot-image-mirror-auth
-                  key: secret
             {{- end }}
             {{- if .Values.api.serviceControl.enabled }}
             # #890 — opt-in lifecycle control (Settings → Services). Pair

@@ -79,6 +79,12 @@ auth:
   metricsToken: ""
 
 # ── API ──────────────────────────────────────────────────────────────────────
+# #1826 — env appended to the api, worker AND beat containers (not the migrate
+# Job or the slot-image mirror). Anything the Celery side reads from
+# ``settings`` belongs here rather than in ``api.env``; the appliance's
+# APPLIANCE_MODE / hostname / host IPs live here. Same shape as ``api.env``.
+sharedEnv: []
+
 api:
   replicas: 2
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class

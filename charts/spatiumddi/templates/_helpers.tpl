@@ -350,6 +350,37 @@ the same set for kombu.
 {{- end -}}
 
 {{/*
+Env shared by the api, worker AND beat — and deliberately NOT by the migrate
+Job or the slot-image mirror, which also include commonEnv. (#1826) The three
+run the same image and read the same ``settings``, but their env used to be
+written three times with the api getting the appliance block: the worker and
+beat ran with ``APPLIANCE_MODE`` unset, so every ``appliance_mode`` gate
+(``node_pressure``, ``cluster_dns_degraded``, the rolling-upgrade
+orchestrator, ...) evaluated as off in the one process that runs alert
+evaluation. Put anything the Celery side reads in ``sharedEnv`` (values.yaml),
+not in ``api.env``. ``.github/scripts/chart-shared-env.py`` fails a render
+where one of the three lacks a variable another carries from this list.
+
+The slot-image mirror URL + secret ride along when the mirror is on: the
+rolling-upgrade preflight runs in the worker and skipped its mirror disk
+headroom check because the worker never had the URL.
+*/}}
+{{- define "spatiumddi.sharedEnv" -}}
+{{- with .Values.sharedEnv }}
+{{- toYaml . }}
+{{- end }}
+{{- if .Values.slotImageMirror.enabled }}
+- name: SLOT_IMAGE_MIRROR_URL
+  value: "http://{{ include "spatiumddi.fullname" . }}-slot-image-mirror.{{ .Release.Namespace }}.svc:8000"
+- name: SLOT_IMAGE_MIRROR_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.fullname" . }}-slot-image-mirror-auth
+      key: secret
+{{- end }}
+{{- end -}}
+
+{{/*
 Common env block for api / worker / beat. Only $(POSTGRES_PASSWORD) and
 $(REDIS_PASSWORD) reference secrets; everything else is inline.
 */}}
