@@ -269,7 +269,10 @@ async def test_wait_deployments_404_treated_as_success(
     monkeypatch.setattr(chart_bump.k8s, "get_deployment", lambda _name, namespace=None: (404, None))
     monkeypatch.setattr(chart_bump, "_POLL_INTERVAL_S", 0.0)
     ok, rolled, err = await chart_bump._wait_for_deployments_rolled(
-        ["api", "worker"], "spatium", stop_after_monotonic=time.monotonic() + 5.0
+        ["api", "worker"],
+        "spatium",
+        new_tag="2026.06.01-1",
+        stop_after_monotonic=time.monotonic() + 5.0,
     )
     assert ok is True
     assert rolled == []
@@ -279,8 +282,10 @@ async def test_wait_deployments_404_treated_as_success(
 @pytest.mark.asyncio
 async def test_wait_deployments_polls_until_ready(monkeypatch: pytest.MonkeyPatch) -> None:
     """Two polls: first NotReady, second Ready → exits cleanly with
-    the name in ``rolled``."""
+    the name in ``rolled``. Both read the new template (#1829: only a
+    template on the new tag counts)."""
 
+    template = {"spec": {"containers": [{"image": "ghcr.io/x/spatiumddi-api:2026.06.01-1"}]}}
     poll_count = 0
 
     def _get_dep(_name: str, namespace: str | None = None) -> Any:
@@ -291,7 +296,7 @@ async def test_wait_deployments_polls_until_ready(monkeypatch: pytest.MonkeyPatc
                 200,
                 {
                     "metadata": {"generation": 5},
-                    "spec": {"replicas": 2},
+                    "spec": {"replicas": 2, "template": template},
                     "status": {
                         "observedGeneration": 4,
                         "updatedReplicas": 1,
@@ -303,7 +308,7 @@ async def test_wait_deployments_polls_until_ready(monkeypatch: pytest.MonkeyPatc
             200,
             {
                 "metadata": {"generation": 5},
-                "spec": {"replicas": 2},
+                "spec": {"replicas": 2, "template": template},
                 "status": {
                     "observedGeneration": 5,
                     "updatedReplicas": 2,
@@ -315,7 +320,10 @@ async def test_wait_deployments_polls_until_ready(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(chart_bump.k8s, "get_deployment", _get_dep)
     monkeypatch.setattr(chart_bump, "_POLL_INTERVAL_S", 0.0)
     ok, rolled, err = await chart_bump._wait_for_deployments_rolled(
-        ["api"], "spatium", stop_after_monotonic=time.monotonic() + 5.0
+        ["api"],
+        "spatium",
+        new_tag="2026.06.01-1",
+        stop_after_monotonic=time.monotonic() + 5.0,
     )
     assert ok is True
     assert rolled == ["api"]

@@ -4,10 +4,15 @@
 current dirty sequence and stores it (``services.dns.agent_bundle_render``)
 so the agent long-poll serves bytes instead of assembling the group's
 whole record set on the api's request loop, once per agent per change.
-The worker has no HTTP liveness probe to kill a long build and its
-per-task engine carries no ``command_timeout`` (``app.db.task_session``),
-so the 1.09 M-row records query that could not fit the api's 30 s
-ceiling simply runs.
+The worker has no HTTP liveness probe to kill a long build, so the
+1.09 M-row records query that could not fit the api's 30 s ceiling runs
+here. Its per-task engine is still bounded (#1719): the render opens its
+session with ``settings.task_db_long_command_timeout`` (900 s per
+statement), not the 120 s ``task_db_command_timeout`` every other task
+gets, because the records query on a large group legitimately runs past
+120 s. The bound exists so a black-holed CNPG primary fails the render
+in minutes rather than the kernel's ~15 min TCP retransmit timeout; the
+cheap sweep query keeps the default bound.
 
 Two Redis keys shape the load, both advisory (Redis down degrades to
 "render anyway"; the store's unique (server, watermark) keeps duplicates
@@ -180,7 +185,9 @@ async def _server_exists(db: Any, server_id: uuid.UUID) -> bool:
 
 
 async def _render_once(server_id: uuid.UUID) -> dict[str, Any]:
-    async with task_session() as db:
+    # Long bound: the group's records query is one statement that can run
+    # past the 120 s default on a large group (see module docstring, #1719).
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         server = await db.get(DNSServer, server_id)
         if server is None:
             return {"status": "gone"}
