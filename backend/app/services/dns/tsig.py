@@ -305,8 +305,12 @@ async def pull_zone_records_signed(
     keys: Sequence[TsigKey | None],
     *,
     view_name: str | None = None,
+    **pull_kwargs: Any,
 ) -> tuple[list[RecordData], TsigKey | None]:
     """``driver.pull_zone_records`` with each of ``keys`` in turn.
+
+    ``pull_kwargs`` go to every ``pull_zone_records`` call unchanged (the
+    drift report's ``include_apex_ns``, #1857).
 
     Moves to the next key only when the server answered BADKEY. That is how an
     agent that predates the per-view keys (#920) answers one — it never
@@ -324,7 +328,7 @@ async def pull_zone_records_signed(
     first: Exception | None = None
     for i, key in enumerate(keys):
         try:
-            return await driver.pull_zone_records(server, zone_name, tsig=key), key
+            return await driver.pull_zone_records(server, zone_name, tsig=key, **pull_kwargs), key
         except Exception as exc:  # noqa: BLE001 — classified below, re-raised
             first = first or exc
             if i == len(keys) - 1 or not _answered_badkey(exc):
