@@ -75,19 +75,55 @@ def test_recursion_on_with_acl_sends_specified_acl(tmp_path: Path) -> None:
     ]
 
 
-def test_default_any_keeps_private_networks_and_never_opens_recursion(
-    tmp_path: Path,
-) -> None:
-    # ["any"] is the stored default and indistinguishable from an explicit
-    # choice; it must not become open recursion on upgrade (#1761 review,
-    # #1786). Same for an empty list and for no options row at all.
-    for acl in (["any"], ["ANY"], [], None):
+def test_default_is_loopback_plus_private_ranges(tmp_path: Path) -> None:
+    # The stored default (#1817) and a bundle without the key. ``localnets``
+    # expands to the private ranges the default also lists explicitly: the
+    # ACL carries each range once.
+    stored_default = [
+        "localhost",
+        "localnets",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+    ]
+    for acl in (stored_default, ["localhost", "localnets"], None):
         opts: dict[str, Any] = {"recursion_enabled": True}
         if acl is not None:
             opts["allow_recursion"] = acl
         sets = _apply(tmp_path, opts)
-        assert _field(sets, "recursion") == ["AllowOnlyForPrivateNetworks"], acl
+        assert _field(sets, "recursion") == ["UseSpecifiedNetworkACL"], acl
+        assert _field(sets, "recursionNetworkACL") == [
+            "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,"
+            "169.254.0.0/16,fc00::/7,fe80::/10"
+        ], acl
+
+
+def test_explicit_any_opens_recursion(tmp_path: Path) -> None:
+    for acl in (["any"], ["ANY"]):
+        sets = _apply(tmp_path, {"recursion_enabled": True, "allow_recursion": acl})
+        assert _field(sets, "recursion") == ["Allow"], acl
         assert _field(sets, "recursionNetworkACL") == [], acl
+
+
+def test_empty_list_denies(tmp_path: Path) -> None:
+    sets = _apply(tmp_path, {"recursion_enabled": True, "allow_recursion": []})
+    assert _field(sets, "recursion") == ["Deny"]
+
+
+def test_duplicates_collapse_first_occurrence_kept(tmp_path: Path) -> None:
+    sets = _apply(
+        tmp_path,
+        {
+            "recursion_enabled": True,
+            "allow_recursion": ["!10.9.0.0/16", "10.0.0.0/8", "10.0.0.0/8", "localnets"],
+        },
+    )
+    assert _field(sets, "recursionNetworkACL") == [
+        "!10.9.0.0/16,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,"
+        "169.254.0.0/16,fc00::/7,fe80::/10"
+    ]
 
 
 def test_an_acl_with_no_usable_entry_fails_closed(tmp_path: Path) -> None:

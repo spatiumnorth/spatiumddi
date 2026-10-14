@@ -121,14 +121,17 @@ def task_connect_args(command_timeout: float | None = None) -> dict[str, float]:
 
 
 @asynccontextmanager
-async def task_session(
+async def task_sessionmaker(
     *, command_timeout: float | None = None
-) -> AsyncGenerator[AsyncSession, None]:
-    """Per-Celery-task DB session — fresh engine, fresh loop binding.
+) -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
+    """Per-Celery-task session factory, for task code that opens several
+    sessions in turn (a poll loop) and must not reach for the shared
+    ``AsyncSessionLocal``. One throwaway engine bound to the current loop,
+    disposed at exit — so N sessions cost one engine, not N (#1687).
 
     ``command_timeout`` overrides the per-statement bound
     (``settings.task_db_command_timeout``); tasks whose single statements are
-    legitimately slow pass ``settings.task_db_long_command_timeout``.
+    legitimately slow pass ``settings.task_db_long_command_timeout`` (#1719).
     """
 
     # A task needs exactly one connection; bound the pool to 1 (no
@@ -154,12 +157,23 @@ async def task_session(
         # The pre-ping is a command too, so this bounds it as well.
         connect_args=task_connect_args(command_timeout),
     )
-    factory = async_sessionmaker(task_engine, class_=AsyncSession, expire_on_commit=False)
     try:
-        async with factory() as session:
-            yield session
+        yield async_sessionmaker(task_engine, class_=AsyncSession, expire_on_commit=False)
     finally:
         await task_engine.dispose()
+
+
+@asynccontextmanager
+async def task_session(
+    *, command_timeout: float | None = None
+) -> AsyncGenerator[AsyncSession, None]:
+    """Per-Celery-task DB session — fresh engine, fresh loop binding.
+
+    ``command_timeout`` is passed to :func:`task_sessionmaker`.
+    """
+    async with task_sessionmaker(command_timeout=command_timeout) as factory:
+        async with factory() as session:
+            yield session
 
 
 # ── Global soft-delete filter ──────────────────────────────────────────────

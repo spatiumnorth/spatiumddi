@@ -88,6 +88,17 @@ _API_TIMEOUT = 10.0
 _ADMIN_PASSWORD_FILE = "technitium-admin-password"
 _API_TOKEN_FILE = "technitium-api.token"
 _TOKEN_NAME = "spatiumddi-agent"
+# #1772: set after Technitium REFUSES the bootstrap credentials, so the agent
+# stops presenting them. ``AuthManager.cs`` counts failed logins per client
+# address (the agent's is loopback) with NO time window: the count only resets
+# on a successful login or when a block expires, and every 5th failure blocks
+# that address for 5 minutes (MAX_LOGIN_ATTEMPTS / BLOCK_NETWORK_INTERVAL).
+# Without this marker the apply loop and every record op re-presented the
+# dead password, keeping the agent's address blocked almost continuously.
+_CREDS_REJECTED_FILE = "technitium-credentials-rejected.json"
+# One attempt per window: at most one 5-minute loopback block per ~75 minutes
+# while the credentials stay wrong, and never a standing one.
+_CREDS_RETRY_SECONDS = 15 * 60
 # Zones this agent created from a bundle — the only ones it may delete when
 # the bundle drops them (see ``_retire_dropped_zones``).
 _MANAGED_ZONES_FILE = "technitium-managed-zones.json"
@@ -421,6 +432,17 @@ _RECURSION_MODES = frozenset(
 # ``!``-prefixed CIDR).
 _ACL_ANY = ("0.0.0.0/0", "::/0")
 _ACL_LOCALHOST = ("127.0.0.0/8", "::1/128")
+#: The stored ``allow_recursion`` default (#1817), mirroring the control
+#: plane's ``app.models.dns.DEFAULT_ALLOW_RECURSION``.
+_DEFAULT_ALLOW_RECURSION = (
+    "localhost",
+    "localnets",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "fc00::/7",
+    "fe80::/10",
+)
 _ACL_LOCALNETS = (
     "10.0.0.0/8",
     "172.16.0.0/12",
@@ -478,9 +500,13 @@ _TSIG_ALGORITHMS = frozenset(
 
 # Exact Technitium "the server is already in that state" answers (#1770).
 # Matching the bare substring "already exists" also swallowed Technitium's
-# CNAME/DNAME conflict refusal, "Cannot add record: CNAME record already
-# exists for the same name." (AuthZone.cs:817, v15.4.0), which is a REFUSAL:
-# the record does not exist and the server keeps serving the old data.
+# CNAME/DNAME conflict refusals, which are REFUSALS: the record does not exist
+# and the server keeps serving the old data. A PRIMARY zone answers "Cannot add
+# record: a CNAME record cannot exists with other record types for the same
+# name." (AuthZone.cs:135/145 ``TrySetRecords``, v15.4.0, no "already exists"
+# in it); "Cannot add record: CNAME record already exists for the same name."
+# is the base ``AuthZone.SetRecords`` text (AuthZone.cs:817), kept here as a
+# defensive case. Neither is in the no-op set below.
 # Upstream (TechnitiumSoftware/DnsServer v15.4.0):
 #   WebServiceZonesApi.cs:4229  "Cannot add record: record already exists."
 #   WebServiceZonesApi.cs:4336-4596  "Cannot delete record: no such record exists."
@@ -1959,6 +1985,54 @@ def _record_params(
     return {"value": value}
 
 
+class TechnitiumCredentialsError(RuntimeError):
+    """Technitium refused the agent's admin credentials (#1772).
+
+    ``reason`` is ``bad-credentials`` or ``2fa-required``. The text is what
+    reaches the control plane as the #882 apply-status ``error``, so it
+    names the cause and the way out rather than "no API token available".
+    """
+
+    #: Raised before any authenticated call succeeds — every call in an apply
+    #: carries the same token — so the daemon has taken nothing from this
+    #: apply and there is nothing to revert (see ``ConfigApplyError``).
+    daemon_untouched = True
+
+    def __init__(self, reason: str, detail: str = ""):
+        self.reason = reason
+        super().__init__(_creds_message(reason, detail))
+
+
+def _creds_message(reason: str, detail: str = "") -> str:
+    if reason == "2fa-required":
+        what = (
+            "Technitium requires a two-factor code for the 'admin' account "
+            "(2fa-required), so the agent cannot mint a new API token"
+        )
+    elif reason == "locked-out":
+        what = (
+            "Technitium has blocked logins from the agent's address after "
+            "repeated failures (locked-out), so the agent cannot mint a new "
+            "API token; the block lifts after 5 minutes"
+        )
+    else:
+        what = (
+            "Technitium rejected the agent's stored admin password "
+            "(bad-credentials), so the agent cannot mint a new API token"
+        )
+    fix = (
+        "Recovery: disable TOTP on 'admin', or make the two passwords agree — "
+        "write Technitium's current 'admin' password into "
+        "technitium-admin-password in the agent state directory (the file is "
+        "regenerated if the state volume was lost), or set 'admin' in "
+        "Technitium to the password in that file. Changing that file, or "
+        "deleting technitium-credentials-rejected.json beside it, retries at "
+        "once; otherwise the agent retries at most every 15 minutes to stay "
+        "clear of Technitium's 5-attempt login lockout"
+    )
+    return f"{what}. {fix}." + (f" Technitium said: {detail}" if detail else "")
+
+
 class TechnitiumDriver(DriverBase):
     """Technitium agent driver — v1."""
 
@@ -3313,24 +3387,32 @@ class TechnitiumDriver(DriverBase):
         """Pure mapping: bundle options → (``recursion`` mode, ACL entries).
 
         * ``recursion_enabled`` false → ``Deny``.
-        * ``allow_recursion`` absent, empty, or exactly ``["any"]`` →
-          ``AllowOnlyForPrivateNetworks``. ``["any"]`` is the model's stored
-          default and nothing distinguishes it from an explicit choice, while
-          the BIND9 agent never renders ``allow-recursion`` (#1786) and so
-          runs BIND's localnets/localhost default. Mapping it to ``Allow``
-          would open recursion to the internet on upgrade; the engine's
-          private-network default is the closest match and is what
-          Technitium already did. ``Allow`` is therefore never sent.
+        * ``allow_recursion`` absent (an older control plane) → the stored
+          default, local + private networks (#1817). Otherwise the list
+          is read literally, with no special case for any value:
+          ``["any"]`` → ``Allow`` (open, deliberately), ``none`` / empty →
+          ``Deny``.
+        * NOTE ``localnets`` differs from BIND's: BIND's is the server's
+          directly attached subnets, Technitium has no such notion, so it is
+          the RFC 1918 + ULA + link-local ranges (``_ACL_LOCALNETS``), which
+          is also what Technitium's own ``AllowOnlyForPrivateNetworks`` allows.
         * otherwise ``UseSpecifiedNetworkACL`` with the list translated to
           CIDRs. Unresolvable tokens (named ACLs, garbage) are dropped with
           a warning; if none survive the result is ``Deny`` — fail closed.
+        * the ACL is deduplicated, first occurrence kept: the default lists
+          ``localnets`` AND the private ranges it expands to here, and a
+          later duplicate can never fire in a first-match list anyway.
         """
         if not options.get("recursion_enabled", True):
             return "Deny", []
-        raw = [str(e).strip() for e in (options.get("allow_recursion") or []) if str(e).strip()]
-        if not raw or [e.lower() for e in raw] == ["any"]:
-            return "AllowOnlyForPrivateNetworks", []
+        stored = options.get("allow_recursion")
+        if stored is None:
+            stored = list(_DEFAULT_ALLOW_RECURSION)
+        raw = [str(e).strip() for e in stored if str(e).strip()]
+        if [e.lower() for e in raw] == ["any"]:
+            return "Allow", []
         acl: list[str] = []
+        seen: set[tuple[bool, str]] = set()
         for entry in raw:
             deny = entry.startswith("!")
             name = entry.lstrip("!").strip()
@@ -3350,7 +3432,11 @@ class TechnitiumDriver(DriverBase):
                     log.warning("technitium_allow_recursion_entry_dropped", entry=entry)
                     continue
                 cidrs = (name,)
-            acl.extend(("!" + c) if deny else c for c in cidrs)
+            for c in cidrs:
+                seen_key = (deny, str(ipaddress.ip_network(c, strict=False)))
+                if seen_key not in seen:
+                    seen.add(seen_key)
+                    acl.append(("!" + c) if deny else c)
         if not any(not a.startswith("!") for a in acl):
             return "Deny", []
         return "UseSpecifiedNetworkACL", acl
@@ -4501,6 +4587,7 @@ class TechnitiumDriver(DriverBase):
         orphaned tokens on the server).
         """
         password = self.admin_bootstrap_password()
+        self._raise_if_creds_cooling_down()
         try:
             # A form body, never query parameters: a URL is logged (httpx
             # writes every request line at INFO) and the password must not be
@@ -4515,14 +4602,83 @@ class TechnitiumDriver(DriverBase):
             log.error("technitium_create_token_failed", error=str(exc))
             return None
         if body.get("status") != "ok" or not body.get("token"):
-            log.error(
-                "technitium_create_token_rejected", error=body.get("errorMessage")
-            )
+            detail = str(body.get("errorMessage") or "")
+            log.error("technitium_create_token_rejected", error=detail or None)
+            # Verified against APIDOCS.md ("2fa-required" status) and
+            # AuthManager.cs: a wrong password answers "Invalid username or
+            # password for user: …" and TOTP-enabled users get 2fa-required.
+            # Both are verdicts about the credentials, not transient faults.
+            # A blocked address answers "Max limit of 5 attempts exceeded"
+            # before the password is even checked (not counted, but the
+            # agent would otherwise retry it on every op).
+            reason = None
+            if body.get("status") == "2fa-required":
+                reason = "2fa-required"
+            elif "invalid username or password" in detail.lower():
+                reason = "bad-credentials"
+            elif detail.lower().startswith("max limit of"):
+                reason = "locked-out"
+            if reason is not None:
+                self._record_creds_rejected(reason, detail)
+                raise TechnitiumCredentialsError(reason, detail)
             return None
         token = body["token"]
         self._write_secret(self._api_token_path(), token)
         log.info("technitium_api_token_created")
         return token
+
+    def _creds_rejected_path(self) -> Path:
+        return self.state_dir / _CREDS_REJECTED_FILE
+
+    def _password_file_identity(self) -> str:
+        """Which version of the admin password file is on disk.
+
+        Inode, size and mtime, so a rewritten file lifts the hold, without
+        storing anything derived from the password itself: a fast hash of it
+        in the state directory could be guessed offline (#1772, CodeQL).
+        Empty when the file is missing.
+        """
+        try:
+            st = self._admin_password_path().stat()
+        except OSError:
+            return ""
+        return f"{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
+
+    def _record_creds_rejected(self, reason: str, detail: str) -> None:
+        # ``detail`` is kept so the suppressed attempts report the same error
+        # text as the real one: a steady apply-status error, not one that
+        # changes shape after the first failure.
+        write_private(
+            self._creds_rejected_path(),
+            json.dumps(
+                {
+                    "reason": reason,
+                    "detail": detail,
+                    "at": time.time(),
+                    "pw_file": self._password_file_identity(),
+                }
+            ),
+        )
+
+    def _raise_if_creds_cooling_down(self) -> None:
+        """Refuse to present credentials Technitium has already refused.
+
+        Lifted by a changed password file, by the retry window elapsing, or
+        by deleting the marker; an unreadable marker never blocks.
+        """
+        path = self._creds_rejected_path()
+        try:
+            rec = json.loads(path.read_text())
+            reason = str(rec["reason"])
+            detail = str(rec.get("detail") or "")
+            at = float(rec["at"])
+            same_pw = rec.get("pw_file") == self._password_file_identity()
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        if same_pw and time.time() - at < _CREDS_RETRY_SECONDS:
+            log.warning("technitium_create_token_suppressed", reason=reason)
+            raise TechnitiumCredentialsError(reason, detail)
+        path.unlink(missing_ok=True)
 
     @staticmethod
     def _write_secret(path: Path, value: str) -> None:

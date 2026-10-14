@@ -111,7 +111,8 @@ def _validate_opt_ddns_domain(v: Any) -> Any:
 DDNSDomainOverride = Annotated[str | None, BeforeValidator(_validate_opt_ddns_domain)]
 
 # Router-level permission gate: GET → `read`, POST/PUT/PATCH → `write`,
-# DELETE → `delete`. Endpoints under /ipam manipulate IPAM resources, so we
+# DELETE → `delete`, and the multi-row delete POSTs (`/addresses/bulk-delete`,
+# `/subnets/{id}/orphans/purge`) → `delete` too. Endpoints under /ipam manipulate IPAM resources, so we
 # accept any of the IPAM resource types (an "IPAM Editor" role grants all
 # four; a scoped Subnet-writer role would be matched here for subnet routes
 # and fail for space routes — which is intended). ``address_set`` is included
@@ -1540,7 +1541,11 @@ async def _sync_dns_record(
             )
             .options(selectinload(DNSRecord.zone))
         )
-        records = list(result.scalars().all())
+        # #1800 — PTRs first. Technitium deletes the matching PTR with an
+        # A/AAAA, and the control plane re-asserts a PTR whose row is still
+        # live and whose delete is not yet queued; retracting the PTR first
+        # spares the wire a create the PTR's own delete then undoes.
+        records = sorted(result.scalars().all(), key=lambda r: r.record_type != "PTR")
         for record in records:
             zone = record.zone
             # #1419 — a zone IPAM does not author (a release before the fix
@@ -2046,11 +2051,43 @@ async def _sync_dns_record(
                 ip.reverse_zone_id = rev_zone.id
                 await _enqueue_dns_op(db, rev_zone, "create", ptr_name, "PTR", ptr_value, ttl)
             else:
-                changed = record.value != ptr_value or record.name != ptr_name
+                old_ptr_name, old_ptr_value = record.name, record.value
+                name_changed = old_ptr_name != ptr_name
+                changed = record.value != ptr_value or name_changed
                 record.name = ptr_name
                 record.fqdn = rev_pointer_full
                 record.value = ptr_value
-                if changed:
+                if name_changed:
+                    # #1822 — the address moved inside the same reverse zone:
+                    # the PTR's owner name changed. An "update" replaces the
+                    # RRset AT the new name and never touches the old one, so
+                    # the old PTR stayed served (agentless: indefinitely).
+                    # Retract the old name first, then create the new one
+                    # (#1489 order) — the same delete + create the forward
+                    # rename and the record PUT (#1773) emit, as ONE batch so
+                    # an agentless primary gets both in a single
+                    # apply_record_changes call. Inside a bulk
+                    # ``_batched_dns_ops`` block the outer collector already
+                    # batches per zone, so only open our own when none is
+                    # active. A value-only change (hostname rename) stays a
+                    # single update.
+                    async with contextlib.AsyncExitStack() as stack:
+                        if _dns_op_collector.get() is None:
+                            await stack.enter_async_context(_batched_dns_ops(db))
+                        await _enqueue_dns_op(
+                            db,
+                            rev_zone,
+                            "delete",
+                            old_ptr_name,
+                            "PTR",
+                            old_ptr_value,
+                            record.ttl,
+                            record_id=record.id,
+                        )
+                        await _enqueue_dns_op(
+                            db, rev_zone, "create", ptr_name, "PTR", ptr_value, record.ttl
+                        )
+                elif changed:
                     await _enqueue_dns_op(
                         db, rev_zone, "update", ptr_name, "PTR", ptr_value, record.ttl
                     )
@@ -8592,6 +8629,10 @@ async def purge_orphans(
     db: DB,
 ) -> dict[str, int]:
     """Permanently delete the given orphan IPs in this subnet.
+
+    The router gate requires ``delete`` here, as for a permanent single-row
+    ``DELETE /addresses/{id}`` (``MULTI_ROW_DELETE_SUFFIXES``); the ``write`` on
+    the subnet below is the per-subnet check the single delete makes too.
 
     The UI lists orphans from `GET /subnets/{id}/addresses?status=orphan` (client-
     side filter) and passes the chosen ids here. We scope by subnet so a stale UI

@@ -1316,7 +1316,11 @@ async def mfa_disable(
     """Disable MFA. Local users supply the current password AND a current
     TOTP code (neither alone suffices); external-auth users (no local
     password, #408) supply just the current TOTP code. Clears the secret
-    and recovery codes."""
+    and recovery codes.
+
+    A wrong password or code is 403, not 401, as on enrolment: the SPA reads
+    any 401 off a non-login path as an expired token, rotates the session and
+    resubmits, which spent two step-up attempts on one typo (#1371)."""
     if not current_user.totp_enabled or current_user.totp_secret_encrypted is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="MFA is not currently enabled"
@@ -1328,13 +1332,11 @@ async def mfa_disable(
         assert current_user.hashed_password is not None  # narrowed by uses_local_password
         if not body.password or not verify_password(body.password, current_user.hashed_password):
             await record_stepup_password_failure(current_user.id)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
-            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid credentials")
     secret = decrypt_secret(current_user.totp_secret_encrypted)
     if not verify_totp(secret, body.code):
         await record_stepup_password_failure(current_user.id)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid TOTP code")
     current_user.totp_enabled = False
     current_user.totp_secret_encrypted = None
     current_user.recovery_codes_encrypted = None
@@ -1367,7 +1369,8 @@ async def mfa_regenerate_recovery_codes(
     The existing ``secret`` is kept so the authenticator app entry stays
     valid; only the recovery-code list rotates. Same reauth shape as
     ``/disable``: local users supply password + TOTP, external-auth users
-    (no local password, #408) supply just the TOTP code."""
+    (no local password, #408) supply just the TOTP code, and a wrong answer
+    is 403 for the same reason (#1371)."""
     if not current_user.totp_enabled or current_user.totp_secret_encrypted is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="MFA is not currently enabled"
@@ -1377,13 +1380,11 @@ async def mfa_regenerate_recovery_codes(
         assert current_user.hashed_password is not None  # narrowed by uses_local_password
         if not body.password or not verify_password(body.password, current_user.hashed_password):
             await record_stepup_password_failure(current_user.id)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
-            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid credentials")
     secret = decrypt_secret(current_user.totp_secret_encrypted)
     if not verify_totp(secret, body.code):
         await record_stepup_password_failure(current_user.id)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid TOTP code")
     codes = generate_recovery_codes()
     current_user.recovery_codes_encrypted = encrypt_recovery_codes(codes)
     db.add(

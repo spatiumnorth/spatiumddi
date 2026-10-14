@@ -30,11 +30,13 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import lzma
 import os
 import secrets
 import socket
 import tempfile
 import zipfile
+import zlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -577,6 +579,29 @@ async def build_backup_archive(
 
 # ── Archive reading ────────────────────────────────────────────────────
 
+# What reading the members of an uploaded zip raises when the archive is
+# damaged or foreign, besides ``BadZipFile`` (#1426). A corrupt deflate stream
+# raises ``zlib.error``, and one that ends early ``EOFError``. A corrupt bzip2
+# or LZMA member raises ``OSError`` or ``lzma.LZMAError``, a member compressed
+# with a method zipfile cannot read ``NotImplementedError``, and an encrypted
+# member ``RuntimeError`` (a password is required). A manifest that is not
+# UTF-8 JSON raises ``UnicodeDecodeError`` or ``json.JSONDecodeError``. Every one
+# is a malformed archive to the operator, a refusal with its reason, not a 500.
+_MALFORMED_ARCHIVE_ERRORS: tuple[type[Exception], ...] = (
+    zipfile.BadZipFile,
+    zlib.error,
+    EOFError,
+    OSError,
+    lzma.LZMAError,
+    NotImplementedError,
+    RuntimeError,
+    UnicodeDecodeError,
+    json.JSONDecodeError,
+)
+# The pre-flight opens manifest.json by name, so a zip without one is a
+# KeyError there.
+_MALFORMED_MANIFEST_ERRORS: tuple[type[Exception], ...] = (KeyError, *_MALFORMED_ARCHIVE_ERRORS)
+
 
 def read_backup_manifest(archive_bytes: bytes) -> dict[str, Any]:
     """Pull just ``manifest.json`` out of an archive without
@@ -588,7 +613,7 @@ def read_backup_manifest(archive_bytes: bytes) -> dict[str, Any]:
         with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as zf:
             with zf.open("manifest.json") as fh:
                 manifest = json.loads(fh.read().decode("utf-8"))
-    except (zipfile.BadZipFile, KeyError, json.JSONDecodeError) as exc:
+    except _MALFORMED_MANIFEST_ERRORS as exc:
         raise BackupArchiveError(f"archive is malformed: {exc}") from exc
     if not isinstance(manifest, dict):
         raise BackupArchiveError("manifest.json is not a JSON object")
@@ -653,6 +678,6 @@ def extract_archive_members(
                 )
             db_bytes = zf.read(dump_member)
             secrets_enc = zf.read("secrets.enc")
-    except (zipfile.BadZipFile, json.JSONDecodeError) as exc:
+    except _MALFORMED_ARCHIVE_ERRORS as exc:
         raise BackupArchiveError(f"archive is malformed: {exc}") from exc
     return manifest, db_bytes, dump_format, secrets_enc

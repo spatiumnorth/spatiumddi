@@ -49,7 +49,7 @@ NAMED_CONF_SKELETON = """\
     listen-on {{ any; }};
     listen-on-v6 {{ any; }};
 {encrypted_listeners}    recursion {recursion};
-    allow-query {{ {allow_query}; }};
+{allow_recursion}    allow-query {{ {allow_query}; }};
     {allow_transfer}
     dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
@@ -1268,6 +1268,85 @@ def _rndc_run(base: list[str], *args: str) -> tuple[int, str, str]:
     return res.returncode, res.stdout or "", res.stderr or ""
 
 
+# One address-match-list element: ``[!]`` then an address / prefix / built-in /
+# ACL name, or ``key <name>``. The API gate (#876/#1244) is authoritative; this
+# only stops a value stored before that gate existed (or an ACL deleted since)
+# from reaching named.conf, where one bad element makes named-checkconf refuse
+# the whole bundle.
+_AML_ELEMENT_RE = re.compile(r"^!?\s*(?:key\s+)?[A-Za-z0-9_.:/-]+$")
+#: The stored default for ``allow_recursion`` (#1817): local + private
+#: networks. ``localnets`` is the subnets of the interfaces named sees, which
+#: is the LAN only on host networking (the plain appliance); on a pod / bridge
+#: network (appliance DNS VIP, umbrella chart, k8s manifests, Compose) it is
+#: that network, so the private ranges are what keep a LAN recursing. Mirrors
+#: the control plane's ``app.models.dns.DEFAULT_ALLOW_RECURSION``.
+DEFAULT_ALLOW_RECURSION = (
+    "localhost",
+    "localnets",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "fc00::/7",
+    "fe80::/10",
+)
+_AML_BUILTINS = frozenset({"any", "none", "localhost", "localnets"})
+
+
+def _aml_element_ok(entry: str, acl_names: Collection[str]) -> bool:
+    """Whether ``entry`` is an element named-checkconf will accept here."""
+    if not _AML_ELEMENT_RE.match(entry):
+        return False
+    body = entry.lstrip("!").strip()
+    if body.lower().startswith("key ") or body.lower() in _AML_BUILTINS:
+        return True
+    try:
+        ipaddress.ip_network(body, strict=False)
+        return True
+    except ValueError:
+        pass
+    # A bare name is an ACL reference: it must be defined in this bundle, or
+    # named-checkconf fails on the undefined symbol.
+    return body in acl_names
+
+
+def _render_allow_recursion(
+    opts: dict[str, Any], acls: list[dict[str, Any]] | None = None
+) -> str:
+    """The ``allow-recursion`` line for ``options {}`` (#1786, #1817), or ``""``.
+
+    Rendered literally. Recursion off renders no line (``recursion no;``).
+    The stored default is local + private networks
+    (``DEFAULT_ALLOW_RECURSION``), so a group nobody configured is not an open
+    resolver; an explicit ``any`` renders ``any`` and really opens recursion.
+    A key absent from the bundle (an older control plane) takes the default
+    too. An empty list renders ``none``: the API saves a blank field as the
+    default, so an empty list only reaches here from a row written around it,
+    and omitting the line would fall back to ``allow-query`` (``any`` by
+    default, ``bin/named/server.c``), i.e. open. Fail closed.
+
+    Elements named-checkconf would refuse (a malformed value, an ACL not
+    defined in this bundle) are dropped; if none survive the line is ``none``,
+    never omitted.
+    """
+    if not opts.get("recursion_enabled", True):
+        return ""
+    stored = opts.get("allow_recursion")
+    if stored is None:
+        stored = list(DEFAULT_ALLOW_RECURSION)
+    raw = [str(e).strip() for e in stored if str(e).strip()]
+    acl_names = {str(a.get("name") or "").strip() for a in acls or []}
+    kept: list[str] = []
+    for entry in raw:
+        if _aml_element_ok(entry, acl_names):
+            kept.append(entry)
+        else:
+            log.warning("bind9_allow_recursion_entry_dropped", entry=entry)
+    if not kept:
+        # Fail closed, as the Technitium agent does (#1761).
+        kept = ["none"]
+    return f"    allow-recursion {{ {'; '.join(kept)}; }};\n"
+
+
 class Bind9Driver(DriverBase):
     rendered_dir_name = "rendered"
 
@@ -1391,6 +1470,7 @@ class Bind9Driver(DriverBase):
         logging_block = _render_logging_block(opts)
         conf = NAMED_CONF_SKELETON.format(
             recursion=recursion,
+            allow_recursion=_render_allow_recursion(opts, bundle.get("acls")),
             allow_query=allow_query,
             allow_transfer=allow_transfer_opt.rstrip(),
             dnssec=dnssec,
