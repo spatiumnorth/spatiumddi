@@ -115,6 +115,64 @@ the formatter handles the rest.
   Ingress examples and a troubleshooting table; DOCKER.md Option C no longer
   mounts a file over the entrypoint's rendered `default.conf`, and a stale
   `X-Forwarded-Host` comment is corrected.
+
+- **Re-importing a zone's own export no longer pins every inherited TTL
+  (#1727).** A record with no TTL of its own inherits the zone default and
+  is exported without one, so the re-import read the file's `$TTL` back
+  as 3600 against a stored NULL, listed the record under `to_update` and,
+  on commit, wrote 3600 onto it so it stopped following the zone. The
+  import diff now compares effective TTLs: a row inheriting the zone
+  default is unchanged when the file carries that same value, and stays
+  inherited even when only its priority or weight changes. An RRset whose
+  members carry different TTLs no longer has its members rewritten to the
+  lowest of them either: the zone file reports one TTL per RRset, so a
+  member is unchanged when that TTL is the RRset's existing lowest one,
+  which is what it is served with. An explicit TTL in a foreign file that
+  differs still updates.
+
+- **Bulk delete requires the `delete` action, like deleting one row
+  does.** The router-level permission gates mapped every `POST` to
+  `write`, so a role holding `write` but not `delete` was refused
+  `DELETE /x/{id}` yet could remove up to 500 rows through
+  `POST /x/bulk-delete` (ASNs, VRFs, overlays, multicast groups,
+  circuits, services, customers, sites, providers, DNS records and IPAM
+  addresses). IPAM's Clean Orphans (`POST
+  /ipam/subnets/{id}/orphans/purge`) permanently deletes addresses the
+  same way and was gated the same. The gates now treat these POSTs as
+  `delete`, and IPAM's Bulk delete and Clean Orphans buttons ask for
+  `delete` before offering themselves. IPAM's per-subnet and
+  address-set write checks on each row are unchanged. A role that
+  relied on `write` alone for bulk delete needs `delete` added. A test
+  walks the route table so a new multi-row delete route without the
+  check fails CI.
+
+- **An IPAM template apply lists only the columns it changed (#1634).**
+  `fields_written`, in the response and in the apply's audit row, named
+  every column that was empty on the target, including ones the template
+  has no value for (a DDNS-only template listed `tags`, `custom_fields`,
+  the zones and the domain override). A column now counts as written
+  only when its value changed; `force` lists the columns it overwrote
+  with a different value.
+
+- **An ACME order's teardown no longer fails with "Event loop is
+  closed" in the worker (#1687, #1726).** `run_order`'s `finally`
+  removed the DNS-01 challenge TXT records and the http-01 tokens
+  through the shared engine's session factory. That runs inside a
+  Celery task's own event loop, where a pooled connection left by an
+  earlier task is bound to a closed loop, so on a reused connection
+  the cleanup failed with only a warning. The challenge TXT then
+  stayed in the zone until the 24 h stale sweep, or for good without
+  it, and http-01 tokens stayed in the database. The teardown now
+  opens its sessions with `task_session()`, as the order itself does.
+  The same flaw sat in the DNS-01 solve: its wait for the agents to
+  apply the challenge TXT polled through the shared factory, so in a
+  worker that had run a task before, the first poll raised and the
+  order ended `invalid` with `unexpected: Event loop is closed`. The
+  wait helpers now take a session factory, and the solve passes one
+  from the new `task_sessionmaker()` (one per-task engine for the
+  whole poll loop). The acme-dns provider's API path still uses the
+  shared factory, which is correct in a request handler.
+
 - **The DICOM AE, OT device and IPAM CSV imports read a file with classic
   Mac line endings (#1370, #1637, #1711).** Each importer read the
   pasted or uploaded text without handing its line endings to the csv
