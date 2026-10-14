@@ -39,7 +39,8 @@ async def test_create_with_a_taken_name_is_409(
     url = f"/api/v1/dhcp/server-groups/{grp.id}/pxe-profiles"
     for with_match in (False, True):
         name = f"boot-{with_match}"
-        assert (await client.post(url, headers=h, json=_body(name, with_match))).status_code == 201
+        first = await client.post(url, headers=h, json=_body(name, with_match))
+        assert first.status_code == 201, first.text
         resp = await client.post(url, headers=h, json=_body(name, with_match))
         assert resp.status_code == 409, resp.text
         assert "exists" in resp.json()["detail"]
@@ -79,7 +80,35 @@ async def test_sibling_dhcp_families_answer_409_on_a_duplicate(
     grp = await _group(db_session)
     url = f"/api/v1/dhcp/server-groups/{grp.id}/client-classes"
     body = {"name": "cc1", "match_expression": "option[60].text == 'x'"}
-    assert (await client.post(url, headers=h, json=body)).status_code == 201
-    assert (await client.post(url, headers=h, json=body)).status_code == 409
+    first = await client.post(url, headers=h, json=body)
+    assert first.status_code == 201, first.text
+    second = await client.post(url, headers=h, json=body)
+    assert second.status_code == 409, second.text
     resp = await client.post("/api/v1/dhcp/server-groups", headers=h, json={"name": grp.name})
     assert resp.status_code == 409, resp.text
+
+
+async def test_copilot_lists_profiles_that_carry_matches(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The Copilot's ``list_pxe_profiles`` reads a profile with matches.
+
+    ``matches`` is joined-eager, so its query needs ``unique()``; without it
+    the tool raised InvalidRequestError for any profile with a match.
+    """
+    from sqlalchemy import select
+
+    from app.models.auth import User
+    from app.services.ai.tools.dhcp import ListPXEProfilesArgs, list_pxe_profiles
+
+    h = await _headers(db_session)
+    grp = await _group(db_session)
+    created = await client.post(
+        f"/api/v1/dhcp/server-groups/{grp.id}/pxe-profiles",
+        headers=h,
+        json=_body("with-match", True),
+    )
+    assert created.status_code == 201, created.text
+    user = (await db_session.execute(select(User).limit(1))).scalar_one()
+    rows = await list_pxe_profiles(db_session, user, ListPXEProfilesArgs(group_id=str(grp.id)))
+    assert [r["name"] for r in rows] == ["with-match"]
