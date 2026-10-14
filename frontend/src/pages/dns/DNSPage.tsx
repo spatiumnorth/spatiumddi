@@ -3477,7 +3477,8 @@ function MoveZoneModal({
       preview.dnssec_unsupported_drivers.length > 0 ||
       preview.acl_names_lost.length > 0 ||
       preview.key_names_lost.length > 0 ||
-      !!preview.technitium_api_refusal);
+      !!preview.technitium_api_refusal ||
+      !!preview.tsig_algorithm_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -3536,6 +3537,11 @@ function MoveZoneModal({
             {preview.technitium_api_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.technitium_api_refusal}
+              </div>
+            )}
+            {preview.tsig_algorithm_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.tsig_algorithm_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
@@ -6809,7 +6815,7 @@ function TSIGKeyModal({
   );
 }
 
-function RevealedSecretModal({
+export function RevealedSecretModal({
   name,
   algorithm,
   secret,
@@ -6829,7 +6835,9 @@ function RevealedSecretModal({
           This is the only time the plaintext secret for{" "}
           <code className="font-mono">{name}</code> will be shown. Copy it into
           your <code>nsupdate</code> client / secondary-server config before
-          closing — it is hashed at rest and can't be recovered.
+          closing. SpatiumDDI keeps it encrypted at rest (it has to, to sign DNS
+          updates), but the UI never shows it again — rotate the key to get a
+          new one.
         </p>
         <div className="rounded border bg-muted/30 p-3 font-mono text-xs">
           <div className="mb-1 text-muted-foreground">{algorithm}</div>

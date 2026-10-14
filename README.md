@@ -1212,7 +1212,7 @@ To populate a fresh install with a representative dataset (DNS group + zones + r
 python3 scripts/seed_demo.py http://localhost:8000 admin <your-password>
 ```
 
-Idempotent — re-running the seed swallows 409s and PATCHes existing rows so foreign-key pointers converge as new entities are added in later releases. Out of scope: AI providers (secrets), webhooks (per-deployment URLs), audit-forward targets, API tokens — those need real credentials from you.
+Idempotent — re-running the seed swallows 409s and PATCHes existing rows so foreign-key pointers converge as new entities are added in later releases. Any other refused request is printed as it happens and listed again at the end, and the script then exits 2 instead of reporting `Seed complete`. Out of scope: AI providers (secrets), webhooks (per-deployment URLs), audit-forward targets, API tokens — those need real credentials from you.
 
 ### Upgrading
 

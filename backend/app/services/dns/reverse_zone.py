@@ -21,10 +21,17 @@ from typing import TYPE_CHECKING
 import structlog
 from sqlalchemy import select, text
 
+from app.core.agent_wake import collect_wake, dns_group_channel
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup, DNSZone
 from app.models.ipam import Subnet
-from app.services.dns.sync_check import _effective_dns, ipam_authors_zone
+from app.services.dns.sync_check import (  # noqa: F401 — cidrs_overlap, reverse_zone_network re-exported
+    _effective_dns,
+    cidrs_overlap,
+    ipam_authors_zone,
+    reverse_zone_network,
+    reverse_zone_pieces,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,67 +48,35 @@ logger = structlog.get_logger(__name__)
 _cross_space_warned: set[tuple[str, str]] = set()
 
 
-def cidrs_overlap(a: object, b: object) -> bool:
-    """True when two CIDR strings are the same address family and overlap.
+def compute_reverse_zone_names(network: str) -> list[str]:
+    """The reverse-zone FQDNs (trailing dot) that cover ``network``, in address
+    order — one zone per /24 the subnet spans (spatiumddi#1840).
 
-    #844 uses this instead of a bare space-id comparison: IPv4 reverse zones
-    aggregate to /24 (``compute_reverse_zone_name``), so two NON-overlapping
-    subnets in different spaces legitimately share one reverse zone — their
-    PTR names are disjoint and nothing leaks. Only an actual CIDR overlap
-    can fold two tenants' PTRs onto the same names.
-    """
-    try:
-        na = ipaddress.ip_network(str(a), strict=False)
-        nb = ipaddress.ip_network(str(b), strict=False)
-    except (ValueError, TypeError):
-        return False
-    return na.version == nb.version and na.overlaps(nb)
+    One zone PER PIECE, never one enclosing zone: a /16 zone for a /23 would
+    make SpatiumDDI authoritative for 510 addresses that are not the subnet's,
+    shadowing reverse DNS someone else serves. The piece is the zone boundary
+    that lies inside the subnet:
 
-
-def compute_reverse_zone_name(network: str) -> str:
-    """Return the canonical reverse-zone FQDN (with trailing dot) for ``network``.
-
-    Uses ``ipaddress.ip_network(...).reverse_pointer`` which always produces a
-    properly aligned in-addr.arpa / ip6.arpa name for byte/nibble-aligned
-    prefixes. For non-aligned IPv4 prefixes (e.g. /23) we fall back to the
-    nearest enclosing octet boundary, which is the standard BIND convention for
-    an "aggregated" reverse zone covering multiple smaller subnets.
+    * IPv4 /17–/32: the /24 (a /23 gets two zones, a /20 sixteen, a /17 128; a
+      /25 or longer shares its /24's zone with its neighbours).
+    * IPv4 /9–/16: the /16 (a /16 gets its one zone, a /12 sixteen). Per-/24
+      would be up to 32,768 zones; each /16 here lies wholly inside the
+      subnet, so the zone still claims nothing that is not its own.
+    * IPv4 /0–/8: the /8 (up to 256 zones).
+    * IPv6: the next nibble boundary at or past the prefix length — a /44,
+      /48, /56 and /64 each get one zone, a non-aligned /55 its two /56 zones,
+      a /45 its eight /48s (never more than 8 for a real prefix).
     """
     net = ipaddress.ip_network(network, strict=False)
-    if isinstance(net, ipaddress.IPv4Network):
-        # Align to the next-smaller /8, /16, or /24 boundary.
-        if net.prefixlen <= 8:
-            aligned_prefix = 8
-        elif net.prefixlen <= 16:
-            aligned_prefix = 16
-        elif net.prefixlen <= 24:
-            aligned_prefix = 24
-        else:
-            aligned_prefix = 24  # zones at /24 cover sub-prefixes
-        aligned = ipaddress.ip_network(f"{net.network_address}/{aligned_prefix}", strict=False)
-        name = aligned.network_address.reverse_pointer
-        # reverse_pointer for 10.0.0.0 returns "0.0.0.10.in-addr.arpa"
-        # We need to drop leading octets outside the /aligned_prefix.
-        octets_kept = aligned_prefix // 8
-        parts = name.split(".")
-        # first 4 entries are the 4 IPv4 octets in reverse
-        reversed_octets = parts[:4]
-        suffix = ".".join(parts[4:])  # "in-addr.arpa"
-        keep = reversed_octets[4 - octets_kept :]
-        fqdn = ".".join(keep + [suffix])
-    else:
-        # IPv6 — reverse_pointer already yields a full nibble-aligned name.
-        # For prefixes that aren't nibble-aligned, round up to the next nibble.
-        aligned_prefix = ((net.prefixlen + 3) // 4) * 4
-        aligned = ipaddress.ip_network(f"{net.network_address}/{aligned_prefix}", strict=False)
-        name = aligned.network_address.reverse_pointer
-        nibbles_kept = aligned_prefix // 4
-        parts = name.split(".")
-        reversed_nibbles = parts[:32]
-        suffix = ".".join(parts[32:])  # "ip6.arpa"
-        keep = reversed_nibbles[32 - nibbles_kept :]
-        fqdn = ".".join(keep + [suffix])
-    return fqdn if fqdn.endswith(".") else fqdn + "."
+    # bits per reverse label, and labels in a full reverse pointer
+    bits, total = (8, 4) if isinstance(net, ipaddress.IPv4Network) else (4, 32)
+    names: list[str] = []
+    for piece in reverse_zone_pieces(net):
+        parts = piece.network_address.reverse_pointer.split(".")
+        labels = piece.prefixlen // bits  # octets (IPv4) or nibbles (IPv6) kept
+        keep = parts[:total][total - labels :]
+        names.append(".".join(keep + parts[total:]) + ".")
+    return names
 
 
 async def _inherited_dns_group(db: AsyncSession, subnet: Subnet) -> uuid.UUID | None:
@@ -129,15 +104,16 @@ async def _inherited_dns_group(db: AsyncSession, subnet: Subnet) -> uuid.UUID | 
     return None
 
 
-async def ensure_reverse_zone_for_subnet(
+async def ensure_reverse_zones_for_subnet(
     db: AsyncSession,
     subnet: Subnet,
     current_user: User | None,
     *,
     dns_group_id: uuid.UUID | None = None,
     dns_zone_id: uuid.UUID | None = None,
-) -> DNSZone | None:
-    """Create the matching reverse zone for ``subnet`` if one does not exist.
+) -> list[DNSZone]:
+    """Create the matching reverse zones for ``subnet`` where they do not exist:
+    one per /24 it spans (``compute_reverse_zone_names``, spatiumddi#1840).
 
     Resolution of the server group:
 
@@ -149,15 +125,15 @@ async def ensure_reverse_zone_for_subnet(
        with inheritance off, else its space — the same walk
        ``GET /subnets/{id}/effective-dns`` answers with: the effective zone's
        group, then the effective ``dns_group_ids[0]`` (spatiumddi#1149).
-    4. If no group can be resolved the call is a no-op and returns ``None``.
+    4. If no group can be resolved the call is a no-op and returns ``[]``.
 
-    The function is idempotent: if a reverse zone with the computed FQDN
-    already exists in the resolved group it is returned unchanged (or, #844,
+    The function is idempotent, per zone of the set: one that already exists
+    in the resolved group is returned unchanged (or, #844,
     refused when an overlapping subnet in another IP space owns it — however
     the group was resolved). A zone of that name SpatiumDDI does not author —
     a forwarder, a secondary or a stub — is not adopted: another server owns
-    the subnet's reverse names, so the call returns ``None`` and creates
-    nothing beside it (spatiumddi#1419).
+    the subnet's reverse names, so that zone is left out of the result and
+    nothing is created beside it (spatiumddi#1419).
 
     Writes an ``audit_log`` entry on newly-created zones.
     """
@@ -193,7 +169,7 @@ async def ensure_reverse_zone_for_subnet(
             subnet_id=str(subnet.id),
             network=str(subnet.network),
         )
-        return None
+        return []
 
     group = await db.get(DNSServerGroup, group_id)
     if group is None:
@@ -202,27 +178,72 @@ async def ensure_reverse_zone_for_subnet(
             subnet_id=str(subnet.id),
             group_id=str(group_id),
         )
-        return None
+        return []
 
-    # 2. Compute reverse FQDN
+    # 2. Compute the reverse FQDNs — one per /24 (nibble piece) the subnet spans
     try:
-        reverse_name = compute_reverse_zone_name(str(subnet.network))
+        names = compute_reverse_zone_names(str(subnet.network))
     except ValueError:
         logger.warning(
             "reverse_zone_compute_failed",
             subnet_id=str(subnet.id),
             network=str(subnet.network),
         )
-        return None
+        return []
 
-    # 3. Idempotency — return any existing zone with this FQDN in this group
-    existing_q = await db.execute(
-        select(DNSZone).where(
-            DNSZone.group_id == group.id,
-            DNSZone.name == reverse_name,
+    # 3. Zones of the set that already exist (one query, not one per name)
+    found = (
+        (
+            await db.execute(
+                select(DNSZone).where(DNSZone.group_id == group.id, DNSZone.name.in_(names))
+            )
         )
+        .scalars()
+        .all()
     )
-    existing = existing_q.scalar_one_or_none()
+    by_name = {z.name: z for z in found}
+    out: list[DNSZone] = []
+    for name in names:
+        zone = await _ensure_zone_named(db, subnet, group, name, by_name.get(name), current_user)
+        if zone is not None:
+            out.append(zone)
+    if any(z.name not in by_name for z in out):
+        # One wake for the whole set, however many zones it created (a /17
+        # makes 128): the collector is a set, flushed once after the commit,
+        # so the agents re-render once rather than waiting for the safety
+        # tick. No-op outside a request (Celery callers converge on the
+        # bundle-dirty render, which wakes its own servers).
+        collect_wake(dns_group_channel(group.id))
+    return out
+
+
+async def ensure_reverse_zone_for_subnet(
+    db: AsyncSession,
+    subnet: Subnet,
+    current_user: User | None,
+    *,
+    dns_group_id: uuid.UUID | None = None,
+    dns_zone_id: uuid.UUID | None = None,
+) -> DNSZone | None:
+    """:func:`ensure_reverse_zones_for_subnet`, returning the first zone of the
+    set (or ``None``)."""
+    zones = await ensure_reverse_zones_for_subnet(
+        db, subnet, current_user, dns_group_id=dns_group_id, dns_zone_id=dns_zone_id
+    )
+    return zones[0] if zones else None
+
+
+async def _ensure_zone_named(
+    db: AsyncSession,
+    subnet: Subnet,
+    group: DNSServerGroup,
+    reverse_name: str,
+    existing: DNSZone | None,
+    current_user: User | None,
+) -> DNSZone | None:
+    """Idempotently ensure ONE reverse zone of ``subnet``'s set exists.
+    ``existing`` is the zone of that name already in the group, if any."""
+    # Idempotency — an existing zone with this FQDN in this group is returned.
     if existing is not None and not ipam_authors_zone(existing):
         # #1419 — a forwarder, a secondary or a stub of this name: another
         # server owns the subnet's reverse names. It is not the subnet's
@@ -342,29 +363,6 @@ async def ensure_reverse_zone_for_subnet(
 # rendered to the agents. The permanent path deleted it with a bare set-based
 # DELETE — no queued-op sweep, no agent wake, and no thought for a sibling
 # subnet sharing the aggregated /24. Both paths now go through here.
-
-
-def reverse_zone_network(name: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
-    """The network an octet-aligned ``in-addr.arpa`` (nibble-aligned
-    ``ip6.arpa``) zone name covers — the inverse of
-    :func:`compute_reverse_zone_name`. ``None`` for any other name."""
-    labels = name.lower().rstrip(".").split(".")
-    if labels[-2:] == ["in-addr", "arpa"]:
-        octets = labels[:-2][::-1]
-        if not 1 <= len(octets) <= 3 or not all(o.isdigit() and int(o) <= 255 for o in octets):
-            return None
-        addr = ".".join(octets + ["0"] * (4 - len(octets)))
-        return ipaddress.ip_network(f"{addr}/{8 * len(octets)}")
-    if labels[-2:] == ["ip6", "arpa"]:
-        nibbles = labels[:-2][::-1]
-        if not 1 <= len(nibbles) <= 32 or not all(
-            len(n) == 1 and n in "0123456789abcdef" for n in nibbles
-        ):
-            return None
-        hexstr = "".join(nibbles).ljust(32, "0")
-        addr = ":".join(hexstr[i : i + 4] for i in range(0, 32, 4))
-        return ipaddress.ip_network(f"{addr}/{4 * len(nibbles)}")
-    return None
 
 
 async def surviving_sharer(db: AsyncSession, zone: DNSZone, subnet: Subnet) -> uuid.UUID | None:

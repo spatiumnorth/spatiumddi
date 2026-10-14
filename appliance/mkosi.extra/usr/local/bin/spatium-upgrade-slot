@@ -293,9 +293,20 @@ def _write_progress(step: str, pct: int | None = None, detail: str = "") -> None
                 "at": datetime.now(timezone.utc).isoformat(),
             }
         )
+        # #1747 — temp + fsync + rename + directory fsync. Without the
+        # fsyncs a power loss can leave the renamed file length-extended and
+        # unwritten, i.e. NUL bytes the supervisor then ships upward.
         tmp = _PROGRESS_FILE.with_name(_PROGRESS_FILE.name + ".new")
-        tmp.write_text(payload, encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
         tmp.replace(_PROGRESS_FILE)
+        dfd = os.open(_PROGRESS_FILE.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
     except OSError:
         # Progress reporting is cosmetic — a write failure must never
         # abort the slot apply itself, so swallow it.
