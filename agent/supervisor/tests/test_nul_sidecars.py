@@ -75,3 +75,91 @@ def test_progress_strings_are_scrubbed(
         "detail": "ab",
         "pct": 3,
     }
+
+
+# --- an unparseable state is healed by the clear paths ----------------------
+
+
+@pytest.fixture
+def appliance_state_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setattr(st, "detect_deployment_kind", lambda: "appliance")
+    paths = {
+        "state": tmp_path / "slot-upgrade-pending.state",
+        "trigger": tmp_path / "slot-upgrade-pending",
+        "marker": tmp_path / "slot-upgrade-fired-url",
+        "progress": tmp_path / "slot-upgrade.progress",
+    }
+    monkeypatch.setattr(st, "_HOST_SLOT_STATE", paths["state"])
+    monkeypatch.setattr(st, "_TRIGGER_FILE", paths["trigger"])
+    monkeypatch.setattr(st, "_FIRED_URL_MARKER", paths["marker"])
+    monkeypatch.setattr(st, "_SLOT_UPGRADE_PROGRESS", paths["progress"])
+    return paths
+
+
+@pytest.mark.parametrize("raw", [b"\x00" * 64, b"", b"garbage"])
+def test_clear_command_heals_an_unparseable_state(appliance_state_files, raw: bytes) -> None:
+    """A NUL-filled state is not ``in-flight``, so no crash detector keys on
+    it; left alone, the operator's clear could never be acknowledged."""
+    appliance_state_files["state"].write_bytes(raw)
+    assert st.apply_clear_upgrade_command() is True
+    assert st._last_upgrade_state_from_sidecar()[0] == "ready"
+
+
+def test_clear_command_still_leaves_a_live_inflight_alone(appliance_state_files) -> None:
+    appliance_state_files["state"].write_text("in-flight 2026-10-11T16:01:54+00:00\n")
+    st.apply_clear_upgrade_command()
+    assert st._last_upgrade_state_from_sidecar()[0] == "in-flight"
+
+
+def test_passive_heal_resets_an_unparseable_state(appliance_state_files) -> None:
+    appliance_state_files["state"].write_bytes(b"\x00" * 64)
+    st.clear_fleet_upgrade_marker()
+    assert st._last_upgrade_state_from_sidecar()[0] == "ready"
+
+
+def test_passive_heal_leaves_done_alone(appliance_state_files) -> None:
+    appliance_state_files["state"].write_text("done 2026-10-11T16:01:54+00:00\n")
+    st.clear_fleet_upgrade_marker()
+    assert st._last_upgrade_state_from_sidecar()[0] == "done"
+
+
+# --- the heartbeat body never carries a NUL, whatever field it came from ------
+
+
+def test_heartbeat_body_is_sent_without_nul(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import types
+    import uuid
+
+    import httpx
+    import structlog
+
+    from spatium_supervisor import heartbeat as hb
+
+    monkeypatch.setattr(
+        st,
+        "collect",
+        lambda: {"some_host_field": "ok\x00\x00", "nested": {"k": ["a\x00b"]}},
+    )
+    monkeypatch.setattr(st, "detect_deployment_kind", lambda: "docker")
+    monkeypatch.setattr(st, "read_firewall_state", dict)
+    monkeypatch.setattr(hb, "probe_port_conflicts", dict)
+    monkeypatch.setattr(hb, "_capabilities_payload", dict)
+    monkeypatch.setattr(hb, "_effective_control_plane_url", lambda cfg: "http://cp.invalid")
+    monkeypatch.setattr(hb, "load_cert", lambda d: None)
+
+    sent: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.content)
+        raise httpx.ConnectError("stop here", request=request)
+
+    cfg = types.SimpleNamespace(heartbeat_interval_seconds=0, state_dir=tmp_path)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        hb.heartbeat_once(
+            cfg, uuid.uuid4(), "tok", None, client, structlog.get_logger()  # type: ignore[arg-type]
+        )
+    assert len(sent) == 1
+    body = json.loads(sent[0])
+    assert "\\u0000" not in sent[0].decode() and "\x00" not in sent[0].decode()
+    assert body["some_host_field"] == "ok"
+    assert body["nested"] == {"k": ["ab"]}

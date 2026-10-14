@@ -316,21 +316,21 @@ def _durable_default_from_grubenv() -> str | None:
     return None
 
 
-# #1747 — a power loss right after a host runner's write leaves the file
-# length extended but the data blocks unwritten: the file reads back as
-# NUL bytes (or a truncated prefix). Postgres refuses U+0000 in a text
-# value, so one NUL in anything the heartbeat carries makes the api answer
-# 422 to EVERY heartbeat from the node — its Fleet row freezes for good.
-# So every free-text value read off a host sidecar goes through
-# ``_scrub_text`` before it can reach the wire, and a state file that is
-# nothing but NULs reads as unknown (the same as unparseable), never as a
-# state.
+# #1747 — a power loss right after a write can leave a host sidecar with its
+# length extended but its data blocks unwritten: it reads back as NUL bytes,
+# or as a prefix followed by NULs. Postgres refuses U+0000 in a text value,
+# so one NUL in anything the heartbeat carries makes the api answer 422 to
+# EVERY heartbeat from the node and its Fleet row freezes. So every
+# free-text value read off a slot-upgrade sidecar goes through
+# ``_scrub_text``, and a state file that does not parse (all NULs, empty,
+# truncated) reads as unknown, never as a state.
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_SLOT_STATES = ("ready", "in-flight", "done", "failed")
 
 
 def _scrub_text(text: str) -> str:
     """Drop NUL and every C0 control character except ``\\n`` and ``\\t``
-    (``\\r`` too is dropped — splitlines already handles it)."""
+    (``\\r`` too: ``splitlines`` already splits on it)."""
     return _CONTROL_CHARS_RE.sub("", text)
 
 
@@ -345,15 +345,29 @@ def _scrub_json(value: object) -> object:
     return value
 
 
+def _read_slot_state_word() -> str | None:
+    """The first word of the .state sidecar, scrubbed, or None when it is
+    not one of the four states (empty, NUL-filled, garbage). Raises OSError
+    like ``read_text``."""
+    parts = _scrub_text(_HOST_SLOT_STATE.read_text(encoding="utf-8", errors="replace")).split(
+        maxsplit=1
+    )
+    return parts[0] if parts and parts[0] in _SLOT_STATES else None
+
+
 def _write_sidecar_durable(path: Path, text: str) -> None:
     """Overwrite ``path`` in place and fsync it (#1747).
 
-    In place, not temp-file + rename, deliberately: release-state is a
+    In place, not temp file + rename, deliberately: release-state is a
     sticky directory and the host runner owns these files as root, so this
     unprivileged process may write them (0660, shared gid) but can never
-    replace them by rename. The host runners themselves DO use temp +
-    fsync + rename + directory fsync (``spatium_atomic_write`` in the bash
-    runners, ``_write_progress`` in spatium-upgrade-slot)."""
+    replace them by rename. The truncate-then-write is not atomic: a power
+    loss inside it can still leave the file empty or NUL-filled. The fsync
+    narrows that window to this call, and the readers are the real safety
+    net — an unparseable state reads as unknown, and the clear paths below
+    heal it. The host runners use temp + fsync + rename + directory fsync
+    (``atomic_write`` in the bash runners, ``_write_progress`` in
+    spatium-upgrade-slot)."""
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
         fh.flush()
@@ -386,14 +400,12 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     if not _HOST_SLOT_STATE.exists():
         return "ready", None
     try:
-        text = _scrub_text(
-            _HOST_SLOT_STATE.read_text(encoding="utf-8", errors="replace")
-        ).strip()
+        text = _scrub_text(_HOST_SLOT_STATE.read_text(encoding="utf-8", errors="replace")).strip()
     except OSError:
         return None, None
     parts = text.split(maxsplit=1)
     state = parts[0] if parts else None
-    if state not in ("ready", "in-flight", "done", "failed"):
+    if state not in _SLOT_STATES:
         return None, None
     stamp = None
     if len(parts) > 1:
@@ -461,9 +473,7 @@ def _reap_stale_inflight(
     try:
         _write_sidecar_durable(
             _SLOT_UPGRADE_PROGRESS,
-            json.dumps(
-                {"step": "failed", "pct": None, "detail": reason, "at": now.isoformat()}
-            ),
+            json.dumps({"step": "failed", "pct": None, "detail": reason, "at": now.isoformat()}),
         )
     except OSError:
         # Cosmetic breadcrumb only — the durable "failed" .state written
@@ -910,7 +920,7 @@ def clear_fleet_upgrade_marker() -> None:
     """#386 Part B — the control plane reports no upgrade desired
     (cleared via the Cancel button, or never set). Drop the fire-once
     marker so a future Apply of the same URL re-fires, and reset a stale
-    ``failed`` state back to ``ready`` so a cancelled failure stops
+    ``failed`` (or unreadable, #1747) state back to ``ready`` so a cancelled failure stops
     sticking on the Fleet chip. No-op off-appliance, and never touches
     an in-flight apply (trigger file present)."""
     if detect_deployment_kind() != "appliance":
@@ -924,14 +934,11 @@ def clear_fleet_upgrade_marker() -> None:
     if _TRIGGER_FILE.exists():
         return
     try:
-        if _HOST_SLOT_STATE.exists():
-            parts = _scrub_text(
-                _HOST_SLOT_STATE.read_text(encoding="utf-8", errors="replace")
-            ).split(maxsplit=1)
-            if parts and parts[0] == "failed":
-                _write_sidecar_durable(
-                    _HOST_SLOT_STATE, f"ready {datetime.now(UTC).isoformat()}\n"
-                )
+        # #1747 — an unparseable state (NUL-filled by a power loss) is as
+        # stuck as a failed one, and with no trigger present nothing else
+        # will ever rewrite it.
+        if _HOST_SLOT_STATE.exists() and _read_slot_state_word() in ("failed", None):
+            _write_sidecar_durable(_HOST_SLOT_STATE, f"ready {datetime.now(UTC).isoformat()}\n")
     except OSError:
         # Best-effort heal — if the state sidecar can't be read/rewritten
         # the chip just keeps its last value; the next apply overwrites it.
@@ -973,9 +980,7 @@ def apply_clear_upgrade_command() -> bool:
             # Surfaced rather than swallowed: if the stranded trigger
             # survives, the operator's clear silently didn't take and the
             # box stays wedged — exactly the failure this exists to fix.
-            log.warning(
-                "supervisor.clear_upgrade.unlink_failed", path=str(path), error=str(exc)
-            )
+            log.warning("supervisor.clear_upgrade.unlink_failed", path=str(path), error=str(exc))
 
     # Only rewrite a state that is actually stuck. Two reasons: a healthy
     # box would otherwise report "cleared" on every heartbeat inside the
@@ -984,15 +989,12 @@ def apply_clear_upgrade_command() -> bool:
     # and the supervisor's stale-in-flight reaper — so a mid-apply Cancel
     # could leave a truncated image with nothing recording the failure.
     try:
-        if _HOST_SLOT_STATE.exists():
-            current = _scrub_text(
-                _HOST_SLOT_STATE.read_text(encoding="utf-8", errors="replace")
-            ).split(maxsplit=1)
-            if current and current[0] == "failed":
-                _write_sidecar_durable(
-                    _HOST_SLOT_STATE, f"ready {datetime.now(UTC).isoformat()}\n"
-                )
-                reset = True
+        # #1747 — an unparseable state (NUL-filled by a power loss) is stuck
+        # too: it is not ``in-flight``, so no crash detector keys on it, and
+        # leaving it would keep this clear from ever being acknowledged.
+        if _HOST_SLOT_STATE.exists() and _read_slot_state_word() in ("failed", None):
+            _write_sidecar_durable(_HOST_SLOT_STATE, f"ready {datetime.now(UTC).isoformat()}\n")
+            reset = True
     except OSError as exc:
         log.warning("supervisor.clear_upgrade.state_reset_failed", error=str(exc))
 
@@ -1384,7 +1386,7 @@ def _read_slot_upgrade_log_tail(lines: int = 40, max_chars: int = 8000) -> str:
         text = _SLOT_UPGRADE_LOG.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
-    # #1747 — NULs from an unwritten tail (power loss) make the api 422
+    # #1747 — NULs from an unwritten tail (power loss) made the api 422
     # every heartbeat; scrub before slicing so the cap counts what is sent.
     tail = "\n".join(_scrub_text(text).splitlines()[-lines:])
     return tail[-max_chars:] if len(tail) > max_chars else tail
@@ -1395,21 +1397,19 @@ def _read_slot_upgrade_progress() -> dict[str, object] | None:
     writes to the progress sidecar (step / pct / detail / at). None when
     absent / unreadable / malformed."""
     try:
-        data = json.loads(
-            _SLOT_UPGRADE_PROGRESS.read_text(encoding="utf-8", errors="replace")
-        )
+        data = json.loads(_SLOT_UPGRADE_PROGRESS.read_text(encoding="utf-8", errors="replace"))
     except (OSError, ValueError):
-        # NUL-filled / truncated (power loss, #1747) is unknown, not a crash.
+        # NUL-filled or truncated by a power loss (#1747): unknown, not a crash.
         return None
-    return _scrub_json(data) if isinstance(data, dict) else None  # type: ignore[return-value]
+    if not isinstance(data, dict):
+        return None
+    return {_scrub_text(str(k)): _scrub_json(v) for k, v in data.items()}
 
 
 def read_boot_id() -> str | None:
     """This boot's kernel boot id, or None when it cannot be read."""
     try:
-        value = (
-            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
-        )
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
     except OSError:
         return None
     return value or None
@@ -2013,9 +2013,7 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
     # fingerprint — the budget bounds "this node's demote", period.
     fingerprint = "leave"
     if not _cluster_transition_should_fire(
-        _CLUSTER_LEAVE_TRIGGER_FILE,
-        fingerprint,
-        max_attempts=_CLUSTER_LEAVE_MAX_ATTEMPTS,
+        _CLUSTER_LEAVE_TRIGGER_FILE, fingerprint, max_attempts=_CLUSTER_LEAVE_MAX_ATTEMPTS
     ):
         return False
     try:
@@ -2263,8 +2261,12 @@ def maybe_fire_apt_reload(bundle_block: object) -> bool:
             "unattended": bundle_block.get("unattended") or {},
         }
     )
-    payload = ("enabled\n" if enabled else "disabled\n") + (config_hash + "\n") + blob
-    return _fire_host_config(_APT_TRIGGER_FILE, _APT_HASH_SIDECAR, config_hash, payload)
+    payload = (
+        ("enabled\n" if enabled else "disabled\n") + (config_hash + "\n") + blob
+    )
+    return _fire_host_config(
+        _APT_TRIGGER_FILE, _APT_HASH_SIDECAR, config_hash, payload
+    )
 
 
 def read_apt_state() -> str | None:
@@ -3509,9 +3511,7 @@ def read_network_state() -> dict[str, object] | None:
     # nothing rather than as a clean bill of health.
     stamped = fields.get("BOOT_ID", "")
     try:
-        current = (
-            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
-        )
+        current = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
     except OSError:
         current = ""
     if not stamped or not current or stamped != current:
@@ -3734,8 +3734,7 @@ def _booted_disk_kname() -> str | None:
             continue
         _props, links = _udev_properties(entry)
         if not any(
-            link.startswith("disk/by-uuid/")
-            and link.rsplit("/", 1)[-1].lower() == root_uuid
+            link.startswith("disk/by-uuid/") and link.rsplit("/", 1)[-1].lower() == root_uuid
             for link in links
         ):
             continue
@@ -3911,9 +3910,7 @@ def read_removable_disks(host_root: Path | None = None) -> list[dict[str, object
     return out
 
 
-def read_removable_mounts(
-    removable_root: Path | None = None,
-) -> list[dict[str, object]]:
+def read_removable_mounts(removable_root: Path | None = None) -> list[dict[str, object]]:
     """Live state of each configured removable mount (#989 item 3).
 
     ``mounted`` is decided by comparing st_dev with the parent's, which

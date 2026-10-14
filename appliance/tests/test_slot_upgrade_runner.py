@@ -234,3 +234,26 @@ def test_atomic_write_replaces_via_temp_and_fsyncs(tmp_path: Path) -> None:
         assert not [
             p for p in tmp_path.iterdir() if p.name.startswith(target.name + ".")
         ]
+
+
+def test_atomic_write_creates_a_missing_target_readable(tmp_path: Path) -> None:
+    """First write of a sidecar: mktemp's 0600 must not leak through, or the
+    supervisor (a different user) could never read the state."""
+    for script in _HOST_RUNNERS:
+        target = tmp_path / f"{script}.new.state"
+        src = _extract_atomic_write(script) + f'\natomic_write "{target}" "in-flight X"\n'
+        r = subprocess.run(["bash", "-c", src], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        assert target.read_text() == "in-flight X\n"
+        assert (target.stat().st_mode & 0o777) == 0o644
+
+
+def test_atomic_write_failure_leaves_the_target_and_no_temp(tmp_path: Path) -> None:
+    """A write that cannot complete returns non-zero and never replaces the
+    target with a partial file."""
+    for script in _HOST_RUNNERS:
+        target = tmp_path / "missing-dir" / "x.state"
+        src = _extract_atomic_write(script) + f'\natomic_write "{target}" "done"\n'
+        r = subprocess.run(["bash", "-c", src], capture_output=True, text=True)
+        assert r.returncode != 0
+        assert not target.exists()

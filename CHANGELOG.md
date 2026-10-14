@@ -344,18 +344,24 @@ the formatter handles the rest.
   Fleet row (#1747).** The slot-upgrade runners wrote their state and
   progress sidecars with a plain redirect and no fsync, so a power loss
   right after "apply succeeded" could leave `slot-upgrade.log` or a
-  sidecar as a run of NUL bytes. The supervisor sends the log tail on
-  every heartbeat, Postgres refuses a NUL in a text value, and the api
-  answered 422 to every heartbeat from that node until someone edited the
-  file by hand. The supervisor now strips NUL and other control
-  characters from the log tail and the progress sidecar and reads a
-  NUL-filled or truncated state or progress file as unknown. The host
-  runners (`spatiumddi-slot-upgrade`, `-slot-set-next-boot`,
-  `-slot-set-default`, `-slot-rollback`, `spatium-upgrade-slot`) write
-  their sidecars to a temp file, fsync it, rename it over the target and
-  fsync the directory, and the main runner fsyncs the log after the
-  apply. The supervisor's own in-place writes into the sticky
-  `release-state` directory are fsynced.
+  sidecar ending in, or made of, NUL bytes. The supervisor sends the log
+  tail on every heartbeat, Postgres refuses a NUL in a text value, and the
+  api answered 422 to every heartbeat from that node until someone edited
+  the file by hand.
+  - The supervisor strips NUL and other control characters from the log
+    tail and the progress sidecar, and strips NUL from every string in
+    the heartbeat body before sending it, so a NUL in any other field
+    read off a host file cannot freeze the row either.
+  - A NUL-filled, empty or truncated state or progress file reads as
+    unknown. Clearing a failed upgrade, and the passive heal when no
+    upgrade is desired, reset an unreadable state to `ready` the way they
+    already reset `failed`.
+  - The host runners (`spatiumddi-slot-upgrade`, `-slot-set-next-boot`,
+    `-slot-set-default`, `-slot-rollback`, `spatium-upgrade-slot`) write
+    their sidecars to a temp file, fsync it, rename it over the target
+    and fsync the directory. The main runner also fsyncs the log after
+    the apply and, on every exit, the log and the trigger's terminal
+    rename.
 
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single

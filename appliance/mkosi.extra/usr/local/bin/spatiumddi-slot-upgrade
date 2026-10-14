@@ -185,6 +185,11 @@ on_exit() {
             [ -f "$TRIGGER" ] && mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
         fi
     fi
+    # #1747 — every exit from the apply region (done, fail, abrupt) gets the
+    # log tail and the trigger's terminal rename onto the disk: a rolling
+    # upgrade reboots the node seconds after "done", and #1747's power loss
+    # came 2.5 s after the reboot request.
+    fsync_path "$LOG" "$(dirname "$TRIGGER")"
 }
 
 if [ ! -f "$TRIGGER" ]; then
