@@ -210,7 +210,11 @@ async def test_copilot_technitium_role_into_group_holding_sha224_key_is_refused(
     plain = await _group(db_session, "plain-g")
     dst = await _group(db_session, "holds224g")
     await _key(db_session, dst, "k224", "hmac-sha224")
-    appliance = await _fleet_appliance(db_session, plain)
+    # The Copilot also checks the engine capability (#1856), so the appliance
+    # must advertise Technitium for the sha224 refusal to be the one reached.
+    appliance = await _fleet_appliance(
+        db_session, plain, capabilities={"can_run_dns_technitium": True}
+    )
     args = AssignApplianceRoleArgs(
         appliance_id=str(appliance.id), roles=["dns-technitium"], dns_group_id=str(dst.id)
     )
