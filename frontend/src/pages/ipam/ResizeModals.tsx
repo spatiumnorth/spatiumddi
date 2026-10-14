@@ -23,6 +23,7 @@ import {
   MODAL_BACKDROP_CLS,
   useModalDialog,
 } from "@/components/ui/use-draggable-modal";
+import { summarizeZoneNames } from "@/lib/dnsNames";
 import { cn } from "@/lib/utils";
 import {
   formatApiError,
@@ -454,14 +455,17 @@ export function ResizeSubnetModal({
                   <span className="text-muted-foreground">Reverse zones:</span>{" "}
                   {preview.reverse_zones_existing.length > 0 && (
                     <span className="font-mono text-[10px]">
-                      existing {preview.reverse_zones_existing.join(", ")}
+                      existing{" "}
+                      {summarizeZoneNames(preview.reverse_zones_existing)}
                     </span>
                   )}
                   {preview.reverse_zones_will_be_created.length > 0 && (
                     <span className="font-mono text-[10px]">
                       {" "}
                       + create{" "}
-                      {preview.reverse_zones_will_be_created.join(", ")}
+                      {summarizeZoneNames(
+                        preview.reverse_zones_will_be_created,
+                      )}
                     </span>
                   )}
                 </div>

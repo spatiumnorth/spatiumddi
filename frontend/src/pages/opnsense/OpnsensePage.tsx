@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Check,
   Clipboard,
@@ -65,7 +66,11 @@ export function OpnsensePage() {
     NEEDS_SUPERADMIN,
   );
   const qc = useQueryClient();
-  const { data: routers = [], isFetching } = useQuery({
+  const {
+    data: routers = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["opnsense-routers"],
     queryFn: opnsenseApi.listRouters,
   });
@@ -154,7 +159,9 @@ export function OpnsensePage() {
           {routers.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No OPNsense firewalls configured yet.
+                <ListEmpty error={listError} what="OPNsense firewalls">
+                  No OPNsense firewalls configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
