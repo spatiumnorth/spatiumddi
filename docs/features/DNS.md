@@ -1225,6 +1225,8 @@ The UI surfaces per-server results with zones-imported / zones-pushed / errors, 
 
 **Name targets are read the way the driver reads them (#1794).** A CNAME / DNAME / NS / PTR / MX / SRV / NAPTR / SVCB / HTTPS target with no trailing dot is relative to the zone on BIND9, Technitium (both drivers) and Windows without WinRM credentials, so `a.b` means `a.b.<zone>.`; on the cloud drivers and Windows over WinRM the name is taken as given, so `a.b` is already absolute. Drift and sync compare on that reading, so neither reports a false difference nor imports a duplicate.
 
+**Apex NS is not compared (#1857).** The transfer read drops the apex NS set, so the drift report ignores apex NS rows on both sides (a stored one, such as an importer's copy of the source's, would otherwise read "missing on server" forever). NS records below the apex are compared as usual.
+
 Manual drift checks from the subnet / block / space side use **Check DNS Sync** which only covers IPAM-managed records (A/AAAA/PTR). The group-level reconciliation covers everything in a zone.
 
 ---

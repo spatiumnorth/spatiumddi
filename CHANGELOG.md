@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Drift no longer lists a stored apex NS as missing on the server
+  (#1857).** The zone-transfer read drops the apex NS set on purpose
+  (SpatiumDDI owns it at the zone level), so a stored apex NS row, such
+  as the copy of the source's `@ NS` a Technitium or BIND9 import brings
+  in, could only ever read "missing on server", and the zone never
+  showed in sync whatever Sync did. Drift now compares neither side's
+  apex NS; delegations below the apex are still compared. The importers
+  keep the row, since the agent writes a zone's own apex NS records as
+  its NS set, so no migration and no stored data is deleted.
+
 - **Failed sign-ins are forwarded to syslog / SIEM as warnings, not info
   (#1874).** Every rejected sign-in (bad password, bad MFA code, locked or
   disabled account) is audited with `result="failure"`, which audit

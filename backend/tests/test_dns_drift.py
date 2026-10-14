@@ -361,3 +361,30 @@ def test_key_ignores_struct_fields_for_other_types() -> None:
         None,
         None,
     )
+
+
+async def test_stored_apex_ns_is_not_reported_missing(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """#1857 — the AXFR read drops the apex NS, so a stored apex NS row
+    (a Technitium import's copy of the source's) must not read as drift."""
+    group, _server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="imp.example.com."
+    )
+    db_session.add_all(
+        [
+            DNSRecord(zone_id=zone.id, name="@", record_type="NS", value="tech.lan.", ttl=3600),
+            DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1", ttl=300),
+            # A delegation below the apex is a real record and still counts.
+            DNSRecord(zone_id=zone.id, name="sub", record_type="NS", value="ns.sub.", ttl=300),
+        ]
+    )
+    await db_session.commit()
+    live = [RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300)]
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver(live))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    s = report.servers[0]
+    assert [(r.name, r.record_type) for r in s.missing_on_server] == [("sub", "NS")]
+    assert s.extra_on_server == []
+    assert s.in_sync == 1

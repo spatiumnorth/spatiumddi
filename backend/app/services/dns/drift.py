@@ -83,6 +83,14 @@ class ZoneDriftReport:
     warnings: list[str] = field(default_factory=list)
 
 
+def _is_apex_ns(r: RecordData | DNSRecord, zone_name: str) -> bool:
+    """An NS record at the zone apex (``@`` or the zone's own FQDN)."""
+    if r.record_type.upper() != "NS":
+        return False
+    name = (r.name or "").strip().lower()
+    return name in ("@", "", zone_name.strip().lower().rstrip(".") + ".")
+
+
 def _to_drift_record(r: RecordData | DNSRecord) -> DriftRecord:
     return DriftRecord(
         name=r.name or "@",
@@ -205,7 +213,14 @@ async def compute_zone_drift(
         # #1794 — a dot-less name target is relative on a zone-file driver and
         # absolute on a cloud one, so the DB side is keyed per server.
         rel = targets_are_relative(srv)
-        db_by_key = {_key(r, zone.name, relative_targets=rel): r for r in db_rows}
+        # #1857 — a zone transfer never carries the apex NS set (the AXFR
+        # reader drops it: SpatiumDDI owns it at the zone level), so a stored
+        # apex NS row — an importer's copy of the source's, or one an operator
+        # wrote — can only ever read "missing on server". It is not drift, it
+        # is a row the read cannot see; compare neither side.
+        db_rows_cmp = [r for r in db_rows if not _is_apex_ns(r, zone.name)]
+        on_wire = [r for r in on_wire if not _is_apex_ns(r, zone.name)]
+        db_by_key = {_key(r, zone.name, relative_targets=rel): r for r in db_rows_cmp}
         on_wire = without_agent_ns_glue(on_wire, srv, zone.name, set(db_by_key))
         wire_by_key = {_key(r, zone.name, relative_targets=rel): r for r in on_wire}
         entry.extra_on_server = [
