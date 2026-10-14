@@ -8504,7 +8504,7 @@ async def import_zone_preview(
         raise HTTPException(status_code=422, detail=str(exc))
 
     existing = await _load_zone_records(zone_id, db)
-    diff = diff_records(parsed.records, existing)
+    diff = diff_records(parsed.records, existing, zone_default_ttl=zone.ttl)
 
     return ImportPreviewResponse(
         zone_id=zone.id,
@@ -8554,7 +8554,7 @@ async def import_zone_commit(
         raise HTTPException(status_code=422, detail=str(exc))
 
     existing = await _load_zone_records(zone_id, db)
-    diff = diff_records(parsed.records, existing)
+    diff = diff_records(parsed.records, existing, zone_default_ttl=zone.ttl)
 
     # #1861 — the route takes ``write`` on ``dns_record``; a ``replace`` that
     # would remove records also takes ``delete``, as the record DELETE does.
