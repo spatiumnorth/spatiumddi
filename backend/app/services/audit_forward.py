@@ -55,6 +55,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.config import settings as _app_settings
+from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.settings import PlatformSettings
@@ -126,11 +127,36 @@ def _serialize(row: AuditLog) -> dict[str, Any]:
     }
 
 
-def _severity_bucket(result: str | None) -> str:
+def _severity_bucket(result: str | None, action: str | None = None) -> str:
+    """Bucket an audit row's ``result`` for the PRI / CEF / LEEF severity
+    and the ``min_severity`` gate.
+
+    #1874: three result spellings used to fall through to ``info``, so a
+    target filtered above info dropped them:
+
+    * ``failure`` on a ``login`` row is a rejected sign-in (bad password,
+      bad MFA code, locked or disabled account). It buckets with
+      ``denied``, not ``error``: the system worked and refused an
+      unauthenticated request, which is what ``denied`` means for an
+      authenticated one, and RFC 5424 severity 4 (warning) is where
+      authentication failures conventionally sit. ``err`` (3) means the
+      system itself failed — a provider timeout on the same ``login``
+      action is audited ``error`` and keeps that bucket. It also puts a
+      failed sign-in through the strictest selectable threshold, which
+      is the one an operator picks to see security refusals only.
+    * ``failure`` on anything else (a backup run, a backup drill, a
+      Wake-on-LAN send, an auth-provider test) is an operation that did
+      not work, so it ranks with ``failed``.
+    * ``forbidden`` is a refused request (non-superadmin break-glass or
+      secret reveal, throttled supervisor registration), the same thing
+      ``denied`` records under another name.
+    """
     r = (result or "").lower()
-    if r == "denied":
+    if r in ("denied", "forbidden"):
         return "denied"
-    if r in ("failed", "error"):
+    if r == "failure" and (action or "").lower() == "login":
+        return "denied"
+    if r in ("failed", "failure", "error"):
         return "error"
     return "info"
 
@@ -172,7 +198,8 @@ def _payload_severity(payload: dict[str, Any]) -> str:
     sev = payload.get("severity")
     if isinstance(sev, str) and sev:
         return sev.lower()
-    return _severity_bucket(payload.get("result"))
+    action = payload.get("action")
+    return _severity_bucket(payload.get("result"), action if isinstance(action, str) else None)
 
 
 def _payload_timestamp(payload: dict[str, Any]) -> str:
@@ -1011,7 +1038,9 @@ async def _ephemeral_session() -> AsyncIterator[AsyncSession]:
     ("another operation is in progress"). An ephemeral engine with
     ``NullPool`` has no loop-bound pool state to leak.
     """
-    engine = create_async_engine(_app_settings.database_url, poolclass=NullPool)
+    engine = create_async_engine(
+        _app_settings.database_url, poolclass=NullPool, connect_args=task_connect_args()
+    )
     try:
         async with AsyncSession(engine, expire_on_commit=False) as session:
             yield session

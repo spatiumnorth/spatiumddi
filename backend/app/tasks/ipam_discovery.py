@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.ipam import Subnet
 from app.services.ipam.discovery import reconcile_subnet, sweep_subnet
@@ -47,7 +48,9 @@ _DISCOVERY_LOCK_NS = 0x1DA_D15C  # "IPAM DISC"
 
 
 async def _run_subnet_discovery_async(subnet_id_str: str) -> dict[str, Any]:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         subnet_id = uuid.UUID(subnet_id_str)
@@ -176,7 +179,9 @@ def run_subnet_discovery(self: Any, subnet_id_str: str) -> dict[str, Any]:  # no
 
 
 async def _dispatch_due_async() -> int:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     factory = async_sessionmaker(engine, expire_on_commit=False)
     queued = 0
     skipped_do_not_probe = 0

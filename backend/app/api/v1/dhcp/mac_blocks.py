@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._mac import canonicalize_mac
 from app.core.agent_wake import collect_wake, dhcp_group_channel
@@ -197,7 +197,7 @@ async def list_mac_blocks(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[M
     status_code=status.HTTP_201_CREATED,
 )
 async def create_mac_block(
-    group_id: uuid.UUID, body: MACBlockCreate, db: DB, user: SuperAdmin
+    group_id: uuid.UUID, body: MACBlockCreate, db: DB, user: CurrentUser
 ) -> MACBlockResponse:
     grp = await db.get(DHCPServerGroup, group_id)
     if grp is None:
@@ -247,7 +247,7 @@ async def create_mac_block(
     response_model=MACBlockResponse,
 )
 async def update_mac_block(
-    block_id: uuid.UUID, body: MACBlockUpdate, db: DB, user: SuperAdmin
+    block_id: uuid.UUID, body: MACBlockUpdate, db: DB, user: CurrentUser
 ) -> MACBlockResponse:
     block = await db.get(DHCPMACBlock, block_id)
     if block is None:
@@ -277,7 +277,7 @@ async def update_mac_block(
 
 
 @router.delete("/mac-blocks/{block_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_mac_block(block_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_mac_block(block_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     block = await db.get(DHCPMACBlock, block_id)
     if block is None:
         raise HTTPException(status_code=404, detail="MAC block not found")

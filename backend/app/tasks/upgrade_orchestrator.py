@@ -37,6 +37,7 @@ import structlog
 from celery import shared_task
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.config import settings
 from app.db import task_session
 from app.services.upgrades.orchestrator import OrchestratorError, drive_upgrade
 
@@ -46,6 +47,10 @@ logger = structlog.get_logger(__name__)
 # again, up to this many times, this many seconds apart (#1449).
 _MAX_HANDOFF_HOPS = 30
 _HANDOFF_HOP_DELAY_S = 5
+# The rest of a run after its shared-tag flip waits for a worker on the new
+# tag, passed on this many times (10 min at 5 s) before it runs anyway
+# (#1710): the flip rolls the workers one at a time, a minute or two each.
+_MAX_VERSION_HOPS = 120
 
 
 async def _async_drive(run_id: str) -> dict[str, str]:
@@ -117,6 +122,7 @@ def drive_upgrade_run(  # type: ignore[type-arg]
     run_id: str,
     avoid_node: str | None = None,
     hops: int = 0,
+    avoid_version: str | None = None,
 ) -> dict[str, str]:
     """Celery entrypoint. ``run_id`` is the SystemUpgradeRun UUID as a
     str (Celery's JSON serializer can't carry UUIDs directly).
@@ -126,7 +132,13 @@ def drive_upgrade_run(  # type: ignore[type-arg]
     on rather than running it, so a worker elsewhere takes it. After
     ``_MAX_HANDOFF_HOPS`` passes (no other worker took it, say every other
     worker is down) it runs here anyway: a drive evicted mid-chain is
-    redelivered later, which beats one that never runs."""
+    redelivered later, which beats one that never runs.
+
+    ``avoid_version`` is set by the drive that flipped the shared charts'
+    image tag (#1710): the flip rolls every worker off that version, this
+    one's too, so a worker still running it passes the task on, up to
+    ``_MAX_VERSION_HOPS`` times, and a worker on the new version finishes
+    the run."""
     own = os.environ.get("NODE_NAME") or None
     if avoid_node and own == avoid_node and hops < _MAX_HANDOFF_HOPS:
         drive_upgrade_run.apply_async(  # type: ignore[attr-defined]
@@ -136,4 +148,34 @@ def drive_upgrade_run(  # type: ignore[type-arg]
         )
         logger.info("upgrade_drive_passed_on", run_id=run_id, node=own, hops=hops + 1)
         return {"run_id": run_id, "state": "passed_on"}
+    if avoid_version and settings.version == avoid_version and hops < _MAX_VERSION_HOPS:
+        drive_upgrade_run.apply_async(  # type: ignore[attr-defined]
+            args=[run_id],
+            kwargs={"avoid_version": avoid_version, "hops": hops + 1},
+            countdown=_HANDOFF_HOP_DELAY_S,
+        )
+        logger.info(
+            "upgrade_drive_passed_on_by_version",
+            run_id=run_id,
+            version=avoid_version,
+            hops=hops + 1,
+        )
+        return {"run_id": run_id, "state": "passed_on"}
     return asyncio.run(_async_drive(run_id))
+
+
+async def _async_release_lingering_hold() -> dict[str, str] | None:
+    from app.services.upgrades import shared_tags  # noqa: PLC0415
+
+    async with task_session() as db:
+        return await shared_tags.release_lingering_hold(db)
+
+
+@shared_task(name="app.tasks.upgrade_orchestrator.release_lingering_shared_tag_hold")
+def release_lingering_shared_tag_hold() -> dict[str, str] | None:
+    """Beat, every minute (#1710): end the shared-tag hold of a rolling run
+    that failed or was aborted, once every cluster member reports one
+    installed version (the operator finished, or took back, the roll node
+    by node). Without it the control plane would stay on the old tag until
+    a rolling run succeeded."""
+    return asyncio.run(_async_release_lingering_hold())

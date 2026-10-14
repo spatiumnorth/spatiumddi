@@ -30,10 +30,12 @@ pre-#62 handler when the module is off:
   delegate) — fidelity break.
 * Superadmin parity with the ORIGINAL ROUTE (so the approve path, which
   bypasses the delete route's dependencies, enforces identically):
-  subnet / block / space require superadmin only on the ``permanent``
-  branch; ``delete_zone`` / ``delete_scope`` / ``delete_group`` were
-  fully ``SuperAdmin``-gated at the route, so their ``apply()`` requires
-  superadmin ALWAYS. A failed check raises ``HTTPException(403)``.
+  subnet / block / space / ``delete_zone`` / ``delete_scope`` require
+  superadmin only on the ``permanent`` branch (the zone and scope routes
+  were fully ``SuperAdmin``-gated until #1861 opened their soft-delete to
+  the resource's ``delete`` permission); ``delete_group`` is still fully
+  ``SuperAdmin``-gated at the route, so its ``apply()`` requires superadmin
+  ALWAYS. A failed check raises ``HTTPException(403)``.
 * The ``permanent`` / ``force`` flags are frozen into the args model so
   the approved replay takes the *identical* branch the requester intended.
 * Audit ``action`` strings stay exactly as today (``soft_delete`` on the
@@ -793,10 +795,13 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     from app.models.audit import AuditLog
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
 
-    # The original DELETE route was fully SuperAdmin-gated — replicate here so
-    # the approve path (which bypasses the route's SuperAdmin dependency)
-    # enforces identically (#8). require_superadmin raises HTTPException(403).
-    require_superadmin(user)
+    # Parity with the route (#8): ``delete`` on ``dns_zone`` admits the
+    # default soft-delete (#1861), and only the permanent branch takes a
+    # superadmin, as on the IPAM deletes. The approve path bypasses the route's
+    # dependencies, so this is where it is enforced for it. Checked before any
+    # side effect; require_superadmin raises HTTPException(403).
+    if args.permanent:
+        require_superadmin(user)
 
     zone = await _require_zone(args.group_id, args.zone_id, db)  # raises 404 if absent
     _reject_if_synthesised_zone(zone, "delete")
@@ -937,8 +942,11 @@ async def _apply_delete_scope(
     from app.services.dhcp.windows_writethrough import push_scope_delete
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
 
-    # The original DELETE route was fully SuperAdmin-gated (#8).
-    require_superadmin(user)
+    # Parity with the route (#8): soft-delete on ``delete`` on ``dhcp_scope``
+    # (#1861), the permanent branch superadmin-only, checked before any side
+    # effect.
+    if args.permanent:
+        require_superadmin(user)
 
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:
