@@ -84,6 +84,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Creating a PXE profile with a name its group already holds is a 409,
+  not a 500 (#1911).** The name-clash check selected the whole profile,
+  whose `matches` collection is eager-joined, so the moment a clash
+  existed `scalar_one_or_none()` raised `InvalidRequestError` and the
+  route's own 409 was unreachable; renaming onto a taken name had the
+  same shape. Both checks now select only the id. No other DHCP / DNS
+  create or rename check loads a joined collection, so none shared it.
 - **Technitium: an hmac-sha224 TSIG key is refused instead of being
   installed and failing every signed transfer (#1858).** Technitium has
   no HMAC-SHA224 (`DnsDatagram.GetTsigMacSize` returns 0 for it), so a
