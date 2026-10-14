@@ -3833,6 +3833,9 @@ async def delete_appliance(
                 "or factory-reset / reinstall this box to decommission it.",
             )
 
+    # Ownership is judged on the state the appliance is deleted FROM (#1810):
+    # only an approved appliance may claim a row by hostname.
+    dependents = await _find_appliance_dependents(db, row)
     state_at_delete = row.state
     row.state = APPLIANCE_STATE_REVOKED
     row.revoked_at = datetime.now(UTC)
@@ -3845,7 +3848,6 @@ async def delete_appliance(
     # the supervisor's next heartbeat post-reauthorize re-runs role
     # assignment and the agent containers re-register, recreating the
     # rows automatically. Eventual consistency, but operator-invisible.
-    dependents = await _find_appliance_dependents(db, row)
     dependent_dns_names = [d.name for d in dependents.dns]
     dependent_dhcp_names = [d.name for d in dependents.dhcp]
     if dependents.dns or dependents.dhcp:

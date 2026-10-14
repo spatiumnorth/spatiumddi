@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting an appliance only removes servers provably its own
+  (#1810).** The hostname match on agent-registered DNS / DHCP rows now
+  applies only to an approved appliance, judged on the state it is deleted
+  from. A pending or revoked duplicate (a re-imaged box's stale entry)
+  claims its FK-owned rows only, so deleting it, or previewing the
+  delete, can no longer take a live appliance's servers, with their
+  settings such as the Kea `ha_peer_url`. The Kea HA firewall inputs
+  follow the same rule: an appliance's own HA member and a partner's
+  appliance are matched case-blind and only against approved
+  appliances, so a revoked duplicate's old node IPs no longer replace
+  the live partner's in the listener's allowed sources.
+
 - **A DHCP group change made through the Operator Copilot now moves the
   appliance's Kea server too (#1902).** `assign_appliance_role` (and the MCP
   `propose_assign_role` that proposes it) set the appliance's DHCP group
