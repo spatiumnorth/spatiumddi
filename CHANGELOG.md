@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Trashing a subnet now withdraws its own DNS records, instead of
+  leaving them answering from a zone that stays (#1906).** When one of
+  two subnets sharing a /24 reverse zone went to Trash, the zone was
+  correctly kept for the survivor, but the deleted subnet's host A
+  records, their PTRs and its gateway PTR kept being served, with no
+  page showing them. Trashing a subnet, block or space now retracts
+  the auto-generated A / AAAA / PTR records of every subnet it takes
+  through the record-op queue (agents and agentless primaries alike)
+  and trashes them under the same batch; Restore re-asserts them, and
+  purging the subnet drops them. A reverse zone that goes to Trash
+  with its subnet is unchanged. Hand-made records are left alone.
+
 - **A subnet wider than a /24 now gets a reverse zone for every /24 it
   spans, so every address gets its PTR (#1840).** A /17–/23 was given
   the zone of the /24 holding its network address, so in a /23 every

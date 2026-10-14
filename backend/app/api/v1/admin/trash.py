@@ -17,6 +17,7 @@ import structlog
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import String, cast, func, literal, select, union_all
+from sqlalchemy import delete as sa_delete
 
 from app.api.deps import DB, SuperAdmin
 from app.core.agent_wake import dns_group_channel, publish_wake
@@ -24,7 +25,7 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPScope
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.dhcp.lease_cleanup import delete_leases_for_scope
 from app.services.dhcp.static_ipam import (
     remirror_scope_statics,
@@ -338,7 +339,10 @@ async def restore_row(
     # skipped — the zone-delete path never retracts the provider (no hosted-zone
     # teardown on soft-delete, to avoid cloud zone-ID / NS churn), so its
     # cascade-deleted records are still live there and need no re-push.
-    restored_has_zone = any(isinstance(o, DNSZone) for o in restored)
+    # A record rides the zone's own un-stamp only when its ZONE is restored in
+    # this batch. A subnet's records in a zone that stayed (#1906) restore beside
+    # a retired reverse zone and still owe the provider their ``create``.
+    restored_zone_ids = {o.id for o in restored if isinstance(o, DNSZone)}
     # Records re-push per ZONE in one batch, not per record: a #963 bulk delete
     # restores as one batch of N independent records, and N singular pushes
     # would be N serial bumps and, on an agentless driver, N WinRM round trips
@@ -353,7 +357,7 @@ async def restore_row(
             # push_scope_restore re-creates the device scope and the next poll
             # re-populates them.
             await remirror_scope_statics(db, obj)
-        elif isinstance(obj, DNSRecord) and not restored_has_zone:
+        elif isinstance(obj, DNSRecord) and obj.zone_id not in restored_zone_ids:
             records_by_zone.setdefault(obj.zone_id, []).append(obj)
         db.add(
             AuditLog(
@@ -371,10 +375,18 @@ async def restore_row(
             )
         )
 
+    restore_wake_groups: set[uuid.UUID] = set()
     for zone_id, recs in records_by_zone.items():
         await push_records_restore(db, zone_id, recs)
+        zone_row = await db.get(DNSZone, zone_id)
+        if zone_row is not None:
+            restore_wake_groups.add(zone_row.group_id)
 
     await db.commit()
+    # This router carries no wake_publishing dependency (see the purge below),
+    # so the create ops queued above are announced here, after the commit.
+    for gid in restore_wake_groups:
+        await publish_wake(dns_group_channel(gid))
     logger.info(
         "trash.restore",
         batch_id=str(batch_id),
@@ -444,6 +456,22 @@ async def permanent_delete_from_trash(
         # them first, through the record-op queue. (A block or space can't
         # reach addresses from here: subnet.block_id / space_id are RESTRICT.)
         records_retracted, dns_wake_group_ids = await retract_address_records(db, [target.id])
+        # spatiumddi#1906 — the records retracted when the subnet was trashed sit
+        # in the Trash under its batch, ownerless once the addresses cascade.
+        # They are not served; drop them with the subnet instead of leaving a
+        # stray Trash entry per record.
+        if target.deletion_batch_id is not None:
+            await db.execute(
+                sa_delete(DNSRecord)
+                .where(
+                    DNSRecord.deletion_batch_id == target.deletion_batch_id,
+                    DNSRecord.auto_generated.is_(True),
+                    DNSRecord.ip_address_id.in_(
+                        select(IPAddress.id).where(IPAddress.subnet_id == target.id)
+                    ),
+                )
+                .execution_options(include_deleted=True, synchronize_session=False)
+            )
     db.add(
         AuditLog(
             user_id=current_user.id,
