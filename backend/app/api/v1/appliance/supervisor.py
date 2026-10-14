@@ -260,6 +260,32 @@ def _evicted_row_ignores_report(
     return row_state == CLUSTER_JOIN_STATE_LEFT and reported != CLUSTER_JOIN_STATE_LEFT
 
 
+def _stale_report_in_transition(
+    row_state: str | None, desired_role: str | None, reported: str
+) -> bool:
+    """PURE (#1806): a report that contradicts the transition the control plane
+    has already started must not move the row.
+
+    Demote/promote stamp ``leaving`` / ``joining`` on the row first; the node's
+    supervisor only learns of it on its next heartbeat response, and until its
+    host runner writes its own ``.state`` it keeps reporting the LAST verdict —
+    ``ready`` for a member, ``left`` for a node that was once demoted. Applied,
+    that overwrote ``leaving`` with ``ready`` (the Fleet showed a demoting member
+    as a healthy one for the whole leave) or ``joining`` with ``left``.
+
+    Guarded by explicit state: while the row says ``leaving`` for a demote, a
+    reported ``ready`` / ``joining`` is the pre-leave state and is ignored; while
+    it says ``joining`` for a promote, a reported ``left`` / ``leaving`` is the
+    pre-join state. ``left`` / ``failed`` / ``leaving`` (demote) and ``ready`` /
+    ``failed`` / ``joining`` (promote) still apply: they are the runner's own
+    progress, which is what ends the transition."""
+    if desired_role == DESIRED_CLUSTER_ROLE_NONE and row_state == CLUSTER_JOIN_STATE_LEAVING:
+        return reported in (CLUSTER_JOIN_STATE_READY, CLUSTER_JOIN_STATE_JOINING)
+    if desired_role == DESIRED_CLUSTER_ROLE_MEMBER and row_state == CLUSTER_JOIN_STATE_JOINING:
+        return reported in (CLUSTER_JOIN_STATE_LEFT, CLUSTER_JOIN_STATE_LEAVING)
+    return False
+
+
 # The last ignored report logged per row (this process), so a node that keeps
 # reporting the same state costs one log line, not one per heartbeat.
 _ignored_join_reports_logged: dict[uuid.UUID, str] = {}
@@ -2167,6 +2193,21 @@ async def supervisor_heartbeat(
                 appliance_id=str(row.id),
                 hostname=row.hostname,
                 row_state=row.cluster_join_state,
+                reported=body.cluster_join_state,
+            )
+    elif body.cluster_join_state is not None and _stale_report_in_transition(
+        row.cluster_join_state, row.desired_cluster_role, body.cluster_join_state
+    ):
+        # #1806 — the node still reports the state from before the transition
+        # the control plane started; keep the row's own.
+        if _ignored_join_reports_logged.get(row.id) != body.cluster_join_state:
+            _ignored_join_reports_logged[row.id] = body.cluster_join_state
+            logger.info(
+                "control_plane_stale_transition_report_ignored",
+                appliance_id=str(row.id),
+                hostname=row.hostname,
+                row_state=row.cluster_join_state,
+                desired=row.desired_cluster_role,
                 reported=body.cluster_join_state,
             )
     elif body.cluster_join_state is not None:

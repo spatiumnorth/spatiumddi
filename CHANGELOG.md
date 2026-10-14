@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A demoting control-plane member's row read `ready` for the whole
+  leave (#1806).** Demote stamps `leaving`, but the node keeps reporting
+  its last verdict (`ready`) until its leave runner writes its own state,
+  and the heartbeat applied it, so Fleet and the cluster view showed a
+  member being removed as healthy. While a demote is `leaving`, a reported
+  `ready` / `joining` is now ignored; the runner's own `leaving`, `left`
+  and `failed` still apply. The mirror race on promote (a once-demoted
+  node still reporting `left` while its row says `joining`) is guarded the
+  same way.
+
 - **The built-in Auditor and Compliance Editor could not read the
   audit log (#1862).** Both roles were granted `read` on `audit`, a
   resource type no route checks, while every audit-log route (the
