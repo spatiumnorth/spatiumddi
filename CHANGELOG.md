@@ -95,6 +95,12 @@ the formatter handles the rest.
   and trashes them under the same batch; Restore re-asserts them, and
   purging the subnet drops them. A reverse zone that goes to Trash
   with its subnet is unchanged. Hand-made records are left alone.
+  **This changes #1151's behaviour on purpose:** a trashed subnet's
+  records used to keep answering until the purge withdrew them (#1152
+  left that as an open question and the delete dialog described it);
+  they are now withdrawn when the subnet goes to Trash, and the dialog
+  says so. A restore can now refuse (409, naming the record) when an
+  identical record was created by hand while the subnet sat in Trash.
 
 - **A subnet wider than a /24 now gets a reverse zone for every /24 it
   spans, so every address gets its PTR (#1840).** A /17–/23 was given

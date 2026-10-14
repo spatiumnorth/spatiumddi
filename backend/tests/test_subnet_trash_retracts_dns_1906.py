@@ -9,12 +9,14 @@ re-asserts them.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.agent_wake import dns_group_channel
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSServerGroup, DNSZone
@@ -273,3 +275,109 @@ async def test_a_reverse_zone_that_goes_to_trash_with_its_subnet_is_unchanged(
     # Only the forward record is re-pushed; the zone's own records come back
     # with the zone (it is re-rendered whole).
     assert await _ops(db_session, server) == [(zone.name, "create", "host50", "A", ["10.97.5.50"])]
+
+
+@pytest.mark.asyncio
+async def test_trashing_a_block_retracts_its_subnets_records_and_restore_wakes_the_group(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The block soft delete takes its subnets' records with it, and the Trash
+    restore (a router with no ``wake_publishing``) wakes the group itself."""
+    headers = await _admin_headers(db_session)
+    grp, server, zone = await _dns(db_session)
+    space, outer = await _space_block(db_session, "10.98.0.0/16")
+    inner = IPBlock(space_id=space.id, parent_block_id=outer.id, network="10.98.7.0/24", name="i")
+    db_session.add(inner)
+    await db_session.commit()
+    sid = await _bound_subnet(client, headers, space, inner, "10.98.7.0/25", grp, zone)
+    await _address(client, headers, sid, "10.98.7.50", "blk50")
+    await _clear_ops(db_session)
+
+    resp = await client.delete(f"/api/v1/ipam/blocks/{inner.id}", headers=headers)
+    assert resp.status_code == 204, resp.text
+    assert await _live_records(db_session, zone.id) == []
+    assert (zone.name, "delete", "blk50", "A", []) in await _ops(db_session, server)
+
+    await _clear_ops(db_session)
+    woken = _record_wakes(monkeypatch, "app.api.v1.admin.trash")
+    resp = await client.post(f"/api/v1/admin/trash/ip_block/{inner.id}/restore", headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert await _live_records(db_session, zone.id) == [("blk50", "A", "10.98.7.50")]
+    assert (zone.name, "create", "blk50", "A", ["10.98.7.50"]) in await _ops(db_session, server)
+    assert dns_group_channel(grp.id) in woken
+
+
+class _RecordingDriver:
+    """An agentless (Windows DNS) driver that records what it is handed."""
+
+    def __init__(self) -> None:
+        self.changes: list[tuple[str, str, str]] = []
+
+    async def apply_record_change(self, _server: Any, change: Any) -> None:
+        self.changes.append((change.op, change.record.name, change.record.record_type))
+
+    async def apply_record_changes(self, server: Any, changes: list[Any]) -> list[Any]:
+        from app.drivers.dns.base import RecordChangeResult
+
+        for change in changes:
+            await self.apply_record_change(server, change)
+        return [RecordChangeResult(ok=True) for _ in changes]
+
+
+@pytest.mark.asyncio
+async def test_an_agentless_primary_is_told_on_trash_and_on_restore(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#632: an agentless provider is only changed by an explicit push, so the
+    trash owes it the delete and the restore owes it the create."""
+    headers = await _admin_headers(db_session)
+    grp, _, zone = await _dns(db_session, driver="windows_dns")
+    space, block = await _space_block(db_session, "10.99.0.0/16")
+    await db_session.commit()
+    rec = _RecordingDriver()
+    monkeypatch.setattr("app.services.dns.record_ops.get_driver", lambda _name: rec)
+    sid = await _bound_subnet(client, headers, space, block, "10.99.50.0/24", grp, zone)
+    await _address(client, headers, sid, "10.99.50.50", "win50")
+    rec.changes.clear()
+
+    resp = await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=headers)
+    assert resp.status_code == 204, resp.text
+    assert rec.changes == [("delete", "win50", "A")]
+    rec.changes.clear()
+
+    await _restore(client, headers, sid)
+    assert rec.changes == [("create", "win50", "A")]
+    assert await _live_records(db_session, zone.id) == [("win50", "A", "10.99.50.50")]
+
+
+@pytest.mark.asyncio
+async def test_purging_a_trashed_subnet_leaves_no_record_in_the_trash(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _admin_headers(db_session)
+    grp, server, zone, sid, _ = await _setup(
+        client, db_session, headers, "10.95.8.0/25", "10.95.8.128/25", "10.95.0.0/16"
+    )
+    await _address(client, headers, sid, "10.95.8.50", "gone50")
+    resp = await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=headers)
+    assert resp.status_code == 204, resp.text
+    batch = (
+        await db_session.execute(
+            select(Subnet.deletion_batch_id)
+            .where(Subnet.id == uuid.UUID(sid))
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one()
+    await _clear_ops(db_session)
+
+    resp = await client.delete(f"/api/v1/admin/trash/subnet/{sid}", headers=headers)
+    assert resp.status_code == 204, resp.text
+    left = (
+        await db_session.execute(
+            select(DNSRecord.name)
+            .where(DNSRecord.deletion_batch_id == batch)
+            .execution_options(include_deleted=True, populate_existing=True)
+        )
+    ).all()
+    assert left == []
+    assert await _ops(db_session, server) == []
