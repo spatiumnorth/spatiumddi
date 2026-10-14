@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Security dashboard counts failed sign-ins, and the TSIG reveal
+  stops calling the secret hashed (#1836, #1837).** The failed-login
+  panel filtered audit rows on `result="denied"`, but `/auth/login`
+  writes `"failure"` for a bad credential, so a real failed sign-in
+  never appeared; it now reads `"failure"`, matching the Copilot
+  health tool. Provider outages are written as `"error"` and stay out,
+  as they are not guesses. The TSIG key reveal said the secret was
+  "hashed at rest and can't be recovered"; it is Fernet-encrypted
+  (SpatiumDDI must read it to sign updates) and is simply not shown
+  again, so the copy now says that.
+
 - **One Fleet save that switches an appliance's DNS engine and its group
   moves the server row too (#1856).** The roles PUT moved only rows
   already carrying the new engine's driver, so when the old engine's
