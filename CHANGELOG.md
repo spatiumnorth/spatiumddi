@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DHCP group change made through the Operator Copilot now moves the
+  appliance's Kea server too (#1902).** `assign_appliance_role` (and the MCP
+  `propose_assign_role` that proposes it) set the appliance's DHCP group
+  pointer alone, so the Kea row stayed in the old group and its agent kept
+  serving there: the DHCP half of #1565, reachable only through the
+  Copilot. It now makes the same move the Fleet roles save does, with the
+  same refusals (a Kea and Windows DHCP mix, v6 scopes for Windows), which
+  preview reports and apply enforces before anything changes. The apply also
+  takes the appliance row lock and wakes the agents and both groups after
+  the commit.
+
 - **One Fleet save that switches an appliance's DNS engine and its group
   moves the server row too (#1856).** The roles PUT moved only rows
   already carrying the new engine's driver, so when the old engine's

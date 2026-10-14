@@ -3702,9 +3702,18 @@ async def _preview_assign_appliance_role(
     signer_problem = await _assign_role_signer_problem(db, row, args, lock=False)
     if signer_problem is not None:
         return PreviewResult(ok=False, detail=signer_problem)
-    move_problem = await _assign_role_dns_move_problem(db, row, args)
-    if move_problem is not None:
-        return PreviewResult(ok=False, detail=move_problem)
+    # #1856 / #1902 — both server moves' refusals, so an operator changing
+    # the DNS and DHCP groups in one proposal sees every reason it won't apply.
+    move_problems = [
+        problem
+        for problem in (
+            await _assign_role_dns_move_problem(db, row, args),
+            await _assign_role_dhcp_move_problem(db, user, row, args),
+        )
+        if problem is not None
+    ]
+    if move_problems:
+        return PreviewResult(ok=False, detail=" ".join(move_problems))
 
     preview_lines = [
         f"Assign roles to **{row.hostname}** ({appliance_uuid})",
@@ -3907,6 +3916,35 @@ async def _assign_role_dns_move_problem(
     return None
 
 
+async def _assign_role_dhcp_move_problem(
+    db: AsyncSession, user: User, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#1902 — the refusals the apply's Kea server move makes (a mixed
+    Kea / Windows group, v6 scopes for Windows), reported at preview. Read-only."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
+    from app.services.appliance.dhcp_group_move import (  # noqa: PLC0415
+        move_appliance_dhcp_servers,
+    )
+
+    if not args.dhcp_group_id or "dhcp_group_id" not in args.model_fields_set:
+        return None
+    try:
+        group = await db.get(DHCPServerGroup, UUID(args.dhcp_group_id))
+    except ValueError:
+        return None  # _assign_role_group_problem reports it
+    if group is None:
+        return None
+    try:
+        await move_appliance_dhcp_servers(
+            db, row, group, user, dry_run=True, roles=list(args.roles)
+        )
+    except HTTPException as exc:
+        return str(exc.detail)
+    return None
+
+
 async def _apply_assign_appliance_role(
     db: AsyncSession, user: User, args: AssignApplianceRoleArgs
 ) -> dict[str, Any]:
@@ -3984,6 +4022,20 @@ async def _apply_assign_appliance_role_locked(
             dhcp_group = await db.get(DHCPServerGroup, UUID(args.dhcp_group_id))
             if dhcp_group is None:
                 raise ValueError(f"DHCP group {args.dhcp_group_id} not found.")
+            # #1565 / #1902 — the same Kea server move the REST route makes: the
+            # pointer alone would leave the appliance's server in the old group.
+            # A refusal raises, and the proposal applies nothing.
+            from fastapi import HTTPException  # noqa: PLC0415
+
+            from app.services.appliance.dhcp_group_move import (  # noqa: PLC0415
+                move_appliance_dhcp_servers,
+            )
+
+            try:
+                dhcp_move = await move_appliance_dhcp_servers(db, row, dhcp_group, user)
+            except HTTPException as exc:
+                raise ValueError(str(exc.detail)) from exc
+            moved_servers.extend(dhcp_move.moved)
             row.assigned_dhcp_group_id = dhcp_group.id
         else:
             row.assigned_dhcp_group_id = None
