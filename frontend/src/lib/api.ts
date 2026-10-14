@@ -5941,7 +5941,10 @@ export interface PropagationCheckResult {
 export interface DNSKeyState {
   key_tag: number;
   key_type: "ksk" | "zsk" | "csk";
+  /** IANA DNSSEC algorithm number (13 = ECDSAP256SHA256). */
   algorithm: number;
+  /** IANA mnemonic; null for a number the server does not know. */
+  algorithm_name?: string | null;
   state: string;
   ds_records: string[];
   timing?: Record<string, string>;
@@ -9360,6 +9363,8 @@ export interface DHCPPool {
   end_ip: string;
   pool_type: string; // "dynamic" | "excluded" | "reserved" | "pd"
   class_restriction: string | null;
+  // Legacy, never served (#1689): Kea has no per-pool lease time. The API
+  // refuses a non-null value; send null only, to clear an old row.
   lease_time_override: number | null;
   options_override: Record<string, unknown> | null;
   // DHCPv6 prefix delegation (#368) — only set for pool_type === "pd".
@@ -12229,6 +12234,8 @@ export type ClusterUpgradeFailureCategory =
   | "node_did_not_rejoin"
   | "chart_bump_failed"
   | "uncordon_fail"
+  | "slot_image_mirror_not_ready"
+  | "release_failed"
   | "other";
 
 export type PreflightLevel = "ok" | "warn" | "fail";
@@ -12274,6 +12281,14 @@ export interface PerNodeProgress {
   // render the right operator-action hint. Absent on still-in-flight
   // nodes; set when the node's primitive returns ok=False.
   failure_category?: ClusterUpgradeFailureCategory;
+  // #1542 — set when the compensating release (uncordon + CNPG
+  // maintenance-window clear) itself failed, so the node is left held.
+  // ``stuck`` names what is still held: "cordon" / "maintenance_window".
+  release_failed?: {
+    error: string;
+    stuck: string[];
+    underlying_category?: ClusterUpgradeFailureCategory;
+  };
 }
 
 export interface ChartBumpProgress {

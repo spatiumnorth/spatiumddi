@@ -38,6 +38,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { pollUnlessRefused } from "@/lib/refusal";
 import { errMsg, inputCls } from "@/pages/dhcp/_shared";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // Relative "time ago" for the sync/pushed columns. Cheap, no dependency.
 function timeAgo(iso: string): string {
@@ -60,6 +61,13 @@ const PUSH_STATUS_STYLE: Record<BlockPushStatus, string> = {
 };
 
 export function BlockSyncPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks admin on 'manage_block_sync'.
+  const perms = usePermissions();
+  const adminGate = permissionGate(
+    perms.can("admin", "manage_block_sync"),
+    "Requires admin permission on block sync",
+  );
   const qc = useQueryClient();
 
   const [showArm, setShowArm] = useState<BlockTarget | null>(null);
@@ -182,6 +190,7 @@ export function BlockSyncPage() {
             setPageError(null);
             setShowNewBlock(true);
           }}
+          {...adminGate}
         >
           New block
         </HeaderButton>
@@ -441,7 +450,8 @@ export function BlockSyncPage() {
                           <button
                             type="button"
                             onClick={() => setLiftTarget(b)}
-                            className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-1 text-destructive hover:bg-destructive/10"
+                            className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                            {...adminGate}
                           >
                             <Ban className="h-3 w-3" />
                             Lift

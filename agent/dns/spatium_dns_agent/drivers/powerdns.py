@@ -430,6 +430,188 @@ def render_dnsdist_conf(opts: dict[str, Any], has_cert: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ── Zone kinds, masters and the apex SOA (#1521, #1522) ─────────────────────
+
+#: SpatiumDDI zone type → PowerDNS zone kind. PowerDNS has no stub kind:
+#: a stub's closest served equivalent is a secondary that transfers the
+#: whole zone from its primaries, which is what ``Slave`` does. ``forward``
+#: is absent on purpose — pdns auth cannot forward, and render() drops
+#: those zones loudly rather than serving or reporting them.
+_KIND_BY_ZONE_TYPE = {
+    "primary": "Native",
+    "master": "Native",
+    "secondary": "Slave",
+    "slave": "Slave",
+    "stub": "Slave",
+}
+
+#: PowerDNS 5.1 renamed the kinds Master→Primary / Slave→Secondary and
+#: both spellings read back depending on version, so kind comparisons go
+#: through this normalisation.
+_KIND_CATEGORY = {
+    "native": "native",
+    "master": "primary",
+    "primary": "primary",
+    "slave": "secondary",
+    "secondary": "secondary",
+}
+
+
+def _kind_category(kind: Any) -> str:
+    return _KIND_CATEGORY.get(str(kind or "").strip().lower(), "native")
+
+
+def _pdns_masters(entries: Any) -> list[str]:
+    """Bundle ``masters`` entries → PowerDNS ``masters`` strings.
+
+    The bundle wire shape is ``ip`` or ``ip@port`` (the control-plane
+    convention the BIND9 renderer also consumes); the PowerDNS API wants
+    ``ip`` or ``ip:port`` (``[v6]:port`` when ported). Anything that is
+    not an IP address, or carries a non-numeric port, is dropped — a
+    master pdns cannot parse would fail the whole zone write.
+    """
+    out: list[str] = []
+    for entry in entries or []:
+        text = str(entry).strip()
+        if not text:
+            continue
+        host, port = text, None
+        if "@" in text:
+            host, _, port_s = text.partition("@")
+            host = host.strip()
+            if not port_s.strip().isdigit() or not 1 <= int(port_s) <= 65535:
+                continue
+            port = int(port_s)
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        if port is None:
+            out.append(str(addr))
+        elif addr.version == 6:
+            out.append(f"[{addr}]:{port}")
+        else:
+            out.append(f"{addr}:{port}")
+    return out
+
+
+#: The ``notify`` value grammar (control-plane validator, #1316).
+_NOTIFY_VALUES = frozenset({"yes", "no", "explicit", "master-only", "primary-only"})
+
+
+def _also_notify_targets(entries: Any) -> list[str]:
+    """Bundle also-notify entries → PowerDNS ``ALSO-NOTIFY`` values (#1523).
+
+    The stored shape is BIND grammar, ``<ip> [port <n>] [key <name>]``
+    (#1316); the PowerDNS metadata wants ``ip`` / ``ip:port`` and has no
+    per-target TSIG key, so a key token is dropped. Unusable entries are
+    dropped by the same conversion the masters list goes through.
+    """
+    out: list[str] = []
+    for entry in entries or []:
+        tokens = str(entry).split()
+        if not tokens:
+            continue
+        port: str | None = None
+        if "port" in tokens:
+            idx = tokens.index("port")
+            if idx + 1 < len(tokens) and tokens[idx + 1].isdigit():
+                port = tokens[idx + 1]
+        host = tokens[0]
+        out.extend(_pdns_masters([f"{host}@{port}" if port else host]))
+    return out
+
+
+# Characters a zone-file / SOA name cannot carry unescaped — the same set
+# the BIND9 apex renderer guards (backend ``contains_zonefile_unsafe``
+# mirrors it on write; rows written before that guard still reach here).
+_NAME_UNSAFE_RE = re.compile(r'[\s;$()"@\\]|[\x00-\x1f\x7f]')
+
+
+def _absolute_name(value: Any) -> str | None:
+    """``value`` as an absolute domain name, or None if it cannot be one.
+
+    Same rule as the BIND9 apex renderer: ``primary_ns`` / ``admin_email``
+    are stored in SOA form with or without the trailing dot, and both
+    spellings are absolute names.
+    """
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if (
+        not name
+        or name == "."
+        or not name.isascii()
+        or name.startswith(".")
+        or ".." in name
+        or _NAME_UNSAFE_RE.search(name)
+    ):
+        return None
+    return name if name.endswith(".") else name + "."
+
+
+def _name_in_zone(value: Any, zone: str) -> str:
+    """How a stored name reads on the wire: absolute when it ends in a
+    dot, the apex for ``@`` / empty, otherwise relative to the apex."""
+    v = str(value or "").strip()
+    if v in ("", "@"):
+        return zone
+    return v if v.endswith(".") else f"{v}.{zone}"
+
+
+#: SOA timers served when a zone carries none (or an unusable one) —
+#: the same fallbacks the BIND9 renderer uses (#1171). The bundle ships
+#: ``refresh`` / ``retry`` / ``expire`` / ``minimum`` on every zone: the
+#: zone's own once its group serves them, else this same literal
+#: (``backend/app/services/dns/soa_timers.py``), so a group mixing
+#: PowerDNS and BIND9 agents serves one SOA per serial either way.
+_SOA_TIMER_FALLBACKS = (
+    ("refresh", 3600),
+    ("retry", 600),
+    ("expire", 86400),
+    ("minimum", 300),
+)
+
+
+def _soa_content(zone: dict[str, Any], zname: str) -> str:
+    """The apex SOA rdata for a PowerDNS-served primary zone (#1522).
+
+    MNAME from the zone's Primary NS, else its first declared apex NS,
+    else the ``ns1.<zone>`` placeholder the BIND9 renderer also serves;
+    RNAME from Admin Email, else ``admin.<zone>``. The serial is the
+    bundle's — the one the control plane stamped — and the timers are
+    the zone's own when the bundle carries usable ones.
+    """
+    declared_ns: list[str] = []
+    for rec in zone.get("records") or []:
+        if str(rec.get("type") or "").upper() != "NS":
+            continue
+        if _name_in_zone(rec.get("name") or "@", zname).lower() != zname.lower():
+            continue
+        target = _name_in_zone(rec.get("value") or "", zname)
+        if target != zname:
+            declared_ns.append(target)
+
+    mname = (
+        _absolute_name(zone.get("primary_ns"))
+        or (declared_ns[0] if declared_ns else None)
+        or f"ns1.{zname}"
+    )
+    rname = _absolute_name(zone.get("admin_email")) or f"admin.{zname}"
+    try:
+        serial = int(zone.get("serial") or 1)
+    except (TypeError, ValueError):
+        serial = 1
+    timers: list[int] = []
+    for field, fallback in _SOA_TIMER_FALLBACKS:
+        value = zone.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            timers.append(fallback)
+        else:
+            timers.append(value)
+    return f"{mname} {rname} {serial} {timers[0]} {timers[1]} {timers[2]} {timers[3]}"
+
+
 class PowerDNSDriver(DriverBase):
     """PowerDNS agent driver — Phase 1."""
 
@@ -565,13 +747,72 @@ class PowerDNSDriver(DriverBase):
             zname = (zone.get("name") or "").rstrip(".") + "."
             if not zname or zname == ".":
                 continue
-            ztype = zone.get("type", "primary")
+            ztype = str(zone.get("type", "primary") or "primary").lower()
             if ztype == "forward":
-                # Phase 1: skip forward zones on PowerDNS — they're a
-                # recursor concept and the authoritative server doesn't
-                # consume them. The control-plane validator will surface
-                # this via the capabilities() dict in Phase 2.
+                # PowerDNS Authoritative cannot serve a forward zone —
+                # forwarding is a recursor concept. Drop it LOUDLY
+                # (#1521): before, the zone vanished silently here while
+                # its serial was still reported to the control plane as
+                # if it were live. The zone-state reporter now reads the
+                # served serials back from pdns, so a forward zone is no
+                # longer reported either.
+                log.warning(
+                    "powerdns_forward_zone_not_served",
+                    zone=zname,
+                    hint=(
+                        "PowerDNS authoritative does not serve forward "
+                        "zones; use a BIND9 group for this zone."
+                    ),
+                )
                 continue
+            kind = _KIND_BY_ZONE_TYPE.get(ztype, "Native")
+            masters = _pdns_masters(zone.get("masters")) if kind == "Slave" else []
+            if kind == "Slave" and not masters:
+                # A secondary with no usable primaries can never
+                # transfer; pdns would serve an empty copy
+                # authoritatively. Skip it loudly, as the BIND9
+                # renderer skips a masters-less secondary stanza.
+                log.warning(
+                    "powerdns_secondary_zone_no_masters_skipped",
+                    zone=zname,
+                    zone_type=ztype,
+                )
+                continue
+            # NOTIFY behaviour (#1523): the zone's own override wins,
+            # else the server options'. A primary that may notify must
+            # be kind Master — Native never sends NOTIFY at all, which
+            # is why also-notify targets configured in SpatiumDDI were
+            # never notified. The targets ride the payload and the
+            # reconciler applies them as ALSO-NOTIFY metadata.
+            zone_notify = str(zone.get("notify_enabled") or "").strip().lower()
+            server_notify = str(opts.get("notify_enabled") or "yes").strip().lower()
+            eff_notify = (
+                zone_notify
+                if zone_notify in _NOTIFY_VALUES
+                else (
+                    server_notify
+                    if server_notify in _NOTIFY_VALUES
+                    else "yes"
+                )
+            )
+            eff_also = zone.get("also_notify")
+            if eff_also is None:
+                eff_also = opts.get("also_notify") or []
+            if kind == "Native" and eff_notify != "no":
+                kind = "Master"
+            if zone.get("allow_query"):
+                # pdns auth has no per-zone query ACL (no metadata kind
+                # expresses it) — say so loudly instead of letting the
+                # saved setting look applied (#1523).
+                log.warning(
+                    "powerdns_zone_allow_query_unsupported",
+                    zone=zname,
+                    hint=(
+                        "PowerDNS authoritative cannot enforce a per-zone "
+                        "allow-query; the restriction is not applied on "
+                        "this group. Use a BIND9 group if it is required."
+                    ),
+                )
             # Dynamic-update ACL (issue #641). PowerDNS is coarse-only:
             # ALLOW-DNSUPDATE-FROM (IP grants) + TSIG-ALLOW-DNSUPDATE (key
             # grants); name-scope / per-type / deny are rejected at the
@@ -602,9 +843,16 @@ class PowerDNSDriver(DriverBase):
             zone_ttl = zone.get("ttl")
             default_ttl = 3600 if zone_ttl is None else int(zone_ttl)
             rrset_ttls: dict[tuple[str, str], list[int]] = {}
-            for rec in zone.get("records") or []:
+            # A secondary's records come from the transfer, not the bundle
+            # (#1521): shipping the bundle's copy would have pdns serve it
+            # authoritatively if the transfer never lands.
+            records = (zone.get("records") or []) if kind != "Slave" else []
+            for rec in records:
                 qname = _qualified_name(zname, rec.get("name") or "@")
                 rtype = rec["type"].upper()
+                if rtype == "SOA" and qname.lower() == zname.lower():
+                    # The apex SOA is synthesised from the zone below.
+                    continue
                 key = (qname.lower(), rtype)
                 rrset_names.setdefault(key, qname)
                 rrsets.setdefault(key, []).append(_record_content(rec))
@@ -615,6 +863,18 @@ class PowerDNSDriver(DriverBase):
                 rrset_ttls.setdefault(key, []).append(
                     default_ttl if rec_ttl is None else int(rec_ttl)
                 )
+            if kind != "Slave":
+                # The apex SOA is synthesised from the zone itself (#1522):
+                # Primary NS / Admin Email / timers / serial. Zones used to
+                # be created with only the bundle's records, so pdns filled
+                # in its default SOA and the zone's own SOA fields never
+                # reached the wire. The reconcile REPLACEs this rrset like
+                # every other, so a later edit re-renders it too. Served at
+                # the zone TTL, as the BIND9 renderer's ``$TTL`` does.
+                soa_key = (zname.lower(), "SOA")
+                rrset_names[soa_key] = zname
+                rrsets[soa_key] = [_soa_content(zone, zname)]
+                rrset_ttls[soa_key] = [default_ttl]
             deduped: dict[tuple[str, str], list[str]] = {}
             duplicates: list[str] = []
             for key, contents in rrsets.items():
@@ -654,7 +914,16 @@ class PowerDNSDriver(DriverBase):
             zones_payload.append(
                 {
                     "name": zname,
-                    "kind": "Native",
+                    "kind": kind,
+                    # Primaries the zone transfers from (secondary/stub
+                    # only; #1521). The reconciler PUTs kind/masters on
+                    # an existing zone whose type or primaries changed.
+                    "masters": masters,
+                    # Effective NOTIFY behaviour (#1523) — the zone's
+                    # override already folded over the server options;
+                    # applied as ALSO-NOTIFY metadata by the reconciler.
+                    "notify_enabled": eff_notify,
+                    "also_notify": [str(e) for e in eff_also or []],
                     "serial": zone.get("serial") or 1,
                     "rrsets": [
                         {
@@ -691,6 +960,22 @@ class PowerDNSDriver(DriverBase):
                     "This agent does not wire up PowerDNS catalog-consumer "
                     "mode. Use AXFR-based secondaries against the producer "
                     "instead."
+                ),
+            )
+
+        # Server-wide allow-query (#1523): pdns auth serves any client
+        # and has no equivalent of BIND's options allow-query — warn
+        # loudly when an operator configured a restriction here, rather
+        # than letting it look applied.
+        server_allow_query = [str(a).strip() for a in (opts.get("allow_query") or ["any"])]
+        if server_allow_query != ["any"]:
+            log.warning(
+                "powerdns_allow_query_unsupported",
+                allow_query=server_allow_query,
+                hint=(
+                    "PowerDNS authoritative cannot restrict which clients "
+                    "may query it; the server allow-query is not applied "
+                    "on this group."
                 ),
             )
 
@@ -991,7 +1276,11 @@ class PowerDNSDriver(DriverBase):
 
         url = f"{_PDNS_API_BASE}/zones/{zone}"
         headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
-        new_content = _record_content(rec) if op_kind != "delete" else None
+        # The content is computed for deletes too (#1520): a ``delete_value``
+        # op has to splice exactly this value out of the live rrset, and
+        # computing ``None`` for every delete made the fallback filter keep
+        # every record and PATCH the unchanged set back, acked as applied.
+        new_content = _record_content(rec)
 
         # PowerDNS rrset PATCH semantics: ``REPLACE`` swaps the entire
         # rrset contents and ``DELETE`` drops it. There is no
@@ -1059,11 +1348,16 @@ class PowerDNSDriver(DriverBase):
             )
             return None
 
-        # Fallback for an op enqueued by a control plane that predates the
-        # ``rrset`` payload: read the current rrset, splice the new content in
-        # (or out), and PATCH the merged set back. Without this, two
+        # Fallback for an op that carries no ``rrset`` payload. That is an
+        # op enqueued by a control plane that predates the payload — and,
+        # deliberately, every DNS-pool op: pools opt out of the stamping
+        # (#773) because a pool re-points a member as a delete-then-create
+        # pair on one serial, which only per-RR semantics make
+        # order-independent. Read the current rrset, splice the op's content
+        # in (or out), and PATCH the merged set back. Without this, two
         # consecutive ``create www A`` calls collide (the second overwrites
         # the first), which broke GSLB pool fan-out among other things.
+        rrset_action = (rec.get("rrset_action") or "").lower()
         with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
             zone_resp = client.get(url, headers=headers)
             existing_records: list[dict[str, Any]] = []
@@ -1091,7 +1385,11 @@ class PowerDNSDriver(DriverBase):
             # *change* leaves the old IP in the rrset until a delete op fires
             # for the prior content.
             merged: list[dict[str, Any]] = []
-            if op_kind == "delete":
+            if op_kind == "delete" and rrset_action == "delete_value":
+                # Pool member removal (#1520): splice exactly this value
+                # out; sibling members at the same (name, type) survive.
+                # Nothing left ⇒ delete the rrset rather than REPLACE it
+                # with an empty set (PowerDNS rejects that as malformed).
                 merged = [r for r in existing_records if r["content"] != new_content]
                 if not merged:
                     rrset: dict[str, Any] = {
@@ -1107,6 +1405,15 @@ class PowerDNSDriver(DriverBase):
                         "changetype": "REPLACE",
                         "records": merged,
                     }
+            elif op_kind == "delete":
+                # A plain delete clears the whole rrset by (name, type) —
+                # the same value-blind semantics the BIND9 driver uses for
+                # an op with no ``rrset_action`` override.
+                rrset = {
+                    "name": name,
+                    "type": rtype,
+                    "changetype": "DELETE",
+                }
             else:  # create | update
                 merged = [r for r in existing_records if r["content"] != new_content]
                 merged.append({"content": new_content, "disabled": False})
@@ -1618,19 +1925,32 @@ class PowerDNSDriver(DriverBase):
             # reconcile after the first and re-POSTed it, which answers 409.
             # Verified against a real pdns, which also accepts either case in
             # the PATCH URL.
-            existing_names = {
-                z["name"].lower() for z in existing if isinstance(z, dict) and z.get("name")
+            # Kept per zone (#1521): the kind and masters PowerDNS holds,
+            # compared below with the payload's.
+            existing_by_name = {
+                z["name"].lower(): z for z in existing if isinstance(z, dict) and z.get("name")
             }
+            existing_names = set(existing_by_name)
 
             for zone_payload in payload:
                 zone_name = zone_payload["name"]
                 if zone_name.lower() not in existing_names:
                     # Create — POST /zones with the full rrset list.
-                    create_body = {
+                    create_body: dict[str, Any] = {
                         "name": zone_name,
                         "kind": zone_payload.get("kind", "Native"),
                         "rrsets": zone_payload.get("rrsets") or [],
                     }
+                    # The zone's serial goes on create (#1522) — it was
+                    # in the payload but never sent, so a fresh zone
+                    # started at pdns's default serial whatever the
+                    # control plane had stamped.
+                    try:
+                        create_body["serial"] = int(zone_payload.get("serial") or 1)
+                    except (TypeError, ValueError):
+                        create_body["serial"] = 1
+                    if zone_payload.get("masters"):
+                        create_body["masters"] = zone_payload["masters"]
                     resp = client.post(
                         f"{_PDNS_API_BASE}/zones",
                         headers=headers,
@@ -1641,12 +1961,51 @@ class PowerDNSDriver(DriverBase):
                         continue
                     log.info("powerdns_zone_created", zone=zone_name)
                 else:
+                    # Zone type / primaries drift (#1521): a zone
+                    # converted primary↔secondary, or whose masters
+                    # changed, keeps its original kind forever if only
+                    # rrsets are PATCHed. PUT the kind/masters when the
+                    # live zone differs from the payload's.
+                    desired_kind = zone_payload.get("kind", "Native")
+                    desired_masters = [str(m) for m in zone_payload.get("masters") or []]
+                    current = existing_by_name.get(zone_name.lower()) or {}
+                    current_masters = [str(m) for m in current.get("masters") or []]
+                    if _kind_category(current.get("kind")) != _kind_category(
+                        desired_kind
+                    ) or {m.lower() for m in current_masters} != {
+                        m.lower() for m in desired_masters
+                    }:
+                        resp = client.put(
+                            f"{_PDNS_API_BASE}/zones/{zone_name}",
+                            headers=headers,
+                            json={
+                                "name": zone_name,
+                                "kind": desired_kind,
+                                "masters": desired_masters,
+                            },
+                        )
+                        if resp.status_code >= 400:
+                            self._zone_not_applied(
+                                zone_name, "kind_update", resp, refused, failures
+                            )
+                            continue
+                        log.info(
+                            "powerdns_zone_kind_updated",
+                            zone=zone_name,
+                            kind=desired_kind,
+                            masters=desired_masters,
+                        )
                     # Update — PATCH /zones/{zone}: DELETE what the bundle
                     # dropped, then REPLACE every rrset it carries. One PATCH,
                     # which PowerDNS applies as one transaction.
                     desired = zone_payload.get("rrsets") or []
                     rrsets: list[dict[str, Any]] = []
-                    if zone_payload.get("update_acl"):
+                    if _kind_category(desired_kind) == "secondary":
+                        # A secondary's rrsets are the transfer's (#1521):
+                        # the payload carries none, so a sweep would DELETE
+                        # every transferred rrset.
+                        log.debug("powerdns_absent_rrset_sweep_skipped_secondary", zone=zone_name)
+                    elif zone_payload.get("update_acl"):
                         # RFC 2136 clients write straight into this zone, and
                         # their records are not in the bundle; sweeping
                         # absent rrsets here would delete every one of them.
@@ -1707,6 +2066,11 @@ class PowerDNSDriver(DriverBase):
                     )
                 )
 
+                # NOTIFY targets (issue #1523) — ALSO-NOTIFY metadata.
+                notify_problem = self._apply_notify_settings(client, headers, zone_payload)
+                if notify_problem:
+                    failures.append(f"{zone_name} also-notify: {notify_problem}")
+
                 # LUA records are enabled globally via
                 # ``enable-lua-records=yes`` in pdns.conf (see
                 # ``_render_conf``). Earlier code attempted a per-zone
@@ -1754,6 +2118,28 @@ class PowerDNSDriver(DriverBase):
             refused.append(f"{zone_name} {action}: HTTP {resp.status_code} {_pdns_error(resp)}")
         else:
             failures.append(f"{zone_name} {action}: HTTP {resp.status_code} {_pdns_error(resp)}")
+
+    # ── NOTIFY settings (issue #1523) ─────────────────────────────────────
+
+    def _apply_notify_settings(
+        self,
+        client: httpx.Client,
+        headers: dict[str, str],
+        zone_payload: dict[str, Any],
+    ) -> str | None:
+        """Set (or clear) a primary zone's ALSO-NOTIFY metadata (#1523).
+
+        The kind decision (Master vs Native) happens in render(); this is
+        the target list. An empty effective list clears the metadata so
+        removed targets stop being notified. Secondaries do not notify
+        their primaries, so they are skipped. Returns what went wrong, or
+        None, so a target list PowerDNS refused fails the apply like the
+        dynamic-update metadata does (#1225) instead of looking applied.
+        """
+        if _kind_category(zone_payload.get("kind")) not in ("native", "primary"):
+            return None
+        targets = _also_notify_targets(zone_payload.get("also_notify"))
+        return self._put_metadata(client, headers, zone_payload["name"], "ALSO-NOTIFY", targets)
 
     # ── Dynamic-update ACLs (issue #641) ───────────────────────────────────
 
@@ -1894,6 +2280,42 @@ class PowerDNSDriver(DriverBase):
         return None
 
     # ── Reload (compatibility with bind9 daemon-pid signal pattern) ────────
+
+    def served_zone_serials(self, bundle: dict[str, Any]) -> dict[str, int]:
+        """Zone name (no trailing dot, lowercased) → the serial pdns serves.
+
+        The sync loop's zone-state reporter uses this instead of the
+        bundle's serials (#1522): reporting the bundle serial made
+        per-server sync status read "in sync" whatever pdns served, and
+        it reported zones the agent never served at all (forward zones,
+        #1521). A zone absent from the map is simply not reported. An
+        unreadable API returns an empty map — report nothing rather
+        than something unverified.
+        """
+        api_key = self._load_or_generate_api_key()
+        try:
+            with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
+                resp = client.get(
+                    f"{_PDNS_API_BASE}/zones", headers={"X-API-Key": api_key}
+                )
+            if resp.status_code >= 400:
+                log.warning("powerdns_served_serials_http", status=resp.status_code)
+                return {}
+            zones = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("powerdns_served_serials_failed", error=str(exc))
+            return {}
+        out: dict[str, int] = {}
+        for z in zones or []:
+            if not isinstance(z, dict) or not z.get("name"):
+                continue
+            serial = z.get("serial")
+            if isinstance(serial, bool) or not isinstance(serial, int):
+                continue
+            # Lowercased: PowerDNS stores zone names lowercased, and the
+            # bundle may carry another spelling (``Case.Test.``).
+            out[str(z["name"]).rstrip(".").lower()] = serial
+        return out
 
     def _reload_via_api(self) -> None:
         """Optional — issue a notify on every zone after a bulk

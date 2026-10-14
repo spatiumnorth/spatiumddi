@@ -158,7 +158,9 @@ def peer_host(url: str) -> str:
 def _member_name_re(host: str) -> re.Pattern[str]:
     """The name k3s gives a server's etcd member: `<node name>-<8 hex>`, and
     nothing after it (`\\Z`: `$` also matches before a trailing newline)."""
-    return re.compile(r"^" + re.escape(host) + r"-[0-9a-f]{8}\Z")
+    # k3s lowercases the host's name for the node, and the member is named
+    # after that (#1757): `Ddi-Member-1` owns `ddi-member-1-1a2b3c4d`.
+    return re.compile(r"^" + re.escape(host.strip().rstrip(".").lower()) + r"-[0-9a-f]{8}\Z")
 
 
 def node_members(members: list[dict], host: str, ips: list[str],
@@ -194,7 +196,10 @@ def own_names() -> set[str]:
         # No etcd config to read: the set still holds the hostname, which is
         # the k3s node name this node's own member name starts with.
         pass
-    return {n for n in names if n}
+    # Both spellings: socket.gethostname() keeps an uppercase hostname as
+    # typed, while the member k3s named is lowercase (#1757). Missing the
+    # lowercase one would let this runner take its own member for a stranger's.
+    return {n for n in names if n} | {n.lower() for n in names if n}
 
 
 # ---- etcd --------------------------------------------------------------------------

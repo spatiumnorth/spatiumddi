@@ -112,6 +112,10 @@ from app.services.appliance.ca import (
     sign_supervisor_cert,
     verify_session_token,
 )
+from app.services.appliance.cluster_dns_group import (
+    cluster_dns_group_refusal,
+    promote_dns_group_refusal,
+)
 from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.group_names import group_name_problem
 from app.services.appliance.lldp import lldp_bundle
@@ -124,6 +128,8 @@ from app.services.appliance.network_mtu import (
 )
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.ownership import current_dns_drivers as _current_dns_drivers
+from app.services.appliance.ownership import hostname_sql as _hostname_sql
+from app.services.appliance.ownership import k8s_node_name as _k8s_node_name
 from app.services.appliance.ownership import own_server_condition as _own_server_condition
 from app.services.appliance.reboot import request_reboot
 from app.services.appliance.removable import (
@@ -156,6 +162,7 @@ from app.services.appliance.storage_health import (
 from app.services.appliance.syslog import syslog_bundle
 from app.services.appliance.tls_pins import signed_pin_set
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
+from app.services.upgrades import shared_tags as upgrade_shared_tags
 from app.services.upgrades.safety import assert_no_upgrade_in_flight
 from app.services.upgrades.schema_rollback import check_release_can_run
 from app.services.upgrades.schema_rollback import enforce as enforce_schema_rollback
@@ -1750,6 +1757,14 @@ class SupervisorHeartbeatResponse(BaseModel):
     # mount a disk it cannot see. Empty-shape block still sent, because
     # an empty desired set is how an EJECT reaches the host.
     removable_settings: dict[str, Any] = Field(default_factory=dict)
+    # #1710 — a rolling upgrade holds the cluster's shared charts on the tag
+    # it runs until every node reports ``target_version``: ``{"run_id",
+    # "from_tag", "target_version"}`` while it does, for each node of the
+    # run, else null. A supervisor whose host already runs the target writes
+    # nothing to the shared role chart until the hold ends, so the agents on
+    # the nodes still on the old slot keep images they have. Absent from
+    # old control planes, which reads as no hold.
+    shared_chart_hold: dict[str, str] | None = None
 
 
 def _s(v: object, limit: int = 255) -> str | None:
@@ -2239,7 +2254,10 @@ async def supervisor_heartbeat(
             (
                 await db.execute(
                     select(Appliance).where(
-                        Appliance.hostname.in_(body.evicted_node_names),
+                        # #1757 — the seed reports the Node's (lowercase) name.
+                        _hostname_sql(Appliance.hostname).in_(
+                            [_k8s_node_name(n) for n in body.evicted_node_names]
+                        ),
                         Appliance.evict_requested.is_(True),
                     )
                 )
@@ -2256,11 +2274,14 @@ async def supervisor_heartbeat(
     # #1284 — an eviction the seed has not confirmed yet stays ``evicting``,
     # with the seed's reason on the row so the Fleet UI says what it waits on.
     if body.evict_pending:
+        pending_reasons = {_k8s_node_name(n): r for n, r in body.evict_pending.items()}
         waiting = (
             (
                 await db.execute(
                     select(Appliance).where(
-                        Appliance.hostname.in_(list(body.evict_pending)),
+                        _hostname_sql(Appliance.hostname).in_(
+                            [_k8s_node_name(n) for n in body.evict_pending]
+                        ),
                         Appliance.evict_requested.is_(True),
                     )
                 )
@@ -2269,7 +2290,7 @@ async def supervisor_heartbeat(
             .all()
         )
         for ev in waiting:
-            reason = str(body.evict_pending.get(ev.hostname or "") or "")[:500]
+            reason = str(pending_reasons.get(_k8s_node_name(ev.hostname)) or "")[:500]
             if reason and ev.cluster_join_reason != reason:
                 ev.cluster_join_reason = reason
                 logger.info(
@@ -2828,21 +2849,25 @@ async def supervisor_heartbeat(
             )
         )
     ).all()
-    evict_names = [h for (h, _ips, _ip, _demote) in evict_rows]
+    # #1757 — by the Node's name (k3s lowercases the host's), which is what the
+    # seed deletes the Node by and what k3s's etcd member name starts with.
+    evict_names = [_k8s_node_name(h) for (h, _ips, _ip, _demote) in evict_rows]
     evict_addresses = {
-        h: [str(a) for a in (ips or ([ip] if ip else []))] for (h, ips, ip, _demote) in evict_rows
+        _k8s_node_name(h): [str(a) for a in (ips or ([ip] if ip else []))]
+        for (h, ips, ip, _demote) in evict_rows
     }
     # #1541 — which of those are a dead-node Replace (the seed holds the
     # control plane's size for the replacement, #1059) and which are a
     # demote's cleanup (no replacement coming: the seed scales down).
-    replace_names = [h for (h, _ips, _ip, demote) in evict_rows if not demote]
-    demote_names = [h for (h, _ips, _ip, demote) in evict_rows if demote]
+    replace_names = [_k8s_node_name(h) for (h, _ips, _ip, demote) in evict_rows if not demote]
+    demote_names = [_k8s_node_name(h) for (h, _ips, _ip, demote) in evict_rows if demote]
     # #1284 — and the nodes asked to join, so the seed never takes a node
     # promoted again after its eviction for a late arrival of the evicted one.
     join_names: list[str] = []
     if row.cluster_role == CLUSTER_ROLE_PRIMARY:
         join_names = sorted(
-            (
+            _k8s_node_name(h)
+            for h in (
                 await db.execute(
                     select(Appliance.hostname).where(
                         Appliance.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER,
@@ -2908,6 +2933,14 @@ async def supervisor_heartbeat(
         firewall_settings=firewall_block,
         removable_settings=removable_bundle_safe(row.desired_removable_mounts),
         long_poll=long_poll,
+        # Only a settled member shares the charts: a node demoted out of the
+        # cluster after a failed run runs its own, and must not defer to a
+        # hold on charts it no longer reads.
+        shared_chart_hold=(
+            await upgrade_shared_tags.heartbeat_hold(db, row.hostname)
+            if row.cluster_role in (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+            else None
+        ),
     )
 
 
@@ -3633,9 +3666,14 @@ async def _find_appliance_dependents(
     appliance: Appliance,
 ) -> ApplianceDependents:
     """Return the dns_server + dhcp_server rows that belong to this
-    appliance. Matches on EITHER ``appliance_id`` (FK populated at
-    register time per #197) OR ``hostname`` (legacy / pre-FK rows).
-    Duplicates de-duped by row id.
+    appliance, by the shared ownership rule (#1715 / #1749): the
+    ``appliance_id`` FK, or an agent-based row with no FK whose host equals
+    this appliance's hostname case-blind — only while no OTHER approved
+    appliance shares that hostname. The host side is case-blind because an
+    agent on k3s registers the Node's name, which k3s lowercases (#1757);
+    the ambiguity guard is what keeps that from letting two appliances that
+    differ only in case (or a re-paired duplicate) delete each other's
+    servers.
     """
     from app.models.dhcp import DHCPServer  # noqa: PLC0415
     from app.models.dns import DNSServer  # noqa: PLC0415
@@ -3651,12 +3689,7 @@ async def _find_appliance_dependents(
     dns_rows = (
         (
             await db.execute(
-                select(DNSServer).where(
-                    or_(
-                        DNSServer.appliance_id == appliance.id,
-                        DNSServer.host == appliance.hostname,
-                    )
-                )
+                select(DNSServer).where(await _own_server_condition(db, appliance, DNSServer))
             )
         )
         .scalars()
@@ -3669,12 +3702,7 @@ async def _find_appliance_dependents(
     dhcp_rows = (
         (
             await db.execute(
-                select(DHCPServer).where(
-                    or_(
-                        DHCPServer.appliance_id == appliance.id,
-                        DHCPServer.host == appliance.hostname,
-                    )
-                )
+                select(DHCPServer).where(await _own_server_condition(db, appliance, DHCPServer))
             )
         )
         .scalars()
@@ -4353,6 +4381,24 @@ async def update_appliance_roles(
                         f"capability {cap_key}=true; cannot assign role {r!r}."
                     ),
                 )
+
+    # #1427 — a control-plane cluster serves one DNS server group; refused
+    # before anything below changes the row or moves a server.
+    refusal = await cluster_dns_group_refusal(
+        db,
+        row,
+        roles=list(body.roles) if body.roles is not None else list(row.assigned_roles or []),
+        group_id=(
+            body.dns_group_id
+            if "dns_group_id" in body.model_fields_set
+            else row.assigned_dns_group_id
+        ),
+        prev_roles=prev_dns_roles,
+        prev_group_id=prev_dns_group_id,
+    )
+    if refusal is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, refusal)
+    if body.roles is not None:
         row.assigned_roles = list(body.roles)
 
     # #1562 — presence in the payload decides, not non-None: an
@@ -4909,6 +4955,13 @@ async def promote_control_plane(
             )
         targets.append(row)
 
+    # #1427 — a cluster serves one DNS server group: a joiner running DNS in
+    # another group would flip every DNS agent of the cluster to whichever
+    # member wrote the shared chart last.
+    dns_refusal = await promote_dns_group_refusal(db, members, targets)
+    if dns_refusal is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, dns_refusal)
+
     new_total = current_count + len(targets)
     if new_total % 2 == 0:
         raise HTTPException(
@@ -5115,7 +5168,7 @@ async def _refuse_demote_without_quorum(db: DB, targets: list[Appliance]) -> Non
                     f"over {int(ONLINE_STALE_SECONDS)}s"
                 )
         if nodes is not None:
-            ready = nodes.get(r.hostname or "")
+            ready = nodes.get(_k8s_node_name(r.hostname))
             if ready is None:
                 problems.append("no k8s Node")
             elif not ready:
@@ -5221,7 +5274,10 @@ async def _set_node_schedulable(hostname: str | None, *, cordon: bool) -> None:
     if not hostname:
         return
     try:
-        outcome, err = await asyncio.to_thread(_node_schedulable_sync, hostname, cordon=cordon)
+        # #1757 — k3s lowercases the host's name for the Node.
+        outcome, err = await asyncio.to_thread(
+            _node_schedulable_sync, _k8s_node_name(hostname), cordon=cordon
+        )
     except Exception as exc:  # noqa: BLE001 - best-effort, must not fail the caller
         outcome, err = "failed", str(exc)
     if outcome == "failed":

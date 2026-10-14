@@ -111,7 +111,25 @@ CATEGORY_CONVERGENCE_TIMEOUT = "node_did_not_rejoin"
 CATEGORY_CHART_BUMP = "chart_bump_failed"
 CATEGORY_UNCORDON_FAIL = "uncordon_fail"
 CATEGORY_MIRROR_NOT_READY = "slot_image_mirror_not_ready"
+CATEGORY_RELEASE_FAILED = "release_failed"
 CATEGORY_OTHER = "other"
+
+
+def release_failure(steps: list[Any]) -> tuple[str, list[str]] | None:
+    """The failed ``release_node`` compensation (#1542), if the chain ran
+    one that did not succeed: ``(error, stuck)`` where ``stuck`` names what
+    is still held (``cordon`` / ``maintenance_window``). ``steps`` are the
+    per-node step records, as ``StepResult`` objects or their progress
+    dicts. None when no compensation ran or it succeeded."""
+    for s in reversed(steps):
+        get = s.get if isinstance(s, dict) else lambda k, _s=s: getattr(_s, k, None)
+        if get("name") != "release_node":
+            continue
+        if get("ok"):
+            return None
+        detail = get("detail") or {}
+        return (get("error") or "unknown", list(detail.get("stuck") or []))
+    return None
 
 
 def classify_per_node_failure(
@@ -251,6 +269,13 @@ def operator_hint(category: str) -> str:
             "is up and uncordoned and read the mirror pod's events, then plan "
             "the upgrade again."
         )
+    if category == CATEGORY_RELEASE_FAILED:
+        return (
+            "The upgrade failed AND the automatic release of the node failed, "
+            "so the node is left held. Release it by hand: ``kubectl uncordon`` "
+            "the node and/or patch the CNPG Cluster's "
+            "nodeMaintenanceWindow.inProgress to false, as named above."
+        )
     if category == CATEGORY_UNCORDON_FAIL:
         return (
             "Node upgraded cleanly but uncordon / maintenance-window clear "
@@ -274,6 +299,7 @@ async def emit_upgrade_failed_alert(
     failed_node: str | None,
     failed_at_step: str | None,
     category: str,
+    stuck: list[str] | None = None,
 ) -> AlertEvent | None:
     """Open an AlertEvent against the cluster-upgrade-failed rule.
 
@@ -301,6 +327,8 @@ async def emit_upgrade_failed_alert(
     if failed_at_step:
         message_parts.append(f"at step {failed_at_step!r}")
     message_parts.append(f"({category}).")
+    if stuck:
+        message_parts.append(f"Still held after the failed release: {', '.join(stuck)}.")
     message_parts.append(hint)
     message = " ".join(message_parts)
 
@@ -313,6 +341,8 @@ async def emit_upgrade_failed_alert(
         "hint": hint,
         "last_error": run.last_error,
     }
+    if stuck:
+        detail["stuck"] = stuck
 
     evt = AlertEvent(
         rule_id=rule.id,

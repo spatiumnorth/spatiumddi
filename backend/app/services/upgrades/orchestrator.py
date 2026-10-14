@@ -66,6 +66,7 @@ from app.services.upgrades import (
     per_node,
     preflight,
     safety,
+    shared_tags,
 )
 
 logger = structlog.get_logger(__name__)
@@ -189,8 +190,11 @@ async def plan_upgrade(
         if cnpg_cluster_name:
             logger.info("upgrade_plan_cnpg_cluster_detected", cluster=cnpg_cluster_name)
 
-    # Preflight gate.
-    report = await preflight.run_all(target_version=target_version)
+    # Preflight gate. #1709 — an uploaded target the mirror holds needs no
+    # room on it.
+    report = await preflight.run_all(
+        target_version=target_version, slot_image_id=slot_image.image_id
+    )
     if report.overall == "fail":
         fails = [r.name for r in report.results if r.level == "fail"]
         raise OrchestratorError(f"preflight failed; refusing to plan: {', '.join(fails)}")
@@ -230,17 +234,19 @@ async def plan_upgrade(
     # before/after picture even if the appliance row's
     # installed_appliance_version is updated mid-run.
     from app.models.appliance import Appliance  # noqa: PLC0415
+    from app.services.appliance.ownership import hostname_sql, k8s_node_name  # noqa: PLC0415
 
     source_versions: dict[str, str | None] = {}
     appliance_rows = (
         await db.execute(
             select(Appliance.hostname, Appliance.installed_appliance_version).where(
-                Appliance.hostname.in_(order)
+                hostname_sql(Appliance.hostname).in_([k8s_node_name(n) for n in order])
             )
         )
     ).all()
     for hostname, installed in appliance_rows:
-        source_versions[hostname] = installed
+        # Keyed by the Node name the plan and the per-node steps use (#1757).
+        source_versions[k8s_node_name(hostname)] = installed
 
     run = SystemUpgradeRun(
         kind="cluster_rolling",
@@ -494,6 +500,14 @@ def _enqueue_drive(run_id: uuid.UUID, *, avoid_node: str | None) -> None:
     drive_upgrade_run.apply_async(args=[str(run_id)], kwargs={"avoid_node": avoid_node})
 
 
+def _enqueue_continuation(run_id: uuid.UUID, *, avoid_version: str) -> None:
+    """Enqueue the rest of the run for a worker that does NOT run
+    ``avoid_version`` (#1710): the flip is rolling the workers off it."""
+    from app.tasks.upgrade_orchestrator import drive_upgrade_run  # noqa: PLC0415
+
+    drive_upgrade_run.apply_async(args=[str(run_id)], kwargs={"avoid_version": avoid_version})
+
+
 async def _lease_renewal_loop(stop_event: asyncio.Event, holder: str) -> None:
     """Background task — renew the upgrade Lease every
     ``LEASE_DURATION_S / 3`` seconds until ``stop_event`` is set.
@@ -633,9 +647,11 @@ async def _drive_loop(
     cnpg_namespace: str | None = run.plan.get("cnpg_namespace")
     # #1463 — every node waits for this release's slot-image mirror before
     # it is told to fetch an uploaded image.
-    mirror_deployment = per_node.slot_image_mirror_deployment(
-        run.plan.get("chart_name") or chart_bump.DEFAULT_CHART_NAME
-    )
+    release_name = run.plan.get("chart_name") or chart_bump.DEFAULT_CHART_NAME
+    mirror_deployment = per_node.slot_image_mirror_deployment(release_name)
+    # #1544 — the namespace the chart-bump poll reads the release's
+    # Deployments in; the per-node control-plane gate reads the same one.
+    release_namespace: str = run.plan.get("release_namespace") or chart_bump.DEFAULT_RELEASE_NS
 
     while True:
         if stop_event.is_set():
@@ -684,6 +700,13 @@ async def _drive_loop(
             _release_lease(run, holder)
             _enqueue_drive(run.id, avoid_node=own_node)
             logger.info("upgrade_drive_handoff", run_id=str(run.id), node=next_node)
+            return
+        if next_node is None and shared_tags.holds(run):
+            # #1710 — every node reports the target: move the shared tags
+            # once, then hand the rest to a worker on the target.
+            await _finish_with_flip(
+                db, run, stop_event, holder, cnpg_name=cnpg_name, cnpg_namespace=cnpg_namespace
+            )
             return
         if next_node is None:
             # Every node committed the new slot. Phase E — bump the
@@ -758,9 +781,9 @@ async def _drive_loop(
             # instance count, DS pods NotReady cluster-wide) doesn't
             # silently report success. The per-node chain already waited
             # for the CNPG count after each node's uncordon, the last
-            # node's included (#1544, ``cluster_verify``); this single
-            # read re-confirms it after the chart bump rolled the
-            # control-plane Deployments.
+            # node's included (#1544, ``cluster_verify``); this re-confirms
+            # it after the chart bump rolled the control-plane Deployments,
+            # waiting (bounded) for an instance still rejoining (#1829).
             verify_results = await safety.verify_post_upgrade(
                 cnpg_cluster_name=cnpg_name,
                 cnpg_namespace=cnpg_namespace,
@@ -829,6 +852,22 @@ async def _drive_loop(
             )
             return
 
+        # #1710 — hold the shared charts' image tag at the running version
+        # before the first node boots the new slot, and re-assert it before
+        # every node after.
+        hold = await shared_tags.ensure_hold(db, run)
+        if not hold.ok:
+            await _fail_at_shared_tags(
+                db,
+                run,
+                holder,
+                event="shared_tag_hold_failed",
+                failed_at_step="shared_tag_hold",
+                error=f"could not hold the shared charts' image tag: {hold.error}",
+            )
+            return
+        await db.commit()
+
         # Drive Phase C for this node.
         await _record_event(db, run, "node_started", node=next_node)
         await db.commit()
@@ -841,6 +880,11 @@ async def _drive_loop(
             cnpg_namespace=cnpg_namespace,
             lease_holder=run.lease_holder,
             mirror_deployment=mirror_deployment,
+            control_plane_release=release_name,
+            control_plane_namespace=release_namespace,
+            # #1709 — the node's preflight asks for /var room only on the
+            # nodes the run has still to upgrade.
+            remaining_nodes=[n for n in plan_order if n not in completed_nodes],
         )
 
         per_node_progress[next_node] = {
@@ -872,6 +916,27 @@ async def _drive_loop(
             category = upgrade_alerts.classify_per_node_failure(
                 failed_at=result.failed_at, error=result.error
             )
+            # #1542 — the compensating release failed too: the node is left
+            # cordoned and/or the CNPG window on. Worse than the original
+            # failure, so it gets its own category + alert text naming what
+            # is stuck. The run still stops.
+            stuck: list[str] | None = None
+            release_failed = upgrade_alerts.release_failure(result.steps)
+            if release_failed is not None:
+                release_error, stuck = release_failed
+                underlying_category = category
+                category = upgrade_alerts.CATEGORY_RELEASE_FAILED
+                run.last_error = (
+                    f"{run.last_error}; release of node {next_node} failed "
+                    f"(still held: {', '.join(stuck) or 'unknown'}): {release_error}"
+                )
+                per_node_progress[next_node]["release_failed"] = {
+                    "error": release_error,
+                    "stuck": stuck,
+                    # What the step failure would have been classified as,
+                    # so the original cause survives the override.
+                    "underlying_category": underlying_category,
+                }
             per_node_progress[next_node]["failure_category"] = category
             run.progress = {**run.progress, "per_node": per_node_progress}
             await upgrade_alerts.emit_upgrade_failed_alert(
@@ -880,6 +945,7 @@ async def _drive_loop(
                 failed_node=next_node,
                 failed_at_step=result.failed_at,
                 category=category,
+                stuck=stuck,
             )
             await _transition(
                 db,
@@ -917,3 +983,178 @@ async def _drive_loop(
             # next node on the next loop iteration. No log so we
             # don't add a line on every healthy between-node tick.
             pass
+
+
+# ── #1710: the end of a run that held the shared tags ────────────────
+
+
+async def _fail_at_shared_tags(
+    db: AsyncSession,
+    run: SystemUpgradeRun,
+    holder: str | None,
+    *,
+    event: str,
+    failed_at_step: str,
+    error: str | None,
+) -> None:
+    """Fail the run at a shared-tag step, alert, and release the lease.
+
+    The hold is left as it is: nodes on two versions are what it protects,
+    and the next run's Start (or the beat task, once every node reports one
+    version) takes it from here."""
+    run.last_error = error
+    category = upgrade_alerts.classify_per_node_failure(failed_at=failed_at_step, error=error)
+    await upgrade_alerts.emit_upgrade_failed_alert(
+        db,
+        run,
+        failed_node=None,
+        failed_at_step=failed_at_step,
+        category=category,
+    )
+    await _transition(
+        db,
+        run,
+        "failed",
+        allowed_from=("running",),
+        event=event,
+        error=error,
+        failure_category=category,
+    )
+    await db.commit()
+    _release_lease(run, holder)
+    logger.warning(
+        "upgrade_shared_tags_failed",
+        run_id=str(run.id),
+        step=failed_at_step,
+        error=error,
+        category=category,
+    )
+
+
+async def _finish_with_flip(
+    db: AsyncSession,
+    run: SystemUpgradeRun,
+    stop_event: asyncio.Event,
+    holder: str | None,
+    *,
+    cnpg_name: str,
+    cnpg_namespace: str | None,
+) -> None:
+    """Phase E of a run that held the shared tags (#1710, #1829).
+
+    1. The flip: the run's last change to the cluster (the pins come off,
+       the supervisors are freed to write the appliance chart).
+    2. The flip rolls the worker this drive runs on, so a drive still on the
+       old tag hands the rest to a worker on the new one, once, and stops.
+       A drive that is killed anyway is redelivered and resumes here: the
+       flip is recorded, so it is not repeated.
+    3. Wait for every workload the flip moves, then the post-upgrade verify.
+    """
+    record = shared_tags.record_of(run)
+    from_tag = str(record.get("from_tag") or "")
+    if shared_tags.flip_record(run).get("state") not in (
+        shared_tags.FLIP_FLIPPED,
+        shared_tags.FLIP_SETTLED,
+    ):
+        await _record_event(db, run, "all_nodes_complete", shared_tag_flip_starting=True)
+        await db.commit()
+        flipped = await shared_tags.flip(db, run)
+        if not flipped.ok:
+            await _fail_at_shared_tags(
+                db,
+                run,
+                holder,
+                event="chart_bump_failed",
+                failed_at_step="chart_bump",
+                error=f"shared tag flip to {run.target_version} failed: {flipped.error}",
+            )
+            return
+        await _record_event(
+            db, run, "shared_tags_flipped", from_tag=from_tag, to_tag=run.target_version
+        )
+        await db.commit()
+
+    flip_rec = shared_tags.flip_record(run)
+    if from_tag and settings.version == from_tag and not flip_rec.get("handed_off_at"):
+        record = shared_tags.record_of(run)
+        record["flip"] = {**flip_rec, "handed_off_at": _now().isoformat()}
+        run.progress = {**run.progress, shared_tags.PROGRESS_KEY: record}
+        await _record_event(db, run, "drive_version_handoff", from_tag=from_tag)
+        await db.commit()
+        # As the node hand-off: stop renewing, release this drive's lease,
+        # and let the new drive take it over.
+        stop_event.set()
+        _release_lease(run, holder)
+        _enqueue_continuation(run.id, avoid_version=from_tag)
+        logger.info("upgrade_drive_version_handoff", run_id=str(run.id), from_tag=from_tag)
+        return
+
+    settled = await shared_tags.settle(db, run)
+    await db.commit()
+    if not settled.ok:
+        await _fail_at_shared_tags(
+            db,
+            run,
+            holder,
+            event="chart_bump_failed",
+            failed_at_step="chart_bump",
+            error=f"the shared tag flip to {run.target_version} did not settle: {settled.error}",
+        )
+        return
+
+    verify_results = await safety.verify_post_upgrade(
+        cnpg_cluster_name=cnpg_name,
+        cnpg_namespace=cnpg_namespace,
+    )
+    verify_overall = safety.verification_overall(verify_results)
+    run.progress = {
+        **run.progress,
+        "post_upgrade_verify": {
+            "overall": verify_overall,
+            "results": [
+                {"name": r.name, "level": r.level, "message": r.message, "detail": r.detail}
+                for r in verify_results
+            ],
+        },
+    }
+    if verify_overall == "fail":
+        fails = [r.name for r in verify_results if r.level == "fail"]
+        run.last_error = f"post-upgrade verification failed: {', '.join(fails)}"
+        await upgrade_alerts.emit_upgrade_failed_alert(
+            db,
+            run,
+            failed_node=None,
+            failed_at_step="post_upgrade_verify",
+            category=upgrade_alerts.CATEGORY_OTHER,
+        )
+        await _transition(
+            db,
+            run,
+            "failed",
+            allowed_from=("running",),
+            event="post_upgrade_verify_failed",
+            failed_checks=fails,
+        )
+        await db.commit()
+        _release_lease(run, holder)
+        logger.warning("upgrade_post_verify_failed", run_id=str(run.id), failed_checks=fails)
+        return
+
+    rolled = list(settled.detail.get("rolled") or [])
+    await _transition(
+        db,
+        run,
+        "succeeded",
+        allowed_from=("running",),
+        event="succeeded",
+        shared_tags_rolled=rolled,
+        post_upgrade_verify=verify_overall,
+    )
+    await db.commit()
+    _release_lease(run, holder)
+    logger.info(
+        "upgrade_succeeded",
+        run_id=str(run.id),
+        rolled=rolled,
+        post_upgrade_verify=verify_overall,
+    )

@@ -31,6 +31,7 @@ pinned against its own wire:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1110,11 +1111,130 @@ def test_powerdns_without_rrset_still_does_the_get_merge_patch(
     ]
 
 
+def _pool_zone_doc() -> dict[str, Any]:
+    return {
+        "rrsets": [
+            {
+                "name": "pool.example.com.",
+                "type": "A",
+                "records": [
+                    {"content": "10.0.0.1", "disabled": False},
+                    {"content": "10.0.0.2", "disabled": False},
+                ],
+            }
+        ]
+    }
+
+
+def test_powerdns_without_rrset_delete_value_removes_only_that_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pool member removal actually removes the member (#1520).
+
+    Pool ops carry ``rrset_action="delete_value"`` and no ``rrset``
+    payload, so they always take the read-merge-PATCH fallback. The
+    fallback computed the content to remove as ``None`` and filtered on
+    it, which kept every record: the PATCH sent the unchanged set back
+    and the op was acked as applied, so a removed / unhealthy pool
+    member kept receiving round-robin traffic.
+    """
+    driver = PowerDNSDriver(state_dir=tmp_path)
+    calls = _install_fake_pdns_client(monkeypatch, zone_doc=_pool_zone_doc())
+
+    driver.apply_record_op(
+        {
+            "zone_name": "example.com.",
+            "op": "delete",
+            "record": {
+                "name": "pool",
+                "type": "A",
+                "value": "10.0.0.1",
+                "ttl": 300,
+                "rrset_action": "delete_value",
+            },
+        }
+    )
+
+    assert [method for (method, _, _) in calls] == ["GET", "PATCH"]
+    assert calls[1][2]["rrsets"] == [
+        {
+            "name": "pool.example.com.",
+            "type": "A",
+            "ttl": 300,
+            "changetype": "REPLACE",
+            "records": [{"content": "10.0.0.2", "disabled": False}],
+        }
+    ]
+
+
+def test_powerdns_without_rrset_delete_value_last_member_deletes_rrset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removing the last pool member deletes the rrset (#1520)."""
+    driver = PowerDNSDriver(state_dir=tmp_path)
+    calls = _install_fake_pdns_client(
+        monkeypatch,
+        zone_doc={
+            "rrsets": [
+                {
+                    "name": "pool.example.com.",
+                    "type": "A",
+                    "records": [{"content": "10.0.0.1", "disabled": False}],
+                }
+            ]
+        },
+    )
+
+    driver.apply_record_op(
+        {
+            "zone_name": "example.com.",
+            "op": "delete",
+            "record": {
+                "name": "pool",
+                "type": "A",
+                "value": "10.0.0.1",
+                "ttl": 300,
+                "rrset_action": "delete_value",
+            },
+        }
+    )
+
+    assert calls[1][2]["rrsets"] == [
+        {"name": "pool.example.com.", "type": "A", "changetype": "DELETE"}
+    ]
+
+
+def test_powerdns_without_rrset_plain_delete_drops_whole_rrset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delete with no ``delete_value`` override clears (name, type).
+
+    Matches the BIND9 driver's plain-delete semantics; before #1520 the
+    fallback REPLACEd the rrset with its own unchanged contents.
+    """
+    driver = PowerDNSDriver(state_dir=tmp_path)
+    calls = _install_fake_pdns_client(monkeypatch, zone_doc=_pool_zone_doc())
+
+    driver.apply_record_op(
+        {
+            "zone_name": "example.com.",
+            "op": "delete",
+            "record": {"name": "pool", "type": "A", "value": "10.0.0.1", "ttl": 300},
+        }
+    )
+
+    assert calls[1][2]["rrsets"] == [
+        {"name": "pool.example.com.", "type": "A", "changetype": "DELETE"}
+    ]
+
+
 @pytest.mark.parametrize(
     "message",
     [
         "Cannot add record: CNAME record already exists for the same name.",
         "Cannot add record: DNAME record already exists for the same name.",
+        # The real primary-zone text (AuthZone.cs:135/145 TrySetRecords, v15.4.0).
+        "Cannot add record: a CNAME record cannot exists with other record types for the same name.",
         "Record already exists. Use overwrite option if you wish to overwrite existing record.",
         "Record already exists.",
     ],
@@ -1127,7 +1247,7 @@ def test_technitium_conflict_refusal_is_a_failure(tmp_path: Path, message: str) 
     _install_fake_request(
         driver, lambda path, params, n: {"status": "error", "errorMessage": message}
     )
-    with pytest.raises(RuntimeError, match="already exists"):
+    with pytest.raises(RuntimeError, match=re.escape(message.rstrip("."))):
         driver.apply_record_op(
             {
                 "zone_name": "example.com.",

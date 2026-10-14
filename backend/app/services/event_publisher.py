@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.config import settings as _app_settings
+from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services.after_commit_dispatch import dispatch
@@ -188,6 +189,8 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     ("upgrade.failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.node_failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.chart_bump_failed", "system_upgrade_run"): "system.upgrade.failed",
+    # #1710 — the run could not hold the shared charts' image tag.
+    ("upgrade.shared_tag_hold_failed", "system_upgrade_run"): "system.upgrade.failed",
     ("upgrade.post_upgrade_verify_failed", "system_upgrade_run"): "system.upgrade.failed",
     # Approval workflow lifecycle (#62). The service layer writes plain-verb
     # audit actions (requested / approved / …); without these explicit
@@ -293,6 +296,7 @@ async def _ephemeral_session() -> AsyncIterator[AsyncSession]:
         _app_settings.database_url,
         poolclass=NullPool,
         echo=False,
+        connect_args=task_connect_args(),
     )
     try:
         async with AsyncSession(engine, expire_on_commit=False) as session:

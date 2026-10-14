@@ -26,7 +26,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 
@@ -1184,8 +1184,10 @@ async def list_entries(
     stmt = select(DNSBlockListEntry).where(DNSBlockListEntry.list_id == list_id)
     if q:
         stmt = stmt.where(DNSBlockListEntry.domain.ilike(f"%{q.lower()}%"))
-    total_stmt = stmt
-    total = len((await db.execute(total_stmt)).scalars().all())
+    # COUNT in the database; never hydrate every matching entry (#1724).
+    total = (
+        await db.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))
+    ).scalar_one()
     items_result = await db.execute(
         stmt.order_by(DNSBlockListEntry.domain).limit(limit).offset(offset)
     )
@@ -1201,7 +1203,7 @@ async def list_entries(
     status_code=201,
 )
 async def add_entry(
-    list_id: uuid.UUID, body: EntryCreate, db: DB, current_user: SuperAdmin
+    list_id: uuid.UUID, body: EntryCreate, db: DB, current_user: CurrentUser
 ) -> EntryResponse:
     bl = await _require_list(list_id, db)
     domain = body.domain.strip().lower().strip(".")
@@ -1250,18 +1252,29 @@ async def bulk_add_entries(
     list_id: uuid.UUID,
     body: BulkAddRequest,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> BulkAddResponse:
     bl = await _require_list(list_id, db)
 
     # Dedupe submitted domains + validate
     incoming = dedupe_domains(body.domains)
 
-    # Fetch existing domains in the list for the diff
-    existing_result = await db.execute(
-        select(DNSBlockListEntry.domain).where(DNSBlockListEntry.list_id == list_id)
-    )
-    existing: set[str] = set(existing_result.scalars().all())
+    # Ask only about the incoming domains — never read the whole list (#1724).
+    existing: set[str] = set()
+    for i in range(0, len(incoming), 5000):
+        chunk = incoming[i : i + 5000]
+        existing.update(
+            (
+                await db.execute(
+                    select(DNSBlockListEntry.domain).where(
+                        DNSBlockListEntry.list_id == list_id,
+                        DNSBlockListEntry.domain.in_(chunk),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
 
     added = 0
     skipped = 0
@@ -1310,7 +1323,7 @@ async def update_entry(
     entry_id: uuid.UUID,
     body: EntryUpdate,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> EntryResponse:
     bl = await _require_list(list_id, db)
     result = await db.execute(
@@ -1371,7 +1384,7 @@ async def delete_entry(
     list_id: uuid.UUID,
     entry_id: uuid.UUID,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> None:
     bl = await _require_list(list_id, db)
     result = await db.execute(
@@ -1423,7 +1436,7 @@ async def add_exception(
     list_id: uuid.UUID,
     body: ExceptionCreate,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> DNSBlockListException:
     bl = await _require_list(list_id, db)
     domain = body.domain.strip().lower().strip(".")
@@ -1470,7 +1483,7 @@ async def update_exception(
     exception_id: uuid.UUID,
     body: ExceptionUpdate,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> DNSBlockListException:
     bl = await _require_list(list_id, db)
     result = await db.execute(
@@ -1520,7 +1533,7 @@ async def delete_exception(
     list_id: uuid.UUID,
     exception_id: uuid.UUID,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> None:
     bl = await _require_list(list_id, db)
     result = await db.execute(

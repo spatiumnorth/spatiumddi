@@ -32,6 +32,7 @@ import {
   type PlanValidationConflict,
 } from "@/lib/api";
 import { newNodeId } from "@/lib/uuid";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { Modal } from "@/components/ui/modal";
 
 /**
@@ -44,6 +45,17 @@ export function SubnetPlannerEditorPage() {
   const { id = "" } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const qc = useQueryClient();
+  // #1341 — the plans router asks write on 'ip_block' (save, reopen), and
+  // apply also asks write on 'subnet' since it creates subnets (plans.py).
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "ip_block"),
+    "Requires write permission on IP blocks",
+  );
+  const applyGate = permissionGate(
+    perms.can("write", "ip_block") && perms.can("write", "subnet"),
+    "Requires write permission on IP blocks and subnets",
+  );
 
   const { data: plan, isLoading } = useQuery({
     queryKey: ["subnet-plan", id],
@@ -203,6 +215,7 @@ export function SubnetPlannerEditorPage() {
                 disabled={reopenMut.isPending}
                 title="Re-open this plan as a draft. Only succeeds if every block / subnet it created has been deleted from IPAM."
                 className="inline-flex items-center gap-1 rounded border px-3 py-1.5 text-sm hover:bg-muted/50 disabled:opacity-50"
+                {...writeGate}
               >
                 {reopenMut.isPending ? (
                   <Loader2 className="h-3 w-3 animate-spin" />
@@ -217,6 +230,7 @@ export function SubnetPlannerEditorPage() {
               disabled={!dirty || saveMut.isPending || applied}
               onClick={() => saveMut.mutate()}
               className="inline-flex items-center gap-1 rounded border px-3 py-1.5 text-sm hover:bg-muted/50 disabled:opacity-50"
+              {...writeGate}
             >
               {saveMut.isPending ? (
                 <Loader2 className="h-3 w-3 animate-spin" />
@@ -239,6 +253,7 @@ export function SubnetPlannerEditorPage() {
                     ? "Resolve conflicts before applying"
                     : ""
               }
+              {...applyGate}
             >
               {applyMut.isPending && (
                 <Loader2 className="h-3 w-3 animate-spin" />
