@@ -317,3 +317,32 @@ async def test_signature_rejection_does_not_blame_allow_transfer(
     msg = str(excinfo.value)
     assert "TSIG signature" in msg
     assert "allow-transfer" not in msg
+
+
+async def test_apex_ns_is_dropped_unless_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1857 — the import / sync paths never see the apex NS (SpatiumDDI owns
+    it at the zone level); the drift report asks for it so it can compare."""
+    import dns.query
+    import dns.zone
+
+    served = dns.zone.from_text(
+        "$TTL 300\n@ SOA ns1 hostmaster 1 7200 3600 1209600 300\n"
+        "@ NS ns1.example.net.\nsub NS ns.sub.example.com.\n",
+        origin="example.com.",
+        relativize=True,
+    )
+    monkeypatch.setattr(dns.query, "xfr", lambda *_a, **_kw: object())
+    monkeypatch.setattr(dns.zone, "from_xfr", lambda _gen: served)
+
+    default = await axfr_zone_records(host="192.0.2.1", port=53, zone_name="example.com.")
+    assert [(r.name, r.value) for r in default if r.record_type == "NS"] == [
+        ("sub", "ns.sub.example.com.")
+    ]
+    asked = await axfr_zone_records(
+        host="192.0.2.1", port=53, zone_name="example.com.", include_apex_ns=True
+    )
+    assert sorted((r.name, r.value) for r in asked if r.record_type == "NS") == [
+        ("@", "ns1.example.net."),
+        ("sub", "ns.sub.example.com."),
+    ]
+    assert all(r.record_type != "SOA" for r in asked)

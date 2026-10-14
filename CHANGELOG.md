@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Drift no longer lists a stored apex NS as missing on the server
+  (#1857).** The zone-transfer read drops the apex NS set, so a stored
+  apex NS row, such as the copy of the source's `@ NS` a Technitium or
+  BIND9 import brings in, could only ever read "missing on server", and
+  the zone never showed in sync whatever Sync did. On an agent-managed
+  BIND9 or Technitium server, which serves a zone's own apex NS rows as
+  its NS set, drift now reads the apex NS too and compares it, so an NS
+  set changed on the server, or an NS change the agent did not apply,
+  still shows. Where the read carries no apex NS (an operator's own
+  BIND9, Windows), the stored rows are left out of the comparison; where
+  the zone declares none, the server's own NS set is not reported.
+  Delegations below the apex are compared as before. Import and Sync with
+  Servers still never see the apex NS. The importers keep the row, so no
+  stored data changes.
+
 - **The built-in Auditor and Compliance Editor could not read the
   audit log (#1862).** Both roles were granted `read` on `audit`, a
   resource type no route checks, while every audit-log route (the

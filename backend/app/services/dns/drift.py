@@ -83,6 +83,51 @@ class ZoneDriftReport:
     warnings: list[str] = field(default_factory=list)
 
 
+def _is_apex_ns(r: RecordData | DNSRecord, zone_name: str) -> bool:
+    """An NS record at the zone apex (``@`` or the zone's own FQDN)."""
+    if r.record_type.upper() != "NS":
+        return False
+    name = (r.name or "").strip().lower()
+    return name in ("@", "", zone_name.strip().lower().rstrip(".") + ".")
+
+
+def _renders_apex_ns(srv: DNSServer, driver: object) -> bool:
+    """Whether ``srv`` serves the zone's own apex NS rows as its NS set, and
+    the read can return them (#1857).
+
+    True for an agent-managed BIND9 or Technitium: both agents write a
+    zone's apex NS records as the whole NS set (#1153), and both drivers read
+    over AXFR, which keeps the apex NS when asked. Elsewhere the NS set is the
+    server's or the provider's, not rendered from the rows.
+    """
+    return srv.agent_id is not None and bool(getattr(driver, "pull_can_include_apex_ns", False))
+
+
+def _compare_apex_ns(
+    db_rows: list[DNSRecord], on_wire: list[RecordData], zone_name: str
+) -> tuple[list[DNSRecord], list[RecordData]]:
+    """The two sides of a drift diff with apex NS kept only where it means
+    something (#1857).
+
+    * The zone declares no apex NS: whatever NS set the server answers with
+      is its own (an agent's ``primary_ns`` or placeholder, a provider's name
+      servers), not a difference from the zone. Drop it from the wire.
+    * The read carried no apex NS: an AXFR of a server that does not render
+      the zone's NS rows (an operator's BIND9, Windows). Every zone has an apex
+      NS set, so its absence means the read could not see it, and the stored
+      rows would read "missing on server" forever. Drop them from the DB side.
+    * Both sides have one: compare them like any record, so an NS set changed
+      on the server, or an NS change the agent failed to apply, shows.
+    """
+    db_has = any(_is_apex_ns(r, zone_name) for r in db_rows)
+    wire_has = any(_is_apex_ns(r, zone_name) for r in on_wire)
+    if not db_has:
+        on_wire = [r for r in on_wire if not _is_apex_ns(r, zone_name)]
+    elif not wire_has:
+        db_rows = [r for r in db_rows if not _is_apex_ns(r, zone_name)]
+    return db_rows, on_wire
+
+
 def _to_drift_record(r: RecordData | DNSRecord) -> DriftRecord:
     return DriftRecord(
         name=r.name or "@",
@@ -185,9 +230,10 @@ async def compute_zone_drift(
             # authorised by address; handing either a key it never granted
             # turns a working pull into NOTAUTH.
             keys = [None]
+        pull_kwargs = {"include_apex_ns": True} if _renders_apex_ns(srv, driver) else {}
         try:
             on_wire, used = await pull_zone_records_signed(
-                driver, srv, zone.name, keys, view_name=view_name
+                driver, srv, zone.name, keys, view_name=view_name, **pull_kwargs
             )
         except Exception as exc:  # noqa: BLE001 — per-server, never fail the whole report
             entry.status = "error"
@@ -205,7 +251,11 @@ async def compute_zone_drift(
         # #1794 — a dot-less name target is relative on a zone-file driver and
         # absolute on a cloud one, so the DB side is keyed per server.
         rel = targets_are_relative(srv)
-        db_by_key = {_key(r, zone.name, relative_targets=rel): r for r in db_rows}
+        # #1857 — a stored apex NS row (an importer's copy of the source's, or
+        # one an operator wrote) read "missing on server" forever, because the
+        # transfer dropped the apex NS. See ``_compare_apex_ns``.
+        db_rows_cmp, on_wire = _compare_apex_ns(db_rows, on_wire, zone.name)
+        db_by_key = {_key(r, zone.name, relative_targets=rel): r for r in db_rows_cmp}
         on_wire = without_agent_ns_glue(on_wire, srv, zone.name, set(db_by_key))
         wire_by_key = {_key(r, zone.name, relative_targets=rel): r for r in on_wire}
         entry.extra_on_server = [
