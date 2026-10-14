@@ -24,7 +24,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import attributes
 
 from app.api.deps import DB, CurrentUser
-from app.config import settings
 from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
@@ -33,6 +32,7 @@ from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
+from app.services.backup import node_local
 from app.services.backup.archive import MAX_ARCHIVE_BYTES
 from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
 from app.services.backup.runner import (
@@ -47,6 +47,7 @@ from app.services.backup.schedule import (
 )
 from app.services.backup.targets import (
     ARCHIVE_NAME_RE,
+    ArchiveNotFoundError,
     BackupDestinationError,
     DestinationConfigError,
     InvalidArchiveNameError,
@@ -246,6 +247,10 @@ class BackupTargetResponse(BaseModel):
     last_run_status: str
     last_run_at: datetime | None
     last_run_filename: str | None
+    # The node whose pod wrote ``last_run_filename`` (#1838). For a
+    # node-local ``local_volume`` target on a multi-node appliance this is
+    # where that archive is. Null when unknown (pre-#1838 run, Compose).
+    last_run_node: str | None = None
     last_run_bytes: int | None
     last_run_duration_ms: int | None
     last_run_error: str | None
@@ -287,6 +292,7 @@ def _to_response(t: BackupTarget) -> BackupTargetResponse:
         last_run_status=t.last_run_status,
         last_run_at=t.last_run_at,
         last_run_filename=t.last_run_filename,
+        last_run_node=t.last_run_node,
         last_run_bytes=t.last_run_bytes,
         last_run_duration_ms=t.last_run_duration_ms,
         last_run_error=t.last_run_error,
@@ -622,6 +628,8 @@ class RunNowResponse(BaseModel):
     duration_ms: int | None
     deleted: int
     error: str | None
+    # The node whose pod wrote the archive (#1838); null off the appliance.
+    node_name: str | None = None
 
 
 @router.post("/{target_id}/run-now", response_model=RunNowResponse)
@@ -690,6 +698,12 @@ async def test_target(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -
         outcome = {"ok": False, "error": str(exc)}
     except BackupDestinationError as exc:
         outcome = {"ok": False, "error": str(exc)}
+    # #1838 — on a multi-node appliance a local volume is per node. Only
+    # the api can say so: the driver has no database to count nodes with.
+    if outcome.get("ok"):
+        cluster = node_local.multi_node_warning(row, await node_local.control_plane_size(db))
+        if cluster:
+            outcome["warning"] = " ".join(w for w in (outcome.get("warning"), cluster) if w)
     return outcome
 
 
@@ -702,19 +716,28 @@ class ArchiveListingResponse(BaseModel):
     node_name: str | None = None
 
 
-def _node_local_listing_note(row: BackupTarget, archives: list[Any]) -> str | None:
-    node = next((a.node_name for a in archives if a.node_name), None)
-    if row.kind != "local_volume" or not (node or settings.node_name):
-        return None
-    node = node or settings.node_name
-    note = (
-        f"Listing is node {node} only: a local volume is per node on a multi-node "
-        "appliance, so archives written by other nodes are not shown"
-    )
-    last = row.last_run_filename
-    if row.last_run_status == "success" and last and all(a.filename != last for a in archives):
-        note += f"; the last run's archive {last} is held by another node, not missing"
-    return note
+async def _archive_miss(db: DB, row: BackupTarget, filename: str, exc: Exception) -> HTTPException:
+    """502 for an archive the destination does not have (#1838).
+
+    On a multi-node appliance a ``local_volume`` archive is on the disk of
+    the node that wrote it, so the detail names the node that answered and,
+    when the run row recorded it, the node that holds the file.
+    """
+    hint = ""
+    if isinstance(exc, ArchiveNotFoundError):
+        hint = node_local.miss_hint(row, filename, await node_local.control_plane_size(db))
+    return HTTPException(status_code=502, detail=str(exc) + hint)
+
+
+async def _set_listing_note(
+    db: DB, response: Response, row: BackupTarget, filenames: list[str]
+) -> None:
+    """``X-Archive-Listing-Note``: whose disk a node-local listing is (#1838)."""
+    if not node_local.applies(row):
+        return
+    note = node_local.listing_note(row, filenames, await node_local.control_plane_size(db))
+    if note:
+        response.headers["X-Archive-Listing-Note"] = note
 
 
 @router.get("/{target_id}/archives", response_model=list[ArchiveListingResponse])
@@ -739,9 +762,7 @@ async def list_target_archives(
     # #1838 — a node-local listing is one node's view, and says so rather
     # than reading as the complete list. When the last successful run's
     # archive is not in it, it is on another node, not missing.
-    note = _node_local_listing_note(row, archives)
-    if note:
-        response.headers["X-Archive-Listing-Note"] = note
+    await _set_listing_note(db, response, row, [a.filename for a in archives])
     return [
         ArchiveListingResponse(
             filename=a.filename,
@@ -842,7 +863,7 @@ async def download_latest_target_archive(
     try:
         archive_bytes = await driver.download(config=plain_config, filename=newest.filename)
     except BackupDestinationError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise await _archive_miss(db, row, newest.filename, exc) from exc
     _enforce_download_size(len(archive_bytes), filename=newest.filename)
 
     def _iter():
@@ -918,7 +939,7 @@ async def download_target_archive(
         # looking like the destination is down.
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise await _archive_miss(db, row, safe_name, exc) from exc
     _enforce_download_size(len(archive_bytes), filename=safe_name)
 
     # The archive exists and is readable — only now is a precondition
@@ -986,7 +1007,7 @@ async def restore_from_archive(
     except SecretFieldError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise await _archive_miss(db, row, body.filename, exc) from exc
     if not archive_bytes:
         raise HTTPException(
             status_code=502,
@@ -997,6 +1018,7 @@ async def restore_from_archive(
     # Reuse the Phase 1a restore path so the safety dump +
     # passphrase verify + psql replay + post-replay audit row all
     # behave the same as the upload-based restore.
+    from app.config import settings  # noqa: PLC0415
     from app.services.backup import (  # noqa: PLC0415
         BackupArchiveError,
         BackupCryptoError,

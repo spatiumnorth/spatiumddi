@@ -100,6 +100,17 @@ class DestinationConfigError(BackupDestinationError):
     the API side."""
 
 
+class ArchiveNotFoundError(BackupDestinationError):
+    """The named archive is not at the destination (#1838).
+
+    A subclass so every existing ``except BackupDestinationError`` still
+    catches it. It exists so the api can tell a miss from a destination
+    failure: on a multi-node appliance a ``local_volume`` miss usually
+    means the archive is on another node's disk, and the api, which can
+    read the database, appends which node.
+    """
+
+
 class InvalidArchiveNameError(BackupDestinationError):
     """The archive name is not a single plain path component (#1243).
 

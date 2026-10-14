@@ -15,6 +15,7 @@ from app.services.backup.targets.base import (
     DESTINATIONS,
     PRE_RESTORE_KEEP_LAST_N,
     ArchiveListing,
+    ArchiveNotFoundError,
     BackupDestination,
     BackupDestinationError,
     DestinationConfigError,
@@ -60,6 +61,7 @@ DESTINATIONS["https_put"] = HttpsPutDestination()
 __all__ = [
     "ARCHIVE_NAME_RE",
     "ArchiveListing",
+    "ArchiveNotFoundError",
     "BackupDestination",
     "BackupDestinationError",
     "UnsupportedOperationError",

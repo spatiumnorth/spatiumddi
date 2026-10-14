@@ -51,6 +51,7 @@ from app.services.appliance.removable import REMOVABLE_ROOT
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveNotFoundError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
@@ -238,9 +239,10 @@ class LocalVolumeDestination(BackupDestination):
             # served here — escaping the configured root the listing
             # deliberately never leaves.
             if target.is_symlink() or not target.is_file():
-                raise BackupDestinationError(
-                    f"archive {safe!r} not found at {root}" + _other_node_hint()
-                )
+                # The api appends where the archive probably is on a
+                # multi-node appliance (#1838, services.backup.node_local);
+                # the driver has no database to tell one node from three.
+                raise ArchiveNotFoundError(f"archive {safe!r} not found at {root}")
             return target.read_bytes()
 
         try:
@@ -311,8 +313,6 @@ class LocalVolumeDestination(BackupDestination):
         # A warning, not a failure: the write works — until the
         # container is replaced (#1160).
         warning = await asyncio.to_thread(_not_on_a_volume_warning, root)
-        multi = _multi_node_warning(root)
-        warning = " ".join(w for w in (warning, multi) if w) or None
         if warning:
             outcome["warning"] = warning
         return outcome
@@ -321,39 +321,6 @@ class LocalVolumeDestination(BackupDestination):
 def _this_node() -> str:
     """The k8s node this pod runs on; empty off the appliance."""
     return os.environ.get("NODE_NAME", "").strip()
-
-
-def _other_node_hint() -> str:
-    """Appended to a miss: on a cluster the file may simply be elsewhere (#1838)."""
-    node = _this_node()
-    if not node:
-        return ""
-    return (
-        f" (answered by the api on node {node}). A local volume is per node on a "
-        "multi-node appliance: the archive is on the disk of the node whose pod "
-        "wrote it, which the pod name inside the file name identifies. Nothing was "
-        "lost or restored. Retry through the api replica on that node, or move "
-        "backups to a network destination (S3, SCP, SMB, NFS)."
-    )
-
-
-def _multi_node_warning(root: Path) -> str | None:
-    """Per-node storage caveat for an appliance pod (#1838).
-
-    Fires whenever ``NODE_NAME`` is set (appliance, one or many nodes — the
-    driver has no database to count them), except for a removable disk,
-    which already states its node. Worded conditionally for that reason.
-    """
-    node = _this_node()
-    if not node or Path(REMOVABLE_ROOT) in root.parents:
-        return None
-    return (
-        f"On a multi-node appliance this path is per node: this check ran on node "
-        f"{node}, and an archive written here exists only on the disk of the node "
-        "whose pod wrote it. A restore, download or drill served by the api on "
-        "another node will not find it, and losing the node loses the backup. "
-        "Use S3, SCP, SMB or NFS for a cluster."
-    )
 
 
 def _not_on_a_volume_warning(root: Path) -> str | None:

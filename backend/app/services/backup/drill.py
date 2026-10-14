@@ -55,6 +55,7 @@ from app.config import settings
 from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget, RestoreDrill
+from app.services.backup import node_local
 from app.services.backup.archive import (
     MAX_ARCHIVE_BYTES,
     BackupArchiveError,
@@ -981,6 +982,13 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
                     "is empty. Recovery readiness reports it as UNVERIFIED."
                 ),
             )
+        elsewhere = node_local.drill_note(target, [])
+        if elsewhere:
+            # #1838 — a node-local destination on a multi-node appliance:
+            # this node's directory is empty because the archive is on
+            # the node that wrote it. That is no verdict about the backup,
+            # so ``error`` (could not drill), never ``failed`` (no archive).
+            return DrillOutcome(state="error", error=f"could not drill here: {elsewhere}")
         assertions.append(
             Assertion(
                 "archive_available",
@@ -991,9 +999,14 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
         return DrillOutcome(state="failed", assertions=assertions)
 
     newest = max(listings, key=lambda a: a.created_at)
-    assertions.append(
-        Assertion("archive_available", PASS, f"{newest.filename} ({newest.size_bytes} bytes)")
-    )
+    available = f"{newest.filename} ({newest.size_bytes} bytes)"
+    # #1838 — the newest archive VISIBLE here is older than the target's
+    # last run when that run's archive sits on another node's disk. Drill
+    # what is here, but say it is not the newest backup.
+    elsewhere = node_local.drill_note(target, [a.filename for a in listings])
+    if elsewhere:
+        available += f"; this is the newest on this node, not the newest backup: {elsewhere}"
+    assertions.append(Assertion("archive_available", PASS, available))
 
     if newest.size_bytes > MAX_ARCHIVE_BYTES:
         # Same destination-download cap as the API (#1568): the

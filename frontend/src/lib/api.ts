@@ -3026,6 +3026,12 @@ export interface BackupTarget {
   last_run_status: string;
   last_run_at: string | null;
   last_run_filename: string | null;
+  /**
+   * The node whose pod wrote `last_run_filename` (#1838). A `local_volume`
+   * target is per node on a multi-node appliance, so this is the only node
+   * that can list, download or restore that archive. Null when unknown.
+   */
+  last_run_node: string | null;
   last_run_bytes: number | null;
   last_run_duration_ms: number | null;
   last_run_error: string | null;
@@ -3132,6 +3138,18 @@ export interface BackupArchiveListing {
   filename: string;
   size_bytes: number;
   created_at: string;
+  /** The node whose disk holds the archive (`local_volume` on the
+   *  appliance, #1838); null for network destinations. */
+  node_name?: string | null;
+}
+
+/** An archive listing plus the server's `X-Archive-Listing-Note` (#1838):
+ *  on a multi-node appliance a `local_volume` listing is one node's disk,
+ *  and the note says so, or that the last run's archive is on another
+ *  node rather than missing. */
+export interface BackupArchiveList {
+  archives: BackupArchiveListing[];
+  note: string | null;
 }
 
 export interface BackupRunNowOutcome {
@@ -3141,6 +3159,8 @@ export interface BackupRunNowOutcome {
   duration_ms: number | null;
   deleted: number;
   error: string | null;
+  /** The node whose pod wrote the archive (#1838); null off the appliance. */
+  node_name?: string | null;
 }
 
 export interface BackupTestOutcome {
@@ -3177,10 +3197,16 @@ export const backupTargetsApi = {
     api
       .post<BackupTestOutcome>(`/backup/targets/${id}/test`)
       .then((r) => r.data),
-  listArchives: (id: string) =>
+  listArchives: (id: string): Promise<BackupArchiveList> =>
     api
       .get<BackupArchiveListing[]>(`/backup/targets/${id}/archives`)
-      .then((r) => r.data),
+      .then((r) => {
+        const note = r.headers?.["x-archive-listing-note"];
+        return {
+          archives: r.data,
+          note: typeof note === "string" && note ? note : null,
+        };
+      }),
   /**
    * Restore-verification drills (issue #702) — replay this target's
    * newest archive into a throwaway database and assert against the

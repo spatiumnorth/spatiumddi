@@ -85,15 +85,27 @@ the formatter handles the rest.
 ### Fixed
 
 - **A `local_volume` backup on a multi-node appliance is per node, and now
-  says so (#1838).** The default backups hostPath is node-local, so a
-  restore, download or drill served by another node's api answered a bare
-  "archive not found" 502, and the archive list depended on which replica
-  answered. The miss now names the answering node and the remedy (retry on
-  the node that wrote it, or use S3/SCP/SMB/NFS), Test connection warns,
-  the path help says it, listings carry `node_name` plus an
-  `X-Archive-Listing-Note` header saying the last run's archive is held by
-  another node rather than missing. Not moved off-node: a cluster-wide
-  store is still a network destination.
+  says so (#1838).** The default backups directory is a per-node hostPath,
+  so an archive exists only on the disk of the node whose pod wrote it. A
+  restore, download or drill answered by another node's api returned a bare
+  "archive not found" 502, the archive list depended on which replica
+  answered, and a drill there reported `failed` ("the destination holds no
+  archives") about a target that was fine. Now each successful run records
+  the node that wrote it (`last_run_node`, on the target, the run-now
+  response, the Backup page and `list_backup_targets`). A miss names the
+  node that answered and, when known, the node holding the archive, and
+  says nothing was restored. On an appliance with two or more control-plane
+  nodes, Test connection warns that the target is per node, and the archive
+  list carries `node_name` per archive plus an `X-Archive-Listing-Note`
+  header, shown on the Backup page, saying whose disk the list is and that
+  the last run's archive is held by another node rather than missing. A
+  drill whose node cannot see the newest archive reports `error` (no
+  verdict) when it sees nothing, and notes it when it drilled an older
+  one. A single-node appliance and Compose see no cluster wording. The
+  Backup page's restore, download, delete, save and drill errors now show
+  the server's reason instead of "Request failed with status code 502".
+  Archives are not moved: the remedy on a cluster is a network destination
+  (S3, SCP, SMB, NFS).
 - **The built-in Auditor and Compliance Editor could not read the
   audit log (#1862).** Both roles were granted `read` on `audit`, a
   resource type no route checks, while every audit-log route (the
@@ -3788,6 +3800,9 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `d9d0f6ddc446` — #1838: nullable `backup_target.last_run_node`, the
+  node whose pod wrote `last_run_filename`. No backfill: an existing row
+  cannot say where its archive was written, so NULL (unknown) stays.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column
