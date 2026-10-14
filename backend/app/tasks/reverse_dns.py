@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
 
@@ -33,7 +34,9 @@ _SINGLETON_ID = 1
 async def _run_sweep(force: bool = False) -> dict[str, Any]:
     from app.services.ipam.reverse_dns import populate_reverse_dns  # noqa: PLC0415
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:

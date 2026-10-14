@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._mac import canonicalize_mac
 from app.api.v1.dhcp.scopes import validate_dhcp_options
@@ -239,7 +239,7 @@ async def list_statics(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_static(
-    scope_id: uuid.UUID, body: StaticCreate, db: DB, user: SuperAdmin
+    scope_id: uuid.UUID, body: StaticCreate, db: DB, user: CurrentUser
 ) -> DHCPStaticAssignment:
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
@@ -279,7 +279,7 @@ async def create_static(
 
 @router.put("/statics/{static_id}", response_model=StaticResponse)
 async def update_static(
-    static_id: uuid.UUID, body: StaticUpdate, db: DB, user: SuperAdmin
+    static_id: uuid.UUID, body: StaticUpdate, db: DB, user: CurrentUser
 ) -> DHCPStaticAssignment:
     st = await db.get(DHCPStaticAssignment, static_id)
     if st is None:
@@ -334,7 +334,7 @@ async def update_static(
 
 
 @router.delete("/statics/{static_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_static(static_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_static(static_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     st = await db.get(DHCPStaticAssignment, static_id)
     if st is None:
         raise HTTPException(status_code=404, detail="Static assignment not found")

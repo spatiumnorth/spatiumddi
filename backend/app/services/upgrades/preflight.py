@@ -67,6 +67,7 @@ from app.models.appliance import (
     CLUSTER_ROLE_PRIMARY,
     Appliance,
 )
+from app.services.appliance.ownership import k8s_node_name
 from app.services.upgrades import mutex
 
 logger = structlog.get_logger(__name__)
@@ -411,10 +412,28 @@ def judge_node_disk_headroom(
 
 async def check_node_disk_headroom(
     *,
+    nodes: list[str] | None = None,
+    target_version: str | None = None,
     slot_image_size_bytes: int = 4 * 1024 * 1024 * 1024,
     safety_margin_bytes: int = 1 * 1024 * 1024 * 1024,
 ) -> PreflightResult:
     """Per-node ``/var`` headroom for appliance fleets (#1234).
+
+    ``nodes`` narrows the judgement to those hostnames (matched as k8s Node names):
+    a rolling run's chain passes the nodes it has still to upgrade. Upgrading
+    a node shrinks its ``/var`` (it keeps the old slot's images beside the
+    new ones), and a node the run has finished, or an approved row that is
+    not part of the run, never stages this image; judging them failed the
+    run's own next node (ddi-pg, nightly-20261012: both upgraded nodes short,
+    the node left to upgrade with 8 GiB free). A named node with no row is
+    unverified (``warn``). Plan passes no ``nodes`` and judges every row.
+
+    ``target_version`` leaves out the rows that already report it, Plan and
+    chain alike: such a node stages nothing (the chain's ``mirror_ready`` and
+    ``stage`` skip a node whose ``installed_appliance_version`` is the
+    target). So a new Plan after a failed run, which is the way out of it, is
+    not refused on the nodes that run already upgraded. They are named in
+    ``detail.on_target``.
 
     Falls back to :func:`check_disk_headroom` (the api container's own
     ``/var``) when there are no approved appliance rows — docker-compose /
@@ -447,19 +466,54 @@ async def check_node_disk_headroom(
             slot_image_size_bytes=slot_image_size_bytes,
             safety_margin_bytes=safety_margin_bytes,
         )
-    return judge_node_disk_headroom(
-        rows,
-        need_bytes=slot_image_size_bytes + safety_margin_bytes,
-        now=datetime.now(UTC),
-    )
+    need = slot_image_size_bytes + safety_margin_bytes
+    missing: list[str] = []
+    if nodes is not None:
+        # #1757 — the Node name k3s gives a host is its lowercased hostname.
+        wanted = {k8s_node_name(n) for n in nodes}
+        rows = [r for r in rows if k8s_node_name(r.hostname) in wanted]
+        missing = sorted(wanted - {k8s_node_name(r.hostname) for r in rows})
+    on_target: list[str] = []
+    if target_version:
+        on_target = sorted(
+            r.hostname or str(r.id) for r in rows if r.installed_appliance_version == target_version
+        )
+        rows = [r for r in rows if r.installed_appliance_version != target_version]
+    result = judge_node_disk_headroom(rows, need_bytes=need, now=datetime.now(UTC))
+    detail = {**result.detail, "on_target": on_target} if target_version else result.detail
+    if missing and result.level != "fail":
+        unknown = [{"node": n, "reason": "no appliance row"} for n in missing]
+        names = ", ".join(f"{e['node']} ({e['reason']})" for e in unknown)
+        return PreflightResult(
+            name="disk_headroom",
+            level="warn",
+            message=f"/var headroom unverified on {names}",
+            detail={**detail, "unverified": detail["unverified"] + unknown},
+        )
+    if not on_target:
+        return result
+    message = result.message
+    if result.level == "ok":
+        message = (
+            f"{message}; already on {target_version}, nothing to stage: {', '.join(on_target)}"
+        )
+    return PreflightResult(name="disk_headroom", level=result.level, message=message, detail=detail)
 
 
 async def check_mirror_disk_headroom(
     *,
+    slot_image_id: uuid.UUID | None = None,
     slot_image_size_bytes: int = 4 * 1024 * 1024 * 1024,
     safety_margin_bytes: int = 1 * 1024 * 1024 * 1024,
 ) -> PreflightResult:
     """Mirror node has room for the slot image + a safety margin.
+
+    #1709 — ``slot_image_id`` is the run's target when it is an uploaded
+    image. An upload streams its bytes to the mirror, so when the mirror is
+    short of the full need the check asks it (a HEAD, as the re-upload
+    presence check does) whether it already holds that image; if it does,
+    only the margin is needed. An external URL, an image the mirror does not
+    hold, or a presence check that fails keep the full need.
 
     Phase B-only check — only fires when ``settings.slot_image_mirror_url``
     is set. Queries the mirror's ``/api/v1/appliance/internal/slot-
@@ -510,6 +564,11 @@ async def check_mirror_disk_headroom(
     free = int(body.get("free_bytes") or 0)
     total = int(body.get("total_bytes") or 0)
     need = slot_image_size_bytes + safety_margin_bytes
+    on_mirror: bool | None = None
+    if free < need and slot_image_id is not None:
+        on_mirror = await _mirror_holds_image(slot_image_id)
+        if on_mirror:
+            need = safety_margin_bytes
     if free < need:
         return PreflightResult(
             name="mirror_disk_headroom",
@@ -523,19 +582,60 @@ async def check_mirror_disk_headroom(
                 "needed_bytes": need,
                 "total_bytes": total,
                 "path": body.get("path"),
+                "slot_image_id": str(slot_image_id) if slot_image_id else None,
+                "target_on_mirror": on_mirror,
             },
+        )
+    message = f"mirror: {free // (1024**3)} GiB free (need {need // (1024**3)} GiB)"
+    if on_mirror:
+        message = (
+            f"mirror: {free // (1024**3)} GiB free; the target is already on the mirror, "
+            f"so it needs only the {need // (1024**3)} GiB margin"
         )
     return PreflightResult(
         name="mirror_disk_headroom",
         level="ok",
-        message=(f"mirror: {free // (1024**3)} GiB free " f"(need {need // (1024**3)} GiB)"),
+        message=message,
         detail={
             "free_bytes": free,
             "needed_bytes": need,
             "total_bytes": total,
             "path": body.get("path"),
+            "slot_image_id": str(slot_image_id) if slot_image_id else None,
+            "target_on_mirror": on_mirror,
         },
     )
+
+
+async def _mirror_holds_image(image_id: uuid.UUID) -> bool | None:
+    """Does the slot-image mirror hold ``image_id``'s bytes? True / False,
+    or None when it could not tell (unreachable, or an answer other than
+    200 / 404). A HEAD costs headers, not the 1-4 GiB body (#1709)."""
+    import httpx  # noqa: PLC0415
+
+    from app.api.v1.appliance.slot_image_mirror import mirror_auth_token  # noqa: PLC0415
+
+    url = (
+        f"{settings.slot_image_mirror_url.rstrip('/')}"
+        f"/api/v1/appliance/internal/slot-images/{image_id}"
+    )
+    headers = {"X-Mirror-Auth": mirror_auth_token("get", image_id)}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.head(url, headers=headers)
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "preflight_mirror_presence_unreachable", image_id=str(image_id), error=str(exc)
+        )
+        return None
+    if resp.status_code == 200:
+        return True
+    if resp.status_code == 404:
+        return False
+    logger.warning(
+        "preflight_mirror_presence_unexpected", image_id=str(image_id), status=resp.status_code
+    )
+    return None
 
 
 def check_version_path(
@@ -806,11 +906,17 @@ async def run_all(
     target_version: str,
     namespace: str | None = None,
     own_holder: str | None = None,
+    slot_image_id: uuid.UUID | None = None,
+    disk_nodes: list[str] | None = None,
 ) -> PreflightReport:
     """Run every check + return the aggregate report.
 
     ``own_holder`` is passed by a run that already holds the upgrade
     lease (see :func:`check_inflight_conflict`); Plan passes nothing.
+    ``slot_image_id`` is the run's target when it is an uploaded image
+    (#1709, :func:`check_mirror_disk_headroom`). ``disk_nodes`` is a
+    rolling run's nodes still to upgrade (:func:`check_node_disk_headroom`,
+    which also leaves out every node already on ``target_version``).
 
     Order doesn't matter (independent checks); we run them
     sequentially for now since none of them are slow. If any block
@@ -820,8 +926,8 @@ async def run_all(
     results: list[PreflightResult] = [
         check_inflight_conflict(namespace=namespace, own_holder=own_holder),
         await check_replication_lag(),
-        await check_node_disk_headroom(),
-        await check_mirror_disk_headroom(),
+        await check_node_disk_headroom(nodes=disk_nodes, target_version=target_version),
+        await check_mirror_disk_headroom(slot_image_id=slot_image_id),
         check_version_path(target_version=target_version),
         check_quorum(),
         await check_kea_ha_version_skew(),

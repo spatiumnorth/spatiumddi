@@ -99,6 +99,84 @@ the formatter handles the rest.
   fails a render where the three disagree. An existing appliance picks it up when firstboot
   re-renders the control-plane chart values (the next slot upgrade).
 
+- **A lost CNPG primary no longer hangs a Celery task for ~15 minutes
+  (#1719).** No Celery-side database engine set asyncpg bounds: neither
+  `task_session()` nor the ~55 per-task `create_async_engine` calls the
+  lease pulls, DNS / IPAM syncs, health sweeps, integration mirrors and the
+  event outbox build directly. A query to a black-holed primary therefore
+  waited out the kernel's TCP retransmit timeout while the worker completed
+  nothing and its liveness probe passed. Every task and service engine on
+  the app database now carries the api engine's connect bound
+  (`TASK_DB_CONNECT_TIMEOUT`, 5 s) and a per-statement
+  `TASK_DB_COMMAND_TIMEOUT` (120 s, the pre-ping included), through one
+  helper, `app.db.task_connect_args()`; a test fails any new engine that
+  omits it. Tasks with a single statement that can legitimately run long use
+  `TASK_DB_LONG_COMMAND_TIMEOUT` (900 s): the prunes (metrics, logs,
+  internal errors, lease history, stale ARP), trash purge, audit-chain
+  verify, utilization recount, backup sweep, the DNS threat rollup and the
+  DNS agent bundle render, whose records query on a million-row group is
+  the #1111 case. The backup drill's scratch-database engine and the backup
+  migration helper's explicit-URL engine are deliberately unbounded.
+
+- **Drift no longer lists a stored apex NS as missing on the server
+  (#1857).** The zone-transfer read drops the apex NS set, so a stored
+  apex NS row, such as the copy of the source's `@ NS` a Technitium or
+  BIND9 import brings in, could only ever read "missing on server", and
+  the zone never showed in sync whatever Sync did. On an agent-managed
+  BIND9 or Technitium server, which serves a zone's own apex NS rows as
+  its NS set, drift now reads the apex NS too and compares it, so an NS
+  set changed on the server, or an NS change the agent did not apply,
+  still shows. Where the read carries no apex NS (an operator's own
+  BIND9, Windows), the stored rows are left out of the comparison; where
+  the zone declares none, the server's own NS set is not reported.
+  Delegations below the apex are compared as before. Import and Sync with
+  Servers still never see the apex NS. The importers keep the row, so no
+  stored data changes.
+
+- **The built-in Auditor and Compliance Editor could not read the
+  audit log (#1862).** Both roles were granted `read` on `audit`, a
+  resource type no route checks, while every audit-log route (the
+  list, the PDF export and the integrity check) requires `read` on
+  `audit_log`. An Auditor opening Administration, Audit Log was told
+  "0 events" with the log full, and the role's own description ("read
+  on audit log") was false. Both roles now carry `read` on
+  `audit_log`. Built-in roles are re-written from code on every api
+  start, so existing installs pick this up on upgrade with no
+  migration. A new test walks every route's required permission and
+  fails when a built-in role holds a grant that no route checks.
+
+- **The DNS Editor and DHCP Editor roles now grant the writes they
+  always claimed to (#1861).** Both promised "Full CRUD", but 134 of
+  the 147 DNS and DHCP write routes also took `SuperAdmin`, so a DHCP
+  Editor could not create a scope and a DNS Editor could write records
+  and nothing else; the subnet's DHCP Pools panel offered Create Scope
+  and then refused the filled-in form with "Superadmin required". The
+  everyday data routes now check the role's own resource permission,
+  with `delete` for a delete. **This widens what both roles can do on
+  existing installs**, on purpose:
+  - DNS Editor: zones (create, from template, edit, delete), records,
+    zone-file import, views, named ACLs, and the entries and exceptions
+    of existing blocklists.
+  - DHCP Editor: scopes, pools, static assignments, client classes and
+    device policies, option templates (and applying one to a scope),
+    phone and PXE profiles, and MAC blocks.
+
+  Infrastructure stays superadmin-only: server groups and servers,
+  DNS server options, TSIG keys, DNSSEC signing and policies,
+  dynamic-update ACLs, zone moves, blocklist lists and their feeds and
+  assignments, DNS GSLB pools, Windows DHCP failover, lease deletion and
+  the importers. So do `?permanent=true` on a zone or scope delete and
+  changing a zone's DNSSEC, dynamic-update or TLS-probing settings. The
+  DNS Editor's grant on `manage_dns_pools` narrows from `admin` to
+  `read`, since every pool write stays superadmin-only. The console's
+  controls follow the same gates: an Editor gets them, a Viewer sees
+  them disabled with the reason, and the PXE profiles page, which had
+  no gate at all, now has one. `docs/PERMISSIONS.md` lists every gate,
+  and `test_builtin_roles_match_routes.py` now fails when a built-in
+  role is refused a route its description promises, holds a write grant
+  none of its promised routes use, or when a DNS / DHCP write route is
+  neither on the open list nor superadmin-only.
+
 - **Failed sign-ins are forwarded to syslog / SIEM as warnings, not info
   (#1874).** Every rejected sign-in (bad password, bad MFA code, locked or
   disabled account) is audited with `result="failure"`, which audit

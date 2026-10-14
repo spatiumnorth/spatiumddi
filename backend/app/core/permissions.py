@@ -570,6 +570,7 @@ def require_permission(
             detail=f"Permission denied: need '{action}' on '{resource_type}'",
         )
 
+    _dep.spatium_requires = ("exact", [(action, resource_type)])  # type: ignore[attr-defined]
     return _dep
 
 
@@ -596,6 +597,7 @@ def require_any_permission(*pairs: tuple[str, str]) -> Callable[..., Awaitable[U
             detail="Permission denied",
         )
 
+    _dep.spatium_requires = ("exact", list(pairs))  # type: ignore[attr-defined]
     return _dep
 
 
@@ -673,6 +675,7 @@ def require_resource_permission(resource_type: str) -> Callable[..., Awaitable[U
             detail=f"Permission denied: need '{action}' on '{resource_type}'",
         )
 
+    _dep.spatium_requires = ("method", [resource_type])  # type: ignore[attr-defined]
     return _dep
 
 
@@ -703,6 +706,7 @@ def require_any_resource_permission(
             detail=f"Permission denied: need '{action}' on one of {list(resource_types)}",
         )
 
+    _dep.spatium_requires = ("method", list(resource_types))  # type: ignore[attr-defined]
     return _dep
 
 
@@ -780,6 +784,7 @@ def require_any_resource_or_scoped(
             detail=f"Permission denied: need '{action}' on one of {all_types}",
         )
 
+    _dep.spatium_requires = ("method", list(unscoped_types))  # type: ignore[attr-defined]
     return _dep
 
 
