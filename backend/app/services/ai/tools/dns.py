@@ -417,6 +417,7 @@ async def preview_dns_zone_move(
         "acl_names_lost": plan.acl_names_lost,
         "key_names_lost": plan.key_names_lost,
         "technitium_api_refusal": plan.technitium_api_refusal,
+        "tsig_algorithm_refusal": plan.tsig_algorithm_refusal,
         "warnings": plan.warnings,
         "required_acknowledgements": plan.required_acknowledgements,
     }
