@@ -28,12 +28,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
+import structlog
 from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.integration_ownership import dns_record_owned_elsewhere
+
+logger = structlog.get_logger(__name__)
 
 # ── Drift report dataclasses ─────────────────────────────────────────────────
 
@@ -85,6 +88,10 @@ class DriftReport:
     missing: list[MissingItem] = field(default_factory=list)
     mismatched: list[MismatchItem] = field(default_factory=list)
     stale: list[StaleItem] = field(default_factory=list)
+    # Every reverse zone the subnet's addresses resolve to, in address order
+    # (spatiumddi#1840: a /23 spans two, a /17 128). ``reverse_zone_id`` /
+    # ``reverse_zone_name`` are the first of them, kept for older clients.
+    reverse_zone_names: list[str] = field(default_factory=list)
 
 
 # ── Effective DNS resolution (duplicated minimally to avoid a router import) ─
@@ -164,49 +171,227 @@ def reverse_owner_key(zone: DNSZone) -> tuple[int, bool]:
     return (len(zone.name.rstrip(".")), ipam_authors_zone(zone))
 
 
-async def _effective_reverse_zone(db: AsyncSession, subnet: Subnet) -> DNSZone | None:
-    """Find the reverse zone for this subnet — first by ``linked_subnet_id``,
-    then by longest-suffix match against the subnet's *effective* DNS group(s).
+def cidrs_overlap(a: object, b: object) -> bool:
+    """True when two CIDR strings are the same address family and overlap.
 
-    Only a zone IPAM authors is returned (spatiumddi#1419), by the same rule
-    as the IPAM router's ``_resolve_reverse_zone``: when the zone that owns
-    the subnet's reverse names is a forwarder, a secondary or a stub, there is
-    none, and the drift check expects no PTR.
+    #844 uses this instead of a bare space-id comparison: reverse zones
+    aggregate (``compute_reverse_zone_names``), so two NON-overlapping subnets
+    in different spaces legitimately share one reverse zone — their PTR names
+    are disjoint and nothing leaks. Only an actual CIDR overlap can fold two
+    tenants' PTRs onto the same names.
     """
-    res = await db.execute(
-        select(DNSZone).where(
-            DNSZone.linked_subnet_id == subnet.id,
-            DNSZone.kind == "reverse",
-        )
+    try:
+        na = ipaddress.ip_network(str(a), strict=False)
+        nb = ipaddress.ip_network(str(b), strict=False)
+    except (ValueError, TypeError):
+        return False
+    return na.version == nb.version and na.overlaps(nb)
+
+
+def reverse_zone_pieces(
+    net: ipaddress.IPv4Network | ipaddress.IPv6Network,
+) -> list[ipaddress.IPv4Network] | list[ipaddress.IPv6Network]:
+    """The zone-sized pieces ``net`` is split into, one reverse zone each
+    (spatiumddi#1840) — see ``reverse_zone.compute_reverse_zone_names``.
+
+    Each piece is either inside ``net`` or, for a subnet narrower than the
+    unit, the one unit holding it: IPv4 /17–/32 → the /24, /9–/16 → the /16,
+    /0–/8 → the /8; IPv6 → the next nibble boundary at or past the prefix
+    length (a /55 → its two /56s). At most 256 pieces on IPv4 (a /0, /9 or
+    /17), and at most 8 on IPv6 for any prefix but a /0.
+    """
+    if isinstance(net, ipaddress.IPv4Network):
+        unit = 24 if net.prefixlen > 16 else 16 if net.prefixlen > 8 else 8
+        if net.prefixlen >= unit:
+            return [net.supernet(new_prefix=unit)] if net.prefixlen > unit else [net]
+        return list(net.subnets(new_prefix=unit))
+    unit6 = -(-net.prefixlen // 4) * 4 or 4
+    if net.prefixlen >= unit6:
+        return [net]
+    return list(net.subnets(new_prefix=unit6))
+
+
+def reverse_zone_network(name: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """The network an octet-aligned ``in-addr.arpa`` (nibble-aligned
+    ``ip6.arpa``) zone name covers — the inverse of
+    ``reverse_zone.compute_reverse_zone_names``. ``None`` for any other name."""
+    labels = name.lower().rstrip(".").split(".")
+    if labels[-2:] == ["in-addr", "arpa"]:
+        octets = labels[:-2][::-1]
+        if not 1 <= len(octets) <= 3 or not all(o.isdigit() and int(o) <= 255 for o in octets):
+            return None
+        addr = ".".join(octets + ["0"] * (4 - len(octets)))
+        return ipaddress.ip_network(f"{addr}/{8 * len(octets)}")
+    if labels[-2:] == ["ip6", "arpa"]:
+        nibbles = labels[:-2][::-1]
+        if not 1 <= len(nibbles) <= 32 or not all(
+            len(n) == 1 and n in "0123456789abcdef" for n in nibbles
+        ):
+            return None
+        hexstr = "".join(nibbles).ljust(32, "0")
+        addr = ":".join(hexstr[i : i + 4] for i in range(0, 32, 4))
+        return ipaddress.ip_network(f"{addr}/{4 * len(nibbles)}")
+    return None
+
+
+def ptr_address(
+    record_name: str, zone_name: str
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The address a PTR named ``record_name`` in ``zone_name`` is for, or
+    ``None`` when the owner name is not a full reverse pointer."""
+    owner = (
+        zone_name.rstrip(".")
+        if record_name in ("", "@")
+        else (f"{record_name.rstrip('.')}.{zone_name.rstrip('.')}")
     )
-    z = res.scalar_one_or_none()
-    if z and ipam_authors_zone(z):
-        return z
-
-    group_ids, _ = await _effective_dns(db, subnet)
-    if not group_ids:
+    labels = owner.lower().split(".")
+    try:
+        if labels[-2:] == ["in-addr", "arpa"] and len(labels) == 6:
+            return ipaddress.IPv4Address(".".join(labels[:4][::-1]))
+        if labels[-2:] == ["ip6", "arpa"] and len(labels) == 34:
+            hexstr = "".join(labels[:32][::-1])
+            return ipaddress.IPv6Address(":".join(hexstr[i : i + 4] for i in range(0, 32, 4)))
+    except ValueError:
         return None
+    return None
 
-    # Use the subnet network's reverse pointer for the suffix match.
+
+# #844 — log-dedupe for the cross-space skip. Per-IP call site, so an unfixed
+# misconfig would warn once per IP per run forever; warn once per (subnet,
+# zone) pair per process, debug after. Log suppression only.
+_cross_space_skip_warned: set[tuple[str, str]] = set()
+
+
+@dataclass(frozen=True)
+class ReverseCandidate:
+    zone: DNSZone
+    linked_space_id: uuid.UUID | None
+    linked_network: object | None
+    in_group: bool  # from the effective DNS group(s), not only subnet-linked
+
+
+async def load_reverse_candidates(
+    db: AsyncSession, subnet: Subnet, group_ids: Sequence[object]
+) -> list[ReverseCandidate]:
+    """Every zone that could own a reverse name of ``subnet``'s addresses:
+    the zones linked to the subnet, plus the reverse-owner zones of its
+    effective DNS group(s). Load once per subnet and :func:`pick_reverse_zone`
+    per address (spatiumddi#1840: a subnet wider than a /24 can span more than
+    one zone, so the zone is a property of the ADDRESS, not of the subnet)."""
+    out: dict[uuid.UUID, ReverseCandidate] = {}
+    linked = (
+        await db.execute(
+            select(DNSZone).where(
+                DNSZone.linked_subnet_id == subnet.id,
+                DNSZone.kind == "reverse",
+            )
+        )
+    ).scalars()
+    for z in linked:
+        out[z.id] = ReverseCandidate(z, subnet.space_id, subnet.network, False)
+    if group_ids:
+        rows = await db.execute(
+            select(DNSZone, Subnet.space_id, Subnet.network)
+            .outerjoin(Subnet, Subnet.id == DNSZone.linked_subnet_id)
+            .where(DNSZone.group_id.in_(group_ids), reverse_owner_candidates())
+        )
+        for z, space_id, network in rows.all():
+            out[z.id] = ReverseCandidate(z, space_id, network, True)
+    return list(out.values())
+
+
+def pick_reverse_zone(
+    subnet: Subnet,
+    ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    candidates: Sequence[ReverseCandidate],
+) -> DNSZone | None:
+    """The reverse zone IPAM writes ``ip_addr``'s PTR into, or ``None``.
+
+    The ONE address → reverse-zone mapping: the IPAM router (PTR writes and
+    the collision check) and the drift check both go through it.
+
+    The most specific zone covering the address — among the zones linked to
+    the subnet and those of its effective group(s) — owns the name whatever
+    its type, and the PTR is written only when that is a zone IPAM authors
+    (#1419). So a zone an operator made for a part of the subnet keeps winning over
+    a wider zone that happens to cover them (#1840). A zone linked to
+    an OVERLAPPING subnet in another IP space is never adopted (#844): both
+    compute the same name, and a bare suffix match would fold two tenants'
+    PTRs together.
+    """
+    rev_pointer = ip_addr.reverse_pointer + "."
+
+    def covers(z: DNSZone) -> bool:
+        zname = z.name.rstrip(".") + "."
+        return rev_pointer.endswith("." + zname) or rev_pointer == zname
+
+    best: DNSZone | None = None
+    for c in candidates:
+        z = c.zone
+        own = z.linked_subnet_id == subnet.id and z.kind == "reverse"
+        if not (own or c.in_group) or not covers(z):
+            continue
+        if (
+            not own
+            and c.linked_space_id is not None
+            and c.linked_space_id != subnet.space_id
+            and cidrs_overlap(c.linked_network, subnet.network)
+        ):
+            key = (str(subnet.id), str(z.id))
+            log_fn = logger.debug if key in _cross_space_skip_warned else logger.warning
+            _cross_space_skip_warned.add(key)
+            log_fn(
+                "reverse_zone_cross_space_skipped",
+                subnet_id=str(subnet.id),
+                zone_id=str(z.id),
+                zone=z.name,
+                note="zone is linked to an overlapping subnet in another "
+                "IP space; PTR would leak across tenants (#844)",
+            )
+            continue
+        if best is None or reverse_owner_key(z) > reverse_owner_key(best):
+            best = z
+    return best if best is not None and ipam_authors_zone(best) else None
+
+
+def _subnet_reverse_zones(subnet: Subnet, candidates: Sequence[ReverseCandidate]) -> list[DNSZone]:
+    """Every reverse zone that takes the PTR of at least one of ``subnet``'s
+    addresses, in address order (spatiumddi#1840).
+
+    The pick at the start of each piece of the subnet's zone set
+    (``compute_reverse_zone_names``), plus any candidate zone overlapping the
+    subnet that wins at its own first address inside it — an operator's zone
+    for part of the subnet, which the per-piece picks can step over. Bounded:
+    a subnet has at most 256 pieces.
+    """
     try:
         net = ipaddress.ip_network(subnet.network, strict=False)
     except ValueError:
-        return None
-    sample = net.network_address.reverse_pointer + "."
+        return []
+    starts = {int(p.network_address) for p in reverse_zone_pieces(net)}
+    for c in candidates:
+        covered = reverse_zone_network(c.zone.name)
+        if covered is not None and covered.version == net.version and covered.overlaps(net):
+            starts.add(max(int(covered.network_address), int(net.network_address)))
+    out: list[DNSZone] = []
+    seen: set[uuid.UUID] = set()
+    for start in sorted(starts):
+        z = pick_reverse_zone(subnet, ipaddress.ip_address(start), candidates)
+        if z is not None and z.id not in seen:
+            seen.add(z.id)
+            out.append(z)
+    return out
 
-    res = await db.execute(
-        select(DNSZone).where(
-            DNSZone.group_id.in_(group_ids),
-            reverse_owner_candidates(),
-        )
-    )
-    best: DNSZone | None = None
-    for cand in res.scalars().all():
-        zname = cand.name.rstrip(".") + "."
-        if sample.endswith("." + zname) or sample == zname:
-            if best is None or reverse_owner_key(cand) > reverse_owner_key(best):
-                best = cand
-    return best if best is not None and ipam_authors_zone(best) else None
+
+async def resolve_reverse_zone(
+    db: AsyncSession,
+    subnet: Subnet,
+    ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    group_ids: Sequence[object],
+) -> DNSZone | None:
+    """:func:`pick_reverse_zone` over freshly loaded candidates."""
+    cands = await load_reverse_candidates(db, subnet, group_ids)
+    return pick_reverse_zone(subnet, ip_addr, cands)
 
 
 # ── Drift computation ────────────────────────────────────────────────────────
@@ -337,7 +522,20 @@ async def compute_subnet_dns_drift(
 
     forward_zone_id = await _effective_forward_zone_id(db, subnet)
     forward_zone = await db.get(DNSZone, forward_zone_id) if forward_zone_id else None
-    reverse_zone = await _effective_reverse_zone(db, subnet)
+    # A subnet wider than a /24 spans several reverse zones (spatiumddi#1840),
+    # so the zone is resolved per address below; the header lists every zone
+    # the subnet's addresses resolve to.
+    rev_group_ids, _ = await _effective_dns(db, subnet)
+    rev_cands = await load_reverse_candidates(db, subnet, rev_group_ids)
+    subnet_rev_zones = _subnet_reverse_zones(subnet, rev_cands)
+    reverse_zone = subnet_rev_zones[0] if subnet_rev_zones else None
+    rev_zones_by_id = {c.zone.id: c.zone for c in rev_cands}
+    try:
+        subnet_net: ipaddress.IPv4Network | ipaddress.IPv6Network | None = ipaddress.ip_network(
+            subnet.network, strict=False
+        )
+    except ValueError:
+        subnet_net = None
 
     report = DriftReport(
         subnet_id=subnet_id,
@@ -345,6 +543,7 @@ async def compute_subnet_dns_drift(
         forward_zone_name=forward_zone.name if forward_zone else None,
         reverse_zone_id=reverse_zone.id if reverse_zone else None,
         reverse_zone_name=reverse_zone.name if reverse_zone else None,
+        reverse_zone_names=[z.name for z in subnet_rev_zones],
     )
 
     # All live IPs in the subnet (batched by the caller, else loaded here).
@@ -431,9 +630,13 @@ async def compute_subnet_dns_drift(
     # IPAM authors the zone: applying the sync would queue a delete op into a
     # forwarder, a secondary or a stub, which none of them can take
     # (spatiumddi#1633).
+    # The reverse half is every zone the subnet's addresses resolve to — not
+    # every reverse zone of the group, which would report other subnets'
+    # orphans here (and once per subnet in a block or space aggregate).
     candidate_zone_ids = [
-        z.id for z in (forward_zone, reverse_zone) if z is not None and ipam_authors_zone(z)
+        z.id for z in (forward_zone, *subnet_rev_zones) if z is not None and ipam_authors_zone(z)
     ]
+    rev_zone_ids = {z.id for z in subnet_rev_zones}
     if candidate_zone_ids:
         orphan_res = await db.execute(
             select(DNSRecord).where(
@@ -450,10 +653,19 @@ async def compute_subnet_dns_drift(
             # recreate them on its next pass, flapping the name).
             if dns_record_owned_elsewhere(r):
                 continue
+            if r.record_type == "PTR" and r.zone_id in rev_zone_ids and subnet_net is not None:
+                # A reverse zone is shared by every subnet in its /24 (a /25
+                # pair, spatiumddi#1840): only a PTR for one of THIS subnet's
+                # addresses is this subnet's orphan.
+                addr = ptr_address(r.name, rev_zones_by_id[r.zone_id].name)
+                if addr is not None and (
+                    addr.version != subnet_net.version or addr not in subnet_net
+                ):
+                    continue
             zone_name = (
                 forward_zone.name
                 if forward_zone and r.zone_id == forward_zone.id
-                else reverse_zone.name if reverse_zone and r.zone_id == reverse_zone.id else ""
+                else rev_zones_by_id[r.zone_id].name if r.zone_id in rev_zones_by_id else ""
             )
             report.stale.append(
                 StaleItem(
@@ -484,8 +696,8 @@ async def compute_subnet_dns_drift(
                 zone_name = ""
                 if forward_zone and r.zone_id == forward_zone.id:
                     zone_name = forward_zone.name
-                elif reverse_zone and r.zone_id == reverse_zone.id:
-                    zone_name = reverse_zone.name
+                elif r.zone_id in rev_zones_by_id:
+                    zone_name = rev_zones_by_id[r.zone_id].name
                 report.stale.append(
                     StaleItem(
                         record_id=r.id,
@@ -610,9 +822,13 @@ async def compute_subnet_dns_drift(
         # "expected" value of ``hostname.`` (bare label, no FQDN), and the
         # reconciler rewrites every PTR to that broken value instead of
         # deleting them.
-        if reverse_zone and forward_zone:
+        try:
+            rz = pick_reverse_zone(subnet, ipaddress.ip_address(str(ip.address)), rev_cands)
+        except ValueError:
+            continue
+        if rz and forward_zone:
             try:
-                exp_label, _ = _expected_ptr(str(ip.address), ip.hostname, reverse_zone.name)
+                exp_label, _ = _expected_ptr(str(ip.address), ip.hostname, rz.name)
                 exp_value = (ip.hostname + "." + forward_zone.name.rstrip(".")).rstrip(".") + "."
             except ValueError:
                 continue
@@ -626,13 +842,13 @@ async def compute_subnet_dns_drift(
                         record_type="PTR",
                         expected_name=exp_label,
                         expected_value=exp_value,
-                        zone_id=reverse_zone.id,
-                        zone_name=reverse_zone.name,
+                        zone_id=rz.id,
+                        zone_name=rz.name,
                     )
                 )
             else:
                 for r in ip_ptr_records:
-                    if r.zone_id != reverse_zone.id or r.name != exp_label or r.value != exp_value:
+                    if r.zone_id != rz.id or r.name != exp_label or r.value != exp_value:
                         report.mismatched.append(
                             MismatchItem(
                                 record_id=r.id,
@@ -640,14 +856,14 @@ async def compute_subnet_dns_drift(
                                 ip_address=str(ip.address),
                                 record_type="PTR",
                                 zone_id=r.zone_id,
-                                zone_name=reverse_zone.name if r.zone_id == reverse_zone.id else "",
+                                zone_name=rz.name if r.zone_id == rz.id else "",
                                 current_name=r.name,
                                 current_value=r.value,
                                 expected_name=exp_label,
                                 expected_value=exp_value,
                             )
                         )
-        elif reverse_zone and not forward_zone:
+        elif rz and not forward_zone:
             # Forward zone was unassigned after PTRs were already published.
             # There's no valid FQDN to point them at now — mark them stale
             # so they get cleaned up when the user applies the sync.
@@ -657,7 +873,7 @@ async def compute_subnet_dns_drift(
                         record_id=r.id,
                         record_type="PTR",
                         zone_id=r.zone_id,
-                        zone_name=reverse_zone.name if r.zone_id == reverse_zone.id else "",
+                        zone_name=rz.name if r.zone_id == rz.id else "",
                         name=r.name,
                         value=r.value,
                         reason="no-forward-zone",

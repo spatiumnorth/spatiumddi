@@ -3826,9 +3826,11 @@ async def _assign_role_cluster_dns_problem(
 async def _assign_role_catalog_problem(
     db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
 ) -> str | None:
-    """#1782 — same refusal as the REST role-assign route: a Technitium
-    appliance must not be pointed at a catalog-enabled DNS group (#1766).
-    Only on a change, so a pre-existing assignment can still be re-saved."""
+    """#1782 / #1858 — same refusals as the REST role-assign route: a
+    Technitium appliance must not be pointed at a catalog-enabled DNS group
+    (#1766), nor at one holding a TSIG key Technitium cannot use
+    (hmac-sha224). Only on a change, so a pre-existing assignment can still
+    be re-saved."""
     from app.models.dns import DNSServerGroup  # noqa: PLC0415
     from app.services.dns.server_move import catalog_unsupported_message  # noqa: PLC0415
 
@@ -3846,8 +3848,14 @@ async def _assign_role_catalog_problem(
     if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
         return None
     group = await db.get(DNSServerGroup, group_id)
-    if group is None or not group.catalog_zones_enabled:
+    if group is None:
         return None
+    if not group.catalog_zones_enabled:
+        # #1858 — same refusal as the REST route: a key Technitium cannot use.
+        from app.services.dns.tsig_algorithms import group_key_refusal  # noqa: PLC0415
+
+        key_problem = await group_key_refusal(db, group.id, {"technitium"})
+        return f"DNS server group {group.name!r}: {key_problem}" if key_problem else None
     return f"DNS server group {group.name!r} has catalog zones enabled. " + (
         catalog_unsupported_message({"technitium"})
     )
