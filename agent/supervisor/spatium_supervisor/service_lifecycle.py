@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -489,6 +490,79 @@ def shared_chart_write_refusal(member: bool | None = None) -> str | None:
     return None
 
 
+# #1710 — the rolling upgrade's hold on the shared charts, as the last
+# heartbeat delivered it, kept beside the role env in the state dir (a
+# hostPath): the watchdog applies before the next heartbeat's response, and
+# so does the first pass after a reboot.
+_SHARED_CHART_HOLD_FILENAME = "shared-chart-hold"
+
+
+def _shared_chart_hold_path(env_file: Path) -> Path:
+    return env_file.with_name(_SHARED_CHART_HOLD_FILENAME)
+
+
+def record_shared_chart_hold(env_file: Path, hold: object) -> None:
+    """Keep (or clear) the hold a heartbeat response carried (#1710).
+
+    ``hold`` is the response's ``shared_chart_hold``: a mapping while a
+    rolling upgrade holds the cluster's shared charts, else None, which is
+    also what a control plane from before the hold sends. Best effort: a
+    failed write leaves the last known hold, and the next heartbeat writes
+    again."""
+    path = _shared_chart_hold_path(env_file)
+    try:
+        if isinstance(hold, dict) and hold.get("target_version"):
+            text = json.dumps(hold, sort_keys=True)
+            if not path.exists() or path.read_text() != text:
+                tmp = path.with_name(path.name + ".tmp")
+                tmp.write_text(text)
+                tmp.replace(path)
+                log.info("supervisor.k3s_lifecycle.shared_chart_hold_recorded", hold=hold)
+        elif path.exists():
+            path.unlink()
+            log.info("supervisor.k3s_lifecycle.shared_chart_hold_cleared")
+    except OSError as exc:
+        log.warning("supervisor.k3s_lifecycle.shared_chart_hold_write_failed", error=str(exc))
+
+
+def read_shared_chart_hold(env_file: Path) -> dict[str, str] | None:
+    """The hold :func:`record_shared_chart_hold` kept, or None."""
+    try:
+        hold = json.loads(_shared_chart_hold_path(env_file).read_text())
+    except (OSError, ValueError):
+        return None
+    return hold if isinstance(hold, dict) else None
+
+
+def shared_chart_hold_refusal(hold: dict[str, str] | None) -> str | None:
+    """Why this node must not write the shared role chart now, or None
+    (#1710, #1427).
+
+    A rolling upgrade holds every shared chart on the tag the cluster ran
+    until every node reports the target. This chart's image tag is the
+    writer's own slot's, and the agents it runs are ``imagePullPolicy:
+    Never``: a node that has already booted the target slot would hand the
+    nodes still on the old slot images they do not have, and their DNS and
+    DHCP went down mid-roll. So while the hold lasts such a node writes
+    nothing; the nodes still on the old slot keep writing (and healing) the
+    chart with the old chart AND the old tag.
+
+    "Already on the target" is the host's installed version, the file the
+    control plane's health gate reads too: not the tag in this process's
+    env, which can lag a slot boot."""
+    if not hold:
+        return None
+    target = str(hold.get("target_version") or "")
+    if not target or appliance_state.read_installed_version() != target:
+        return None
+    held = hold.get("from_tag") or "the version it runs"
+    return (
+        "not writing the role chart: a rolling upgrade holds the cluster's "
+        f"shared charts on {held} until every node runs {target}, and this "
+        "node already runs it"
+    )
+
+
 def roles_awaiting_key(profiles: list[str], values: dict[str, object]) -> set[str]:
     """The assigned profiles whose DaemonSet the values do NOT render yet
     (#1062): the role's chart block is ``enabled: False`` because its agent
@@ -682,6 +756,12 @@ def apply_role_assignment(
     # cannot ship values rendered as a non-member under a member's gate.
     was_member = appliance_state.is_control_plane_member()
     refusal = shared_chart_write_refusal(was_member)
+    if refusal:
+        log.info("supervisor.k3s_lifecycle.shared_chart_write_deferred", reason=refusal)
+        return LifecycleResult(state="idle", reason=refusal, deferred=True)
+    # #1710 — a node already on a rolling upgrade's target leaves the shared
+    # chart to the nodes still on the old slot until the hold ends.
+    refusal = shared_chart_hold_refusal(read_shared_chart_hold(env_file))
     if refusal:
         log.info("supervisor.k3s_lifecycle.shared_chart_write_deferred", reason=refusal)
         return LifecycleResult(state="idle", reason=refusal, deferred=True)
