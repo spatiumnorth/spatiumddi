@@ -26,8 +26,10 @@ import {
   type PreflightReport,
   type SystemUpgradeRun,
   type UpgradeImage,
+  type UpgradeLeaseState,
 } from "@/lib/api";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 
 /**
@@ -183,28 +185,74 @@ export function ClusterUpgradeTab() {
 
 // ── Lease pill ───────────────────────────────────────────────────────
 
-function LeasePill({ lease }: { lease: ReturnType<typeof useQuery>["data"] }) {
-  const state = lease as
-    | { held: boolean; holder: string | null; expired: boolean }
-    | undefined;
-  if (!state)
+// A live drive renews the Lease every 200 s; the API refuses a force-release
+// until the holder has gone 300 s without renewing (#1707). Mirrors
+// ``FORCE_RELEASE_MIN_IDLE_S`` in the orchestrator.
+const FORCE_RELEASE_MIN_IDLE_S = 300;
+
+function LeasePill({ lease }: { lease: UpgradeLeaseState | undefined }) {
+  const qc = useQueryClient();
+  const { isSuperadmin } = usePermissions();
+  const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const releaseMut = useMutation({
+    mutationFn: clusterUpgradesApi.forceReleaseLease,
+    onSuccess: () => {
+      setError(null);
+      qc.invalidateQueries({ queryKey: ["upgrades"] });
+    },
+    onError: (err) => setError(formatApiError(err)),
+    onSettled: () => setConfirming(false),
+  });
+  if (!lease)
     return (
       <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
         Lease unknown
       </span>
     );
-  if (!state.held)
+  if (!lease.held)
     return (
       <span className="rounded-md bg-emerald-500/10 px-1.5 py-0.5 text-xs text-emerald-700 dark:text-emerald-300">
         Lease free
       </span>
     );
+  const renewed = lease.renew_time ? Date.parse(lease.renew_time) : NaN;
+  const idleS = Number.isNaN(renewed) ? null : (Date.now() - renewed) / 1000;
+  // Only offered once the holder looks dead; the server decides.
+  const stale = idleS === null || idleS >= FORCE_RELEASE_MIN_IDLE_S;
   return (
-    <span
-      className="rounded-md bg-blue-500/10 px-1.5 py-0.5 font-mono text-xs text-blue-700 dark:text-blue-300"
-      title="The upgrade lease is the cluster-wide single-upgrader lock. While held, no other orchestrator (or operator) can start a new run."
-    >
-      Lease held · {state.holder ?? "?"}
+    <span className="inline-flex min-w-0 flex-wrap items-center gap-1.5">
+      <span
+        className="break-all rounded-md bg-blue-500/10 px-1.5 py-0.5 font-mono text-xs text-blue-700 dark:text-blue-300"
+        title="The upgrade lease is the cluster-wide single-upgrader lock. While held, no other orchestrator (or operator) can start a new run. A halted or aborted drive keeps it until the node it is on ends."
+      >
+        Lease held · {lease.holder ?? "?"}
+        {idleS !== null && idleS >= FORCE_RELEASE_MIN_IDLE_S
+          ? ` · not renewed for ${Math.round(idleS / 60)} min`
+          : ""}
+      </span>
+      {isSuperadmin && stale ? (
+        <button
+          type="button"
+          onClick={() => setConfirming(true)}
+          disabled={releaseMut.isPending}
+          className="rounded-md border border-red-500/40 px-1.5 py-0.5 text-xs text-red-700 hover:bg-red-500/10 disabled:opacity-50 dark:text-red-300"
+        >
+          Force release
+        </button>
+      ) : null}
+      {error ? (
+        <span className="text-xs text-red-700 dark:text-red-300">{error}</span>
+      ) : null}
+      <ConfirmModal
+        open={confirming}
+        title="Force-release the upgrade Lease?"
+        message="Only for a drive that died: its Lease would otherwise lapse on its own within 10 minutes. The server refuses while the holder still renews it. Releasing a live drive's Lease lets a second run drive the cluster beside it. Audited."
+        confirmLabel="Force release"
+        tone="destructive"
+        onClose={() => setConfirming(false)}
+        onConfirm={() => releaseMut.mutate()}
+      />
     </span>
   );
 }
@@ -762,7 +810,7 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
       <ConfirmModal
         open={aborting}
         title="Abort upgrade?"
-        message="Abort is terminal — no resume. Leaves the cluster in whatever partial state the in-flight nodes ended in. Operator owns cleanup."
+        message="Abort is terminal — no resume. The node in flight is not cut short: the drive finishes it, then stops, and holds the upgrade Lease until then, so a new run cannot start beside it. Leaves the cluster in whatever partial state the in-flight nodes ended in. Operator owns cleanup."
         confirmLabel="Abort"
         tone="destructive"
         onClose={() => setAborting(false)}

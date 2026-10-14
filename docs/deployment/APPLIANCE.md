@@ -3054,7 +3054,15 @@ so a first-time operator never gets stuck looking for the upload.
    stopped, so a new Plan and Start are refused meanwhile (#1707). A
    drive whose Lease was taken over by another writes nothing to the run
    (#1704). If the drive itself died, the Lease lapses after its
-   10-minute duration.
+   10-minute duration; a superadmin can free it sooner with
+   **Force release** beside the Lease pill (`POST
+   /api/v1/upgrades/lease/force-release`). That is refused while the
+   holder has renewed the Lease within the last 300 s (a live drive
+   renews every 200 s), and it is audited
+   (`upgrade.lease_force_released`) and recorded on the run. A failed or
+   aborted run's shared-tag hold (#1710) is not ended by the beat task
+   while the aborted drive still holds the Lease: the node it is
+   finishing may yet boot the new slot.
    Each node's own preflight judges `/var` only on the nodes the run
    has still to upgrade: upgrading a node is what shrinks its `/var`,
    so the nodes already done are not asked again (#1709).

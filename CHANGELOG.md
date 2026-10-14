@@ -200,8 +200,17 @@ the formatter handles the rest.
   is left alone. Abort also no longer frees the Lease at once: the
   aborted drive releases its own when it stops, so a second run cannot
   plan and start while a node is still being worked on (a run that never
-  started has no drive, and still frees it). A lease renewal that dies of
-  an unexpected error now stops the drive, as a refused one does.
+  started has no drive, and still frees it). A drive that died holds the
+  Lease until it lapses (10 min); a superadmin can free it sooner with
+  **Force release** (`POST /upgrades/lease/force-release`), which is
+  refused while the holder still renews it and is audited. Halt and Abort
+  are also honoured between nodes and around the end-of-roll flip: a Halt
+  while the shared-tag hold (#1710) is being placed now stops the node it
+  was meant to stop, and the flip's own record writes no longer drop
+  events committed meanwhile. The fence's row lock is never held across
+  a kubeapi call, the post-upgrade verify or alert delivery. A lease
+  renewal that dies of an unexpected error now stops the drive, as a
+  refused one does.
 
 - **Re-importing a zone's own export no longer pins every inherited TTL
   (#1727).** A record with no TTL of its own inherits the zone default and
