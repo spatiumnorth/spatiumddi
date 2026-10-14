@@ -7,9 +7,11 @@ import io
 import json
 
 import pytest
+from fastapi import HTTPException
+from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import hash_password
+from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.ipam_io import (
@@ -56,6 +58,85 @@ def test_parse_csv_basic() -> None:
     assert row["gateway"] == "10.0.1.1"
     # 'owner' is unknown → custom field
     assert row["custom_fields"] == {"owner": "NetOps"}
+
+
+@pytest.mark.parametrize("eol", ["\n", "\r\n", "\r"], ids=["LF", "CRLF", "CR"])
+def test_parse_csv_reads_every_line_ending(eol: str) -> None:
+    """A CSV saved with classic Mac line endings parses like any other
+    (#1637). The bare CR reached the csv reader inside an unquoted field
+    and it raised, which the import routes answered with a 500."""
+    subnets = eol.join(["network,name", "10.9.0.0/24,a", "10.9.1.0/24,b"]).encode()
+    parsed = parse_payload(subnets, "import.csv", "text/csv")
+    assert [(s["network"], s["name"]) for s in parsed.subnets] == [
+        ("10.9.0.0/24", "a"),
+        ("10.9.1.0/24", "b"),
+    ]
+
+    addresses = eol.join(["address,hostname", "10.9.0.5,h1", "10.9.0.6,h2"]).encode()
+    parsed = parse_payload(addresses, "addresses.csv", "text/csv")
+    assert [(a["address"], a["hostname"]) for a in parsed.addresses] == [
+        ("10.9.0.5", "h1"),
+        ("10.9.0.6", "h2"),
+    ]
+
+
+def test_parse_csv_keeps_a_newline_inside_a_quoted_cell() -> None:
+    """Handing line endings to the csv module keeps a quoted multi-line
+    cell whole, whatever the file's line endings."""
+    data = b'network,description\r10.9.0.0/24,"line one\rline two"\r'
+    parsed = parse_payload(data, "import.csv", "text/csv")
+    assert [s["description"] for s in parsed.subnets] == ["line one\rline two"]
+
+
+def test_parse_csv_the_reader_refuses_is_a_422() -> None:
+    """Whatever else the csv reader refuses is a 422 with its reason, as
+    JSON it cannot read already is (#1637): here a cell over the reader's
+    field size limit."""
+    data = ("network,description\n10.9.0.0/24," + "x" * (_csv.field_size_limit() + 1)).encode()
+    with pytest.raises(HTTPException) as exc:
+        parse_payload(data, "import.csv", "text/csv")
+    assert exc.value.status_code == 422
+    assert str(exc.value.detail).startswith("CSV could not be read")
+
+
+@pytest.mark.asyncio
+async def test_import_routes_read_a_csv_with_cr_line_endings(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The subnet and address import previews answer 200 for a CSV with
+    classic Mac line endings, not 500 (#1637)."""
+    user = await _seed_user(db_session)
+    space = await _seed_space(db_session, "CRSpace")
+    block = IPBlock(space_id=space.id, network="10.9.0.0/16", name="agg")
+    db_session.add(block)
+    await db_session.flush()
+    subnet = Subnet(
+        space_id=space.id, block_id=block.id, network="10.9.0.0/24", name="cr", total_ips=254
+    )
+    db_session.add(subnet)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+    resp = await client.post(
+        "/api/v1/ipam/import/preview",
+        headers=headers,
+        files={"file": ("x.csv", b"network,name\r10.9.1.0/24,a\r10.9.2.0/24,b\r", "text/csv")},
+        data={"space_id": str(space.id)},
+    )
+    assert resp.status_code == 200, resp.text
+    created = {r["network"] for r in resp.json()["creates"] if r["kind"] == "subnet"}
+    assert created == {"10.9.1.0/24", "10.9.2.0/24"}
+
+    resp = await client.post(
+        "/api/v1/ipam/import/addresses/preview",
+        headers=headers,
+        files={"file": ("a.csv", b"address,hostname\r10.9.0.5,h1\r10.9.0.6,h2\r", "text/csv")},
+        data={"subnet_id": str(subnet.id)},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["summary"]["creates"] == 2, body
+    assert body["summary"]["errors"] == 0, body
 
 
 def test_parse_json_list() -> None:

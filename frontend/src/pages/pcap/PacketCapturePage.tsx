@@ -12,6 +12,7 @@ import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { humanTime } from "@/pages/network/_shared";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 type RightTab = "live" | "history" | "result";
 
@@ -237,6 +238,13 @@ function CaptureForm({
   onStarted: (c: PcapCaptureRead) => void;
   initialVantage?: string;
 }) {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'manage_packet_capture'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_packet_capture"),
+    "Requires write permission on packet captures",
+  );
   // vantage select value: "server" or an appliance UUID.
   const [vantage, setVantage] = useState<string>(initialVantage);
   const [iface, setIface] = useState<string>("any");
@@ -472,6 +480,7 @@ function CaptureForm({
         type="submit"
         disabled={!hasStop || start.isPending}
         className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        {...writeGate}
       >
         {start.isPending ? (
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -540,6 +549,11 @@ function LiveTab({
   onComplete: (id: string) => void;
 }) {
   const qc = useQueryClient();
+  // Stop and delete take delete on 'manage_packet_capture' (pcap/router.py).
+  const deleteGate = permissionGate(
+    usePermissions().can("delete", "manage_packet_capture"),
+    "Requires delete permission on packet captures",
+  );
   const { data } = useQuery({
     enabled: !!captureId,
     queryKey: ["pcap-capture", captureId],
@@ -597,6 +611,7 @@ function LiveTab({
           onClick={() => cancel.mutate(data.id)}
           disabled={cancel.isPending}
           className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-50"
+          {...deleteGate}
         >
           <Trash2 className="h-3 w-3" /> Stop capture
         </button>
@@ -705,6 +720,11 @@ function ResultTab({ captureId }: { captureId: string | null }) {
 
 function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
   const qc = useQueryClient();
+  // Stop and delete take delete on 'manage_packet_capture' (pcap/router.py).
+  const deleteGate = permissionGate(
+    usePermissions().can("delete", "manage_packet_capture"),
+    "Requires delete permission on packet captures",
+  );
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [pendingBulk, setPendingBulk] = useState<PcapCaptureRead[] | null>(
     null,
@@ -781,6 +801,7 @@ function HistoryTab({ onSelect }: { onSelect: (c: PcapCaptureRead) => void }) {
             }
             disabled={bulkDelete.isPending}
             className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-0.5 text-[11px] text-destructive hover:bg-destructive/10 disabled:opacity-60"
+            {...deleteGate}
           >
             <Trash2 className="h-3 w-3" /> Delete {selected.size}
           </button>

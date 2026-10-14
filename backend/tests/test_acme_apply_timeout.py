@@ -160,7 +160,9 @@ async def test_solve_waits_for_the_scaled_timeout(db_session: AsyncSession) -> N
     db_session.add_all([_bundle(servers[0], 30_000, 1), _bundle(servers[1], 25_000, 1)])
     await db_session.commit()
 
-    async def _applied(op_ids: list[uuid.UUID], *, timeout: float) -> dict[uuid.UUID, str]:
+    async def _applied(
+        op_ids: list[uuid.UUID], *, timeout: float, **_kw: object
+    ) -> dict[uuid.UUID, str]:
         seen["timeout"] = timeout
         return {op_id: "applied" for op_id in op_ids}
 
@@ -216,7 +218,9 @@ async def test_solve_ignores_same_serial_ops_from_other_groups(db_session: Async
 
     waited: dict[str, list[uuid.UUID]] = {}
 
-    async def _applied(op_ids: list[uuid.UUID], *, timeout: float) -> dict[uuid.UUID, str]:
+    async def _applied(
+        op_ids: list[uuid.UUID], *, timeout: float, **_kw: object
+    ) -> dict[uuid.UUID, str]:
         waited["ids"] = list(op_ids)
         return {op_id: "applied" for op_id in op_ids}
 
@@ -258,7 +262,9 @@ async def test_solve_tears_down_txt_on_unexpected_error(db_session: AsyncSession
     # greenlet (MissingGreenlet).
     zone_id = zone.id
 
-    async def _boom(op_ids: list[uuid.UUID], *, timeout: float) -> dict[uuid.UUID, str]:
+    async def _boom(
+        op_ids: list[uuid.UUID], *, timeout: float, **_kw: object
+    ) -> dict[uuid.UUID, str]:
         raise RuntimeError("wait exploded")
 
     with (

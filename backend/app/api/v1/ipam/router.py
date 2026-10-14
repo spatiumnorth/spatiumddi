@@ -111,7 +111,8 @@ def _validate_opt_ddns_domain(v: Any) -> Any:
 DDNSDomainOverride = Annotated[str | None, BeforeValidator(_validate_opt_ddns_domain)]
 
 # Router-level permission gate: GET → `read`, POST/PUT/PATCH → `write`,
-# DELETE → `delete`. Endpoints under /ipam manipulate IPAM resources, so we
+# DELETE → `delete`, and the multi-row delete POSTs (`/addresses/bulk-delete`,
+# `/subnets/{id}/orphans/purge`) → `delete` too. Endpoints under /ipam manipulate IPAM resources, so we
 # accept any of the IPAM resource types (an "IPAM Editor" role grants all
 # four; a scoped Subnet-writer role would be matched here for subnet routes
 # and fail for space routes — which is intended). ``address_set`` is included
@@ -8628,6 +8629,10 @@ async def purge_orphans(
     db: DB,
 ) -> dict[str, int]:
     """Permanently delete the given orphan IPs in this subnet.
+
+    The router gate requires ``delete`` here, as for a permanent single-row
+    ``DELETE /addresses/{id}`` (``MULTI_ROW_DELETE_SUFFIXES``); the ``write`` on
+    the subnet below is the per-subnet check the single delete makes too.
 
     The UI lists orphans from `GET /subnets/{id}/addresses?status=orphan` (client-
     side filter) and passes the chosen ids here. We scope by subnet so a stale UI

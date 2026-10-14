@@ -194,7 +194,9 @@ async def test_type_scoped_grant_for_other_type_denied(
 _ALLOWED = [
     ("POST", "/subnets/{s}/resize/preview", {"new_cidr": "10.0.5.0/23"}, "subnet", "write"),
     ("POST", "/subnets/{s}/split/preview", {"new_prefix_length": 25}, "subnet", "write"),
-    ("POST", "/subnets/{s}/orphans/purge", {"ip_ids": []}, "subnet", "write"),
+    # A multi-row delete: the router gate wants ``delete`` (as a permanent
+    # single-row address delete does), the handler ``write`` on the subnet.
+    ("POST", "/subnets/{s}/orphans/purge", {"ip_ids": []}, "subnet", "write+delete"),
     (
         "POST",
         "/subnets/{s}/dns-sync/commit",
@@ -228,7 +230,9 @@ async def test_matching_type_permission_still_succeeds(
     action: str,
 ) -> None:
     w = await _world(db_session)
-    token = await _user(db_session, [{"action": action, "resource_type": rtype}])
+    token = await _user(
+        db_session, [{"action": a, "resource_type": rtype} for a in action.split("+")]
+    )
     fmt = {
         "s": w["subnet"].id,
         "b": w["block"].id,
