@@ -33,8 +33,10 @@ export function SetupBanner() {
     queryKey: ["appliance", "setup"],
     queryFn: applianceSetupApi.state,
     // Only run when we know it's an appliance deploy — otherwise
-    // /appliance/system/setup returns 401/403 noise on plain deploys.
-    enabled: !!version.data?.appliance_mode,
+    // /appliance/system/setup returns 401/403 noise on plain deploys — and
+    // only for a user who may act on the answer: the route needs `read` on
+    // `appliance`, and every refusal is an audited `denied` row (#1864).
+    enabled: !!version.data?.appliance_mode && canFinishSetup,
     staleTime: 60 * 1000,
   });
 

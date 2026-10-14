@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Bird,
   Check,
@@ -63,7 +64,11 @@ export function NetbirdPage() {
     NEEDS_SUPERADMIN,
   );
   const qc = useQueryClient();
-  const { data: instances = [], isFetching } = useQuery({
+  const {
+    data: instances = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["netbird-instances"],
     queryFn: netbirdApi.listInstances,
   });
@@ -155,7 +160,9 @@ export function NetbirdPage() {
           {instances.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No NetBird instances configured yet.
+                <ListEmpty error={listError} what="NetBird instances">
+                  No NetBird instances configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}

@@ -84,6 +84,46 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A list a scoped user may not read says so instead of showing as
+  empty (#1865).** Audit Log, Conformity, VRFs, Requests, the
+  integration pages (Kubernetes, Docker, Proxmox, Tailscale, UniFi,
+  Meraki, NetBird, OPNsense, PAN-OS, Fortinet, Cloud), Circuits, ASNs,
+  Overlays, Multicast groups, Network devices, TLS certificate targets,
+  Firewall feeds, Logs, Wake schedules, DNS blocking lists and Nmap
+  scans rendered a refused list read as their empty state ("No audit
+  events found", "No policies yet", "No VRFs yet.") over lists that hold
+  rows. They now share one `ListEmpty` wrapper around the empty copy
+  that shows "You don't have permission to see ..." for a refusal and
+  "Couldn't load ..." for any other failure. Requests also no longer
+  invites a user who cannot submit to ask for an IP, and its poll,
+  Nmap's and the Cloud page's stop once refused. The row counters that
+  sat over those lists ("0 events", "0 total", "0 ASNs") read "—" when
+  the read was refused, and Audit Log's Export PDF, which needs the same
+  grant, is disabled.
+
+- **The app shell stops asking routes its user cannot read (#1864).**
+  The maintenance banner (every 15 s), the first-boot setup banner and
+  the sidebar approvals badge (every 30 s) polled
+  `/appliance/system/info`, `/appliance/system/setup` and
+  `/change-requests?state=pending` for whoever was signed in. A user
+  without `read` on `appliance` or `approve` on `change_request` was
+  refused all three, each console 403 was an error, and each refused
+  appliance read wrote a `denied` row to the audit log: about four a
+  minute per open tab, none of them an access attempt the user made.
+  Each query is now enabled only for a user who holds the grant its
+  route needs, and stops polling once a read is refused.
+
+- **An editor whose write an approval policy queued can see, and
+  cancel, its own change request (#1863).** The list, `?mine=true` and
+  `GET /change-requests/{id}` all demanded `read` on `change_request`
+  before the read rule that scopes a requester to the rows it made, and
+  only the built-in Change Approver holds that grant, so the editor was
+  told "Nothing waiting for approval" while the server let it cancel the
+  request it could not read. The grant is no longer a precondition: the
+  own-rows scope on the list and the 404 on get are the access rule, as
+  the router's own read rule always said. Seeing every row still takes
+  `approve` (or superadmin).
+
 - **IPAM bulk delete no longer leaves a DHCP reservation behind (#1714).**
   `POST /ipam/addresses/bulk-delete` ran none of the reservation handling
   the single delete has had since #1656: an IPAM Editor could bulk-delete a
