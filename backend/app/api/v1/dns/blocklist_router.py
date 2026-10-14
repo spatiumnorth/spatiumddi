@@ -1203,7 +1203,7 @@ async def list_entries(
     status_code=201,
 )
 async def add_entry(
-    list_id: uuid.UUID, body: EntryCreate, db: DB, current_user: SuperAdmin
+    list_id: uuid.UUID, body: EntryCreate, db: DB, current_user: CurrentUser
 ) -> EntryResponse:
     bl = await _require_list(list_id, db)
     domain = body.domain.strip().lower().strip(".")
@@ -1252,7 +1252,7 @@ async def bulk_add_entries(
     list_id: uuid.UUID,
     body: BulkAddRequest,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> BulkAddResponse:
     bl = await _require_list(list_id, db)
 
@@ -1323,7 +1323,7 @@ async def update_entry(
     entry_id: uuid.UUID,
     body: EntryUpdate,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> EntryResponse:
     bl = await _require_list(list_id, db)
     result = await db.execute(
@@ -1384,7 +1384,7 @@ async def delete_entry(
     list_id: uuid.UUID,
     entry_id: uuid.UUID,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> None:
     bl = await _require_list(list_id, db)
     result = await db.execute(
@@ -1436,7 +1436,7 @@ async def add_exception(
     list_id: uuid.UUID,
     body: ExceptionCreate,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> DNSBlockListException:
     bl = await _require_list(list_id, db)
     domain = body.domain.strip().lower().strip(".")
@@ -1483,7 +1483,7 @@ async def update_exception(
     exception_id: uuid.UUID,
     body: ExceptionUpdate,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> DNSBlockListException:
     bl = await _require_list(list_id, db)
     result = await db.execute(
@@ -1533,7 +1533,7 @@ async def delete_exception(
     list_id: uuid.UUID,
     exception_id: uuid.UUID,
     db: DB,
-    current_user: SuperAdmin,
+    current_user: CurrentUser,
 ) -> None:
     bl = await _require_list(list_id, db)
     result = await db.execute(

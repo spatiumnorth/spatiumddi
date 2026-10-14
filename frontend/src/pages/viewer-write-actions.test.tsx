@@ -218,20 +218,33 @@ describe("#1338 the DNS page", () => {
   }
 
   const GROUP_WRITES = ["Sync with Servers", "Edit Group", "Delete Group"];
-  const TAB_CREATES: [string, string][] = [
-    ["zones", "Add Zone"],
-    ["servers", "Add Server"],
-    ["views", "New View"],
-    ["acls", "New ACL"],
-    ["blocklists", "New Blocking List"],
-    ["tsig", "New TSIG Key"],
+  // #1861 — each tab's create and the reason it is refused: zones, views and
+  // ACLs are DNS data on their own resource permission, the rest stay
+  // superadmin-only infrastructure.
+  const ZONE_WRITE = "Requires write permission on DNS zones";
+  const GROUP_WRITE = "Requires write permission on DNS server groups";
+  const TAB_CREATES: [string, string, string][] = [
+    ["zones", "Add Zone", ZONE_WRITE],
+    ["servers", "Add Server", SUPERADMIN],
+    ["views", "New View", GROUP_WRITE],
+    ["acls", "New ACL", GROUP_WRITE],
+    ["blocklists", "New Blocking List", SUPERADMIN],
+    ["tsig", "New TSIG Key", SUPERADMIN],
+  ];
+  // The built-in DNS Editor's grants (app/main.py).
+  const DNS_EDITOR: Grant[] = [
+    ["admin", "dns_group"],
+    ["admin", "dns_zone"],
+    ["admin", "dns_record"],
+    ["admin", "dns_blocklist"],
+    ["read", "manage_dns_pools"],
   ];
 
   it("offers a Viewer no group, zone or tab write, and says why", async () => {
     signInAs(VIEWER);
     await openDns("zones");
     expectDenied(GROUP_WRITES, SUPERADMIN);
-    expectDenied(["Add Zone", /From Template/], SUPERADMIN);
+    expectDenied(["Add Zone", /From Template/], ZONE_WRITE);
     // The tree's "New server group" is an icon button: while denied it is
     // named by its tooltip, the reason (as #1175's icon buttons are).
     expect(
@@ -240,7 +253,7 @@ describe("#1338 the DNS page", () => {
     for (const tab of TAB_CREATES.slice(1)) {
       cleanup();
       await openDns(tab[0]);
-      expectDenied([tab[1]], SUPERADMIN);
+      expectDenied([tab[1]], tab[2]);
     }
   });
 
@@ -256,10 +269,26 @@ describe("#1338 the DNS page", () => {
   it("offers a record writer the records, and still not the zone", async () => {
     signInAs([...VIEWER, ["write", "dns_record"]]);
     await openDns("zones");
-    expectDenied([...GROUP_WRITES, "Add Zone"], SUPERADMIN);
+    expectDenied(GROUP_WRITES, SUPERADMIN);
+    expectDenied(["Add Zone"], ZONE_WRITE);
     await openZone();
     expectOffered([/Add Record/]);
     expect(button(/^Zone$/).disabled).toBe(true);
+  });
+
+  it("offers the built-in DNS Editor zones, views and ACLs, not the infrastructure (#1861)", async () => {
+    signInAs(DNS_EDITOR);
+    await openDns("zones");
+    expectDenied(GROUP_WRITES, SUPERADMIN);
+    expectOffered(["Add Zone", /From Template/]);
+    await openZone();
+    expectOffered([/Add Record/, /^Zone$/]);
+    for (const [tab, create, reason] of TAB_CREATES.slice(1)) {
+      cleanup();
+      await openDns(tab);
+      if (reason === SUPERADMIN) expectDenied([create], SUPERADMIN);
+      else expectOffered([create]);
+    }
   });
 
   it("offers a superadmin every one of them", async () => {
@@ -358,19 +387,46 @@ describe("#1339 the DHCP page", () => {
     await permissionsLoaded();
   }
 
-  const KEA_TABS: [string, string][] = [
-    ["Client Classes", "New Client Class"],
-    ["Option Templates", "New Template"],
-    ["MAC Blocks", "Block MAC"],
-    ["Phone Profiles", "New Phone Profile"],
-    ["Device Policies", "New Policy"],
+  // #1861 — each Kea tab's create and the permission it asks for.
+  const KEA_TABS: [string, string, string][] = [
+    [
+      "Client Classes",
+      "New Client Class",
+      "Requires write permission on DHCP client classes",
+    ],
+    [
+      "Option Templates",
+      "New Template",
+      "Requires write permission on DHCP option templates",
+    ],
+    ["MAC Blocks", "Block MAC", "Requires write permission on DHCP MAC blocks"],
+    [
+      "Phone Profiles",
+      "New Phone Profile",
+      "Requires write permission on DHCP scopes",
+    ],
+    [
+      "Device Policies",
+      "New Policy",
+      "Requires write permission on DHCP client classes",
+    ],
+  ];
+  // The built-in DHCP Editor's grants (app/main.py).
+  const DHCP_EDITOR: Grant[] = [
+    ["admin", "dhcp_server"],
+    ["admin", "dhcp_scope"],
+    ["admin", "dhcp_pool"],
+    ["admin", "dhcp_static"],
+    ["admin", "dhcp_client_class"],
+    ["admin", "dhcp_option_template"],
+    ["admin", "dhcp_mac_block"],
   ];
 
-  async function eachKeaTab(check: (create: string) => void) {
-    for (const [tab, create] of KEA_TABS) {
+  async function eachKeaTab(check: (create: string, reason: string) => void) {
+    for (const [tab, create, reason] of KEA_TABS) {
       button(tab).click();
       await screen.findByRole("button", { name: create });
-      check(create);
+      check(create, reason);
     }
   }
 
@@ -385,7 +441,17 @@ describe("#1339 the DHCP page", () => {
     for (const name of ["New group", "Edit server", "Delete server"]) {
       expect(screen.queryByRole("button", { name })).toBeNull();
     }
-    await eachKeaTab((create) => expectDenied([create], SUPERADMIN));
+    await eachKeaTab((create, reason) => expectDenied([create], reason));
+  });
+
+  it("offers the built-in DHCP Editor every Kea-tab write, not the servers (#1861)", async () => {
+    signInAs(DHCP_EDITOR);
+    await openDhcp();
+    expectDenied(
+      ["Edit Group", "Delete Group", "Add Server", /^Pause\b/],
+      SUPERADMIN,
+    );
+    await eachKeaTab((create) => expectOffered([create]));
   });
 
   it("offers a superadmin every one of them", async () => {

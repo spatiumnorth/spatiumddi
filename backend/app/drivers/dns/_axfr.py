@@ -126,12 +126,16 @@ async def axfr_zone_records(
     log_driver: str = "dns",
     server_id: str | None = None,
     tsig: TsigKey | None = None,
+    include_apex_ns: bool = False,
 ) -> list[RecordData]:
     """AXFR ``zone_name`` from ``host:port`` and return neutral record dicts.
 
     Apex SOA and NS are filtered out — SpatiumDDI manages those at the zone
     level, so importing them as user records would create duplicate control
-    surfaces. Out-of-zone glue (an NS target living in a different zone) is
+    surfaces. ``include_apex_ns`` keeps the apex NS set for a read-only
+    caller that compares rather than imports (the drift report, #1857): on an
+    agent-managed server the served NS set is rendered from the zone's own
+    apex NS rows, so dropping it there hides real drift. Out-of-zone glue (an NS target living in a different zone) is
     also skipped, as are DNSSEC signing artefacts (RRSIG / NSEC* / DNSKEY /
     CDS / CDNSKEY), which the signing server owns and rotates itself.
 
@@ -248,7 +252,7 @@ async def axfr_zone_records(
             rtype = dns.rdatatype.to_text(rdataset.rdtype)
             if rtype == "SOA":
                 continue
-            if rtype == "NS" and rel_label == "@":
+            if rtype == "NS" and rel_label == "@" and not include_apex_ns:
                 continue
             if rtype in _DNSSEC_ARTEFACTS:
                 # The daemon owns these — it mints them when the zone is
