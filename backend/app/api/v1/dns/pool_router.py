@@ -5,8 +5,10 @@ Pools live under a zone; members live under a pool. The actual
 apply-state service and flagged with ``pool_member_id`` — this router
 only manages the pool config + member roster + manual triggers.
 
-Permission gate: ``manage_dns_pools`` (admin-only). Seeded into the
-existing "DNS Editor" builtin role at startup.
+Permission gate: ``manage_dns_pools`` on the router, and every write is
+superadmin-only on top: creating a pool arms control-plane health checks
+that probe its members, so pools are infrastructure rather than everyday
+DNS data (#1861). The built-in "DNS Editor" role holds ``read`` on it.
 """
 
 from __future__ import annotations
