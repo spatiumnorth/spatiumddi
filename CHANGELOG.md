@@ -84,6 +84,28 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Failed sign-ins are forwarded to syslog / SIEM as warnings, not info
+  (#1874).** Every rejected sign-in (bad password, bad MFA code, locked or
+  disabled account) is audited with `result="failure"`, which audit
+  forwarding did not recognise, so it went out at info and a target with
+  `min_severity` above info dropped it. A failed sign-in now ranks with
+  `denied`, because the system worked and refused the request, which is
+  what `denied` already records for a signed-in user. **Existing
+  collectors will receive failed sign-ins at a higher severity than
+  before:** syslog PRI severity 4 (warning) instead of 6, CEF severity 9
+  instead of 3, LEEF `sev=9` instead of 3, and every `min_severity`
+  threshold, `denied` included, now lets them through. A sign-in the
+  system could not evaluate (the LDAP / RADIUS / TACACS+ server timed out)
+  was already audited `error` and is unchanged. Two related results also
+  fell through to info and are fixed with it: `failure` on anything other
+  than a sign-in (a failed backup run or drill, a Wake-on-LAN send, an
+  auth-provider test) now ranks with `failed` (PRI 3, CEF / LEEF 6), and
+  `forbidden` (a refused break-glass, a refused secret reveal, a throttled
+  supervisor registration) ranks with `denied`. `success`, `denied`,
+  `failed` and `error` map exactly as before. The dashboard Live Activity
+  badge reads `failure` as a red FAIL and `forbidden` as DENY, and the
+  Audit Log result filter offers `failure` and `forbidden`.
+
 - **Re-importing a zone's own export no longer pins every inherited TTL
   (#1727).** A record with no TTL of its own inherits the zone default and
   is exported without one, so the re-import read the file's `$TTL` back
