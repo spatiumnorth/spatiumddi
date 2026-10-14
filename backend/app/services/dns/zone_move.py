@@ -64,6 +64,7 @@ from app.services.dns.record_ops import (
     sweep_zone_ops,
 )
 from app.services.dns.tsig import ensure_group_tsig_key, group_key_names
+from app.services.dns.tsig_algorithms import key_refusal
 
 logger = structlog.get_logger(__name__)
 
@@ -195,6 +196,10 @@ class ZoneMovePlan:
     #: Set by the plan so the preview reports the same refusal the commit
     #: raises; ``None`` when the target is not such a group or the zone fits.
     technitium_api_refusal: str | None = None
+    #: #1858 — a TSIG key this zone uses (update grant or ``key <name>``)
+    #: resolves, by name, to a target key whose algorithm a target driver
+    #: cannot use (Technitium has no hmac-sha224). Refused, never waived.
+    tsig_algorithm_refusal: str | None = None
 
     warnings: list[str] = field(default_factory=list)
     #: Acknowledgement keys the commit will demand.
@@ -415,6 +420,39 @@ async def assemble_move_plan(
         await group_key_names(db, zone.group_id),
         await group_key_names(db, target_group.id),
     )
+
+    # #1858 — the keys the zone uses, as they resolve in the target.
+    used_key_names = {
+        name
+        for values in (zone.allow_query, zone.allow_transfer, zone.also_notify)
+        for element in values or []
+        if (name := key_reference(str(element)))
+    }
+    if acl_rows:
+        granted = (
+            await db.execute(
+                select(DNSTSIGKey.name).where(
+                    DNSTSIGKey.id.in_([r.tsig_key_id for r in acl_rows if r.tsig_key_id])
+                )
+            )
+        ).scalars()
+        used_key_names |= set(granted)
+    if used_key_names and plan.target_drivers:
+        target_algos = (
+            await db.execute(
+                select(DNSTSIGKey.name, DNSTSIGKey.algorithm).where(
+                    DNSTSIGKey.group_id == target_group.id,
+                    DNSTSIGKey.name.in_(used_key_names),
+                )
+            )
+        ).all()
+        for kname, kalgo in sorted(target_algos):
+            msg = key_refusal(kalgo, plan.target_drivers, key=kname)
+            if msg:
+                plan.tsig_algorithm_refusal = (
+                    f"Group {target_group.name!r}: {msg} The zone uses that key."
+                )
+                break
 
     plan.pools_repointed = await _count(db, DNSPool, DNSPool.zone_id == zone.id)
     plan.zone_state_rows = await _count(
@@ -688,6 +726,8 @@ async def commit_move(
             f"group running one of {sorted(DNSSEC_SIGN_DRIVERS)}.",
             status_code=422,
         )
+    if plan.tsig_algorithm_refusal:
+        raise ZoneMoveError(plan.tsig_algorithm_refusal, status_code=422)
     if plan.technitium_api_refusal:
         # #1784 — refused, not warned: the zone would read as configured on
         # a server that ignores the config. Derived in the plan so the
