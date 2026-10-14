@@ -205,8 +205,7 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     which also hardens the permanent zone-delete path — is the real fix, tracked
     separately.
     """
-    from app.api.v1.dns.router import _push_zone_to_agentless_servers  # noqa: PLC0415
-    from app.services.dns.record_ops import sweep_zone_ops  # noqa: PLC0415
+    from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
 
     res = await db.execute(
         select(DNSZone)
@@ -217,7 +216,7 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     skipped = 0
     for zone in res.scalars().all():
         try:
-            await _push_zone_to_agentless_servers(db, zone, "delete")
+            await purge_trashed_zone(db, zone)
         except Exception as exc:  # noqa: BLE001 — best-effort; retry next sweep
             # A dead / rejecting provider must NOT let the row Core-DELETE (that
             # orphans the hosted zone forever). Leave it soft-deleted + logged;
@@ -231,21 +230,6 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
                 hint="left soft-deleted; next daily sweep retries the provider push",
             )
             continue
-        # Ops queued before the soft-delete started sweeping them (#964 review)
-        # have no zone FK to cascade through; sweep defensively so a pre-fix
-        # trash row does not leave a failed queue behind.
-        await sweep_zone_ops(db, zone, zone.group_id)
-        # Core DELETE (not ORM ``db.delete``) — leans on the DB-level FK ON
-        # DELETE CASCADE to remove this zone's still-present soft-deleted records
-        # (they were excluded from the record pass precisely so they'd ride this
-        # delete, atomic with the teardown). An ORM delete would instead fire an
-        # ``all, delete-orphan`` cascade lazy-load per zone — wasted work that
-        # also couples correctness to the soft-delete filter hiding those rows.
-        # ``include_deleted`` bypasses that filter so the WHERE matches this
-        # tombstoned row.
-        await db.execute(
-            delete(DNSZone).where(DNSZone.id == zone.id).execution_options(include_deleted=True)
-        )
         purged += 1
     if purged:
         await db.flush()

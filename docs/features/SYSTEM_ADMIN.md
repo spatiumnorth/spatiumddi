@@ -22,7 +22,10 @@ brings the scope back whole — #617). See
 the full data model + cascade-batch semantics. The admin page
 lists deleted rows newest-first with type / since / `q` filters,
 per-row Restore (with conflict-detail rendering when a live row
-would clash) and Delete-permanently buttons. Nightly purge sweep
+would clash) and Delete-permanently buttons. Soft-deleting a DNS zone
+does not touch agentless servers (Windows DNS, cloud, Technitium API);
+Delete-permanently and the purge sweep do, and a failing provider keeps
+the zone in the Trash. Nightly purge sweep
 is operator-configurable via
 `PlatformSettings.soft_delete_purge_days`.
 
