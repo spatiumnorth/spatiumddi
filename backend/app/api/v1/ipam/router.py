@@ -1508,7 +1508,7 @@ async def _operator_record_twin(
     The record API refuses a second identical record with a 409 (#1230), but
     IPAM's generated records do not pass through it, so an address allocated
     at a name a person had already written into the zone got a twin beside it
-    (PowerDNS refuses the whole zone for the pair, #1379). The caller adopts
+    (PowerDNS refused the whole zone for such a pair until #1379). The caller adopts
     the operator's record instead of writing one: IPAM links the address to it
     and creates nothing. Only a record with ``auto_generated`` false counts: a
     generated record belongs to another address, and adopting it would let
@@ -1927,6 +1927,35 @@ async def _sync_dns_record(
                         ip.dns_record_id = None
                     primary_cname_skip = primary_cname_skip or is_primary_zone
                     continue
+                if name_changed or value_changed:
+                    twin = await _operator_record_twin(
+                        db,
+                        desired_zone_id,
+                        name=ip.hostname,
+                        rtype=forward_rtype,
+                        value=str(ip.address),
+                    )
+                    if twin is not None:
+                        # #1867 — renamed (or re-addressed) onto a record the
+                        # operator wrote: retract ours, adopt theirs. The
+                        # delete names our row, so an RRset the operator's
+                        # row shares keeps it on the wire.
+                        await _enqueue_dns_op(
+                            db,
+                            target_zone,
+                            "delete",
+                            old_name,
+                            forward_rtype,
+                            old_value,
+                            existing.ttl,
+                            record_id=existing.id,
+                        )
+                        await db.delete(existing)
+                        if is_primary_zone:
+                            ip.dns_record_id = twin.id
+                            ip.forward_zone_id = effective_zone_id
+                        forward_published = True
+                        continue
                 if name_changed:
                     # A rename is delete-at-old-name + create-at-new-name at
                     # the driver level: the agent's "update" op replaces the
@@ -2115,6 +2144,11 @@ async def _sync_dns_record(
                         record_id=record.id,
                     )
                 await db.delete(record)
+                ip.reverse_zone_id = rev_zone.id
+                if await _operator_record_twin(
+                    db, rev_zone.id, name=ptr_name, rtype="PTR", value=ptr_value
+                ):
+                    continue  # #1867 — the operator wrote this PTR: adopt it.
                 new_ptr = DNSRecord(
                     zone_id=rev_zone.id,
                     name=ptr_name,
@@ -2133,6 +2167,23 @@ async def _sync_dns_record(
                 old_ptr_name, old_ptr_value = record.name, record.value
                 name_changed = old_ptr_name != ptr_name
                 changed = record.value != ptr_value or name_changed
+                if changed and await _operator_record_twin(
+                    db, rev_zone.id, name=ptr_name, rtype="PTR", value=ptr_value
+                ):
+                    # #1867 — rewritten onto a PTR the operator wrote: retract
+                    # ours (by row, so a shared RRset keeps theirs), adopt it.
+                    await _enqueue_dns_op(
+                        db,
+                        rev_zone,
+                        "delete",
+                        old_ptr_name,
+                        "PTR",
+                        old_ptr_value,
+                        record.ttl,
+                        record_id=record.id,
+                    )
+                    await db.delete(record)
+                    continue
                 record.name = ptr_name
                 record.fqdn = rev_pointer_full
                 record.value = ptr_value

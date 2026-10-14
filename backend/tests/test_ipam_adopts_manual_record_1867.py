@@ -332,3 +332,129 @@ async def test_ddns_lease_adopts_the_operators_record(
     assert [x for x in await _rows(db_session, r.rev_id) if x[0] == "50"] == [
         ("50", "PTR", f"printer.{r.fwd_name}", False)
     ]
+
+
+async def _patch_hostname(
+    client: AsyncClient, headers: dict[str, str], ip_id: str, hostname: str | None
+) -> None:
+    resp = await client.put(
+        f"/api/v1/ipam/addresses/{ip_id}",
+        headers=headers,
+        json={"hostname": hostname, "force": True},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_sync_dns_does_not_report_an_adopted_record_missing(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The drift check reads only generated rows, so without knowing about
+    adoption it reported the adopted A and PTR missing on every check, and
+    applying the sync changed nothing."""
+    headers = await _headers(db_session)
+    r = await _rig(db_session)
+    db_session.add_all(
+        [
+            _manual(r.fwd_id, r.fwd_name, "db1", "A", "10.97.5.10"),
+            # Written without the trailing dot: still the same PTR.
+            _manual(r.rev_id, PTR_ZONE, "10", "PTR", f"db1.{r.fwd_name}".rstrip(".")),
+        ]
+    )
+    await db_session.commit()
+    sid = await _subnet(client, headers, r)
+    await _allocate(client, headers, sid, "10.97.5.10", "db1")
+
+    resp = await client.get(f"/api/v1/ipam/subnets/{sid}/dns-sync/summary", headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["missing"] == 0, body
+    assert body["has_drift"] is False, body
+
+
+@pytest.mark.asyncio
+async def test_sync_dns_still_reports_a_genuinely_missing_record(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The negative control: an operator record at another value does not
+    hide a missing one."""
+    headers = await _headers(db_session)
+    r = await _rig(db_session)
+    sid = await _subnet(client, headers, r)
+    ip_id = await _allocate(client, headers, sid, "10.97.5.10", "db1")
+    db_session.add(_manual(r.fwd_id, r.fwd_name, "db1", "A", "10.97.5.99"))
+    # Drop what IPAM wrote, so the A and PTR are missing.
+    for rec in (
+        await db_session.execute(
+            select(DNSRecord).where(DNSRecord.ip_address_id == uuid.UUID(ip_id))
+        )
+    ).scalars():
+        await db_session.delete(rec)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/v1/ipam/subnets/{sid}/dns-sync/summary", headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["missing"] == 2, resp.json()
+
+
+@pytest.mark.asyncio
+async def test_renaming_an_adopted_address_leaves_the_operators_record(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """After adoption, a new hostname is a new record IPAM writes for itself;
+    the operator's row keeps its name and value."""
+    headers = await _headers(db_session)
+    r = await _rig(db_session)
+    manual_a = _manual(r.fwd_id, r.fwd_name, "db1", "A", "10.97.5.10")
+    manual_a.id = a_id = uuid.uuid4()
+    db_session.add_all([manual_a, _manual(r.rev_id, PTR_ZONE, "10", "PTR", f"db1.{r.fwd_name}")])
+    await db_session.commit()
+    sid = await _subnet(client, headers, r)
+    ip_id = await _allocate(client, headers, sid, "10.97.5.10", "db1")
+    assert (await _ip(db_session, ip_id)).dns_record_id == a_id
+
+    await _patch_hostname(client, headers, ip_id, "db2")
+
+    assert await _rows(db_session, r.fwd_id) == [
+        ("db1", "A", "10.97.5.10", False),
+        ("db2", "A", "10.97.5.10", True),
+    ]
+    assert [x for x in await _rows(db_session, r.rev_id) if x[0] == "10"] == [
+        ("10", "PTR", f"db1.{r.fwd_name}", False),
+        ("10", "PTR", f"db2.{r.fwd_name}", True),
+    ]
+    ip = await _ip(db_session, ip_id)
+    assert ip.dns_record_id not in (None, a_id)
+
+    # Clearing the hostname retracts IPAM's records only.
+    await _patch_hostname(client, headers, ip_id, None)
+    assert await _rows(db_session, r.fwd_id) == [("db1", "A", "10.97.5.10", False)]
+    assert [x for x in await _rows(db_session, r.rev_id) if x[0] == "10"] == [
+        ("10", "PTR", f"db1.{r.fwd_name}", False)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_generated_record_renamed_onto_the_operators_is_retracted(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The in-place case: IPAM's own db0 A and PTR exist, the operator wrote
+    db1 at the same address, and the address is renamed to db1. IPAM's rows
+    go (by row, so the operator's stay served) and the address adopts the
+    operator's, instead of renaming its own into a twin."""
+    headers = await _headers(db_session)
+    r = await _rig(db_session)
+    sid = await _subnet(client, headers, r)
+    ip_id = await _allocate(client, headers, sid, "10.97.5.10", "db0")
+    manual_a = _manual(r.fwd_id, r.fwd_name, "db1", "A", "10.97.5.10")
+    manual_a.id = a_id = uuid.uuid4()
+    db_session.add_all([manual_a, _manual(r.rev_id, PTR_ZONE, "10", "PTR", f"db1.{r.fwd_name}")])
+    await db_session.commit()
+
+    await _patch_hostname(client, headers, ip_id, "db1")
+
+    assert await _rows(db_session, r.fwd_id) == [("db1", "A", "10.97.5.10", False)]
+    assert [x for x in await _rows(db_session, r.rev_id) if x[0] == "10"] == [
+        ("10", "PTR", f"db1.{r.fwd_name}", False)
+    ]
+    assert (await _ip(db_session, ip_id)).dns_record_id == a_id

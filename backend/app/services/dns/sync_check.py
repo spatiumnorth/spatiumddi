@@ -28,7 +28,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
-from sqlalchemy import ColumnElement, and_, or_, select
+from sqlalchemy import ColumnElement, String, and_, any_, func, literal, or_, select
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSZone
@@ -664,4 +665,52 @@ async def compute_subnet_dns_drift(
                     )
                 )
 
+    report.missing = await _drop_operator_held(db, report.missing)
     return report
+
+
+def _rr_identity(zone_id: uuid.UUID, name: str, rtype: str, value: str) -> tuple[str, ...]:
+    """The #1230 identity of a record, as ``_operator_record_twin`` in the
+    IPAM router matches it: owner name case-insensitive, value trimmed, and a
+    PTR target with or without its trailing dot."""
+    v = value.strip()
+    if rtype.upper() == "PTR":
+        v = v.rstrip(".")
+    return (str(zone_id), name.lower(), rtype.upper(), v)
+
+
+async def _drop_operator_held(db: AsyncSession, missing: list[MissingItem]) -> list[MissingItem]:
+    """Drop the "missing" records an operator already wrote (#1867).
+
+    ``_sync_dns_record`` adopts an identical operator-written record instead
+    of writing a twin, and the adopted row is neither ``auto_generated`` nor
+    linked by ``ip_address_id``, so the classifier above cannot see it. Without
+    this, an adopted address reads as missing on every check, and applying the
+    sync changes nothing.
+    """
+    if not missing:
+        return missing
+    names = sorted({m.expected_name.lower() for m in missing})
+    zone_ids = list({m.zone_id for m in missing})
+    rows = (
+        await db.execute(
+            select(DNSRecord.zone_id, DNSRecord.name, DNSRecord.record_type, DNSRecord.value).where(
+                DNSRecord.auto_generated.is_(False),
+                DNSRecord.view_id.is_(None),
+                DNSRecord.zone_id.in_(zone_ids),
+                func.upper(DNSRecord.record_type).in_(["A", "AAAA", "PTR"]),
+                DNSRecord.priority.is_(None),
+                DNSRecord.weight.is_(None),
+                DNSRecord.port.is_(None),
+                # One array parameter: a /16's worth of names as an IN list
+                # would pass asyncpg's bind-parameter limit.
+                func.lower(DNSRecord.name) == any_(literal(names, ARRAY(String))),
+            )
+        )
+    ).all()
+    held = {_rr_identity(z, n, t, v) for z, n, t, v in rows}
+    return [
+        m
+        for m in missing
+        if _rr_identity(m.zone_id, m.expected_name, m.record_type, m.expected_value) not in held
+    ]

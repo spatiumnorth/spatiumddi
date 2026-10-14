@@ -1780,7 +1780,11 @@ bulk-edit DNS zone, DDNS from a lease and Sync DNS. The adopted row stays the
 operator's (`auto_generated` false, no `ip_address_id`), so deleting the
 address or expiring the lease leaves it served. A record with the same name
 but another value is a different record and still gets its own, and a
-generated record belonging to another address is never adopted.
+generated record belonging to another address is never adopted. Renaming
+an address onto a name and value the operator wrote retracts IPAM's own row
+and adopts theirs; renaming an adopted address away writes a new record for
+IPAM and leaves the operator's alone. Sync DNS counts an adopted record as
+present, not missing.
 
 ### ✅ 15.12 DHCP Pool Awareness in IP Listing & Allocation
 
