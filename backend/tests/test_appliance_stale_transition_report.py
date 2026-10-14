@@ -61,10 +61,14 @@ async def test_ready_does_not_overwrite_leaving(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     row, token = await _leaving(db_session)
+    started_at = row.cluster_join_state_at
     for _ in range(3):  # the node reports ready on every heartbeat
         await _report(client, row, token, CLUSTER_JOIN_STATE_READY)
     await db_session.refresh(row)
     assert row.cluster_join_state == CLUSTER_JOIN_STATE_LEAVING
+    # The #590 staleness clock still measures the leave, so a leave whose
+    # runner never starts is offered the clear-state hatch on time.
+    assert row.cluster_join_state_at == started_at
     assert row.cluster_role == CLUSTER_ROLE_MEMBER
     assert row.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
 
