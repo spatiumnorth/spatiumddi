@@ -18,6 +18,7 @@ from sqlalchemy.orm import selectinload
 from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
+from app.db import task_connect_args
 from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSServer
 from app.services.dns_blocklist import parse_feed_detailed
 from app.services.feature_modules import is_module_enabled
@@ -42,7 +43,9 @@ def _batched(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
 
 async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
     """Core async logic for refresh_blocklist_feed, reusable from tests."""
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
@@ -294,7 +297,9 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
 
     from app.models.dns import DNSServer
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -345,7 +350,9 @@ async def _agentless_op_retry_sweep_async() -> dict[str, int]:
     for them."""
     from app.services.dns.record_ops import apply_pending_agentless_ops
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -398,7 +405,9 @@ async def _check_health(server_id: uuid.UUID) -> None:
     # loop that touches it, which turns into "Future attached to a different
     # loop" errors when multiple Celery tasks share a worker. See the matching
     # pattern in ``app.tasks.dns_pull`` / ``app.tasks.dhcp_pull_leases``.
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -496,7 +505,9 @@ def check_dns_server_health(self: object, server_id: str) -> None:  # type: igno
 
 
 async def _enqueue_all() -> None:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:

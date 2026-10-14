@@ -22,6 +22,7 @@ from celery import shared_task
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.config import settings
 from app.db import task_session
 from app.models.alerts import AlertEvent, AlertRule
 from app.services.audit_chain import verify_chain
@@ -33,7 +34,7 @@ _RULE_NAME = "audit-chain-broken"
 
 
 async def _async_verify_and_alert() -> dict:
-    async with task_session() as db:
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         result = await verify_chain(db)
         rule = (
             await db.execute(select(AlertRule).where(AlertRule.name == _RULE_NAME))

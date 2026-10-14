@@ -159,6 +159,10 @@ class TechnitiumDriver(DNSDriver):
 
     name = "technitium"
 
+    # ``pull_zone_records`` takes ``include_apex_ns`` (#1857): the AXFR read
+    # can keep the apex NS set for the drift report, which compares it.
+    pull_can_include_apex_ns = True
+
     # ── Rendering ─────────────────────────────────────────────────────────
 
     def render_server_config(
@@ -267,7 +271,12 @@ class TechnitiumDriver(DNSDriver):
         )
 
     async def pull_zone_records(
-        self, server: Any, zone_name: str, *, tsig: TsigKey | None = None
+        self,
+        server: Any,
+        zone_name: str,
+        *,
+        tsig: TsigKey | None = None,
+        include_apex_ns: bool = False,
     ) -> list[RecordData]:
         """AXFR the zone off the Technitium host, for the #61 drift report.
 
@@ -304,6 +313,7 @@ class TechnitiumDriver(DNSDriver):
                 log_driver="technitium",
                 server_id=str(getattr(server, "id", "")),
                 tsig=tsig,
+                include_apex_ns=include_apex_ns,
             )
         except Exception as exc:
             # A bare "REFUSED" tells the operator nothing about what to do.
