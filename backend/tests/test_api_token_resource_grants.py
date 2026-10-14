@@ -316,8 +316,9 @@ async def test_subnet_token_bulk_delete_skips_other_subnet(
     assert ra.status_code == 201 and rb.status_code == 201
     ip_a, ip_b = ra.json()["id"], rb.json()["id"]
 
-    # bulk-delete is a POST → maps to the 'write' action, so the token needs a
-    # write/admin grant (a bare 'delete' grant wouldn't clear the coarse gate).
+    # bulk-delete needs 'delete' at the coarse gate (as a single-row DELETE
+    # does) and 'write' on each row's subnet, so the token takes 'admin',
+    # which implies both.
     raw = await _make_token(
         db_session,
         owner,

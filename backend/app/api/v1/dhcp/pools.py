@@ -12,7 +12,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
@@ -267,7 +267,7 @@ async def list_pools(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCPPo
     status_code=status.HTTP_201_CREATED,
 )
 async def create_pool(
-    scope_id: uuid.UUID, body: PoolCreate, db: DB, user: SuperAdmin
+    scope_id: uuid.UUID, body: PoolCreate, db: DB, user: CurrentUser
 ) -> PoolResponse:
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
@@ -335,7 +335,7 @@ async def create_pool(
 
 
 @router.put("/pools/{pool_id}", response_model=PoolResponse)
-async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperAdmin) -> DHCPPool:
+async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: CurrentUser) -> DHCPPool:
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
@@ -413,7 +413,7 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
 
 
 @router.delete("/pools/{pool_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_pool(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_pool(pool_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")

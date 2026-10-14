@@ -17,11 +17,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
-from app.core.permissions import require_resource_permission
+from app.core.permissions import require_permission, require_resource_permission
 from app.models.dhcp import (
     DHCPOptionTemplate,
     DHCPScope,
@@ -116,7 +116,7 @@ async def create_template(
     group_id: uuid.UUID,
     body: OptionTemplateCreate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> OptionTemplateResponse:
     grp = await db.get(DHCPServerGroup, group_id)
     if grp is None:
@@ -168,7 +168,7 @@ async def update_template(
     template_id: uuid.UUID,
     body: OptionTemplateUpdate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> OptionTemplateResponse:
     tpl = await db.get(DHCPOptionTemplate, template_id)
     if tpl is None:
@@ -222,7 +222,7 @@ async def update_template(
 
 
 @router.delete("/option-templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_template(template_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_template(template_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     tpl = await db.get(DHCPOptionTemplate, template_id)
     if tpl is None:
         raise HTTPException(status_code=404, detail="Template not found")
@@ -262,12 +262,15 @@ class ApplyTemplateResponse(BaseModel):
 @router.post(
     "/scopes/{scope_id}/apply-option-template",
     response_model=ApplyTemplateResponse,
+    # Applying a template rewrites the scope's options, so the scope's own
+    # write permission is required on top of the router's template gate.
+    dependencies=[Depends(require_permission("write", "dhcp_scope"))],
 )
 async def apply_template_to_scope(
     scope_id: uuid.UUID,
     body: ApplyTemplateRequest,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> ApplyTemplateResponse:
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:

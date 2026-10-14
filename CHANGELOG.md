@@ -94,6 +94,164 @@ the formatter handles the rest.
   "hashed at rest and can't be recovered"; it is Fernet-encrypted
   (SpatiumDDI must read it to sign updates) and is simply not shown
   again, so the copy now says that.
+
+- **A lost CNPG primary no longer hangs a Celery task for ~15 minutes
+  (#1719).** No Celery-side database engine set asyncpg bounds: neither
+  `task_session()` nor the ~55 per-task `create_async_engine` calls the
+  lease pulls, DNS / IPAM syncs, health sweeps, integration mirrors and the
+  event outbox build directly. A query to a black-holed primary therefore
+  waited out the kernel's TCP retransmit timeout while the worker completed
+  nothing and its liveness probe passed. Every task and service engine on
+  the app database now carries the api engine's connect bound
+  (`TASK_DB_CONNECT_TIMEOUT`, 5 s) and a per-statement
+  `TASK_DB_COMMAND_TIMEOUT` (120 s, the pre-ping included), through one
+  helper, `app.db.task_connect_args()`; a test fails any new engine that
+  omits it. Tasks with a single statement that can legitimately run long use
+  `TASK_DB_LONG_COMMAND_TIMEOUT` (900 s): the prunes (metrics, logs,
+  internal errors, lease history, stale ARP), trash purge, audit-chain
+  verify, utilization recount, backup sweep, the DNS threat rollup and the
+  DNS agent bundle render, whose records query on a million-row group is
+  the #1111 case. The backup drill's scratch-database engine and the backup
+  migration helper's explicit-URL engine are deliberately unbounded.
+
+- **Drift no longer lists a stored apex NS as missing on the server
+  (#1857).** The zone-transfer read drops the apex NS set, so a stored
+  apex NS row, such as the copy of the source's `@ NS` a Technitium or
+  BIND9 import brings in, could only ever read "missing on server", and
+  the zone never showed in sync whatever Sync did. On an agent-managed
+  BIND9 or Technitium server, which serves a zone's own apex NS rows as
+  its NS set, drift now reads the apex NS too and compares it, so an NS
+  set changed on the server, or an NS change the agent did not apply,
+  still shows. Where the read carries no apex NS (an operator's own
+  BIND9, Windows), the stored rows are left out of the comparison; where
+  the zone declares none, the server's own NS set is not reported.
+  Delegations below the apex are compared as before. Import and Sync with
+  Servers still never see the apex NS. The importers keep the row, so no
+  stored data changes.
+
+- **The built-in Auditor and Compliance Editor could not read the
+  audit log (#1862).** Both roles were granted `read` on `audit`, a
+  resource type no route checks, while every audit-log route (the
+  list, the PDF export and the integrity check) requires `read` on
+  `audit_log`. An Auditor opening Administration, Audit Log was told
+  "0 events" with the log full, and the role's own description ("read
+  on audit log") was false. Both roles now carry `read` on
+  `audit_log`. Built-in roles are re-written from code on every api
+  start, so existing installs pick this up on upgrade with no
+  migration. A new test walks every route's required permission and
+  fails when a built-in role holds a grant that no route checks.
+
+- **The DNS Editor and DHCP Editor roles now grant the writes they
+  always claimed to (#1861).** Both promised "Full CRUD", but 134 of
+  the 147 DNS and DHCP write routes also took `SuperAdmin`, so a DHCP
+  Editor could not create a scope and a DNS Editor could write records
+  and nothing else; the subnet's DHCP Pools panel offered Create Scope
+  and then refused the filled-in form with "Superadmin required". The
+  everyday data routes now check the role's own resource permission,
+  with `delete` for a delete. **This widens what both roles can do on
+  existing installs**, on purpose:
+  - DNS Editor: zones (create, from template, edit, delete), records,
+    zone-file import, views, named ACLs, and the entries and exceptions
+    of existing blocklists.
+  - DHCP Editor: scopes, pools, static assignments, client classes and
+    device policies, option templates (and applying one to a scope),
+    phone and PXE profiles, and MAC blocks.
+
+  Infrastructure stays superadmin-only: server groups and servers,
+  DNS server options, TSIG keys, DNSSEC signing and policies,
+  dynamic-update ACLs, zone moves, blocklist lists and their feeds and
+  assignments, DNS GSLB pools, Windows DHCP failover, lease deletion and
+  the importers. So do `?permanent=true` on a zone or scope delete and
+  changing a zone's DNSSEC, dynamic-update or TLS-probing settings. The
+  DNS Editor's grant on `manage_dns_pools` narrows from `admin` to
+  `read`, since every pool write stays superadmin-only. The console's
+  controls follow the same gates: an Editor gets them, a Viewer sees
+  them disabled with the reason, and the PXE profiles page, which had
+  no gate at all, now has one. `docs/PERMISSIONS.md` lists every gate,
+  and `test_builtin_roles_match_routes.py` now fails when a built-in
+  role is refused a route its description promises, holds a write grant
+  none of its promised routes use, or when a DNS / DHCP write route is
+  neither on the open list nor superadmin-only.
+
+- **Failed sign-ins are forwarded to syslog / SIEM as warnings, not info
+  (#1874).** Every rejected sign-in (bad password, bad MFA code, locked or
+  disabled account) is audited with `result="failure"`, which audit
+  forwarding did not recognise, so it went out at info and a target with
+  `min_severity` above info dropped it. A failed sign-in now ranks with
+  `denied`, because the system worked and refused the request, which is
+  what `denied` already records for a signed-in user. **Existing
+  collectors will receive failed sign-ins at a higher severity than
+  before:** syslog PRI severity 4 (warning) instead of 6, CEF severity 9
+  instead of 3, LEEF `sev=9` instead of 3, and every `min_severity`
+  threshold, `denied` included, now lets them through. A sign-in the
+  system could not evaluate (the LDAP / RADIUS / TACACS+ server timed out)
+  was already audited `error` and is unchanged. Two related results also
+  fell through to info and are fixed with it: `failure` on anything other
+  than a sign-in (a failed backup run or drill, a Wake-on-LAN send, an
+  auth-provider test) now ranks with `failed` (PRI 3, CEF / LEEF 6), and
+  `forbidden` (a refused break-glass, a refused secret reveal, a throttled
+  supervisor registration) ranks with `denied`. `success`, `denied`,
+  `failed` and `error` map exactly as before. The dashboard Live Activity
+  badge reads `failure` as a red FAIL and `forbidden` as DENY, and the
+  Audit Log result filter offers `failure` and `forbidden`.
+
+- **Re-importing a zone's own export no longer pins every inherited TTL
+  (#1727).** A record with no TTL of its own inherits the zone default and
+  is exported without one, so the re-import read the file's `$TTL` back
+  as 3600 against a stored NULL, listed the record under `to_update` and,
+  on commit, wrote 3600 onto it so it stopped following the zone. The
+  import diff now compares effective TTLs: a row inheriting the zone
+  default is unchanged when the file carries that same value, and stays
+  inherited even when only its priority or weight changes. An RRset whose
+  members carry different TTLs no longer has its members rewritten to the
+  lowest of them either: the zone file reports one TTL per RRset, so a
+  member is unchanged when that TTL is the RRset's existing lowest one,
+  which is what it is served with. An explicit TTL in a foreign file that
+  differs still updates.
+
+- **Bulk delete requires the `delete` action, like deleting one row
+  does.** The router-level permission gates mapped every `POST` to
+  `write`, so a role holding `write` but not `delete` was refused
+  `DELETE /x/{id}` yet could remove up to 500 rows through
+  `POST /x/bulk-delete` (ASNs, VRFs, overlays, multicast groups,
+  circuits, services, customers, sites, providers, DNS records and IPAM
+  addresses). IPAM's Clean Orphans (`POST
+  /ipam/subnets/{id}/orphans/purge`) permanently deletes addresses the
+  same way and was gated the same. The gates now treat these POSTs as
+  `delete`, and IPAM's Bulk delete and Clean Orphans buttons ask for
+  `delete` before offering themselves. IPAM's per-subnet and
+  address-set write checks on each row are unchanged. A role that
+  relied on `write` alone for bulk delete needs `delete` added. A test
+  walks the route table so a new multi-row delete route without the
+  check fails CI.
+
+- **An IPAM template apply lists only the columns it changed (#1634).**
+  `fields_written`, in the response and in the apply's audit row, named
+  every column that was empty on the target, including ones the template
+  has no value for (a DDNS-only template listed `tags`, `custom_fields`,
+  the zones and the domain override). A column now counts as written
+  only when its value changed; `force` lists the columns it overwrote
+  with a different value.
+
+- **An ACME order's teardown no longer fails with "Event loop is
+  closed" in the worker (#1687, #1726).** `run_order`'s `finally`
+  removed the DNS-01 challenge TXT records and the http-01 tokens
+  through the shared engine's session factory. That runs inside a
+  Celery task's own event loop, where a pooled connection left by an
+  earlier task is bound to a closed loop, so on a reused connection
+  the cleanup failed with only a warning. The challenge TXT then
+  stayed in the zone until the 24 h stale sweep, or for good without
+  it, and http-01 tokens stayed in the database. The teardown now
+  opens its sessions with `task_session()`, as the order itself does.
+  The same flaw sat in the DNS-01 solve: its wait for the agents to
+  apply the challenge TXT polled through the shared factory, so in a
+  worker that had run a task before, the first poll raised and the
+  order ended `invalid` with `unexpected: Event loop is closed`. The
+  wait helpers now take a session factory, and the solve passes one
+  from the new `task_sessionmaker()` (one per-task engine for the
+  whole poll loop). The acme-dns provider's API path still uses the
+  shared factory, which is correct in a request handler.
+
 - **The DICOM AE, OT device and IPAM CSV imports read a file with classic
   Mac line endings (#1370, #1637, #1711).** Each importer read the
   pasted or uploaded text without handing its line endings to the csv

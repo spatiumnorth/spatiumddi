@@ -46,6 +46,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import settings
+from app.db import task_connect_args
 from app.models.nmap import NmapScan
 
 logger = structlog.get_logger(__name__)
@@ -586,7 +587,9 @@ def parse_nmap_xml(xml_str: str) -> dict:
 
 
 def _new_engine_factory() -> tuple[Any, async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     factory = async_sessionmaker(engine, expire_on_commit=False)
     return engine, factory
 

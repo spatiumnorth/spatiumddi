@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -372,11 +373,21 @@ async def _step_preflight(
     cnpg_cluster_name: str = "",
     cnpg_namespace: str | None = None,
     cnpg_timeout_s: float = DEFAULT_CNPG_READY_TIMEOUT_S,
+    slot_image_id: uuid.UUID | None = None,
+    disk_nodes: list[str] | None = None,
 ) -> StepResult:
     step = StepResult(name="preflight", started_at=_now_iso())
     # The orchestrator holds the upgrade lease while it drives this chain;
     # without its identity, the in-flight check fails on that very lease.
-    report = await preflight.run_all(target_version=target_version, own_holder=lease_holder)
+    # #1709 — the run's uploaded target, which the mirror already holds by
+    # now, needs no room on it; and /var is judged on the run's nodes still
+    # to upgrade, not on the ones it has finished.
+    report = await preflight.run_all(
+        target_version=target_version,
+        own_holder=lease_holder,
+        slot_image_id=slot_image_id,
+        disk_nodes=disk_nodes,
+    )
     if report.overall == "fail":
         fails = [r.name for r in report.results if r.level == "fail"]
         return step.finish(
@@ -1402,6 +1413,7 @@ async def single_node_upgrade(
     mirror_deployment: str | None = None,
     control_plane_release: str | None = None,
     control_plane_namespace: str | None = None,
+    remaining_nodes: list[str] | None = None,
 ) -> SingleNodeResult:
     """Drive one node through the 12-step rolling-upgrade primitive.
 
@@ -1434,6 +1446,9 @@ async def single_node_upgrade(
             to the default release.
         control_plane_namespace: namespace those Deployments live in;
             defaults to the api's own namespace.
+        remaining_nodes: the run's nodes still to upgrade, this one
+            included; the preflight judges ``/var`` headroom on those only.
+            None judges every approved appliance, as Plan does.
     """
     steps_in_order: list[StepName] = list(CHAIN)
     if start_step is not None:
@@ -1533,6 +1548,8 @@ async def single_node_upgrade(
             lease_holder,
             cnpg_cluster_name=cnpg_cluster_name,
             cnpg_namespace=cnpg_namespace,
+            slot_image_id=slot_image.image_id,
+            disk_nodes=remaining_nodes,
         ),
     ):
         return _failed(node_name, target_version, "preflight", results)

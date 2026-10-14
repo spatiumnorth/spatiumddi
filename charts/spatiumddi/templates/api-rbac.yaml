@@ -82,9 +82,10 @@ rules:
   # mutates the orchestrator Lease for the cluster-wide single-
   # upgrader lock. All namespace-scoped (this Role); cluster-scoped
   # cordon / drain / Node reads live in the ClusterRole rendered
-  # alongside this template.
+  # alongside this template. #1710 — DaemonSets too: the end-of-roll flip
+  # waits for the supervisor and agent DaemonSets it moves.
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "daemonsets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
