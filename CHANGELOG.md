@@ -84,6 +84,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **One Fleet save that switches an appliance's DNS engine and its group
+  moves the server row too (#1856).** The roles PUT moved only rows
+  already carrying the new engine's driver, so when the old engine's
+  row was the one the new agent adopts, it stayed in the old group:
+  the new group listed no server and answered REFUSED until a second
+  save. The appliance's own row now moves as the new engine's row, and
+  a target group running another driver is a 422 before anything changes.
+
 - **Failed sign-ins are forwarded to syslog / SIEM as warnings, not info
   (#1874).** Every rejected sign-in (bad password, bad MFA code, locked or
   disabled account) is audited with `result="failure"`, which audit

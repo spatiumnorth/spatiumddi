@@ -4120,6 +4120,38 @@ async def _appliance_own_dns_servers(db: DB, appliance: Appliance) -> list[Any]:
     )
 
 
+async def _appliance_adoptable_dns_server(
+    db: DB, appliance: Appliance, target_group: Any
+) -> Any | None:
+    """The row the new engine's agent will adopt, when none carries its driver (#1856).
+
+    A save that switches the engine AND the group finds no row of the new
+    engine's driver, yet a row of the old one can still be the one the new
+    agent lands on: registration finds a row by agent id with no group
+    filter (a second switch back to an engine reaches the row it once
+    adopted, wherever it stands) and otherwise by hostname within the group
+    it names. Left in the old group the agent re-registers into it and the
+    new group lists no server. So the appliance's own row of another
+    driver, outside ``target_group``, is the one to move; the most recently
+    seen if there are several. ``None`` when there is no such row.
+    """
+    from app.models.dns import DNSServer  # noqa: PLC0415
+
+    own = await _own_server_condition(db, appliance, DNSServer)
+    rows = (
+        (
+            await db.execute(
+                select(DNSServer)
+                .where(own, DNSServer.group_id != target_group.id)
+                .order_by(DNSServer.last_seen_at.desc().nulls_last(), DNSServer.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return rows[0] if rows else None
+
+
 async def _retire_stale_engine_rows(
     db: DB, appliance: Appliance, target_group: Any, current_user: Any
 ) -> list[str]:
@@ -4393,6 +4425,16 @@ async def update_appliance_roles(
             from app.services.dns.server_move import ServerMoveError, move_server_to_group
 
             own_dns = await _appliance_own_dns_servers(db, row)
+            if not own_dns and _current_dns_drivers(row):
+                # #1856 — an engine AND group change in one save: the row still
+                # carries the old engine's driver, so nothing above matched.
+                # Move it, as the new engine's row (the agent re-registers into
+                # it); the target's single-driver check then judges the group
+                # against the NEW driver, and refuses before anything changes.
+                adoptee = await _appliance_adoptable_dns_server(db, row, dns_group)
+                if adoptee is not None:
+                    adoptee.driver = next(iter(_current_dns_drivers(row)))
+                    own_dns = [adoptee]
             if (
                 not own_dns
                 and _current_dns_drivers(row)

@@ -1436,3 +1436,131 @@ async def test_fleet_move_wakes_the_agent_and_both_groups(
     assert agent_wake.dns_server_channel(srv.id) in published
     assert agent_wake.dns_group_channel(default.id) in published
     assert agent_wake.dns_group_channel(target.id) in published
+
+
+# ── #1856: one save that switches the engine AND the group ────────────────────
+
+
+_CAPS_1856 = {"can_run_dns_bind9": True, "can_run_dns_technitium": True}
+
+
+async def _adopted_row_rig(
+    client: AsyncClient, db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):  # noqa: ANN202
+    """Eric's steps 1-2: bind9 in group A, then an engine-only switch to
+    technitium whose agent (its own agent id) adopts the bind9 row by hostname."""
+    monkeypatch.setenv("DNS_AGENT_KEY", "psk-1715")
+    group_a = await _group(db, "grp1856-a")
+    await db.commit()
+    bind9_agent = uuid.uuid4()
+    row_id = await _agent_register(client, driver="bind9", group="grp1856-a", agent_id=bind9_agent)
+    appliance = await _fleet_appliance(db, group_a, hostname=_HOST_1715, capabilities=_CAPS_1856)
+    appliance.assigned_roles = ["dns-technitium"]
+    await db.commit()
+    adopted = await _agent_register(
+        client, driver="technitium", group="grp1856-a", agent_id=uuid.uuid4()
+    )
+    assert adopted == row_id
+    return appliance, group_a, bind9_agent, uuid.UUID(row_id)
+
+
+@pytest.mark.asyncio
+async def test_engine_and_group_in_one_save_moves_the_adopted_row(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = await _superadmin(db_session, "root1856a")
+    appliance, group_a, bind9_agent, row_id = await _adopted_row_rig(
+        client, db_session, monkeypatch
+    )
+    group_b = await _group(db_session, "grp1856-b")
+    await db_session.commit()
+    a_id, b_id = group_a.id, group_b.id
+
+    resp = await client.put(
+        _roles_url(appliance.id),
+        json={"roles": ["dns-bind9"], "dns_group_id": str(b_id)},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    row = await db_session.get(DNSServer, row_id)
+    assert row is not None and row.group_id == b_id and row.driver == "bind9"
+    await db_session.refresh(appliance)
+    assert appliance.assigned_dns_group_id == b_id
+
+    # The bind9 agent comes back by its agent id naming the new group: the
+    # same row, still in B, and no second row anywhere.
+    sid = await _agent_register(client, driver="bind9", group="grp1856-b", agent_id=bind9_agent)
+    assert sid == str(row_id)
+    db_session.expire_all()
+    rows = (await db_session.execute(select(DNSServer))).scalars().all()
+    assert [(r.id, r.group_id, r.driver) for r in rows] == [(row_id, b_id, "bind9")]
+    assert a_id not in {r.group_id for r in rows}
+
+
+@pytest.mark.asyncio
+async def test_engine_and_group_save_into_a_mixed_group_is_refused_whole(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = await _superadmin(db_session, "root1856b")
+    appliance, group_a, _agent, row_id = await _adopted_row_rig(client, db_session, monkeypatch)
+    group_b = await _group(db_session, "grp1856-mixed")
+    await _server(db_session, group_b, "other-tech", driver="technitium", is_primary=True)
+    await db_session.commit()
+    a_id, b_id, app_id = group_a.id, group_b.id, appliance.id
+
+    # bind9 into a technitium-only group: a clean 422, nothing changed.
+    resp = await client.put(
+        _roles_url(app_id),
+        json={"roles": ["dns-bind9"], "dns_group_id": str(b_id)},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 422, resp.text
+    assert "single-driver" in resp.json()["detail"]
+    # The test session is shared with the handler; production closes it
+    # uncommitted on a refusal, which is a rollback.
+    await db_session.rollback()
+    db_session.expire_all()
+    row = await db_session.get(DNSServer, row_id)
+    assert row is not None and row.group_id == a_id and row.driver == "technitium"
+    from app.models.appliance import Appliance
+
+    app_row = await db_session.get(Appliance, app_id)
+    assert app_row is not None
+    assert app_row.assigned_roles == ["dns-technitium"]
+    assert app_row.assigned_dns_group_id == a_id
+
+
+@pytest.mark.asyncio
+async def test_engine_and_group_save_from_bind9_to_technitium_leaves_no_orphan(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The direction that already worked left the bind9 row behind in the old
+    group; now the row follows and the technitium agent adopts it in B."""
+    monkeypatch.setenv("DNS_AGENT_KEY", "psk-1715")
+    token = await _superadmin(db_session, "root1856c")
+    group_a = await _group(db_session, "grp1856-c-a")
+    group_b = await _group(db_session, "grp1856-c-b")
+    await db_session.commit()
+    row_id = await _agent_register(
+        client, driver="bind9", group="grp1856-c-a", agent_id=uuid.uuid4()
+    )
+    appliance = await _fleet_appliance(
+        db_session, group_a, hostname=_HOST_1715, capabilities=_CAPS_1856
+    )
+    await db_session.commit()
+    b_id = group_b.id
+
+    resp = await client.put(
+        _roles_url(appliance.id),
+        json={"roles": ["dns-technitium"], "dns_group_id": str(b_id)},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+    sid = await _agent_register(
+        client, driver="technitium", group="grp1856-c-b", agent_id=uuid.uuid4()
+    )
+    assert sid == row_id
+    db_session.expire_all()
+    rows = (await db_session.execute(select(DNSServer))).scalars().all()
+    assert [(str(r.id), r.group_id, r.driver) for r in rows] == [(row_id, b_id, "technitium")]
