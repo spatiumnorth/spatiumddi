@@ -94,6 +94,40 @@ the formatter handles the rest.
   node still reporting `left` while its row says `joining`) is guarded the
   same way.
 
+- **A lost CNPG primary no longer hangs a Celery task for ~15 minutes
+  (#1719).** No Celery-side database engine set asyncpg bounds: neither
+  `task_session()` nor the ~55 per-task `create_async_engine` calls the
+  lease pulls, DNS / IPAM syncs, health sweeps, integration mirrors and the
+  event outbox build directly. A query to a black-holed primary therefore
+  waited out the kernel's TCP retransmit timeout while the worker completed
+  nothing and its liveness probe passed. Every task and service engine on
+  the app database now carries the api engine's connect bound
+  (`TASK_DB_CONNECT_TIMEOUT`, 5 s) and a per-statement
+  `TASK_DB_COMMAND_TIMEOUT` (120 s, the pre-ping included), through one
+  helper, `app.db.task_connect_args()`; a test fails any new engine that
+  omits it. Tasks with a single statement that can legitimately run long use
+  `TASK_DB_LONG_COMMAND_TIMEOUT` (900 s): the prunes (metrics, logs,
+  internal errors, lease history, stale ARP), trash purge, audit-chain
+  verify, utilization recount, backup sweep, the DNS threat rollup and the
+  DNS agent bundle render, whose records query on a million-row group is
+  the #1111 case. The backup drill's scratch-database engine and the backup
+  migration helper's explicit-URL engine are deliberately unbounded.
+
+- **Drift no longer lists a stored apex NS as missing on the server
+  (#1857).** The zone-transfer read drops the apex NS set, so a stored
+  apex NS row, such as the copy of the source's `@ NS` a Technitium or
+  BIND9 import brings in, could only ever read "missing on server", and
+  the zone never showed in sync whatever Sync did. On an agent-managed
+  BIND9 or Technitium server, which serves a zone's own apex NS rows as
+  its NS set, drift now reads the apex NS too and compares it, so an NS
+  set changed on the server, or an NS change the agent did not apply,
+  still shows. Where the read carries no apex NS (an operator's own
+  BIND9, Windows), the stored rows are left out of the comparison; where
+  the zone declares none, the server's own NS set is not reported.
+  Delegations below the apex are compared as before. Import and Sync with
+  Servers still never see the apex NS. The importers keep the row, so no
+  stored data changes.
+
 - **The built-in Auditor and Compliance Editor could not read the
   audit log (#1862).** Both roles were granted `read` on `audit`, a
   resource type no route checks, while every audit-log route (the

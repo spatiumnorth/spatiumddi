@@ -27,6 +27,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.celery_app import celery_app
+from app.config import settings
 from app.db import task_session
 from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
@@ -80,7 +81,7 @@ async def _sweep_with_session(db: AsyncSession) -> dict[str, int]:
 
 
 async def _sweep() -> dict[str, int]:
-    async with task_session() as db:
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         return await _sweep_with_session(db)
 
 
