@@ -95,6 +95,21 @@ the formatter handles the rest.
   (SpatiumDDI must read it to sign updates) and is simply not shown
   again, so the copy now says that.
 
+- **One Fleet save that switches an appliance's DNS engine and its group
+  moves the server row too (#1856).** The roles PUT moved only rows
+  already carrying the new engine's driver, so when the old engine's
+  row was the one the new agent adopts, it stayed in the old group:
+  the new group listed no server and answered REFUSED until a second
+  save. The appliance's own row now moves as the new engine's row, and
+  a target group running another driver is a 422 before anything changes.
+  When the appliance holds two or more rows of engines it no longer runs
+  (left by earlier saves), the save is a 409 naming them instead of
+  moving a guess: the new agent lands on whichever row carries its own
+  agent id, which the control plane cannot tell. The Operator Copilot's
+  `assign_appliance_role` (and MCP `propose_assign_role`) now moves the
+  server the same way; it used to set the appliance's group pointer
+  alone, which left the server in the old group on any group change.
+
 - **Creating a PXE profile with a name its group already holds is a 409,
   not a 500 (#1911).** The name-clash check selected the whole profile, The Copilot's `list_pxe_profiles` tool had the same joined-collection read and failed for any profile with a match; it now reads them.
   whose `matches` collection is eager-joined, so the moment a clash
