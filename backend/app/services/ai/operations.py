@@ -3796,9 +3796,11 @@ async def _assign_role_signer_problem(
 async def _assign_role_catalog_problem(
     db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
 ) -> str | None:
-    """#1782 — same refusal as the REST role-assign route: a Technitium
-    appliance must not be pointed at a catalog-enabled DNS group (#1766).
-    Only on a change, so a pre-existing assignment can still be re-saved."""
+    """#1782 / #1858 — same refusals as the REST role-assign route: a
+    Technitium appliance must not be pointed at a catalog-enabled DNS group
+    (#1766), nor at one holding a TSIG key Technitium cannot use
+    (hmac-sha224). Only on a change, so a pre-existing assignment can still
+    be re-saved."""
     from app.models.dns import DNSServerGroup  # noqa: PLC0415
     from app.services.dns.server_move import catalog_unsupported_message  # noqa: PLC0415
 

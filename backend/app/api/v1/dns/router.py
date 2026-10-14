@@ -6617,6 +6617,10 @@ class ZoneMovePreviewResponse(BaseModel):
     #: #1784 — the experimental technitium_api target refuses this zone;
     #: non-null means the commit refuses, not waivable by acknowledgement.
     technitium_api_refusal: str | None = None
+    #: #1858 — a TSIG key the zone uses resolves in the target to an
+    #: algorithm a target driver cannot use; non-null means the commit
+    #: refuses, not waivable by acknowledgement.
+    tsig_algorithm_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -6654,6 +6658,7 @@ class ZoneMovePreviewResponse(BaseModel):
             acl_names_lost=plan.acl_names_lost,
             key_names_lost=plan.key_names_lost,
             technitium_api_refusal=plan.technitium_api_refusal,
+            tsig_algorithm_refusal=plan.tsig_algorithm_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )

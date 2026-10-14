@@ -22,7 +22,7 @@ from tests.test_dns_server_group_move import (
     _server,
     _superadmin,
 )
-from tests.test_dns_zone_group_move import _commit, _zone
+from tests.test_dns_zone_group_move import _commit, _preview, _zone
 
 TECHNITIUM = ["technitium", "technitium_api"]
 
@@ -181,6 +181,42 @@ async def test_zone_using_a_sha224_key_cannot_move_into_a_technitium_group(
         )
     )
     await db_session.flush()
+    # The preview reports the refusal the commit raises, so the UI can block
+    # the Move button instead of letting the operator find out on commit.
+    p = await _preview(client, token, zone, dst)
+    assert p.status_code == 200, p.text
+    refusal = p.json()["tsig_algorithm_refusal"]
+    assert refusal and "hmac-sha224" in refusal and "ddns" in refusal
     r = await _commit(client, token, zone, dst, acks=[])
     assert r.status_code == 422, r.text
     assert "hmac-sha224" in r.json()["detail"] and "ddns" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_copilot_technitium_role_into_group_holding_sha224_key_is_refused(
+    db_session: AsyncSession,
+) -> None:
+    from sqlalchemy import select
+
+    from app.models.auth import User
+    from app.services.ai.operations import (
+        AssignApplianceRoleArgs,
+        _apply_assign_appliance_role,
+        _preview_assign_appliance_role,
+    )
+
+    await _superadmin(db_session, "r1858g")
+    user = (await db_session.execute(select(User).where(User.username == "r1858g"))).scalar_one()
+    plain = await _group(db_session, "plain-g")
+    dst = await _group(db_session, "holds224g")
+    await _key(db_session, dst, "k224", "hmac-sha224")
+    appliance = await _fleet_appliance(db_session, plain)
+    args = AssignApplianceRoleArgs(
+        appliance_id=str(appliance.id), roles=["dns-technitium"], dns_group_id=str(dst.id)
+    )
+    preview = await _preview_assign_appliance_role(db_session, user, args)
+    assert not preview.ok
+    assert "hmac-sha224" in preview.detail
+    with pytest.raises(ValueError, match="hmac-sha224"):
+        await _apply_assign_appliance_role(db_session, user, args)
+    assert appliance.assigned_dns_group_id == plain.id
