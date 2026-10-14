@@ -84,6 +84,33 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Technitium: an hmac-sha224 TSIG key is refused instead of being
+  installed and failing every signed transfer (#1858).** Technitium has
+  no HMAC-SHA224 (`DnsDatagram.GetTsigMacSize` returns 0 for it), so a
+  sha224 key was accepted, installed, pinned on the zones, and every
+  AXFR signed with it answered BADKEY. Creating or changing a key to
+  hmac-sha224 on a `technitium` / `technitium_api` group is now a 422
+  naming the algorithm, as is putting a Technitium server (create,
+  driver change, move, Fleet or Copilot role assignment) into a group
+  that holds one, or moving a zone that uses one into such a group.
+  The zone-move preview reports that refusal, so the Move button is
+  blocked rather than failing on commit. The agent no longer installs or
+  pins a sha224 key already stored and reports it as an apply failure
+  (the `agent_config_rejected` alert fires on it). BIND9 and PowerDNS support all five
+  algorithms, Windows and the cloud drivers use no group TSIG keys, so
+  there was no other gap.
+
+- **DigitalOcean, Linode and Vultr: deleting a zone already absent at
+  the provider is done, not an error (#1889).** The three drivers were
+  left out of #1537, so a zone removed out of band at the provider could
+  never leave the Trash: the retention sweep and "Delete permanently"
+  both failed on the provider's not-found answer. The provider's
+  documented not-found answer on the zone delete now counts as success:
+  DigitalOcean HTTP 404 with `{"id": "not_found"}`, Linode HTTP 404 with
+  its `errors` envelope (or a domain absent from its account's filtered
+  domain list), Vultr HTTP 404. A 404 without that shape, auth,
+  throttling and 5xx still fail.
+
 - **The appliance's Celery worker and beat run in appliance mode
   (#1826).** `APPLIANCE_MODE` was set only on the api container, so the
   worker, which runs alert evaluation and the rolling-upgrade

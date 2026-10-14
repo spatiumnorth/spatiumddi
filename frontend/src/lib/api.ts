@@ -4974,6 +4974,10 @@ export interface ZoneMovePreview {
   /** #1784 — why the experimental technitium_api target refuses this zone.
    *  Non-null means the commit refuses — not waivable by acknowledgement. */
   technitium_api_refusal?: string | null;
+  /** #1858 — a TSIG key the zone uses has, in the target group, an
+   *  algorithm a target driver cannot use (Technitium has no hmac-sha224).
+   *  Non-null means the commit refuses — not waivable by acknowledgement. */
+  tsig_algorithm_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
