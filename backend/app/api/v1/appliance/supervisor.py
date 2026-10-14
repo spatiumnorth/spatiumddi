@@ -112,6 +112,10 @@ from app.services.appliance.ca import (
     sign_supervisor_cert,
     verify_session_token,
 )
+from app.services.appliance.cluster_dns_group import (
+    cluster_dns_group_refusal,
+    promote_dns_group_refusal,
+)
 from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.group_names import group_name_problem
 from app.services.appliance.lldp import lldp_bundle
@@ -2929,7 +2933,14 @@ async def supervisor_heartbeat(
         firewall_settings=firewall_block,
         removable_settings=removable_bundle_safe(row.desired_removable_mounts),
         long_poll=long_poll,
-        shared_chart_hold=await upgrade_shared_tags.heartbeat_hold(db, row.hostname),
+        # Only a settled member shares the charts: a node demoted out of the
+        # cluster after a failed run runs its own, and must not defer to a
+        # hold on charts it no longer reads.
+        shared_chart_hold=(
+            await upgrade_shared_tags.heartbeat_hold(db, row.hostname)
+            if row.cluster_role in (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+            else None
+        ),
     )
 
 
@@ -4373,7 +4384,7 @@ async def update_appliance_roles(
 
     # #1427 — a control-plane cluster serves one DNS server group; refused
     # before anything below changes the row or moves a server.
-    refusal = await _cluster_dns_group_refusal(
+    refusal = await cluster_dns_group_refusal(
         db,
         row,
         roles=list(body.roles) if body.roles is not None else list(row.assigned_roles or []),
@@ -4661,65 +4672,6 @@ async def _effective_cp_members(db: DB) -> list[Appliance]:
     return [r for r in rows if r.desired_cluster_role != DESIRED_CLUSTER_ROLE_NONE]
 
 
-async def _cluster_dns_group_refusal(
-    db: DB,
-    row: Appliance,
-    *,
-    roles: list[str],
-    group_id: uuid.UUID | None,
-    prev_roles: set[str],
-    prev_group_id: uuid.UUID | None,
-) -> str | None:
-    """Why ``row`` may not run DNS in ``group_id`` with ``roles``, or None
-    (#1427).
-
-    A control-plane cluster has ONE ``spatiumddi-appliance`` chart and so ONE
-    DNS agent group (``dnsBind9.serverGroupName``; the PowerDNS and Technitium
-    blocks carry the same value), set by whichever member holding a DNS role
-    wrote the chart last: with members in two groups, every DNS agent of the
-    cluster served the group of the last writer. So a member (or a joiner)
-    may run DNS only in the group the cluster's other DNS members are in.
-    Refused on a change only (gaining a DNS role, or a new group), so
-    re-saving what is there never is; dropping DNS never is; an appliance
-    outside the cluster has its own chart.
-    """
-    if group_id is None or not _DNS_ROLES.intersection(roles):
-        return None
-    if _DNS_ROLES.intersection(prev_roles) and group_id == prev_group_id:
-        return None
-    members = await _effective_cp_members(db)
-    if all(m.id != row.id for m in members):
-        return None
-    others = {
-        m.assigned_dns_group_id
-        for m in members
-        if m.id != row.id
-        and m.assigned_dns_group_id is not None
-        and _DNS_ROLES.intersection(m.assigned_roles or [])
-    }
-    if not others or others == {group_id}:
-        return None
-    from app.models.dns import DNSServerGroup
-
-    names = {
-        g.id: g.name
-        for g in (
-            await db.execute(
-                select(DNSServerGroup).where(DNSServerGroup.id.in_(others | {group_id}))
-            )
-        ).scalars()
-    }
-    if group_id not in names:
-        return None  # an unknown group: the existence check answers it
-    cluster = " and ".join(sorted(repr(names.get(g, str(g))) for g in others))
-    return (
-        f"Appliance {row.hostname!r} is a member of the control-plane cluster, and a "
-        f"cluster serves one DNS server group: its other DNS members are in {cluster}. "
-        f"It cannot run DNS in {names[group_id]!r}. Assign {cluster}, or take DNS off "
-        "the other members first."
-    )
-
-
 async def _committed_cp_count(db: DB) -> int:
     """Count of SETTLED control-plane nodes (``cluster_role`` in
     primary/member), floored at 1 (#277).
@@ -5002,6 +4954,13 @@ async def promote_control_plane(
                 "a k3s control-plane cluster — only OS-appliance nodes can.",
             )
         targets.append(row)
+
+    # #1427 — a cluster serves one DNS server group: a joiner running DNS in
+    # another group would flip every DNS agent of the cluster to whichever
+    # member wrote the shared chart last.
+    dns_refusal = await promote_dns_group_refusal(db, members, targets)
+    if dns_refusal is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, dns_refusal)
 
     new_total = current_count + len(targets)
     if new_total % 2 == 0:
