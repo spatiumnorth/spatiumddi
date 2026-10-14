@@ -84,6 +84,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A power loss right after a slot apply no longer freezes the node's
+  Fleet row (#1747).** The slot-upgrade runners wrote their state and
+  progress sidecars with a plain redirect and no fsync, so a power loss
+  right after "apply succeeded" could leave `slot-upgrade.log` or a
+  sidecar ending in, or made of, NUL bytes. The supervisor sends the log
+  tail on every heartbeat, Postgres refuses a NUL in a text value, and the
+  api answered 422 to every heartbeat from that node until someone edited
+  the file by hand.
+  - The supervisor strips NUL and other control characters from the log
+    tail and the progress sidecar, and strips NUL from every string in
+    the heartbeat body before sending it, so a NUL in any other field
+    read off a host file cannot freeze the row either.
+  - A NUL-filled, empty or truncated state or progress file reads as
+    unknown. Clearing a failed upgrade, and the passive heal when no
+    upgrade is desired, reset an unreadable state to `ready` the way they
+    already reset `failed`.
+  - The host runners (`spatiumddi-slot-upgrade`, `-slot-set-next-boot`,
+    `-slot-set-default`, `-slot-rollback`, `spatium-upgrade-slot`) write
+    their sidecars to a temp file, fsync it, rename it over the target
+    and fsync the directory. The main runner also fsyncs the log after
+    the apply and, on every exit, the log and the trigger's terminal
+    rename.
+
 - **A subnet wider than a /24 now gets a reverse zone for every /24 it
   spans, so every address gets its PTR (#1840).** A /17–/23 was given
   the zone of the /24 holding its network address, so in a /23 every
