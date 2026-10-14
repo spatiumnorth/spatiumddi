@@ -151,6 +151,24 @@ async def get_run(db: AsyncSession, run_id: uuid.UUID) -> SystemUpgradeRun:
     return row
 
 
+async def _get_run_locked(db: AsyncSession, run_id: uuid.UUID) -> SystemUpgradeRun:
+    """The run, re-read and row-locked (``FOR UPDATE``) until the caller
+    commits. Halt, Resume and Abort take it so they serialise with a drive's
+    :func:`_fence`: an operator's change lands wholly before or wholly after
+    the drive's next write, never between its check and the write (#1702)."""
+    row = (
+        await db.execute(
+            select(SystemUpgradeRun)
+            .where(SystemUpgradeRun.id == run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise OrchestratorError(f"upgrade run {run_id} not found")
+    return row
+
+
 async def list_recent_runs(db: AsyncSession, *, limit: int = 25) -> list[SystemUpgradeRun]:
     """Most-recent-first list for the Fleet UI's history pane."""
     stmt = select(SystemUpgradeRun).order_by(SystemUpgradeRun.started_at.desc()).limit(limit)
@@ -398,7 +416,7 @@ async def halt_upgrade(
     """Operator-initiated pause. Survives across orchestrator restarts —
     the next drive loop iteration sees state=halted + exits cleanly.
     """
-    run = await get_run(db, run_id)
+    run = await _get_run_locked(db, run_id)
     await _transition(
         db,
         run,
@@ -425,7 +443,7 @@ async def resume_upgrade(
     """Operator-initiated resume from halt. Flips the row state but
     DOESN'T re-enqueue the celery task — the api endpoint handler does
     that after this call returns ok."""
-    run = await get_run(db, run_id)
+    run = await _get_run_locked(db, run_id)
     await _transition(
         db,
         run,
@@ -454,7 +472,7 @@ async def abort_upgrade(
     (some may be on the new slot, others on the old). Operator owns
     cleanup from here.
     """
-    run = await get_run(db, run_id)
+    run = await _get_run_locked(db, run_id)
     await _transition(
         db,
         run,
@@ -506,6 +524,78 @@ def _enqueue_continuation(run_id: uuid.UUID, *, avoid_version: str) -> None:
     from app.tasks.upgrade_orchestrator import drive_upgrade_run  # noqa: PLC0415
 
     drive_upgrade_run.apply_async(args=[str(run_id)], kwargs={"avoid_version": avoid_version})
+
+
+async def _fence(
+    db: AsyncSession,
+    run: SystemUpgradeRun,
+    holder: str | None,
+    *,
+    carry: tuple[str, ...] = (),
+) -> str | None:
+    """Re-read the run under ``FOR UPDATE`` and say whether this drive may
+    still write it: None if so, else why not (#1702, #1704, #1707).
+
+    The drive holds its own copy of the row for the whole of a node (the
+    session keeps objects past a commit), so what it writes back is stale
+    the moment an operator halts or aborts, or a second drive takes over.
+    Only the current holder of a ``running`` run writes its terminal state.
+    The lock is held until the caller commits (or :func:`_bail` does), and
+    Halt, Resume and Abort take the same lock, so nothing lands between the
+    check and the write. ``carry`` names ``progress`` keys this drive set in
+    memory that the re-read must not discard."""
+    carried = {k: run.progress[k] for k in carry if k in (run.progress or {})}
+    fresh = (
+        await db.execute(
+            select(SystemUpgradeRun)
+            .where(SystemUpgradeRun.id == run.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if fresh is None:
+        return "gone"
+    if fresh.state != "running":
+        return str(fresh.state)
+    if holder and fresh.lease_holder not in (None, holder):
+        return "lease_lost"
+    if carried:
+        fresh.progress = {**fresh.progress, **carried}
+    return None
+
+
+async def _bail(db: AsyncSession, run: SystemUpgradeRun, holder: str | None, why: str) -> None:
+    """Leave a run this drive may no longer write: end the fence's lock, and
+    give up this drive's own Lease unless a second drive has it. The run row
+    is the operator's (or the other drive's) and is left exactly as it is."""
+    await db.commit()
+    logger.info("upgrade_drive_exit_fenced", run_id=str(run.id), why=why)
+    if why != "lease_lost":
+        _release_lease(run, holder)
+
+
+async def _record_node_after_stop(
+    db: AsyncSession,
+    run: SystemUpgradeRun,
+    node: str,
+    entry: dict[str, Any],
+    state: str,
+) -> None:
+    """A node ended after the operator had halted or aborted the run: keep
+    what happened to it in ``progress.per_node`` and the events, but leave
+    the operator's state alone (#1702). A halted run resumes from here."""
+    per_node_progress = dict((run.progress or {}).get("per_node") or {})
+    per_node_progress[node] = entry
+    run.progress = {**run.progress, "per_node": per_node_progress}
+    await _record_event(
+        db,
+        run,
+        "node_ended_after_stop",
+        node=node,
+        ok=entry.get("ok"),
+        failed_at=entry.get("failed_at"),
+        run_state=state,
+    )
 
 
 async def _lease_renewal_loop(stop_event: asyncio.Event, holder: str) -> None:
@@ -734,6 +824,10 @@ async def _drive_loop(
                 chart_namespace=chart_ns,
                 release_namespace=release_ns,
             )
+            why = await _fence(db, run, holder)
+            if why is not None:
+                await _bail(db, run, holder, why)
+                return
             run.progress = {
                 **run.progress,
                 "chart_bump": chart_bump.result_to_dict(bump),
@@ -789,6 +883,10 @@ async def _drive_loop(
                 cnpg_namespace=cnpg_namespace,
             )
             verify_overall = safety.verification_overall(verify_results)
+            why = await _fence(db, run, holder, carry=("chart_bump",))
+            if why is not None:
+                await _bail(db, run, holder, why)
+                return
             run.progress = {
                 **run.progress,
                 "post_upgrade_verify": {
@@ -903,6 +1001,19 @@ async def _drive_loop(
                 for s in result.steps
             ],
         }
+        # The node took minutes to hours; the row this drive holds is as it
+        # was at the loop top. Re-read it, and write the node's outcome only
+        # if the run is still this drive's and still running (#1702, #1704).
+        why = await _fence(db, run, holder)
+        if why is not None:
+            if why in ("halted", "aborted"):
+                await _record_node_after_stop(db, run, next_node, per_node_progress[next_node], why)
+            await _bail(db, run, holder, why)
+            return
+        per_node_progress = {
+            **dict(run.progress.get("per_node") or {}),
+            next_node: per_node_progress[next_node],
+        }
         run.progress = {**run.progress, "per_node": per_node_progress}
 
         if not result.ok:
@@ -1002,6 +1113,10 @@ async def _fail_at_shared_tags(
     The hold is left as it is: nodes on two versions are what it protects,
     and the next run's Start (or the beat task, once every node reports one
     version) takes it from here."""
+    why = await _fence(db, run, holder, carry=(shared_tags.PROGRESS_KEY,))
+    if why is not None:
+        await _bail(db, run, holder, why)
+        return
     run.last_error = error
     category = upgrade_alerts.classify_per_node_failure(failed_at=failed_at_step, error=error)
     await upgrade_alerts.emit_upgrade_failed_alert(
@@ -1090,6 +1205,11 @@ async def _finish_with_flip(
         return
 
     settled = await shared_tags.settle(db, run)
+    # The settle wait is long: the run may have been stopped meanwhile.
+    why = await _fence(db, run, holder, carry=(shared_tags.PROGRESS_KEY,))
+    if why is not None:
+        await _bail(db, run, holder, why)
+        return
     await db.commit()
     if not settled.ok:
         await _fail_at_shared_tags(
@@ -1107,6 +1227,10 @@ async def _finish_with_flip(
         cnpg_namespace=cnpg_namespace,
     )
     verify_overall = safety.verification_overall(verify_results)
+    why = await _fence(db, run, holder)
+    if why is not None:
+        await _bail(db, run, holder, why)
+        return
     run.progress = {
         **run.progress,
         "post_upgrade_verify": {
