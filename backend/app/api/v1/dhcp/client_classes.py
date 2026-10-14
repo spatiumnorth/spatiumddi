@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
@@ -112,7 +112,7 @@ async def list_classes(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCP
     status_code=status.HTTP_201_CREATED,
 )
 async def create_class(
-    group_id: uuid.UUID, body: ClientClassCreate, db: DB, user: SuperAdmin
+    group_id: uuid.UUID, body: ClientClassCreate, db: DB, user: CurrentUser
 ) -> DHCPClientClass:
     grp = await db.get(DHCPServerGroup, group_id)
     if grp is None:
@@ -148,7 +148,7 @@ async def create_class(
 
 @router.put("/client-classes/{class_id}", response_model=ClientClassResponse)
 async def update_class(
-    class_id: uuid.UUID, body: ClientClassUpdate, db: DB, user: SuperAdmin
+    class_id: uuid.UUID, body: ClientClassUpdate, db: DB, user: CurrentUser
 ) -> DHCPClientClass:
     cc = await db.get(DHCPClientClass, class_id)
     if cc is None:
@@ -194,7 +194,7 @@ async def update_class(
 
 
 @router.delete("/client-classes/{class_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_class(class_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_class(class_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     cc = await db.get(DHCPClientClass, class_id)
     if cc is None:
         raise HTTPException(status_code=404, detail="Client class not found")

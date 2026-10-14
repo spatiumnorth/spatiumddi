@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.celery_app import celery_app
 from app.config import settings
 from app.core.versions import includes_release, parse_release
+from app.db import task_connect_args
 from app.models.settings import PlatformSettings
 
 logger = structlog.get_logger(__name__)
@@ -68,7 +69,9 @@ def _is_newer(latest: str, running: str) -> bool:
 
 
 async def _run_check() -> dict[str, Any]:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:

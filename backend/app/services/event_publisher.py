@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.config import settings as _app_settings
+from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services.after_commit_dispatch import dispatch
@@ -295,6 +296,7 @@ async def _ephemeral_session() -> AsyncIterator[AsyncSession]:
         _app_settings.database_url,
         poolclass=NullPool,
         echo=False,
+        connect_args=task_connect_args(),
     )
     try:
         async with AsyncSession(engine, expire_on_commit=False) as session:
