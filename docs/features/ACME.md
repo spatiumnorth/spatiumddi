@@ -466,9 +466,14 @@ cloud-hosted DNS-01 layer on top of it (Phases 3–4 below).
    `spatium-appliance-tls` Secret, so it publishes a Redis wake and the
    **api** deploys the active cert (`sync_active_cert_to_secret`, with a
    60 s periodic reconcile as the safety net for a missed wake, and an
-   advisory lock so one replica patches). The DB is the source of
-   truth; the `secret_expiring` alert judges the cert actually served
-   and says so when the stored one is not deployed (#1895).
+   advisory lock so one replica patches). The active row is the source
+   of truth, as it has always been at api start: a certificate written
+   into the Secret by hand is replaced within a minute, so set one
+   through the Web UI Certificate tab instead. The api publishes what
+   the Secret holds to Redis on each tick, and the `secret_expiring`
+   alert (evaluated in the worker, which cannot read the Secret) judges
+   that served certificate, saying so when the stored one is not
+   deployed (#1895).
 7. The challenge TXT records are **always** torn down in a `finally`
    block (each cleanup on a fresh session), so a failed issuance
    doesn't leave zone noise behind.

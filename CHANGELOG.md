@@ -91,10 +91,16 @@ the formatter handles the rest.
   the database and the old one kept being served. The worker now wakes
   the api over Redis after committing, and the api deploys the active
   certificate (also on a 60 s reconcile tick, under an advisory lock, and
-  only when the Secret differs). The worker no longer attempts the patch
-  or logs `appliance_cert_secret_patch_failed` on every renewal, and the
-  `secret_expiring` alert judges the certificate actually served,
-  flagging when the stored one is not deployed.
+  only when the Secret differs; a frontend roll that fails after the
+  Secret was patched is retried rather than read as converged). The
+  worker no longer attempts the patch or logs
+  `appliance_cert_secret_patch_failed` on every renewal, and the
+  `secret_expiring` alert judges the certificate actually served (from a
+  snapshot the api publishes, since the worker cannot read the Secret),
+  flagging when the stored one is not deployed. The active certificate
+  was always redeployed over a differing Secret at api start; that is
+  now continuous, so a certificate written into the Secret by hand is
+  replaced within a minute.
 - **Drift no longer lists a stored apex NS as missing on the server
   (#1857).** The zone-transfer read drops the apex NS set, so a stored
   apex NS row, such as the copy of the source's `@ NS` a Technitium or

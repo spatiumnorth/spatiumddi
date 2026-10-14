@@ -3343,28 +3343,19 @@ async def _matching_secret_expiring_subjects(
 async def _served_web_cert_expiry() -> tuple[Any, str | None]:
     """``(not_after, sha256 fingerprint)`` of the cert in the TLS Secret.
 
-    ``(None, None)`` off the appliance or when the Secret is unreadable, so
-    the caller falls back to the stored row.
+    Read from the snapshot the api publishes on every deploy tick, not
+    from kubeapi: this rule is evaluated in the Celery worker, whose
+    ServiceAccount cannot read the Secret (#983 / #1445), and reading it
+    directly would make the api's "Evaluate now" and the worker's sweep
+    judge different certificates and flap the event. ``(None, None)``
+    when there is no fresh snapshot, so the caller falls back to the
+    stored row.
     """
-    import asyncio  # noqa: PLC0415
+    from app.services.appliance.bootstrap import (  # noqa: PLC0415
+        read_served_cert_snapshot,
+    )
 
-    from app.config import settings  # noqa: PLC0415
-    from app.services.appliance.deployment import read_deployed_cert  # noqa: PLC0415
-    from app.services.appliance.tls import (
-        TLSValidationError,
-        parse_pem_certificate,
-    )  # noqa: PLC0415
-
-    if not settings.appliance_mode:
-        return None, None
-    try:
-        deployed = await asyncio.to_thread(read_deployed_cert)
-        if deployed is None:
-            return None, None
-        info = parse_pem_certificate(deployed[0])
-    except (TLSValidationError, OSError):
-        return None, None
-    return info.valid_to, info.fingerprint_sha256
+    return await read_served_cert_snapshot()
 
 
 async def _cluster_health_snapshot() -> dict[str, Any] | None:

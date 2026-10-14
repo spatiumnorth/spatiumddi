@@ -12,8 +12,9 @@ Drives one :class:`~app.models.acme_client.ACMEOrder` from ``pending`` to
 5. generate a fresh cert key + CSR, finalize the order, poll to
    ``valid``, download the full PEM chain;
 6. land the chain in an :class:`~app.models.appliance.ApplianceCertificate`
-   row (``source="letsencrypt"``), make it the sole active cert, deploy
-   it to nginx (tolerating deploy failure);
+   row (``source="letsencrypt"``), make it the sole active cert, and wake
+   the api to deploy it to nginx (#1895 — the worker cannot patch the
+   TLS Secret);
 7. ALWAYS clean up every challenge TXT in a ``finally`` block.
 
 The whole thing is idempotent + re-runnable: a re-run from any state
@@ -426,8 +427,8 @@ async def _store_certificate(
 
     Idempotent on the order's stable name: a re-run for the same order
     updates the existing row in place rather than colliding on the
-    unique ``name``. The row is made the sole active cert and deployed
-    to nginx (deploy failure logged, never raised).
+    unique ``name``. The row is made the sole active cert; the api deploys
+    it to nginx on the wake published here (#1895).
     """
     info = parse_pem_certificate(chain_pem)
     name = f"letsencrypt-{order.id}"

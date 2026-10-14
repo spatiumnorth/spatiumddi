@@ -49,7 +49,12 @@ from app.models.appliance import (
     CERT_SOURCE_UPLOADED,
     ApplianceCertificate,
 )
-from app.services.appliance.deployment import deploy_and_reload, read_deployed_cert
+from app.services.appliance.deployment import (
+    deploy_active_cert,
+    deploy_and_reload,
+    read_deployed_cert,
+    reload_frontend_nginx,
+)
 from app.services.appliance.tls import (
     TLSValidationError,
     _format_fingerprint,
@@ -360,7 +365,89 @@ async def _generate_activate_deploy(
 _CERT_RECONCILE_LOCK_KEY = 0x5350433727  # "SPC7c"-ish
 
 
-_CERT_DEPLOY_LOCK_KEY = 0x5350433A31383935  # "SPC:1895"
+# Where the api records the certificate the TLS Secret holds, for the
+# ``secret_expiring`` alert (#1895). The alert is evaluated in the Celery
+# worker, whose ServiceAccount cannot read the Secret (#983 / #1445), so
+# the api — which reads it on every deploy tick anyway — publishes what it
+# saw here. The TTL makes a snapshot nobody refreshes (api down) expire
+# rather than describe the past; the alert then falls back to the stored
+# row, which is what it judged before #1895.
+SERVED_CERT_SNAPSHOT_KEY = "spatium:appliance:served-cert"
+_SERVED_CERT_SNAPSHOT_TTL = 300
+
+# Set by the replica whose Secret PATCH landed but whose frontend roll did
+# not. The next tick then sees the Secret in sync with the DB and would
+# otherwise never roll, leaving nginx on the previous certificate until
+# the pod happened to restart — while the pins list (#1219) and the alert
+# snapshot both already name the new one. Per process on purpose: only
+# the replica that wrote the Secret knows its roll failed.
+_frontend_roll_pending = False
+
+
+async def _write_served_cert_snapshot(cert_pem: str) -> None:
+    """Publish the served cert's fingerprint + expiry. Best-effort."""
+    import json  # noqa: PLC0415
+
+    from app.core.redis_client import make_async_redis  # noqa: PLC0415
+
+    try:
+        info = parse_pem_certificate(cert_pem)
+    except TLSValidationError:
+        return
+    payload = json.dumps(
+        {
+            "fingerprint_sha256": info.fingerprint_sha256,
+            "valid_to": info.valid_to.isoformat() if info.valid_to else None,
+        }
+    )
+    client = None
+    try:
+        client = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        await client.set(SERVED_CERT_SNAPSHOT_KEY, payload, ex=_SERVED_CERT_SNAPSHOT_TTL)
+    except Exception as exc:  # noqa: BLE001 — advisory; the alert falls back
+        logger.warning("appliance_served_cert_snapshot_failed", error=str(exc))
+    finally:
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def read_served_cert_snapshot() -> tuple[_dt.datetime | None, str | None]:
+    """``(valid_to, sha256 fingerprint)`` of the cert the api last saw in
+    the TLS Secret, or ``(None, None)`` when there is no fresh snapshot
+    (not an appliance, api not running, Redis unreachable).
+
+    Readable from any process — the worker included — which is the point:
+    the worker cannot read the Secret itself.
+    """
+    import json  # noqa: PLC0415
+
+    from app.core.redis_client import make_async_redis  # noqa: PLC0415
+
+    client = None
+    try:
+        client = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        raw = await client.get(SERVED_CERT_SNAPSHOT_KEY)
+    except Exception as exc:  # noqa: BLE001 — unknown, fall back to the row
+        logger.info("appliance_served_cert_snapshot_unreadable", error=str(exc))
+        return None, None
+    finally:
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+    if not raw:
+        return None, None
+    try:
+        data = json.loads(raw)
+        valid_to = _dt.datetime.fromisoformat(data["valid_to"]) if data.get("valid_to") else None
+        fingerprint = data.get("fingerprint_sha256") or None
+    except (ValueError, TypeError, KeyError):
+        return None, None
+    return valid_to, fingerprint
 
 
 async def sync_active_cert_to_secret() -> dict[str, object]:
@@ -371,19 +458,32 @@ async def sync_active_cert_to_secret() -> dict[str, object]:
     the worker commits the row and wakes the api, which calls this. Also
     run on a periodic tick, so a missed wake only delays the deploy.
 
+    The active row is the source of truth, exactly as for the startup
+    bootstrap's Path A (which has always overwritten a Secret that differs
+    from it); this makes that reconcile continuous instead of once per api
+    start. A cert set by hand in the Secret is therefore replaced within a
+    tick — upload it through the Web UI Certificate tab instead.
+
     Idempotent: when the Secret already holds exactly the active cert + key
-    nothing is written and the frontend is not rolled. A per-transaction
-    advisory lock keeps N api replicas to one patch.
+    nothing is written and the frontend is not rolled. It shares the
+    advisory lock of ``reconcile_cluster_cert_sans`` (held for the whole
+    read-compare-patch), so N api replicas make one patch, and the SAN
+    reconcile cannot commit a regenerated cert between this reading the
+    active row and patching it.
     """
+    global _frontend_roll_pending
+
     if not settings.appliance_mode:
         return {"status": "disabled"}
 
     from sqlalchemy import text  # noqa: PLC0415
 
     async with AsyncSessionLocal() as db:
+        # Transaction-scoped: held until this session's transaction ends,
+        # i.e. across the kubeapi calls below.
         got = (
             await db.execute(
-                text("select pg_try_advisory_xact_lock(:k)"), {"k": _CERT_DEPLOY_LOCK_KEY}
+                text("select pg_try_advisory_xact_lock(:k)"), {"k": _CERT_RECONCILE_LOCK_KEY}
             )
         ).scalar()
         if not got:
@@ -409,12 +509,26 @@ async def sync_active_cert_to_secret() -> dict[str, object]:
 
         # Blocking kubeapi round-trips: off the event loop (non-negotiable #2).
         deployed = await asyncio.to_thread(read_deployed_cert)
+        if deployed is not None:
+            await _write_served_cert_snapshot(deployed[0])
         if deployed == (cert_pem, key_pem):
-            return {"status": "in-sync"}
-        ok = await asyncio.to_thread(deploy_and_reload, cert_pem, key_pem, name=name)
-        if ok:
-            logger.info("appliance_active_cert_synced", cert_id=str(active_row.id), name=name)
-        return {"status": "deployed" if ok else "deploy-failed"}
+            if not _frontend_roll_pending:
+                return {"status": "in-sync"}
+            # The Secret is right but the frontend never rolled onto it.
+            if await asyncio.to_thread(reload_frontend_nginx):
+                _frontend_roll_pending = False
+                return {"status": "rolled"}
+            return {"status": "roll-failed"}
+
+        if not await asyncio.to_thread(deploy_active_cert, cert_pem, key_pem, name=name):
+            return {"status": "deploy-failed"}
+        await _write_served_cert_snapshot(cert_pem)
+        if not await asyncio.to_thread(reload_frontend_nginx):
+            _frontend_roll_pending = True
+            return {"status": "roll-failed"}
+        _frontend_roll_pending = False
+        logger.info("appliance_active_cert_synced", cert_id=str(active_row.id), name=name)
+        return {"status": "deployed"}
 
 
 async def reconcile_cluster_cert_sans() -> dict[str, object]:
