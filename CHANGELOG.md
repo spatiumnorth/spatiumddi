@@ -84,6 +84,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Technitium: an hmac-sha224 TSIG key is refused instead of being
+  installed and failing every signed transfer (#1858).** Technitium has
+  no HMAC-SHA224 (`DnsDatagram.GetTsigMacSize` returns 0 for it), so a
+  sha224 key was accepted, installed, pinned on the zones, and every
+  AXFR signed with it answered BADKEY. Creating or changing a key to
+  hmac-sha224 on a `technitium` / `technitium_api` group is now a 422
+  naming the algorithm, as is putting a Technitium server (create,
+  driver change, move, Fleet or Copilot role assignment) into a group
+  that holds one, or moving a zone that uses one into such a group.
+  The agent no longer installs or pins a sha224 key already stored and
+  reports it as an apply failure. BIND9 and PowerDNS support all five
+  algorithms, Windows and the cloud drivers use no group TSIG keys, so
+  there was no other gap.
+
 - **DigitalOcean, Linode and Vultr: deleting a zone already absent at
   the provider is done, not an error (#1889).** The three drivers were
   left out of #1537, so a zone removed out of band at the provider could

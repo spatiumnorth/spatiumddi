@@ -56,6 +56,7 @@ from app.services.dns import technitium_api_scope
 from app.services.dns.dnssec_signers import second_signer_refusal
 from app.services.dns.record_ops import QUEUED_OP_STATES
 from app.services.dns.tsig import ensure_group_tsig_key
+from app.services.dns.tsig_algorithms import group_key_refusal
 
 logger = structlog.get_logger(__name__)
 
@@ -172,6 +173,10 @@ async def ensure_group_single_driver(
             f"{driver!r}. A server group is single-driver — {hint}",
             status_code=422,
         )
+    # #1858 — a Technitium server cannot use an hmac-sha224 key the group
+    # already holds; joining would install it and fail every signed transfer.
+    if refusal := await group_key_refusal(db, group_id, {driver}):
+        raise ServerMoveError(f"Group {group_name!r}: {refusal}", status_code=422)
     # #1784 — the experimental agentless Technitium driver supports ONE
     # server per group. Enforced on every path that puts a server in a group
     # (create, driver change, move) because they all come through here.

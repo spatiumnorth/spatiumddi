@@ -3816,8 +3816,14 @@ async def _assign_role_catalog_problem(
     if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
         return None
     group = await db.get(DNSServerGroup, group_id)
-    if group is None or not group.catalog_zones_enabled:
+    if group is None:
         return None
+    if not group.catalog_zones_enabled:
+        # #1858 — same refusal as the REST route: a key Technitium cannot use.
+        from app.services.dns.tsig_algorithms import group_key_refusal  # noqa: PLC0415
+
+        key_problem = await group_key_refusal(db, group.id, {"technitium"})
+        return f"DNS server group {group.name!r}: {key_problem}" if key_problem else None
     return f"DNS server group {group.name!r} has catalog zones enabled. " + (
         catalog_unsupported_message({"technitium"})
     )

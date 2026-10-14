@@ -172,6 +172,7 @@ from app.services.dns.tld_registry import (
     store_snapshot,
 )
 from app.services.dns.tsig import group_key_names, rotate_group_tsig_key
+from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
@@ -4406,6 +4407,10 @@ async def create_tsig_key(
 ) -> TSIGKeyResponse:
     """Create a TSIG key. Secret is returned in the response *exactly once*."""
     await _require_group(group_id, db)
+    # #1858 — an algorithm a driver in the group cannot use is refused, not
+    # installed and left to fail every signed transfer with BADKEY.
+    if refusal := tsig_key_refusal(body.algorithm, await _group_driver_names(db, group_id)):
+        raise HTTPException(status_code=422, detail=refusal)
     existing = await db.execute(
         select(DNSTSIGKey).where(DNSTSIGKey.group_id == group_id, DNSTSIGKey.name == body.name)
     )
@@ -4470,6 +4475,14 @@ async def update_tsig_key(
     if key is None or key.group_id != group_id:
         raise HTTPException(status_code=404, detail="TSIG key not found")
     changes = body.model_dump(exclude_unset=True)
+    # #1858 — only a CHANGE of algorithm is refused: re-saving a key the group
+    # already holds (the form posts every field) must keep working.
+    new_algo = changes.get("algorithm")
+    if new_algo and new_algo != key.algorithm:
+        if refusal := tsig_key_refusal(
+            new_algo, await _group_driver_names(db, group_id), key=key.name
+        ):
+            raise HTTPException(status_code=422, detail=refusal)
     if changes.get("name") and changes["name"] != key.name:
         clash = await db.execute(
             select(DNSTSIGKey).where(
