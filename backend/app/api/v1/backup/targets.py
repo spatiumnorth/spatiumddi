@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import attributes
 
 from app.api.deps import DB, CurrentUser
+from app.config import settings
 from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
@@ -696,11 +697,29 @@ class ArchiveListingResponse(BaseModel):
     filename: str
     size_bytes: int
     created_at: datetime
+    # The node whose disk holds the archive (node-local ``local_volume``
+    # on the appliance, #1838); null for network destinations.
+    node_name: str | None = None
+
+
+def _node_local_listing_note(row: BackupTarget, archives: list[Any]) -> str | None:
+    node = next((a.node_name for a in archives if a.node_name), None)
+    if row.kind != "local_volume" or not (node or settings.node_name):
+        return None
+    node = node or settings.node_name
+    note = (
+        f"Listing is node {node} only: a local volume is per node on a multi-node "
+        "appliance, so archives written by other nodes are not shown"
+    )
+    last = row.last_run_filename
+    if row.last_run_status == "success" and last and all(a.filename != last for a in archives):
+        note += f"; the last run's archive {last} is held by another node, not missing"
+    return note
 
 
 @router.get("/{target_id}/archives", response_model=list[ArchiveListingResponse])
 async def list_target_archives(
-    target_id: uuid.UUID, db: DB, current_user: CurrentUser
+    target_id: uuid.UUID, db: DB, current_user: CurrentUser, response: Response
 ) -> list[ArchiveListingResponse]:
     """List archives stored at this target, newest-first."""
     _require_superadmin(current_user)
@@ -717,11 +736,18 @@ async def list_target_archives(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # #1838 — a node-local listing is one node's view, and says so rather
+    # than reading as the complete list. When the last successful run's
+    # archive is not in it, it is on another node, not missing.
+    note = _node_local_listing_note(row, archives)
+    if note:
+        response.headers["X-Archive-Listing-Note"] = note
     return [
         ArchiveListingResponse(
             filename=a.filename,
             size_bytes=a.size_bytes,
             created_at=a.created_at,
+            node_name=a.node_name,
         )
         for a in archives
     ]
@@ -971,7 +997,6 @@ async def restore_from_archive(
     # Reuse the Phase 1a restore path so the safety dump +
     # passphrase verify + psql replay + post-replay audit row all
     # behave the same as the upload-based restore.
-    from app.config import settings  # noqa: PLC0415
     from app.services.backup import (  # noqa: PLC0415
         BackupArchiveError,
         BackupCryptoError,

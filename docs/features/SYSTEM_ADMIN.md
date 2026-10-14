@@ -486,6 +486,17 @@ where it is reachable — `s3` (a key without `DeleteObject`) and `https_put`
 destination that grants write but not unlink is not a configuration those
 protocols really produce.
 
+#### `local_volume` on a multi-node appliance (#1838)
+
+The default `/var/lib/spatiumddi/backups` is a hostPath, so it is **per node**:
+an archive stays on the disk of the node whose pod wrote it (the pod name is in
+the file name), and only the api replica on that node can list, download, restore
+or drill it. A request served by another node answers 502 with the node name and
+the reason; nothing is lost or restored. The archive list header
+`X-Archive-Listing-Note` and the per-archive `node_name` say which node a listing
+describes, and Test connection warns. Losing a node loses its archives, so on a
+cluster use a network destination (S3, SCP, SMB, NFS).
+
 #### Removable (USB) disks on the appliance
 
 The single-appliance operator with no NAS and no cloud account backs up to a USB

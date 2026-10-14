@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A `local_volume` backup on a multi-node appliance is per node, and now
+  says so (#1838).** The default backups hostPath is node-local, so a
+  restore, download or drill served by another node's api answered a bare
+  "archive not found" 502, and the archive list depended on which replica
+  answered. The miss now names the answering node and the remedy (retry on
+  the node that wrote it, or use S3/SCP/SMB/NFS), Test connection warns,
+  the path help says it, listings carry `node_name` plus an
+  `X-Archive-Listing-Note` header saying the last run's archive is held by
+  another node rather than missing. Not moved off-node: a cluster-wide
+  store is still a network destination.
 - **The built-in Auditor and Compliance Editor could not read the
   audit log (#1862).** Both roles were granted `read` on `audit`, a
   resource type no route checks, while every audit-log route (the

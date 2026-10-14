@@ -142,6 +142,10 @@ class ArchiveListing:
     filename: str
     size_bytes: int
     created_at: datetime
+    #: The cluster node whose disk holds the archive, for a node-local
+    #: destination (``local_volume`` on the appliance, #1838); ``None``
+    #: for every network destination, where there is no such thing.
+    node_name: str | None = None
 
 
 #: ``ConfigFieldSpec.type`` value for prose that renders without an input.
