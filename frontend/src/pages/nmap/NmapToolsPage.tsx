@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { pollUnlessRefused } from "@/lib/refusal";
 import { Loader2, Radar, Trash2 } from "lucide-react";
 import { type NmapScanRead, nmapApi } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
@@ -236,10 +238,10 @@ function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
   const [pendingSingle, setPendingSingle] = useState<NmapScanRead | null>(null);
   const [pendingBulk, setPendingBulk] = useState<NmapScanRead[] | null>(null);
 
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["nmap-scans", "recent"],
     queryFn: () => nmapApi.listScans({ page_size: 50 }),
-    refetchInterval: 5000,
+    refetchInterval: pollUnlessRefused(5000),
   });
   const items = data?.items ?? [];
 
@@ -301,7 +303,9 @@ function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
   }
   if (isError) {
     return (
-      <p className="text-xs text-destructive">Failed to load recent scans.</p>
+      <p className="text-xs">
+        <ListReadError error={error} what="recent scans" />
+      </p>
     );
   }
   if (items.length === 0) {

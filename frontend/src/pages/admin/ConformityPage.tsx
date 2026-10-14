@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   AlertTriangle,
   Check,
@@ -201,7 +202,12 @@ export function ConformityPage() {
                       colSpan={8}
                       className="px-3 py-8 text-center text-xs text-muted-foreground"
                     >
-                      No policies yet — click “New policy” to add one.
+                      <ListEmpty
+                        error={policiesQ.error}
+                        what="conformity policies"
+                      >
+                        No policies yet — click “New policy” to add one.
+                      </ListEmpty>
                     </td>
                   </tr>
                 )}

@@ -94,6 +94,131 @@ the formatter handles the rest.
   only cloned. A test pins the allow-list against every action the builtin
   roles and permission checks use.
 
+- **A list a scoped user may not read says so instead of showing as
+  empty (#1865).** Audit Log, Conformity, VRFs, Requests, the
+  integration pages (Kubernetes, Docker, Proxmox, Tailscale, UniFi,
+  Meraki, NetBird, OPNsense, PAN-OS, Fortinet, Cloud), Circuits, ASNs,
+  Overlays, Multicast groups, Network devices, TLS certificate targets,
+  Firewall feeds, Logs, Wake schedules, DNS blocking lists and Nmap
+  scans rendered a refused list read as their empty state ("No audit
+  events found", "No policies yet", "No VRFs yet.") over lists that hold
+  rows. They now share one `ListEmpty` wrapper around the empty copy
+  that shows "You don't have permission to see ..." for a refusal and
+  "Couldn't load ..." for any other failure. Requests also no longer
+  invites a user who cannot submit to ask for an IP, and its poll,
+  Nmap's and the Cloud page's stop once refused. The row counters that
+  sat over those lists ("0 events", "0 total", "0 ASNs") read "—" when
+  the read was refused, and Audit Log's Export PDF, which needs the same
+  grant, is disabled.
+
+- **The app shell stops asking routes its user cannot read (#1864).**
+  The maintenance banner (every 15 s), the first-boot setup banner and
+  the sidebar approvals badge (every 30 s) polled
+  `/appliance/system/info`, `/appliance/system/setup` and
+  `/change-requests?state=pending` for whoever was signed in. A user
+  without `read` on `appliance` or `approve` on `change_request` was
+  refused all three, each console 403 was an error, and each refused
+  appliance read wrote a `denied` row to the audit log: about four a
+  minute per open tab, none of them an access attempt the user made.
+  Each query is now enabled only for a user who holds the grant its
+  route needs, and stops polling once a read is refused.
+
+- **An editor whose write an approval policy queued can see, and
+  cancel, its own change request (#1863).** The list, `?mine=true` and
+  `GET /change-requests/{id}` all demanded `read` on `change_request`
+  before the read rule that scopes a requester to the rows it made, and
+  only the built-in Change Approver holds that grant, so the editor was
+  told "Nothing waiting for approval" while the server let it cancel the
+  request it could not read. The grant is no longer a precondition: the
+  own-rows scope on the list and the 404 on get are the access rule, as
+  the router's own read rule always said. Seeing every row still takes
+  `approve` (or superadmin).
+
+- **IPAM bulk delete no longer leaves a DHCP reservation behind (#1714).**
+  `POST /ipam/addresses/bulk-delete` ran none of the reservation handling
+  the single delete has had since #1656: an IPAM Editor could bulk-delete a
+  `static_dhcp` row the single delete answers 403 for, leaving the
+  reservation served with `ip_address_id` null (permanent) or linked to an
+  orphan (soft). It now applies the same rule per row. A caller without
+  `delete` on `dhcp_static` has those rows skipped, each with a reason in the
+  new `skipped_reasons` map (shown in the bulk dialog); a caller with it has
+  the reservations removed on the server and audited, as the single delete
+  does. Other rows in the selection are still deleted. Both paths (and the
+  orphan purge) now find the linked reservations and word the refusal through
+  one shared helper, so they cannot drift; the purge also catches a
+  reservation linked only from the row's `static_assignment_id` (#1628). As
+  in the single delete, the reservation push runs before any DNS teardown, and
+  a server refusing it aborts the whole request with 502.
+
+- **Deleting an appliance only removes servers provably its own
+  (#1810).** The hostname match on agent-registered DNS / DHCP rows now
+  applies only to an approved appliance, judged on the state it is deleted
+  from. A pending or revoked duplicate (a re-imaged box's stale entry)
+  claims its FK-owned rows only, so deleting it, or previewing the
+  delete, can no longer take a live appliance's servers, with their
+  settings such as the Kea `ha_peer_url`. The Kea HA firewall inputs
+  follow the same rule: an appliance's own HA member and a partner's
+  appliance are matched case-blind and only against approved
+  appliances, so a revoked duplicate's old node IPs no longer replace
+  the live partner's in the listener's allowed sources.
+
+- **A DHCP group change made through the Operator Copilot now moves the
+  appliance's Kea server too (#1902).** `assign_appliance_role` (and the MCP
+  `propose_assign_role` that proposes it) set the appliance's DHCP group
+  pointer alone, so the Kea row stayed in the old group and its agent kept
+  serving there: the DHCP half of #1565, reachable only through the
+  Copilot. It now makes the same move the Fleet roles save does, with the
+  same refusals (a Kea and Windows DHCP mix, v6 scopes for Windows), which
+  preview reports and apply enforces before anything changes. A proposal
+  that changes both the DNS and the DHCP group moves both servers in one
+  transaction: a refusal of either applies neither, and the preview names
+  both refusals. The apply now also wakes the appliance's supervisor, as the
+  Fleet save does, instead of leaving the change to the next heartbeat.
+
+- **`seed_demo.py` seeds its IPAM templates (#1465).** Both templates
+  sent `ddns_hostname_policy: leave_unchanged`, a value the API has never
+  accepted, so each POST answered 422 and the run still ended with
+  "Seed complete" and no templates. They now send `client_or_generated`.
+  The script also records every refused request (409, the re-run path,
+  excepted), lists them at the end and exits 2 instead of printing "Seed
+  complete", so a section that seeds nothing no longer passes unnoticed.
+  A test builds both payloads from the script and validates them against
+  the template create model.
+
+- **The Security dashboard counts failed sign-ins, and the TSIG reveal
+  stops calling the secret hashed (#1836, #1837).** The failed-login
+  panel filtered audit rows on `result="denied"`, but `/auth/login`
+  writes `"failure"` for a bad credential, so a real failed sign-in
+  never appeared; it now reads `"failure"`, matching the Copilot
+  health tool. Provider outages are written as `"error"` and stay out,
+  as they are not guesses. The TSIG key reveal said the secret was
+  "hashed at rest and can't be recovered"; it is Fernet-encrypted
+  (SpatiumDDI must read it to sign updates) and is simply not shown
+  again, so the copy now says that.
+
+- **One Fleet save that switches an appliance's DNS engine and its group
+  moves the server row too (#1856).** The roles PUT moved only rows
+  already carrying the new engine's driver, so when the old engine's
+  row was the one the new agent adopts, it stayed in the old group:
+  the new group listed no server and answered REFUSED until a second
+  save. The appliance's own row now moves as the new engine's row, and
+  a target group running another driver is a 422 before anything changes.
+  When the appliance holds two or more rows of engines it no longer runs
+  (left by earlier saves), the save is a 409 naming them instead of
+  moving a guess: the new agent lands on whichever row carries its own
+  agent id, which the control plane cannot tell. The Operator Copilot's
+  `assign_appliance_role` (and MCP `propose_assign_role`) now moves the
+  server the same way; it used to set the appliance's group pointer
+  alone, which left the server in the old group on any group change.
+
+- **Creating a PXE profile with a name its group already holds is a 409,
+  not a 500 (#1911).** The name-clash check selected the whole profile, The Copilot's `list_pxe_profiles` tool had the same joined-collection read and failed for any profile with a match; it now reads them.
+  whose `matches` collection is eager-joined, so the moment a clash
+  existed `scalar_one_or_none()` raised `InvalidRequestError` and the
+  route's own 409 was unreachable; renaming onto a taken name had the
+  same shape. Both checks now select only the id. No other DHCP / DNS
+  create or rename check loads a joined collection, so none shared it.
+
 - **The DHCP options editor's search box kept only the first digit of a
   typed code (#1685).** Typing `4` then `3` left the box reading
   "4 —3", matched nothing and made the row option 4. Each keystroke set
