@@ -19,6 +19,7 @@ import {
   type DHCPScopeServing,
   type DHCPServingVerdict,
 } from "@/lib/api";
+import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import {
   AddScopesModal,
@@ -151,12 +152,15 @@ function seconds(v: number | null): string {
  */
 export function WindowsFailoverPanel({ groupId }: { groupId: string }) {
   const { data: report, isLoading } = useGroupFailover(groupId);
+  // Every relationship action takes a superadmin (server_groups.py), so a
+  // user who is not one sees the report without its management controls.
+  const { isSuperadmin } = usePermissions();
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [lastResult, setLastResult] = useState<DHCPFailoverActionResult | null>(
     null,
   );
   if (isLoading || !report || report.windows_member_count === 0) return null;
-  const canManage = report.windows_member_count >= 2;
+  const canManage = report.windows_member_count >= 2 && isSuperadmin;
   const relByName = new Map(report.relationships.map((r) => [r.name, r]));
 
   const attention = report.scopes.filter((s) => !s.safe || s.drift);
@@ -251,6 +255,7 @@ export function WindowsFailoverPanel({ groupId }: { groupId: string }) {
                   <span className="font-mono">{s.cidr}</span>
                   <ServingVerdictTag serving={s} />
                   {s.drift &&
+                    isSuperadmin &&
                     s.relationship_name &&
                     relByName.get(s.relationship_name)?.complete && (
                       <button

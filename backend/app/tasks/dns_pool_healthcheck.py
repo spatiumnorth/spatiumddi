@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
+from app.db import task_connect_args
 from app.models.dns import DNSPool
 from app.services.dns.pool_apply import apply_pool_state
 from app.services.dns.pool_healthcheck import apply_check_to_member, run_check
@@ -39,7 +40,9 @@ logger = structlog.get_logger(__name__)
 
 
 async def _run_pool_check_async(pool_id_str: str) -> dict[str, Any]:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with factory() as db:
@@ -125,7 +128,9 @@ def run_pool_check(self: Any, pool_id_str: str) -> dict[str, Any]:  # noqa: ARG0
 
 
 async def _dispatch_due_async() -> int:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     factory = async_sessionmaker(engine, expire_on_commit=False)
     queued = 0
     try:

@@ -817,7 +817,7 @@ Custom fields are exposed under the `custom_fields` JSONB key on all resource ob
 ### IP Range Import
 
 Supported input formats:
-- **CSV**: columns: `network`, `name`, `gateway`, `vlan_id`, `description` + any custom field columns
+- **CSV**: columns: `network`, `name`, `gateway`, `vlan_id`, `description` + any custom field columns. `\n`, `\r\n` and a bare `\r` (classic Mac) line endings are all read; a CSV the reader cannot read is a 422 with its reason (#1637)
 - **JSON**: array of subnet objects (matches API schema)
 - **IPAM vendor exports**: generic CSV (network, name, gateway, vlan_id), SolarWinds IPAM CSV, Netbox JSON
 

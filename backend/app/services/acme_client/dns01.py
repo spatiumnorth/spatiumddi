@@ -37,6 +37,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent_wake import dns_group_channel, publish_wake
+from app.db import task_sessionmaker
 from app.drivers.dns import CLOUD_DNS_DRIVERS
 from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSServerGroup, DNSZone
 from app.services.acme import ACME_TXT_TTL
@@ -268,7 +269,14 @@ async def solve(db: AsyncSession, fqdn: str, txt_value: str) -> DNS01Handle:
         # records one render takes about 30 s, and a fixed 30 s wait
         # failed intermittently.
         timeout = await apply_timeout_for(db, wait_ids)
-        states = await wait_for_ops_applied(wait_ids, timeout=timeout)
+        # solve() runs inside the ``run_acme_order`` Celery task, so the
+        # wait's per-poll sessions come from a per-task engine, not the
+        # shared one, whose pooled connections can be bound to an earlier
+        # task's closed loop ("Event loop is closed") (#1687).
+        async with task_sessionmaker() as poll_sessions:
+            states = await wait_for_ops_applied(
+                wait_ids, timeout=timeout, session_factory=poll_sessions
+            )
         not_applied = {str(i): s for i, s in states.items() if s != "applied"}
         if not_applied:
             raise DNS01SolveError(

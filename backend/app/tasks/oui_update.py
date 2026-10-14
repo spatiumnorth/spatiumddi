@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
@@ -75,7 +76,9 @@ def _parse_oui_csv(text: str) -> list[dict[str, str]]:
 
 
 async def _run_update(force: bool = False) -> dict[str, Any]:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:

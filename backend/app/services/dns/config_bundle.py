@@ -31,6 +31,7 @@ from app.drivers.dns.base import (
     ZoneData,
 )
 from app.models.dns import (
+    DEFAULT_ALLOW_RECURSION,
     DNSAcl,
     DNSRecord,
     DNSSECPolicy,
@@ -97,7 +98,11 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             forwarders=tuple(opts_row.forwarders or ()),
             forward_policy=opts_row.forward_policy,
             recursion_enabled=opts_row.recursion_enabled,
-            allow_recursion=tuple(opts_row.allow_recursion or ("any",)),
+            allow_recursion=tuple(
+                DEFAULT_ALLOW_RECURSION
+                if opts_row.allow_recursion is None
+                else opts_row.allow_recursion
+            ),
             dnssec_validation=opts_row.dnssec_validation,
             notify_enabled=opts_row.notify_enabled,
             also_notify=tuple(opts_row.also_notify or ()),

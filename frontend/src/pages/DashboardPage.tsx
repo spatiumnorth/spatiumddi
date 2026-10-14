@@ -105,6 +105,7 @@ import { useSessionState } from "@/lib/useSessionState";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 import { HA_V4_ONLY_NOTE } from "@/lib/dhcpHa";
+import { activityTone } from "@/lib/activity-tone";
 import {
   isPartialApply,
   PARTIAL_APPLY_EXPLAIN,
@@ -440,18 +441,7 @@ function SubnetHeatmap({ subnets }: { subnets: Subnet[] }) {
  */
 function ActionBadge({ action, result }: { action: string; result: string }) {
   // Map both action and result to one of a few colour families.
-  let tone: Tone = "info";
-  let label = action.toUpperCase();
-  if (result === "failed") {
-    tone = "bad";
-    label = "FAIL";
-  } else if (result === "denied") {
-    tone = "warn";
-    label = "DENY";
-  } else if (action === "create") tone = "good";
-  else if (action === "delete") tone = "bad";
-  else if (action === "update") tone = "info";
-  else if (action === "login" || action === "logout") tone = "info";
+  const { tone, label } = activityTone(action, result);
 
   const cls = TONE_CLASS[tone];
   return (
