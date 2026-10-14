@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The appliance's Celery worker and beat run in appliance mode
+  (#1826).** `APPLIANCE_MODE` was set only on the api container, so the
+  worker, which runs alert evaluation and the rolling-upgrade
+  orchestrator, saw it unset: `node_pressure` and `cluster_dns_degraded`
+  never fired on schedule, and the worker closed what "Evaluate now"
+  (which runs in the api) opened. The chart gains a `sharedEnv` value
+  appended to the api, worker and beat containers; firstboot writes
+  `APPLIANCE_MODE`, `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and
+  `INITIAL_NTP_SERVERS` there instead of under `api.env`, and the
+  slot-image mirror URL and secret now reach the worker as well as the
+  api (the rolling-upgrade preflight's mirror disk-headroom check never
+  ran there), but not beat. A new chart guard, `chart-shared-env.py`,
+  fails a render where the three disagree. An existing appliance picks it up when firstboot
+  re-renders the control-plane chart values (the next slot upgrade).
+
 - **A lost CNPG primary no longer hangs a Celery task for ~15 minutes
   (#1719).** No Celery-side database engine set asyncpg bounds: neither
   `task_session()` nor the ~55 per-task `create_async_engine` calls the
