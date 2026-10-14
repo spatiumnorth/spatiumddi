@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **IPAM bulk delete no longer leaves a DHCP reservation behind (#1714).**
+  `POST /ipam/addresses/bulk-delete` ran none of the reservation handling
+  the single delete has had since #1656: an IPAM Editor could bulk-delete a
+  `static_dhcp` row the single delete answers 403 for, leaving the
+  reservation served with `ip_address_id` null (permanent) or linked to an
+  orphan (soft). It now applies the same rule per row. A caller without
+  `delete` on `dhcp_static` has those rows skipped, each with a reason in the
+  new `skipped_reasons` map (shown in the bulk dialog); a caller with it has
+  the reservations removed on the server and audited, as the single delete
+  does. Other rows in the selection are still deleted. Both paths (and the
+  orphan purge) now find the linked reservations and word the refusal through
+  one shared helper, so they cannot drift; the purge also catches a
+  reservation linked only from the row's `static_assignment_id` (#1628). As
+  in the single delete, the reservation push runs before any DNS teardown, and
+  a server refusing it aborts the whole request with 502.
+
 - **Deleting an appliance only removes servers provably its own
   (#1810).** The hostname match on agent-registered DNS / DHCP rows now
   applies only to an approved appliance, judged on the state it is deleted
