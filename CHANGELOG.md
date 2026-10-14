@@ -84,6 +84,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Creating a PXE profile with a name its group already holds is a 409,
+  not a 500 (#1911).** The name-clash check selected the whole profile, The Copilot's `list_pxe_profiles` tool had the same joined-collection read and failed for any profile with a match; it now reads them.
+  whose `matches` collection is eager-joined, so the moment a clash
+  existed `scalar_one_or_none()` raised `InvalidRequestError` and the
+  route's own 409 was unreachable; renaming onto a taken name had the
+  same shape. Both checks now select only the id. No other DHCP / DNS
+  create or rename check loads a joined collection, so none shared it.
+
 - **The DHCP options editor's search box kept only the first digit of a
   typed code (#1685).** Typing `4` then `3` left the box reading
   "4 —3", matched nothing and made the row option 4. Each keystroke set
