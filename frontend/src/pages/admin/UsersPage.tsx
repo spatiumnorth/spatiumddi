@@ -2,6 +2,11 @@ import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
+import {
   Plus,
   Pencil,
   Trash2,
@@ -541,6 +546,12 @@ function DeleteUserModal({
 // ── Main Page ─────────────────────────────────────────────────────────────────
 
 export function UsersPage() {
+  // #1341 — every write on this page takes a superadmin (its handlers
+  // take SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const [showCreate, setShowCreate] = useState(false);
   const [editUser, setEditUser] = useState<AppUser | null>(null);
   const [resetUser, setResetUser] = useState<AppUser | null>(null);
@@ -565,7 +576,8 @@ export function UsersPage() {
           </h1>
           <button
             onClick={() => setShowCreate(true)}
-            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...superadminGate}
           >
             <Plus className="h-3.5 w-3.5" />
             New User
@@ -690,8 +702,9 @@ export function UsersPage() {
                     <div className="flex items-center justify-end gap-1">
                       <button
                         onClick={() => setEditUser(user)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Edit"
+                        {...superadminGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
@@ -700,8 +713,9 @@ export function UsersPage() {
                       {user.auth_source === "local" && (
                         <button
                           onClick={() => setResetUser(user)}
-                          className="rounded p-1 text-muted-foreground hover:text-foreground"
+                          className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                           title="Reset password"
+                          {...superadminGate}
                         >
                           <KeyRound className="h-3.5 w-3.5" />
                         </button>
@@ -709,8 +723,9 @@ export function UsersPage() {
                       {user.locked && <UnlockButton userId={user.id} />}
                       <button
                         onClick={() => setDeleteUser(user)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         title="Delete"
+                        {...superadminGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>

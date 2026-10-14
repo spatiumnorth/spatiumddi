@@ -15,6 +15,7 @@ import {
   errMsg,
   DeleteConfirmModal,
 } from "./_shared";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const KEY_BASE = "dhcp-device-policies";
 const OBS_KEY = "dhcp-device-observations";
@@ -34,6 +35,16 @@ const OBS_KEY = "dhcp-device-observations";
  * from a device's next renewal, not the moment it is saved.
  */
 export function DevicePoliciesTab({ groupId }: { groupId: string }) {
+  // #1339, #1861 — writes take write, deletes delete, on ``dhcp_client_class``.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "dhcp_client_class"),
+    "Requires write permission on DHCP client classes",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "dhcp_client_class"),
+    "Requires delete permission on DHCP client classes",
+  );
   const qc = useQueryClient();
   const [showCreate, setShowCreate] = useState(false);
   const [edit, setEdit] = useState<DHCPDevicePolicy | null>(null);
@@ -72,7 +83,8 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
         <button
           type="button"
           onClick={() => setShowCreate(true)}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
+          {...writeGate}
         >
           <Plus className="h-4 w-4" /> New Policy
         </button>
@@ -173,7 +185,8 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
                         type="button"
                         title="Edit"
                         onClick={() => setEdit(p)}
-                        className="rounded p-1 hover:bg-muted"
+                        className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        {...writeGate}
                       >
                         <Pencil className="h-4 w-4" />
                       </button>
@@ -181,7 +194,8 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
                         type="button"
                         title="Delete"
                         onClick={() => setDel(p)}
-                        className="rounded p-1 hover:bg-muted"
+                        className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        {...deleteGate}
                       >
                         <Trash2 className="h-4 w-4" />
                       </button>

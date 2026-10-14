@@ -222,18 +222,28 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         ],
     ),
     "DNS Editor": (
-        "Full CRUD on DNS zones, records, server groups, blocklists, and pools.",
+        "Create, edit and delete DNS zones, records, views and ACLs, and the "
+        "entries and exceptions of existing blocklists; read every DNS surface. "
+        "Infrastructure stays superadmin-only: server groups, servers and "
+        "their options, TSIG keys, DNSSEC signing and policies, dynamic-update "
+        "ACLs, blocklist subscriptions and assignments, GSLB pools (their "
+        "health checks probe the network), zone moves and the importers.",
         [
             {"action": "admin", "resource_type": "dns_group"},
             {"action": "admin", "resource_type": "dns_zone"},
             {"action": "admin", "resource_type": "dns_record"},
             {"action": "admin", "resource_type": "dns_blocklist"},
-            {"action": "admin", "resource_type": "manage_dns_pools"},
+            {"action": "read", "resource_type": "manage_dns_pools"},
         ],
     ),
     "DHCP Editor": (
-        "Full CRUD on DHCP servers, scopes, pools, statics, client classes, "
-        "option templates, and MAC blocks.",
+        "Create, edit and delete DHCP scopes, pools, static assignments, "
+        "client classes and device policies, option templates, phone and PXE "
+        "profiles, and MAC blocks; acknowledge rogue-responder and "
+        "router-advertisement findings; read every DHCP surface. "
+        "Infrastructure stays superadmin-only: DHCP servers and server "
+        "groups, failover relationships, server sync / pause / approval, "
+        "lease deletion and the importers.",
         [
             {"action": "admin", "resource_type": "dhcp_server"},
             {"action": "admin", "resource_type": "dhcp_scope"},
@@ -287,7 +297,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "verify the underlying evidence without making changes.",
         [
             {"action": "read", "resource_type": "conformity"},
-            {"action": "read", "resource_type": "audit"},
+            {"action": "read", "resource_type": "audit_log"},
             {"action": "read", "resource_type": "subnet"},
             {"action": "read", "resource_type": "ip_address"},
             {"action": "read", "resource_type": "dns_zone"},
@@ -302,7 +312,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "operational config.",
         [
             {"action": "admin", "resource_type": "conformity"},
-            {"action": "read", "resource_type": "audit"},
+            {"action": "read", "resource_type": "audit_log"},
             {"action": "read", "resource_type": "subnet"},
             {"action": "read", "resource_type": "ip_address"},
             {"action": "read", "resource_type": "dns_zone"},

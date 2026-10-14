@@ -14,6 +14,7 @@ Three things under test, and what each would look like if it broke:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -68,6 +69,24 @@ def test_thread_pool_size_is_rendered() -> None:
     # to both receive and process, which measured 15,170 socket drops in a
     # run where a pool of one had none.
     assert mt["enable-multi-threading"] is True
+
+
+def test_packet_queue_size_is_rendered_for_both_daemons() -> None:
+    """#1283 — the agent renders Kea's multi-threading ``packet-queue-size``
+    because Kea's own 64 evicts queued requests, uncounted, when an arrival
+    burst outruns the worker. The preview carries the same multi-threading
+    block, so it must show the same queue: one that omitted it would show an
+    operator Kea's default, which is not what the server runs."""
+    v6 = ScopeDef(
+        subnet_cidr="2001:db8:980::/64",
+        address_family="ipv6",
+        pools=(PoolDef(start_ip="2001:db8:980::100", end_ip="2001:db8:980::200"),),
+    )
+    bundle = _bundle()
+    bundle = dataclasses.replace(bundle, scopes=(*bundle.scopes, v6))
+    cfg = json.loads(KeaDriver().render_config(bundle))
+    for daemon in ("Dhcp4", "Dhcp6"):
+        assert cfg[daemon]["multi-threading"]["packet-queue-size"] == 1024, daemon
 
 
 def test_bundle_defaults_to_one_worker_not_keas_auto() -> None:

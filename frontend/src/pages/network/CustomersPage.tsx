@@ -12,6 +12,7 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -213,6 +214,17 @@ function CustomerEditorModal({
 }
 
 export function CustomersPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the customer router asks write (delete) on 'customer'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "customer"),
+    "Requires write permission on customers",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "customer"),
+    "Requires delete permission on customers",
+  );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<CustomerStatus | "">("");
@@ -298,6 +310,7 @@ export function CustomersPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New customer
             </HeaderButton>
@@ -343,6 +356,7 @@ export function CustomersPage() {
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
               }}
+              {...deleteGate}
             >
               Delete selected
             </HeaderButton>
@@ -415,7 +429,8 @@ export function CustomersPage() {
                       type="button"
                       title="Edit"
                       onClick={() => setEditing(c)}
-                      className="rounded p-1 hover:bg-muted"
+                      className="rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
@@ -430,7 +445,8 @@ export function CustomersPage() {
                           onConfirm: () => removeOne.mutate(c.id),
                         });
                       }}
-                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

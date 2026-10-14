@@ -62,6 +62,7 @@ from .service_lifecycle import (
     LifecycleResult,
     apply_role_assignment,
     reconcile_node_labels,
+    record_shared_chart_hold,
     role_release_fingerprint,
     tear_down_supervised_services,
 )
@@ -956,6 +957,9 @@ def heartbeat_once(
     # #358 Phase 1b — True when the control plane long-poll-held this
     # heartbeat (new server); lets the loop re-arm the hold immediately.
     held = bool(body_out.get("long_poll"))
+    # #1710 — keep the rolling upgrade's hold on the shared charts (or clear
+    # it) before anything below applies the role chart.
+    record_shared_chart_hold(cfg.state_dir / _ROLE_ENV_FILENAME, body_out.get("shared_chart_hold"))
 
     # #170 Wave D follow-up — pick up cert + CA chain on the first
     # heartbeat after approval. Subsequent heartbeats include the

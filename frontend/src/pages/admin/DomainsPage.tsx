@@ -14,6 +14,7 @@ import { Modal } from "@/components/ui/modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
 import { ZoneScopePill } from "@/components/ZoneScopePill";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -305,6 +306,17 @@ function DomainEditorModal({
 // ── Page ────────────────────────────────────────────────────────────────────
 
 export function DomainsPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'manage_domains'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_domains"),
+    "Requires write permission on domains",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_domains"),
+    "Requires delete permission on domains",
+  );
   const qc = useQueryClient();
   const [editing, setEditing] = useState<Domain | null>(null);
   const [showCreate, setShowCreate] = useState(false);
@@ -426,6 +438,7 @@ export function DomainsPage() {
                 "inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground",
                 "hover:bg-primary/90",
               )}
+              {...writeGate}
             >
               <Plus className="h-3.5 w-3.5" />
               New domain
@@ -478,7 +491,8 @@ export function DomainsPage() {
               <button
                 onClick={() => bulkRefresh.mutate(Array.from(selected))}
                 disabled={bulkRefresh.isPending}
-                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent"
+                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...writeGate}
               >
                 <RefreshCw
                   className={cn(
@@ -499,7 +513,8 @@ export function DomainsPage() {
                   }
                 }}
                 disabled={bulkDel.isPending}
-                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-red-950/30"
+                {...deleteGate}
               >
                 <Trash2 className="h-3.5 w-3.5" />
                 Bulk delete
@@ -610,6 +625,17 @@ function DomainRow({
   onRefresh: () => void;
   refreshing: boolean;
 }) {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'manage_domains'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_domains"),
+    "Requires write permission on domains",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_domains"),
+    "Requires delete permission on domains",
+  );
   return (
     <tr className={cn("border-b", selected && "bg-primary/5")}>
       <td className="px-3 py-2">
@@ -666,6 +692,7 @@ function DomainRow({
             disabled={refreshing}
             title="Refresh WHOIS"
             className="rounded p-1.5 hover:bg-accent disabled:opacity-50"
+            {...writeGate}
           >
             <RefreshCw
               className={cn("h-3.5 w-3.5", refreshing && "animate-spin")}
@@ -674,14 +701,16 @@ function DomainRow({
           <button
             onClick={onEdit}
             title="Edit"
-            className="rounded p-1.5 hover:bg-accent"
+            className="rounded p-1.5 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Pencil className="h-3.5 w-3.5" />
           </button>
           <button
             onClick={onDelete}
             title="Delete"
-            className="rounded p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+            className="rounded p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:cursor-not-allowed disabled:opacity-50"
+            {...deleteGate}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>

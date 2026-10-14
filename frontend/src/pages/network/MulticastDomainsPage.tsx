@@ -12,6 +12,7 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -239,6 +240,17 @@ function MulticastDomainModal({
 // domain table + modal.
 
 export function MulticastDomainsTab() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'multicast'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "multicast"),
+    "Requires write permission on multicast domains",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "multicast"),
+    "Requires delete permission on multicast domains",
+  );
   const qc = useQueryClient();
   const [editing, setEditing] = useState<MulticastDomainRead | null>(null);
   const [showNew, setShowNew] = useState(false);
@@ -282,6 +294,7 @@ export function MulticastDomainsTab() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New domain
             </HeaderButton>
@@ -340,7 +353,8 @@ export function MulticastDomainsTab() {
                       type="button"
                       onClick={() => setEditing(d)}
                       title="Edit"
-                      className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                      {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
@@ -355,7 +369,8 @@ export function MulticastDomainsTab() {
                         });
                       }}
                       title="Delete"
-                      className="ml-1 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                      className="ml-1 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

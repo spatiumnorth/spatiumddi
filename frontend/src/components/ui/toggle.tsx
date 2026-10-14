@@ -10,6 +10,7 @@ export function Toggle({
   onChange,
   disabled,
   label,
+  title,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
@@ -17,16 +18,19 @@ export function Toggle({
   /** Accessible label for screen readers when no surrounding text
    *  describes what the toggle controls (e.g. an icon-only row). */
   label?: string;
+  /** Tooltip; carries the reason while ``disabled`` (#1341). */
+  title?: string;
 }) {
   return (
     <button
       role="switch"
       aria-checked={checked}
       aria-label={label}
+      title={title}
       onClick={() => !disabled && onChange(!checked)}
       disabled={disabled}
       className={cn(
-        "relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus:outline-none disabled:opacity-60",
+        "relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus:outline-none disabled:cursor-not-allowed disabled:opacity-60",
         checked ? "bg-primary" : "bg-muted-foreground/30",
       )}
     >
