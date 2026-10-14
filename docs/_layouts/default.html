@@ -34,6 +34,28 @@
 <body>
   {% include nav.html root=root %}
 
+  {%- comment -%}
+    Version banner (#1164). These docs track `main`, so a reader running a
+    release may be reading behaviour that has not shipped. The links are
+    absolute (config `links`), so the banner is correct on both Pages sites
+    and in a local build. `site.data.build` is written ONLY by
+    docs-publish.yml, into the published copy (never committed): it carries
+    the commit, date and latest release. Without it (project Pages site,
+    local `jekyll build`) the banner is the generic form.
+  {%- endcomment -%}
+  <aside class="doc-versionbar" role="note">
+    <div class="doc-versionbar-inner">
+      These docs track <code>main</code>
+      {%- if site.data.build.sha %} (<a href="{{ site.links.github }}/commit/{{ site.data.build.sha }}"><code>{{ site.data.build.sha | slice: 0, 8 }}</code></a>{% if site.data.build.date %}, {{ site.data.build.date }}{% endif %}){% endif %}
+      and may describe behaviour that is not in the release you are running.
+      {% if site.data.build.release -%}
+      Latest release: <a href="{{ site.links.releases }}/tag/{{ site.data.build.release }}">{{ site.data.build.release }}</a>.
+      {%- endif %}
+      See the <a href="{{ site.links.github }}/blob/main/CHANGELOG.md">changelog</a>
+      for what is unreleased, or the <a href="{{ site.links.releases }}">releases</a> page.
+    </div>
+  </aside>
+
   <main class="doc">
     {%- comment -%}
       The index is the site's home, so it gets no crumb pointing at itself.

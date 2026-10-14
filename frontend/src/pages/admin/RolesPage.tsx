@@ -14,6 +14,7 @@ import { Modal } from "@/components/ui/modal";
 import { StepUpSection } from "@/components/StepUpSection";
 import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // What a new grant row offers: a mirror of docs/PERMISSIONS.md, keep these in
 // sync. A role can hold more than these lists name — the built-in roles do
@@ -162,9 +163,13 @@ function PermissionEditor({
 function RoleModal({
   role,
   onClose,
+  canEdit = true,
 }: {
   role: AppRole | null;
   onClose: () => void;
+  /** #1341 — false for a caller without `admin` on `role`: the modal
+   *  shows the role read-only, as it does a built-in one. */
+  canEdit?: boolean;
 }) {
   const qc = useQueryClient();
   const [name, setName] = useState(role?.name ?? "");
@@ -210,7 +215,7 @@ function RoleModal({
     },
   });
 
-  const readOnly = role?.is_builtin ?? false;
+  const readOnly = (role?.is_builtin ?? false) || !canEdit;
 
   return (
     <Modal
@@ -221,8 +226,9 @@ function RoleModal({
       <div className="space-y-3">
         {readOnly && (
           <p className="rounded-md bg-muted px-3 py-2 text-xs text-muted-foreground">
-            Built-in roles cannot be edited directly. Clone this role to make a
-            customised copy.
+            {role?.is_builtin
+              ? "Built-in roles cannot be edited directly. Clone this role to make a customised copy."
+              : "View only: editing a role requires admin permission on roles."}
           </p>
         )}
         <Field label="Name">
@@ -387,6 +393,12 @@ function DeleteModal({
 }
 
 export function RolesPage() {
+  // #1341 — every role write takes `admin` on `role` (roles/router.py).
+  const canAdmin = usePermissions().can("admin", "role");
+  const adminGate = permissionGate(
+    canAdmin,
+    "Requires admin permission on roles",
+  );
   const [showCreate, setShowCreate] = useState(false);
   const [editRole, setEditRole] = useState<AppRole | null>(null);
   const [cloneRole, setCloneRole] = useState<AppRole | null>(null);
@@ -413,7 +425,8 @@ export function RolesPage() {
           </div>
           <button
             onClick={() => setShowCreate(true)}
-            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...adminGate}
           >
             <Plus className="h-3.5 w-3.5" />
             New Role
@@ -470,14 +483,15 @@ export function RolesPage() {
                       <button
                         onClick={() => setEditRole(role)}
                         className="rounded p-1 text-muted-foreground hover:text-foreground"
-                        title={role.is_builtin ? "View" : "Edit"}
+                        title={role.is_builtin || !canAdmin ? "View" : "Edit"}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setCloneRole(role)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                        className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Clone"
+                        {...adminGate}
                       >
                         <Copy className="h-3.5 w-3.5" />
                       </button>
@@ -490,6 +504,7 @@ export function RolesPage() {
                             ? "Built-in roles cannot be deleted"
                             : "Delete"
                         }
+                        {...adminGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -506,7 +521,11 @@ export function RolesPage() {
         <RoleModal role={null} onClose={() => setShowCreate(false)} />
       )}
       {editRole && (
-        <RoleModal role={editRole} onClose={() => setEditRole(null)} />
+        <RoleModal
+          role={editRole}
+          onClose={() => setEditRole(null)}
+          canEdit={canAdmin}
+        />
       )}
       {cloneRole && (
         <CloneModal role={cloneRole} onClose={() => setCloneRole(null)} />

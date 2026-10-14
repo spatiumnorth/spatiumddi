@@ -24,6 +24,7 @@ import {
   ProviderChip,
   SiteChip,
 } from "@/components/ownership/pickers";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -577,6 +578,17 @@ function CircuitEditorModal({
 // ── Page ────────────────────────────────────────────────────────────
 
 export function CircuitsPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the circuit router asks write (delete) on 'circuit'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "circuit"),
+    "Requires write permission on circuits",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "circuit"),
+    "Requires delete permission on circuits",
+  );
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<CircuitStatus | "">("");
@@ -709,6 +721,7 @@ export function CircuitsPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowNew(true)}
+              {...writeGate}
             >
               New circuit
             </HeaderButton>
@@ -786,6 +799,7 @@ export function CircuitsPage() {
                   onConfirm: () => bulkDelete.mutate(ids),
                 });
               }}
+              {...deleteGate}
             >
               Delete selected
             </HeaderButton>
@@ -901,7 +915,8 @@ export function CircuitsPage() {
                       type="button"
                       title="Edit"
                       onClick={() => setEditing(c)}
-                      className="ml-1 rounded p-1 hover:bg-muted"
+                      className="ml-1 rounded p-1 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
@@ -916,7 +931,8 @@ export function CircuitsPage() {
                           onConfirm: () => removeOne.mutate(c.id),
                         });
                       }}
-                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      {...deleteGate}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

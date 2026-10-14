@@ -27,6 +27,7 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 /**
  * Conformity admin page (issue #106).
@@ -43,6 +44,13 @@ import { HeaderButton } from "@/components/ui/header-button";
  * fields when editing one of those rows.
  */
 export function ConformityPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks admin on 'conformity'.
+  const perms = usePermissions();
+  const adminGate = permissionGate(
+    perms.can("admin", "conformity"),
+    "Requires admin permission on conformity policies",
+  );
   const qc = useQueryClient();
   const [editing, setEditing] = useState<ConformityPolicy | null>(null);
   const [creating, setCreating] = useState(false);
@@ -139,7 +147,11 @@ export function ConformityPage() {
               <FileDown className="h-4 w-4" />
               {exportPdfMut.isPending ? "Exporting…" : "Export PDF"}
             </HeaderButton>
-            <HeaderButton variant="primary" onClick={() => setCreating(true)}>
+            <HeaderButton
+              variant="primary"
+              onClick={() => setCreating(true)}
+              {...adminGate}
+            >
               <Plus className="h-4 w-4" />
               New policy
             </HeaderButton>
@@ -242,7 +254,8 @@ export function ConformityPage() {
                           type="button"
                           title={p.enabled ? "Disable" : "Enable"}
                           onClick={() => togglePolicyMut.mutate(p)}
-                          className="rounded p-1 hover:bg-accent"
+                          className="rounded p-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                          {...adminGate}
                         >
                           {p.enabled ? (
                             <PowerOff className="h-4 w-4" />
@@ -254,8 +267,9 @@ export function ConformityPage() {
                           type="button"
                           title="Re-evaluate now"
                           onClick={() => evaluateMut.mutate(p.id)}
-                          className="rounded p-1 hover:bg-accent"
+                          className="rounded p-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                           disabled={evaluateMut.isPending}
+                          {...adminGate}
                         >
                           <Play className="h-4 w-4" />
                         </button>
@@ -263,7 +277,8 @@ export function ConformityPage() {
                           type="button"
                           title="Edit"
                           onClick={() => setEditing(p)}
-                          className="rounded p-1 hover:bg-accent"
+                          className="rounded p-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                          {...adminGate}
                         >
                           <Pencil className="h-4 w-4" />
                         </button>
@@ -280,7 +295,8 @@ export function ConformityPage() {
                                 deletePolicyMut.mutate(p.id);
                               }
                             }}
-                            className="rounded p-1 hover:bg-accent text-destructive"
+                            className="rounded p-1 hover:bg-accent text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                            {...adminGate}
                           >
                             <Trash2 className="h-4 w-4" />
                           </button>

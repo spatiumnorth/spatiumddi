@@ -12,7 +12,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
@@ -33,6 +33,26 @@ router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permiss
 # start_ip/end_ip range is ignored — the delegation is described by
 # pd_prefix / delegated_length / excluded_prefix instead.
 VALID_POOL_TYPES = {"dynamic", "excluded", "reserved", "pd"}
+
+# #1689 — Kea has no per-pool lifetime: a ``pools`` entry takes ``pool``,
+# ``option-data``, ``client-classes`` and ``pool-id`` only (valid-lifetime
+# lives on the subnet, shared-network, global scope or a client class, and a
+# class's lifetime only applies to clients matching its test, which would also
+# restrict who may use the pool). The field used to be accepted, stored, echoed
+# and never rendered, so a "guest pool, 10 minute lease" quietly served the
+# scope's lease. Refuse a value rather than store a no-op; null (clear) stays
+# legal so an existing row can still be reset.
+LEASE_OVERRIDE_UNSUPPORTED = (
+    "lease_time_override is not supported: Kea has no per-pool lease time, so the "
+    "pool would be served the scope's lease_time. Set the lease on the scope "
+    "(or use a separate scope), or clear this field"
+)
+
+
+def _refuse_lease_override(v: int | None) -> int | None:
+    if v is not None:
+        raise ValueError(LEASE_OVERRIDE_UNSUPPORTED)
+    return v
 
 
 class PoolCreate(BaseModel):
@@ -56,6 +76,11 @@ class PoolCreate(BaseModel):
             raise ValueError(f"pool_type must be one of {sorted(VALID_POOL_TYPES)}")
         return v
 
+    @field_validator("lease_time_override")
+    @classmethod
+    def _no_lease_override(cls, v: int | None) -> int | None:
+        return _refuse_lease_override(v)
+
 
 class PoolUpdate(BaseModel):
     name: str | None = None
@@ -68,6 +93,11 @@ class PoolUpdate(BaseModel):
     pd_prefix: str | None = None
     delegated_length: int | None = None
     excluded_prefix: str | None = None
+
+    @field_validator("lease_time_override")
+    @classmethod
+    def _no_lease_override(cls, v: int | None) -> int | None:
+        return _refuse_lease_override(v)
 
 
 class PoolResponse(BaseModel):
@@ -237,7 +267,7 @@ async def list_pools(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCPPo
     status_code=status.HTTP_201_CREATED,
 )
 async def create_pool(
-    scope_id: uuid.UUID, body: PoolCreate, db: DB, user: SuperAdmin
+    scope_id: uuid.UUID, body: PoolCreate, db: DB, user: CurrentUser
 ) -> PoolResponse:
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
@@ -305,7 +335,7 @@ async def create_pool(
 
 
 @router.put("/pools/{pool_id}", response_model=PoolResponse)
-async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperAdmin) -> DHCPPool:
+async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: CurrentUser) -> DHCPPool:
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
@@ -383,7 +413,7 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
 
 
 @router.delete("/pools/{pool_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_pool(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_pool(pool_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")

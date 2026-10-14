@@ -25,6 +25,7 @@ import { cn } from "@/lib/utils";
 
 import { errMsg, humanTime } from "./_shared";
 import { AsnFormModal } from "./AsnFormModal";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 // ── Badges ──────────────────────────────────────────────────────────
 
@@ -207,6 +208,13 @@ function AsnRow({
   onToggle: () => void;
   onEdit: () => void;
 }) {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write on 'manage_asns'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_asns"),
+    "Requires write permission on ASNs",
+  );
   const qc = useQueryClient();
   const refreshMut = useMutation({
     mutationFn: () => asnsApi.refreshWhois(a.id),
@@ -278,6 +286,7 @@ function AsnRow({
                 : "Refresh WHOIS"
             }
             className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+            {...writeGate}
           >
             {refreshMut.isPending ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -288,7 +297,8 @@ function AsnRow({
           <button
             onClick={onEdit}
             title="Edit ASN"
-            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Pencil className="h-3 w-3" />
           </button>
@@ -301,6 +311,17 @@ function AsnRow({
 // ── Page ────────────────────────────────────────────────────────────
 
 export function AsnsPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'manage_asns'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_asns"),
+    "Requires write permission on ASNs",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_asns"),
+    "Requires delete permission on ASNs",
+  );
   const qc = useQueryClient();
 
   const [kindFilter, setKindFilter] = useState<ASNKind | "all">("all");
@@ -407,6 +428,7 @@ export function AsnsPage() {
               variant="primary"
               icon={Plus}
               onClick={() => setShowCreate(true)}
+              {...writeGate}
             >
               New ASN
             </HeaderButton>
@@ -465,7 +487,8 @@ export function AsnsPage() {
             <span className="text-xs font-medium">Bulk:</span>
             <button
               onClick={() => setConfirmDelete(true)}
-              className="inline-flex items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
+              className="inline-flex items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50"
+              {...deleteGate}
             >
               <Trash2 className="h-3 w-3" /> Delete {selected.size}
             </button>
@@ -493,7 +516,8 @@ export function AsnsPage() {
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="mt-1 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                className="mt-1 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+                {...writeGate}
               >
                 <Plus className="h-3 w-3" /> New ASN
               </button>
