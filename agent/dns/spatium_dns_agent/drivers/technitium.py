@@ -569,6 +569,59 @@ def _qualified_name(zone_name: str, name: str) -> str:
     return f"{bare}.{zone}"
 
 
+def _shadowing_zone(domain: str, zone: str, hosted: Any) -> str | None:
+    """The hosted zone that answers ``domain`` instead of ``zone``, or None (#1712).
+
+    Technitium keeps one tree node per name, and a node BELOW a zone apex
+    holds a single sub-domain zone that the parent and the child both write
+    through (``AuthZoneManager.AddRecord`` → ``AuthZoneTree.GetOrAddSubDomainZone``
+    → ``AuthZoneNode.GetOrAddParentSideZone``, 15.4.0). So a parent's record
+    at a name inside a child zone on the same daemon lands in the child's
+    data, and ``overwrite=true`` there clears the child's own RRset. The child
+    owns that name, as it does on BIND9, where the deepest zone answers; the
+    parent's record cannot be served from this daemon, and writing it is
+    destructive.
+
+    The child's APEX is not shadowed: at that node Technitium keeps the
+    parent's side apart (``_parentSideZone`` beside ``_apexZone``), which is
+    where a delegation's NS lives, so the parent's records at the cut are
+    written as before. ``hosted`` is the zone names this daemon serves
+    (lower-case, no trailing dot); returns the deepest one that is a strict
+    descendant of ``zone`` and strictly contains ``domain``.
+    """
+    zone = zone.rstrip(".").lower()
+    domain = domain.rstrip(".").lower()
+    best: str | None = None
+    for cand in hosted or ():
+        cand = str(cand).rstrip(".").lower()
+        if cand == zone or not cand.endswith("." + zone):
+            continue
+        if domain.endswith("." + cand) and (best is None or len(cand) > len(best)):
+            best = cand
+    return best
+
+
+def _zone_is_rendered(zone: Any) -> bool:
+    """Whether the structural render creates ``zone`` on the daemon (#1712).
+
+    Mirrors the skips in ``render``'s zone loop (unsupported type, a
+    secondary / stub with no masters, a forwarder with no forwarders). Only a
+    zone the daemon hosts can shadow a parent's record: one the render skips
+    does not exist there, and skipping the parent's record for it would leave
+    the name served by nothing.
+    """
+    if not isinstance(zone, dict) or not str(zone.get("name") or "").rstrip("."):
+        return False
+    ztype = _ZONE_TYPE_MAP.get((zone.get("type") or "primary").lower())
+    if ztype is None:
+        return False
+    if ztype in ("Secondary", "Stub"):
+        return any(zone.get("masters") or [])
+    if ztype == "Forwarder":
+        return any(zone.get("forwarders") or [])
+    return True
+
+
 def _canonical_ip(value: str) -> str:
     """Canonical form of an A/AAAA value via ``ipaddress`` (#1513).
 
@@ -2126,6 +2179,16 @@ class TechnitiumDriver(DriverBase):
                 }
             )
         )
+        # The zones this render creates on the daemon (#1712): only those can
+        # shadow a parent's record. Not ``bundle_zone_names``, which keeps the
+        # skipped ones too.
+        hosted_zone_names = sorted(
+            {
+                str(z.get("name") or "").rstrip(".").lower()
+                for z in raw_zones or []
+                if _zone_is_rendered(z)
+            }
+        )
 
         # The key a secondary signs with is always one of the group's own
         # (#1765): the control plane names only a key this group holds with
@@ -2187,6 +2250,17 @@ class TechnitiumDriver(DriverBase):
                     if rtype in _DAEMON_MANAGED_APEX_TYPES:
                         continue
                     name = _qualified_name(zname, rec.get("name") or "@")
+                    shadow = _shadowing_zone(name, zname, hosted_zone_names)
+                    if shadow is not None:
+                        # #1712: the child zone owns this name on the daemon.
+                        log.warning(
+                            "technitium_record_shadowed_by_child_zone",
+                            zone=zname,
+                            name=name,
+                            type=rtype,
+                            child_zone=shadow,
+                        )
+                        continue
                     if rtype == "NS" and name == zname:
                         # Apex NS is reconciled with the SOA, as a set
                         # (``_zone_apex`` / ``_reconcile_zone_apex``), not
@@ -2301,6 +2375,7 @@ class TechnitiumDriver(DriverBase):
             ],
             "catalog": catalog,
             "bundle_zone_names": bundle_zone_names,
+            "hosted_zone_names": hosted_zone_names,
         }
         self._write_secret(
             new_dir / "server.json", json.dumps(server_payload, indent=2)
@@ -2816,6 +2891,19 @@ class TechnitiumDriver(DriverBase):
         rec = op["record"]
         rtype = (rec.get("type") or "").upper()
         name = _qualified_name(zone, rec.get("name") or "@")
+        shadow = _shadowing_zone(name, zone, self._hosted_zone_names())
+        if shadow is not None:
+            # #1712: Technitium would file this under the child zone and, with
+            # ``overwrite=true``, clear the child's own RRset at the name.
+            log.warning(
+                "technitium_record_op_shadowed_by_child_zone",
+                zone=zone,
+                name=name,
+                type=rtype,
+                op=op_kind,
+                child_zone=shadow,
+            )
+            return None
         # Absence, not falsiness — a TTL of 0 is legal ("never cache this") and
         # ``or`` silently turned it into an hour. Matches bind9's driver, which
         # has always tested for None here.
@@ -2919,6 +3007,26 @@ class TechnitiumDriver(DriverBase):
                 op=op_kind,
             )
         return None
+
+    def _hosted_zone_names(self) -> list[str]:
+        """Zones the last render created on the daemon, or [] when unreadable.
+
+        Read from the rendered snapshot rather than held in memory so a record
+        op arriving after an agent restart, before any new render, still knows
+        the zone layout. A snapshot an older agent wrote has no
+        ``hosted_zone_names``; its ``bundle_zone_names`` is the nearest answer
+        until the next render rewrites it.
+        """
+        try:
+            state = json.loads((self.state_dir / "rendered" / "server.json").read_text())
+        except (OSError, ValueError):
+            return []
+        if not isinstance(state, dict):
+            return []
+        names = state.get("hosted_zone_names")
+        if names is None:
+            names = state.get("bundle_zone_names")
+        return [str(n) for n in names] if isinstance(names, list) else []
 
     def _record_call(
         self,

@@ -2662,7 +2662,9 @@ def test_record_of_the_parent_survives_retiring_the_child_zone(tmp_path: Path) -
     """QA walk on #1497: Technitium files a record added to ``p1`` under the
     closest zone it hosts, here ``kid.p1``, and ``zones/delete`` of the child
     takes it along. The parent's reconcile has to run after the retire, or
-    the name is NXDOMAIN until the next structural pass."""
+    the name is NXDOMAIN until the next structural pass. (Since #1712 the
+    record is not written into the child in the first place; it lands in the
+    parent once the child is gone.)"""
     zones: dict[str, list[dict[str, Any]]] = {}
 
     def _daemon(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
@@ -2704,7 +2706,10 @@ def test_record_of_the_parent_survives_retiring_the_child_zone(tmp_path: Path) -
         "records": [{"name": "www.kid", "type": "A", "value": "192.0.2.11"}],
     }
     _apply({"zones": [{"name": "kid.p1.", "type": "primary", "records": []}, parent]})
-    assert [r["domain"] for r in zones["kid.p1"]] == ["www.kid.p1"]
+    # #1712: while the child exists it owns the name, so the parent's record is
+    # not written (Technitium would file it under the child, and its
+    # overwrite would clear the child's own RRset).
+    assert zones["kid.p1"] == []
 
     _apply({"zones": [parent]})
     assert "kid.p1" not in zones

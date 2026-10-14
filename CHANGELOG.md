@@ -84,6 +84,36 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Sync with Servers on a group syncs each server, not the primary once
+  per server (#1697).** The per-server loop called the per-zone sync with
+  no server, which resolved the zone's primary every time, so an
+  unreachable server was listed as succeeded with the primary's counts
+  and a secondary was never compared. The zone sync now takes the server
+  being walked, which also fixes the single-server Sync on a server row.
+
+- **Technitium's own apex NS is no longer imported by Sync or listed by
+  drift (#1696, #1809).** The `technitium_api` pull returned the NS
+  Technitium writes at every new primary zone's apex, so the first Sync
+  turned it into an operator-owned record and drift never read in sync.
+  It is dropped unless the zone's SpatiumDDI records hold that NS.
+
+- **A Technitium parent zone's record at a name inside a child zone on
+  the same server is no longer written into the child (#1712).**
+  Technitium files a record under the closest zone it hosts, so the
+  parent's record landed in the child and its `overwrite=true` cleared
+  the child's own RRset. The agent now skips such a record, in the
+  structural render and in record ops, and logs
+  `technitium_record_shadowed_by_child_zone`; the child's own value is
+  served, as on BIND9, and any copy the parent's record left in the child
+  is removed by the child's next reconcile. A record at the child's apex
+  (a delegation NS) is still written: Technitium keeps the parent's side
+  of the cut apart.
+
+- **Regression guard for #1695.** Two records of one type at one name,
+  both missing from a `technitium_api` server, are both put back by Sync
+  and stay: each pushed change carries the complete desired set (since
+  #1760), which the driver replays with only member 0 overwriting.
+
 - **A rolling upgrade no longer accepts an `http://` slot image URL
   that every appliance then refuses (#1752).** The Plan validator allowed
   `http` or `https`; the supervisor fetches only `https://` or `file://`
