@@ -491,6 +491,10 @@ export interface DnsSyncPreview {
   forward_zone_name: string | null;
   reverse_zone_id: string | null;
   reverse_zone_name: string | null;
+  /** Every reverse zone the subnet's addresses resolve to, in address
+   * order — a subnet wider than a /24 spans several (#1840). The two
+   * fields above are the first of them. Empty on block/space scope. */
+  reverse_zone_names?: string[];
   missing: DnsSyncMissing[];
   mismatched: DnsSyncMismatch[];
   stale: DnsSyncStale[];

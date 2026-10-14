@@ -1063,7 +1063,7 @@ def resolved_zone_kind(name: str, kind: str | None, zone_type: str) -> str:
     Add Record pre-fills PTR. IPAM publishes PTR records only into kind
     "reverse" zones (``_resolve_reverse_zone``), and the reverse-zone
     auto-create finds a zone of the computed name and creates nothing beside it
-    (``ensure_reverse_zone_for_subnet``). Stored as anything else, such a zone
+    (``ensure_reverse_zones_for_subnet``). Stored as anything else, such a zone
     silently gets no PTR, for a gateway or a host, while the DNS-sync summary
     reads in sync. So for a primary zone ``None`` (the request did not say)
     takes the kind from the name, and a kind the name contradicts raises
