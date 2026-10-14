@@ -18,11 +18,7 @@ import {
   errMsg,
   DeleteConfirmModal,
 } from "./_shared";
-import {
-  NEEDS_SUPERADMIN,
-  permissionGate,
-  usePermissions,
-} from "@/hooks/usePermissions";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const PROFILE_KEY_BASE = "dhcp-phone-profiles";
 
@@ -34,10 +30,15 @@ const PROFILE_KEY_BASE = "dhcp-phone-profiles";
  * starter pack and tweak from there, or roll their own from scratch.
  */
 export function PhoneProfilesTab({ groupId }: { groupId: string }) {
-  // #1339 — every Kea-tab write takes a superadmin (SuperAdmin handlers).
-  const superadminGate = permissionGate(
-    usePermissions().isSuperadmin,
-    NEEDS_SUPERADMIN,
+  // #1339, #1861 — writes take write, deletes delete, on ``dhcp_scope``.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "dhcp_scope"),
+    "Requires write permission on DHCP scopes",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "dhcp_scope"),
+    "Requires delete permission on DHCP scopes",
   );
   const qc = useQueryClient();
   const [showCreate, setShowCreate] = useState(false);
@@ -94,7 +95,7 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
               disabled={seedMut.isPending}
               title="Create disabled starter profiles for the 9 curated VoIP vendors. You'll need to fill in your provisioning server values before enabling each."
               className="inline-flex items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
-              {...superadminGate}
+              {...writeGate}
             >
               <Sparkles className="h-3 w-3" />
               {seedMut.isPending ? "Seeding…" : "Seed starter pack"}
@@ -104,7 +105,7 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
             type="button"
             onClick={() => setShowCreate(true)}
             className="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-            {...superadminGate}
+            {...writeGate}
           >
             <Plus className="h-3 w-3" /> New Phone Profile
           </button>
@@ -175,7 +176,7 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
                         onClick={() => setEdit(p)}
                         className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                         title="Edit profile"
-                        {...superadminGate}
+                        {...writeGate}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
@@ -183,7 +184,7 @@ export function PhoneProfilesTab({ groupId }: { groupId: string }) {
                         onClick={() => setDel(p)}
                         className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         title="Delete profile"
-                        {...superadminGate}
+                        {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>

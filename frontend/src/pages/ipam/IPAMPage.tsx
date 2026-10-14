@@ -4285,6 +4285,34 @@ const NEEDS_SUBNET_WRITE = "Requires write permission on subnets";
 const NEEDS_ADDRESS_WRITE =
   "Requires write permission on this subnet or on an address set in it";
 const NEEDS_NMAP_WRITE = "Requires write permission on nmap scans";
+const NEEDS_ADDRESS_DELETE =
+  "Requires delete permission in IPAM, and write on this subnet or on an address set in it";
+const NEEDS_ORPHAN_PURGE =
+  "Requires delete permission in IPAM and write permission on subnets";
+
+// The IPAM router's gate: a multi-row delete (Bulk delete, Clean Orphans)
+// needs ``delete`` on one of these types, as a single-row DELETE does
+// (``require_any_resource_or_scoped`` in ``api/v1/ipam/router.py``).
+const IPAM_GATE_TYPES = [
+  "ip_space",
+  "ip_block",
+  "subnet",
+  "ip_address",
+  "custom_field",
+  "nat_mapping",
+  "manage_ipam_templates",
+];
+
+function canDeleteInIpam(
+  can: (action: string, type: string, id?: string | null) => boolean,
+  addressSetIds: string[] = [],
+): boolean {
+  return (
+    IPAM_GATE_TYPES.some((t) => can("delete", t)) ||
+    can("delete", "address_set") ||
+    addressSetIds.some((id) => can("delete", "address_set", id))
+  );
+}
 
 // Collapses Clean Orphans / Merge / Resize / Scan with nmap / Split into a
 // single dropdown so the subnet header doesn't accumulate a row of 9+ buttons
@@ -4309,7 +4337,7 @@ function ToolsMenu({
   /** #1155 — which of the writing tools the caller's grants will pass;
    *  the rest stay listed, disabled, with the reason as their tooltip.
    *  Reconcile opens a review and Ask AI reads, so neither is gated. */
-  can: { allocate: boolean; reshape: boolean; scan: boolean };
+  can: { allocate: boolean; reshape: boolean; scan: boolean; purge: boolean };
   onBulkAllocate: () => void;
   onCleanOrphans: () => void;
   onMerge: () => void;
@@ -4342,7 +4370,7 @@ function ToolsMenu({
           label: "Clean Orphans",
           icon: Trash2,
           onSelect: onCleanOrphans,
-          ...reshape,
+          ...permissionGate(can.purge, NEEDS_ORPHAN_PURGE),
         },
         {
           key: "merge",
@@ -4761,6 +4789,12 @@ function SubnetDetail({
   const canWriteSubnets = perms.can("write", "subnet");
   const canAllocate = subnetWritable || writableSets.length > 0;
   const canScan = perms.can("write", "manage_nmap_scans");
+  // Bulk delete and Clean Orphans are deletes: the router gate wants
+  // ``delete``, the handler write on the row's subnet or address set.
+  const canDeleteIpam = canDeleteInIpam(
+    perms.can,
+    addressSets.map((s) => s.id),
+  );
 
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
   const [viewingAddress, setViewingAddress] = useState<IPAddress | null>(null);
@@ -5410,6 +5444,7 @@ function SubnetDetail({
                 allocate: canAllocate,
                 reshape: canWriteSubnets,
                 scan: canScan,
+                purge: canWriteSubnets && canDeleteIpam,
               }}
               onBulkAllocate={() => setShowBulkAllocate(true)}
               onCleanOrphans={() => setShowOrphans(true)}
@@ -5740,7 +5775,11 @@ function SubnetDetail({
               </button>
               <button
                 onClick={() => setShowBulkDelete(true)}
-                className="flex items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-2.5 py-1 text-xs text-destructive hover:bg-destructive/10"
+                className="flex items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-2.5 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
+                {...permissionGate(
+                  canAllocate && canDeleteIpam,
+                  NEEDS_ADDRESS_DELETE,
+                )}
               >
                 <Trash2 className="h-3 w-3" />
                 Bulk delete
@@ -15553,6 +15592,8 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
   const [selectingAll, setSelectingAll] = useState(false);
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
+  const perms = usePermissions();
+  const canDeleteIpam = canDeleteInIpam(perms.can);
 
   const params = {
     q: applied.q || undefined,
@@ -15842,6 +15883,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
               disabled={selected.size === 0}
               onClick={() => setShowBulkDelete(true)}
               className="inline-flex items-center gap-1.5 rounded-md border border-destructive/40 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:opacity-40"
+              {...permissionGate(canDeleteIpam, NEEDS_ADDRESS_DELETE)}
             >
               <Trash2 className="h-3.5 w-3.5" />
               Delete {selected.size > 0 ? selected.size.toLocaleString() : ""}…
