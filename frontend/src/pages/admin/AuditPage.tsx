@@ -49,7 +49,9 @@ const RESOURCE_TYPE_OPTIONS = [
   "dhcp_static_assignment",
 ];
 
-const RESULT_OPTIONS = ["success", "denied", "error"];
+// `failure` is what a rejected sign-in is audited with, and `forbidden`
+// what a refused break-glass or secret reveal is (#1874).
+const RESULT_OPTIONS = ["success", "failure", "denied", "forbidden", "error"];
 
 function ActionBadge({ action }: { action: string }) {
   const cls =

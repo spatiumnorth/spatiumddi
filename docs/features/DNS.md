@@ -1153,6 +1153,17 @@ element:
 - Export zone as standard zone file
 - Record diff view before pushing changes to server
 
+**TTLs on import are compared as effective TTLs (#1727).** A record with no
+TTL of its own inherits the zone default, and the export writes it without a
+TTL column, so the file hands back the zone's `$TTL`. A zone file cannot say
+whether a TTL was written out or inherited, so an import treats a file TTL
+equal to the zone default as no change for an inheriting record, and the
+record keeps inheriting. A file TTL that differs updates it, as before. The
+parser also reports one TTL per RRset (the lowest among its members, which is
+what the RRset is served with), so a member whose file TTL equals its RRset's
+existing lowest effective TTL is unchanged too. Re-importing a zone's own
+export changes nothing.
+
 ### Zone Health Indicators
 - Last successful sync timestamp
 - Serial number displayed
@@ -1217,6 +1228,8 @@ The UI surfaces per-server results with zones-imported / zones-pushed / errors, 
 **Technitium's own apex NS is not imported (#1696, #1809).** The agentless `technitium_api` pull returns the NS Technitium writes at the apex of every primary zone it creates; Sync leaves it out and drift does not list it as extra. An apex NS the zone really holds in SpatiumDDI is still compared like any other record, and an NS below the apex (a delegation) is always handled normally.
 
 **Name targets are read the way the driver reads them (#1794).** A CNAME / DNAME / NS / PTR / MX / SRV / NAPTR / SVCB / HTTPS target with no trailing dot is relative to the zone on BIND9, Technitium (both drivers) and Windows without WinRM credentials, so `a.b` means `a.b.<zone>.`; on the cloud drivers and Windows over WinRM the name is taken as given, so `a.b` is already absolute. Drift and sync compare on that reading, so neither reports a false difference nor imports a duplicate.
+
+**Apex NS (#1857).** An agent-managed BIND9 or Technitium server serves the zone's own apex NS rows as its NS set, so drift reads the apex NS from it and compares the two: an NS set changed on the server, or an NS change the agent has not applied, shows as drift. When the zone has no apex NS rows, the NS set the server answers with (its Primary NS or placeholder, or a provider's name servers) is its own and is not reported. When the read carries no apex NS at all (an operator's own BIND9, Windows over a zone transfer), the stored rows are left out, since they would otherwise read "missing on server" forever. NS records below the apex are always compared. Import and Sync with Servers never read the apex NS.
 
 Manual drift checks from the subnet / block / space side use **Check DNS Sync** which only covers IPAM-managed records (A/AAAA/PTR). The group-level reconciliation covers everything in a zone.
 

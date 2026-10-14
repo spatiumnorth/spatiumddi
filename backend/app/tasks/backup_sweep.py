@@ -28,6 +28,7 @@ import structlog
 from sqlalchemy import select
 
 from app.celery_app import celery_app
+from app.config import settings
 from app.db import task_session
 from app.models.backup import BackupTarget
 from app.services.backup.runner import (
@@ -43,7 +44,7 @@ async def _sweep() -> dict[str, int]:
     fired = 0
     skipped_in_progress = 0
     reaped_stale = 0
-    async with task_session() as db:
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         now = datetime.now(UTC)
         rows = (
             (

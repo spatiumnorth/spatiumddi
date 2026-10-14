@@ -24,6 +24,7 @@ import {
   type VRFUpdate,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -446,6 +447,17 @@ function BulkDeleteModal({
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export function VRFsPage() {
+  // #1340 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'vrf'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "vrf"),
+    "Requires write permission on VRFs",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "vrf"),
+    "Requires delete permission on VRFs",
+  );
   const qc = useQueryClient();
   const [editing, setEditing] = useState<VRF | null>(null);
   const [showCreate, setShowCreate] = useState(false);
@@ -520,7 +532,11 @@ export function VRFsPage() {
             />
             Refresh
           </HeaderButton>
-          <HeaderButton variant="primary" onClick={() => setShowCreate(true)}>
+          <HeaderButton
+            variant="primary"
+            onClick={() => setShowCreate(true)}
+            {...writeGate}
+          >
             <Plus className="h-3.5 w-3.5" /> New VRF
           </HeaderButton>
         </div>
@@ -542,7 +558,8 @@ export function VRFsPage() {
           <div className="flex items-center gap-2">
             <button
               onClick={() => setConfirmBulk(true)}
-              className="inline-flex items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
+              className="inline-flex items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50"
+              {...deleteGate}
             >
               <Trash2 className="h-3 w-3" /> Delete {selected.size}
             </button>
@@ -661,8 +678,9 @@ export function VRFsPage() {
                     />
                     <button
                       onClick={() => setEditing(v)}
-                      className="ml-1 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      className="ml-1 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                       title="Edit VRF"
+                      {...writeGate}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>

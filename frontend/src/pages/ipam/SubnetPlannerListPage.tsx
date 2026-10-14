@@ -11,12 +11,24 @@ import {
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { newNodeId } from "@/lib/uuid";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 /**
  * Index of saved subnet plans. New plans bootstrap with a root node and a
  * choice between "anchored to existing block" or "new top-level CIDR".
  */
 export function SubnetPlannerListPage() {
+  // #1341 — a read-only user is offered no write it would be refused:
+  // the router asks write (delete) on 'ip_block'.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "ip_block"),
+    "Requires write permission on IP blocks",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "ip_block"),
+    "Requires delete permission on IP blocks",
+  );
   const [showNew, setShowNew] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<SubnetPlanRead | null>(
     null,
@@ -61,7 +73,8 @@ export function SubnetPlannerListPage() {
           <button
             type="button"
             onClick={() => setShowNew(true)}
-            className="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+            className="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            {...writeGate}
           >
             <Plus className="h-4 w-4" /> New plan
           </button>
@@ -133,8 +146,9 @@ export function SubnetPlannerListPage() {
                       <button
                         type="button"
                         onClick={() => setPendingDelete(p)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
                         aria-label="Delete plan"
+                        {...deleteGate}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>

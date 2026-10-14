@@ -35,7 +35,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import decrypt_str, encrypt_str
-from app.db import AsyncSessionLocal
+from app.db import task_session
 from app.models.acme_client import (
     ACME_CHALLENGE_HTTP01,
     ACME_ORDER_INVALID,
@@ -307,10 +307,15 @@ async def run_order(
         # Always tear down challenge TXT records — they're useless after
         # validation and would accumulate as zone noise otherwise. Each
         # cleanup opens its own fresh session so a failed primary session
-        # (rolled back) doesn't block the teardown.
+        # (rolled back) doesn't block the teardown. They use
+        # ``task_session()``, not the shared ``AsyncSessionLocal``: this
+        # runs inside a Celery task's ``asyncio.run`` loop, and the shared
+        # engine's pooled connections stay bound to an earlier task's
+        # (closed) loop - "Event loop is closed", teardown skipped
+        # (#1687, #1726).
         for handle in handles:
             try:
-                async with AsyncSessionLocal() as cleanup_db:
+                async with task_session() as cleanup_db:
                     await dns01.cleanup(cleanup_db, handle)
             except Exception as exc:  # noqa: BLE001 — best-effort teardown
                 logger.warning(
@@ -320,7 +325,7 @@ async def run_order(
                 )
         # http-01 token rows are useless after validation — sweep them too.
         try:
-            async with AsyncSessionLocal() as cleanup_db:
+            async with task_session() as cleanup_db:
                 await http01.cleanup(cleanup_db, oid)
                 await cleanup_db.commit()
         except Exception as exc:  # noqa: BLE001 — best-effort teardown

@@ -36,8 +36,12 @@ name different failures:
 * ``receive_drop`` — packets Kea read off the socket and then discarded
   (unparseable, matched the ``DROP`` class, no subnet selected).
 * ``socket_drop`` — packets the kernel dropped because Kea's receive
-  buffer was full, so Kea never saw them at all. Read from
-  ``/proc/net/udp`` by :mod:`.socket_drops`, not from Kea.
+  buffer was full, so Kea never saw them at all. Read by
+  :mod:`.socket_drops`, not from Kea: the DHCP-port UDP sockets from
+  ``/proc/net/udp``. In ``dhcp-socket-type: raw``, kea-dhcp4 serves from
+  its AF_PACKET sockets, relayed traffic too, and its port-67 UDP sockets
+  are only fallbacks, so those AF_PACKET sockets are read through sock_diag
+  instead (#1283).
 
 The distinction is the point. Measured against kea-dhcp4 3.0.3 on
 2026-09-06, a run that lost 9,700 datagrams to buffer overflow reported
@@ -74,7 +78,7 @@ import structlog
 from .config import AgentConfig
 from .kea_ctrl import KeaCtrlError, send_command
 from .push import CPPoster, disabled_spool, drain_for, late_bound
-from .socket_drops import SocketDropCounter
+from .socket_drops import SocketDropCounter, kea_socket_type
 from .spool import RETRY, Shipper, Spool
 
 log = structlog.get_logger(__name__)
@@ -171,8 +175,12 @@ class MetricsPoller:
         # bucket is absorbed (no baseline to diff against).
         self._prev: dict[str, int] | None = None
         # #980 — kernel-side loss, sampled in lockstep with the Kea
-        # counters so both deltas always cover the same interval.
-        self._socket = SocketDropCounter()
+        # counters so both deltas always cover the same interval. #1283 —
+        # which sockets follows kea-dhcp4's socket mode, read from the
+        # config this agent rendered for it.
+        self._socket = SocketDropCounter(
+            socket_type=lambda: kea_socket_type(cfg.kea_config_path)
+        )
 
     def stop(self) -> None:
         self._stop.set()

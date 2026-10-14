@@ -22,6 +22,7 @@ import structlog
 from sqlalchemy import delete, select
 
 from app.celery_app import celery_app
+from app.config import settings as app_config
 from app.db import task_session
 from app.models.dhcp import DHCPLeaseHistory
 from app.models.settings import PlatformSettings
@@ -31,7 +32,7 @@ logger = structlog.get_logger(__name__)
 
 
 async def _prune() -> int:
-    async with task_session() as db:
+    async with task_session(command_timeout=app_config.task_db_long_command_timeout) as db:
         # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
         # do no work (and open no driver connections) when it is.
         if not await is_module_enabled(db, "core.dhcp"):

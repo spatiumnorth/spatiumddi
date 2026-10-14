@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
+from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, Subnet
 from app.models.settings import PlatformSettings
@@ -162,7 +163,9 @@ async def _run_auto_sync() -> dict[str, Any]:
     from app.services.dns.ddns import resolve_effective_ddns  # noqa: PLC0415
     from app.services.dns.sync_check import compute_subnet_dns_drift  # noqa: PLC0415
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
