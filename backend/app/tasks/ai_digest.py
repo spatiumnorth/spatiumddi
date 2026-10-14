@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.drivers.llm import ChatMessage, ChatRequest, get_driver
 from app.models.ai import AIProvider
 from app.models.alerts import AlertEvent
@@ -303,7 +304,9 @@ async def _dispatch_digest(summary: str, rollup: dict[str, Any]) -> int:
 
 
 async def _run() -> dict[str, Any]:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:

@@ -3027,8 +3027,11 @@ so a first-time operator never gets stuck looking for the upload.
 3. Picks source (Uploaded or URL — see above).
 4. Clicks **Run preflight**. Verdict surfaces inline as a checklist:
    `inflight_conflict`, `replication_lag`, `disk_headroom` (each
-   node's reported `/var`; a missing or stale report warns),
-   `mirror_disk_headroom` (mirror PVC; skipped if not configured),
+   node's reported `/var`; a missing or stale report warns; a node
+   already on the target stages nothing and is named instead of
+   judged), `mirror_disk_headroom` (mirror PVC; skipped if not
+   configured; an uploaded target the mirror already holds needs only
+   the margin),
    `version_path`, `quorum`. Any `fail` blocks Plan; `warn` lets
    Plan proceed but flags the row.
 5. Clicks **Plan**. A `system_upgrade_run` row is inserted in
@@ -3042,14 +3045,56 @@ so a first-time operator never gets stuck looking for the upload.
    health-gate → DaemonSet-ready gate → uncordon → settle pause.
 7. Live progress streams into the Plan banner (per-node state pills
    + ETA). Halt / Resume / Abort buttons exposed.
-8. After every node is on the new slot, the orchestrator patches the
-   spatiumddi chart's `image.tag` via a HelmChartConfig (so api /
-   frontend / worker container images land too), waits for the
-   rollout, runs the migrate Job, and posts the cluster-wide
-   verification suite (CNPG instance count, DaemonSet pods Ready).
+   Each node's own preflight judges `/var` only on the nodes the run
+   has still to upgrade: upgrading a node is what shrinks its `/var`,
+   so the nodes already done are not asked again (#1709).
+8. After every node is on the new slot, the shared image tags move,
+   once (see *The shared image tags* below), the drive hands the rest
+   of the run to a worker already on the target, and that worker waits
+   until every moved Deployment and DaemonSet runs the target and has
+   rolled out, then posts the cluster-wide verification suite (CNPG
+   instance count, re-read for up to 10 minutes while an instance
+   rejoins; DaemonSet pods Ready) (#1829). A single-node run has no
+   mixed-version window and patches the control chart's `image.tag`
+   at the end as before.
 9. Run flips to `state='succeeded'` (or `failed` / `halted` /
    `aborted`). Lease is released. The OS Versions tab shows the new
    default slot on every node.
+
+**The shared image tags (#1710).** A cluster shares three k3s
+HelmCharts, each carrying one image tag for workloads on every node:
+`spatium-bootstrap` (the supervisor DaemonSet), `spatium-control` (api,
+worker, beat, frontend, slot-image mirror) and `spatiumddi-appliance`
+(the DNS / DHCP agents). Every pod is `imagePullPolicy: Never`, so a tag
+moved while a node is still on the old slot hands that node images it
+does not have. A rolling run therefore holds all three on the version
+the cluster runs until every node reports the target:
+
+- Before its first node, and again before each one, the run pins
+  `global.imageTag` / `image.tag` in the bootstrap and control charts'
+  HelmChartConfigs, so the seed's firstboot re-render cannot move them.
+- The supervisor heartbeat tells each cluster member of the hold. A
+  supervisor whose host already runs the target writes nothing to the
+  agents chart until the hold ends; the nodes still on the old slot keep
+  writing it, with the old tag.
+- When every node is done, the run removes the pins and ends the hold in
+  one step. Each node's DNS and DHCP pods restart once at that moment.
+
+A run that fails or is aborted keeps its hold, because nodes on two
+versions are exactly what it protects. A new run's Start takes it over,
+and a beat task ends it once every cluster member reports one installed
+version, for a roll the operator finished (or took back) node by node.
+To back out by hand, delete the `global.imageTag` key from the
+`spatium-bootstrap` HelmChartConfig and `image.tag` from
+`spatium-control` in `kube-system`.
+
+**One DNS server group per cluster (#1427).** The cluster has one
+`spatiumddi-appliance` chart and so one DNS agent group. Giving a
+cluster member (or a joiner) DNS in a group other than the one the
+cluster's other DNS members serve is refused with 422, whether through
+the Fleet roles save, the Operator Copilot, a DNS server move or a
+control-plane promote. Re-saving an existing assignment and taking DNS
+off a member are never refused.
 
 **When a node's upgrade fails.** If a step fails after the run has
 cordoned the node or set the CNPG maintenance window, the orchestrator

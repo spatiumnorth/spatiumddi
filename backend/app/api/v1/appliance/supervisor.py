@@ -112,6 +112,10 @@ from app.services.appliance.ca import (
     sign_supervisor_cert,
     verify_session_token,
 )
+from app.services.appliance.cluster_dns_group import (
+    cluster_dns_group_refusal,
+    promote_dns_group_refusal,
+)
 from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.group_names import group_name_problem
 from app.services.appliance.lldp import lldp_bundle
@@ -158,6 +162,7 @@ from app.services.appliance.storage_health import (
 from app.services.appliance.syslog import syslog_bundle
 from app.services.appliance.tls_pins import signed_pin_set
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
+from app.services.upgrades import shared_tags as upgrade_shared_tags
 from app.services.upgrades.safety import assert_no_upgrade_in_flight
 from app.services.upgrades.schema_rollback import check_release_can_run
 from app.services.upgrades.schema_rollback import enforce as enforce_schema_rollback
@@ -1752,6 +1757,14 @@ class SupervisorHeartbeatResponse(BaseModel):
     # mount a disk it cannot see. Empty-shape block still sent, because
     # an empty desired set is how an EJECT reaches the host.
     removable_settings: dict[str, Any] = Field(default_factory=dict)
+    # #1710 — a rolling upgrade holds the cluster's shared charts on the tag
+    # it runs until every node reports ``target_version``: ``{"run_id",
+    # "from_tag", "target_version"}`` while it does, for each node of the
+    # run, else null. A supervisor whose host already runs the target writes
+    # nothing to the shared role chart until the hold ends, so the agents on
+    # the nodes still on the old slot keep images they have. Absent from
+    # old control planes, which reads as no hold.
+    shared_chart_hold: dict[str, str] | None = None
 
 
 def _s(v: object, limit: int = 255) -> str | None:
@@ -2920,6 +2933,14 @@ async def supervisor_heartbeat(
         firewall_settings=firewall_block,
         removable_settings=removable_bundle_safe(row.desired_removable_mounts),
         long_poll=long_poll,
+        # Only a settled member shares the charts: a node demoted out of the
+        # cluster after a failed run runs its own, and must not defer to a
+        # hold on charts it no longer reads.
+        shared_chart_hold=(
+            await upgrade_shared_tags.heartbeat_hold(db, row.hostname)
+            if row.cluster_role in (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+            else None
+        ),
     )
 
 
@@ -4360,6 +4381,24 @@ async def update_appliance_roles(
                         f"capability {cap_key}=true; cannot assign role {r!r}."
                     ),
                 )
+
+    # #1427 — a control-plane cluster serves one DNS server group; refused
+    # before anything below changes the row or moves a server.
+    refusal = await cluster_dns_group_refusal(
+        db,
+        row,
+        roles=list(body.roles) if body.roles is not None else list(row.assigned_roles or []),
+        group_id=(
+            body.dns_group_id
+            if "dns_group_id" in body.model_fields_set
+            else row.assigned_dns_group_id
+        ),
+        prev_roles=prev_dns_roles,
+        prev_group_id=prev_dns_group_id,
+    )
+    if refusal is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, refusal)
+    if body.roles is not None:
         row.assigned_roles = list(body.roles)
 
     # #1562 — presence in the payload decides, not non-None: an
@@ -4915,6 +4954,13 @@ async def promote_control_plane(
                 "a k3s control-plane cluster — only OS-appliance nodes can.",
             )
         targets.append(row)
+
+    # #1427 — a cluster serves one DNS server group: a joiner running DNS in
+    # another group would flip every DNS agent of the cluster to whichever
+    # member wrote the shared chart last.
+    dns_refusal = await promote_dns_group_refusal(db, members, targets)
+    if dns_refusal is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, dns_refusal)
 
     new_total = current_count + len(targets)
     if new_total % 2 == 0:
