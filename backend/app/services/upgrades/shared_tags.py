@@ -65,6 +65,7 @@ from app.config import settings
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.system_upgrade import SystemUpgradeRun
 from app.services.appliance import k8s
+from app.services.appliance.ownership import k8s_node_name
 
 logger = structlog.get_logger(__name__)
 
@@ -90,9 +91,6 @@ FLIP_SETTLED = "settled"
 
 DEFAULT_SETTLE_TIMEOUT_S = 1800.0
 _POLL_INTERVAL_S = 5.0
-# Runs read when looking for the newest hold. Only one run is ever
-# non-terminal, so the newest few are plenty.
-_RECENT_RUNS = 5
 
 
 @dataclass(frozen=True)
@@ -233,21 +231,28 @@ async def _wake_supervisors() -> None:
         logger.warning("upgrade_shared_tag_wake_failed", error=str(exc))
 
 
-async def _recent_runs(db: AsyncSession) -> list[SystemUpgradeRun]:
+async def _unreleased_hold_runs(db: AsyncSession) -> list[SystemUpgradeRun]:
+    """Every run whose hold has not ended, newest first.
+
+    Found by the record itself, not among the newest few runs: a failed
+    run's hold outlives any number of later Plans, and one missed here would
+    keep its pins on the charts with nothing left to remove them."""
+    record = SystemUpgradeRun.progress[PROGRESS_KEY]
     rows = await db.execute(
         select(SystemUpgradeRun)
-        .where(SystemUpgradeRun.kind == "cluster_rolling")
+        .where(
+            SystemUpgradeRun.kind == "cluster_rolling",
+            record["mode"].astext == MODE_HOLD,
+            record["released_at"].astext.is_(None),
+        )
         .order_by(SystemUpgradeRun.started_at.desc())
-        .limit(_RECENT_RUNS)
     )
     return list(rows.scalars().all())
 
 
 async def _newest_hold_run(db: AsyncSession) -> SystemUpgradeRun | None:
-    for run in await _recent_runs(db):
-        if holds(run):
-            return run
-    return None
+    runs = await _unreleased_hold_runs(db)
+    return runs[0] if runs else None
 
 
 # ── Start: place (or re-assert) the hold ─────────────────────────────
@@ -294,13 +299,9 @@ async def ensure_hold(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
         },
     )
     # One hold at a time: this run's takes over a failed or aborted run's.
-    for other in await _recent_runs(db):
+    for other in await _unreleased_hold_runs(db):
         other_record = record_of(other)
-        if (
-            other.id != run.id
-            and other_record.get("mode") == MODE_HOLD
-            and not other_record.get("released_at")
-        ):
+        if other.id != run.id:
             other_record["released_at"] = _now_iso()
             other_record["release_reason"] = f"superseded:{run.id}"
             _store(other, other_record)
@@ -487,7 +488,7 @@ async def settle(
 async def heartbeat_hold(db: AsyncSession, hostname: str | None) -> dict[str, str] | None:
     """The hold a member's heartbeat carries, or None.
 
-    Only the nodes of the holding run's plan are held (case-insensitively,
+    Only the nodes of the holding run's plan are held (matched as k8s Node names,
     as node names and hostnames may differ in case): an appliance outside
     the cluster writes its own chart, which nothing shares. The supervisor
     compares ``target_version`` with its host's installed version, the
@@ -501,8 +502,8 @@ async def heartbeat_hold(db: AsyncSession, hostname: str | None) -> dict[str, st
     record = record_of(run)
     if record.get("released_at"):
         return None
-    nodes = {str(n).lower() for n in record.get("nodes") or []}
-    if hostname.lower() not in nodes:
+    nodes = {k8s_node_name(str(n)) for n in record.get("nodes") or []}
+    if k8s_node_name(hostname) not in nodes:
         return None
     return {
         "run_id": str(run.id),

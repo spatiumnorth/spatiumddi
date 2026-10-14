@@ -536,7 +536,9 @@ def test_the_rest_of_the_run_runs_on_a_new_version_worker_or_after_the_hops(
 # ── Each node of the run hears of the hold in its heartbeat ──────────────────
 
 
-async def _supervisor(db: AsyncSession, hostname: str) -> tuple[Appliance, str]:
+async def _supervisor(
+    db: AsyncSession, hostname: str, cluster_role: str | None = "member"
+) -> tuple[Appliance, str]:
     platform = await db.get(PlatformSettings, 1)
     if platform is None:
         platform = PlatformSettings(id=1)
@@ -552,6 +554,7 @@ async def _supervisor(db: AsyncSession, hostname: str) -> tuple[Appliance, str]:
         state=APPLIANCE_STATE_APPROVED,
         deployment_kind="appliance",
         session_token_hash=token_hash,
+        cluster_role=cluster_role,
     )
     db.add(row)
     await db.commit()
@@ -603,6 +606,53 @@ async def test_the_hold_ends_in_the_heartbeat_when_the_run_releases_it(
     await db_session.commit()
 
     assert await _heartbeat(client, member, token) is None
+
+
+@pytest.mark.asyncio
+async def test_a_node_no_longer_in_the_cluster_is_not_held(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A node of the run demoted after it failed runs its own k3s and its own
+    role chart: a hold on charts it no longer reads would only stop it
+    writing its own."""
+    await _run(db_session, done=["node-a"], state="failed", shared=_hold_record())
+    left, token = await _supervisor(db_session, "node-b", cluster_role=None)
+
+    assert await _heartbeat(client, left, token) is None
+
+
+@pytest.mark.asyncio
+async def test_a_hold_is_found_however_many_runs_came_after_it(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed run's hold outlives later Plans that never started. Looked up
+    among the newest few runs only, it fell out of sight: the supervisors
+    stopped hearing of it and the beat task never took its pins off."""
+    from app.services.upgrades import shared_tags
+
+    held = await _run(db_session, done=["node-a"], state="failed", shared=_hold_record())
+    for _ in range(6):
+        await _run(db_session, done=[], state="aborted")
+    member, token = await _supervisor(db_session, "node-b")
+
+    assert (await _heartbeat(client, member, token) or {}).get("run_id") == str(held.id)
+
+    cluster = _held_cluster()
+    cluster.install(monkeypatch)
+    monkeypatch.setattr("app.core.agent_wake.publish_wake", _no_wake)
+    await db_session.delete(member)
+    await db_session.commit()
+    for name, role in (("node-a", "primary"), ("node-b", "member"), ("node-c", "member")):
+        await _member_row(db_session, name, role, TO)
+    assert await shared_tags.release_lingering_hold(db_session) == {
+        "run_id": str(held.id),
+        "version": TO,
+    }
+    assert cluster.values("spatium-bootstrap") == {}
+
+
+async def _no_wake(*_channels: str) -> None:
+    return None
 
 
 # ── A failed run's hold ends once every member reports one version ───────────

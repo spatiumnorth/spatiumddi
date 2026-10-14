@@ -67,6 +67,7 @@ from app.models.appliance import (
     CLUSTER_ROLE_PRIMARY,
     Appliance,
 )
+from app.services.appliance.ownership import k8s_node_name
 from app.services.upgrades import mutex
 
 logger = structlog.get_logger(__name__)
@@ -418,7 +419,7 @@ async def check_node_disk_headroom(
 ) -> PreflightResult:
     """Per-node ``/var`` headroom for appliance fleets (#1234).
 
-    ``nodes`` narrows the judgement to those hostnames (case-insensitive):
+    ``nodes`` narrows the judgement to those hostnames (matched as k8s Node names):
     a rolling run's chain passes the nodes it has still to upgrade. Upgrading
     a node shrinks its ``/var`` (it keeps the old slot's images beside the
     new ones), and a node the run has finished, or an approved row that is
@@ -468,9 +469,10 @@ async def check_node_disk_headroom(
     need = slot_image_size_bytes + safety_margin_bytes
     missing: list[str] = []
     if nodes is not None:
-        wanted = {n.casefold() for n in nodes}
-        rows = [r for r in rows if (r.hostname or "").casefold() in wanted]
-        missing = sorted(wanted - {(r.hostname or "").casefold() for r in rows})
+        # #1757 — the Node name k3s gives a host is its lowercased hostname.
+        wanted = {k8s_node_name(n) for n in nodes}
+        rows = [r for r in rows if k8s_node_name(r.hostname) in wanted]
+        missing = sorted(wanted - {k8s_node_name(r.hostname) for r in rows})
     on_target: list[str] = []
     if target_version:
         on_target = sorted(
