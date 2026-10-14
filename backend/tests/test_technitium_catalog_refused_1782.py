@@ -161,7 +161,9 @@ async def test_copilot_assigning_technitium_appliance_to_catalog_group_is_refuse
     user = (await db_session.execute(select(User).where(User.username == "root1782g"))).scalar_one()
     plain = await _group(db_session, "plain-g")
     cat = await _group(db_session, "cat-g", catalog_zones_enabled=True)
-    appliance = await _fleet_appliance(db_session, plain)
+    appliance = await _fleet_appliance(
+        db_session, plain, capabilities={"can_run_dns_technitium": True}
+    )
     args = AssignApplianceRoleArgs(
         appliance_id=str(appliance.id), roles=["dns-technitium"], dns_group_id=str(cat.id)
     )

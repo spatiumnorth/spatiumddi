@@ -100,7 +100,7 @@ import {
   customFieldChecked,
   withCustomFieldDefaults,
 } from "@/lib/customFieldValues";
-import { hostnameError } from "@/lib/dnsNames";
+import { hostnameError, summarizeZoneNames } from "@/lib/dnsNames";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -4994,7 +4994,9 @@ function SubnetDetail({
     ...(dnsDrift?.mismatched.map((m) => m.ip_id) ?? []),
   ]);
   const subnetHasDnsZone = !!(
-    dnsDrift?.forward_zone_id || dnsDrift?.reverse_zone_id
+    dnsDrift?.forward_zone_id ||
+    dnsDrift?.reverse_zone_id ||
+    dnsDrift?.reverse_zone_names?.length
   );
 
   function ipDnsState(addr: IPAddress): "in-sync" | "out-of-sync" | "n/a" {
@@ -7136,6 +7138,13 @@ function DnsSyncModal({
     queryFn: fetchPreview,
     refetchOnMount: "always",
   });
+  // #1840 — a subnet wider than a /24 has a reverse zone per /24; an older
+  // API sends only the first one.
+  const reverseZoneNames: string[] = data?.reverse_zone_names?.length
+    ? data.reverse_zone_names
+    : data?.reverse_zone_name
+      ? [data.reverse_zone_name]
+      : [];
 
   // Per-row selection. Empty Set = nothing chosen → Apply disabled.
   const [selMissing, setSelMissing] = useState<Set<string>>(new Set());
@@ -7306,10 +7315,17 @@ function DnsSyncModal({
                     )}
                   </div>
                   <div>
-                    <span className="text-muted-foreground">Reverse zone:</span>{" "}
-                    {data.reverse_zone_name ? (
-                      <span className="font-mono">
-                        {data.reverse_zone_name}
+                    <span className="text-muted-foreground">
+                      {reverseZoneNames.length > 1
+                        ? `Reverse zones (${reverseZoneNames.length}):`
+                        : "Reverse zone:"}
+                    </span>{" "}
+                    {reverseZoneNames.length > 0 ? (
+                      <span
+                        className="font-mono break-all"
+                        title={reverseZoneNames.join("\n")}
+                      >
+                        {summarizeZoneNames(reverseZoneNames)}
                       </span>
                     ) : (
                       <span className="italic text-muted-foreground">none</span>
@@ -8069,13 +8085,13 @@ function EditSubnetModal({
             <strong className="font-mono text-foreground">
               {subnet.network}
             </strong>{" "}
-            and its DHCP scopes will be moved to Trash, with the reverse zone
-            created for it unless another subnet still uses that zone. The
-            addresses you allocated stay with it, and their A/AAAA records keep
-            resolving while it is in Trash. You can restore them together within
-            30 days from Administration → Trash; after that the nightly purge
-            deletes the subnet and its addresses for good and withdraws their
-            DNS records.
+            and its DHCP scopes will be moved to Trash, with the reverse zones
+            created for it unless another subnet still uses one. The addresses
+            you allocated stay with it, and their A/AAAA records keep resolving
+            while it is in Trash. You can restore them together within 30 days
+            from Administration → Trash; after that the nightly purge deletes
+            the subnet and its addresses for good and withdraws their DNS
+            records.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -8348,13 +8364,13 @@ function EditSubnetModal({
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
             Deleting a subnet moves it and its DHCP scopes to Trash, restorable
-            together for 30 days, along with the reverse zone created for it
-            (unless another subnet still uses that zone). The addresses you
-            allocated stay with it and come back on restore, and their A/AAAA
-            records keep resolving while it is in Trash. Addresses from DHCP
-            (leases and reservations) are removed straight away with their DNS
-            records; reservations come back with their scope on restore. Purging
-            the subnet from Trash deletes its addresses and withdraws their DNS
+            together for 30 days, along with the reverse zones created for it
+            (except one another subnet still uses). The addresses you allocated
+            stay with it and come back on restore, and their A/AAAA records keep
+            resolving while it is in Trash. Addresses from DHCP (leases and
+            reservations) are removed straight away with their DNS records;
+            reservations come back with their scope on restore. Purging the
+            subnet from Trash deletes its addresses and withdraws their DNS
             records. The deletion is gated by a confirm in the next step.
           </p>
           <button

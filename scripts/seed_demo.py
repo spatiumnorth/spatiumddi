@@ -73,24 +73,30 @@ class Api:
     409 (already exists) is swallowed silently — that's what makes the
     seed re-runnable. Every other 4xx / 5xx is logged but doesn't
     abort the run, since later sections often don't depend on earlier
-    failures (e.g. domain creation doesn't need DHCP to succeed).
+    failures (e.g. domain creation doesn't need DHCP to succeed). Each
+    one is recorded in ``failures`` so ``main`` can summarise them and
+    exit non-zero, rather than ending "Seed complete" over a section
+    that silently seeded nothing (#1465).
     """
 
     def __init__(self, base: str, token: str):
         self.c = httpx.Client(
             base_url=base, headers={"Authorization": f"Bearer {token}"}, timeout=30.0
         )
+        self.failures: list[str] = []
 
     def call(self, method: str, path: str, **kwargs):
         try:
             r = self.c.request(method, path, **kwargs)
         except httpx.HTTPError as e:
             print(f"  ! {method} {path} transport error: {e}")
+            self.failures.append(f"{method} {path} -> transport error")
             return None
         if r.status_code == 409:
             return None
         if r.status_code >= 400:
             print(f"  ! {method} {path} -> {r.status_code}: {r.text[:200]}")
+            self.failures.append(f"{method} {path} -> {r.status_code}")
             return None
         return r.json() if r.content else None
 
@@ -672,7 +678,7 @@ def seed_ipam_templates(a: Api, dns_group_id: str | None, dhcp_group_id: str | N
         "tags": {},
         "custom_fields": {},
         "ddns_enabled": True,
-        "ddns_hostname_policy": "leave_unchanged",
+        "ddns_hostname_policy": "client_or_generated",
         "child_layout": {
             "children": [
                 {"prefix": 27, "name_template": "Staff-{n}", "description": ""},
@@ -688,7 +694,7 @@ def seed_ipam_templates(a: Api, dns_group_id: str | None, dhcp_group_id: str | N
         "tags": {},
         "custom_fields": {},
         "ddns_enabled": True,
-        "ddns_hostname_policy": "leave_unchanged",
+        "ddns_hostname_policy": "client_or_generated",
     }
     if dns_group_id:
         block_template["dns_group_id"] = dns_group_id
@@ -1874,6 +1880,11 @@ def main(base: str, user: str, pw: str):
     seed_alert_rules(a)
     seed_ai_prompts(a)
 
+    if a.failures:
+        print(f"\n✗ Seed finished with {len(a.failures)} failed request(s):")
+        for f in a.failures:
+            print(f"  - {f}")
+        sys.exit(2)
     print("\n✓ Seed complete.")
 
 

@@ -63,12 +63,7 @@ from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
-from app.services.dns.reverse_zone import cidrs_overlap
-from app.services.dns.sync_check import (
-    ipam_authors_zone,
-    reverse_owner_candidates,
-    reverse_owner_key,
-)
+from app.services.dns.sync_check import ipam_authors_zone, resolve_reverse_zone
 from app.services.ipam.address_set_gate import (
     WritableSetRanges,
     load_writable_set_ranges,
@@ -88,11 +83,6 @@ from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normaliz
 from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
-
-# #844 — log-dedupe for _resolve_reverse_zone's cross-space skip (it runs per
-# IP inside _sync_dns_record). Log suppression only — never consulted for
-# logic.
-_cross_space_skip_warned: set[tuple[str, str]] = set()
 
 
 def _validate_opt_ddns_domain(v: Any) -> Any:
@@ -1137,81 +1127,18 @@ async def _pick_next_available_ip(
 async def _resolve_reverse_zone(
     db: AsyncSession, subnet: Subnet, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address
 ) -> DNSZone | None:
-    """Find the reverse zone covering this IP. Prefers a zone linked to the
-    subnet; falls back to any reverse zone in the subnet's *effective* DNS
-    group whose name is a suffix of the IP's reverse_pointer.
+    """Find the reverse zone covering this IP: a zone linked to the subnet
+    that covers it, else the most specific reverse zone in the subnet's
+    *effective* DNS group whose name is a suffix of the IP's reverse_pointer.
 
-    "Effective" is load-bearing here — see ``_resolve_effective_dns``.
-
-    Only a zone IPAM authors (a primary) is returned (#1419). The zone that
-    owns the IP's reverse name is the most specific one that covers it,
-    whatever its type: when that is a forwarder, a secondary or a stub,
-    another server owns the name and there is no zone to write the PTR into.
+    "Effective" is load-bearing here — see ``_resolve_effective_dns``. The
+    mapping itself (IPAM authors the zone, the #844 cross-space refusal, the
+    most-specific-zone rule of #1419) is ``pick_reverse_zone``, shared with
+    the drift check so the two cannot disagree about an address's zone. It is
+    per ADDRESS: a subnet wider than a /24 spans more than one (#1840).
     """
-    rev_pointer = ip_addr.reverse_pointer + "."
-    # 1. Subnet-linked reverse zone
-    res = await db.execute(
-        select(DNSZone).where(
-            DNSZone.linked_subnet_id == subnet.id,
-            DNSZone.kind == "reverse",
-        )
-    )
-    z = res.scalar_one_or_none()
-    if z and ipam_authors_zone(z) and rev_pointer.endswith("." + z.name.rstrip(".") + "."):
-        return z
-    # 2. Walk effective DNS group(s) for the subnet — inheritance-aware.
     effective_group_ids, _, _ = await _resolve_effective_dns(db, subnet)
-    if not effective_group_ids:
-        return None
-    # #844 — carry the linked subnet's space + network so a zone that an
-    # OVERLAPPING subnet in another IP space auto-created is never adopted
-    # here: both compute the identical reverse zone name, and a bare
-    # name-suffix match would fold two customers' PTRs onto the same names
-    # (cross-tenant hostname disclosure). The overlap test matters — IPv4
-    # reverse zones aggregate to /24, so two NON-overlapping subnets (in any
-    # spaces) legitimately share one zone with disjoint PTR names and must
-    # keep working. Zones with no linked subnet (operator-created shared
-    # reverse zones, or a link left dangling by a subnet delete) stay
-    # matchable — a space can't be attributed to them, and refusing would
-    # break legit single-tenant setups; ``ensure_reverse_zone_for_subnet``
-    # re-links dangling zones on the next allocation.
-    res = await db.execute(
-        select(DNSZone, Subnet.space_id, Subnet.network)
-        .outerjoin(Subnet, Subnet.id == DNSZone.linked_subnet_id)
-        .where(
-            DNSZone.group_id.in_(effective_group_ids),
-            reverse_owner_candidates(),
-        )
-    )
-    # Choose the longest matching suffix (most specific); the PTR is written
-    # only if that zone is one IPAM authors (#1419).
-    best: DNSZone | None = None
-    for z, linked_space_id, linked_network in res.all():
-        zname = z.name.rstrip(".") + "."
-        if rev_pointer.endswith("." + zname) or rev_pointer == zname:
-            if (
-                linked_space_id is not None
-                and linked_space_id != subnet.space_id
-                and cidrs_overlap(linked_network, subnet.network)
-            ):
-                key = (str(subnet.id), str(z.id))
-                # Per-IP call site: warn once per (subnet, zone) pair per
-                # process, debug after — bulk syncs would otherwise emit one
-                # warning per IP per run, forever.
-                log_fn = logger.debug if key in _cross_space_skip_warned else logger.warning
-                _cross_space_skip_warned.add(key)
-                log_fn(
-                    "reverse_zone_cross_space_skipped",
-                    subnet_id=str(subnet.id),
-                    zone_id=str(z.id),
-                    zone=z.name,
-                    note="zone is linked to an overlapping subnet in another "
-                    "IP space; PTR would leak across tenants (#844)",
-                )
-                continue
-            if best is None or reverse_owner_key(z) > reverse_owner_key(best):
-                best = z
-    return best if best is not None and ipam_authors_zone(best) else None
+    return await resolve_reverse_zone(db, subnet, ip_addr, effective_group_ids)
 
 
 # When set (inside a ``_batched_dns_ops`` block), ``_enqueue_dns_op`` defers
@@ -1648,13 +1575,13 @@ async def _sync_dns_record(
         effective_zone_id = None
 
     # Backfill the reverse zone if missing. Subnets created before DNS was
-    # assigned won't have had `ensure_reverse_zone_for_subnet` run at create
+    # assigned won't have had `ensure_reverse_zones_for_subnet` run at create
     # time, so every IP allocation is an opportunity to catch up.
     if backfill_reverse_zone:
         try:
-            from app.services.dns.reverse_zone import ensure_reverse_zone_for_subnet
+            from app.services.dns.reverse_zone import ensure_reverse_zones_for_subnet
 
-            await ensure_reverse_zone_for_subnet(db, subnet, None)
+            await ensure_reverse_zones_for_subnet(db, subnet, None)
         except Exception:  # noqa: BLE001 — best-effort, don't block IP allocation
             pass
 
@@ -4820,9 +4747,9 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     # every such subnet without a reverse zone. The helper resolves the group
     # (#844 guard included) and is a no-op when there is none.
     if not body.skip_reverse_zone:
-        from app.services.dns.reverse_zone import ensure_reverse_zone_for_subnet
+        from app.services.dns.reverse_zone import ensure_reverse_zones_for_subnet
 
-        await ensure_reverse_zone_for_subnet(
+        await ensure_reverse_zones_for_subnet(
             db,
             subnet,
             current_user,
@@ -6840,6 +6767,10 @@ class DnsSyncPreviewResponse(BaseModel):
     forward_zone_name: str | None
     reverse_zone_id: uuid.UUID | None
     reverse_zone_name: str | None
+    # Every reverse zone the subnet's addresses resolve to, in address order:
+    # a subnet wider than a /24 spans several (#1840). ``reverse_zone_id`` /
+    # ``reverse_zone_name`` are the first of them. Empty on block/space scope.
+    reverse_zone_names: list[str] = []
     missing: list[_DnsSyncMissingResp]
     mismatched: list[_DnsSyncMismatchResp]
     stale: list[_DnsSyncStaleResp]
@@ -6923,6 +6854,7 @@ async def dns_sync_preview(
         forward_zone_name=report.forward_zone_name,
         reverse_zone_id=report.reverse_zone_id,
         reverse_zone_name=report.reverse_zone_name,
+        reverse_zone_names=report.reverse_zone_names,
         missing=[_DnsSyncMissingResp(**m.__dict__) for m in report.missing],
         mismatched=[_DnsSyncMismatchResp(**m.__dict__) for m in report.mismatched],
         stale=[_DnsSyncStaleResp(**s.__dict__) for s in report.stale],
@@ -7319,32 +7251,42 @@ async def _backfill_reverse_zones(
     db: AsyncSession, subnets: list[Subnet], user: Any
 ) -> BackfillReverseZonesResponse:
     from app.services.dns.reverse_zone import (
-        compute_reverse_zone_name,
-        ensure_reverse_zone_for_subnet,
+        compute_reverse_zone_names,
+        ensure_reverse_zones_for_subnet,
     )
 
     resp = BackfillReverseZonesResponse()
     for s in subnets:
-        # Pre-check: does a reverse zone already exist for this network in
-        # any group? If so, it's not a candidate for backfill.
+        # Pre-check: does every reverse zone of the subnet's set already exist
+        # (in any group)? If so, it's not a candidate for backfill.
         try:
-            expected_name = compute_reverse_zone_name(str(s.network))
+            expected = compute_reverse_zone_names(str(s.network))
         except Exception:  # noqa: BLE001
             resp.skipped += 1
             continue
-        pre = await db.execute(
-            select(DNSZone).where(DNSZone.name == expected_name, DNSZone.kind == "reverse")
+        have = set(
+            (
+                await db.execute(
+                    select(DNSZone.name).where(
+                        DNSZone.name.in_(expected), DNSZone.kind == "reverse"
+                    )
+                )
+            ).scalars()
         )
-        if pre.scalar_one_or_none() is not None:
+        if have.issuperset(expected):
             resp.skipped += 1
             continue
         try:
-            zone = await ensure_reverse_zone_for_subnet(db, s, user)
+            zones = await ensure_reverse_zones_for_subnet(db, s, user)
         except Exception:  # noqa: BLE001
             resp.skipped += 1
             continue
-        if zone is not None:
-            resp.created.append({"subnet": str(s.network), "zone": zone.name})
+        # Only zones this call made are "created"; one that already existed
+        # is returned by the helper too.
+        made = [z for z in zones if z.name not in have]
+        if made:
+            for z in made:
+                resp.created.append({"subnet": str(s.network), "zone": z.name})
         else:
             # Subnet has no effective DNS group → nothing to do.
             resp.skipped += 1
