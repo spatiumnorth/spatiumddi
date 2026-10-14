@@ -287,17 +287,16 @@ async def test_a_zone_write_needs_dns_zone_not_just_dns_record(
     zone = await _zone(db_session, grp)
     await db_session.commit()
     g = f"/api/v1/dns/groups/{grp.id}"
-    assert (
-        await client.post(f"{g}/zones", headers=h, json={"name": "r.example."})
-    ).status_code == 403
-    assert (await client.delete(f"{g}/zones/{zone.id}", headers=h)).status_code == 403
-    assert (
-        await client.post(
-            f"{g}/zones/{zone.id}/records",
-            headers=h,
-            json={"name": "a", "record_type": "A", "value": "192.0.2.1"},
-        )
-    ).status_code == 201
+    create_resp = await client.post(f"{g}/zones", headers=h, json={"name": "r.example."})
+    assert create_resp.status_code == 403
+    delete_resp = await client.delete(f"{g}/zones/{zone.id}", headers=h)
+    assert delete_resp.status_code == 403
+    post_resp = await client.post(
+        f"{g}/zones/{zone.id}/records",
+        headers=h,
+        json={"name": "a", "record_type": "A", "value": "192.0.2.1"},
+    )
+    assert post_resp.status_code == 201
 
 
 async def test_deleting_takes_delete_not_write(
@@ -320,10 +319,12 @@ async def test_deleting_takes_delete_not_write(
     await db_session.flush()
     await db_session.commit()
 
-    assert (
-        await client.delete(f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}", headers=h)
-    ).status_code == 403
-    assert (await client.delete(f"/api/v1/dhcp/scopes/{scope.id}", headers=h)).status_code == 403
+    zone_delete_resp = await client.delete(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}", headers=h
+    )
+    assert zone_delete_resp.status_code == 403
+    scope_delete_resp = await client.delete(f"/api/v1/dhcp/scopes/{scope.id}", headers=h)
+    assert scope_delete_resp.status_code == 403
     # ...though the same role can edit both.
     _ok(
         await client.put(
