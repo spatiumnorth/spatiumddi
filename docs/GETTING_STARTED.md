@@ -191,7 +191,7 @@ Zones that SpatiumDDI didn't create itself can be imported by clicking **Sync wi
 <details markdown="1">
 <summary>Background: how reverse zone names map to subnets</summary>
 
-Reverse DNS stores IP-to-name mappings in ordinary zones under the special domains `in-addr.arpa` (IPv4) and `ip6.arpa` (IPv6), with the address octets written in reverse: the PTR record for `10.20.21.10` lives at `10.21.20.10.in-addr.arpa`, inside a zone such as `21.20.10.in-addr.arpa` (covering `10.20.21.0/24`). Reverse zones split cleanly only on octet boundaries — /8, /16, /24 — so for a subnet that isn't octet-aligned (a /23, say) SpatiumDDI creates the zone at the nearest enclosing octet boundary, the standard BIND convention for an aggregated reverse zone covering several smaller subnets.
+Reverse DNS stores IP-to-name mappings in ordinary zones under the special domains `in-addr.arpa` (IPv4) and `ip6.arpa` (IPv6), with the address octets written in reverse: the PTR record for `10.20.21.10` lives at `10.21.20.10.in-addr.arpa`, inside a zone such as `21.20.10.in-addr.arpa` (covering `10.20.21.0/24`). Reverse zones split cleanly only on octet boundaries — /8, /16, /24 — so a subnet wider than a /24 gets one zone per /24 it spans (a /23 gets two, a /20 sixteen), never one wider zone that would also claim addresses outside the subnet. A /16 or wider gets one zone per /16 (or /8) it contains, and a subnet narrower than a /24 shares its /24's zone with its neighbours.
 
 </details>
 

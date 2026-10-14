@@ -95,7 +95,7 @@ async def _seed_security_signals(db: AsyncSession) -> None:
             resource_type="user",
             resource_id="",
             resource_display="victim",
-            result="denied",
+            result="failure",
             timestamp=datetime.now(UTC),
         )
     )
