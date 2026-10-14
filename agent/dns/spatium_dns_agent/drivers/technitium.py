@@ -483,11 +483,14 @@ _BLOCK_MODE_TYPES = {
 }
 
 # Technitium's supported TSIG algorithms, as its settings API spells them.
+# hmac-sha224 is deliberately absent (#1858): ``TsigKey`` names it and the
+# settings API stores it, but ``DnsDatagram.GetTsigMacSize`` has no case for
+# it, so a request signed with it answers BADKEY. Installing it would look
+# like success and fail every signed transfer.
 _TSIG_ALGORITHMS = frozenset(
     {
         "hmac-md5",
         "hmac-sha1",
-        "hmac-sha224",
         "hmac-sha256",
         "hmac-sha256-128",
         "hmac-sha384",

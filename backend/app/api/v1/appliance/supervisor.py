@@ -4344,6 +4344,15 @@ async def update_appliance_roles(
                     f"DNS server group {target.name!r} has catalog zones enabled. "
                     + catalog_unsupported_message({"technitium"}),
                 )
+            # #1858 — and not into a group holding a key Technitium cannot use.
+            if target is not None:
+                from app.services.dns.tsig_algorithms import group_key_refusal
+
+                if key_problem := await group_key_refusal(db, target.id, {"technitium"}):
+                    raise HTTPException(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        f"DNS server group {target.name!r}: {key_problem}",
+                    )
     if signer_check is not None:
         from app.services.dns.dnssec_signers import second_signer_refusal
 

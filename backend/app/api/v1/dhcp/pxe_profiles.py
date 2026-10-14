@@ -224,7 +224,7 @@ async def create_profile(
         raise HTTPException(status_code=404, detail="DHCP server group not found")
 
     existing = await db.execute(
-        select(DHCPPXEProfile).where(
+        select(DHCPPXEProfile.id).where(
             DHCPPXEProfile.group_id == group_id,
             DHCPPXEProfile.name == body.name,
         )
@@ -315,7 +315,7 @@ async def update_profile(
     payload = body.model_dump(exclude_none=True)
     if "name" in payload and payload["name"] != prof.name:
         clash = await db.execute(
-            select(DHCPPXEProfile).where(
+            select(DHCPPXEProfile.id).where(
                 DHCPPXEProfile.group_id == prof.group_id,
                 DHCPPXEProfile.name == payload["name"],
                 DHCPPXEProfile.id != prof.id,

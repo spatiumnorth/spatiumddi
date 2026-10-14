@@ -36,7 +36,7 @@ Side-effects committed atomically with the CIDR change:
 * Update ``Subnet.network``, ``total_ips``, ``utilization_percent``, and
   optionally ``gateway`` (via ``move_gateway_to_first_usable``).
 * Re-create default-named placeholder rows at the **new** boundaries.
-* Call ``ensure_reverse_zone_for_subnet`` so any new reverse-zone
+* Call ``ensure_reverse_zones_for_subnet`` so any new reverse-zone
   coverage is backfilled — this is idempotent if the zone already exists.
 * Bump the DHCP ``config_etag`` + enqueue an ``apply_config`` op for any
   agent-based DHCP server that serves a scope on this subnet. Agentless
@@ -769,20 +769,20 @@ async def preview_subnet_resize(
         ) or 0
 
     # Reverse-zone coverage — compute the aligned zone names for old and
-    # new to surface what will be backfilled. ``compute_reverse_zone_name``
+    # new to surface what will be backfilled. ``compute_reverse_zone_names``
     # is idempotent; nothing here writes anything.
-    from app.services.dns.reverse_zone import compute_reverse_zone_name
+    from app.services.dns.reverse_zone import compute_reverse_zone_names
 
     try:
-        old_rev = compute_reverse_zone_name(canonical_old)
+        old_rev = compute_reverse_zone_names(canonical_old)
     except ValueError:
-        old_rev = ""
+        old_rev = []
     try:
-        new_rev = compute_reverse_zone_name(canonical_new)
+        new_rev = compute_reverse_zone_names(canonical_new)
     except ValueError:
-        new_rev = ""
-    reverse_existing = [old_rev] if old_rev else []
-    reverse_will_create = [new_rev] if new_rev and new_rev != old_rev else []
+        new_rev = []
+    reverse_existing = list(old_rev)
+    reverse_will_create = [n for n in new_rev if n not in set(old_rev)]
 
     # Warnings (non-blocking).
     if pool_count:
@@ -1048,7 +1048,7 @@ async def commit_subnet_resize(
        ``_load_boundary_placeholders`` and never reach this loop.
     4. Mutate the CIDR / totals / gateway.
     5. Re-create default-named placeholder rows at the new boundaries.
-    6. ``ensure_reverse_zone_for_subnet`` — idempotent backfill.
+    6. ``ensure_reverse_zones_for_subnet`` — idempotent backfill.
     7. Bump DHCP config bundles on any agent-based server serving a scope
        on this subnet. Skip agentless (Windows DHCP read-only) drivers.
     8. Update block utilization rollup.
@@ -1194,9 +1194,9 @@ async def commit_subnet_resize(
     # returns None (not raises) for the legitimate "no DNS group
     # configured" case; any exception therefore represents a real issue
     # the operator needs to see.
-    from app.services.dns.reverse_zone import ensure_reverse_zone_for_subnet
+    from app.services.dns.reverse_zone import ensure_reverse_zones_for_subnet
 
-    await ensure_reverse_zone_for_subnet(db, subnet, current_user)
+    await ensure_reverse_zones_for_subnet(db, subnet, current_user)
 
     # 6. Notify agent-based DHCP servers with a scope on this subnet.
     dhcp_servers_notified = await _bump_dhcp_bundles_for_subnet(db, subnet.id)
