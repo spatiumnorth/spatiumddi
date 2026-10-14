@@ -23,7 +23,12 @@ member with none of those contributes nothing rather than a guess.
 
 The appliance's own member is found by hostname: the Kea DaemonSet runs with
 host networking and registers under the node's hostname, and
-``DHCPServer.appliance_id`` is never populated.
+``DHCPServer.appliance_id`` is never populated. Both hostname matches follow
+the shared ownership rule (``services/appliance/ownership``, #1810):
+case-blind, and only for an APPROVED appliance whose hostname no other
+approved appliance shares — a revoked or pending duplicate of a re-paired box
+carries the box's OLD node IPs, and opening the listener to those instead of
+the live partner breaks the pair.
 
 The rule mirrors ``services/dhcp/config_bundle._resolve_failover`` — an HA
 group is exactly what that function renders HA for — so the firewall opens
@@ -39,8 +44,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.appliance import Appliance
+from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.dhcp import DHCPServer, DHCPServerGroup
+from app.services.appliance.ownership import hostname_is_unambiguous, hostname_sql, norm_host
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -110,12 +116,18 @@ async def dhcp_ha_firewall_inputs(
     # Same readiness rule as _resolve_failover: no HA hook renders otherwise.
     if len(kea) < 2 or any(not s.ha_peer_url for s in kea):
         return None, []
+    claim_by_host = (
+        appliance.state == APPLIANCE_STATE_APPROVED
+        and bool(appliance.hostname)
+        and await hostname_is_unambiguous(db, appliance)
+    )
+    mine = norm_host(appliance.hostname or "")
     own = next(
         (
             s
             for s in kea
             if s.appliance_id == appliance.id
-            or (appliance.hostname and s.host == appliance.hostname)
+            or (claim_by_host and s.appliance_id is None and s.host and norm_host(s.host) == mine)
         ),
         None,
     )
@@ -126,18 +138,43 @@ async def dhcp_ha_firewall_inputs(
         return None, []
 
     others = [s for s in kea if s.id != own.id]
-    hosts = {s.host for s in others if s.host}
-    by_host: dict[str, Appliance] = {}
+    # A partner's appliance: the FK, else the ONE approved appliance with its
+    # hostname (case-blind). Several approved namesakes resolve to none — the
+    # member then falls back to its agent's last address.
+    by_id: dict[object, Appliance] = {}
+    fk_ids = {s.appliance_id for s in others if s.appliance_id is not None}
+    if fk_ids:
+        for ap in (
+            (await db.execute(select(Appliance).where(Appliance.id.in_(fk_ids)))).scalars().all()
+        ):
+            by_id[ap.id] = ap
+    hosts = {norm_host(s.host) for s in others if s.appliance_id is None and s.host}
+    hosts.discard("")
+    by_host: dict[str, Appliance | None] = {}
     if hosts:
         for ap in (
-            (await db.execute(select(Appliance).where(Appliance.hostname.in_(hosts))))
+            (
+                await db.execute(
+                    select(Appliance).where(
+                        Appliance.state == APPLIANCE_STATE_APPROVED,
+                        hostname_sql(Appliance.hostname).in_(hosts),
+                    )
+                )
+            )
             .scalars()
             .all()
         ):
-            by_host.setdefault(ap.hostname, ap)
+            key = norm_host(ap.hostname or "")
+            by_host[key] = None if key in by_host else ap
+
+    def _partner_appliance(member: DHCPServer) -> Appliance | None:
+        if member.appliance_id is not None:
+            return by_id.get(member.appliance_id)
+        return by_host.get(norm_host(member.host or ""))
+
     cidrs: set[str] = set()
     for member in others:
-        cidrs.update(_member_cidrs(member, by_host.get(member.host)))
+        cidrs.update(_member_cidrs(member, _partner_appliance(member)))
     return port, sorted(cidrs)
 
 

@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import {
   customersApi,
@@ -575,7 +576,9 @@ export function OverlaysPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={10}
                   >
-                    No overlays yet — click "New overlay" to add one.
+                    <ListEmpty error={query.error} what="overlays">
+                      No overlays yet — click "New overlay" to add one.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}

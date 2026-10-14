@@ -72,6 +72,27 @@ _TTL_DEFAULT = 0
 _PRIORITY_TYPES = frozenset({"MX", "SRV"})
 
 
+def _is_not_found(response: Any) -> bool:
+    """Linode's not-found answer (#1889): HTTP 404 ("Not Found. The resource
+    you're requesting doesn't exist.") carrying Linode's documented error
+    envelope, ``{"errors": [{"reason": ...}]}``. The envelope is required so
+    a 404 that is not Linode's own verdict on the domain is never read as
+    "the zone is gone"; the reason text is not, since the docs do not pin it."""
+    if getattr(response, "status_code", 0) != 404:
+        return False
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        return False
+    errors = body.get("errors") if isinstance(body, dict) else None
+    return isinstance(errors, list) and bool(errors)
+
+
+class LinodeDomainNotFound(CloudDNSError):
+    """The zone is not on the account (a subclass, so existing callers that
+    catch :class:`CloudDNSError` still see it)."""
+
+
 class LinodeDNSDriver(CloudDNSDriverBase):
     """Agentless driver for Linode-hosted (DNS Manager) authoritative zones."""
 
@@ -150,7 +171,7 @@ class LinodeDNSDriver(CloudDNSDriverBase):
         for d in results:
             if str(d.get("domain", "")).lower().rstrip(".") == name:
                 return int(d["id"])
-        raise CloudDNSError(f"Linode domain {name!r} not found on this account.")
+        raise LinodeDomainNotFound(f"Linode domain {name!r} not found on this account.")
 
     @staticmethod
     def _relativize(label: str, zone_fqdn: str) -> str:
@@ -409,8 +430,16 @@ class LinodeDNSDriver(CloudDNSDriverBase):
                 return
 
             if op == "delete":
-                domain_id = await self._resolve_domain_id(client, zone_fqdn)
+                # Already gone at the provider is done (#1889, as #1537):
+                # absent from the list, or a 404 on the delete itself.
+                try:
+                    domain_id = await self._resolve_domain_id(client, zone_fqdn)
+                except LinodeDomainNotFound:
+                    return
                 resp = await client.delete(f"/domains/{domain_id}")
+                if _is_not_found(resp):
+                    # Gone between the lookup and the delete.
+                    return
                 self._unwrap(resp)
                 return
 
