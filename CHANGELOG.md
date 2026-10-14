@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DHCP options editor's search box kept only the first digit of a
+  typed code (#1685).** Typing `4` then `3` left the box reading
+  "4 —3", matched nothing and made the row option 4. Each keystroke set
+  the row's code and an effect then rewrote the box to "`<code>` —"
+  before the next digit landed; and a prefix that is itself a standard
+  option (3, 6, 15, 42…) moved the row out of the custom list mid-code, so
+  no code starting with one (31, 60, 150…) could be typed at all. The box
+  now only searches while you type; the code is taken into the row on
+  blur, Enter or a catalogue pick, and its name follows it instead of the
+  previous code's name travelling along. Enter no longer submits the
+  dialog from that box, and a pick or a row delete no longer commits the
+  half-typed text first.
+
 - **A power loss right after a slot apply no longer freezes the node's
   Fleet row (#1747).** The slot-upgrade runners wrote their state and
   progress sidecars with a plain redirect and no fsync, so a power loss
