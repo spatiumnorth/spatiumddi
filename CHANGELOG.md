@@ -91,8 +91,15 @@ the formatter handles the rest.
   the zone card had no record to paste at the parent. The agent now
   computes the SHA-256 DS from the KSK `.key` file in-process with
   dnspython, so no binary can be missing from an image, and a signed
-  zone that still yields no DS logs `dnssec_ds_unavailable` with the
-  reason instead of reporting empty in silence.
+  zone that still yields no DS logs why (`dnssec_ds_pending` or
+  `dnssec_ds_unavailable`) instead of reporting empty in silence. The DS
+  shown follows BIND's own CDS rule: only a KSK whose `DSState` is
+  rumoured or omnipresent gets one, so a newly signed zone shows its DS
+  once BIND considers the DNSKEY propagated (about two hours on the
+  `default` policy), and a KSK withdrawn after a rollover drops out. The
+  agent now re-reads DNSSEC state every 5 minutes rather than only after a
+  config reload, so those changes reach the card without one, and each
+  key in the per-key table carries its own DS rather than every KSK's.
 - **Re-importing a zone's own export no longer pins every inherited TTL
   (#1727).** A record with no TTL of its own inherits the zone default and
   is exported without one, so the re-import read the file's `$TTL` back

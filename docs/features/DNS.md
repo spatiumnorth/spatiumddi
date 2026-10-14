@@ -412,6 +412,14 @@ so there is no private-key custody.
   tools needed) and reports the DS rrset + per-key state back via
   `POST /dns/agents/dnssec-state`; the card surfaces the DS records to
   paste at the parent registrar, plus a per-key table (tag / type / state).
+  The DS shown is the set BIND itself would publish as CDS: only keys whose
+  `DSState` is rumoured or omnipresent. So a newly signed zone shows **no
+  DS until its DNSKEY has propagated** (on the built-in `default` policy
+  about two hours: DNSKEY TTL + publish-safety + propagation delay), and a
+  KSK being withdrawn at the end of a rollover drops out of the card when
+  BIND withdraws it. The agent re-reads this state every 5 minutes, not
+  only after a config change, so both transitions reach the card on their
+  own.
 - **Manual rollover.** The card's per-key **Roll** button
   (`POST .../dnssec/rollover`) enqueues a `dnssec_rollover` op; the agent
   runs `rndc dnssec -rollover -key <tag>`. Routine rollover is automatic
