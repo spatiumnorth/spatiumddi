@@ -185,3 +185,91 @@ async def test_a_halt_and_resume_mid_node_keep_their_events(
     events = _events(row)
     for expected in ("halted", "resumed", "node_succeeded"):
         assert expected in events, events
+
+
+# ── #1704: a drive that lost the Lease writes nothing ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_drive_that_lost_the_lease_does_not_fail_the_run(
+    db_session: AsyncSession, api: AsyncSession, monkeypatch: pytest.MonkeyPatch, stubs: Any
+) -> None:
+    run = await _make_run(db_session)
+
+    async def _takeover() -> None:
+        row = await api.get(SystemUpgradeRun, run.id)
+        assert row is not None
+        row.lease_holder = "worker-1_bbbb"
+        await api.commit()
+
+    _node_stub(monkeypatch, ok=False, during=_takeover)
+    await orchestrator._drive_loop(db_session, run, asyncio.Event(), ME)
+
+    row = await _fresh(api, run.id)
+    assert row.state == "running"
+    assert row.lease_holder == "worker-1_bbbb"
+    assert row.finished_at is None
+    assert "node_failed" not in _events(row)
+    stubs.alert.assert_not_awaited()
+    # Not the other drive's Lease to give up.
+    stubs.release_if_held.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_crash_handler_leaves_a_run_another_drive_holds(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.tasks import upgrade_orchestrator as task
+
+    run = await _make_run(db_session)
+    release = MagicMock(return_value=True)
+    monkeypatch.setattr(orchestrator.mutex, "release_if_held", release)
+
+    async def _crash(db: AsyncSession, rid: uuid.UUID, *, holder: str) -> None:
+        # Another drive has taken the run over by the time this one crashes.
+        other = await db.get(SystemUpgradeRun, rid)
+        assert other is not None
+        other.lease_holder = "worker-1_bbbb"
+        await db.commit()
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(task, "drive_upgrade", _crash)
+    out = await task._async_drive(str(run.id))
+    assert out["state"] == "failed"  # this task's own result
+
+    row = await _fresh(db_session, run.id)
+    assert row.state == "running"
+    assert row.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_the_crash_handler_still_fails_its_own_run(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.tasks import upgrade_orchestrator as task
+
+    run = await _make_run(db_session)
+    monkeypatch.setattr(orchestrator.mutex, "release_if_held", MagicMock(return_value=True))
+    monkeypatch.setattr(orchestrator.mutex, "drive_identity", lambda: ME)
+
+    async def _crash(db: AsyncSession, rid: uuid.UUID, *, holder: str) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(task, "drive_upgrade", _crash)
+    await task._async_drive(str(run.id))
+    row = await _fresh(db_session, run.id)
+    assert row.state == "failed"
+    assert "boom" in (row.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_a_renewal_that_raises_stops_the_drive(monkeypatch: pytest.MonkeyPatch) -> None:
+    stop = asyncio.Event()
+    monkeypatch.setattr(orchestrator, "_LEASE_RENEW_INTERVAL_S", 0.01)
+
+    def _boom(**_kw: Any) -> Any:
+        raise RuntimeError("http.client blew up")
+
+    monkeypatch.setattr(orchestrator.mutex, "renew", _boom)
+    await asyncio.wait_for(orchestrator._lease_renewal_loop(stop, ME), 2)
+    assert stop.is_set()

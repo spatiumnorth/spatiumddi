@@ -616,7 +616,15 @@ async def _lease_renewal_loop(stop_event: asyncio.Event, holder: str) -> None:
             return  # stop_event set during the wait
         except TimeoutError:
             pass
-        ok, err = mutex.renew(holder=holder, lease_duration_seconds=LEASE_DURATION_S)
+        try:
+            ok, err = mutex.renew(holder=holder, lease_duration_seconds=LEASE_DURATION_S)
+        except Exception as exc:  # noqa: BLE001 — any failure here means "not renewed"
+            # An error the kubeapi helpers do not map (#1704) would end this
+            # task silently, leaving the drive running on a Lease nothing
+            # renews. Treat it as a lost Lease.
+            logger.warning("upgrade_lease_renew_crashed", error=str(exc))
+            stop_event.set()
+            return
         if not ok:
             logger.warning("upgrade_lease_renew_failed", error=err)
             stop_event.set()
@@ -763,6 +771,10 @@ async def _drive_loop(
             # new identity) can take it at once instead of waiting out the
             # expiry. Only ours is released, retried like every other exit.
             _release_lease(run, holder)
+            return
+        if holder and run.lease_holder not in (None, holder):
+            # A second drive took the Lease over (#1704): the run is its.
+            logger.warning("upgrade_drive_exit_lease_taken", run_id=str(run.id))
             return
 
         per_node_progress = dict(run.progress.get("per_node") or {})
