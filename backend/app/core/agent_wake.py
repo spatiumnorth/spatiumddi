@@ -121,6 +121,13 @@ def appliance_channel(appliance_id: uuid.UUID | str) -> str:
 HOSTCONFIG_ALL = _ch("hostconfig", "all")
 
 
+# Web UI certificate changed in the DB (#1895). Published by the Celery
+# worker after an ACME issue / renewal commits; the api (the only process
+# whose ServiceAccount may patch the ``spatium-appliance-tls`` Secret)
+# subscribes in its lifespan and deploys the active cert.
+APPLIANCE_CERT_DEPLOY = _ch("appliance", "cert-deploy")
+
+
 def dns_wake_channels(server: Any) -> list[str]:
     """Channels a DNS agent long-poll subscribes to: its group (config
     fan-out) + its own server row (per-server ops / resume / settings).

@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A Let's Encrypt certificate issued or renewed on an appliance is now
+  deployed to the Web UI without an api restart (#1895).** Issuance runs
+  in the Celery worker, whose ServiceAccount deliberately cannot patch
+  the `spatium-appliance-tls` Secret, so the renewed certificate sat in
+  the database and the old one kept being served. The worker now wakes
+  the api over Redis after committing, and the api deploys the active
+  certificate (also on a 60 s reconcile tick, under an advisory lock, and
+  only when the Secret differs). The worker no longer attempts the patch
+  or logs `appliance_cert_secret_patch_failed` on every renewal, and the
+  `secret_expiring` alert judges the certificate actually served,
+  flagging when the stored one is not deployed.
 - **Drift no longer lists a stored apex NS as missing on the server
   (#1857).** The zone-transfer read drops the apex NS set, so a stored
   apex NS row, such as the copy of the source's `@ NS` a Technitium or

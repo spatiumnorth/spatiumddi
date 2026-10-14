@@ -3295,30 +3295,76 @@ async def _matching_secret_expiring_subjects(
                 .where(ApplianceCertificate.source == CERT_SOURCE_LETSENCRYPT)
                 .where(ApplianceCertificate.is_active.is_(True))
                 .where(ApplianceCertificate.valid_to.is_not(None))
-                .where(ApplianceCertificate.valid_to <= cutoff)
             )
         )
         .scalars()
         .all()
     )
+    # #1895 — the alert must describe the certificate nginx actually serves.
+    # A renewal commits to the DB in the worker and reaches the Secret via
+    # the api, so for a while (or for good, if that hand-off is broken) the
+    # stored cert is newer than the served one.
+    served_valid_to = None
+    served_fp = None
+    if web_certs:
+        served_valid_to, served_fp = await _served_web_cert_expiry()
     for c in web_certs:
         if c.valid_to is None:
             continue
-        days = (c.valid_to - now).days
+        valid_to = c.valid_to
+        stale_note = ""
+        if served_valid_to is not None and served_fp != c.fingerprint_sha256:
+            # DB-active is not what is served: judge by the served one.
+            valid_to = min(c.valid_to, served_valid_to)
+            stale_note = (
+                f" The certificate actually served expires {served_valid_to.isoformat()}; "
+                f"the active certificate stored for renewal ({c.valid_to.isoformat()}) "
+                f"is not deployed to the Web UI."
+            )
+        if valid_to > cutoff:
+            continue
+        days = (valid_to - now).days
         sev = _escalate_severity_for_expiring(
             rule.severity, threshold_days=threshold_days, days_to_expiry=days
         )
         message = (
             f"Let's Encrypt Web UI certificate '{c.subject_cn or c.name}' "
-            f"{_descriptor(days)} ({c.valid_to.isoformat()}, threshold "
+            f"{_descriptor(days)} ({valid_to.isoformat()}, threshold "
             f"{threshold_days} d). Auto-renewal may be stuck — check "
-            f"Appliance → Web UI Certificate."
+            f"Appliance → Web UI Certificate.{stale_note}"
         )
         matches.append(
             (f"appliance_cert_tls:{c.id}", f"{c.subject_cn or c.name} (LE)", message, sev)
         )
 
     return matches
+
+
+async def _served_web_cert_expiry() -> tuple[Any, str | None]:
+    """``(not_after, sha256 fingerprint)`` of the cert in the TLS Secret.
+
+    ``(None, None)`` off the appliance or when the Secret is unreadable, so
+    the caller falls back to the stored row.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from app.config import settings  # noqa: PLC0415
+    from app.services.appliance.deployment import read_deployed_cert  # noqa: PLC0415
+    from app.services.appliance.tls import (
+        TLSValidationError,
+        parse_pem_certificate,
+    )  # noqa: PLC0415
+
+    if not settings.appliance_mode:
+        return None, None
+    try:
+        deployed = await asyncio.to_thread(read_deployed_cert)
+        if deployed is None:
+            return None, None
+        info = parse_pem_certificate(deployed[0])
+    except (TLSValidationError, OSError):
+        return None, None
+    return info.valid_to, info.fingerprint_sha256
 
 
 async def _cluster_health_snapshot() -> dict[str, Any] | None:

@@ -28,6 +28,7 @@ Runs on appliance api startup, and settles on ONE active
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import ipaddress
 import uuid
@@ -357,6 +358,63 @@ async def _generate_activate_deploy(
 # appliance_certificate row. A Postgres transaction-level advisory lock
 # serialises them; losers no-op. Arbitrary stable bigint.
 _CERT_RECONCILE_LOCK_KEY = 0x5350433727  # "SPC7c"-ish
+
+
+_CERT_DEPLOY_LOCK_KEY = 0x5350433A31383935  # "SPC:1895"
+
+
+async def sync_active_cert_to_secret() -> dict[str, object]:
+    """Deploy the active DB certificate into the TLS Secret when they differ.
+
+    The api-side half of #1895: ACME issuance / renewal runs in the Celery
+    worker, whose ServiceAccount cannot patch ``spatium-appliance-tls``, so
+    the worker commits the row and wakes the api, which calls this. Also
+    run on a periodic tick, so a missed wake only delays the deploy.
+
+    Idempotent: when the Secret already holds exactly the active cert + key
+    nothing is written and the frontend is not rolled. A per-transaction
+    advisory lock keeps N api replicas to one patch.
+    """
+    if not settings.appliance_mode:
+        return {"status": "disabled"}
+
+    from sqlalchemy import text  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as db:
+        got = (
+            await db.execute(
+                text("select pg_try_advisory_xact_lock(:k)"), {"k": _CERT_DEPLOY_LOCK_KEY}
+            )
+        ).scalar()
+        if not got:
+            return {"status": "locked"}
+        active_row = (
+            await db.execute(
+                select(ApplianceCertificate).where(ApplianceCertificate.is_active.is_(True))
+            )
+        ).scalar_one_or_none()
+        if active_row is None or not active_row.cert_pem:
+            return {"status": "no-active-cert"}
+        try:
+            key_pem = decrypt_str(active_row.key_encrypted)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "appliance_active_cert_decrypt_failed",
+                cert_id=str(active_row.id),
+                error=str(exc),
+            )
+            return {"status": "decrypt-failed"}
+        cert_pem = active_row.cert_pem
+        name = active_row.name
+
+        # Blocking kubeapi round-trips: off the event loop (non-negotiable #2).
+        deployed = await asyncio.to_thread(read_deployed_cert)
+        if deployed == (cert_pem, key_pem):
+            return {"status": "in-sync"}
+        ok = await asyncio.to_thread(deploy_and_reload, cert_pem, key_pem, name=name)
+        if ok:
+            logger.info("appliance_active_cert_synced", cert_id=str(active_row.id), name=name)
+        return {"status": "deployed" if ok else "deploy-failed"}
 
 
 async def reconcile_cluster_cert_sans() -> dict[str, object]:

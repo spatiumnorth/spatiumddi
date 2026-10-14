@@ -462,10 +462,13 @@ cloud-hosted DNS-01 layer on top of it (Phases 3–4 below).
 6. The chain lands in an `ApplianceCertificate` row
    (`source="letsencrypt"`, identity columns from
    `parse_pem_certificate`, cert key Fernet-encrypted), is made the
-   sole active cert, and is deployed to nginx via
-   `deploy_and_reload`. **Deploy failure is logged, not raised** — the
-   DB is the source of truth and the api boot re-deploys the active
-   row.
+   sole active cert. The worker's ServiceAccount cannot patch the
+   `spatium-appliance-tls` Secret, so it publishes a Redis wake and the
+   **api** deploys the active cert (`sync_active_cert_to_secret`, with a
+   60 s periodic reconcile as the safety net for a missed wake, and an
+   advisory lock so one replica patches). The DB is the source of
+   truth; the `secret_expiring` alert judges the cert actually served
+   and says so when the stored one is not deployed (#1895).
 7. The challenge TXT records are **always** torn down in a `finally`
    block (each cleanup on a fresh session), so a failed issuance
    doesn't leave zone noise behind.
