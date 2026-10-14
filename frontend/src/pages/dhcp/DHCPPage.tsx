@@ -90,6 +90,25 @@ import {
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
 
+// #1861 — the DHCP data surfaces (scopes, statics, client classes, option
+// templates) gate each control on the route's own resource permission; the
+// server, server-group and failover controls stay superadmin-only.
+const DHCP_LABELS: Record<string, string> = {
+  dhcp_scope: "DHCP scopes",
+  dhcp_static: "DHCP static assignments",
+  dhcp_client_class: "DHCP client classes",
+  dhcp_option_template: "DHCP option templates",
+};
+
+function useDhcpGate() {
+  const perms = usePermissions();
+  return (action: "write" | "delete", resourceType: string) =>
+    permissionGate(
+      perms.can(action, resourceType),
+      `Requires ${action} permission on ${DHCP_LABELS[resourceType] ?? resourceType}`,
+    );
+}
+
 type Selection =
   | { type: "group"; group: DHCPServerGroup }
   | { type: "server"; group: DHCPServerGroup | null; server: DHCPServer }
@@ -1308,11 +1327,9 @@ function ScopeDeleteModal({
 
 function ServerScopesTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
-  // #1339 — scope create, edit and delete take a superadmin (scopes.py).
-  const superadminGate = permissionGate(
-    usePermissions().isSuperadmin,
-    NEEDS_SUPERADMIN,
-  );
+  // #1339, #1861 — scope create / edit take write and delete takes delete on
+  // ``dhcp_scope`` (scopes.py).
+  const dhcpGate = useDhcpGate();
   const [tagFilters, setTagFilters] = useState<string[]>([]);
   const { data: subnets = [] } = useQuery({
     queryKey: ["subnets"],
@@ -1396,7 +1413,7 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
               e.target.value = "";
             }}
             title="Pick the IPAM subnet you want this DHCP server to serve leases from."
-            {...superadminGate}
+            {...dhcpGate("write", "dhcp_scope")}
           >
             <option value="">+ Serve leases on subnet…</option>
             {subnets
@@ -1508,14 +1525,14 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                             <button
                               onClick={() => setEditScope(sc)}
                               className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-                              {...superadminGate}
+                              {...dhcpGate("write", "dhcp_scope")}
                             >
                               <Pencil className="h-3.5 w-3.5" />
                             </button>
                             <button
                               onClick={() => setDelScope(sc)}
                               className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
-                              {...superadminGate}
+                              {...dhcpGate("delete", "dhcp_scope")}
                             >
                               <Trash2 className="h-3.5 w-3.5" />
                             </button>
@@ -1528,14 +1545,14 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                       <ContextMenuSeparator />
                       <ContextMenuItem
                         onSelect={() => setEditScope(sc)}
-                        {...superadminGate}
+                        {...dhcpGate("write", "dhcp_scope")}
                       >
                         Edit Scope…
                       </ContextMenuItem>
                       <ContextMenuItem
                         destructive
                         onSelect={() => setDelScope(sc)}
-                        {...superadminGate}
+                        {...dhcpGate("delete", "dhcp_scope")}
                       >
                         Delete Scope…
                       </ContextMenuItem>
@@ -1748,9 +1765,10 @@ function ServerPoolsOrStaticsTab({
 
   // Static reservations are created/edited here (issue #472). Creation is
   // group-centric — the operator picks which scope the reservation lands in.
-  // Backend create/update/delete are superadmin-gated, so gate the UI too.
+  // Backend create / update take write and delete takes delete on
+  // ``dhcp_static`` (#1861), so gate the UI the same way.
   const qc = useQueryClient();
-  const { isSuperadmin } = usePermissions();
+  const perms = usePermissions();
   const [showCreate, setShowCreate] = useState(false);
   const [createScopeId, setCreateScopeId] = useState("");
   const [editStatic, setEditStatic] = useState<StaticRow | null>(null);
@@ -1771,7 +1789,10 @@ function ServerPoolsOrStaticsTab({
       setDelStatic(null);
     },
   });
-  const canManageStatics = kind === "statics" && isSuperadmin;
+  const canManageStatics =
+    kind === "statics" && perms.can("write", "dhcp_static");
+  const canDeleteStatics =
+    kind === "statics" && perms.can("delete", "dhcp_static");
 
   return (
     <div className="space-y-3">
@@ -1964,20 +1985,22 @@ function ServerPoolsOrStaticsTab({
                             Copy Hostname
                           </ContextMenuItem>
                         )}
+                        {(canManageStatics || canDeleteStatics) && (
+                          <ContextMenuSeparator />
+                        )}
                         {canManageStatics && (
-                          <>
-                            <ContextMenuSeparator />
-                            <ContextMenuItem
-                              onSelect={() => setEditStatic({ scope, item: s })}
-                            >
-                              Edit…
-                            </ContextMenuItem>
-                            <ContextMenuItem
-                              onSelect={() => setDelStatic({ scope, item: s })}
-                            >
-                              Delete…
-                            </ContextMenuItem>
-                          </>
+                          <ContextMenuItem
+                            onSelect={() => setEditStatic({ scope, item: s })}
+                          >
+                            Edit…
+                          </ContextMenuItem>
+                        )}
+                        {canDeleteStatics && (
+                          <ContextMenuItem
+                            onSelect={() => setDelStatic({ scope, item: s })}
+                          >
+                            Delete…
+                          </ContextMenuItem>
                         )}
                       </ContextMenuContent>
                     </ContextMenu>
@@ -2020,11 +2043,9 @@ function ServerPoolsOrStaticsTab({
 }
 
 function ClientClassesTab({ groupId }: { groupId: string }) {
-  // #1339 — every Kea-tab write takes a superadmin (SuperAdmin handlers).
-  const superadminGate = permissionGate(
-    usePermissions().isSuperadmin,
-    NEEDS_SUPERADMIN,
-  );
+  // #1339, #1861 — each write takes the tab's own resource permission, with
+  // the HTTP method's action (``delete`` for a delete).
+  const dhcpGate = useDhcpGate();
   const qc = useQueryClient();
   const { data: classes = [] } = useQuery({
     queryKey: ["dhcp-client-classes", groupId],
@@ -2060,7 +2081,7 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
         <button
           onClick={() => setShowCreate(true)}
           className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-          {...superadminGate}
+          {...dhcpGate("write", "dhcp_client_class")}
         >
           <Plus className="h-3 w-3" /> New Client Class
         </button>
@@ -2105,14 +2126,14 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
                       <button
                         onClick={() => setEdit(c)}
                         className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
-                        {...superadminGate}
+                        {...dhcpGate("write", "dhcp_client_class")}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDel(c)}
                         className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
-                        {...superadminGate}
+                        {...dhcpGate("delete", "dhcp_client_class")}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -2152,11 +2173,9 @@ function ClientClassesTab({ groupId }: { groupId: string }) {
 }
 
 function OptionTemplatesTab({ groupId }: { groupId: string }) {
-  // #1339 — every Kea-tab write takes a superadmin (SuperAdmin handlers).
-  const superadminGate = permissionGate(
-    usePermissions().isSuperadmin,
-    NEEDS_SUPERADMIN,
-  );
+  // #1339, #1861 — each write takes the tab's own resource permission, with
+  // the HTTP method's action (``delete`` for a delete).
+  const dhcpGate = useDhcpGate();
   const qc = useQueryClient();
   const { data: templates = [] } = useQuery({
     queryKey: ["dhcp-option-templates", groupId],
@@ -2197,7 +2216,7 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
         <button
           onClick={() => setShowCreate(true)}
           className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-          {...superadminGate}
+          {...dhcpGate("write", "dhcp_option_template")}
         >
           <Plus className="h-3 w-3" /> New Template
         </button>
@@ -2242,14 +2261,14 @@ function OptionTemplatesTab({ groupId }: { groupId: string }) {
                       <button
                         onClick={() => setEdit(t)}
                         className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
-                        {...superadminGate}
+                        {...dhcpGate("write", "dhcp_option_template")}
                       >
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
                         onClick={() => setDel(t)}
                         className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
-                        {...superadminGate}
+                        {...dhcpGate("delete", "dhcp_option_template")}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
