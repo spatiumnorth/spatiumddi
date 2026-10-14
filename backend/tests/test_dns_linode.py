@@ -555,6 +555,23 @@ async def test_apply_zone_delete_other_errors_still_raise(
             await driver._apply_zone(_Server(), _CREDS, zone, "delete")
 
 
+async def test_apply_zone_delete_404_without_linode_envelope_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 404 without Linode's ``errors`` envelope is not its verdict on the
+    domain, so the zone is not dropped as already gone."""
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": 77, "domain": "gone.example"}]))],
+            "delete": [_FakeResponse(404, {})],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "gone.example."})()
+    with pytest.raises(CloudDNSError):
+        await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+
 # ── Error surfacing ─────────────────────────────────────────────────────
 async def test_error_envelope_raises_clouddnserror(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {"errors": [{"reason": "Invalid Token", "field": None}]}

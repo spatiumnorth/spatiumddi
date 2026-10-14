@@ -93,8 +93,10 @@ the formatter handles the rest.
   naming the algorithm, as is putting a Technitium server (create,
   driver change, move, Fleet or Copilot role assignment) into a group
   that holds one, or moving a zone that uses one into such a group.
-  The agent no longer installs or pins a sha224 key already stored and
-  reports it as an apply failure. BIND9 and PowerDNS support all five
+  The zone-move preview reports that refusal, so the Move button is
+  blocked rather than failing on commit. The agent no longer installs or
+  pins a sha224 key already stored and reports it as an apply failure
+  (the `agent_config_rejected` alert fires on it). BIND9 and PowerDNS support all five
   algorithms, Windows and the cloud drivers use no group TSIG keys, so
   there was no other gap.
 
@@ -102,10 +104,12 @@ the formatter handles the rest.
   the provider is done, not an error (#1889).** The three drivers were
   left out of #1537, so a zone removed out of band at the provider could
   never leave the Trash: the retention sweep and "Delete permanently"
-  both failed on the provider's not-found answer. HTTP 404 on the zone
-  delete now counts as success (DigitalOcean answers
-  `{"id": "not_found"}`), and Linode also treats a domain missing from
-  its list as already gone. Auth, throttling and 5xx still fail.
+  both failed on the provider's not-found answer. The provider's
+  documented not-found answer on the zone delete now counts as success:
+  DigitalOcean HTTP 404 with `{"id": "not_found"}`, Linode HTTP 404 with
+  its `errors` envelope (or a domain absent from its account's filtered
+  domain list), Vultr HTTP 404. A 404 without that shape, auth,
+  throttling and 5xx still fail.
 
 - **Failed sign-ins are forwarded to syslog / SIEM as warnings, not info
   (#1874).** Every rejected sign-in (bad password, bad MFA code, locked or

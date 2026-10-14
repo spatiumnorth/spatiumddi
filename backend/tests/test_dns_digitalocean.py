@@ -506,6 +506,19 @@ async def test_apply_zone_delete_other_errors_still_raise(
             await driver._apply_zone(_Server(), _CREDS, zone, "delete")
 
 
+async def test_apply_zone_delete_404_without_not_found_id_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only DigitalOcean's documented ``{"id": "not_found"}`` means gone: a
+    404 that is not its verdict on the domain must not drop the zone."""
+    for body in ({}, {"id": "something_else", "message": "?"}):
+        fake = _FakeClient({"delete": [_FakeResponse(404, body)]})
+        driver = _patch_client(monkeypatch, fake)
+        zone = type("Z", (), {"name": "gone.example."})()
+        with pytest.raises(CloudDNSError):
+            await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+
 # ── Error surfacing ─────────────────────────────────────────────────────
 async def test_non_2xx_raises_clouddnserror(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {"id": "unauthorized", "message": "Unable to authenticate you."}
