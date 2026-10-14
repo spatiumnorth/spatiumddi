@@ -8,6 +8,12 @@ describe("activityTone", () => {
       label: "FAIL",
     });
   });
+  it("reads a refused request (result=forbidden) as DENY", () => {
+    expect(activityTone("agent_keys_reveal_denied", "forbidden")).toEqual({
+      tone: "warn",
+      label: "DENY",
+    });
+  });
   it("keeps the existing mappings", () => {
     expect(activityTone("update", "failed")).toEqual({
       tone: "bad",

@@ -446,17 +446,110 @@ def test_audit_syslog_severities_are_unchanged() -> None:
         assert out.startswith(pri + "1 "), result
 
 
-def test_failed_signin_result_failure_ranks_as_error_in_every_format() -> None:
-    """#1874: rejected sign-ins are audited ``result="failure"`` and used
-    to bucket to info. They now rank with ``failed`` (error) in the PRI,
-    CEF and LEEF, and clear a ``warning`` threshold."""
-    payload = _payload(result="failure", action="login")
-    assert svc._severity_bucket("failure") == "error"
+def test_failed_signin_ranks_with_denied_in_every_format() -> None:
+    """#1874: a rejected sign-in is audited ``action="login"``,
+    ``result="failure"`` and used to bucket to info. It is a refused
+    request, so it ranks with ``denied``: PRI 4, CEF / LEEF 9, and it
+    clears the strictest threshold."""
+    payload = _payload(result="failure", action="login", resource_type="user")
+    assert svc._payload_severity(payload) == "denied"
+    assert svc.render_for_target("rfc5424_json", facility=16, payload=payload).startswith("<132>1 ")
+    assert "|9|" in svc.render_for_target("rfc5424_cef", facility=16, payload=payload)
+    assert "sev=9" in svc.render_for_target("rfc5424_leef", facility=16, payload=payload)
+    for threshold in ("warn", "error", "denied"):
+        target = {"kind": "syslog", "min_severity": threshold, "resource_types": None}
+        assert svc._target_accepts(target, payload) is True, threshold
+
+
+def test_signin_the_system_could_not_evaluate_stays_error() -> None:
+    """A provider timeout on the same ``login`` action is audited
+    ``error`` — the system failed, not the caller — and keeps PRI 3."""
+    payload = _payload(result="error", action="login", resource_type="auth_provider")
+    assert svc._payload_severity(payload) == "error"
     assert svc.render_for_target("rfc5424_json", facility=16, payload=payload).startswith("<131>1 ")
-    assert "|6|" in svc.render_for_target("rfc5424_cef", facility=16, payload=payload)
-    assert "sev=6" in svc.render_for_target("rfc5424_leef", facility=16, payload=payload)
-    sev = svc._payload_severity(payload)
-    assert svc._SEVERITY_RANK[sev] >= svc._SEVERITY_RANK["warning"]
+
+
+def test_non_signin_failure_ranks_with_failed() -> None:
+    """``failure`` is also what a failed backup run, backup drill, WoL
+    send and auth-provider test write. Those are operations that did not
+    work, so they rank with ``failed`` (PRI 3), not with ``denied``."""
+    for action in ("backup.run", "wol.send", "test_connection"):
+        payload = _payload(result="failure", action=action)
+        assert svc._payload_severity(payload) == "error", action
+        assert svc.render_for_target("rfc5424_json", facility=16, payload=payload).startswith(
+            "<131>1 "
+        ), action
+
+
+def test_forbidden_ranks_with_denied() -> None:
+    payload = _payload(result="forbidden", action="agent_keys_reveal_denied")
+    assert svc._payload_severity(payload) == "denied"
+    assert svc.render_for_target("rfc5424_json", facility=16, payload=payload).startswith("<132>1 ")
+
+
+@pytest.mark.asyncio
+async def test_failed_signin_reaches_a_target_filtered_at_warn(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1874 through the real path: a wrong-password POST /auth/login
+    writes the audit row, the session listener snapshots it on commit,
+    ``_dispatch`` loads the stored target (``min_severity="warn"``) and
+    delivers. Before the fix the row bucketed to info and the gate
+    dropped it, so the collector received nothing."""
+    from contextlib import asynccontextmanager
+
+    from app.models.audit_forward import AuditForwardTarget
+
+    user = User(
+        username=f"u-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        display_name="Signin Victim",
+        hashed_password=hash_password("right-password"),
+    )
+    db_session.add(user)
+    db_session.add(
+        AuditForwardTarget(
+            name=f"siem-{uuid.uuid4().hex[:6]}",
+            enabled=True,
+            kind="syslog",
+            format="rfc5424_json",
+            host="10.0.0.1",
+            port=514,
+            protocol="udp",
+            facility=16,
+            min_severity="warn",
+        )
+    )
+    await db_session.commit()
+
+    captured: list[object] = []
+
+    def _capture(_name: str, factory: object, **_kw: object) -> None:
+        captured.append(factory)
+
+    with patch.object(svc, "dispatch", new=_capture):
+        resp = await client.post(
+            "/api/v1/auth/login",
+            json={"username": user.username, "password": "wrong-password"},
+        )
+    assert resp.status_code == 401, resp.text
+    assert captured, "the failed sign-in was never handed to audit forwarding"
+
+    @asynccontextmanager
+    async def _same_session():  # noqa: ANN202
+        yield db_session
+
+    with (
+        patch.object(svc, "_ephemeral_session", _same_session),
+        patch.object(svc, "_send_syslog", new=AsyncMock()) as mock_send,
+    ):
+        for factory in captured:
+            await factory()  # type: ignore[operator]
+
+    sent = [c.args[3] for c in mock_send.await_args_list]
+    signin = [m for m in sent if '"action":"login"' in m and '"result":"failure"' in m]
+    assert signin, f"failed sign-in filtered out; delivered: {sent}"
+    assert signin[0].startswith("<132>1 ")
 
 
 def test_alert_syslog_timestamp_comes_from_fired_at() -> None:
