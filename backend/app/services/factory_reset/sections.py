@@ -104,8 +104,10 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "the scopes, pools and static assignments of every "
             "subnet are removed with it (as are vertical-registry "
             "rows keyed on an address or subnet). The preview "
-            "lists them. Refused while an integration still "
-            "points at an IP space — reset Integrations first."
+            "lists them. Refused while an integration, a network "
+            "device or a multicast group still points at an IP "
+            "space — reset Integrations / Vertical network awareness "
+            "first, or run them together."
         ),
         phrase="DESTROY-IPAM",
         kind="truncate",

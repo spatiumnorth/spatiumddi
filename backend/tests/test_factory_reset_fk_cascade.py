@@ -35,9 +35,11 @@ from app.models.base import Base
 from app.services.factory_reset import runner
 from app.services.factory_reset.fk_graph import (
     FK_EDGES_SQL,
+    FKEdge,
     blocking_edges,
     cascade_closure,
     delete_order,
+    dependent_count_queries,
     edges_from_metadata,
     edges_from_rows,
     truncatable,
@@ -131,6 +133,28 @@ def test_truncatable_excludes_referenced_tables() -> None:
     assert "nmap_scan" not in truncatable(EDGES, ["nmap_scan"])
     # a log table nothing references stays on the fast path.
     assert truncatable(EDGES, ["audit_log"]) == {"audit_log"}
+
+
+def test_a_restrict_key_into_a_cascaded_table_blocks_too() -> None:
+    """Deleting ``p`` cascades into ``c``; ``x`` (outside the wipe) holds
+    a RESTRICT key into ``c``, so the cascaded delete is refused just
+    like a direct one — the preview has to say so before it happens."""
+    edges = [
+        FKEdge("c", "p", "CASCADE", ("p_id",), ("id",)),
+        FKEdge("x", "c", "RESTRICT", ("c_id",), ("id",)),
+    ]
+    assert [e.child for e in blocking_edges(edges, ["p"])] == ["x"]
+
+
+def test_every_edge_carries_its_referenced_columns() -> None:
+    assert all(len(e.ref_columns) == len(e.columns) > 0 for e in EDGES)
+
+
+def test_dependent_count_queries_cover_the_cascade_reach() -> None:
+    for section in TRUNCATE_SECTIONS:
+        assert set(dependent_count_queries(EDGES, section.tables)) == set(
+            section.cascade_dependents
+        )
 
 
 def test_delete_order_puts_restrict_children_first() -> None:
@@ -358,6 +382,7 @@ async def test_a_lone_ipam_reset_is_refused_while_an_integration_points_at_a_spa
     await db_session.commit()
     blockers = await runner._preview_blockers(db_session, runner._resolve_targets(["ipam"]))
     assert any("docker_host" in b for b in blockers)
+    await db_session.commit()  # release the preview's read locks before the wipe
     with pytest.raises(asyncpg.ForeignKeyViolationError):
         await _wipe("ipam")
     # the transaction rolled back: nothing was deleted
@@ -387,6 +412,117 @@ async def test_live_fk_edges_match_metadata(db_session: AsyncSession) -> None:
     live = edges_from_rows((await db_session.execute(text(FK_EDGES_SQL))).mappings().all())
 
     def norm(es):
-        return {(e.child, e.parent, e.ondelete, tuple(sorted(e.columns))) for e in es}
+        return {(e.child, e.parent, e.ondelete, e.columns, e.ref_columns) for e in es}
 
     assert norm(live) == norm(EDGES)
+
+
+async def _table_counts(db: AsyncSession, tables) -> dict[str, int]:
+    return {
+        t: int((await db.execute(text(f'SELECT COUNT(*) FROM "{t}"'))).scalar() or 0)
+        for t in tables
+    }
+
+
+async def test_integrations_preview_counts_only_what_the_wipe_removes(
+    db_session: AsyncSession,
+) -> None:
+    """An Integrations reset removes the IPAM rows an integration OWNS,
+    and the preview must count exactly those. Counting every row with a
+    cascading key set would list the operator's whole estate (every
+    address has a subnet, every record a zone) on the card."""
+    from app.models.docker import DockerHost  # noqa: PLC0415
+    from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet  # noqa: PLC0415
+
+    await _seed_estate(db_session)
+    space = (await db_session.execute(select(IPSpace))).scalars().first()
+    assert space is not None
+    host = DockerHost(
+        name="d1",
+        connection_type="tcp",
+        endpoint="docker.example.test:2376",
+        ipam_space_id=space.id,
+        client_key_encrypted=b"",
+    )
+    db_session.add(host)
+    await db_session.flush()
+    # An integration-owned block with an operator-made child block: the
+    # child goes too (ip_block.parent_block_id is ON DELETE CASCADE), so
+    # the count must follow the self-reference.
+    owned = IPBlock(space_id=space.id, network="10.88.0.0/16", name="o", docker_host_id=host.id)
+    db_session.add(owned)
+    await db_session.flush()
+    child = IPBlock(space_id=space.id, network="10.88.1.0/24", name="c", parent_block_id=owned.id)
+    db_session.add(child)
+    owned_subnet = Subnet(
+        space_id=space.id,
+        block_id=owned.id,
+        network="10.88.0.0/24",
+        name="os",
+        docker_host_id=host.id,
+    )
+    db_session.add(owned_subnet)
+    await db_session.flush()
+    db_session.add(IPAddress(subnet_id=owned_subnet.id, address="10.88.0.9", status="allocated"))
+    await db_session.commit()
+
+    previews = await runner.preview_factory_reset(
+        db_session, section_keys=["integrations"], calling_user_id=uuid.uuid4()
+    )
+    predicted = {
+        k.removesuffix(" (cascade)"): v
+        for k, v in previews[0].table_counts.items()
+        if k.endswith(" (cascade)")
+    }
+    section = runner.FACTORY_SECTIONS_BY_KEY["integrations"]
+    watched = sorted(section.cascade_dependents)
+    before = await _table_counts(db_session, watched)
+    # End the session's read transaction: its ACCESS SHARE locks would
+    # make the wipe's TRUNCATE wait on this very test forever.
+    await db_session.commit()
+    await _wipe("integrations")
+    db_session.expire_all()
+    after = await _table_counts(db_session, watched)
+    removed = {t: before[t] - after[t] for t in watched if before[t] != after[t]}
+    assert predicted == removed
+    assert removed["ip_block"] == 2 and removed["subnet"] == 1 and removed["ip_address"] == 1
+    # the operator's estate (seeded by _seed_estate) is untouched
+    c = await _counts(db_session)
+    assert (c["ip_address"], c["dns_record"], c["dhcp_static_assignment"]) == (1, 1, 1)
+
+
+async def test_a_surviving_row_under_a_cascaded_parent_refuses_the_reset(
+    db_session: AsyncSession,
+) -> None:
+    """``subnet.block_id`` is RESTRICT. An operator's subnet under an
+    integration-owned block survives the Integrations reset, so the
+    block's cascaded delete is refused — the preview must say so (it
+    used to only look at keys into the section's own tables)."""
+    from app.models.docker import DockerHost  # noqa: PLC0415
+    from app.models.ipam import IPBlock, IPSpace, Subnet  # noqa: PLC0415
+
+    await _seed_estate(db_session)
+    space = (await db_session.execute(select(IPSpace))).scalars().first()
+    assert space is not None
+    host = DockerHost(
+        name="d1",
+        connection_type="tcp",
+        endpoint="docker.example.test:2376",
+        ipam_space_id=space.id,
+        client_key_encrypted=b"",
+    )
+    db_session.add(host)
+    await db_session.flush()
+    owned = IPBlock(space_id=space.id, network="10.88.0.0/16", name="o", docker_host_id=host.id)
+    db_session.add(owned)
+    await db_session.flush()
+    db_session.add(Subnet(space_id=space.id, block_id=owned.id, network="10.88.5.0/24", name="op"))
+    await db_session.commit()
+
+    blockers = await runner._preview_blockers(db_session, runner._resolve_targets(["integrations"]))
+    assert any(b.startswith("1 subnet row(s) still reference ip_block") for b in blockers)
+    await db_session.commit()
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await _wipe("integrations")
+    db_session.expire_all()
+    assert (await db_session.execute(text('SELECT COUNT(*) FROM "docker_host"'))).scalar() == 1

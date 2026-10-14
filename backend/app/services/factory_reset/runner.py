@@ -43,9 +43,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.factory_reset.fk_graph import (
     FK_EDGES_SQL,
     FKEdge,
-    blocking_edges,
-    cascade_closure,
+    blocking_count_queries,
     delete_order,
+    dependent_count_queries,
     edges_from_rows,
     truncatable,
 )
@@ -260,31 +260,11 @@ async def _present_tables_sa(db: AsyncSession) -> set[str]:
 def _dependent_count_sql(
     section: FactorySection, edges: list[FKEdge], present: set[str]
 ) -> dict[str, str]:
-    """Per dependent table, the SQL counting the rows a wipe of
-    ``section.tables`` removes through CASCADE keys: those whose
-    cascading key is set. An upper bound for tables two hops away (a
-    row may hang off a parent that survives), which is why the preview
-    says "up to"."""
-    own = {t for t in section.tables if t in present}
-    reach = cascade_closure(edges, own)
-    out: dict[str, str] = {}
-    for dep in sorted(reach):
-        if dep not in present:
-            continue
-        cols = sorted(
-            {
-                c
-                for e in edges
-                if e.ondelete == "CASCADE"
-                and e.child == dep
-                and (e.parent in own or e.parent in reach)
-                for c in e.columns
-            }
-        )
-        if cols:
-            cond = " OR ".join(f'"{c}" IS NOT NULL' for c in cols)
-            out[dep] = f'SELECT COUNT(*) FROM "{dep}" WHERE {cond}'
-    return out
+    """Per dependent table, the SQL counting exactly the rows a wipe of
+    ``section.tables`` removes through CASCADE keys (see
+    :func:`.fk_graph.dependent_count_queries`)."""
+    own = [t for t in section.tables if t in present]
+    return {dep: sql for dep, sql in dependent_count_queries(edges, own).items() if dep in present}
 
 
 async def _dependent_counts_sa(
@@ -313,34 +293,36 @@ async def _add_cascade_preview(
         for t, n in nonzero.items():
             preview.table_counts[f"{t} (cascade)"] = n
         preview.notes.append(
-            f"includes up to {total} row(s) in other tables that cannot exist "
+            f"includes {total} row(s) in other tables that cannot exist "
             "without these (foreign keys with ON DELETE CASCADE)"
         )
 
 
 async def _preview_blockers(db: AsyncSession, targets: list[FactorySection]) -> list[str]:
-    """Human-readable list of tables that would make the reset fail,
-    with rows in them. Empty when nothing blocks it."""
+    """Human-readable list of references that would make the reset
+    fail: rows outside the wipe holding a ``RESTRICT`` / ``NO ACTION``
+    key to a row it removes. Empty when nothing blocks it."""
     wiped = [t for s in targets if s.kind == "truncate" for t in s.tables]
     if not wiped:
         return []
     edges = await _load_edges_sa(db)
     present = await _present_tables_sa(db)
     out: list[str] = []
-    for e in blocking_edges(edges, [t for t in wiped if t in present]):
+    for e, sql in blocking_count_queries(edges, [t for t in wiped if t in present]):
         if e.child not in present:
             continue
-        cond = " OR ".join(f'"{c}" IS NOT NULL' for c in e.columns)
         try:
-            n = int(
-                (await db.execute(text(f'SELECT COUNT(*) FROM "{e.child}" WHERE {cond}'))).scalar()
-                or 0
-            )
-        except Exception:  # noqa: BLE001
+            n = int((await db.execute(text(sql))).scalar() or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("factory_reset_blocker_count_failed", table=e.child, error=str(exc))
             await db.rollback()
             continue
         if n:
-            out.append(f"{e.child} ({n}) still references {e.parent}")
+            owner = next(
+                (s.label for s in FACTORY_SECTIONS_BY_KEY.values() if e.child in s.tables), None
+            )
+            hint = f" (reset {owner} with it, or first)" if owner else ""
+            out.append(f"{n} {e.child} row(s) still reference {e.parent}{hint}")
     return out
 
 
@@ -536,20 +518,24 @@ async def _execute_truncate_sections(
 
     # Pre-count for the operator-facing total (own rows + the rows
     # CASCADE keys will take with them).
+    # Each count runs in its own SAVEPOINT: a failed statement would
+    # otherwise abort the whole reset transaction and every DELETE
+    # after it would fail with "current transaction is aborted".
+    async def _count(sql: str) -> int:
+        try:
+            async with conn.transaction():
+                return int(await conn.fetchval(sql) or 0)
+        except asyncpg.PostgresError as exc:
+            logger.info("factory_reset_count_failed", sql=sql, error=str(exc))
+            return 0
+
     deleted = 0
     for section in sections:
         for t in section.tables:
-            if t not in present:
-                continue
-            try:
-                deleted += int(await conn.fetchval(f'SELECT COUNT(*) FROM "{t}"') or 0)
-            except Exception:  # noqa: BLE001
-                logger.info("factory_reset_count_failed", table=t)
+            if t in present:
+                deleted += await _count(f'SELECT COUNT(*) FROM "{t}"')
         for sql in _dependent_count_sql(section, edges, present).values():
-            try:
-                deleted += int(await conn.fetchval(sql) or 0)
-            except Exception:  # noqa: BLE001
-                logger.info("factory_reset_count_failed", sql=sql)
+            deleted += await _count(sql)
 
     wanted = [t for s in sections for t in s.tables if t in present]
     wanted = list(dict.fromkeys(wanted))

@@ -101,10 +101,14 @@ the formatter handles the rest.
   leave with a section besides its own are those a foreign key
   declares cannot exist without it (a DHCP scope without its subnet);
   each section lists them in `cascade_dependents`, and the preview and
-  the impact total now count them. The whole reset runs in one
-  transaction, and a reset a `RESTRICT` key would break (IPAM while an
-  integration still points at an IP space) is refused with a 409
-  before anything is deleted. `Everything` now orders the wipe by the
+  the impact total now count exactly the rows that go (an Integrations
+  reset counts the records of integration-owned zones, not every
+  record that has a zone). The whole reset runs in one transaction,
+  and a reset a `RESTRICT` key would break (IPAM while an integration,
+  network device or multicast group still points at an IP space) is
+  refused with a 409 naming the referencing table and its row count,
+  before anything is deleted; the reset dialog now shows that message
+  instead of "Request failed with status code 409". `Everything` now orders the wipe by the
   foreign keys, and the Integrations section covers the six
   integration tables (`cloud_endpoint`, `fortinet_firewall`,
   `meraki_org`, `netbird_instance`, `opnsense_router`,
