@@ -91,6 +91,13 @@ the formatter handles the rest.
   the new group listed no server and answered REFUSED until a second
   save. The appliance's own row now moves as the new engine's row, and
   a target group running another driver is a 422 before anything changes.
+  When the appliance holds two or more rows of engines it no longer runs
+  (left by earlier saves), the save is a 409 naming them instead of
+  moving a guess: the new agent lands on whichever row carries its own
+  agent id, which the control plane cannot tell. The Operator Copilot's
+  `assign_appliance_role` (and MCP `propose_assign_role`) now moves the
+  server the same way; it used to set the appliance's group pointer
+  alone, which left the server in the old group on any group change.
 
 - **Failed sign-ins are forwarded to syslog / SIEM as warnings, not info
   (#1874).** Every rejected sign-in (bad password, bad MFA code, locked or
