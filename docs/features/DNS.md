@@ -408,7 +408,8 @@ so there is no private-key custody.
   stanza (and a top-level `dnssec-policy { }` block for custom policies),
   BIND auto-generates keys in `key-directory` and signs.
 - **DS export.** After signing the agent runs `rndc dnssec -status` +
-  `dnssec-dsfromkey` and reports the DS rrset + per-key state back via
+  computes the SHA-256 DS from the KSK key files (in-process, no BIND
+  tools needed) and reports the DS rrset + per-key state back via
   `POST /dns/agents/dnssec-state`; the card surfaces the DS records to
   paste at the parent registrar, plus a per-key table (tag / type / state).
 - **Manual rollover.** The card's per-key **Roll** button

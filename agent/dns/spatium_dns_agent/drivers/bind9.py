@@ -1046,6 +1046,49 @@ def _keyfile_is_ksk(path: str) -> bool:
     return False
 
 
+def _ds_from_key_dir(zone: str, key_dir: str) -> list[str]:
+    """SHA-256 DS records (``<zone>. IN DS tag alg 2 HEX``) for a zone's KSKs.
+
+    Same output as ``dnssec-dsfromkey -2`` but computed with dnspython, so it
+    needs no BIND tools in the image. A signed zone that yields no DS is
+    logged (``dnssec_ds_unavailable``) rather than reported as empty in
+    silence: a missing directory or key file is the usual cause.
+    """
+    import dns.dnssec
+    import dns.name
+    import dns.rdata
+    import dns.rdataclass
+    import dns.rdatatype
+
+    out: list[str] = []
+    if not os.path.isdir(key_dir):
+        log.warning("dnssec_ds_unavailable", zone=zone, reason="key_dir_missing", key_dir=key_dir)
+        return out
+    origin = dns.name.from_text(zone)
+    for fn in sorted(os.listdir(key_dir)):
+        if not fn.endswith(".key") or not fn.startswith(f"K{zone}.+"):
+            continue
+        path = os.path.join(key_dir, fn)
+        try:
+            if not _keyfile_is_ksk(path):
+                continue
+            with open(path) as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith(";") or " DNSKEY " not in s:
+                        continue
+                    rdata_text = s.split(" DNSKEY ", 1)[1]
+                    key = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DNSKEY, rdata_text)
+                    ds = dns.dnssec.make_ds(origin, key, "SHA256")
+                    out.append(f"{origin.to_text()} IN DS {ds.to_text().upper()}")
+                    break
+        except Exception as e:  # noqa: BLE001 — one bad key file must not hide the others
+            log.warning("dsfromkey_failed", zone=zone, file=fn, error=str(e))
+    if not out:
+        log.warning("dnssec_ds_unavailable", zone=zone, reason="no_ksk_key_file", key_dir=key_dir)
+    return out
+
+
 def _render_dnssec_policies(policies: list[dict[str, Any]]) -> str:
     """Render top-level ``dnssec-policy "<name>" { ... };`` blocks (issue #49).
 
@@ -2961,29 +3004,13 @@ class Bind9Driver(DriverBase):
             if res.returncode == 0:
                 keys = _parse_dnssec_status(res.stdout)
         # DS rrset(s) from the KSK public-key files BIND wrote into the
-        # key-directory. The CDS records BIND publishes are an alternative,
-        # but dnssec-dsfromkey is deterministic + version-stable.
+        # key-directory, computed in-process with dnspython (#1854). This
+        # used to shell out to ``dnssec-dsfromkey`` behind a ``shutil.which``
+        # guard, and the appliance image has no such binary (Alpine ships it
+        # in a separate package), so every signed zone silently reported an
+        # empty DS. No binary means nothing to be missing from an image.
         key_dir = "/var/cache/bind/keys"
-        if shutil.which("dnssec-dsfromkey") and os.path.isdir(key_dir):
-            for fn in sorted(os.listdir(key_dir)):
-                if not fn.endswith(".key") or not fn.startswith(f"K{zone}.+"):
-                    continue
-                path = os.path.join(key_dir, fn)
-                try:
-                    if not _keyfile_is_ksk(path):
-                        continue
-                    dres = subprocess.run(
-                        ["dnssec-dsfromkey", "-2", path],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
-                    for ln in dres.stdout.splitlines():
-                        ln = ln.strip()
-                        if ln and " DS " in ln:
-                            ds_records.append(ln)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("dsfromkey_failed", zone=zone, file=fn, error=str(e))
+        ds_records = _ds_from_key_dir(zone, key_dir)
         # Attach DS to the KSK key entries so the per-key UI can show them.
         for k in keys:
             if k.get("key_type") in ("ksk", "csk"):

@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A BIND9-signed zone on the appliance now gets its DS (#1854).**
+  The agent derived the DS by running `dnssec-dsfromkey` only when that
+  binary was on `PATH`, and the Alpine dns-bind9 image does not carry
+  it, so every signed zone reported an empty DS with nothing logged and
+  the zone card had no record to paste at the parent. The agent now
+  computes the SHA-256 DS from the KSK `.key` file in-process with
+  dnspython, so no binary can be missing from an image, and a signed
+  zone that still yields no DS logs `dnssec_ds_unavailable` with the
+  reason instead of reporting empty in silence.
 - **Re-importing a zone's own export no longer pins every inherited TTL
   (#1727).** A record with no TTL of its own inherits the zone default and
   is exported without one, so the re-import read the file's `$TTL` back
