@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
@@ -221,7 +221,7 @@ async def create_profile(
     group_id: uuid.UUID,
     body: PhoneProfileCreate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> PhoneProfileResponse:
     grp = await db.get(DHCPServerGroup, group_id)
     if grp is None:
@@ -290,7 +290,7 @@ async def update_profile(
     profile_id: uuid.UUID,
     body: PhoneProfileUpdate,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> PhoneProfileResponse:
     prof = await db.get(DHCPPhoneProfile, profile_id)
     if prof is None:
@@ -348,7 +348,7 @@ async def update_profile(
 
 
 @router.delete("/phone-profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_profile(profile_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_profile(profile_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     prof = await db.get(DHCPPhoneProfile, profile_id)
     if prof is None:
         raise HTTPException(status_code=404, detail="Phone profile not found")
@@ -374,7 +374,7 @@ async def replace_scope_attachments(
     profile_id: uuid.UUID,
     body: PhoneProfileScopeAttach,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> PhoneProfileResponse:
     """Replace the profile's scope attachments with the provided list.
 
@@ -420,7 +420,7 @@ async def replace_scope_attachments(
 async def seed_starter_pack(
     group_id: uuid.UUID,
     db: DB,
-    user: SuperAdmin,
+    user: CurrentUser,
 ) -> list[PhoneProfileResponse]:
     """Seed the curated 9-vendor starter pack into this group.
 

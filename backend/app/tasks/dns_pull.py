@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.drivers.dns import get_driver
 from app.models.audit import AuditLog
 from app.models.dns import DNSServer, DNSZone
@@ -49,7 +50,9 @@ async def _run_sync() -> dict[str, Any]:
         sync_zone_with_server,
     )
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:

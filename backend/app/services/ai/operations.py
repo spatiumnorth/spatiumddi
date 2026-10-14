@@ -3695,6 +3695,9 @@ async def _preview_assign_appliance_role(
     catalog_problem = await _assign_role_catalog_problem(db, row, args)
     if catalog_problem is not None:
         return PreviewResult(ok=False, detail=catalog_problem)
+    cluster_dns_problem = await _assign_role_cluster_dns_problem(db, row, args)
+    if cluster_dns_problem is not None:
+        return PreviewResult(ok=False, detail=cluster_dns_problem)
     signer_problem = await _assign_role_signer_problem(db, row, args, lock=False)
     if signer_problem is not None:
         return PreviewResult(ok=False, detail=signer_problem)
@@ -3793,6 +3796,33 @@ async def _assign_role_signer_problem(
     return await second_signer_refusal(db, group, driver=driver, lock=lock)
 
 
+async def _assign_role_cluster_dns_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#1427 — same refusal as the REST role-assign route: a control-plane
+    cluster serves one DNS server group, so a member may not run DNS in
+    another. Only on a change, so an unchanged assignment re-saves."""
+    from app.services.appliance.cluster_dns_group import (  # noqa: PLC0415
+        cluster_dns_group_refusal,
+    )
+
+    if "dns_group_id" in args.model_fields_set:
+        try:
+            group_id = UUID(args.dns_group_id) if args.dns_group_id else None
+        except ValueError:
+            return None  # _assign_role_group_problem reports the bad UUID
+    else:
+        group_id = row.assigned_dns_group_id
+    return await cluster_dns_group_refusal(
+        db,
+        row,
+        roles=list(args.roles),
+        group_id=group_id,
+        prev_roles=set(row.assigned_roles or []),
+        prev_group_id=row.assigned_dns_group_id,
+    )
+
+
 async def _assign_role_catalog_problem(
     db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
 ) -> str | None:
@@ -3846,6 +3876,9 @@ async def _apply_assign_appliance_role(
     catalog_problem = await _assign_role_catalog_problem(db, row, args)
     if catalog_problem is not None:
         raise ValueError(catalog_problem)
+    cluster_dns_problem = await _assign_role_cluster_dns_problem(db, row, args)
+    if cluster_dns_problem is not None:
+        raise ValueError(cluster_dns_problem)
     signer_problem = await _assign_role_signer_problem(db, row, args, lock=True)
     if signer_problem is not None:
         raise ValueError(signer_problem)
