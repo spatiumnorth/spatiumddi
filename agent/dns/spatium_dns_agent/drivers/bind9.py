@@ -32,6 +32,7 @@ try:
 except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
+from ..oom_watch import cgroup_memory_limit_bytes as _cgroup_memory_limit_bytes
 from ._process import (
     find_running_daemon,
     is_zombie,
@@ -441,45 +442,31 @@ def _redirect_rdata(target: str) -> str | None:
 
 
 # ── Resolver cache ceiling (issue #1725) ────────────────────────────────────
-# BIND's ``max-cache-size`` defaults to 90 % of PHYSICAL memory, per view, and
-# named reads the host's RAM rather than the container's cgroup limit. A pod
-# holding a large RPZ (the zones themselves live in memory, ~1.4 kB per entry
-# per zone measured) has nothing left for a cache that is allowed to grow to
-# nine tenths of the node. So the cache gets an explicit ceiling: a quarter of
-# the cgroup memory limit when there is one, never an unbounded default.
-# ``NAMED_MAX_CACHE_SIZE`` overrides it (a BIND size, e.g. ``512m``).
-_CGROUP_MEMORY_FILES = (
-    "/sys/fs/cgroup/memory.max",  # cgroup v2
-    "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
-)
+# BIND's ``max-cache-size`` defaults to 90 % of PHYSICAL memory for every view
+# with recursion, and named reads the host's RAM rather than the container's
+# cgroup limit. The option sizes ONE cache, and each view has its own (the ARM:
+# "the total amount of memory required for cache data is the sum of the cache
+# database sizes for all views"), so a server-wide figure in ``options {}``
+# is per view. A pod holding a large RPZ (~1.4 kB per entry per zone,
+# measured) has nothing left for caches allowed to grow to nine tenths of the
+# node each. So the caches get an explicit ceiling: a quarter of the cgroup
+# memory limit in total, split across the recursive views.
+# ``NAMED_MAX_CACHE_SIZE`` overrides it (a BIND size, e.g. ``512m``; per view,
+# as BIND applies it).
 _CACHE_SHARE_OF_LIMIT = 0.25
 _CACHE_MIN_MIB = 32
-# cgroup v1 reports "no limit" as a huge page-aligned number, not "max".
-_CGROUP_UNLIMITED_BYTES = 1 << 55
-
-
-def _cgroup_memory_limit_bytes(files: tuple[str, ...] = _CGROUP_MEMORY_FILES) -> int | None:
-    for path in files:
-        try:
-            raw = Path(path).read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
-        if not raw or raw == "max":
-            return None
-        try:
-            val = int(raw)
-        except ValueError:
-            continue
-        return val if 0 < val < _CGROUP_UNLIMITED_BYTES else None
-    return None
 
 
 def _render_max_cache_size(
-    environ: Any = None, limit_bytes: int | None = None
+    environ: Any = None, limit_bytes: int | None = None, caches: int = 1
 ) -> str:
     """``max-cache-size`` line for ``options {}``; "" when there is neither an
     override nor a container memory limit (named then keeps its own default,
-    which is the right answer on a host that set no limit on purpose)."""
+    which is the right answer on a host that set no limit on purpose).
+
+    ``caches`` is the number of views that keep a resolver cache (recursion
+    on); the quarter of the limit is split between them, since the option in
+    ``options {}`` is inherited by every view as its OWN cache's ceiling."""
     env = os.environ if environ is None else environ
     override = (env.get("NAMED_MAX_CACHE_SIZE") or "").strip()
     if override:
@@ -490,8 +477,23 @@ def _render_max_cache_size(
         limit_bytes = _cgroup_memory_limit_bytes()
     if limit_bytes is None:
         return ""
-    mib = max(int(limit_bytes / (1024 * 1024) * _CACHE_SHARE_OF_LIMIT), _CACHE_MIN_MIB)
+    budget_mib = limit_bytes / (1024 * 1024) * _CACHE_SHARE_OF_LIMIT
+    mib = max(int(budget_mib / max(caches, 1)), _CACHE_MIN_MIB)
     return f"    max-cache-size {mib}m;\n"
+
+
+def _resolver_cache_count(bundle: dict[str, Any]) -> int:
+    """How many resolver caches named will keep for ``bundle``: one per
+    rendered view with recursion on, or one when there are no views.
+
+    A view with recursion off has its own cache too, but BIND keeps it to
+    2 MB by default and nothing fills it, so it is not given a share. The
+    options-level value does reach it as its ceiling; a ceiling it never
+    approaches costs nothing."""
+    views = [v for v in (bundle.get("views") or []) if v.get("name")]
+    if not views:
+        return 1
+    return max(sum(1 for v in views if v.get("recursion", True)), 1)
 
 
 def _render_rate_limit_block(opts: dict[str, Any]) -> str:
@@ -1532,7 +1534,7 @@ class Bind9Driver(DriverBase):
             notify_block=_render_notify_block(opts),
             response_policy=response_policy_block,
             rate_limit=_render_rate_limit_block(opts),
-            max_cache_size=_render_max_cache_size(),
+            max_cache_size=_render_max_cache_size(caches=_resolver_cache_count(bundle)),
             response_log=_render_response_log_option(opts),
             logging_block=logging_block,
             tsig_include=tsig_include,

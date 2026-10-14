@@ -971,12 +971,28 @@ Where to change it:
 - Docker Compose: `DNS_BIND9_MEM_LIMIT` in `.env` (default `2g`).
 - Raw manifests: edit `k8s/dns/bind9-statefulset.yaml`.
 
-**Resolver cache.** BIND's `max-cache-size` defaults to 90 % of physical
-memory per view, and named reads the host's RAM, not the container's limit.
-The agent therefore writes an explicit `max-cache-size` of a quarter of the
-container's memory limit (at least 32m) into `options {}`; with no limit it
-writes nothing and BIND keeps its default. Set `NAMED_MAX_CACHE_SIZE` (a
-BIND size such as `256m`) on the agent to override it.
+**When the limit is hit.** The kernel kills named inside the pod, the agent
+exits, and the orchestrator restarts the container into the same config, so
+a list that does not fit is a crash loop on that server. The agent reads the
+container's OOM-kill counter, records the kill in its state directory, and
+from the restart on reports the daemon as not serving with the reason
+(`oom_killed: named was killed for exceeding the container's 2 GiB memory
+limit …`). That is the red chip on the server row and, after its 5-minute
+grace, the default-on **Agent daemon not serving** alert. The record clears
+once named has stayed up for 10 minutes. If a structural apply was in flight
+when named died, the apply's own failure (`agent_config_rejected`) names the
+OOM kill instead. If the kernel picks the agent rather than named, nothing
+can be written first: the pod's last state (`OOMKilled`) is the record.
+
+**Resolver cache.** BIND's `max-cache-size` sizes one cache, every view with
+recursion has its own, and the default is 90 % of physical memory for each:
+named reads the host's RAM, not the container's limit. The agent therefore
+writes an explicit `max-cache-size` into `options {}`: a quarter of the
+container's memory limit, split across the views that recurse (at least
+32m each). So a 2Gi limit gives `512m` with no views and `256m` with two
+recursive views. With no limit it writes nothing and BIND keeps its default.
+Set `NAMED_MAX_CACHE_SIZE` (a BIND size such as `256m`, applied per view, as
+BIND does) on the agent to override it.
 
 ### 8.1 Content filtering / family filter (issue #878)
 

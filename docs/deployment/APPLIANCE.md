@@ -1120,9 +1120,18 @@ spec:
 Size it from the table in [`DNS.md` section 8.0](../features/DNS.md): a
 582k-entry list in a group with one view needs about 4 GiB for named, so a
 node of 8 GiB or more. On a 6 GiB floor node, expect that list to be killed
-by its limit rather than to fit. The agent also derives named's
-`max-cache-size` from the limit (a quarter of it), so the resolver cache
-cannot take the RPZ's share.
+by its limit rather than to fit; the server then reports its daemon as not
+serving, naming the OOM kill, and the **Agent daemon not serving** alert
+fires (see `DNS.md` 8.0). The agent also derives named's `max-cache-size`
+from the limit (a quarter of it, split across the recursive views), so the
+resolver caches cannot take the RPZ's share.
+
+The request (256Mi) is what the scheduler reserves; the limit is a ceiling,
+so the pod is Burstable and a 3 GiB DNS-only node still schedules. Under node
+memory pressure the kubelet evicts pods using more than their request in
+PriorityClass order, and `dns-bind9` runs in `spatium-service`, the highest
+of the three (#983), so the control plane is evicted before it: the limit,
+not eviction, is what stops it.
 
 ### What is deliberately not set
 

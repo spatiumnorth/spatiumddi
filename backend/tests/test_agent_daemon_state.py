@@ -156,6 +156,11 @@ def test_null_is_unknown_not_unhealthy() -> None:
 # every agent change without pulling agent/ into this suite's CI gate (#821).
 _AGENT_REASONS = [
     ("start deferred, no bundle yet", False),  # dns supervisor.py
+    # dns oom_watch.py (#1725): named killed by the container's memory limit
+    (
+        "oom_killed: named was killed for exceeding the container's 2 GiB memory limit",
+        False,
+    ),
     ("config_apply_reverted: named-checkconf failed", True),  # dns + dhcp sync.py
     ("config_apply_revert_failed: rndc reconfig failed", True),  # dns sync.py
     ("config_apply_no_previous: named-checkconf failed", True),  # dns sync.py

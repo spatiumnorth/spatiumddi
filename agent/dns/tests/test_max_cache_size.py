@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from spatium_dns_agent import oom_watch
 from spatium_dns_agent.drivers import bind9
 from spatium_dns_agent.drivers.bind9 import Bind9Driver, _render_max_cache_size
 
@@ -46,12 +47,10 @@ def test_env_override_wins_and_is_validated() -> None:
         ("junk", None),
     ],
 )
-def test_cgroup_file_parsing(
-    tmp_path: Path, content: str, expected: int | None
-) -> None:
+def test_cgroup_file_parsing(tmp_path: Path, content: str, expected: int | None) -> None:
     f = tmp_path / "memory.max"
     f.write_text(content)
-    assert bind9._cgroup_memory_limit_bytes((str(f),)) == expected
+    assert oom_watch.cgroup_memory_limit_bytes((str(f),)) == expected
 
 
 def _bundle() -> dict:
@@ -78,12 +77,32 @@ def test_the_rendered_named_conf_carries_the_ceiling(
     assert "max-cache-size 512m;" in opts
 
 
-def test_no_limit_renders_no_line(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_no_limit_renders_no_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("NAMED_MAX_CACHE_SIZE", raising=False)
     monkeypatch.setattr(bind9, "_cgroup_memory_limit_bytes", lambda *a, **k: None)
     Bind9Driver(state_dir=tmp_path).render(_bundle())
-    assert (
-        "max-cache-size" not in (tmp_path / "rendered.new" / "named.conf").read_text()
-    )
+    assert "max-cache-size" not in (tmp_path / "rendered.new" / "named.conf").read_text()
+
+
+def test_the_budget_is_split_across_recursive_views() -> None:
+    """``max-cache-size`` in ``options {}`` sizes EACH view's cache (BIND ARM),
+    so three recursive views on a 2 GiB limit get a third of the quarter each,
+    not 512m apiece (1.5 GiB of cache in a 2 GiB pod)."""
+    assert _render_max_cache_size({}, 2 * GIB, caches=3) == "    max-cache-size 170m;\n"
+
+
+def test_views_with_recursion_off_take_no_share(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("NAMED_MAX_CACHE_SIZE", raising=False)
+    monkeypatch.setattr(bind9, "_cgroup_memory_limit_bytes", lambda *a, **k: 2 * GIB)
+    bundle = _bundle()
+    bundle["views"] = [
+        {"name": "internal", "match_clients": ["10.0.0.0/8"], "recursion": True},
+        {"name": "guest", "match_clients": ["192.168.0.0/16"], "recursion": True},
+        {"name": "external", "match_clients": ["any"], "recursion": False},
+    ]
+    Bind9Driver(state_dir=tmp_path).render(bundle)
+    conf = (tmp_path / "rendered.new" / "named.conf").read_text()
+    assert "max-cache-size 256m;" in conf
+    assert conf.count("max-cache-size") == 1  # options-level, inherited per view

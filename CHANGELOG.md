@@ -93,8 +93,13 @@ the formatter handles the rest.
   256Mi request and a 2Gi limit (Compose: `DNS_BIND9_MEM_LIMIT`), so an
   overload is the pod's own. The agent also writes `max-cache-size`
   (a quarter of the container's memory limit) into named.conf, since
-  BIND's default is 90 % of the host's RAM per view; override with
-  `NAMED_MAX_CACHE_SIZE`. The appliance limit is one cluster-wide value
+  BIND's default is 90 % of the host's RAM for each view's cache (the
+  quarter is split across the recursive views); override with
+  `NAMED_MAX_CACHE_SIZE`. A named killed by the limit is no longer a
+  silent crash loop: the agent reads the container's OOM-kill counter,
+  persists the kill across the restart, and reports the daemon as not
+  serving with the reason until it stays up for 10 minutes, which raises
+  the default-on **Agent daemon not serving** alert. The appliance limit is one cluster-wide value
   rather than sized per node (the role chart must render identically on
   every node, #1137); a list that needs more raises it with a
   HelmChartConfig. Sizing guidance is in `DNS.md` 8.0 and

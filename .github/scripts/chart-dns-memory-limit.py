@@ -83,6 +83,8 @@ def main() -> int:
         problems.append("no dns-bind9 / dns container rendered; the check exercised nothing")
     for line in problems:
         print(line, file=sys.stderr)
+    if seen and not problems:
+        print(f"   BIND9 memory limit: {seen} container(s) carry one of at least 1Gi")
     return 1 if problems else 0
 
 

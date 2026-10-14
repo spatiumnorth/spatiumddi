@@ -498,6 +498,9 @@ coverage "$METALLB" "${METALLB_ALL_ON[@]}" "${METALLB_BGP[@]}"
 echo "── no external Kea HA port (raw k8s/dhcp manifests)"
 python3 "$ROOT/.github/scripts/chart-no-external-kea-ha.py" "$ROOT"/k8s/dhcp/*.yaml \
     || failures=$((failures + 1))
+echo "── BIND9 memory limit (raw k8s/dns manifest, #1725)"
+python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
+    "$ROOT/k8s/dns/bind9-statefulset.yaml" || failures=$((failures + 1))
 
 # #1589 — the DHCP agent's readiness probe must test the Kea control
 # socket, not the HA listener, in the umbrella chart's render (the
