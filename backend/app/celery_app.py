@@ -325,6 +325,13 @@ celery_app.conf.update(
             "task": "app.tasks.looking_glass.collector_stale_sweep",
             "schedule": schedule(run_every=60.0),
         },
+        # Every 60 s, end the shared-tag hold of a rolling upgrade that
+        # failed or was aborted once every cluster member reports one
+        # version (#1710) — a roll finished node by node instead.
+        "upgrade-shared-tag-hold-release": {
+            "task": "app.tasks.upgrade_orchestrator.release_lingering_shared_tag_hold",
+            "schedule": schedule(run_every=60.0),
+        },
         # Every 5 min, re-run the IPAM/ASN/VRF matcher over every active
         # Looking Glass route — catches IPAM edits made between RIB
         # pushes that a route's own re-announce wouldn't otherwise
