@@ -10506,9 +10506,11 @@ function BlocklistDetail({
                         })
                       }
                       title={
-                        e.source === "manual"
-                          ? "Also block *.<domain>. Saves immediately."
-                          : "Feed-sourced entries can't be toggled."
+                        e.source !== "manual"
+                          ? "Feed-sourced entries can't be toggled."
+                          : !can("write", "dns_blocklist")
+                            ? NEEDS_BLOCKLIST_WRITE
+                            : "Also block *.<domain>. Saves immediately."
                       }
                     />
                   </td>
