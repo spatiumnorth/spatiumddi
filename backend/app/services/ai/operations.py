@@ -3695,6 +3695,9 @@ async def _preview_assign_appliance_role(
     catalog_problem = await _assign_role_catalog_problem(db, row, args)
     if catalog_problem is not None:
         return PreviewResult(ok=False, detail=catalog_problem)
+    cluster_dns_problem = await _assign_role_cluster_dns_problem(db, row, args)
+    if cluster_dns_problem is not None:
+        return PreviewResult(ok=False, detail=cluster_dns_problem)
     signer_problem = await _assign_role_signer_problem(db, row, args, lock=False)
     if signer_problem is not None:
         return PreviewResult(ok=False, detail=signer_problem)
@@ -3793,12 +3796,41 @@ async def _assign_role_signer_problem(
     return await second_signer_refusal(db, group, driver=driver, lock=lock)
 
 
+async def _assign_role_cluster_dns_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#1427 — same refusal as the REST role-assign route: a control-plane
+    cluster serves one DNS server group, so a member may not run DNS in
+    another. Only on a change, so an unchanged assignment re-saves."""
+    from app.services.appliance.cluster_dns_group import (  # noqa: PLC0415
+        cluster_dns_group_refusal,
+    )
+
+    if "dns_group_id" in args.model_fields_set:
+        try:
+            group_id = UUID(args.dns_group_id) if args.dns_group_id else None
+        except ValueError:
+            return None  # _assign_role_group_problem reports the bad UUID
+    else:
+        group_id = row.assigned_dns_group_id
+    return await cluster_dns_group_refusal(
+        db,
+        row,
+        roles=list(args.roles),
+        group_id=group_id,
+        prev_roles=set(row.assigned_roles or []),
+        prev_group_id=row.assigned_dns_group_id,
+    )
+
+
 async def _assign_role_catalog_problem(
     db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
 ) -> str | None:
-    """#1782 — same refusal as the REST role-assign route: a Technitium
-    appliance must not be pointed at a catalog-enabled DNS group (#1766).
-    Only on a change, so a pre-existing assignment can still be re-saved."""
+    """#1782 / #1858 — same refusals as the REST role-assign route: a
+    Technitium appliance must not be pointed at a catalog-enabled DNS group
+    (#1766), nor at one holding a TSIG key Technitium cannot use
+    (hmac-sha224). Only on a change, so a pre-existing assignment can still
+    be re-saved."""
     from app.models.dns import DNSServerGroup  # noqa: PLC0415
     from app.services.dns.server_move import catalog_unsupported_message  # noqa: PLC0415
 
@@ -3816,8 +3848,14 @@ async def _assign_role_catalog_problem(
     if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
         return None
     group = await db.get(DNSServerGroup, group_id)
-    if group is None or not group.catalog_zones_enabled:
+    if group is None:
         return None
+    if not group.catalog_zones_enabled:
+        # #1858 — same refusal as the REST route: a key Technitium cannot use.
+        from app.services.dns.tsig_algorithms import group_key_refusal  # noqa: PLC0415
+
+        key_problem = await group_key_refusal(db, group.id, {"technitium"})
+        return f"DNS server group {group.name!r}: {key_problem}" if key_problem else None
     return f"DNS server group {group.name!r} has catalog zones enabled. " + (
         catalog_unsupported_message({"technitium"})
     )
@@ -3846,6 +3884,9 @@ async def _apply_assign_appliance_role(
     catalog_problem = await _assign_role_catalog_problem(db, row, args)
     if catalog_problem is not None:
         raise ValueError(catalog_problem)
+    cluster_dns_problem = await _assign_role_cluster_dns_problem(db, row, args)
+    if cluster_dns_problem is not None:
+        raise ValueError(cluster_dns_problem)
     signer_problem = await _assign_role_signer_problem(db, row, args, lock=True)
     if signer_problem is not None:
         raise ValueError(signer_problem)

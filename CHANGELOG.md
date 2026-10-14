@@ -84,6 +84,170 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A power loss right after a slot apply no longer freezes the node's
+  Fleet row (#1747).** The slot-upgrade runners wrote their state and
+  progress sidecars with a plain redirect and no fsync, so a power loss
+  right after "apply succeeded" could leave `slot-upgrade.log` or a
+  sidecar ending in, or made of, NUL bytes. The supervisor sends the log
+  tail on every heartbeat, Postgres refuses a NUL in a text value, and the
+  api answered 422 to every heartbeat from that node until someone edited
+  the file by hand.
+  - The supervisor strips NUL and other control characters from the log
+    tail and the progress sidecar, and strips NUL from every string in
+    the heartbeat body before sending it, so a NUL in any other field
+    read off a host file cannot freeze the row either.
+  - A NUL-filled, empty or truncated state or progress file reads as
+    unknown. Clearing a failed upgrade, and the passive heal when no
+    upgrade is desired, reset an unreadable state to `ready` the way they
+    already reset `failed`.
+  - The host runners (`spatiumddi-slot-upgrade`, `-slot-set-next-boot`,
+    `-slot-set-default`, `-slot-rollback`, `spatium-upgrade-slot`) write
+    their sidecars to a temp file, fsync it, rename it over the target
+    and fsync the directory. The main runner also fsyncs the log after
+    the apply and, on every exit, the log and the trigger's terminal
+    rename.
+
+- **A subnet wider than a /24 now gets a reverse zone for every /24 it
+  spans, so every address gets its PTR (#1840).** A /17–/23 was given
+  the zone of the /24 holding its network address, so in a /23 every
+  address past the first /24 had no zone and no PTR, with nothing
+  reported. It now gets one zone per /24 (a /23 two, a /20 sixteen, a
+  /17 128), never one enclosing zone, which would make SpatiumDDI
+  authoritative for space outside the subnet. A /9–/16 gets one per /16
+  it contains, and an IPv6 prefix one per nibble-aligned piece (a /55
+  gets both its /56 zones where it used to get only the first, a /45 its
+  eight /48s). The zones are a set: subnet delete trashes all of them
+  (and restore brings them back), a resize grow adds the new range's,
+  and the reverse-zone backfill creates the missing ones. Which zone
+  takes a PTR is decided per address by one shared lookup, also used by
+  the DNS drift check, whose preview now lists every reverse zone of the
+  subnet rather than the first, and which no longer reports another
+  subnet's orphaned PTRs because they share a /24 zone. The Windows
+  cutover checklist counts a wider reverse zone as covering its /24s
+  instead of reporting each one missing. An install's existing first-/24
+  zone keeps serving its addresses; the rest of the set is created on
+  the next allocation or backfill. No migration.
+
+- **Technitium: an hmac-sha224 TSIG key is refused instead of being
+  installed and failing every signed transfer (#1858).** Technitium has
+  no HMAC-SHA224 (`DnsDatagram.GetTsigMacSize` returns 0 for it), so a
+  sha224 key was accepted, installed, pinned on the zones, and every
+  AXFR signed with it answered BADKEY. Creating or changing a key to
+  hmac-sha224 on a `technitium` / `technitium_api` group is now a 422
+  naming the algorithm, as is putting a Technitium server (create,
+  driver change, move, Fleet or Copilot role assignment) into a group
+  that holds one, or moving a zone that uses one into such a group.
+  The zone-move preview reports that refusal, so the Move button is
+  blocked rather than failing on commit. The agent no longer installs or
+  pins a sha224 key already stored and reports it as an apply failure
+  (the `agent_config_rejected` alert fires on it). BIND9 and PowerDNS support all five
+  algorithms, Windows and the cloud drivers use no group TSIG keys, so
+  there was no other gap.
+
+- **DigitalOcean, Linode and Vultr: deleting a zone already absent at
+  the provider is done, not an error (#1889).** The three drivers were
+  left out of #1537, so a zone removed out of band at the provider could
+  never leave the Trash: the retention sweep and "Delete permanently"
+  both failed on the provider's not-found answer. The provider's
+  documented not-found answer on the zone delete now counts as success:
+  DigitalOcean HTTP 404 with `{"id": "not_found"}`, Linode HTTP 404 with
+  its `errors` envelope (or a domain absent from its account's filtered
+  domain list), Vultr HTTP 404. A 404 without that shape, auth,
+  throttling and 5xx still fail.
+
+- **The appliance's Celery worker and beat run in appliance mode
+  (#1826).** `APPLIANCE_MODE` was set only on the api container, so the
+  worker, which runs alert evaluation and the rolling-upgrade
+  orchestrator, saw it unset: `node_pressure` and `cluster_dns_degraded`
+  never fired on schedule, and the worker closed what "Evaluate now"
+  (which runs in the api) opened. The chart gains a `sharedEnv` value
+  appended to the api, worker and beat containers; firstboot writes
+  `APPLIANCE_MODE`, `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and
+  `INITIAL_NTP_SERVERS` there instead of under `api.env`, and the
+  slot-image mirror URL and secret now reach the worker as well as the
+  api (the rolling-upgrade preflight's mirror disk-headroom check never
+  ran there), but not beat. A new chart guard, `chart-shared-env.py`,
+  fails a render where the three disagree. An existing appliance picks it up when firstboot
+  re-renders the control-plane chart values (the next slot upgrade).
+
+- **A lost CNPG primary no longer hangs a Celery task for ~15 minutes
+  (#1719).** No Celery-side database engine set asyncpg bounds: neither
+  `task_session()` nor the ~55 per-task `create_async_engine` calls the
+  lease pulls, DNS / IPAM syncs, health sweeps, integration mirrors and the
+  event outbox build directly. A query to a black-holed primary therefore
+  waited out the kernel's TCP retransmit timeout while the worker completed
+  nothing and its liveness probe passed. Every task and service engine on
+  the app database now carries the api engine's connect bound
+  (`TASK_DB_CONNECT_TIMEOUT`, 5 s) and a per-statement
+  `TASK_DB_COMMAND_TIMEOUT` (120 s, the pre-ping included), through one
+  helper, `app.db.task_connect_args()`; a test fails any new engine that
+  omits it. Tasks with a single statement that can legitimately run long use
+  `TASK_DB_LONG_COMMAND_TIMEOUT` (900 s): the prunes (metrics, logs,
+  internal errors, lease history, stale ARP), trash purge, audit-chain
+  verify, utilization recount, backup sweep, the DNS threat rollup and the
+  DNS agent bundle render, whose records query on a million-row group is
+  the #1111 case. The backup drill's scratch-database engine and the backup
+  migration helper's explicit-URL engine are deliberately unbounded.
+
+- **Drift no longer lists a stored apex NS as missing on the server
+  (#1857).** The zone-transfer read drops the apex NS set, so a stored
+  apex NS row, such as the copy of the source's `@ NS` a Technitium or
+  BIND9 import brings in, could only ever read "missing on server", and
+  the zone never showed in sync whatever Sync did. On an agent-managed
+  BIND9 or Technitium server, which serves a zone's own apex NS rows as
+  its NS set, drift now reads the apex NS too and compares it, so an NS
+  set changed on the server, or an NS change the agent did not apply,
+  still shows. Where the read carries no apex NS (an operator's own
+  BIND9, Windows), the stored rows are left out of the comparison; where
+  the zone declares none, the server's own NS set is not reported.
+  Delegations below the apex are compared as before. Import and Sync with
+  Servers still never see the apex NS. The importers keep the row, so no
+  stored data changes.
+
+- **The built-in Auditor and Compliance Editor could not read the
+  audit log (#1862).** Both roles were granted `read` on `audit`, a
+  resource type no route checks, while every audit-log route (the
+  list, the PDF export and the integrity check) requires `read` on
+  `audit_log`. An Auditor opening Administration, Audit Log was told
+  "0 events" with the log full, and the role's own description ("read
+  on audit log") was false. Both roles now carry `read` on
+  `audit_log`. Built-in roles are re-written from code on every api
+  start, so existing installs pick this up on upgrade with no
+  migration. A new test walks every route's required permission and
+  fails when a built-in role holds a grant that no route checks.
+
+- **The DNS Editor and DHCP Editor roles now grant the writes they
+  always claimed to (#1861).** Both promised "Full CRUD", but 134 of
+  the 147 DNS and DHCP write routes also took `SuperAdmin`, so a DHCP
+  Editor could not create a scope and a DNS Editor could write records
+  and nothing else; the subnet's DHCP Pools panel offered Create Scope
+  and then refused the filled-in form with "Superadmin required". The
+  everyday data routes now check the role's own resource permission,
+  with `delete` for a delete. **This widens what both roles can do on
+  existing installs**, on purpose:
+  - DNS Editor: zones (create, from template, edit, delete), records,
+    zone-file import, views, named ACLs, and the entries and exceptions
+    of existing blocklists.
+  - DHCP Editor: scopes, pools, static assignments, client classes and
+    device policies, option templates (and applying one to a scope),
+    phone and PXE profiles, and MAC blocks.
+
+  Infrastructure stays superadmin-only: server groups and servers,
+  DNS server options, TSIG keys, DNSSEC signing and policies,
+  dynamic-update ACLs, zone moves, blocklist lists and their feeds and
+  assignments, DNS GSLB pools, Windows DHCP failover, lease deletion and
+  the importers. So do `?permanent=true` on a zone or scope delete and
+  changing a zone's DNSSEC, dynamic-update or TLS-probing settings. The
+  DNS Editor's grant on `manage_dns_pools` narrows from `admin` to
+  `read`, since every pool write stays superadmin-only. The console's
+  controls follow the same gates: an Editor gets them, a Viewer sees
+  them disabled with the reason, and the PXE profiles page, which had
+  no gate at all, now has one. `docs/PERMISSIONS.md` lists every gate,
+  and `test_builtin_roles_match_routes.py` now fails when a built-in
+  role is refused a route its description promises, holds a write grant
+  none of its promised routes use, or when a DNS / DHCP write route is
+  neither on the open list nor superadmin-only.
+
 - **Failed sign-ins are forwarded to syslog / SIEM as warnings, not info
   (#1874).** Every rejected sign-in (bad password, bad MFA code, locked or
   disabled account) is audited with `result="failure"`, which audit
@@ -340,28 +504,6 @@ the formatter handles the rest.
     rendered for Kea.
   - The Stats tab, the InfluxDB export and the `dhcp_packets_dropped`
     alert now get the right number, with no change of their own.
-- **A power loss right after a slot apply no longer freezes the node's
-  Fleet row (#1747).** The slot-upgrade runners wrote their state and
-  progress sidecars with a plain redirect and no fsync, so a power loss
-  right after "apply succeeded" could leave `slot-upgrade.log` or a
-  sidecar ending in, or made of, NUL bytes. The supervisor sends the log
-  tail on every heartbeat, Postgres refuses a NUL in a text value, and the
-  api answered 422 to every heartbeat from that node until someone edited
-  the file by hand.
-  - The supervisor strips NUL and other control characters from the log
-    tail and the progress sidecar, and strips NUL from every string in
-    the heartbeat body before sending it, so a NUL in any other field
-    read off a host file cannot freeze the row either.
-  - A NUL-filled, empty or truncated state or progress file reads as
-    unknown. Clearing a failed upgrade, and the passive heal when no
-    upgrade is desired, reset an unreadable state to `ready` the way they
-    already reset `failed`.
-  - The host runners (`spatiumddi-slot-upgrade`, `-slot-set-next-boot`,
-    `-slot-set-default`, `-slot-rollback`, `spatium-upgrade-slot`) write
-    their sidecars to a temp file, fsync it, rename it over the target
-    and fsync the directory. The main runner also fsyncs the log after
-    the apply and, on every exit, the log and the trigger's terminal
-    rename.
 
 - **Changing an address's IP inside one reverse zone retracts the old
   PTR (#1822).** IPAM rewrote the PTR row in place and queued a single

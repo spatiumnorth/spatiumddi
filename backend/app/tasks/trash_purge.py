@@ -20,6 +20,7 @@ import structlog
 from sqlalchemy import and_, delete, or_, select
 
 from app.celery_app import celery_app
+from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
 from app.db import task_session
 from app.models.audit import AuditLog
@@ -253,7 +254,7 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
 
 
 async def _sweep() -> dict[str, Any]:
-    async with task_session() as db:
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         ps_res = await db.execute(select(PlatformSettings).limit(1))
         ps = ps_res.scalar_one_or_none()
         purge_days = 30

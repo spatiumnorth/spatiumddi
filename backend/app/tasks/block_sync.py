@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.models.meraki import MerakiOrg
 from app.models.opnsense import OPNsenseRouter
 from app.models.panos import PANOSFirewall
@@ -42,7 +43,9 @@ async def _run_sweep() -> dict[str, Any]:
         reconcile_unifi,
     )
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -153,7 +156,9 @@ async def _run_one(target_kind: str, target_id: str) -> dict[str, Any]:
         reconcile_unifi,
     )
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -200,7 +205,9 @@ async def _run_lift(target_kind: str, target_id: str) -> dict[str, Any]:
     leaving its blocks stuck on the device is the bug we're fixing)."""
     from app.services.block_sync.reconcile import lift_all_for_target  # noqa: PLC0415
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:

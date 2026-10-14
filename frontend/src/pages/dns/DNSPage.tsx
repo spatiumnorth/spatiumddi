@@ -141,16 +141,28 @@ import {
 // #1338 — a read-only user is offered no DNS write it would be refused.
 // The DNS router admits a write (a delete) on any of its three resource
 // types (dns/router.py, ``require_any_resource_permission``); record writes
-// need nothing more, while every server group, server, view, ACL, TSIG key
-// and zone handler also takes a superadmin. The controls ask the same.
+// need nothing more. #1861 — zone writes also take ``dns_zone``, view and
+// ACL writes ``dns_group``, a zone-file import ``dns_record``, and blocklist
+// entry / exception writes ``dns_blocklist``, each with the HTTP method's
+// action (``delete`` for a delete). Server groups, servers, server options,
+// TSIG keys, DNSSEC, dynamic-update ACLs, zone moves, blocklist
+// subscriptions and pools stay superadmin-only. The controls ask the same.
 const DNS_RESOURCES = ["dns_group", "dns_zone", "dns_record"];
 const NEEDS_DNS_WRITE = "Requires write permission on DNS records";
 const NEEDS_DNS_DELETE = "Requires delete permission on DNS records";
+const NEEDS_RECORD_WRITE = NEEDS_DNS_WRITE;
+const NEEDS_ZONE_WRITE = "Requires write permission on DNS zones";
+const NEEDS_ZONE_DELETE = "Requires delete permission on DNS zones";
+const NEEDS_GROUP_WRITE = "Requires write permission on DNS server groups";
+const NEEDS_GROUP_DELETE = "Requires delete permission on DNS server groups";
+const NEEDS_BLOCKLIST_WRITE = "Requires write permission on DNS blocklists";
+const NEEDS_BLOCKLIST_DELETE = "Requires delete permission on DNS blocklists";
 
 function useDnsGrants() {
   const perms = usePermissions();
   return {
     isSuperadmin: perms.isSuperadmin,
+    can: perms.can,
     canWriteRecords: DNS_RESOURCES.some((t) => perms.can("write", t)),
     canDeleteRecords: DNS_RESOURCES.some((t) => perms.can("delete", t)),
   };
@@ -2282,6 +2294,9 @@ function DnssecCard({
   const [error, setError] = useState<string | null>(null);
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
   const [policyId, setPolicyId] = useState<string>("");
+  // #1861 — the zone is editable by a DNS Editor, but DNSSEC signing and key
+  // management stay superadmin-only (the sign / unsign / rollover routes).
+  const { isSuperadmin } = usePermissions();
 
   const info = useQuery({
     queryKey: ["dns-zone-dnssec-info", groupId, zoneId],
@@ -2428,6 +2443,7 @@ function DnssecCard({
                     ? unmanagedNote
                     : "Re-run sign (keeps the current policy)"
                 }
+                {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
                 {signMut.isPending ? "Re-signing…" : "Re-sign"}
               </button>
@@ -2436,6 +2452,7 @@ function DnssecCard({
                 disabled={busy}
                 onClick={() => unsignMut.mutate()}
                 className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs text-destructive hover:bg-destructive/20 disabled:opacity-50"
+                {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
                 {unsignMut.isPending ? "Unsigning…" : "Unsign"}
               </button>
@@ -2447,6 +2464,7 @@ function DnssecCard({
                 onChange={(e) => setPolicyId(e.target.value)}
                 className="rounded border bg-background px-2 py-1 text-xs"
                 title="DNSSEC signing policy (BIND9)"
+                {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
                 <option value="">default policy</option>
                 {(policies.data ?? [])
@@ -2464,6 +2482,7 @@ function DnssecCard({
                 title={signingUnmanaged ? unmanagedNote : undefined}
                 onClick={() => signMut.mutate(policyId || null)}
                 className="rounded bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
                 {signMut.isPending ? "Signing…" : "Sign zone"}
               </button>
@@ -2511,6 +2530,7 @@ function DnssecCard({
                       onClick={() => rolloverMut.mutate(k.key_tag)}
                       className="rounded border px-1.5 py-0.5 text-[10px] hover:bg-accent disabled:opacity-50"
                       title="Force a key rollover (BIND9 rndc dnssec -rollover)"
+                      {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
                     >
                       Roll
                     </button>
@@ -2602,6 +2622,8 @@ export function ZoneModal({
   const [adminEmail, setAdminEmail] = useState(zone?.admin_email ?? "");
   const [ttl, setTtl] = useState(String(zone?.ttl ?? 3600));
   const [dnssec, setDnssec] = useState(zone?.dnssec_enabled ?? false);
+  // #1861 — DNSSEC at create is superadmin-only; the zone itself is not.
+  const { isSuperadmin: zoneIsSuperadmin } = usePermissions();
   const [color, setColor] = useState<string | null>(zone?.color ?? null);
   // #1784 — the experimental agentless Technitium driver writes only the
   // zone name + Primary type, and the API refuses a changed SOA / TTL or a
@@ -2684,11 +2706,15 @@ export function ZoneModal({
       primary_ns: primaryNs,
       admin_email: adminEmail,
       ttl: parseInt(ttl, 10),
-      dnssec_enabled: dnssec,
       color,
       domain_id: domainId,
       customer_id: customerId,
     };
+    // DNSSEC is chosen here only at create; an edit manages signing in the
+    // DnssecCard. Sending the value the dialog opened with would re-send a
+    // stale flag (unsigning a zone signed since), and for a non-superadmin
+    // any change to it is refused (#1861).
+    if (!zone) payload.dnssec_enabled = dnssec;
     if (zoneType === "forward") {
       const fwds = forwardersText
         .split(/[,\s]+/)
@@ -2903,6 +2929,7 @@ export function ZoneModal({
                   checked={dnssec}
                   onChange={(e) => setDnssec(e.target.checked)}
                   className="h-4 w-4"
+                  {...permissionGate(zoneIsSuperadmin, NEEDS_SUPERADMIN)}
                 />
                 <span className="text-sm">Enable DNSSEC after creation</span>
               </label>
@@ -3449,7 +3476,8 @@ function MoveZoneModal({
       preview.dnssec_unsupported_drivers.length > 0 ||
       preview.acl_names_lost.length > 0 ||
       preview.key_names_lost.length > 0 ||
-      !!preview.technitium_api_refusal);
+      !!preview.technitium_api_refusal ||
+      !!preview.tsig_algorithm_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -3508,6 +3536,11 @@ function MoveZoneModal({
             {preview.technitium_api_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.technitium_api_refusal}
+              </div>
+            )}
+            {preview.tsig_algorithm_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.tsig_algorithm_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
@@ -3815,7 +3848,8 @@ function ZoneDetailView({
   // selection to the trash under one batch id; before #963 the grid could
   // only hard-delete, so the option stays reachable for the one role that
   // may use it.
-  const { isSuperadmin, canWriteRecords, canDeleteRecords } = useDnsGrants();
+  const { isSuperadmin, can, canWriteRecords, canDeleteRecords } =
+    useDnsGrants();
   const [bulkPermanent, setBulkPermanent] = useState(false);
   // Outcome of the last bulk delete when some rows were skipped — the
   // selection persists across pages, so the count in the modal can differ
@@ -4126,7 +4160,10 @@ function ZoneDetailView({
                       label: "Import",
                       icon: Upload,
                       onSelect: () => setShowImport(true),
-                      ...permissionGate(isSuperadmin, NEEDS_SUPERADMIN),
+                      ...permissionGate(
+                        can("write", "dns_record"),
+                        NEEDS_RECORD_WRITE,
+                      ),
                     },
                     {
                       key: "export",
@@ -4167,7 +4204,7 @@ function ZoneDetailView({
                 title: zone.tailscale_tenant_id
                   ? "This zone is synthesised by the Tailscale integration; edits would be overwritten on the next sync."
                   : undefined,
-                ...permissionGate(isSuperadmin, NEEDS_SUPERADMIN),
+                ...permissionGate(can("write", "dns_zone"), NEEDS_ZONE_WRITE),
               },
               ...((zone.zone_type === "primary" ||
                 zone.zone_type === "master") &&
@@ -4192,7 +4229,10 @@ function ZoneDetailView({
                       icon: Plus,
                       onSelect: () => setShowAddSubzone(true),
                       title: `Create a sub-zone under ${zone.name.replace(/\.$/, "")}`,
-                      ...permissionGate(isSuperadmin, NEEDS_SUPERADMIN),
+                      ...permissionGate(
+                        can("write", "dns_zone"),
+                        NEEDS_ZONE_WRITE,
+                      ),
                     },
                   ]
                 : []),
@@ -4218,7 +4258,7 @@ function ZoneDetailView({
                 title: zone.tailscale_tenant_id
                   ? "Delete the Tailscale tenant or unbind its DNS group to release this zone."
                   : undefined,
-                ...permissionGate(isSuperadmin, NEEDS_SUPERADMIN),
+                ...permissionGate(can("delete", "dns_zone"), NEEDS_ZONE_DELETE),
               },
             ]}
           />
@@ -5663,7 +5703,7 @@ function SyncStat({
  */
 function ViewsTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
-  const { isSuperadmin } = useDnsGrants();
+  const { can } = useDnsGrants();
   const [editing, setEditing] = useState<DNSView | null>(null);
   const [creating, setCreating] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<DNSView | null>(null);
@@ -5719,7 +5759,7 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
             setError("");
             setCreating(true);
           }}
-          {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
+          {...permissionGate(can("write", "dns_group"), NEEDS_GROUP_WRITE)}
         >
           <Plus className="h-3 w-3" /> New View
         </button>
@@ -5780,7 +5820,10 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
                         setError("");
                         setEditing(v);
                       }}
-                      {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
+                      {...permissionGate(
+                        can("write", "dns_group"),
+                        NEEDS_GROUP_WRITE,
+                      )}
                     >
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
@@ -5791,7 +5834,10 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
                         setError("");
                         setConfirmDelete(v);
                       }}
-                      {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
+                      {...permissionGate(
+                        can("delete", "dns_group"),
+                        NEEDS_GROUP_DELETE,
+                      )}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
@@ -6198,7 +6244,7 @@ function SubnetPickerModal({
 
 function AclsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
-  const { isSuperadmin } = useDnsGrants();
+  const { can } = useDnsGrants();
   const [showCreate, setShowCreate] = useState(false);
   // ConfirmModal rather than window.confirm — a native dialog can't be
   // styled, can't explain the blast radius, and is blocked outright in
@@ -6255,7 +6301,7 @@ function AclsTab({ groupId }: { groupId: string }) {
         <button
           className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
           onClick={() => setShowCreate(true)}
-          {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
+          {...permissionGate(can("write", "dns_group"), NEEDS_GROUP_WRITE)}
         >
           <Plus className="h-3 w-3" /> New ACL
         </button>
@@ -6337,7 +6383,10 @@ function AclsTab({ groupId }: { groupId: string }) {
                 className="h-7 w-7 flex items-center justify-center rounded opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive disabled:opacity-0"
                 onClick={() => setConfirmDelete(acl)}
                 title="Delete ACL"
-                {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
+                {...permissionGate(
+                  can("delete", "dns_group"),
+                  NEEDS_GROUP_DELETE,
+                )}
               >
                 <Trash2 className="h-3.5 w-3.5" />
               </button>
@@ -8721,7 +8770,7 @@ function ZonesTab({
   group: DNSServerGroup;
   onSelectZone: (z: DNSZone) => void;
 }) {
-  const { isSuperadmin } = useDnsGrants();
+  const { can } = useDnsGrants();
   const qc = useQueryClient();
   const [showAdd, setShowAdd] = useState(false);
   const [showFromTemplate, setShowFromTemplate] = useState(false);
@@ -9011,7 +9060,10 @@ function ZonesTab({
               <button
                 onClick={() => setConfirmBulkDelete(true)}
                 className="flex items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50"
-                {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
+                {...permissionGate(
+                  can("delete", "dns_zone"),
+                  NEEDS_ZONE_DELETE,
+                )}
               >
                 <Trash2 className="h-3 w-3" /> Delete {selected.size}
               </button>
@@ -9051,14 +9103,14 @@ function ZonesTab({
             className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-50"
             onClick={() => setShowFromTemplate(true)}
             title="Stamp a starter zone from a curated template (mail, AD, web, k8s)"
-            {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
+            {...permissionGate(can("write", "dns_zone"), NEEDS_ZONE_WRITE)}
           >
             <Sparkles className="h-3 w-3" /> From Template
           </button>
           <button
             className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
             onClick={() => setShowAdd(true)}
-            {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
+            {...permissionGate(can("write", "dns_zone"), NEEDS_ZONE_WRITE)}
           >
             <Plus className="h-3 w-3" /> Add Zone
           </button>
@@ -10185,7 +10237,8 @@ function BlocklistDetail({
 }) {
   const qc = useQueryClient();
   // Every blocklist write takes a superadmin (blocklist_router.py).
-  const blGate = permissionGate(useDnsGrants().isSuperadmin, NEEDS_SUPERADMIN);
+  const { isSuperadmin, can } = useDnsGrants();
+  const blGate = permissionGate(isSuperadmin, NEEDS_SUPERADMIN);
   const [q, setQ] = useState("");
   const [limit] = useState(50);
   const [offset, setOffset] = useState(0);
@@ -10396,14 +10449,20 @@ function BlocklistDetail({
               className="flex-shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-accent"
               onClick={() => addEntry.mutate()}
               disabled={!newDomain}
-              {...blGate}
+              {...permissionGate(
+                can("write", "dns_blocklist"),
+                NEEDS_BLOCKLIST_WRITE,
+              )}
             >
               Add
             </button>
             <button
               className="flex-shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-accent"
               onClick={() => setShowBulk(true)}
-              {...blGate}
+              {...permissionGate(
+                can("write", "dns_blocklist"),
+                NEEDS_BLOCKLIST_WRITE,
+              )}
             >
               Bulk add
             </button>
@@ -10442,6 +10501,7 @@ function BlocklistDetail({
                       checked={e.is_wildcard}
                       disabled={
                         e.source !== "manual" ||
+                        !can("write", "dns_blocklist") ||
                         (toggleEntryWildcard.isPending &&
                           toggleEntryWildcard.variables?.id === e.id)
                       }
@@ -10452,9 +10512,11 @@ function BlocklistDetail({
                         })
                       }
                       title={
-                        e.source === "manual"
-                          ? "Also block *.<domain>. Saves immediately."
-                          : "Feed-sourced entries can't be toggled."
+                        e.source !== "manual"
+                          ? "Feed-sourced entries can't be toggled."
+                          : !can("write", "dns_blocklist")
+                            ? NEEDS_BLOCKLIST_WRITE
+                            : "Also block *.<domain>. Saves immediately."
                       }
                     />
                   </td>
@@ -10476,7 +10538,10 @@ function BlocklistDetail({
                             setEditEntryWildcard(e.is_wildcard);
                           }}
                           title="Edit domain"
-                          {...blGate}
+                          {...permissionGate(
+                            can("write", "dns_blocklist"),
+                            NEEDS_BLOCKLIST_WRITE,
+                          )}
                         >
                           <Pencil className="h-3 w-3" />
                         </button>
@@ -10489,7 +10554,10 @@ function BlocklistDetail({
                             ? "Remove entry"
                             : "Remove (will return on next feed refresh)"
                         }
-                        {...blGate}
+                        {...permissionGate(
+                          can("delete", "dns_blocklist"),
+                          NEEDS_BLOCKLIST_DELETE,
+                        )}
                       >
                         <Trash2 className="h-3 w-3" />
                       </button>
@@ -10553,7 +10621,10 @@ function BlocklistDetail({
             className="flex-shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-accent"
             onClick={() => addException.mutate()}
             disabled={!excDomain}
-            {...blGate}
+            {...permissionGate(
+              can("write", "dns_blocklist"),
+              NEEDS_BLOCKLIST_WRITE,
+            )}
           >
             Add
           </button>
@@ -10592,7 +10663,10 @@ function BlocklistDetail({
                           setEditExcReason(ex.reason ?? "");
                         }}
                         title="Edit exception"
-                        {...blGate}
+                        {...permissionGate(
+                          can("write", "dns_blocklist"),
+                          NEEDS_BLOCKLIST_WRITE,
+                        )}
                       >
                         <Pencil className="h-3 w-3" />
                       </button>
@@ -10600,7 +10674,10 @@ function BlocklistDetail({
                         className="text-muted-foreground hover:text-destructive"
                         onClick={() => deleteException.mutate(ex.id)}
                         title="Remove exception"
-                        {...blGate}
+                        {...permissionGate(
+                          can("delete", "dns_blocklist"),
+                          NEEDS_BLOCKLIST_DELETE,
+                        )}
                       >
                         <Trash2 className="h-3 w-3" />
                       </button>
