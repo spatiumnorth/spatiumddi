@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.drivers.dhcp import is_agentless
 from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.registry import get_driver
@@ -34,7 +35,9 @@ logger = structlog.get_logger(__name__)
 
 
 async def _run_sync() -> dict[str, Any]:
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:

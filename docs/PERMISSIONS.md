@@ -160,17 +160,57 @@ neither on the list nor reviewed as something else.
 | `Superadmin`   | `[{"action": "*", "resource_type": "*"}]`                    |
 | `Viewer`       | `[{"action": "read", "resource_type": "*"}]`                 |
 | `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `address_set`, `vlan`, `nat_mapping`, `custom_field`, `manage_ipam_templates`, `customer`, `site`, `provider`, `network_service` |
-| `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`, `manage_dns_pools` |
-| `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block` |
+| `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`; `read` on `manage_dns_pools` — create, edit and delete zones, records, views and ACLs, and the entries and exceptions of existing blocklists. Infrastructure stays superadmin-only (see below) |
+| `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block` — create, edit and delete scopes, pools, static assignments, client classes and device policies, option templates, phone and PXE profiles, and MAC blocks; acknowledge rogue-responder and router-advertisement findings. Infrastructure stays superadmin-only (see below) |
 | `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans` (nmap `extra_args` are allowlisted, #1223), `manage_packet_capture`, `manage_block_sync`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `av_flow`, `bacnet_device`, `dicom_ae`, `ot_device`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert` |
-| `Auditor`        | `read` on `conformity`, `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope`, `tls_cert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
-| `Compliance Editor` | `admin` on `conformity`, `read` on `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope` — for the team that authors / tunes conformity policies without touching operational config |
+| `Auditor`        | `read` on `conformity`, `audit_log`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope`, `tls_cert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
+| `Compliance Editor` | `admin` on `conformity`, `read` on `audit_log`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope` — for the team that authors / tunes conformity policies without touching operational config |
 | `Address Set Editor` | `admin` on `address_set` (#103) — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |
 | `Change Approver`  | `approve` + `read` on `change_request` (#62) — the second-person decision capability in the two-person approval workflow. Approving a specific request *also* requires the underlying operation's permission (e.g. `delete,subnet`), enforced server-side. |
 | `Requester`        | `write` + `read` on `provisioning_request` (#696) — the low-privilege half of the request workflow, meant to be granted broadly (a whole department, not just the network team). Holders can ask for an IP / subnet / DNS record / DHCP reservation and see their own requests; they cannot provision anything, cannot see anyone else's requests, and cannot approve. |
 | `Appliance Operator` | `admin` on `appliance` (#134) — full control of the SpatiumDDI OS appliance management surface (TLS cert upload, release manager, container start/stop/restart + live logs, host network + firewall config, maintenance mode, diagnostic bundle download) for ops staff who manage the appliance lifecycle without full superadmin over the DDI data plane. |
 
 Built-in roles (`is_builtin=True`) can be cloned but not deleted.
+
+### DNS and DHCP: data writes vs infrastructure (#1861)
+
+Until #1861 the DNS Editor and DHCP Editor descriptions promised "Full CRUD"
+while almost every DNS and DHCP write route also took `SuperAdmin`, so the
+roles could read everything and write DNS records and little else. The
+everyday data routes now check the role's own resource permission, with the
+HTTP method's action (`write` for POST / PUT, `delete` for DELETE), so the
+Editor roles grant the writes they always claimed to:
+
+| Surface | Gate |
+|---|---|
+| DNS zones (create, from template, edit, delete) | `write` / `delete` on `dns_zone` |
+| DNS records, bulk create, zone-file import | `write` / `delete` on `dns_record` (a `replace` import that would remove records also takes `delete`) |
+| DNS views and named ACLs | `write` / `delete` on `dns_group` |
+| Blocklist entries and exceptions | `write` / `delete` on `dns_blocklist` |
+| DHCP scopes, phone profiles, PXE profiles | `write` / `delete` on `dhcp_scope` |
+| DHCP pools / static assignments | `write` / `delete` on `dhcp_pool` / `dhcp_static` |
+| DHCP client classes and device policies | `write` / `delete` on `dhcp_client_class` |
+| DHCP option templates (applying one to a scope also takes `write` on `dhcp_scope`) | `write` / `delete` on `dhcp_option_template` |
+| DHCP MAC blocks | `write` / `delete` on `dhcp_mac_block` |
+
+**Infrastructure stays superadmin-only**: DNS and DHCP server groups and
+servers (create, edit, delete, move, credentials, pause / resume, approve,
+sync), DNS server options and trust anchors, TSIG keys, DNSSEC signing, key
+rollover and policies, dynamic-update ACLs, zone moves between groups,
+blocklist lists themselves (subscriptions, feeds, profiles, assignments,
+refresh), DNS GSLB pools (their health checks probe the network), Windows
+DHCP failover relationships, DHCP lease deletion, every importer and the
+cutover, and agent registration. Inside an opened route, three things stay
+superadmin-only as well: `?permanent=true` on a zone or scope delete (as on
+the IPAM deletes), and changing a zone's `dnssec_enabled` /
+`dnssec_policy_id`, `dynamic_update_enabled` or `auto_tls_probe` (sending
+the current value back is not a change, so an edit dialog still saves).
+
+`backend/tests/test_builtin_roles_match_routes.py` holds the built-in roles
+to the routes: each role's promised routes must be reachable on its grants,
+every write grant must back one of them, and every other DNS / DHCP write
+route must take `SuperAdmin`. `backend/tests/test_dns_dhcp_editor_roles.py`
+drives the same promises through the API.
 
 > **Feature-module gating.** The `Change Approver` role only matters when
 > the default-off `governance.approvals` feature module is enabled, and

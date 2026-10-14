@@ -193,8 +193,11 @@ front of the stored bytes and streams them. Whatever the group's record
 count, the api never holds the group's record set as Python objects and
 never serialises a multi-megabyte body on the request loop; the DB runs
 the records query once per change, not once per agent per poll. The worker
-has no HTTP liveness probe and its per-task engine carries no
-`command_timeout`, so a render of a million-row group simply runs.
+has no HTTP liveness probe, and the render's engine carries the long
+per-statement bound (`TASK_DB_LONG_COMMAND_TIMEOUT`, 900 s) rather than the
+120 s every other Celery task gets, so a render of a million-row group runs
+to completion while a black-holed database still fails it in minutes
+(#1719).
 
 *What says a stored bundle is current.* `dns_server.bundle_dirty_seq` is
 bumped **in the same transaction** as every change that feeds the bundle
