@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DigitalOcean, Linode and Vultr: deleting a zone already absent at
+  the provider is done, not an error (#1889).** The three drivers were
+  left out of #1537, so a zone removed out of band at the provider could
+  never leave the Trash: the retention sweep and "Delete permanently"
+  both failed on the provider's not-found answer. HTTP 404 on the zone
+  delete now counts as success (DigitalOcean answers
+  `{"id": "not_found"}`), and Linode also treats a domain missing from
+  its list as already gone. Auth, throttling and 5xx still fail.
+
 - **Failed sign-ins are forwarded to syslog / SIEM as warnings, not info
   (#1874).** Every rejected sign-in (bad password, bad MFA code, locked or
   disabled account) is audited with `result="failure"`, which audit

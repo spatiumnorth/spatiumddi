@@ -509,6 +509,52 @@ async def test_apply_zone_delete_resolves_then_deletes(monkeypatch: pytest.Monke
     assert fake.calls[1]["path"] == "/domains/77"
 
 
+# ── #1889 — deleting a zone already absent at the provider is done ──────
+async def test_apply_zone_delete_absent_from_list_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient({"get": [_FakeResponse(200, _env([]))]})
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "gone.example."})()
+
+    await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+    assert [c["method"] for c in fake.calls] == ["get"]
+
+
+async def test_apply_zone_delete_404_at_delete_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(
+        {
+            "get": [_FakeResponse(200, _env([{"id": 77, "domain": "gone.example"}]))],
+            "delete": [_FakeResponse(404, {"errors": [{"reason": "Not found"}]})],
+        }
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "gone.example."})()
+
+    await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+    assert [c["method"] for c in fake.calls] == ["get", "delete"]
+
+
+async def test_apply_zone_delete_other_errors_still_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for status in (401, 429, 500):
+        fake = _FakeClient(
+            {
+                "get": [_FakeResponse(200, _env([{"id": 77, "domain": "gone.example"}]))],
+                "delete": [_FakeResponse(status, {"errors": [{"reason": "nope"}]})],
+            }
+        )
+        driver = _patch_client(monkeypatch, fake)
+        zone = type("Z", (), {"name": "gone.example."})()
+        with pytest.raises(CloudDNSError):
+            await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+
 # ── Error surfacing ─────────────────────────────────────────────────────
 async def test_error_envelope_raises_clouddnserror(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {"errors": [{"reason": "Invalid Token", "field": None}]}
