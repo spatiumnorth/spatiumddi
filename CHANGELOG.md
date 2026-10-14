@@ -85,7 +85,7 @@ the formatter handles the rest.
 ### Fixed
 
 - **The Roles API accepted every action but `approve`, so a cloned Change
-  Approver could not be saved (#1631).** The validator allow-listed `read`,
+  Approver could not be saved (#1631).** The validator allow-listed `read`, The time-bound grant dialog (Groups → temporary access) now offers the same actions and resource types as the role editor, from one shared list, so a temporary `approve` on `change_request` can be granted from the page too.
   `write`, `delete`, `admin` and `*`, while the builtin Change Approver role
   (and every approval check) uses `approve` on `change_request`; saving a
   clone 422d. `approve` is now accepted by the Roles and time-bound-grant
