@@ -473,6 +473,7 @@ async def abort_upgrade(
     cleanup from here.
     """
     run = await _get_run_locked(db, run_id)
+    was = run.state
     await _transition(
         db,
         run,
@@ -484,10 +485,16 @@ async def abort_upgrade(
         actor_source=actor_source,
     )
     await db.commit()
-    # Release the lease so a new run can plan immediately.
-    ok, err = mutex.release()
-    if not ok:
-        logger.warning("upgrade_lease_release_failed", error=err)
+    # The Lease is the drive's to give up (#1707). A drive that is mid-node
+    # keeps changing the cluster until that node ends, and a free Lease
+    # would let a new run plan and start beside it. It sees the abort at its
+    # next fence, releases its own Lease and exits. Only a run that never
+    # started has no drive and no Lease of its own to wait for. A drive that
+    # died holds the Lease until it expires (``LEASE_DURATION_S``).
+    if was == "planned":
+        ok, err = mutex.release()
+        if not ok:
+            logger.warning("upgrade_lease_release_failed", error=err)
     await db.refresh(run)
     return run
 

@@ -184,6 +184,25 @@ the formatter handles the rest.
   badge reads `failure` as a red FAIL and `forbidden` as DENY, and the
   Audit Log result filter offers `failure` and `forbidden`.
 
+- **A Halt or Abort mid-node, and a drive that lost the upgrade Lease,
+  no longer get overwritten by the drive (#1702, #1704, #1707).** A
+  rolling-upgrade drive kept its own copy of the run for the whole of a
+  node and wrote it back when the node ended, so a node that failed turned
+  a `halted` or `aborted` run `failed` (with a new `finished_at` and an
+  upgrade-failed alert), and a node that succeeded dropped the operator's
+  `halted`, `aborted` and `resumed` events from the run's history. A
+  drive whose Lease another drive had taken over could do the same, and
+  so could its crash handler. Every terminal write now re-reads the run
+  under a row lock and goes ahead only if the run is still `running` and
+  this drive is still its holder; Halt, Resume and Abort take the same
+  lock. A node that ends after a stop is recorded under
+  `progress.per_node` and a `node_ended_after_stop` event, and the state
+  is left alone. Abort also no longer frees the Lease at once: the
+  aborted drive releases its own when it stops, so a second run cannot
+  plan and start while a node is still being worked on (a run that never
+  started has no drive, and still frees it). A lease renewal that dies of
+  an unexpected error now stops the drive, as a refused one does.
+
 - **Re-importing a zone's own export no longer pins every inherited TTL
   (#1727).** A record with no TTL of its own inherits the zone default and
   is exported without one, so the re-import read the file's `$TTL` back

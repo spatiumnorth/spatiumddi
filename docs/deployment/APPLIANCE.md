@@ -3045,6 +3045,16 @@ so a first-time operator never gets stuck looking for the upload.
    health-gate → DaemonSet-ready gate → uncordon → settle pause.
 7. Live progress streams into the Plan banner (per-node state pills
    + ETA). Halt / Resume / Abort buttons exposed.
+   A Halt or Abort takes effect when the node in flight ends: the drive
+   finishes the node it is on (cutting a drain or an apply short would
+   leave it half-changed), then writes what happened to that node into
+   the run's history and stops, leaving the run `halted` or `aborted` and
+   the run's events as the operator left them (#1702). Abort does not
+   free the upgrade Lease: the drive releases its own once it has
+   stopped, so a new Plan and Start are refused meanwhile (#1707). A
+   drive whose Lease was taken over by another writes nothing to the run
+   (#1704). If the drive itself died, the Lease lapses after its
+   10-minute duration.
    Each node's own preflight judges `/var` only on the nodes the run
    has still to upgrade: upgrading a node is what shrinks its `/var`,
    so the nodes already done are not asked again (#1709).

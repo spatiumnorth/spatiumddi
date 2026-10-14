@@ -273,3 +273,44 @@ async def test_a_renewal_that_raises_stops_the_drive(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(orchestrator.mutex, "renew", _boom)
     await asyncio.wait_for(orchestrator._lease_renewal_loop(stop, ME), 2)
     assert stop.is_set()
+
+
+# ── #1707: Abort leaves the Lease to the drive ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_abort_of_a_running_run_keeps_the_lease_until_the_drive_exits(
+    db_session: AsyncSession, api: AsyncSession, monkeypatch: pytest.MonkeyPatch, stubs: Any
+) -> None:
+    released = MagicMock(return_value=(True, None))
+    monkeypatch.setattr(orchestrator.mutex, "release", released)
+    run = await _make_run(db_session)
+    seen_during_node: list[int] = []
+
+    async def _abort() -> None:
+        await orchestrator.abort_upgrade(api, run.id)
+        # The drive is still on its node: the Lease must still be held.
+        seen_during_node.append(released.call_count)
+        seen_during_node.append(stubs.release_if_held.call_count)
+
+    _node_stub(monkeypatch, ok=True, during=_abort)
+    await orchestrator._drive_loop(db_session, run, asyncio.Event(), ME)
+
+    assert seen_during_node == [0, 0]
+    released.assert_not_called()
+    # The drive released its own, once it had stopped.
+    stubs.release_if_held.assert_called_once_with(
+        holder=ME, attempts=orchestrator._LEASE_RELEASE_ATTEMPTS
+    )
+
+
+@pytest.mark.asyncio
+async def test_abort_of_a_planned_run_frees_the_lease(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    released = MagicMock(return_value=(True, None))
+    monkeypatch.setattr(orchestrator.mutex, "release", released)
+    run = await _make_run(db_session, state="planned")
+    out = await orchestrator.abort_upgrade(db_session, run.id)
+    assert out.state == "aborted"
+    released.assert_called_once()
