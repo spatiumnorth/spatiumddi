@@ -130,7 +130,9 @@ def _severity_bucket(result: str | None) -> str:
     r = (result or "").lower()
     if r == "denied":
         return "denied"
-    if r in ("failed", "error"):
+    # ``failure`` is what every rejected sign-in is audited with (#1874);
+    # it used to fall through to ``info``.
+    if r in ("failed", "failure", "error"):
         return "error"
     return "info"
 

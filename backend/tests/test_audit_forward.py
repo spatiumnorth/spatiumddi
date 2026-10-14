@@ -446,6 +446,19 @@ def test_audit_syslog_severities_are_unchanged() -> None:
         assert out.startswith(pri + "1 "), result
 
 
+def test_failed_signin_result_failure_ranks_as_error_in_every_format() -> None:
+    """#1874: rejected sign-ins are audited ``result="failure"`` and used
+    to bucket to info. They now rank with ``failed`` (error) in the PRI,
+    CEF and LEEF, and clear a ``warning`` threshold."""
+    payload = _payload(result="failure", action="login")
+    assert svc._severity_bucket("failure") == "error"
+    assert svc.render_for_target("rfc5424_json", facility=16, payload=payload).startswith("<131>1 ")
+    assert "|6|" in svc.render_for_target("rfc5424_cef", facility=16, payload=payload)
+    assert "sev=6" in svc.render_for_target("rfc5424_leef", facility=16, payload=payload)
+    sev = svc._payload_severity(payload)
+    assert svc._SEVERITY_RANK[sev] >= svc._SEVERITY_RANK["warning"]
+
+
 def test_alert_syslog_timestamp_comes_from_fired_at() -> None:
     """Not the wall clock. ``rfc3164`` rendered without raising before
     the fix, but stamped 'now' — so a delayed or replayed alert was

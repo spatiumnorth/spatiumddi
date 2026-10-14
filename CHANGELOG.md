@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Failed sign-ins are forwarded above info, and the Live Activity badge
+  shows them as failures (#1874).** Every rejected sign-in is audited
+  with `result="failure"`, which audit forwarding did not recognise, so
+  it went to syslog / SIEM at info and a target with `min_severity`
+  above info dropped it. It now ranks with `failed` (error), so
+  **existing collectors will receive failed sign-ins at a higher
+  severity than before** (syslog PRI severity 3, CEF 6, LEEF `sev=6`),
+  and a target filtered at warning now gets them. Every other result
+  maps exactly as before. The dashboard Live Activity badge also reads
+  `failure` as a red FAIL.
+
 - **Re-importing a zone's own export no longer pins every inherited TTL
   (#1727).** A record with no TTL of its own inherits the zone default and
   is exported without one, so the re-import read the file's `$TTL` back
