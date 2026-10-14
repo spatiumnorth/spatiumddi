@@ -363,28 +363,121 @@ def test_key_ignores_struct_fields_for_other_types() -> None:
     )
 
 
-async def test_stored_apex_ns_is_not_reported_missing(
-    db_session: AsyncSession, monkeypatch: Any
-) -> None:
-    """#1857 — the AXFR read drops the apex NS, so a stored apex NS row
-    (a Technitium import's copy of the source's) must not read as drift."""
-    group, _server, zone = await _group_server_zone(
-        db_session, server_name="ns1", zone_name="imp.example.com."
+class _ApexNsDriver(_FakeDriver):
+    """An AXFR driver that, like BIND9 and the agent Technitium driver, keeps
+    the apex NS only when asked (#1857); records whether it was asked."""
+
+    pull_can_include_apex_ns = True
+
+    def __init__(self, records: list[RecordData]) -> None:
+        super().__init__(records)
+        self.asked: list[bool] = []
+
+    async def pull_zone_records(
+        self, server: Any, zone_name: str, *, tsig: Any = None, include_apex_ns: bool = False
+    ) -> list[RecordData]:
+        self.asked.append(include_apex_ns)
+        return [
+            r
+            for r in self._records
+            if include_apex_ns or not (r.record_type == "NS" and r.name == "@")
+        ]
+
+
+async def _imported_zone(db: AsyncSession, apex_ns: list[str]) -> tuple[Any, Any, DNSZone]:
+    group, server, zone = await _group_server_zone(
+        db, server_name="ns1", zone_name="imp.example.com."
     )
-    db_session.add_all(
-        [
-            DNSRecord(zone_id=zone.id, name="@", record_type="NS", value="tech.lan.", ttl=3600),
+    db.add_all(
+        [DNSRecord(zone_id=zone.id, name="@", record_type="NS", value=v, ttl=3600) for v in apex_ns]
+        + [
             DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1", ttl=300),
-            # A delegation below the apex is a real record and still counts.
+            # A delegation below the apex is an ordinary record, always compared.
             DNSRecord(zone_id=zone.id, name="sub", record_type="NS", value="ns.sub.", ttl=300),
         ]
     )
-    await db_session.commit()
-    live = [RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300)]
-    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver(live))
+    await db.commit()
+    return group, server, zone
+
+
+_WWW = RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300)
+_SUB = RecordData(name="sub", record_type="NS", value="ns.sub.", ttl=300)
+
+
+async def test_agent_served_apex_ns_matching_the_zone_is_in_sync(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """#1857 — the agent serves a zone's apex NS rows as its NS set, so an
+    imported ``@ NS`` it serves is in sync, not "missing on server"."""
+    group, _server, zone = await _imported_zone(db_session, ["tech.lan."])
+    live = [RecordData(name="@", record_type="NS", value="tech.lan.", ttl=3600), _WWW, _SUB]
+    driver = _ApexNsDriver(live)
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: driver)
 
     report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
     s = report.servers[0]
+    assert driver.asked == [True]
+    assert s.missing_on_server == []
+    assert s.extra_on_server == []
+    assert s.in_sync == 3
+
+
+async def test_agent_served_apex_ns_changed_on_the_server_is_drift(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """An NS set changed on the server (or an NS change the agent never
+    applied) is real drift and must show, on both sides."""
+    group, _server, zone = await _imported_zone(db_session, ["ns-a.example.net."])
+    live = [
+        RecordData(name="@", record_type="NS", value="ns-b.example.net.", ttl=3600),
+        _WWW,
+        _SUB,
+    ]
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _ApexNsDriver(live))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    s = report.servers[0]
+    assert [(r.name, r.value) for r in s.missing_on_server] == [("@", "ns-a.example.net.")]
+    assert [(r.name, r.value) for r in s.extra_on_server] == [("@", "ns-b.example.net.")]
+
+
+async def test_server_own_apex_ns_is_not_drift_when_the_zone_declares_none(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """A zone with no apex NS rows is served the agent's ``primary_ns`` or
+    placeholder NS: that is the server's own, not a difference."""
+    group, _server, zone = await _imported_zone(db_session, [])
+    live = [
+        RecordData(name="@", record_type="NS", value="ns1.imp.example.com.", ttl=3600),
+        RecordData(name="ns1", record_type="A", value="127.0.0.1", ttl=3600),
+        _WWW,
+        _SUB,
+    ]
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _ApexNsDriver(live))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    s = report.servers[0]
+    assert s.extra_on_server == []
+    assert s.missing_on_server == []
+
+
+async def test_stored_apex_ns_is_not_reported_missing(
+    db_session: AsyncSession, monkeypatch: Any
+) -> None:
+    """#1857 — a read that cannot carry the apex NS (an AXFR of a server that
+    does not render the zone's NS rows) must not report the stored apex NS
+    row missing forever. A delegation below the apex still counts."""
+    group, server, zone = await _imported_zone(db_session, ["tech.lan."])
+    server.agent_id = None  # an operator's own BIND9: the NS set is not ours
+    await db_session.commit()
+    driver = _ApexNsDriver(
+        [RecordData(name="@", record_type="NS", value="other.lan.", ttl=3600), _WWW]
+    )
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: driver)
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    s = report.servers[0]
+    assert driver.asked == [False]
     assert [(r.name, r.record_type) for r in s.missing_on_server] == [("sub", "NS")]
     assert s.extra_on_server == []
     assert s.in_sync == 1
