@@ -152,9 +152,10 @@ Caddy sets `Host`, `X-Forwarded-For` and `X-Forwarded-Proto` itself, preserves
 ```yaml
 services:
   traefik:
-    image: traefik:v3
+    image: traefik:v3.6
     command:
       - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
       - --entrypoints.websecure.address=:443
       - --entrypoints.websecure.transport.respondingTimeouts.writeTimeout=0s
       - --entrypoints.websecure.transport.respondingTimeouts.idleTimeout=3600s
@@ -165,47 +166,70 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./letsencrypt:/letsencrypt
+    networks: [proxy]
 
-  frontend:   # in SpatiumDDI's docker-compose.override.yml, on a network Traefik shares
+  frontend:   # in SpatiumDDI's docker-compose.override.yml
+    networks: [default, proxy]
     labels:
       - traefik.enable=true
+      - traefik.docker.network=proxy
       - traefik.http.routers.ddi.rule=Host(`ddi.example.com`)
       - traefik.http.routers.ddi.entrypoints=websecure
       - traefik.http.routers.ddi.tls.certresolver=le
       - traefik.http.services.ddi.loadbalancer.server.port=80
       - traefik.http.services.ddi.loadbalancer.responseforwarding.flushinterval=-1ms
+
+networks:
+  proxy:
+    external: true   # docker network create proxy
 ```
 
 `writeTimeout` defaults to unlimited, so the `respondingTimeouts` lines are
 there to make that explicit and to keep idle streams open; the load-bearing
 part is `flushinterval=-1ms` (flush every write immediately). Traefik passes
-`Host` through and sets the `X-Forwarded-*` headers itself. Mounting the
-Docker socket gives Traefik control of the host; use a socket proxy if that
-matters to you.
+`Host` through and sets the `X-Forwarded-*` headers itself.
+Use Traefik 3.6 or later: against a current Docker Desktop, 3.5 built no
+routers from these labels, so every request answered `404 page not found`.
+`traefik.docker.network` matters because the frontend now sits on two
+networks: without it Traefik may pick the address on SpatiumDDI's own network,
+which it cannot reach, and answer `504`/`502`. Set
+`FRONTEND_TRUSTED_PROXY_CIDRS` to Traefik's address on the `proxy` network
+(`docker network inspect proxy` shows it, or use that network's subnet if
+nothing else joins it). Mounting the Docker socket gives Traefik control of
+the host; use a socket proxy if that matters to you.
 
 ### HAProxy
 
 ```
+defaults
+    mode http
+    timeout connect 5s
+    timeout client 1h
+    timeout server 1h
+
 frontend https_in
     bind :443 ssl crt /etc/haproxy/certs/ddi.example.com.pem
-    mode http
     option forwardfor
     http-request set-header X-Forwarded-Proto https
     http-request set-header X-Real-IP %[src]
     default_backend ddi
 
 backend ddi
-    mode http
-    timeout server 1h
-    timeout tunnel 1h
     server frontend docker-host:8077
 ```
 
-`timeout client` on the frontend should be at least as long as the streams you
-want (`1h`). HAProxy does not buffer responses by default and preserves
-`Host`.
+`timeout client` and `timeout server` must be at least as long as the streams
+you want (`1h`); HAProxy's own default is to have none, and it warns at start.
+HAProxy does not buffer responses and preserves `Host`. `option forwardfor`
+appends a second `X-Forwarded-For` header line rather than editing the
+client's; the frontend nginx reads them together, so a value a client sends
+is still never believed.
 
 ### Nginx Proxy Manager
+
+This one is written from NPM's documentation and has not been run against
+SpatiumDDI the way the four examples above were; NPM generates an nginx
+`location` like the one under [nginx](#nginx), so the same settings apply.
 
 On the proxy host (Details tab): scheme `http`, forward host `docker-host`,
 port `8077`; leave **Websockets Support** off (not needed). SSL tab: pick the
