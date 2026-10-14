@@ -933,6 +933,51 @@ view "guest" {
   address made both features fail with "The peer didn't know the key we
   used".
 
+### 8.0 Memory sizing for large blocklists (issue #1725)
+
+named holds every RPZ zone in memory, and the agent builds the zone files
+beside it. Measured on a 6 GiB appliance with the Hagezi Gambling list
+(582,305 entries) in a group with one view, which renders the list into two
+RPZ zones:
+
+| | Measured |
+|---|---|
+| named, resident | 1.6 - 2.2 GB (about 1.4 kB per entry per zone) |
+| agent while it renders | about 1.0 - 1.2 GB, plus short-lived children |
+| the pod's peak | 2.8 GB on the first apply, 3.6 GB on the next |
+
+Before #1725 the pod had no memory limit, so that peak was the node's: the
+kubelet evicted the worker, Postgres and the api, then the kernel killed
+named. The pod now carries a memory request (256Mi) and a limit (2Gi), so an
+overload kills named inside its own cgroup and leaves the control plane
+alone. That is a DNS outage on that node, not a platform outage, but it is
+still an outage: **size the limit for the lists you subscribe to.**
+
+Rule of thumb for the limit: 400 MB for named and the agent at idle, plus
+about 3 kB per blocklist entry per RPZ zone while an apply is in flight
+(named and the agent's render each hold a copy). A group with views writes a
+list once per view that carries it (the one-copy-per-view fix is #1706, so
+the factor falls with it). So 582k entries x 2 zones is about 3.9 GB and
+needs a node with 8 GiB or more; one list on a group with no views is about
+half that.
+
+Where to change it:
+
+- Appliance: `dnsBind9.resources` on the role chart, as a HelmChartConfig
+  (see `docs/deployment/APPLIANCE.md`, "Memory sizing for named"). The limit
+  is one value for the whole cluster; the role chart renders the same on
+  every node.
+- Umbrella chart: `dnsAgents.servers[].resources`.
+- Docker Compose: `DNS_BIND9_MEM_LIMIT` in `.env` (default `2g`).
+- Raw manifests: edit `k8s/dns/bind9-statefulset.yaml`.
+
+**Resolver cache.** BIND's `max-cache-size` defaults to 90 % of physical
+memory per view, and named reads the host's RAM, not the container's limit.
+The agent therefore writes an explicit `max-cache-size` of a quarter of the
+container's memory limit (at least 32m) into `options {}`; with no limit it
+writes nothing and BIND keeps its default. Set `NAMED_MAX_CACHE_SIZE` (a
+BIND size such as `256m`) on the agent to override it.
+
 ### 8.1 Content filtering / family filter (issue #878)
 
 Two independent ways to filter adult content, and they compose:

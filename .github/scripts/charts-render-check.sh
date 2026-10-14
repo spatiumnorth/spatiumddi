@@ -140,6 +140,9 @@ render() { # name chart [helm --set args...]
     # address (externalTrafficPolicy: Local); see the script's docstring.
     python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" "$file" \
         || failures=$((failures + 1))
+    # #1725 — a BIND9 agent container must carry a memory limit.
+    python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" "$file" \
+        || failures=$((failures + 1))
     # #1510 — no two Services may ask MetalLB for the same address; only the
     # one created first would get it.
     python3 "$ROOT/.github/scripts/chart-lb-address-single-owner.py" "$file" \
@@ -323,6 +326,9 @@ python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
     --expect-annotation metallb.universe.tf/loadBalancerIPs=10.0.0.53 \
     --expect-annotation metallb.universe.tf/address-pool=default \
     "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
+echo "── BIND9 memory limit (umbrella, #1725)"
+python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
+    "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
 
 # ── Appliance chart ─────────────────────────────────────────────────────────
 # Every role + every feature on at once. This is not a valid appliance (one
@@ -364,6 +370,9 @@ render appliance-all-on "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
 # never leaves the VIP on a Service without endpoints.
 python3 "$ROOT/.github/scripts/chart-lb-address-single-owner.py" --require \
     --dns-vip 10.0.0.53 "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
+echo "── BIND9 memory limit (appliance, #1725)"
+python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
+    "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
 # The single-node default install shape: one DNS driver + DHCP + supervisor.
 render appliance-full-stack "$APPLIANCE" \
     --set dnsBind9.enabled=true --set dhcpKea.enabled=true --set supervisor.enabled=true
