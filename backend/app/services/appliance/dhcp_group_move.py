@@ -41,7 +41,7 @@ async def appliance_own_dhcp_servers(
     ``dhcp_server.name`` is globally unique and kea is the only agent engine,
     so there is no stale-engine row to retire on this side. ``roles`` overrides
     the appliance's current roles (a preview of a role change)."""
-    if "dhcp" not in (appliance.assigned_roles if roles is None else roles or []):
+    if "dhcp" not in ((appliance.assigned_roles if roles is None else roles) or []):
         return []
     own = await own_server_condition(db, appliance, DHCPServer)
     return list(

@@ -3971,9 +3971,15 @@ async def _apply_assign_appliance_role(
 async def _apply_assign_appliance_role_locked(
     db: AsyncSession, user: User, args: AssignApplianceRoleArgs, row: Any
 ) -> dict[str, Any]:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.core.agent_wake import appliance_channel, collect_wake  # noqa: PLC0415
     from app.models.audit import AuditLog  # noqa: PLC0415
     from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
     from app.models.dns import DNSServerGroup  # noqa: PLC0415
+    from app.services.appliance.dhcp_group_move import (  # noqa: PLC0415
+        move_appliance_dhcp_servers,
+    )
     from app.services.appliance.dns_group_move import (  # noqa: PLC0415
         move_appliance_dns_servers,
     )
@@ -4025,12 +4031,6 @@ async def _apply_assign_appliance_role_locked(
             # #1565 / #1902 — the same Kea server move the REST route makes: the
             # pointer alone would leave the appliance's server in the old group.
             # A refusal raises, and the proposal applies nothing.
-            from fastapi import HTTPException  # noqa: PLC0415
-
-            from app.services.appliance.dhcp_group_move import (  # noqa: PLC0415
-                move_appliance_dhcp_servers,
-            )
-
             try:
                 dhcp_move = await move_appliance_dhcp_servers(db, row, dhcp_group, user)
             except HTTPException as exc:
@@ -4059,6 +4059,10 @@ async def _apply_assign_appliance_role_locked(
             },
         )
     )
+    # #358 Phase 1 — wake the supervisor heartbeat, as the Fleet roles PUT
+    # does, so the new roles and groups apply without waiting a heartbeat.
+    # Collected, so it publishes after the commit (and not on a refusal).
+    collect_wake(appliance_channel(row.id))
     await db.commit()
     return {
         "appliance_id": str(row.id),

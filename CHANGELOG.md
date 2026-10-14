@@ -91,9 +91,11 @@ the formatter handles the rest.
   serving there: the DHCP half of #1565, reachable only through the
   Copilot. It now makes the same move the Fleet roles save does, with the
   same refusals (a Kea and Windows DHCP mix, v6 scopes for Windows), which
-  preview reports and apply enforces before anything changes. The apply also
-  takes the appliance row lock and wakes the agents and both groups after
-  the commit.
+  preview reports and apply enforces before anything changes. A proposal
+  that changes both the DNS and the DHCP group moves both servers in one
+  transaction: a refusal of either applies neither, and the preview names
+  both refusals. The apply now also wakes the appliance's supervisor, as the
+  Fleet save does, instead of leaving the change to the next heartbeat.
 
 - **One Fleet save that switches an appliance's DNS engine and its group
   moves the server row too (#1856).** The roles PUT moved only rows
