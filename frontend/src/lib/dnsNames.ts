@@ -117,3 +117,13 @@ export function zoneKindForName(name: string): "forward" | "reverse" {
   const tree = labels.slice(-2).join(".");
   return tree === "in-addr.arpa" || tree === "ip6.arpa" ? "reverse" : "forward";
 }
+
+/**
+ * A list of zone names for one line of text, cut to the first `max` with a
+ * count of the rest: a subnet wider than a /24 has a reverse zone per /24
+ * (#1840), so a /17 has 128 and a plain join would fill the dialog.
+ */
+export function summarizeZoneNames(names: string[], max = 4): string {
+  if (names.length <= max) return names.join(", ");
+  return `${names.slice(0, max).join(", ")} + ${names.length - max} more`;
+}

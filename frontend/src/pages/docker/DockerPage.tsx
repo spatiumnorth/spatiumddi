@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Check,
   Clipboard,
@@ -87,7 +88,11 @@ export function DockerPage() {
     NEEDS_SUPERADMIN,
   );
   const qc = useQueryClient();
-  const { data: hosts = [], isFetching } = useQuery({
+  const {
+    data: hosts = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["docker-hosts"],
     queryFn: dockerApi.listHosts,
   });
@@ -175,7 +180,9 @@ export function DockerPage() {
           {hosts.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No hosts configured yet.
+                <ListEmpty error={listError} what="Docker hosts">
+                  No hosts configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}

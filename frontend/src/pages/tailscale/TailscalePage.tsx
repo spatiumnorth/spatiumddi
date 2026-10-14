@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Check,
   Clipboard,
@@ -64,7 +65,11 @@ export function TailscalePage() {
     NEEDS_SUPERADMIN,
   );
   const qc = useQueryClient();
-  const { data: tenants = [], isFetching } = useQuery({
+  const {
+    data: tenants = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["tailscale-tenants"],
     queryFn: tailscaleApi.listTenants,
   });
@@ -155,7 +160,9 @@ export function TailscalePage() {
           {tenants.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No Tailscale tenants configured yet.
+                <ListEmpty error={listError} what="Tailscale tenants">
+                  No Tailscale tenants configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
