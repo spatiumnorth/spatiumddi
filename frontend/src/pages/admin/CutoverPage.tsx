@@ -48,6 +48,11 @@ import { useSessionState } from "@/lib/useSessionState";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 
 /**
  * Configuration → Import → Windows cutover (issue #756).
@@ -411,6 +416,12 @@ function PlanListView({
   canQuery: boolean;
   onOpen: (id: string) => void;
 }) {
+  // #1341 — every write on this page takes a superadmin (its handlers
+  // take SuperAdmin), so a read-only user is offered none of them.
+  const superadminGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const [newOpen, setNewOpen] = useState(false);
   const [deleting, setDeleting] = useState<CutoverPlan | null>(null);
@@ -465,6 +476,7 @@ function PlanListView({
             icon={Plus}
             onClick={() => setNewOpen(true)}
             disabled={!canQuery}
+            {...superadminGate}
           >
             New plan
           </HeaderButton>

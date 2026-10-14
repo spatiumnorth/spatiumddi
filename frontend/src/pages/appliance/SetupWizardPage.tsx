@@ -17,6 +17,7 @@ import {
   versionApi,
   formatApiError,
 } from "@/lib/api";
+import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 
 /**
  * Phase 4g — Web first-boot setup wizard.
@@ -36,6 +37,8 @@ import {
  * banner stops showing + the redirect-on-first-hit logic stops firing.
  */
 export function SetupWizardPage() {
+  // #1342 — every appliance action takes `admin` on `appliance`.
+  const applianceGate = useApplianceAdminGate();
   const qc = useQueryClient();
   const navigate = useNavigate();
 
@@ -170,6 +173,7 @@ export function SetupWizardPage() {
             onClick={() => finish.mutate()}
             disabled={finish.isPending || setup.data?.complete}
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            {...applianceGate}
           >
             <CheckCircle2 className="h-3.5 w-3.5" />
             {setup.data?.complete

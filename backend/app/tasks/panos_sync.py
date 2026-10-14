@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.db import task_connect_args
 from app.models.panos import PANOSFirewall
 from app.models.settings import PlatformSettings
 
@@ -28,7 +29,9 @@ _PLATFORM_SINGLETON_ID = 1
 async def _run_sweep() -> dict[str, Any]:
     from app.services.panos.reconcile import reconcile_firewall  # noqa: PLC0415
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -99,7 +102,9 @@ async def _run_one(firewall_id: str) -> dict[str, Any]:
 
     from app.services.panos.reconcile import reconcile_firewall  # noqa: PLC0415
 
-    engine = create_async_engine(settings.database_url, future=True)
+    engine = create_async_engine(
+        settings.database_url, future=True, connect_args=task_connect_args()
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:

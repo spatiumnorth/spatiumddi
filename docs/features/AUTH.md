@@ -79,8 +79,10 @@ session alone doesn't prove and an SSO account has no local password.
   count toward a per-account budget of 5 per 15 minutes, after which the
   step-up answers `429` without checking the credential: these run for a
   caller who already holds a session, so unthrottled each would be a
-  password (or TOTP) oracle. A wrong code at verify answers `403`, and
-  verify claims its attempt atomically before checking the code (refunding
+  password (or TOTP) oracle. A wrong answer at verify, disable or
+  regenerate answers `403`, never `401` (the console reads a `401` as an
+  expired session and resubmits, which spent two attempts on one typo,
+  #1371), and verify claims its attempt atomically before checking the code (refunding
   it on a right one), so concurrent guesses cannot all slip under the
   budget. The
   budget lives in Redis and, unlike the login throttle, fails **closed**:

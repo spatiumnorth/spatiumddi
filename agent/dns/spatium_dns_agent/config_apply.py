@@ -110,6 +110,13 @@ class ConfigApplyError(RuntimeError):
 
     @property
     def daemon_disturbed(self) -> bool:
+        # A cause may vouch that the daemon never took a change, whatever the
+        # phase: Technitium's reload phase is a series of API calls, and an
+        # auth refusal on the first one means nothing reached the daemon
+        # (#1772). Reverting then would only repeat the same refused calls
+        # and report ``revert_failed`` for a daemon that is still serving.
+        if getattr(self.cause, "daemon_untouched", False):
+            return False
         return self.phase in DAEMON_DISTURBING_PHASES
 
 

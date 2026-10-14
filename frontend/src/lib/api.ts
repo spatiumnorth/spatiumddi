@@ -5932,7 +5932,10 @@ export interface PropagationCheckResult {
 export interface DNSKeyState {
   key_tag: number;
   key_type: "ksk" | "zsk" | "csk";
+  /** IANA DNSSEC algorithm number (13 = ECDSAP256SHA256). */
   algorithm: number;
+  /** IANA mnemonic; null for a number the server does not know. */
+  algorithm_name?: string | null;
   state: string;
   ds_records: string[];
   timing?: Record<string, string>;
@@ -9351,6 +9354,8 @@ export interface DHCPPool {
   end_ip: string;
   pool_type: string; // "dynamic" | "excluded" | "reserved" | "pd"
   class_restriction: string | null;
+  // Legacy, never served (#1689): Kea has no per-pool lease time. The API
+  // refuses a non-null value; send null only, to clear an old row.
   lease_time_override: number | null;
   options_override: Record<string, unknown> | null;
   // DHCPv6 prefix delegation (#368) — only set for pool_type === "pd".

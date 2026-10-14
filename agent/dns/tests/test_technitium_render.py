@@ -4303,6 +4303,9 @@ def test_render_reads_the_name_rule_from_the_bundle(tmp_path: Path) -> None:
     "message",
     [
         "Cannot add record: CNAME record already exists for the same name.",
+        # What a PRIMARY zone really answers (AuthZone.cs:135/145
+        # ``TrySetRecords``, v15.4.0); note it has no "already exists" at all.
+        "Cannot add record: a CNAME record cannot exists with other record types for the same name.",
         # A different CNAME at the name: reconcile only adds what the server
         # lacks, so this answer cannot mean ours is already there.
         "Record already exists. Use overwrite option if you wish to overwrite existing record.",
@@ -4326,7 +4329,8 @@ def test_reconcile_add_conflict_is_an_apply_failure(tmp_path: Path, message: str
         [{"zone": "z.test", "type": "Primary", "records": [
             {"domain": "www.z.test", "type": "CNAME", "ttl": 300, "cname": "t.z.test"}]}],
     )
-    assert any("already exists" in f for f in d._apply_failures)
+    assert len(d._apply_failures) == 1, d._apply_failures
+    assert message.rstrip(".") in d._apply_failures[0]
 
 
 def _fwd_noop_daemon(add_error: str):

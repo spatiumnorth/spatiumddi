@@ -187,6 +187,10 @@ def _render_update_clause(zone: ZoneData) -> str:
 class BIND9Driver(DNSDriver):
     name = "bind9"
 
+    # ``pull_zone_records`` takes ``include_apex_ns`` (#1857): the AXFR read
+    # can keep the apex NS set for the drift report, which compares it.
+    pull_can_include_apex_ns = True
+
     # ── Rendering ─────────────────────────────────────────────────────────
 
     def render_server_config(
@@ -422,7 +426,12 @@ class BIND9Driver(DNSDriver):
         logger.info("bind9.reload_zone", server=str(getattr(server, "id", "")), zone=zone_name)
 
     async def pull_zone_records(
-        self, server: Any, zone_name: str, *, tsig: TsigKey | None = None
+        self,
+        server: Any,
+        zone_name: str,
+        *,
+        tsig: TsigKey | None = None,
+        include_apex_ns: bool = False,
     ) -> list[RecordData]:
         """AXFR the zone from the BIND9 host.
 
@@ -451,6 +460,7 @@ class BIND9Driver(DNSDriver):
             log_driver="bind9",
             server_id=str(getattr(server, "id", "")),
             tsig=tsig,
+            include_apex_ns=include_apex_ns,
         )
 
     # ── Validation / capabilities ─────────────────────────────────────────

@@ -312,6 +312,25 @@ async def test_deleting_an_acl_cited_by_a_view_is_refused(client: AsyncClient, d
     assert "corp" in r.json()["detail"]["message"]
 
 
+async def test_deleting_an_acl_cited_by_server_options_is_refused(client: AsyncClient, db_session):
+    """#1786: ``allow_recursion`` now renders, so an ACL it names must stay."""
+    token = await _admin(db_session)
+    group = await _group(db_session)
+    await db_session.flush()
+
+    acl_id = await _create_acl(client, token, group.id, "office", "10.0.0.0/8")
+    o = await client.put(
+        f"/api/v1/dns/groups/{group.id}/options",
+        headers=_hdr(token),
+        json={"allow_recursion": ["office"]},
+    )
+    assert o.status_code == 200, o.text
+
+    r = await client.delete(f"/api/v1/dns/groups/{group.id}/acls/{acl_id}", headers=_hdr(token))
+    assert r.status_code == 409, r.text
+    assert "allow_recursion" in r.json()["detail"]["message"]
+
+
 async def test_renaming_a_cited_acl_is_refused(client: AsyncClient, db_session):
     """A rename orphans every reference to the OLD name, exactly as a
     delete would — and is the easier mistake to make."""

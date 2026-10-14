@@ -81,6 +81,11 @@ class SlotImageTarget:
     # second full slot apply of an image it already staged. Carried in the
     # run plan so every node in a run, and every resume of it, agrees.
     nonce: str | None = None
+    # #1709 — the uploaded image this URL serves, when it is one of ours. An
+    # upload streams its bytes to the slot-image mirror, so the mirror
+    # headroom check needs no room for it once the mirror holds it. None for
+    # an operator-pasted external URL.
+    image_id: uuid.UUID | None = None
 
     def as_plan_fields(self) -> dict[str, object]:
         """Serialise into an ``UpgradeRun.plan`` JSON blob."""
@@ -90,6 +95,7 @@ class SlotImageTarget:
             "slot_image_tls_insecure": self.tls_insecure,
             "slot_image_nonce": self.nonce,
             "slot_image_architecture": self.architecture,
+            "slot_image_id": str(self.image_id) if self.image_id else None,
         }
 
     @classmethod
@@ -108,6 +114,9 @@ class SlotImageTarget:
             # to UNKNOWN and fall through to the host runner's check,
             # which is the same answer they had when they were planned.
             architecture=plan.get("slot_image_architecture"),
+            # Absent in a plan written before #1709: the check then asks for
+            # room as it did when the run was planned.
+            image_id=_uuid_or_none(plan.get("slot_image_id")),
         )
 
 
@@ -151,6 +160,13 @@ def slot_image_url_problem(url: str) -> str | None:
         if not host:
             return "slot image URL must include a host"
     return None
+
+
+def _uuid_or_none(value: object) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(value)) if value else None
+    except ValueError:
+        return None
 
 
 def supervisor_strips_url_fragment(row: Appliance) -> bool:
@@ -225,6 +241,7 @@ async def resolve_slot_image_target(
         sha256=image.sha256,
         tls_insecure=True,
         architecture=image.architecture,
+        image_id=image.id,
     )
 
 
