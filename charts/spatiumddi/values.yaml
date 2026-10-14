@@ -334,7 +334,8 @@ api:
 # upgrades. Without this, the upload endpoint writes to the api pod's
 # ephemeral local FS and every other api replica 404s on the serve
 # side. The api Deployment proxies byte ops to the mirror Service when
-# ``SLOT_IMAGE_MIRROR_URL`` is set on the api (via env wiring below).
+# ``SLOT_IMAGE_MIRROR_URL`` is set on the api; the worker gets it too, for
+# the upgrade preflight's mirror disk-headroom check (#1826).
 #
 # Disabled by default — only useful for multi-replica api deployments
 # that also use the slot-image upload feature (= multi-node appliance

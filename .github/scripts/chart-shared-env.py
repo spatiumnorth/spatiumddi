@@ -10,11 +10,13 @@ evaluated as off, with nothing reporting a problem: the render was valid and
 every probe passed.
 
 This reads ``helm template`` streams and, for the api, worker and beat
-containers, requires every ``--expect NAME`` to be present on all three. It
-also takes ``--absent COMPONENT:NAME`` for a container that must NOT carry a
-name (the slot-image mirror and migrate Job include the common env block but
-must not run in appliance mode: the mirror would try to bootstrap the Web UI
-certificate).
+containers, requires every ``--expect NAME`` to be present on all three.
+``--expect-on COMPONENT:NAME`` requires a name on one of them only (the
+slot-image mirror client env goes to the api and worker, not beat), and
+``--absent COMPONENT:NAME`` names a container that must NOT carry a name (the
+slot-image mirror includes the common env block but must not run in appliance
+mode, where it would try to bootstrap the Web UI certificate; beat must not
+hold the mirror's secret).
 
 It fails closed: a render with no api, worker or beat container is refused,
 and so is a run with nothing to expect.
@@ -53,9 +55,15 @@ def _env_names(container: dict[str, Any]) -> list[str]:
     return [e.get("name", "") for e in container.get("env") or []]
 
 
-def problems(docs: list[Any], expect: list[str], absent: list[tuple[str, str]]) -> list[str]:
+def problems(
+    docs: list[Any],
+    expect: list[str],
+    absent: list[tuple[str, str]],
+    expect_on: list[tuple[str, str]] | None = None,
+) -> list[str]:
     out: list[str] = []
     found = _containers(docs)
+    containers = dict(_REQUIRED)
     for comp, cname in _REQUIRED:
         container = found.get(comp, {}).get(cname)
         if container is None:
@@ -71,8 +79,19 @@ def problems(docs: list[Any], expect: list[str], absent: list[tuple[str, str]]) 
         dupes = sorted({n for n in names if names.count(n) > 1})
         for d in dupes:
             out.append(f"{comp}: container '{cname}' sets env {d} more than once")
+    for comp, name in expect_on or []:
+        container = found.get(comp, {}).get(containers.get(comp, comp))
+        if container is None:
+            out.append(f"no '{comp}' container to check {name} on")
+        elif name not in _env_names(container):
+            out.append(f"{comp}: container is missing env {name}")
     for comp, name in absent:
-        for cname, container in found.get(comp, {}).items():
+        if comp not in found:
+            # An absence check on a component the render does not contain
+            # passes vacuously; refuse it, as for a missing api/worker/beat.
+            out.append(f"no Deployment with component label '{comp}' to check {name} is absent on")
+            continue
+        for cname, container in found[comp].items():
             if name in _env_names(container):
                 out.append(f"{comp}: container '{cname}' must not carry env {name}")
     return out
@@ -81,11 +100,15 @@ def problems(docs: list[Any], expect: list[str], absent: list[tuple[str, str]]) 
 def main(argv: list[str]) -> int:
     expect: list[str] = []
     absent: list[tuple[str, str]] = []
+    expect_on: list[tuple[str, str]] = []
     paths: list[str] = []
     it = iter(argv[1:])
     for arg in it:
         if arg == "--expect":
             expect.append(next(it))
+        elif arg == "--expect-on":
+            comp, _, name = next(it).partition(":")
+            expect_on.append((comp, name))
         elif arg == "--absent":
             comp, _, name = next(it).partition(":")
             absent.append((comp, name))
@@ -98,7 +121,7 @@ def main(argv: list[str]) -> int:
     for p in paths or ["-"]:
         text = sys.stdin.read() if p == "-" else Path(p).read_text(encoding="utf-8")
         docs.extend(d for d in yaml.safe_load_all(text) if d)
-    bad = problems(docs, expect, absent)
+    bad = problems(docs, expect, absent, expect_on)
     for line in bad:
         print(f"chart-shared-env: {line}", file=sys.stderr)
     if bad:

@@ -77,6 +77,7 @@ spec:
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
             {{- include "spatiumddi.sharedEnv" . | nindent 12 }}
+            {{- include "spatiumddi.slotImageMirrorClientEnv" . | nindent 12 }}
             {{- if $kubeletCA.enabled }}
             - name: SPATIUM_KUBELET_CA_PATH
               value: {{ $kubeletCA.mountPath | quote }}

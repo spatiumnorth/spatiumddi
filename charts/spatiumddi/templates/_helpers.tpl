@@ -361,14 +361,25 @@ evaluation. Put anything the Celery side reads in ``sharedEnv`` (values.yaml),
 not in ``api.env``. ``.github/scripts/chart-shared-env.py`` fails a render
 where one of the three lacks a variable another carries from this list.
 
-The slot-image mirror URL + secret ride along when the mirror is on: the
-rolling-upgrade preflight runs in the worker and skipped its mirror disk
-headroom check because the worker never had the URL.
+The slot-image mirror client env is a separate helper
+(``spatiumddi.slotImageMirrorClientEnv``) because beat never talks to the
+mirror and has no use for its shared secret.
 */}}
 {{- define "spatiumddi.sharedEnv" -}}
 {{- with .Values.sharedEnv }}
 {{- toYaml . }}
 {{- end }}
+{{- end -}}
+
+{{/*
+Slot-image mirror client env, for the api AND the worker (#1826). The api
+proxies upgrade-image byte ops to the mirror; the worker runs the
+rolling-upgrade preflight, whose mirror disk-headroom check needs the URL and
+signs its request with the secret. Before #1826 only the api had them, so the
+worker's preflight reported "no mirror configured". Not beat: it only
+enqueues, so it gets no copy of the secret.
+*/}}
+{{- define "spatiumddi.slotImageMirrorClientEnv" -}}
 {{- if .Values.slotImageMirror.enabled }}
 - name: SLOT_IMAGE_MIRROR_URL
   value: "http://{{ include "spatiumddi.fullname" . }}-slot-image-mirror.{{ .Release.Namespace }}.svc:8000"

@@ -101,6 +101,7 @@ spec:
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
             {{- include "spatiumddi.sharedEnv" . | nindent 12 }}
+            {{- include "spatiumddi.slotImageMirrorClientEnv" . | nindent 12 }}
             # #989 item 3 — the node this replica runs on. SCHEDULED
             # backups run here, and a removable destination is
             # node-local: without this the worker cannot say which node

@@ -93,10 +93,10 @@ the formatter handles the rest.
   appended to the api, worker and beat containers; firstboot writes
   `APPLIANCE_MODE`, `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and
   `INITIAL_NTP_SERVERS` there instead of under `api.env`, and the
-  slot-image mirror URL and secret now reach the worker too (the
-  rolling-upgrade preflight's mirror disk-headroom check never ran
-  there). A new chart guard, `chart-shared-env.py`, fails a render where
-  the three disagree. An existing appliance picks it up when firstboot
+  slot-image mirror URL and secret now reach the worker as well as the
+  api (the rolling-upgrade preflight's mirror disk-headroom check never
+  ran there), but not beat. A new chart guard, `chart-shared-env.py`,
+  fails a render where the three disagree. An existing appliance picks it up when firstboot
   re-renders the control-plane chart values (the next slot upgrade).
 
 - **Failed sign-ins are forwarded to syslog / SIEM as warnings, not info

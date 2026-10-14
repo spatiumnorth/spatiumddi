@@ -61,8 +61,9 @@
 #                      frontend retire first at one replica too, where the
 #                      blocking term rides on the OUTGOING pods (#1541).
 #   shared-env       — dedicated umbrella render: api, worker and beat all carry
-#                      every variable in ``sharedEnv`` plus the slot-image
-#                      mirror URL / secret, and the mirror does not (#1826).
+#                      every variable in ``sharedEnv``; api and worker carry
+#                      the slot-image mirror URL / secret, beat and the mirror
+#                      itself do not (#1826).
 #                      The appliance's APPLIANCE_MODE reached only the api, so
 #                      the worker that runs alert evaluation saw it unset.
 #
@@ -270,7 +271,9 @@ python3 "$ROOT/.github/scripts/chart-shared-env.py" \
     --expect CELERY_BROKER_URL \
     --expect APPLIANCE_MODE --expect APPLIANCE_HOSTNAME --expect APPLIANCE_HOST_IPS \
     --expect INITIAL_NTP_SERVERS \
-    --expect SLOT_IMAGE_MIRROR_URL --expect SLOT_IMAGE_MIRROR_SECRET \
+    --expect-on api:SLOT_IMAGE_MIRROR_URL --expect-on api:SLOT_IMAGE_MIRROR_SECRET \
+    --expect-on worker:SLOT_IMAGE_MIRROR_URL --expect-on worker:SLOT_IMAGE_MIRROR_SECRET \
+    --absent beat:SLOT_IMAGE_MIRROR_SECRET \
     --absent slot-image-mirror:APPLIANCE_MODE \
     --absent slot-image-mirror:SLOT_IMAGE_MIRROR_URL \
     "$OUT/umbrella-shared-env.yaml" || failures=$((failures + 1))

@@ -24,8 +24,11 @@ from _installer_source import BIN
 
 FIRSTBOOT = (BIN / "spatiumddi-firstboot").read_text(encoding="utf-8")
 
-# Read by code that runs in the worker (appliance_mode gates, cert SAN
-# bootstrap helpers, the settings row's NTP seed).
+# APPLIANCE_MODE is the live fix: the worker's appliance_mode gates. The other
+# three are the cluster-wide seed identity and the settings row's NTP seed;
+# no worker code path reads them today, but the three processes share one
+# ``settings`` and a task that ever creates the platform_settings row lazily
+# must seed it from the operator's Time-source answer, not the default pool.
 SHARED = {"APPLIANCE_MODE", "APPLIANCE_HOSTNAME", "APPLIANCE_HOST_IPS", "INITIAL_NTP_SERVERS"}
 
 
