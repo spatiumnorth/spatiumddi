@@ -106,6 +106,27 @@ the formatter handles the rest.
   badge reads `failure` as a red FAIL and `forbidden` as DENY, and the
   Audit Log result filter offers `failure` and `forbidden`.
 
+- **A subnet wider than a /24 now gets a reverse zone for every /24 it
+  spans, so every address gets its PTR (#1840).** A /17–/23 was given
+  the zone of the /24 holding its network address, so in a /23 every
+  address past the first /24 had no zone and no PTR, with nothing
+  reported. It now gets one zone per /24 (a /23 two, a /20 sixteen, a
+  /17 128), never one enclosing zone, which would make SpatiumDDI
+  authoritative for space outside the subnet. A /9–/16 gets one per /16
+  it contains, and an IPv6 prefix one per nibble-aligned piece (a /55
+  gets both its /56 zones where it used to get only the first, a /45 its
+  eight /48s). The zones are a set: subnet delete trashes all of them
+  (and restore brings them back), a resize grow adds the new range's,
+  and the reverse-zone backfill creates the missing ones. Which zone
+  takes a PTR is decided per address by one shared lookup, also used by
+  the DNS drift check, whose preview now lists every reverse zone of the
+  subnet rather than the first, and which no longer reports another
+  subnet's orphaned PTRs because they share a /24 zone. The Windows
+  cutover checklist counts a wider reverse zone as covering its /24s
+  instead of reporting each one missing. An install's existing first-/24
+  zone keeps serving its addresses; the rest of the set is created on
+  the next allocation or backfill. No migration.
+
 - **Re-importing a zone's own export no longer pins every inherited TTL
   (#1727).** A record with no TTL of its own inherits the zone default and
   is exported without one, so the re-import read the file's `$TTL` back
