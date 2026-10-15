@@ -91,7 +91,10 @@ the formatter handles the rest.
   New policy, Edit and Delete enabled for everyone, so a DNS Editor filled in
   the form and was then refused. They are now disabled with the reason
   "Requires superadmin" for anyone else, as the zone's own Pools tab already
-  was (#1877).
+  was (#1877). The IP detail's Reputation **Check now** was gated on editing
+  the address, while `POST /dnsbl/check` asks write on `dnsbl`, which no
+  built-in role but superadmin holds; it now follows that grant, so an IPAM
+  Editor sees it disabled with the reason instead of a 403.
 
 - **An imported zone no longer has to stay delegated to the server it was
   migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
