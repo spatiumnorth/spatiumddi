@@ -30,14 +30,16 @@
 #      the ssh port to the allowed CIDRs (unscoped if list empty). The
 #      port-22 accept floor lives in the firewall renderer, NOT here, so a
 #      bad port change can't lock the operator out.
-#   7. ``systemctl reload sshd`` (falls back to ssh.service / ssh.socket).
+#   7. Apply to sshd: restart ssh.service under socket activation (a reload
+#      re-execs sshd, which cannot bind the port ssh.socket holds, #1632),
+#      otherwise reload; success = the unit is active afterwards.
 #   8. Write the hash sidecar + the per-host applied key-count sidecar.
 #
 # Apply flow when disabled (the pristine default: password auth on, no
 # managed keys, default port, root login off):
 #   1. Remove /etc/ssh/sshd_config.d/spatiumddi.conf + the nft drop-in.
 #   2. Truncate the managed authorized_keys to a "managed off" stub.
-#   3. ``systemctl reload sshd``; write hash sidecar (empty) + count 0.
+#   3. Apply to sshd as in step 7 above; write hash sidecar (empty) + count 0.
 #
 # Persistence across A/B slot swaps (Phase 8a, issue #138):
 #
@@ -104,24 +106,107 @@ if ! flock -n 9; then
     exit 0
 fi
 
-# Reload sshd so the drop-in + authorized_keys changes take effect. Debian
-# names the unit ssh.service (alias sshd.service); try both. authorized_keys
-# is re-read per-connection so a reload isn't strictly required for it, but
-# the sshd drop-in (Port / PasswordAuthentication / PermitRootLogin) does
-# need one.
+# Apply the sshd drop-in (#1632).
+#
+# Debian trixie runs sshd SOCKET-ACTIVATED: ssh.socket holds :22 and hands the
+# listening fd to ssh.service. `systemctl reload ssh.service` is the wrong
+# tool there. The unit's ExecReload is `sshd -t` + `kill -HUP $MAINPID`, and
+# sshd answers SIGHUP by re-executing itself and binding its OWN listeners,
+# which fails ("Cannot bind any address") because the socket unit owns the
+# port. Both ExecReload commands exit 0, so systemd logs "Reloaded" while
+# ssh.service goes `failed` and no sshd runs until the next connection makes
+# the socket start a fresh one.
+#
+# So under socket activation we RESTART ssh.service instead: the socket stays
+# bound across it (queued connections wait, none are refused) and the new sshd
+# inherits the fd. ssh.service has KillMode=process, so established sessions
+# survive. A changed port is not an sshd matter at all under socket
+# activation: the new ListenStream (sync_socket_listen above) only binds once
+# the SOCKET is restarted after a daemon-reload, so $1 = "socket" asks for that.
+# Without socket activation a plain reload is correct (sshd binds its own
+# listeners) and is still used.
+#
+# Success is whatever systemd reports AFTER the action, never the exit code
+# of the action: that was the original bug, a "successful" reload that left
+# the unit failed. A false return makes the caller fail the trigger, so the
+# hash sidecar stays unwritten and Fleet shows the config as not applied.
+# Under socket activation sshd runs on the fd ssh.socket hands it and IGNORES
+# sshd_config's Port, so a changed ssh_port only takes effect through the
+# socket's own ListenStream. Debian trixie ships no generator that derives it
+# (README.Debian: override it with an ssh.socket.d drop-in), so write one.
+# $1 = the port ("22" removes the drop-in: the unit's own ListenStream=22
+# stands). Sets SOCK_ARG=socket when the drop-in changed, i.e. the socket must
+# be re-bound for the new port to listen.
+SOCKET_DROPIN=/etc/systemd/system/ssh.socket.d/spatiumddi-listen.conf
+SOCK_ARG=""
+sync_socket_listen() {
+    local port="$1" want
+    # No ssh.socket unit on this image: nothing to configure.
+    systemctl cat ssh.socket >/dev/null 2>&1 || return 0
+    want="# Managed by SpatiumDDI (spatiumddi-ssh-reload): sshd_config Port is ignored under socket activation.
+[Socket]
+ListenStream=
+ListenStream=$port"
+    if [ "$port" = "22" ]; then
+        if [ -f "$SOCKET_DROPIN" ]; then
+            rm -f "$SOCKET_DROPIN"
+            SOCK_ARG="socket"
+        fi
+        return 0
+    fi
+    if [ -f "$SOCKET_DROPIN" ] && [ "$(cat "$SOCKET_DROPIN")" = "$want" ]; then
+        return 0
+    fi
+    mkdir -p "$(dirname "$SOCKET_DROPIN")"
+    printf '%s\n' "$want" > "$SOCKET_DROPIN"
+    chmod 0644 "$SOCKET_DROPIN"
+    SOCK_ARG="socket"
+}
+
 reload_sshd() {
+    local restart_socket="${1:-}"
+    systemctl daemon-reload >/dev/null 2>&1 || echo "  ! systemctl daemon-reload failed"
+    if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+        if [ "$restart_socket" = "socket" ]; then
+            if ! systemctl restart ssh.socket >/dev/null 2>&1; then
+                echo "  ✗ ssh.socket restart failed"
+                return 1
+            fi
+            echo "  ✓ ssh.socket restarted (listen port re-read)"
+        fi
+        # Only a RUNNING sshd needs bouncing: an idle socket starts a fresh
+        # one, on the new config, with the next connection.
+        if systemctl is-active --quiet ssh.service 2>/dev/null; then
+            if ! systemctl restart ssh.service >/dev/null 2>&1; then
+                echo "  ✗ ssh.service restart failed"
+                systemctl status ssh.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+                return 1
+            fi
+            if ! systemctl is-active --quiet ssh.service 2>/dev/null; then
+                echo "  ✗ ssh.service is not active after restart"
+                return 1
+            fi
+            echo "  ✓ ssh.service restarted (socket-activated)"
+        else
+            echo "  ✓ sshd idle under ssh.socket; the new config applies on the next connection"
+        fi
+        if ! systemctl is-active --quiet ssh.socket 2>/dev/null; then
+            echo "  ✗ ssh.socket is not active after apply"
+            return 1
+        fi
+        return 0
+    fi
+    # No socket activation: sshd listens by itself, a reload re-execs cleanly.
     if systemctl reload ssh.service >/dev/null 2>&1 \
         || systemctl reload sshd.service >/dev/null 2>&1; then
-        echo "  ✓ sshd reloaded"
-        return 0
+        if systemctl is-active --quiet ssh.service 2>/dev/null; then
+            echo "  ✓ sshd reloaded"
+            return 0
+        fi
+        echo "  ✗ sshd reload returned success but ssh.service is not active"
+        return 1
     fi
-    # A reload can fail if the unit isn't loaded as a long-running service
-    # (socket-activated). Restart the socket as a fallback.
-    if systemctl restart ssh.socket >/dev/null 2>&1; then
-        echo "  ✓ ssh.socket restarted"
-        return 0
-    fi
-    echo "  ! sshd reload failed (changes apply on next sshd start)"
+    echo "  ✗ sshd reload failed"
     return 1
 }
 
@@ -229,10 +314,16 @@ PYEOF
         # so we filter sshd/ssh out and only fail on a genuinely foreign
         # listener.
         PORT="${SSH_PORT:-22}"
+        # Under socket activation ssh.socket is the listener on the port sshd
+        # is already configured for (#1632), and ss names it "systemd".
+        SELF_RE='^sshd?$'
+        if systemctl show ssh.socket -p Listen --value 2>/dev/null | grep -qF ":$PORT "; then
+            SELF_RE='^(sshd?|systemd)$'
+        fi
         if command -v ss >/dev/null 2>&1; then
             INUSE=$(ss -ltnpH "sport = :$PORT" 2>/dev/null \
                 | grep -oP 'users:\(\("\K[^"]+' \
-                | grep -vE '^sshd?$' \
+                | grep -vE "$SELF_RE" \
                 | sort -u \
                 || true)
             if [ -n "$INUSE" ]; then
@@ -384,9 +475,14 @@ PYEOF
         # off at all (#995 item 18 found the same shadowing).
         rm -f /etc/ssh/sshd_config.d/10-spatiumddi-password-auth.conf
         install -o root -g root -m 0644 "$SSHD_TMP" "$SSHD_DROPIN"
+        sync_socket_listen "$PORT"
         echo "  ✓ sshd drop-in installed"
 
-        reload_sshd || true
+        if ! reload_sshd "$SOCK_ARG"; then
+            # The config is installed but sshd is not running it: leave the
+            # hash sidecar alone so Fleet reports "not applied" (#1632).
+            fail "sshd did not come back after applying the config"
+        fi
         echo "$HASH" > "$HASH_SIDECAR"
         echo "$KEY_COUNT" > "$COUNT_SIDECAR"
         echo "  ✓ ssh config applied — status: managed, $KEY_COUNT key(s), port $PORT"
@@ -398,6 +494,7 @@ PYEOF
         # stub the managed authorized_keys. The host's baseline sshd config
         # takes back over (password auth on, default port).
         rm -f "$SSHD_DROPIN"
+        sync_socket_listen 22
         if [ -f "$NFT_DROPIN" ]; then
             rm -f "$NFT_DROPIN"
             nft_reload
@@ -417,7 +514,9 @@ EOF
             chown "$ADMIN_USER:$ADMIN_USER" "$AK_FILE" 2>/dev/null || true
             chmod 0600 "$AK_FILE"
         fi
-        reload_sshd || true
+        if ! reload_sshd "$SOCK_ARG"; then
+            fail "sshd did not come back after removing the managed config"
+        fi
         : > "$HASH_SIDECAR"
         echo "0" > "$COUNT_SIDECAR"
         echo "  ✓ managed ssh config removed, sshd reloaded, status: off"

@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Saving an SSH setting no longer leaves `ssh.service` failed (#1632).**
+  The appliance runs sshd socket-activated: `ssh.socket` holds the port.
+  The runner applied a change with `systemctl reload ssh.service`, whose
+  `ExecReload` is `sshd -t` plus `kill -HUP`; sshd answers SIGHUP by
+  re-executing itself, cannot bind the port the socket owns and dies, while
+  both reload commands exit 0. The log said "sshd reloaded" over a failed
+  unit, with no sshd running until the next connection. Under socket
+  activation the runner now restarts `ssh.service` (the socket keeps the
+  port, sessions survive, `KillMode=process`) and judges success by whether
+  the unit is active afterwards. A failed apply now fails the trigger and
+  leaves the applied-hash sidecar unwritten, so Fleet shows it as not
+  applied instead of green. Also fixed on the way: under socket activation
+  sshd ignores `Port`, so a changed `ssh_port` opened the firewall for a port
+  nothing listened on; the runner now writes an `ssh.socket` `ListenStream`
+  drop-in and re-binds the socket when the port changes.
+
 - **Delete Zone no longer says the zone is permanently deleted (#1880).**
   The dialog, its confirm checkbox, the "Confirm Permanent Deletion"
   title and the bulk zone delete all said the zone and its records would
