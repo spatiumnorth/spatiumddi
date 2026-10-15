@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An imported zone no longer has to stay delegated to the server it was
+  migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
+  BIND9, PowerDNS and Technitium importers keep the source's apex NS, which the
+  agent then serves as the zone's NS set. Preview now lists, per zone, an apex
+  NS naming a host outside the target group (`foreign_apex_ns`, plus a
+  warning), and the import page offers to replace it with the group's own
+  servers that have a DNS hostname. The box starts unticked, because an outside
+  NS can be deliberate (a hidden primary whose public NS are a provider's). The
+  commit API takes `apex_ns_policy: "replace"`, and so does the Copilot's
+  `commit_dns_import`. Replacing is audited, leaves delegations below the apex
+  alone, moves a SOA primary name that named the old host, and keeps the rows
+  with a warning when the group has no server with a hostname. Sync with
+  Servers no longer pushes a stored apex NS to a server whose read cannot see
+  the apex NS (a zone transfer drops it); on agent-managed BIND9 that push
+  failed every run for want of a TSIG key.
+
 - **An agentless DNS record op no longer reaches the provider before
   the database commits (#1539).** Windows DNS, the cloud providers and
   `technitium_api` were called in the middle of the request, so a commit

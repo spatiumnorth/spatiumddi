@@ -37,6 +37,7 @@ from app.services.dns.record_ops import (
     resolve_primary_server,
 )
 
+from .apex_ns import ApexNsPolicy, group_names, is_apex_ns_warning, replace_apex_ns
 from .canonical import (
     ConflictAction,
     ImportedZone,
@@ -365,6 +366,8 @@ async def _create_zone_at(
         "records_created": records_created,
         "skipped_record_types": parsed.skipped_record_types,
     }
+    if parsed.apex_ns_replaced:
+        audit_meta["apex_ns_replaced"] = parsed.apex_ns_replaced
     if skipped_records:
         audit_meta["records_skipped_unsafe"] = skipped_records
     if overwrote_records:
@@ -589,6 +592,7 @@ async def commit_import(
     target_view_id: uuid.UUID | None,
     conflict_actions: dict[str, tuple[ConflictAction, str | None]],
     current_user: User,
+    apex_ns_policy: ApexNsPolicy = "keep",
 ) -> CommitResult:
     """Apply ``preview`` to the DB inside per-zone savepoints.
 
@@ -645,11 +649,22 @@ async def commit_import(
     )
     bind9_target = not drivers or "bind9" in drivers
     warnings = list(preview.warnings)
+    # #1892 — "replace" swaps an imported apex NS naming a host outside the
+    # group for the group's own servers; "keep" (default) imports it as is.
+    apex_names = await group_names(db, target_group_id) if apex_ns_policy == "replace" else None
 
     now = datetime.now(UTC)
     results: list[CommitZoneResult] = []
 
     for parsed in preview.zones:
+        if apex_names is not None:
+            parsed, change, apex_warning = replace_apex_ns(parsed, apex_names)
+            if apex_warning:
+                warnings.append(apex_warning)
+            if change is not None:
+                # The plan's preview warning said to commit with "replace";
+                # done, so it no longer belongs in the result.
+                warnings = [w for w in warnings if not is_apex_ns_warning(w, parsed.name)]
         if bind9_target and parsed.forwarders:
             kept, dropped = split_zone_forwarders(parsed.forwarders)
             if dropped:

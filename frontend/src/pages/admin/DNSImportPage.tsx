@@ -21,8 +21,10 @@ import {
   dnsApi,
   dnsImportApi,
   type CloudDNSServerOption,
+  type DNSImportApexNsPolicy,
   type DNSImportCommitResult,
   type DNSImportConflictDecision,
+  type DNSImportedZone,
   type DNSImportPreview,
   type DNSImportSource,
   type DNSImportZoneConflict,
@@ -249,13 +251,14 @@ function BindTab() {
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the archive first");
       return dnsImportApi.bind9Commit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
@@ -322,9 +325,9 @@ function BindTab() {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -415,13 +418,14 @@ function WindowsDNSTab() {
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the server first");
       return dnsImportApi.windowsDNSCommit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
@@ -478,9 +482,9 @@ function WindowsDNSTab() {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -746,13 +750,14 @@ function CloudDNSTab({ initialServerId }: { initialServerId?: string }) {
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the server first");
       return dnsImportApi.cloudDNSCommit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
@@ -810,9 +815,9 @@ function CloudDNSTab({ initialServerId }: { initialServerId?: string }) {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -1078,13 +1083,14 @@ function PowerDNSTab() {
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the server first");
       return dnsImportApi.powerDNSCommit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
@@ -1141,9 +1147,9 @@ function PowerDNSTab() {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -1428,13 +1434,14 @@ function TechnitiumTab() {
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the server first");
       return dnsImportApi.technitiumCommit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
@@ -1491,9 +1498,9 @@ function TechnitiumTab() {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -1773,7 +1780,59 @@ function UploadForm({
   );
 }
 
-function PreviewPanel({
+/**
+ * #1892 — an imported zone carries the source server's apex NS, and the
+ * group's agents serve those rows as the zone's whole NS set, so without this
+ * the managed zone stays delegated to the host it was migrated off. Off by
+ * default: an apex NS outside the group can be deliberate (a hidden primary
+ * whose public NS are a provider's), so replacing it is the operator's call.
+ */
+function ApexNsPolicyChoice({
+  zones,
+  replace,
+  onChange,
+}: {
+  zones: DNSImportedZone[];
+  replace: boolean;
+  onChange: (replace: boolean) => void;
+}) {
+  const affected = zones.filter((z) => (z.foreign_apex_ns ?? []).length > 0);
+  if (affected.length === 0) return null;
+  return (
+    <div className="mb-3 space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+      <div className="font-medium text-amber-700 dark:text-amber-400">
+        Apex NS outside the target group
+      </div>
+      <div className="text-amber-700/90 dark:text-amber-300/90">
+        These zones name a server that is not in the target group as their NS.
+        Kept, the imported zone stays delegated to that host and goes lame once
+        it is retired.
+      </div>
+      <ul className="space-y-0.5">
+        {affected.map((z) => (
+          <li key={z.name} className="break-all font-mono">
+            {z.name} → {(z.foreign_apex_ns ?? []).join(", ")}
+          </li>
+        ))}
+      </ul>
+      <label className="flex items-start gap-2">
+        <input
+          type="checkbox"
+          checked={replace}
+          onChange={(e) => onChange(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          Replace them with the target group&apos;s servers (only servers whose
+          host is a DNS name; NS records below the apex are kept). Leave
+          unticked if the zone is deliberately served from these hosts.
+        </span>
+      </label>
+    </div>
+  );
+}
+
+export function PreviewPanel({
   preview,
   decisions,
   setDecisions,
@@ -1790,10 +1849,11 @@ function PreviewPanel({
     ) => Record<string, DNSImportConflictDecision>,
   ) => void;
   conflictByZone: Map<string, DNSImportZoneConflict>;
-  onCommit: () => void;
+  onCommit: (apexNsPolicy: DNSImportApexNsPolicy) => void;
   committing: boolean;
   onReset: () => void;
 }) {
+  const [replaceApexNs, setReplaceApexNs] = useState(false);
   return (
     <div className="space-y-4">
       <div className="rounded-md border bg-muted/20 p-4">
@@ -1831,6 +1891,12 @@ function PreviewPanel({
             ))}
           </div>
         )}
+
+        <ApexNsPolicyChoice
+          zones={preview.zones}
+          replace={replaceApexNs}
+          onChange={setReplaceApexNs}
+        />
 
         {Object.keys(preview.record_type_histogram).length > 0 && (
           <div className="mb-3 flex flex-wrap gap-2">
@@ -1973,7 +2039,7 @@ function PreviewPanel({
           variant="primary"
           icon={committing ? Loader2 : Database}
           iconClassName={committing ? "animate-spin" : undefined}
-          onClick={onCommit}
+          onClick={() => onCommit(replaceApexNs ? "replace" : "keep")}
           disabled={committing}
         >
           {committing ? "Committing…" : "Commit import"}

@@ -134,6 +134,26 @@ or `google_dns` — into every created row's `import_source` column, so
 provenance stays queryable per provider. The plan's `source` field
 must match the endpoint or the commit is rejected.
 
+**Apex NS (#1892).** The BIND9, PowerDNS and Technitium sources carry the
+source server's apex NS (`@ NS tech1.example.`) into the zone's records, and
+the group's agents serve those rows as the zone's whole NS set (#1153), so the
+managed zone stays delegated to the host it was migrated off and goes lame once
+that host is retired. Preview therefore lists, per primary zone, any apex NS
+whose target is not a server of the target group (matched on the server's name
+or host), in the zone's `foreign_apex_ns` and as a warning. A group with no
+servers yet is not compared. Nothing changes unless the operator asks: an apex
+NS outside the group can be deliberate, for example a hidden primary whose
+public name servers are a provider's. The review step shows the affected zones
+with an unticked **Replace them with the target group's servers** box; the
+commit API's `apex_ns_policy: "replace"` (and the Copilot's
+`commit_dns_import`) does the same. Replacing drops the foreign apex NS rows,
+adds every enabled server in the group whose host is a DNS hostname (not an IP,
+not a single label) as an apex NS, and moves a SOA primary name that named a
+foreign host. Delegations below the apex are never touched, the change is
+recorded in the zone's audit row (`apex_ns_replaced`), and a group with no such
+server keeps the imported rows with a warning rather than falling back to the
+agent's loopback placeholder. Existing zones are not rewritten.
+
 See `docs/drivers/DNS_DRIVERS.md` for parser + agentless-driver
 internals.
 
