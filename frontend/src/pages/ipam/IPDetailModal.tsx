@@ -47,6 +47,7 @@ import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { IPNetworkTab } from "./IPNetworkTab";
 import { SeenDot } from "./SeenDot";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { RpkiPill } from "@/components/network/bgp-route-table";
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -601,7 +602,7 @@ export function IPDetailModal({
 
           {/* Reputation — DNSBL / RBL listing status (issue #528). Hidden
               when the security.dnsbl module is off or the IP isn't IPv4. */}
-          <ReputationSection address={addr.address} canEdit={canEdit} />
+          <ReputationSection address={addr.address} />
         </div>
       </div>
     </div>
@@ -614,14 +615,16 @@ export function IPDetailModal({
 // "Check now" action. IPv4-only (v1). Hidden when the security.dnsbl
 // feature module is disabled.
 
-function ReputationSection({
-  address,
-  canEdit,
-}: {
-  address: string;
-  canEdit: boolean;
-}) {
+export function ReputationSection({ address }: { address: string }) {
   const qc = useQueryClient();
+  // POST /dnsbl/check takes write on 'dnsbl' (the router's method gate),
+  // not write on the address: an IPAM Editor holds the second and not the
+  // first, so gating on the address's canEdit offered a check the server
+  // refused (#1879's sweep).
+  const checkGate = permissionGate(
+    usePermissions().can("write", "dnsbl"),
+    "Requires write permission on DNSBL",
+  );
   const { enabled } = useFeatureModules();
   const dnsblEnabled = enabled("security.dnsbl");
   const bareIp = (address || "").split("/")[0];
@@ -658,21 +661,20 @@ function ReputationSection({
           )}{" "}
           Reputation
         </div>
-        {canEdit && (
-          <button
-            type="button"
-            onClick={() => check.mutate()}
-            disabled={check.isPending}
-            className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:opacity-60"
-          >
-            {check.isPending ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3 w-3" />
-            )}
-            Check now
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={() => check.mutate()}
+          disabled={check.isPending || !!checkGate.disabled}
+          title={checkGate.title}
+          className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {check.isPending ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <RefreshCw className="h-3 w-3" />
+          )}
+          Check now
+        </button>
       </div>
 
       {entries.length === 0 ? (

@@ -96,6 +96,48 @@ the formatter handles the rest.
   count-over-subquery sites count models that are not soft-deleted. A
   statement that opts out with `include_deleted` still counts Trash.
 
+- **The control plane's DNSSEC keys for a BIND zone follow the keys BIND
+  serves (#1934).** When BIND changed a zone's keys without a structural
+  reload (a pod replacement that re-keyed the zone, a manual or
+  policy-driven rollover), the zone page kept the old key and a DS made from
+  it. The reported build predated #1886, whose 5-minute re-read is what
+  first let a key change with no reload reach the control plane at all
+  (nothing was refused: no report was sent). That re-read still had gaps:
+  a read or report that failed waited a full 5 minutes to try again, a
+  manual rollover's report was the pre-rollover key set (BIND generates the
+  successor after `rndc` returns), and an `rndc` that could not answer for
+  the zone yet was reported as "no keys", clearing the key rows. The agent
+  now looks again 20 s after any report, rollover or failed read, doubling
+  up to 5 minutes while a zone stays unreadable, and leaves a zone `rndc`
+  cannot answer for out of the report instead of clearing its keys.
+
+- **The DNS Pools and DNSSEC Policies pages no longer offer writes the API
+  refuses (#1879).** Every pool write (create, edit, delete, check now) and
+  every DNSSEC-policy write takes a superadmin, but the top-level DNS Pools
+  page and the DNSSEC Policies page rendered New Pool, Check now, Delete,
+  New policy, Edit and Delete enabled for everyone, so a DNS Editor filled in
+  the form and was then refused. They are now disabled with the reason
+  "Requires superadmin" for anyone else, as the zone's own Pools tab already
+  was (#1877). The IP detail's Reputation **Check now** was gated on editing
+  the address, while `POST /dnsbl/check` asks write on `dnsbl`, which no
+  built-in role but superadmin holds; it now follows that grant, so an IPAM
+  Editor sees it disabled with the reason instead of a 403. The DNS import
+  page let a non-superadmin upload an archive or enter a PowerDNS /
+  Technitium key before refusing it; every `/dns/import` route takes a
+  superadmin, so its Preview import and Test connection buttons now say so.
+
+- **Delete Zone no longer says the zone is permanently deleted (#1880).**
+  The dialog, its confirm checkbox, the "Confirm Permanent Deletion"
+  title and the bulk zone delete all said the zone and its records would
+  be permanently deleted, while the console sends the soft delete and the
+  zone goes to Trash. They now say the zone and its records move to Trash,
+  and that a superadmin can restore them from Administration → Trash
+  (restoring is superadmin-only, so the dialog does not tell a DNS Editor
+  they can undo it themselves). The same untrue "cannot be undone" is gone
+  from the DNS records grid's single-record delete. "Permanent" stays on
+  the paths that are: group, TSIG key and blocking-list deletes, and
+  Trash's purge. Same class as #1152 / #1398 for IPAM.
+
 - **An imported zone no longer has to stay delegated to the server it was
   migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
   BIND9, PowerDNS and Technitium importers keep the source's apex NS, which the
@@ -4221,6 +4263,15 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
+  **On the upgrade itself, expect up to two minutes of 500s from
+  appliance host-state reads (#1661).** After the reboot into the new
+  slot, k3s keeps serving the previous release's api until the new
+  control chart rolls it, and that api has no gid 2770, so
+  `GET /api/v1/appliance/slot-upgrade` (and the setup-state and
+  system-info reads) answer `500` until the new api is Ready — about
+  90 s in testing, mixed in with the 502s the rollout already causes.
+  The upgrade completes normally; retry once the new api serves. This
+  happens once, on the upgrade that introduces the tightened directory.
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already

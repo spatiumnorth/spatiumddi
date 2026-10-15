@@ -63,6 +63,15 @@ def _touch_ready_marker(state_dir: Path) -> None:
 # (an hour and up on the default policy), so minutes are plenty.
 DNSSEC_REFRESH_SECONDS = 300.0
 
+# #1934 — the re-read interval while a signed zone's key set is still
+# settling: right after a structural reload or pod start (BIND generates the
+# keys a few seconds AFTER it loads the zone, and a re-keyed zone — #1855 —
+# serves its new key only then), after the keys changed, when BIND could not
+# be asked yet, or when the control plane did not take the report. The slow
+# cadence above is for a quiet zone; using it here left the control plane
+# showing the old key (and a DS made from it) for a full interval.
+DNSSEC_SETTLE_SECONDS = 20.0
+
 
 def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[str, Any]:
     """One op ack. Echoes the page's ``dispatch`` stamp when it has one
@@ -182,6 +191,9 @@ class SyncLoop:
         self._dnssec_bundle: dict[str, Any] | None = None
         self._dnssec_reported: list[dict[str, Any]] | None = None
         self._dnssec_refresh_at = 0.0
+        # #1934 — consecutive reads that ended unsettled (a report, a refused
+        # report, an unreadable zone); drives the settling backoff.
+        self._dnssec_settle_streak = 0
         # #1725 — the supervisor's; ``None`` in tests that build a loop
         # directly. Only read on a failed apply, to name an OOM kill.
         self.oom_watch = oom_watch
@@ -495,6 +507,11 @@ class SyncLoop:
                 failed_zones.add(_zone_key(op.get("zone_name")))
         if dnssec_states:
             self._report_dnssec_state(dnssec_states)
+            # #1934 — a manual rollover (``rndc dnssec -rollover``) makes BIND
+            # generate the successor key AFTER the op returns, so the state
+            # just reported is the pre-rollover set. Look again soon.
+            self._dnssec_settle_streak = 0
+            self._dnssec_recheck_soon()
         self._report_reached_serials(
             {zone: serial for zone, serial in reached.items() if zone not in failed_zones}
         )
@@ -868,6 +885,8 @@ class SyncLoop:
         unchanged signed zone costs one ``rndc dnssec -status`` per zone
         every ``DNSSEC_REFRESH_SECONDS`` and no control-plane write.
         """
+        # Re-arm for the slow cadence first; every path below that has not
+        # reached a settled, accepted read pulls it back to the short one.
         self._dnssec_refresh_at = time.monotonic() + DNSSEC_REFRESH_SECONDS
         collect = getattr(self.driver, "collect_dnssec_state", None)
         if collect is None or self._dnssec_bundle is None:
@@ -876,11 +895,43 @@ class SyncLoop:
             states = collect(self._dnssec_bundle)
         except Exception:
             log.exception("dnssec_collect_failed")
+            self._dnssec_recheck_soon()
             return
+        # The driver could not read (or has not yet got) some zone's keys:
+        # named still loading, or the zone not keyed yet. Retry soon.
+        settling = bool(getattr(self.driver, "dnssec_incomplete", False))
         if not states or (not force and states == self._dnssec_reported):
+            if settling:
+                self._dnssec_recheck_soon()
+            else:
+                # Complete and unchanged: the key set has settled.
+                self._dnssec_settle_streak = 0
             return
         if self._report_dnssec_state(states):
             self._dnssec_reported = states
+            # The keys just moved (or this is the first look after a reload):
+            # a new settling episode, so the next look is the short one again.
+            self._dnssec_settle_streak = 0
+        # Reported (BIND may still be mid-change) or refused (retry, backing
+        # off while it keeps being refused): look again before a quiet-zone
+        # interval.
+        self._dnssec_recheck_soon()
+
+    def _dnssec_recheck_soon(self) -> None:
+        """Arm the next DNSSEC read on the settling cadence.
+
+        ``DNSSEC_SETTLE_SECONDS`` the first time, doubling on each further
+        unsettled read up to ``DNSSEC_REFRESH_SECONDS``. A key change settles
+        in one or two short reads; a zone that stays unreadable (held back by
+        the zone check until the next structural apply, a control plane that
+        keeps refusing) must not cost one ``rndc`` per signed zone every 20 s
+        for as long as it lasts.
+        """
+        delay = min(
+            DNSSEC_SETTLE_SECONDS * (2**self._dnssec_settle_streak), DNSSEC_REFRESH_SECONDS
+        )
+        self._dnssec_settle_streak = min(self._dnssec_settle_streak + 1, 8)
+        self._dnssec_refresh_at = time.monotonic() + delay
 
     def _report_dnssec_state(self, states: list[dict[str, Any]]) -> bool:
         """POST the DS rrset(s) the driver just produced after a sign /
