@@ -17,6 +17,11 @@ import {
   type DNSZone,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { PoolModal } from "./PoolsView";
 
@@ -37,6 +42,12 @@ export function DNSPoolsPage() {
   useStickyLocation("spatium.lastUrl.dnsPools");
   const qc = useQueryClient();
   const nav = useNavigate();
+  // Every pool write takes a superadmin (dns/pool_router.py): create, edit,
+  // delete and check-now all carry the SuperAdmin dependency (#1879).
+  const poolGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
 
   const [showPicker, setShowPicker] = useState(false);
   const [createCtx, setCreateCtx] = useState<{
@@ -83,7 +94,8 @@ export function DNSPoolsPage() {
         <button
           type="button"
           onClick={() => setShowPicker(true)}
-          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          {...poolGate}
         >
           <Plus className="h-3 w-3" /> New Pool
         </button>
@@ -127,6 +139,7 @@ export function DNSPoolsPage() {
                   <PoolRow
                     key={p.id}
                     pool={p}
+                    gate={poolGate}
                     onCheckNow={() => checkNow.mutate(p.id)}
                     onOpen={() =>
                       nav(
@@ -175,11 +188,13 @@ export function DNSPoolsPage() {
 
 function PoolRow({
   pool,
+  gate,
   onCheckNow,
   onOpen,
   onDelete,
 }: {
   pool: DNSPoolListEntry;
+  gate: { disabled?: boolean; title?: string };
   onCheckNow: () => void;
   onOpen: () => void;
   onDelete: () => void;
@@ -255,8 +270,10 @@ function PoolRow({
           <button
             type="button"
             onClick={onCheckNow}
-            className="rounded p-1 text-muted-foreground hover:text-foreground"
+            className="rounded p-1 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
             title="Check now"
+            aria-label="Check now"
+            {...gate}
           >
             <RefreshCw className="h-3.5 w-3.5" />
           </button>
@@ -271,8 +288,10 @@ function PoolRow({
           <button
             type="button"
             onClick={onDelete}
-            className="rounded p-1 text-muted-foreground hover:text-destructive"
+            className="rounded p-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
             title="Delete pool"
+            aria-label="Delete pool"
+            {...gate}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>
