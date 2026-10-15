@@ -108,6 +108,40 @@ the formatter handles the rest.
   old tag" request and leaving a hand-off still in transit alone. The
   re-driven task still has to take the Lease, so a live drive wins. It
   does nothing on docker-compose, and nothing while Redis is down.
+
+- **Starting an MFA enrolment re-checks an external account at its own
+  provider (#1354).** An account with no local password used to pass
+  the enrolment step-up with any session younger than 10 minutes,
+  which is a sign-in time, not a check. An LDAP, RADIUS or TACACS+
+  account now re-verifies its password against its own provider
+  (backup servers included, wrong answers spend the step-up budget),
+  and an OIDC or SAML account is sent back to its IdP, forced to
+  authenticate again (`prompt=login` + `max_age=0`, `ForceAuthn`),
+  with a fresh `auth_time` / `AuthnInstant` required. The callback
+  leaves a single-use proof bound to that user and sign-in, which
+  `enroll/begin` takes. The 10-minute window remains only for an
+  account whose provider is gone or disabled. New
+  `POST /auth/mfa/enroll/reauth`; `GET /auth/mfa/status` gains
+  `enrol_provider_name` and two `enrol_requires` values.
+
+- **A Let's Encrypt certificate issued or renewed on an appliance is now
+  deployed to the Web UI without an api restart (#1895).** Issuance runs
+  in the Celery worker, whose ServiceAccount deliberately cannot patch
+  the `spatium-appliance-tls` Secret, so the renewed certificate sat in
+  the database and the old one kept being served. The worker now wakes
+  the api over Redis after committing, and the api deploys the active
+  certificate (also on a 60 s reconcile tick, under an advisory lock, and
+  only when the Secret differs; a frontend roll that fails after the
+  Secret was patched is retried rather than read as converged). The
+  worker no longer attempts the patch or logs
+  `appliance_cert_secret_patch_failed` on every renewal, and the
+  `secret_expiring` alert judges the certificate actually served (from a
+  snapshot the api publishes, since the worker cannot read the Secret),
+  flagging when the stored one is not deployed. The active certificate
+  was always redeployed over a differing Secret at api start; that is
+  now continuous, so a certificate written into the Secret by hand is
+  replaced within a minute.
+
 - **A BIND9-signed zone on the appliance now gets its DS (#1854).**
   The agent derived the DS by running `dnssec-dsfromkey` only when that
   binary was on `PATH`, and the Alpine dns-bind9 image does not carry
