@@ -84,6 +84,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A slot-upgrade apply that landed during a systemd reload no longer
+  stays pending for good, and a new apply no longer reads the previous
+  run's `done` (#1825, #1288).** A `daemon-reload` re-creates the path
+  watches, and `PathChanged=` does not fire for a file already there
+  (systemd.path(5)), so a trigger written mid-reload never started the
+  runner. On the per-box path the status read `in-flight` with no stamp,
+  so nothing aged it and apply and rollback answered 409 until someone
+  touched the file on the host. On the fleet path the heartbeat reported
+  the previous run's state while the stranded trigger and the fire-once
+  marker stopped the supervisor writing it again. Both the api and the
+  supervisor now read a trigger with no `.state`, or one older than the
+  trigger, as `in-flight` stamped with the trigger's mtime, so the
+  existing 300 s heal reports it `failed`. After 30 s unclaimed, each
+  re-fires the watcher by opening the trigger for write and closing it:
+  the mtime, and so the heal's clock, does not move; at most once per
+  30 s; a trigger that has gone is not re-created, and one the process
+  cannot open (the other writer's) is left to the heal. The same reading
+  fixes #1288: the api's unlink of the root-owned `.state` always failed
+  with EPERM, so it is dropped. The other `PathChanged=` triggers are
+
 - **Drift and pull-from-server reach an agent-managed BIND9 or Technitium
   behind the appliance's DNS VIP (#1470).** With `dns_vip` set the DNS
   pods drop hostNetwork, so the node address a server row carries
