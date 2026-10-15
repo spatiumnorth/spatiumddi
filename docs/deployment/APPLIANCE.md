@@ -1094,6 +1094,52 @@ Nothing is emitted in `hard` mode (the appliance's shape — required
 anti-affinity already pins one replica per node, #590), in `none` mode, at
 `replicas: 1`, or when the operator supplied their own list.
 
+### Memory sizing for named (#1725)
+
+`dns-bind9` carries a memory request of 256Mi and a limit of 2Gi
+(`dnsBind9.resources` in `charts/spatiumddi-appliance/values.yaml`). Without
+a limit, one ~580k-entry catalog blocklist in a group with a view took the
+pod to 2.8-3.6 GB on a 6 GiB node; the kubelet then evicted the worker,
+Postgres and the api, and the kernel killed named. With the limit the kernel
+kills named inside the pod's own cgroup instead, and the control plane stays
+up.
+
+Unlike the api, worker and Postgres limits, this one is **not** sized from
+the node's RAM. The role chart is one HelmChart for the whole cluster and
+every node's supervisor writes it, so it must render the same everywhere
+(#1137), and a DaemonSet has one limit for all its pods. A node whose
+blocklists need more raises it for the cluster with a HelmChartConfig:
+
+```yaml
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: spatiumddi-appliance
+  namespace: kube-system
+spec:
+  valuesContent: |
+    dnsBind9:
+      resources:
+        limits:
+          memory: 4Gi
+```
+
+Size it from the table in [`DNS.md` section 8.0](../features/DNS.md): a
+582k-entry list in a group with one view needs about 4 GiB for named, so a
+node of 8 GiB or more. On a 6 GiB floor node, expect that list to be killed
+by its limit rather than to fit; the server then reports its daemon as not
+serving, naming the OOM kill, and the **Agent daemon not serving** alert
+fires (see `DNS.md` 8.0). The agent also derives named's `max-cache-size`
+from the limit (a quarter of it, split across the recursive views), so the
+resolver caches cannot take the RPZ's share.
+
+The request (256Mi) is what the scheduler reserves; the limit is a ceiling,
+so the pod is Burstable and a 3 GiB DNS-only node still schedules. Under node
+memory pressure the kubelet evicts pods using more than their request in
+PriorityClass order, and `dns-bind9` runs in `spatium-service`, the highest
+of the three (#983), so the control plane is evicted before it: the limit,
+not eviction, is what stops it.
+
 ### What is deliberately not set
 
 `disable-network-policy: true` stays on. The old rationale ("single node,

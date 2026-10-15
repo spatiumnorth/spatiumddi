@@ -84,6 +84,28 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The BIND9 pod has a memory limit, and named's cache is bounded
+  (#1725).** `dns-bind9` had none: loading a ~580k-entry catalog
+  blocklist into a group with a view took it to 2.8-3.6 GB, so on a
+  6 GiB appliance the kubelet evicted the worker, Postgres and the api
+  and then the kernel killed named. The appliance chart, the umbrella
+  chart's DNS agents, `k8s/dns` and the Compose files now carry a
+  256Mi request and a 2Gi limit (Compose: `DNS_BIND9_MEM_LIMIT`), so an
+  overload is the pod's own. The agent also writes `max-cache-size`
+  (a quarter of the container's memory limit) into named.conf, since
+  BIND's default is 90 % of the host's RAM for each view's cache (the
+  quarter is split across the recursive views); override with
+  `NAMED_MAX_CACHE_SIZE`. A named killed by the limit is no longer a
+  silent crash loop: the agent reads the container's OOM-kill counter,
+  persists the kill across the restart, and reports the daemon as not
+  serving with the reason until it stays up for 10 minutes, which raises
+  the default-on **Agent daemon not serving** alert. The appliance limit is one cluster-wide value
+  rather than sized per node (the role chart must render identically on
+  every node, #1137); a list that needs more raises it with a
+  HelmChartConfig. Sizing guidance is in `DNS.md` 8.0 and
+  `APPLIANCE.md`. A new chart check refuses a BIND9 container with no
+  memory limit or one under 1Gi.
+
 - **A demoting control-plane member's row read `ready` for the whole
   leave (#1806).** Demote stamps `leaving`, but the node keeps reporting
   its last verdict (`ready`) until its leave runner writes its own state,

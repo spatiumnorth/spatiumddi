@@ -935,6 +935,67 @@ view "guest" {
   address made both features fail with "The peer didn't know the key we
   used".
 
+### 8.0 Memory sizing for large blocklists (issue #1725)
+
+named holds every RPZ zone in memory, and the agent builds the zone files
+beside it. Measured on a 6 GiB appliance with the Hagezi Gambling list
+(582,305 entries) in a group with one view, which renders the list into two
+RPZ zones:
+
+| | Measured |
+|---|---|
+| named, resident | 1.6 - 2.2 GB (about 1.4 kB per entry per zone) |
+| agent while it renders | about 1.0 - 1.2 GB, plus short-lived children |
+| the pod's peak | 2.8 GB on the first apply, 3.6 GB on the next |
+
+Before #1725 the pod had no memory limit, so that peak was the node's: the
+kubelet evicted the worker, Postgres and the api, then the kernel killed
+named. The pod now carries a memory request (256Mi) and a limit (2Gi), so an
+overload kills named inside its own cgroup and leaves the control plane
+alone. That is a DNS outage on that node, not a platform outage, but it is
+still an outage: **size the limit for the lists you subscribe to.**
+
+Rule of thumb for the limit: 400 MB for named and the agent at idle, plus
+about 3 kB per blocklist entry per RPZ zone while an apply is in flight
+(named and the agent's render each hold a copy). A group with views writes a
+list once per view that carries it (the one-copy-per-view fix is #1706, so
+the factor falls with it). So 582k entries x 2 zones is about 3.9 GB and
+needs a node with 8 GiB or more; one list on a group with no views is about
+half that.
+
+Where to change it:
+
+- Appliance: `dnsBind9.resources` on the role chart, as a HelmChartConfig
+  (see `docs/deployment/APPLIANCE.md`, "Memory sizing for named"). The limit
+  is one value for the whole cluster; the role chart renders the same on
+  every node.
+- Umbrella chart: `dnsAgents.servers[].resources`.
+- Docker Compose: `DNS_BIND9_MEM_LIMIT` in `.env` (default `2g`).
+- Raw manifests: edit `k8s/dns/bind9-statefulset.yaml`.
+
+**When the limit is hit.** The kernel kills named inside the pod, the agent
+exits, and the orchestrator restarts the container into the same config, so
+a list that does not fit is a crash loop on that server. The agent reads the
+container's OOM-kill counter, records the kill in its state directory, and
+from the restart on reports the daemon as not serving with the reason
+(`oom_killed: named was killed for exceeding the container's 2 GiB memory
+limit …`). That is the red chip on the server row and, after its 5-minute
+grace, the default-on **Agent daemon not serving** alert. The record clears
+once named has stayed up for 10 minutes. If a structural apply was in flight
+when named died, the apply's own failure (`agent_config_rejected`) names the
+OOM kill instead. If the kernel picks the agent rather than named, nothing
+can be written first: the pod's last state (`OOMKilled`) is the record.
+
+**Resolver cache.** BIND's `max-cache-size` sizes one cache, every view with
+recursion has its own, and the default is 90 % of physical memory for each:
+named reads the host's RAM, not the container's limit. The agent therefore
+writes an explicit `max-cache-size` into `options {}`: a quarter of the
+container's memory limit, split across the views that recurse (at least
+32m each). So a 2Gi limit gives `512m` with no views and `256m` with two
+recursive views. With no limit it writes nothing and BIND keeps its default.
+Set `NAMED_MAX_CACHE_SIZE` (a BIND size such as `256m`, applied per view, as
+BIND does) on the agent to override it.
+
 ### 8.1 Content filtering / family filter (issue #878)
 
 Two independent ways to filter adult content, and they compose:
