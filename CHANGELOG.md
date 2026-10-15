@@ -96,9 +96,14 @@ the formatter handles the rest.
   replays. A provider refusal gets its own `agentless_push_failed` audit
   row, because the request's audit row is written before the provider is
   called. Every caller is covered (record CRUD, import, IPAM sync, DDNS,
-  trash purge) since the hook sits on the session. A bulk delete or IPAM
-  purge no longer keeps a row on a first provider failure: the delete
-  commits and the op is retried.
+  trash purge, Celery workers) since the hook sits on the session. The
+  hook waits for the outer commit (a savepoint release does not count),
+  claims the rows before calling the provider so the retry sweep can never
+  send the same op at the same time, and holds no database connection
+  during the provider call. A bulk delete or IPAM purge no longer keeps a
+  row on a first provider failure: the delete commits, as a single delete
+  always has, the op is retried, and the bulk-delete response and its
+  notice say the provider has not removed the records yet.
 - **A rolling upgrade no longer drops its Lease on one unanswered
   kubeapi read, and a `running` run whose drive is gone is resumed
   (#1713).** A node reboot or a loaded host makes a Lease read time out;

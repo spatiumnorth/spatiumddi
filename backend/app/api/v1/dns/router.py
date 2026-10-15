@@ -7924,8 +7924,9 @@ async def delete_record(
     rec_snapshot = record_op_payload(record)
 
     async def _push_delete() -> None:
-        # enqueue_record_op dispatches per-driver: agentless applies immediately
-        # (recording a ``failed`` op row, non-fatal, if the provider rejects);
+        # enqueue_record_op dispatches per-driver: agentless is sent once the
+        # commit below lands (#1539) and a provider refusal is retried from
+        # the op row with backoff;
         # agent-based enqueues a delete op the bundle drop also covers
         # (idempotent against an already-absent record). Kept in one closure so
         # the soft and permanent paths retract identically (#632).
@@ -8009,6 +8010,12 @@ class BulkDeleteRecordsResponse(BaseModel):
     # per-record singular route cannot offer that). ``None`` when
     # ``permanent=true`` — there is nothing to restore.
     deletion_batch_id: uuid.UUID | None = None
+    # #1539 — set when an agentless provider did not accept the retraction
+    # on its first attempt. The provider is called after the DB commit, so
+    # the records ARE deleted here and the provider delete is retried from
+    # its op row with backoff; until it lands the provider keeps serving
+    # them. Always None for agent-based groups.
+    provider_warning: str | None = None
 
 
 @router.post(
@@ -8113,9 +8120,11 @@ async def bulk_delete_records(
         ) from exc
 
     # #1539 — an agentless provider is called AFTER the commit, so no op is
-    # ``failed`` at this point: the delete is committed and a provider
-    # refusal is retried from the op row (visible in the record-ops view and
-    # audited as ``agentless_push_failed``), never silently dropped.
+    # ``failed`` at this point: the delete commits — exactly as the singular
+    # DELETE route always has — and a provider refusal is retried from the op
+    # row (audited as ``agentless_push_failed``, terminally alerted by
+    # ``dns_op_failed``) and reported on the response as
+    # ``provider_warning``, read after the commit below.
     #
     # Per-op state determines the DB delete. A wire delete that came back
     # failed must NOT remove the DB row — if we delete blindly the user
@@ -8169,7 +8178,11 @@ async def bulk_delete_records(
             )
             await db.delete(rec)
         await db.commit()
-        return BulkDeleteRecordsResponse(deleted=len(dispatched), skipped=skipped)
+        return BulkDeleteRecordsResponse(
+            deleted=len(dispatched),
+            skipped=skipped,
+            provider_warning=_agentless_batch_warning([o for o in op_rows if o is not None]),
+        )
 
     # One batch id across the whole selection. ``collect_soft_delete_batch``
     # mints a fresh id per root, so append each record's cascade set to a
@@ -8197,6 +8210,7 @@ async def bulk_delete_records(
         deleted=len(dispatched),
         skipped=skipped,
         deletion_batch_id=batch.batch_id if dispatched else None,
+        provider_warning=_agentless_batch_warning([o for o in op_rows if o is not None]),
     )
 
 

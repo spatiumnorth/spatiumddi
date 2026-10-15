@@ -41,9 +41,15 @@ class _FakeProvider:
     calls: list[tuple[str, str, str]] = []
     batches: list[int] = []
     fail = False
+    # Awaited once, during the first provider call: lets a test act while a
+    # dispatch is in progress.
+    hook: Any = None
 
     async def apply_record_change(self, _server: Any, change: Any) -> None:
         type(self).calls.append((change.op, change.record.name, change.record.value))
+        hook, type(self).hook = type(self).hook, None
+        if hook is not None:
+            await hook()
         if type(self).fail:
             raise RuntimeError("503 provider unavailable")
 
@@ -61,6 +67,7 @@ def provider(monkeypatch: pytest.MonkeyPatch) -> type[_FakeProvider]:
     _FakeProvider.calls = []
     _FakeProvider.batches = []
     _FakeProvider.fail = False
+    _FakeProvider.hook = None
     monkeypatch.setitem(_DRIVERS, "windows_dns", _DRIVERS["windows_dns"])  # restore on exit
     register_driver("windows_dns", _FakeProvider)  # type: ignore[arg-type]
     return _FakeProvider
@@ -227,3 +234,166 @@ async def test_api_create_record_dispatches_once_after_commit(
     assert resp.status_code == 201, resp.text
     assert provider.calls == [("create", "api", "10.1.1.1")]
     assert resp.json().get("provider_warning") is None
+
+
+# ── Validation pass: savepoints, worker sessions, claims ─────────────────────
+
+
+async def test_savepoint_release_does_not_dispatch_before_the_outer_commit(
+    db_session: AsyncSession, provider: type[_FakeProvider]
+) -> None:
+    """``after_commit`` fires when a SAVEPOINT is released too (the DHCP
+    lease path opens one per MAC observation). Dispatching there sent
+    nothing — the rows were not yet visible to the dispatch session — and
+    consumed the registration, so the real commit sent nothing either."""
+    zone = await _zone(db_session)
+    await db_session.commit()
+
+    op = await enqueue_record_op(db_session, zone, "create", _a())
+    async with db_session.begin_nested():
+        db_session.add(DNSServerGroup(name=f"sp-{uuid.uuid4().hex[:6]}"))
+    assert provider.calls == [], "a savepoint release is not the commit"
+
+    await db_session.commit()
+    assert provider.calls == [("create", "www", "10.0.0.2")]
+    assert op is not None and op.state == "applied"
+
+
+async def test_worker_task_session_dispatches_on_commit(provider: type[_FakeProvider]) -> None:
+    """``task_session`` is ``pool_size=1, max_overflow=0``. The dispatch must
+    not need a second connection while the committing one is still held, or
+    every Celery-side commit (IPAM auto-sync, DDNS, trash purge) waits out
+    the pool timeout and leaves the op to the sweep."""
+    from app.db import task_session  # noqa: PLC0415
+
+    async with task_session() as db:
+        zone = await _zone(db)
+        await db.commit()
+        op = await enqueue_record_op(db, zone, "create", _a("worker"))
+        await db.commit()
+        assert provider.calls == [("create", "worker", "10.0.0.2")]
+        assert op is not None and op.state == "applied"
+        # Clean up: this session is not the per-test one the fixture truncates
+        # around, but the truncate runs on every mapped table regardless.
+
+
+async def test_no_connection_is_held_across_the_provider_call(
+    db_session: AsyncSession, provider: type[_FakeProvider]
+) -> None:
+    """On a one-connection pool, a query issued while the provider call is in
+    progress gets the connection — i.e. the dispatch holds none."""
+    from sqlalchemy import text  # noqa: PLC0415
+    from sqlalchemy.ext.asyncio import create_async_engine  # noqa: PLC0415
+
+    url = db_session.bind.url.render_as_string(hide_password=False)
+    engine = create_async_engine(url, pool_size=1, max_overflow=0, pool_timeout=3)
+    seen: list[int] = []
+
+    async def probe() -> None:
+        async with AsyncSession(engine) as other:
+            seen.append((await other.execute(text("SELECT 1"))).scalar_one())
+
+    provider.hook = probe
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
+            zone = await _zone(db)
+            await db.commit()
+            op = await enqueue_record_op(db, zone, "create", _a("held"))
+            await db.commit()
+        assert seen == [1], "the probe could not get the pool's only connection"
+        assert op is not None and op.state == "applied"
+    finally:
+        await engine.dispose()
+
+
+async def test_sweep_cannot_resend_an_op_whose_dispatch_is_still_running(
+    db_session: AsyncSession, provider: type[_FakeProvider]
+) -> None:
+    """A Windows batch or a slow cloud API can outlast the 120 s grace. The
+    row is claimed ``in_flight`` before the provider is called, so a sweep
+    running past the grace finds nothing to send — no concurrent duplicate."""
+    zone = await _zone(db_session)
+    await db_session.commit()
+    swept: list[dict[str, int]] = []
+
+    async def sweep_meanwhile() -> None:
+        async with AsyncSession(db_session.bind, expire_on_commit=False) as other:
+            swept.append(
+                await apply_pending_agentless_ops(
+                    other, now=datetime.now(UTC) + timedelta(minutes=5)
+                )
+            )
+
+    provider.hook = sweep_meanwhile
+    op = await enqueue_record_op(db_session, zone, "create", _a("slow"))
+    await db_session.commit()
+
+    assert swept and swept[0]["applied"] == 0 and swept[0]["rescheduled"] == 0
+    assert provider.calls == [("create", "slow", "10.0.0.2")], "sent twice"
+    assert op is not None and op.state == "applied"
+
+
+async def test_expired_lease_is_recovered_and_a_late_outcome_is_dropped(
+    db_session: AsyncSession, provider: type[_FakeProvider]
+) -> None:
+    """A dispatcher that dies (or hangs past its lease) leaves the row
+    ``in_flight``; the sweep counts it as a failed attempt and puts it back
+    on the retry path. If the original dispatch then finishes, its outcome
+    must not overwrite the row the sweep now owns."""
+    zone = await _zone(db_session)
+    await db_session.commit()
+    zone_name = zone.name
+    late: list[dict[str, int]] = []
+
+    async def lease_expires_meanwhile() -> None:
+        async with AsyncSession(db_session.bind, expire_on_commit=False) as other:
+            late.append(
+                await apply_pending_agentless_ops(other, now=datetime.now(UTC) + timedelta(hours=2))
+            )
+
+    provider.hook = lease_expires_meanwhile
+    await enqueue_record_op(db_session, zone, "create", _a("hung"))
+    await db_session.commit()
+
+    assert late and late[0]["recovered"] == 1
+    (stored,) = await _ops_in_fresh_session(db_session, zone_name)
+    assert stored.state == "pending", "the late success overwrote the recovered row"
+    assert stored.attempts == 1 and "lease" in (stored.last_error or "")
+
+
+async def test_bulk_delete_reports_a_refused_provider_delete(
+    client: AsyncClient, db_session: AsyncSession, provider: type[_FakeProvider]
+) -> None:
+    """The DB delete commits before the provider is called, so a refusal can
+    no longer keep the row — the response must say the provider still has
+    the records instead of reading as a clean delete."""
+    user = User(
+        username=f"u1539b-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.test",
+        display_name="u",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    zone = await _zone(db_session)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+    base = f"/api/v1/dns/groups/{zone.group_id}/zones/{zone.id}/records"
+
+    ids = []
+    for i in range(2):
+        resp = await client.post(
+            base,
+            json={"name": f"b{i}", "record_type": "A", "value": f"10.2.0.{i + 1}"},
+            headers=headers,
+        )
+        assert resp.status_code == 201, resp.text
+        ids.append(resp.json()["id"])
+
+    provider.fail = True
+    resp = await client.post(f"{base}/bulk-delete", json={"record_ids": ids}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["deleted"] == 2
+    assert body["provider_warning"] and "2 of 2" in body["provider_warning"]
+    assert provider.batches[-1] == 2, "the delete is still one batch"
