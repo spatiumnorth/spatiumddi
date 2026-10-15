@@ -661,7 +661,7 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
 
     # Lazy: the IPAM router includes this module's router at import time.
     from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
-    from app.services.dns.reverse_zone import ensure_reverse_zone_for_subnet  # noqa: PLC0415
+    from app.services.dns.reverse_zone import ensure_reverse_zones_for_subnet  # noqa: PLC0415
 
     async def materialise(
         node: PlanNode,
@@ -801,7 +801,7 @@ async def apply_plan(plan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> A
             # PTR. Apply never ran either, so the reverse zone waited for the
             # first allocation's catch-up and the gateway's PTR was missing
             # from then on.
-            await ensure_reverse_zone_for_subnet(db, subnet, current_user)
+            await ensure_reverse_zones_for_subnet(db, subnet, current_user)
             if gw_row is not None:
                 await _sync_dns_record(db, gw_row, subnet, backfill_reverse_zone=False)
 

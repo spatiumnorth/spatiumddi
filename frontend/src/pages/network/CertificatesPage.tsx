@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { Pencil, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 
 import {
@@ -935,7 +936,9 @@ export function CertificatesPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={8}
                   >
-                    No targets yet — click "New target" to add one.
+                    <ListEmpty error={query.error} what="certificate targets">
+                      No targets yet — click "New target" to add one.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}

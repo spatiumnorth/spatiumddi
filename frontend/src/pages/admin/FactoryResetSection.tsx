@@ -11,6 +11,7 @@ import {
 
 import {
   factoryResetApi,
+  formatApiError,
   type FactoryResetExecuteRequest,
   type FactoryResetSection,
 } from "@/lib/api";
@@ -306,7 +307,7 @@ function ResetModal({
           ) : previewQ.isError ? (
             <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
               Failed to compute preview:{" "}
-              {(previewQ.error as Error)?.message || "unknown"}
+              {formatApiError(previewQ.error, "unknown")}
             </div>
           ) : (
             <PreviewBlock previewData={previewQ.data!} />
@@ -392,7 +393,7 @@ function ResetModal({
           {/* Error / success */}
           {executeMut.isError && (
             <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-              {(executeMut.error as Error)?.message || "Reset failed"}
+              {formatApiError(executeMut.error, "Reset failed")}
             </div>
           )}
           {executeMut.isSuccess && executeMut.data && (

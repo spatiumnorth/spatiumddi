@@ -17,6 +17,8 @@ import { cn } from "@/lib/utils";
 import { safeExternalHref } from "@/lib/safeUrl";
 import { changeRequestsApi, versionApi } from "@/lib/api";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
+import { pollUnlessRefused } from "@/lib/refusal";
 import { useSessionState } from "@/lib/useSessionState";
 import { BrandLogo } from "@/components/BrandLogo";
 import {
@@ -270,11 +272,16 @@ export function Sidebar({
   // polls when the (default-off) governance.approvals module is on, so a
   // disabled module fires zero requests.
   const approvalsOn = moduleEnabled("governance.approvals");
+  // The count is the queue awaiting an approver's decision, so only an
+  // approver asks for it. Anyone else is refused (or, with no `approve`, would
+  // see only their own rows counted as "waiting"), and every refusal is an
+  // audited `denied` row each 30 s (#1864).
+  const canApproveRequests = usePermissions().can("approve", "change_request");
   const pendingChangeCount = useQuery({
     queryKey: ["change-requests", "pending-count"],
     queryFn: changeRequestsApi.countPending,
-    enabled: approvalsOn,
-    refetchInterval: 30000,
+    enabled: approvalsOn && canApproveRequests,
+    refetchInterval: pollUnlessRefused(30000),
   }).data;
 
   // Integrations live in their own sidebar section, rendered between

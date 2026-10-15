@@ -53,6 +53,8 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_appliance_group_names.py": ("agent/supervisor/spatium_supervisor/role_orchestrator.py"),
     "test_ci_backend_relevant.py": ".github/scripts/ci-backend-relevant.sh",
     "test_openapi_export.py": "scripts/export_openapi.py",
+    # #1465: runs the demo seeder's own template payloads through the API model.
+    "test_seed_demo_templates.py": "scripts/seed_demo.py",
     "test_merge_test_durations.py": "scripts/merge_test_durations.py",
     "test_test_impact_selection.py": ".github/scripts/select_impacted_tests.py",
     # #1353 — the outbound-host guard scans the four shipped agent packages
@@ -93,6 +95,11 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     # its own nginx location block in BOTH shipped templates or it falls
     # through to the SPA and a PBX asking where a phone is gets index.html.
     # The test reads both; both must therefore run this suite when edited.
+    # #1752: parity between the control plane's slot-image URL rule and
+    # the supervisor's own ``allowed_schemes``.
+    "test_slot_image_url_scheme_1752.py": (
+        "agent/supervisor/spatium_supervisor/appliance_state.py",
+    ),
     "test_e911_held.py": (
         "frontend/default.conf.template",
         "charts/spatiumddi/templates/frontend-tls-config.yaml",

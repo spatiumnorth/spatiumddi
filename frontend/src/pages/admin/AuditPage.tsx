@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
+import { isRefused } from "@/lib/refusal";
 import {
   ClipboardList,
   ChevronLeft,
@@ -133,7 +135,7 @@ export function AuditPage() {
     source_ip: colFilters.ip || undefined,
   };
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     queryKey: ["audit", queryParams],
     queryFn: () => auditApi.list(queryParams),
   });
@@ -167,7 +169,9 @@ export function AuditPage() {
           <ChainIntegrityBadge />
           <button
             onClick={() => exportPdfMut.mutate()}
-            disabled={exportPdfMut.isPending}
+            // The PDF needs the same `read` on `audit_log` the list does; a
+            // refused list means the export would be refused too (#1865).
+            disabled={exportPdfMut.isPending || isRefused(error)}
             title="Download a compliance / change report PDF (last 30 days)"
             className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
           >
@@ -175,7 +179,9 @@ export function AuditPage() {
             {exportPdfMut.isPending ? "Exporting…" : "Export PDF"}
           </button>
           <span className="text-sm text-muted-foreground">
-            {total.toLocaleString()} {total === 1 ? "event" : "events"}
+            {error
+              ? "—"
+              : `${total.toLocaleString()} ${total === 1 ? "event" : "events"}`}
           </span>
         </div>
 
@@ -328,7 +334,9 @@ export function AuditPage() {
                     colSpan={8}
                     className="px-3 py-8 text-center text-muted-foreground"
                   >
-                    No audit events found
+                    <ListEmpty error={error} what="the audit log">
+                      No audit events found
+                    </ListEmpty>
                   </td>
                 </tr>
               ) : (
