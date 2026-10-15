@@ -1751,7 +1751,7 @@ class DNSKey(UUIDPrimaryKeyMixin, Base):
     """Public DNSSEC key state for one zone, reported by the agent.
 
     Populated from ``rndc dnssec -status <zone>`` (per-key states + timing)
-    plus ``dnssec-dsfromkey`` for the KSK DS rrset. **No private key
+    plus a DS computed in-process from the KSK key files (#1854). **No private key
     material** — BIND holds and rotates the private keys; these rows are a
     read-only mirror for the operator's "is it signed / what do I give the
     registrar / where is the rollover" view. Replaced wholesale per zone on

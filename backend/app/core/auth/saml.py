@@ -21,6 +21,8 @@ from onelogin.saml2.auth import OneLogin_Saml2_Auth
 from onelogin.saml2.constants import OneLogin_Saml2_Constants
 from onelogin.saml2.idp_metadata_parser import OneLogin_Saml2_IdPMetadataParser
 from onelogin.saml2.settings import OneLogin_Saml2_Settings
+from onelogin.saml2.utils import OneLogin_Saml2_Utils
+from onelogin.saml2.xml_utils import OneLogin_Saml2_XML
 
 from app.config import settings as app_settings
 from app.core.auth.user_sync import ExternalAuthResult
@@ -163,15 +165,19 @@ def _request_data(host: str, path: str, query: str = "", post: dict | None = Non
     }
 
 
-def build_authorize_url(cfg: SAMLConfig, base_url: str, relay_state: str) -> tuple[str, str]:
+def build_authorize_url(
+    cfg: SAMLConfig, base_url: str, relay_state: str, *, force_authn: bool = False
+) -> tuple[str, str]:
     """Returns the IdP's SSO URL (HTTP-Redirect binding) with a SAMLRequest
     parameter, and that AuthnRequest's ID. ``relay_state`` is the CSRF-like
-    token we round-trip; the ID is what the Response must answer (#1335)."""
+    token we round-trip; the ID is what the Response must answer (#1335).
+    ``force_authn`` sets ``ForceAuthn="true"`` for the MFA-enrolment step-up
+    (#1354): the IdP must authenticate the user again, not reuse its session."""
     settings = OneLogin_Saml2_Settings(_settings_dict(cfg), sp_validation_only=False)
     saml_auth = OneLogin_Saml2_Auth(
         _request_data(base_url, "/api/v1/auth/authorize"), old_settings=settings
     )
-    url = saml_auth.login(return_to=relay_state)
+    url = saml_auth.login(return_to=relay_state, force_authn=force_authn)
     return url, saml_auth.get_last_request_id()
 
 
@@ -184,6 +190,8 @@ class SAMLConsumeResult:
     # (epoch seconds), for ``claim_assertion``.
     assertion_id: str = ""
     not_on_or_after: int | None = None
+    # When the IdP says the user authenticated (epoch seconds), or None.
+    authn_instant: int | None = None
 
     def replay_window_seconds(self, now: float | None = None) -> int:
         """How long this Assertion's ID must be remembered (see
@@ -194,8 +202,37 @@ class SAMLConsumeResult:
         return max(remaining, 0) + _REPLAY_DRIFT_SECONDS
 
 
+#: How far before a step-up flow started an ``AuthnInstant`` may fall, for
+#: clock skew between this server and the IdP.
+AUTHN_INSTANT_LEEWAY_SECONDS = 30
+
+
+def _authn_instant(saml_auth: OneLogin_Saml2_Auth) -> int | None:
+    """The signed Assertion's ``AuthnStatement/@AuthnInstant`` as epoch
+    seconds. Read from the Response's own direct-child Assertion, which
+    python3-saml has just validated as the only one (and as signed)."""
+    xml = saml_auth.get_last_response_xml()
+    if not xml:
+        return None
+    try:
+        doc = OneLogin_Saml2_XML.to_etree(xml)
+        found = OneLogin_Saml2_XML.query(
+            doc, "/samlp:Response/saml:Assertion/saml:AuthnStatement/@AuthnInstant"
+        )
+        if len(found) != 1:
+            return None
+        return int(OneLogin_Saml2_Utils.parse_SAML_to_time(str(found[0])))
+    except Exception:  # noqa: BLE001 — unreadable means "no instant", which fails closed
+        return None
+
+
 def consume_assertion(
-    cfg: SAMLConfig, base_url: str, post_data: dict, *, request_id: str | None = None
+    cfg: SAMLConfig,
+    base_url: str,
+    post_data: dict,
+    *,
+    request_id: str | None = None,
+    fresh_since: int | None = None,
 ) -> SAMLConsumeResult:
     """Validate a signed SAML Response and extract claims.
 
@@ -203,7 +240,11 @@ def consume_assertion(
     optional ``RelayState``). ``base_url`` is the one ``cfg`` was built from,
     so ``cfg.sp_acs_url`` already carries it. ``request_id`` is the ID of the
     AuthnRequest this sign-in sent: when given, the Response must answer it
-    (#1335).
+    (#1335). ``fresh_since`` (epoch seconds) makes this the verification half
+    of the MFA-enrolment step-up (#1354): the Assertion's ``AuthnInstant`` must
+    be no earlier than that instant (less the skew leeway) and not in the
+    future, and one with no ``AuthnInstant`` is refused. An IdP that ignored
+    ``ForceAuthn`` and vouched for its old session proves nothing new.
     """
     settings = OneLogin_Saml2_Settings(_settings_dict(cfg), sp_validation_only=False)
     # Validate the Response as received at ``cfg.sp_acs_url`` (#1335): the ACS
@@ -234,6 +275,23 @@ def consume_assertion(
         )
     if not saml_auth.is_authenticated():
         raise SAMLServiceError("SAML response did not authenticate the user")
+
+    authn_instant = _authn_instant(saml_auth)
+    if fresh_since is not None:
+        if authn_instant is None:
+            raise SAMLServiceError(
+                "SAML response rejected: the assertion has no AuthnInstant, so it "
+                "proves no fresh sign-in"
+            )
+        if authn_instant < fresh_since - AUTHN_INSTANT_LEEWAY_SECONDS:
+            raise SAMLServiceError(
+                "SAML response rejected: the assertion's AuthnInstant predates this "
+                "re-authentication"
+            )
+        if authn_instant > int(time.time()) + AUTHN_INSTANT_LEEWAY_SECONDS:
+            raise SAMLServiceError(
+                "SAML response rejected: the assertion's AuthnInstant is in the future"
+            )
 
     attrs = saml_auth.get_attributes() or {}
     name_id = saml_auth.get_nameid() or ""
@@ -290,6 +348,7 @@ def consume_assertion(
         },
         assertion_id=saml_auth.get_last_assertion_id() or "",
         not_on_or_after=saml_auth.get_last_assertion_not_on_or_after(),
+        authn_instant=authn_instant,
     )
 
 

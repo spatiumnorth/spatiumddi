@@ -1771,6 +1771,22 @@ submit re-checks fresh.
   by the Sync DNS classifier.
 - Empty MAC / empty hostname — nothing to collide with.
 
+**A record an operator already wrote is adopted, not duplicated.** When an
+address's A / AAAA or PTR would be identical (same zone, name, type and
+value) to a record a person wrote by hand, IPAM links the address to that
+row and creates no `auto_generated` copy ([#1867](https://github.com/spatiumnorth/spatiumddi/issues/1867)).
+This is the same rule the record API applies with its 409 on a duplicate
+(#1230), and it holds on every path that publishes records: allocation,
+bulk-edit DNS zone, DDNS from a lease and Sync DNS. The adopted row stays the
+operator's (`auto_generated` false, no `ip_address_id`), so deleting the
+address or expiring the lease leaves it served. A record with the same name
+but another value is a different record and still gets its own, and a
+generated record belonging to another address is never adopted. Renaming
+an address onto a name and value the operator wrote retracts IPAM's own row
+and adopts theirs; renaming an adopted address away writes a new record for
+IPAM and leaves the operator's alone. Sync DNS counts an adopted record as
+present, not missing.
+
 ### ✅ 15.12 DHCP Pool Awareness in IP Listing & Allocation
 
 The subnet IP listing now shows **where DHCP pools begin and end**,
@@ -1942,6 +1958,13 @@ its records).
   "move to Trash. You can restore from Admin → Trash within 30
   days." Hard-delete is reachable via the Permanent button on the
   Trash row.
+- A trashed subnet stops publishing: the auto-generated A / AAAA / PTR
+  records IPAM wrote for its addresses (gateway PTR included) are
+  retracted through the record-op queue and trashed under the same
+  batch, so a Restore re-asserts them (#1906). Records in a reverse
+  zone that goes to Trash with the subnet ride that zone; records in
+  a zone that stays (a /24 reverse zone kept for a sibling /25, the
+  forward zone) are what this covers. Hand-made records are untouched.
 - IP addresses are deliberately NOT soft-deletable — they
   cascade-delete with their parent subnet, and the parent subnet
   is the recoverable unit.

@@ -33,6 +33,7 @@ from .config_apply import (
     truncate_error,
 )
 from .drivers.base import DriverBase, HeldZone
+from .oom_watch import OomWatch, is_oom_status
 
 log = structlog.get_logger(__name__)
 
@@ -55,6 +56,12 @@ def _touch_ready_marker(state_dir: Path) -> None:
         marker.touch(exist_ok=True)
     except OSError:
         log.exception("ready_marker_touch_failed", path=str(state_dir / ".ready"))
+
+
+# #1854 — how often the DNSSEC state of signed zones is re-read between
+# structural reloads. BIND's key-state transitions run on TTL-scale timers
+# (an hour and up on the default policy), so minutes are plenty.
+DNSSEC_REFRESH_SECONDS = 300.0
 
 
 def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[str, Any]:
@@ -134,7 +141,12 @@ def _partial_apply_error(held: Sequence[HeldZone], refused: Sequence[str]) -> st
 
 class SyncLoop:
     def __init__(
-        self, cfg: AgentConfig, token_ref: list[str], driver: DriverBase, heartbeat: Any
+        self,
+        cfg: AgentConfig,
+        token_ref: list[str],
+        driver: DriverBase,
+        heartbeat: Any,
+        oom_watch: OomWatch | None = None,
     ):
         self.cfg = cfg
         self.token_ref = token_ref
@@ -162,6 +174,17 @@ class SyncLoop:
         # poll must not read the degraded verdict as stale and clear it.
         self._zones_refused = False
         self.heartbeat.config_apply = self.apply_status
+        # #1854 — the bundle last applied structurally, so the DNSSEC state
+        # (DS + per-key) can be re-read between reloads. BIND moves a key's
+        # DS from not-submittable to submittable hours after signing, and
+        # withdraws the old one at the end of a rollover, with no config
+        # change in between; reading only after a reload would freeze both.
+        self._dnssec_bundle: dict[str, Any] | None = None
+        self._dnssec_reported: list[dict[str, Any]] | None = None
+        self._dnssec_refresh_at = 0.0
+        # #1725 — the supervisor's; ``None`` in tests that build a loop
+        # directly. Only read on a failed apply, to name an OOM kill.
+        self.oom_watch = oom_watch
 
         # Preload cached bundle (offline-operation guarantee)
         bundle, etag = load_config(self.cfg.state_dir)
@@ -208,6 +231,7 @@ class SyncLoop:
                 # the K8s readinessProbe this pod is ready to serve without
                 # waiting for the next control-plane long-poll round-trip.
                 _touch_ready_marker(self.cfg.state_dir)
+                self._dnssec_bundle = bundle
                 log.info("dns_agent_bootstrap_from_cache", etag=etag)
                 # #170 Wave C1 — fleet-upgrade / reboot / SNMP / NTP
                 # trigger-file writes moved to the supervisor's
@@ -426,14 +450,8 @@ class SyncLoop:
             # config, so after a structural reload we read each signed
             # zone's DS + per-key state and report it. PowerDNS reports via
             # the op path below instead (so its driver has no collector).
-            collect = getattr(self.driver, "collect_dnssec_state", None)
-            if collect is not None:
-                try:
-                    bind_states = collect(bundle)
-                    if bind_states:
-                        self._report_dnssec_state(bind_states)
-                except Exception:
-                    log.exception("dnssec_collect_failed")
+            self._dnssec_bundle = bundle
+            self._refresh_dnssec_state(force=True)
 
             # Push the on-disk rendered config snapshot so the Server
             # Detail modal's Config tab can show "what's actually live
@@ -559,9 +577,15 @@ class SyncLoop:
             return
         self.apply_status = ApplyStatus(status=STATUS_OK, etag=etag)
         self.heartbeat.config_apply = self.apply_status
-        if self.heartbeat.daemon_status.get("status") == "degraded":
+        if self.heartbeat.daemon_status.get("status") == "degraded" and not is_oom_status(
+            self.heartbeat.daemon_status
+        ):
             # Clear a degraded verdict this loop set on a previous cycle;
             # leaving it would make a recovered server look broken forever.
+            # An OOM-kill verdict (#1725) is not this loop's to clear: an apply
+            # succeeding says nothing about whether the daemon then survives
+            # the config, so the supervisor clears it once the daemon has
+            # stayed up (``oom_watch.STABLE_SECONDS``).
             self.heartbeat.daemon_status = {"status": "ok"}
 
     def _applied_fingerprint(self, bundle: dict[str, Any]) -> str | None:
@@ -658,6 +682,14 @@ class SyncLoop:
         cause: BaseException,
         daemon_disturbed: bool,
     ) -> None:
+        if self.oom_watch is not None and self.oom_watch.fired(consume=True):
+            # #1725 — the error the daemon left (an rndc refusal, a dead
+            # control channel) does not say why it died. Say it.
+            cause = RuntimeError(
+                f"{cause} (the container's OOM killer fired: the daemon ran out of "
+                "memory under its limit; large RPZ blocklists are the usual cause, "
+                "see docs/features/DNS.md 8.0)"
+            )
         log.error(
             "sync_apply_failed",
             etag=etag,
@@ -828,7 +860,29 @@ class SyncLoop:
         for entry in entries:
             self._reported_serials[_zone_key(entry["zone_name"])] = int(entry["serial"])
 
-    def _report_dnssec_state(self, states: list[dict[str, Any]]) -> None:
+    def _refresh_dnssec_state(self, force: bool = False) -> None:
+        """Re-read the driver's DNSSEC state and POST it when it changed.
+
+        ``force`` posts regardless (after a structural reload, as before
+        #1854); the periodic call from ``run`` posts only a change, so an
+        unchanged signed zone costs one ``rndc dnssec -status`` per zone
+        every ``DNSSEC_REFRESH_SECONDS`` and no control-plane write.
+        """
+        self._dnssec_refresh_at = time.monotonic() + DNSSEC_REFRESH_SECONDS
+        collect = getattr(self.driver, "collect_dnssec_state", None)
+        if collect is None or self._dnssec_bundle is None:
+            return
+        try:
+            states = collect(self._dnssec_bundle)
+        except Exception:
+            log.exception("dnssec_collect_failed")
+            return
+        if not states or (not force and states == self._dnssec_reported):
+            return
+        if self._report_dnssec_state(states):
+            self._dnssec_reported = states
+
+    def _report_dnssec_state(self, states: list[dict[str, Any]]) -> bool:
         """POST the DS rrset(s) the driver just produced after a sign /
         unsign op (issue #127, Phase 3c.fe).
 
@@ -836,7 +890,7 @@ class SyncLoop:
         re-trigger sign in the UI to retry.
         """
         if not states:
-            return
+            return False
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
         try:
             with self._client() as c:
@@ -851,9 +905,14 @@ class SyncLoop:
                     status=resp.status_code,
                     body=resp.text[:200],
                 )
+                return False
         except httpx.HTTPError as e:
             log.warning("dnssec_state_report_failed", error=str(e))
+            return False
+        return True
 
     def run(self) -> None:
         while not self._stop.is_set():
             self._poll_once()
+            if time.monotonic() >= self._dnssec_refresh_at:
+                self._refresh_dnssec_state()
