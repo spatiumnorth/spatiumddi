@@ -84,17 +84,6 @@ the formatter handles the rest.
 
 ### Fixed
 
-- **Icon-only buttons have accessible names (#1950).** The remove X on
-  a custom option row of the DHCP option editor (used by the scope,
-  option-template and client-class dialogs) was announced by a screen
-  reader as just "button". It is now "Remove option", with a matching
-  tooltip. A sweep found thirteen more icon-only buttons with no name
-  (APT source / GPG key / credential remove, Copilot send, the aggregation
-  panel's close, AI provider edit / delete, audit-log previous / next page,
-  IPAM template child remove, firewall rule remove, IP space delete, and
-  the IPAM drag-and-drop error's dismiss), all named the same way, and a
-  test now fails on any new one. The search palette's clear-query X is
-  named by the #1949 change.
 - **The control plane's DNSSEC keys for a BIND zone follow the keys BIND
   serves (#1934).** When BIND changed a zone's keys without a structural
   reload (a pod replacement that re-keyed the zone, a manual or
@@ -109,6 +98,18 @@ the formatter handles the rest.
   now looks again 20 s after any report, rollover or failed read, doubling
   up to 5 minutes while a zone stays unreadable, and leaves a zone `rndc`
   cannot answer for out of the report instead of clearing its keys.
+
+- **Icon-only buttons have accessible names (#1950).** The remove X on
+  a custom option row of the DHCP option editor (used by the scope,
+  option-template and client-class dialogs) was announced by a screen
+  reader as just "button". It is now "Remove option", with a matching
+  tooltip. A sweep found thirteen more icon-only buttons with no name
+  (APT source / GPG key / credential remove, Copilot send, the aggregation
+  panel's close, AI provider edit / delete, audit-log previous / next page,
+  IPAM template child remove, firewall rule remove, IP space delete, and
+  the IPAM drag-and-drop error's dismiss), all named the same way, and a
+  test now fails on any new one. The search palette's clear-query X is
+  named by the #1949 change.
 
 - **The DNS Pools and DNSSEC Policies pages no longer offer writes the API
   refuses (#1879).** Every pool write (create, edit, delete, check now) and
