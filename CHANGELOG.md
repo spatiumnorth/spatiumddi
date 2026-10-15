@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A paginated list's `total` no longer counts rows in Trash (#1933).** The
+  shared `paginate` helper counts through
+  `select(count()).select_from(base.subquery())`, and the global soft-delete
+  filter only looked at the outer statement's FROM, so it saw an anonymous
+  subquery and skipped it: the page query was filtered and the count was not.
+  A zone with four of ten records trashed listed six rows under `total: 10`,
+  so the pager offered pages that came back empty. The filter now looks inside
+  subquery FROMs (and CTEs), with the criterion placed inside the subquery.
+  The lists this changes are the zone and group-wide record lists; the other
+  count-over-subquery sites count models that are not soft-deleted. A
+  statement that opts out with `include_deleted` still counts Trash.
+
 - **The control plane's DNSSEC keys for a BIND zone follow the keys BIND
   serves (#1934).** When BIND changed a zone's keys without a structural
   reload (a pod replacement that re-keyed the zone, a manual or
