@@ -66,6 +66,7 @@ from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     CLUSTER_ROLE_PRIMARY,
     Appliance,
+    ApplianceUpgradeImage,
 )
 from app.services.appliance.ownership import k8s_node_name
 from app.services.upgrades import mutex
@@ -133,6 +134,17 @@ def check_inflight_conflict(
             level="ok",
             message="the upgrade lease is held by this run",
             detail={"holder": state.holder, "transitions": state.transitions},
+        )
+    if own_holder and state.holder == "<unreachable>":
+        # #1713 — the kubeapi did not answer the read. The run asking holds
+        # the Lease by its own renewals, which stop the drive if it is lost;
+        # failing its node on a read nobody answered would fail the run on
+        # the reboot blip that follows every node.
+        return PreflightResult(
+            name="inflight_conflict",
+            level="warn",
+            message="the upgrade lease could not be read; this run's renewals hold it",
+            detail={"holder": state.holder},
         )
     if state.held and not state.expired:
         return PreflightResult(
@@ -901,6 +913,46 @@ class PreflightReport:
         }
 
 
+_DEFAULT_SLOT_IMAGE_BYTES = 4 * 1024 * 1024 * 1024
+
+# #1919 — what a node's /var must take for an image of ``size_bytes``, as a
+# multiple of it. Two writes, one after the other (spatium-upgrade-slot):
+# the compressed ``.raw.xz`` is staged whole on /var, streamed through xz
+# into the inactive partition and deleted; then, on the new slot's first
+# boot, k3s imports that slot's container images into containerd on /var
+# BESIDE the old slot's (spatiumddi-image-prune drops the oldest set only
+# after the slot commits). The import is the larger of the two: it is the
+# release's own images unpacked, ~1.6x the compressed slot image measured
+# on a 1.9 GB image, and the staged file is 1x. 2x covers the larger with
+# room; the 1 GiB margin stays on top for the etcd snapshot and logs. The
+# mirror stores the compressed file only, so its need is 1x.
+_NODE_NEED_IMAGE_MULTIPLE = 2
+
+
+async def _slot_image_size(slot_image_id: uuid.UUID | None) -> int | None:
+    """The run's uploaded image's ``size_bytes`` (the compressed artifact),
+    or None when the Plan names none, the row is gone or zero, or the DB
+    could not be read. None keeps each check's 4 GiB default, which fails
+    closed (#1919)."""
+    if slot_image_id is None:
+        return None
+    try:
+        async with AsyncSessionLocal() as db:
+            size = (
+                await db.execute(
+                    select(ApplianceUpgradeImage.size_bytes).where(
+                        ApplianceUpgradeImage.id == slot_image_id
+                    )
+                )
+            ).scalar_one_or_none()
+    except Exception as e:  # pragma: no cover - DB unavailable keeps the default
+        logger.warning("preflight_image_size_query_failed", error=str(e))
+        return None
+    if size is None or size <= 0:
+        return None
+    return int(size)
+
+
 async def run_all(
     *,
     target_version: str,
@@ -923,11 +975,22 @@ async def run_all(
     of checks starts to dominate latency we can parallelise via
     ``asyncio.gather``.
     """
+    image_bytes = await _slot_image_size(slot_image_id)
+    node_image_bytes = (
+        image_bytes * _NODE_NEED_IMAGE_MULTIPLE if image_bytes else _DEFAULT_SLOT_IMAGE_BYTES
+    )
     results: list[PreflightResult] = [
         check_inflight_conflict(namespace=namespace, own_holder=own_holder),
         await check_replication_lag(),
-        await check_node_disk_headroom(nodes=disk_nodes, target_version=target_version),
-        await check_mirror_disk_headroom(slot_image_id=slot_image_id),
+        await check_node_disk_headroom(
+            nodes=disk_nodes,
+            target_version=target_version,
+            slot_image_size_bytes=node_image_bytes,
+        ),
+        await check_mirror_disk_headroom(
+            slot_image_id=slot_image_id,
+            slot_image_size_bytes=image_bytes or _DEFAULT_SLOT_IMAGE_BYTES,
+        ),
         check_version_path(target_version=target_version),
         check_quorum(),
         await check_kea_ha_version_skew(),

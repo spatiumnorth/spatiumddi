@@ -69,6 +69,12 @@ class LeaseState:
 _NO_LEASE = LeaseState(held=False, holder=None, renew_time=None, transitions=0, expired=False)
 
 
+class LeaseUnknownError(RuntimeError):
+    """The kubeapi did not answer, so whether a Lease is held is UNKNOWN
+    (#1713). Distinct from "not held": a caller that cannot see the Lease must
+    neither conclude it lost it nor that it is free."""
+
+
 def _identity() -> str:
     """The pod's hostname (k8s sets it to the pod name).
 
@@ -139,7 +145,18 @@ def _read(*, namespace: str | None = None) -> tuple[LeaseState, str | None]:
     (#1512). The version is None whenever there is no lease body to hold."""
     try:
         status, body = k8s.get_lease(LEASE_NAME, namespace=namespace)
-    except k8s.KubeapiUnavailableError:
+    except k8s.KubeapiUnavailableError as exc:
+        if k8s.get_config() is not None:
+            # The kubeapi is configured but did not answer (#1713): the Lease
+            # is UNKNOWN, not absent. Report it held by "<unreachable>" like a
+            # 5xx, so no acquire races in and nothing reads it as free.
+            logger.warning("upgrade_lease_read_unanswered", error=str(exc))
+            return (
+                LeaseState(
+                    held=True, holder="<unreachable>", renew_time=None, transitions=0, expired=False
+                ),
+                None,
+            )
         # On docker-compose deployments the SA isn't mounted; treat as
         # "no lease, no concurrent upgrade" — single-node deployments
         # don't need a cluster-wide lock anyway.
@@ -231,6 +248,21 @@ def acquire(
     return False, err
 
 
+def read_state_strict(*, namespace: str | None = None) -> LeaseState:
+    """The Lease's state, or :class:`LeaseUnknownError` when the kubeapi did
+    not answer it (a timeout, a refused connection, a 5xx / 401 / 403).
+    Unlike :func:`get_state`, an unanswered read is never "not held"."""
+    try:
+        status, body = k8s.get_lease(LEASE_NAME, namespace=namespace)
+    except k8s.KubeapiUnavailableError as exc:
+        raise LeaseUnknownError(f"lease read unanswered: {exc}") from exc
+    if status == 404:
+        return _NO_LEASE
+    if status != 200 or body is None:
+        raise LeaseUnknownError(f"lease read returned {status}")
+    return _parse_lease(body)
+
+
 def renew(
     *,
     holder: str | None = None,
@@ -246,18 +278,40 @@ def renew(
     on the next tick. The write is a compare-and-swap on the version read, so a
     takeover between the read and the write loses this renewal instead. A
     failure means the caller no longer holds the cluster lock and must stop.
+
+    #1713 — a renewal the kubeapi did not answer (the read, or the write) is
+    neither: it raises :class:`LeaseUnknownError`, because the Lease may well
+    still be held. Only a Lease SEEN to name someone else (or nobody), or a
+    write refused with a conflict, returns ``(False, ...)``.
     """
     me = holder or _identity()
-    state, version = _read(namespace=namespace)
+    if k8s.get_config() is None:
+        # docker-compose: no Lease to read; as before, nobody holds it.
+        return False, "lease lost: held by nobody"
+    try:
+        status, body = k8s.get_lease(LEASE_NAME, namespace=namespace)
+    except k8s.KubeapiUnavailableError as exc:
+        raise LeaseUnknownError(f"lease read unanswered: {exc}") from exc
+    if status == 404:
+        return False, "lease lost: held by nobody"
+    if status != 200 or body is None:
+        raise LeaseUnknownError(f"lease read returned {status}")
+    state = _parse_lease(body)
     if state.holder != me:
         return False, f"lease lost: held by {state.holder or 'nobody'}"
-    return k8s.update_lease(
+    version = (body.get("metadata") or {}).get("resourceVersion")
+    ok, err = k8s.update_lease(
         LEASE_NAME,
         me,
         namespace=namespace,
         lease_duration_seconds=lease_duration_seconds,
-        resource_version=version,
+        resource_version=str(version) if version else None,
     )
+    if not ok and not (err or "").startswith("conflict"):
+        # The write was not answered or was refused for a reason that says
+        # nothing about who holds the Lease (a 5xx, a timeout).
+        raise LeaseUnknownError(f"lease renew write failed: {err}")
+    return ok, err
 
 
 def release_if_held(
@@ -316,6 +370,67 @@ def release_if_held(
         # A 409 (the lease moved since the read) or an unanswered write: the
         # next attempt re-reads and finds out whether it is still ours.
     return False
+
+
+@dataclass(frozen=True)
+class ForceReleaseOutcome:
+    """What :func:`force_release_idle` did. ``outcome`` is ``released``,
+    ``no_lease`` (no Lease on this deployment), ``not_held``, ``alive`` (the
+    holder renewed within ``min_idle_s``), ``unreadable`` (the kubeapi did
+    not answer) or ``write_failed`` (the clear was refused: renewed or taken
+    over since the read, or the kubeapi said no). ``idle_s`` is how long ago the holder last renewed.
+    """
+
+    outcome: str
+    state: LeaseState | None = None
+    idle_s: float | None = None
+    error: str | None = None
+
+
+def force_release_idle(*, min_idle_s: float, namespace: str | None = None) -> ForceReleaseOutcome:
+    """An operator's way out when the drive that holds the Lease has died
+    (#1707): Abort leaves the Lease to the drive, so a dead one's lapses
+    only after ``leaseDurationSeconds``.
+
+    Refused while the holder is alive, read off the Lease itself: a drive
+    renews every third of the duration, so a ``renewTime`` older than
+    ``min_idle_s`` means it missed a renewal. The read is direct, not
+    through :func:`_read`, which reports an unanswered read as "not held"
+    (#1713). The clear is a compare-and-swap on the version read, so a
+    renewal or takeover landing in between makes it fail rather than free a
+    live drive's Lease."""
+    if k8s.get_config() is None:
+        return ForceReleaseOutcome(outcome="no_lease")
+    try:
+        status, body = k8s.get_lease(LEASE_NAME, namespace=namespace)
+    except k8s.KubeapiUnavailableError as exc:
+        return ForceReleaseOutcome(outcome="unreadable", error=str(exc))
+    if status == 404:
+        return ForceReleaseOutcome(outcome="not_held")
+    if status != 200 or body is None:
+        return ForceReleaseOutcome(outcome="unreadable", error=f"lease read returned {status}")
+    state = _parse_lease(body)
+    if not state.holder:
+        return ForceReleaseOutcome(outcome="not_held", state=state)
+    idle_s: float | None = None
+    if state.renew_time:
+        try:
+            renewed = datetime.fromisoformat(state.renew_time.replace("Z", "+00:00"))
+            idle_s = (datetime.now(UTC) - renewed).total_seconds()
+        except ValueError:
+            idle_s = None  # unparseable: as _parse_lease, treated as expired
+    if idle_s is not None and idle_s < min_idle_s:
+        return ForceReleaseOutcome(outcome="alive", state=state, idle_s=idle_s)
+    version = (body.get("metadata") or {}).get("resourceVersion")
+    try:
+        ok, err = k8s.clear_lease_holder(
+            LEASE_NAME, namespace=namespace, resource_version=str(version) if version else None
+        )
+    except k8s.KubeapiUnavailableError as exc:
+        return ForceReleaseOutcome(outcome="unreadable", state=state, idle_s=idle_s, error=str(exc))
+    if not ok:
+        return ForceReleaseOutcome(outcome="write_failed", state=state, idle_s=idle_s, error=err)
+    return ForceReleaseOutcome(outcome="released", state=state, idle_s=idle_s)
 
 
 def release(*, holder: str | None = None, namespace: str | None = None) -> tuple[bool, str | None]:

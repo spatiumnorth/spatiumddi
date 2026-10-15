@@ -256,20 +256,22 @@ async def test_resume_upgrade_halted_to_running() -> None:
 async def test_abort_upgrade_from_planned() -> None:
     run = _FakeRun(state="planned")
     db = _db_for_state_test(run)
-    with patch.object(orchestrator.mutex, "release", return_value=(True, None)):
+    with patch.object(orchestrator.mutex, "release", return_value=(True, None)) as rel:
         out = await orchestrator.abort_upgrade(db, run.id, actor_display="admin")
     assert out.state == "aborted"
     assert out.finished_at is not None
+    rel.assert_called_once()  # a run that never started has no drive to wait for
 
 
 @pytest.mark.asyncio
-async def test_abort_upgrade_from_running_releases_lease() -> None:
+async def test_abort_upgrade_from_running_leaves_the_lease_to_the_drive() -> None:
+    """The drive releases its own Lease once it has stopped (#1707)."""
     run = _FakeRun(state="running")
     db = _db_for_state_test(run)
     with patch.object(orchestrator.mutex, "release", return_value=(True, None)) as rel:
         out = await orchestrator.abort_upgrade(db, run.id)
     assert out.state == "aborted"
-    rel.assert_called_once()
+    rel.assert_not_called()
 
 
 @pytest.mark.asyncio

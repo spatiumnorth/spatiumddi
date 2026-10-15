@@ -40,12 +40,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -112,6 +114,20 @@ def detect_cnpg_cluster_name(namespace: str | None = None) -> str:
 # before expiration.
 LEASE_DURATION_S = 600  # 10 min
 _LEASE_RENEW_INTERVAL_S = LEASE_DURATION_S / 3.0
+# An unanswered renewal is retried this often (#1713).
+_LEASE_RENEW_RETRY_S = 15.0
+# #1713 — how long a drive may go on treating its Lease as held with no
+# renewal confirmed. It must end strictly before anyone else may take the
+# Lease over: a would-be acquirer reads ``renewTime`` (stamped by THIS
+# worker's clock, after the renewal attempt started) and takes over once its
+# own clock says ``leaseDurationSeconds`` have passed. The margin covers the
+# skew between the two clocks and the length of the renewal call itself (a
+# read and a write, each up to the kubeapi helpers' 10 s timeout), since the
+# give-up is only checked when a call returns.
+_LEASE_EXPIRY_MARGIN_S = 120.0
+_LEASE_SAFE_HOLD_S = LEASE_DURATION_S - _LEASE_EXPIRY_MARGIN_S
+# Patched by tests; asyncio's own clock must stay real.
+_monotonic = time.monotonic
 
 
 # When the per-node primitive succeeds the orchestrator gates the next
@@ -146,6 +162,24 @@ class PlanResult:
 async def get_run(db: AsyncSession, run_id: uuid.UUID) -> SystemUpgradeRun:
     """Fetch + 404-raise if the row doesn't exist."""
     row = await db.get(SystemUpgradeRun, run_id)
+    if row is None:
+        raise OrchestratorError(f"upgrade run {run_id} not found")
+    return row
+
+
+async def _get_run_locked(db: AsyncSession, run_id: uuid.UUID) -> SystemUpgradeRun:
+    """The run, re-read and row-locked (``FOR UPDATE``) until the caller
+    commits. Halt, Resume and Abort take it so they serialise with a drive's
+    :func:`_fence`: an operator's change lands wholly before or wholly after
+    the drive's next write, never between its check and the write (#1702)."""
+    row = (
+        await db.execute(
+            select(SystemUpgradeRun)
+            .where(SystemUpgradeRun.id == run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if row is None:
         raise OrchestratorError(f"upgrade run {run_id} not found")
     return row
@@ -398,7 +432,7 @@ async def halt_upgrade(
     """Operator-initiated pause. Survives across orchestrator restarts —
     the next drive loop iteration sees state=halted + exits cleanly.
     """
-    run = await get_run(db, run_id)
+    run = await _get_run_locked(db, run_id)
     await _transition(
         db,
         run,
@@ -425,7 +459,7 @@ async def resume_upgrade(
     """Operator-initiated resume from halt. Flips the row state but
     DOESN'T re-enqueue the celery task — the api endpoint handler does
     that after this call returns ok."""
-    run = await get_run(db, run_id)
+    run = await _get_run_locked(db, run_id)
     await _transition(
         db,
         run,
@@ -454,7 +488,8 @@ async def abort_upgrade(
     (some may be on the new slot, others on the old). Operator owns
     cleanup from here.
     """
-    run = await get_run(db, run_id)
+    run = await _get_run_locked(db, run_id)
+    was = run.state
     await _transition(
         db,
         run,
@@ -466,12 +501,105 @@ async def abort_upgrade(
         actor_source=actor_source,
     )
     await db.commit()
-    # Release the lease so a new run can plan immediately.
-    ok, err = mutex.release()
-    if not ok:
-        logger.warning("upgrade_lease_release_failed", error=err)
+    # The Lease is the drive's to give up (#1707). A drive that is mid-node
+    # keeps changing the cluster until that node ends, and a free Lease
+    # would let a new run plan and start beside it. It sees the abort at its
+    # next fence, releases its own Lease and exits. Only a run that never
+    # started has no drive and no Lease of its own to wait for. A drive that
+    # died holds the Lease until it expires (``LEASE_DURATION_S``).
+    if was == "planned":
+        ok, err = mutex.release()
+        if not ok:
+            logger.warning("upgrade_lease_release_failed", error=err)
     await db.refresh(run)
     return run
+
+
+# A live drive renews its Lease every ``_LEASE_RENEW_INTERVAL_S``; one whose
+# last renewal is older than this has missed one. Force-release is refused
+# until then (#1707).
+FORCE_RELEASE_MIN_IDLE_S = _LEASE_RENEW_INTERVAL_S * 1.5
+
+
+class LeaseForceReleaseRefused(OrchestratorError):
+    """The Lease cannot be force-released now; ``status`` is the HTTP code
+    the API answers with."""
+
+    def __init__(self, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+async def force_release_lease(
+    db: AsyncSession,
+    *,
+    actor_user_id: uuid.UUID | None,
+    actor_display: str,
+    actor_source: str | None,
+) -> mutex.ForceReleaseOutcome:
+    """Free the upgrade Lease a dead drive left held (#1707).
+
+    Abort no longer frees the Lease, so that a drive still on its node keeps
+    other runs out; a drive that died instead holds it until it lapses
+    (``LEASE_DURATION_S``). This is the operator's way out before then. It
+    is refused while the holder is still renewing: freeing a live drive's
+    Lease would let a second run drive the cluster beside it. Audited, and
+    recorded on the run that names the holder."""
+    out = mutex.force_release_idle(min_idle_s=FORCE_RELEASE_MIN_IDLE_S)
+    if out.outcome == "no_lease":
+        raise LeaseForceReleaseRefused("this deployment has no upgrade Lease", status=409)
+    if out.outcome == "not_held":
+        raise LeaseForceReleaseRefused("the upgrade Lease is not held", status=409)
+    if out.outcome == "alive":
+        idle = int(out.idle_s or 0)
+        raise LeaseForceReleaseRefused(
+            f"the holder {out.state.holder if out.state else '?'!r} renewed the Lease {idle} s "
+            f"ago, so its drive is alive; it releases the Lease itself when the node it is on "
+            f"ends. Retry once it has gone {int(FORCE_RELEASE_MIN_IDLE_S)} s without renewing.",
+            status=409,
+        )
+    if out.outcome == "unreadable":
+        raise LeaseForceReleaseRefused(
+            f"the upgrade Lease could not be read: {out.error}", status=503
+        )
+    if out.outcome != "released":
+        raise LeaseForceReleaseRefused(
+            f"the upgrade Lease was not released: {out.error}", status=409
+        )
+    holder = out.state.holder if out.state else None
+    run = (
+        await db.execute(
+            select(SystemUpgradeRun)
+            .where(SystemUpgradeRun.lease_holder == holder)
+            .order_by(SystemUpgradeRun.started_at.desc())
+            .limit(1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    detail = {
+        "holder": holder,
+        "renew_time": out.state.renew_time if out.state else None,
+        "idle_s": round(out.idle_s, 1) if out.idle_s is not None else None,
+    }
+    if run is not None:
+        await _record_event(db, run, "lease_force_released", actor=actor_display, **detail)
+    db.add(
+        AuditLog(
+            user_id=actor_user_id,
+            user_display_name=actor_display,
+            auth_source=actor_source or "local",
+            action="upgrade.lease_force_released",
+            resource_type="system_upgrade_run",
+            resource_id=str(run.id) if run is not None else mutex.LEASE_NAME,
+            resource_display=run.target_version if run is not None else mutex.LEASE_NAME,
+            result="success",
+            new_value=detail,
+        )
+    )
+    await db.commit()
+    logger.warning("upgrade_lease_force_released", **detail)
+    return out
 
 
 # ── drive_upgrade — the actual orchestration loop ────────────────────
@@ -508,29 +636,190 @@ def _enqueue_continuation(run_id: uuid.UUID, *, avoid_version: str) -> None:
     drive_upgrade_run.apply_async(args=[str(run_id)], kwargs={"avoid_version": avoid_version})
 
 
-async def _lease_renewal_loop(stop_event: asyncio.Event, holder: str) -> None:
-    """Background task — renew the upgrade Lease every
-    ``LEASE_DURATION_S / 3`` seconds until ``stop_event`` is set.
+async def _locked_reread(db: AsyncSession, run: SystemUpgradeRun) -> SystemUpgradeRun | None:
+    """Re-read ``run`` under ``FOR UPDATE``, discarding this session's
+    unflushed changes to it.
 
-    On renewal failure (someone else claimed the lease, or kubeapi
-    transient) we set ``stop_event`` so the main drive loop exits
-    cleanly. The drive loop checks ``stop_event`` between per-node
-    iterations; we DON'T abort an in-flight per-node primitive
-    because canceling a mid-drain / mid-cordon would leave the
-    cluster in an ambiguous state. The next orchestrator that picks
-    up the row resumes from the row's progress.
+    The ``expire`` comes first and is load-bearing: the session autoflushes
+    before a query, so a ``run`` the drive has changed in memory (a shared-tag
+    record, a ``progress`` key) would otherwise be written back over the
+    operator's Halt or Abort by the very read meant to protect it. Callers
+    that need such a change re-apply it to the fresh row."""
+    run_id = run.id
+    db.expire(run)
+    return (
+        await db.execute(
+            select(SystemUpgradeRun)
+            .where(SystemUpgradeRun.id == run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+
+
+async def _fence(
+    db: AsyncSession,
+    run: SystemUpgradeRun,
+    holder: str | None,
+    *,
+    carry: tuple[str, ...] = (),
+) -> str | None:
+    """Re-read the run under ``FOR UPDATE`` and say whether this drive may
+    still write it: None if so, else why not (#1702, #1704, #1707).
+
+    The drive holds its own copy of the row for the whole of a node (the
+    session keeps objects past a commit), so what it writes back is stale
+    the moment an operator halts or aborts, or a second drive takes over.
+    Only the current holder of a ``running`` run writes it. The lock is held
+    until the caller commits (or :func:`_bail` does), and Halt, Resume and
+    Abort take the same lock, so nothing lands between the check and the
+    write. Callers commit before anything slow (a kubeapi call, alert
+    delivery): the lock is for the check and the write, nothing else.
+
+    The holder is checked before the state: after a takeover the row is the
+    other drive's whatever its state, and this drive writes nothing to it.
+
+    ``carry`` names ``progress`` keys this drive set in memory that the
+    re-read must not discard. They are kept when the run was halted or
+    aborted too, since they record a change already made to the cluster
+    (the shared-tag hold's pins) that the beat task or the next run must be
+    able to find; only after a takeover are they dropped."""
+    carried = {k: run.progress[k] for k in carry if k in (run.progress or {})}
+    fresh = await _locked_reread(db, run)
+    if fresh is None:
+        return "gone"
+    if holder and fresh.lease_holder not in (None, holder):
+        return "lease_lost"
+    if carried and fresh.state in ("running", "halted", "aborted"):
+        fresh.progress = {**(fresh.progress or {}), **carried}
+    if fresh.state != "running":
+        return str(fresh.state)
+    return None
+
+
+async def _bail(db: AsyncSession, run: SystemUpgradeRun, holder: str | None, why: str) -> None:
+    """Leave a run this drive may no longer write: end the fence's lock, and
+    give up this drive's own Lease unless a second drive has it. The run row
+    is the operator's (or the other drive's) and is left exactly as it is."""
+    await db.commit()
+    # By identity, not ``run.id``: when the row is gone the expired object
+    # cannot be loaded again.
+    run_id = str(sa_inspect(run).identity[0])
+    logger.info("upgrade_drive_exit_fenced", run_id=run_id, why=why)
+    if why != "lease_lost" and not mutex.release_if_held(
+        holder=holder, attempts=_LEASE_RELEASE_ATTEMPTS
+    ):
+        logger.warning("upgrade_lease_release_failed", run_id=run_id)
+
+
+async def _record_node_after_stop(
+    db: AsyncSession,
+    run: SystemUpgradeRun,
+    node: str,
+    entry: dict[str, Any],
+    state: str,
+) -> None:
+    """A node ended after the operator had halted or aborted the run: keep
+    what happened to it in ``progress.per_node`` and the events, but leave
+    the operator's state alone (#1702). A halted run resumes from here."""
+    per_node_progress = dict((run.progress or {}).get("per_node") or {})
+    per_node_progress[node] = entry
+    run.progress = {**run.progress, "per_node": per_node_progress}
+    await _record_event(
+        db,
+        run,
+        "node_ended_after_stop",
+        node=node,
+        ok=entry.get("ok"),
+        failed_at=entry.get("failed_at"),
+        run_state=state,
+    )
+
+
+async def _lease_renewal_loop(
+    stop_event: asyncio.Event,
+    holder: str,
+    until: asyncio.Event | None = None,
+    renewed_at: float | None = None,
+    lease_ok: asyncio.Event | None = None,
+) -> None:
+    """Background task — renew the upgrade Lease every
+    ``LEASE_DURATION_S / 3`` seconds until ``until`` is set (default:
+    ``stop_event``).
+
+    On a lost Lease (seen held by someone else, or gone, or a write refused
+    with a conflict) we set ``stop_event`` so the main drive loop exits
+    cleanly, and stop renewing. The drive loop checks ``stop_event`` between
+    per-node iterations; we DON'T abort an in-flight per-node primitive
+    because canceling a mid-drain / mid-cordon would leave the cluster in an
+    ambiguous state. The next orchestrator that picks up the row resumes
+    from the row's progress.
+
+    #1713 — a renewal the kubeapi did not answer is UNKNOWN, not lost: the
+    Lease is most likely still ours. ``lease_ok`` is cleared, which pauses
+    the drive before its next node, and the renewal is retried every
+    ``_LEASE_RENEW_RETRY_S``. Once ``_LEASE_SAFE_HOLD_S`` has passed since
+    the last renewal that landed (measured from when that attempt STARTED,
+    which is no later than the ``renewTime`` it wrote), the drive gives up:
+    ``stop_event`` is set while the Lease is still unexpired for everyone
+    else. With a separate ``until`` the retries go on after that, so a
+    renewal that lands keeps the Lease ours while the node in flight
+    finishes, and nothing else starts a drive beside it.
     """
-    while not stop_event.is_set():
+    done = until or stop_event
+    confirmed = _monotonic() if renewed_at is None else renewed_at
+    gave_up = False
+    wait_s = _LEASE_RENEW_INTERVAL_S
+    while not done.is_set():
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=_LEASE_RENEW_INTERVAL_S)
-            return  # stop_event set during the wait
+            await asyncio.wait_for(done.wait(), timeout=wait_s)
+            return  # done during the wait
         except TimeoutError:
             pass
-        ok, err = mutex.renew(holder=holder, lease_duration_seconds=LEASE_DURATION_S)
-        if not ok:
-            logger.warning("upgrade_lease_renew_failed", error=err)
+        attempt_started = _monotonic()
+        try:
+            ok, err = mutex.renew(holder=holder, lease_duration_seconds=LEASE_DURATION_S)
+        except mutex.LeaseUnknownError as exc:
+            if lease_ok is not None:
+                lease_ok.clear()
+            left = _LEASE_SAFE_HOLD_S - (_monotonic() - confirmed)
+            if left > 0:
+                logger.warning(
+                    "upgrade_lease_renew_unanswered",
+                    error=str(exc),
+                    give_up_in_s=round(left, 1),
+                )
+                wait_s = min(_LEASE_RENEW_RETRY_S, left)
+                continue
+            if not gave_up:
+                gave_up = True
+                logger.warning("upgrade_lease_renew_failed", error=f"unanswered: {exc}")
+                stop_event.set()
+                if done is stop_event:
+                    return
+            wait_s = _LEASE_RENEW_RETRY_S
+            continue
+        except Exception as exc:  # noqa: BLE001 — any failure here means "not renewed"
+            # An error the kubeapi helpers do not map (#1704) would end this
+            # task silently, leaving the drive running on a Lease nothing
+            # renews. Treat it as a lost Lease.
+            logger.warning("upgrade_lease_renew_crashed", error=str(exc))
+            if lease_ok is not None:
+                lease_ok.clear()
             stop_event.set()
             return
+        if not ok:
+            logger.warning("upgrade_lease_renew_failed", error=err)
+            if lease_ok is not None:
+                lease_ok.clear()
+            stop_event.set()
+            return
+        confirmed = attempt_started
+        if lease_ok is not None:
+            lease_ok.set()
+        if gave_up:
+            logger.info("upgrade_lease_renew_recovered")
+        wait_s = _LEASE_RENEW_INTERVAL_S
 
 
 async def drive_upgrade(
@@ -571,6 +860,9 @@ async def drive_upgrade(
     # and a second task under the pod's name renewed the first one's lease
     # and ran a second drive loop beside it.
     me = holder or mutex.drive_identity()
+    # #1713 — when this drive's Lease was last confirmed, from before the
+    # acquire that writes its renewTime.
+    acquire_started = _monotonic()
     if run.state == "planned":
         # First call — acquire the lease.
         ok, err = mutex.acquire(holder=me, lease_duration_seconds=LEASE_DURATION_S)
@@ -606,11 +898,19 @@ async def drive_upgrade(
         return run
 
     stop_event = asyncio.Event()
-    renewal_task = asyncio.create_task(_lease_renewal_loop(stop_event, me))
+    # The renewal outlives a give-up (#1713): it ends with the drive, so a
+    # renewal that lands keeps the Lease while the node in flight finishes.
+    renewal_done = asyncio.Event()
+    lease_ok = asyncio.Event()
+    lease_ok.set()
+    renewal_task = asyncio.create_task(
+        _lease_renewal_loop(stop_event, me, renewal_done, acquire_started, lease_ok)
+    )
     try:
-        await _drive_loop(db, run, stop_event, me)
+        await _drive_loop(db, run, stop_event, me, lease_ok=lease_ok)
     finally:
         stop_event.set()
+        renewal_done.set()
         # Wait for the renewal loop to exit cleanly. The ``await`` IS
         # the side-effect — it blocks until the task finishes after
         # the ``stop_event.set()`` above. github-code-quality's
@@ -631,6 +931,8 @@ async def _drive_loop(
     run: SystemUpgradeRun,
     stop_event: asyncio.Event,
     holder: str | None = None,
+    *,
+    lease_ok: asyncio.Event | None = None,
 ) -> None:
     """The per-node iteration. Each cycle:
 
@@ -652,6 +954,7 @@ async def _drive_loop(
     # #1544 — the namespace the chart-bump poll reads the release's
     # Deployments in; the per-node control-plane gate reads the same one.
     release_namespace: str = run.plan.get("release_namespace") or chart_bump.DEFAULT_RELEASE_NS
+    paused = False
 
     while True:
         if stop_event.is_set():
@@ -660,6 +963,12 @@ async def _drive_loop(
             # mis-attribute a transient kubeapi blip as a real
             # upgrade failure.
             logger.warning("upgrade_drive_exit_lease_lost", run_id=str(run.id))
+            if holder and lease_ok is not None and lease_ok.is_set():
+                # #1713 — the renewal gave up, then landed again while the
+                # node in flight finished: the Lease is still this drive's.
+                # Free it (only ours, as a compare-and-swap) so the orphan
+                # sweep resumes the run now rather than after it lapses.
+                mutex.release_if_held(holder=holder)
             return
 
         await db.refresh(run)
@@ -674,6 +983,27 @@ async def _drive_loop(
             # expiry. Only ours is released, retried like every other exit.
             _release_lease(run, holder)
             return
+        if holder and run.lease_holder not in (None, holder):
+            # A second drive took the Lease over (#1704): the run is its.
+            logger.warning("upgrade_drive_exit_lease_taken", run_id=str(run.id))
+            return
+        if lease_ok is not None and not lease_ok.is_set():
+            # #1713 — the last renewal went unanswered: the Lease is unknown,
+            # so start nothing new (a node, a hand-off, the tag flip, the
+            # chart bump) until one lands. The renewal sets ``stop_event``
+            # before the Lease could lapse; re-checked every retry so a Halt
+            # or Abort is still seen.
+            if not paused:
+                paused = True
+                logger.warning("upgrade_drive_paused_lease_unknown", run_id=str(run.id))
+            try:
+                await asyncio.wait_for(lease_ok.wait(), timeout=_LEASE_RENEW_RETRY_S)
+            except TimeoutError:
+                pass  # still unknown: loop round to re-check Halt / Abort and the Lease
+            continue
+        if paused:
+            paused = False
+            logger.info("upgrade_drive_resumed_lease_confirmed", run_id=str(run.id))
 
         per_node_progress = dict(run.progress.get("per_node") or {})
         completed_nodes = [
@@ -689,6 +1019,10 @@ async def _drive_loop(
             # the drive to a worker on another node instead: release the
             # lease, enqueue the drive asking to be run elsewhere, and stop.
             # The new drive takes the lease over and resumes at this node.
+            why = await _fence(db, run, holder)
+            if why is not None:
+                await _bail(db, run, holder, why)
+                return
             await _record_event(db, run, "drive_handoff", node=next_node)
             await db.commit()
             # Stop the renewal loop first. A renew after the release would
@@ -718,6 +1052,10 @@ async def _drive_loop(
             # idempotent so a resumed orchestrator (worker died
             # between the all-nodes-done state + the chart bump
             # completion) re-runs cleanly.
+            why = await _fence(db, run, holder)
+            if why is not None:
+                await _bail(db, run, holder, why)
+                return
             await _record_event(
                 db,
                 run,
@@ -734,10 +1072,18 @@ async def _drive_loop(
                 chart_namespace=chart_ns,
                 release_namespace=release_ns,
             )
+            why = await _fence(db, run, holder)
+            if why is not None:
+                await _bail(db, run, holder, why)
+                return
             run.progress = {
                 **run.progress,
                 "chart_bump": chart_bump.result_to_dict(bump),
             }
+            if bump.ok:
+                # Ends the fence's lock: the verify below waits (bounded)
+                # on the cluster, and Halt / Abort must not wait on it.
+                await db.commit()
             if not bump.ok:
                 run.last_error = f"chart bump to {run.target_version} failed: {bump.error}"
                 # Phase F — classify + fire the cluster-upgrade-failed
@@ -747,13 +1093,6 @@ async def _drive_loop(
                 category = upgrade_alerts.classify_per_node_failure(
                     failed_at="chart_bump", error=bump.error
                 )
-                await upgrade_alerts.emit_upgrade_failed_alert(
-                    db,
-                    run,
-                    failed_node=None,
-                    failed_at_step="chart_bump",
-                    category=category,
-                )
                 await _transition(
                     db,
                     run,
@@ -762,6 +1101,16 @@ async def _drive_loop(
                     event="chart_bump_failed",
                     error=bump.error,
                     failure_category=category,
+                )
+                await db.commit()
+                # The alert is delivered (webhook / syslog / SMTP) after the commit
+                # that ends the fence's lock, so Halt / Abort never wait on it.
+                await upgrade_alerts.emit_upgrade_failed_alert(
+                    db,
+                    run,
+                    failed_node=None,
+                    failed_at_step="chart_bump",
+                    category=category,
                 )
                 await db.commit()
                 _release_lease(run, holder)
@@ -789,6 +1138,10 @@ async def _drive_loop(
                 cnpg_namespace=cnpg_namespace,
             )
             verify_overall = safety.verification_overall(verify_results)
+            why = await _fence(db, run, holder, carry=("chart_bump",))
+            if why is not None:
+                await _bail(db, run, holder, why)
+                return
             run.progress = {
                 **run.progress,
                 "post_upgrade_verify": {
@@ -807,13 +1160,6 @@ async def _drive_loop(
             if verify_overall == "fail":
                 fails = [r.name for r in verify_results if r.level == "fail"]
                 run.last_error = f"post-upgrade verification failed: {', '.join(fails)}"
-                await upgrade_alerts.emit_upgrade_failed_alert(
-                    db,
-                    run,
-                    failed_node=None,
-                    failed_at_step="post_upgrade_verify",
-                    category=upgrade_alerts.CATEGORY_OTHER,
-                )
                 await _transition(
                     db,
                     run,
@@ -821,6 +1167,16 @@ async def _drive_loop(
                     allowed_from=("running",),
                     event="post_upgrade_verify_failed",
                     failed_checks=fails,
+                )
+                await db.commit()
+                # The alert is delivered (webhook / syslog / SMTP) after the commit
+                # that ends the fence's lock, so Halt / Abort never wait on it.
+                await upgrade_alerts.emit_upgrade_failed_alert(
+                    db,
+                    run,
+                    failed_node=None,
+                    failed_at_step="post_upgrade_verify",
+                    category=upgrade_alerts.CATEGORY_OTHER,
                 )
                 await db.commit()
                 _release_lease(run, holder)
@@ -866,7 +1222,14 @@ async def _drive_loop(
                 error=f"could not hold the shared charts' image tag: {hold.error}",
             )
             return
-        await db.commit()
+        # The hold went to the kubeapi: re-read before writing it and the
+        # node's start, so a Halt or Abort that landed meanwhile is neither
+        # overwritten nor followed by a node it was meant to stop (#1702).
+        # The hold's record is kept either way; the pins are on the charts.
+        why = await _fence(db, run, holder, carry=(shared_tags.PROGRESS_KEY,))
+        if why is not None:
+            await _bail(db, run, holder, why)
+            return
 
         # Drive Phase C for this node.
         await _record_event(db, run, "node_started", node=next_node)
@@ -902,6 +1265,19 @@ async def _drive_loop(
                 }
                 for s in result.steps
             ],
+        }
+        # The node took minutes to hours; the row this drive holds is as it
+        # was at the loop top. Re-read it, and write the node's outcome only
+        # if the run is still this drive's and still running (#1702, #1704).
+        why = await _fence(db, run, holder)
+        if why is not None:
+            if why in ("halted", "aborted"):
+                await _record_node_after_stop(db, run, next_node, per_node_progress[next_node], why)
+            await _bail(db, run, holder, why)
+            return
+        per_node_progress = {
+            **dict(run.progress.get("per_node") or {}),
+            next_node: per_node_progress[next_node],
         }
         run.progress = {**run.progress, "per_node": per_node_progress}
 
@@ -939,14 +1315,6 @@ async def _drive_loop(
                 }
             per_node_progress[next_node]["failure_category"] = category
             run.progress = {**run.progress, "per_node": per_node_progress}
-            await upgrade_alerts.emit_upgrade_failed_alert(
-                db,
-                run,
-                failed_node=next_node,
-                failed_at_step=result.failed_at,
-                category=category,
-                stuck=stuck,
-            )
             await _transition(
                 db,
                 run,
@@ -956,6 +1324,17 @@ async def _drive_loop(
                 node=next_node,
                 failed_at=result.failed_at,
                 failure_category=category,
+            )
+            await db.commit()
+            # The alert is delivered (webhook / syslog / SMTP) after the commit
+            # that ends the fence's lock, so Halt / Abort never wait on it.
+            await upgrade_alerts.emit_upgrade_failed_alert(
+                db,
+                run,
+                failed_node=next_node,
+                failed_at_step=result.failed_at,
+                category=category,
+                stuck=stuck,
             )
             await db.commit()
             _release_lease(run, holder)
@@ -1002,15 +1381,12 @@ async def _fail_at_shared_tags(
     The hold is left as it is: nodes on two versions are what it protects,
     and the next run's Start (or the beat task, once every node reports one
     version) takes it from here."""
+    why = await _fence(db, run, holder, carry=(shared_tags.PROGRESS_KEY,))
+    if why is not None:
+        await _bail(db, run, holder, why)
+        return
     run.last_error = error
     category = upgrade_alerts.classify_per_node_failure(failed_at=failed_at_step, error=error)
-    await upgrade_alerts.emit_upgrade_failed_alert(
-        db,
-        run,
-        failed_node=None,
-        failed_at_step=failed_at_step,
-        category=category,
-    )
     await _transition(
         db,
         run,
@@ -1019,6 +1395,16 @@ async def _fail_at_shared_tags(
         event=event,
         error=error,
         failure_category=category,
+    )
+    await db.commit()
+    # The alert is delivered (webhook / syslog / SMTP) after the commit
+    # that ends the fence's lock, so Halt / Abort never wait on it.
+    await upgrade_alerts.emit_upgrade_failed_alert(
+        db,
+        run,
+        failed_node=None,
+        failed_at_step=failed_at_step,
+        category=category,
     )
     await db.commit()
     _release_lease(run, holder)
@@ -1056,6 +1442,10 @@ async def _finish_with_flip(
         shared_tags.FLIP_FLIPPED,
         shared_tags.FLIP_SETTLED,
     ):
+        why = await _fence(db, run, holder)
+        if why is not None:
+            await _bail(db, run, holder, why)
+            return
         await _record_event(db, run, "all_nodes_complete", shared_tag_flip_starting=True)
         await db.commit()
         flipped = await shared_tags.flip(db, run)
@@ -1069,6 +1459,12 @@ async def _finish_with_flip(
                 error=f"shared tag flip to {run.target_version} failed: {flipped.error}",
             )
             return
+        # The flip committed its own record (a locked merge); the run may
+        # have been stopped while it talked to the kubeapi.
+        why = await _fence(db, run, holder)
+        if why is not None:
+            await _bail(db, run, holder, why)
+            return
         await _record_event(
             db, run, "shared_tags_flipped", from_tag=from_tag, to_tag=run.target_version
         )
@@ -1076,6 +1472,12 @@ async def _finish_with_flip(
 
     flip_rec = shared_tags.flip_record(run)
     if from_tag and settings.version == from_tag and not flip_rec.get("handed_off_at"):
+        # A Halt or Abort ends the run here instead: no continuation.
+        why = await _fence(db, run, holder)
+        if why is not None:
+            await _bail(db, run, holder, why)
+            return
+        flip_rec = shared_tags.flip_record(run)
         record = shared_tags.record_of(run)
         record["flip"] = {**flip_rec, "handed_off_at": _now().isoformat()}
         run.progress = {**run.progress, shared_tags.PROGRESS_KEY: record}
@@ -1090,6 +1492,11 @@ async def _finish_with_flip(
         return
 
     settled = await shared_tags.settle(db, run)
+    # The settle wait is long: the run may have been stopped meanwhile.
+    why = await _fence(db, run, holder, carry=(shared_tags.PROGRESS_KEY,))
+    if why is not None:
+        await _bail(db, run, holder, why)
+        return
     await db.commit()
     if not settled.ok:
         await _fail_at_shared_tags(
@@ -1107,6 +1514,10 @@ async def _finish_with_flip(
         cnpg_namespace=cnpg_namespace,
     )
     verify_overall = safety.verification_overall(verify_results)
+    why = await _fence(db, run, holder)
+    if why is not None:
+        await _bail(db, run, holder, why)
+        return
     run.progress = {
         **run.progress,
         "post_upgrade_verify": {
@@ -1120,13 +1531,6 @@ async def _finish_with_flip(
     if verify_overall == "fail":
         fails = [r.name for r in verify_results if r.level == "fail"]
         run.last_error = f"post-upgrade verification failed: {', '.join(fails)}"
-        await upgrade_alerts.emit_upgrade_failed_alert(
-            db,
-            run,
-            failed_node=None,
-            failed_at_step="post_upgrade_verify",
-            category=upgrade_alerts.CATEGORY_OTHER,
-        )
         await _transition(
             db,
             run,
@@ -1134,6 +1538,16 @@ async def _finish_with_flip(
             allowed_from=("running",),
             event="post_upgrade_verify_failed",
             failed_checks=fails,
+        )
+        await db.commit()
+        # The alert is delivered (webhook / syslog / SMTP) after the commit
+        # that ends the fence's lock, so Halt / Abort never wait on it.
+        await upgrade_alerts.emit_upgrade_failed_alert(
+            db,
+            run,
+            failed_node=None,
+            failed_at_step="post_upgrade_verify",
+            category=upgrade_alerts.CATEGORY_OTHER,
         )
         await db.commit()
         _release_lease(run, holder)

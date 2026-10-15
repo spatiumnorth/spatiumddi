@@ -283,8 +283,14 @@ config-driven, not op-driven (unlike PowerDNS's REST sign):
    the key-directory and signs on load.
 3. **DS + key-state report.** After a reload the agent's `collect_dnssec_state`
    runs `rndc dnssec -status <zone>` (parsed by the version-tolerant
-   `_parse_dnssec_status`) + `dnssec-dsfromkey` over the KSK key files, and
-   POSTs the DS rrset + per-key state to `/dns/agents/dnssec-state`. The
+   `_parse_dnssec_status`) + a DS computed in-process (dnspython `make_ds`,
+   SHA-256) from the KSK key files — no `dnssec-dsfromkey` binary, which the
+   Alpine image does not carry — and POSTs the DS rrset + per-key state to
+   `/dns/agents/dnssec-state`. Only KSKs whose `.state` file says `DSState:
+   rumoured` or `omnipresent` get a DS, which is BIND's own CDS rule
+   (`syncpublish` in `lib/dns/dnssec.c`); a key with no `.state` file is
+   included. The sync loop re-collects every 5 minutes and posts only a
+   change, because those transitions happen hours after the reload. The
    control plane mirrors it into `DNSZone.dnssec_ds_records` + `DNSKey` rows
    (replace-per-zone) for the operator's DS-export + key-status view.
 4. **Manual rollover.** `POST .../dnssec/rollover` enqueues a
@@ -908,6 +914,8 @@ Only `Primary` zones are imported. Secondary / Stub / Forwarder / Catalog are re
 ### 4B.3e Config drift (issue #61)
 
 `pull_zone_records` AXFRs the zone off the Technitium host, the same path BIND9's drift uses. Technitium's own REST API would be the more natural source — it is exactly what the live-pull importer reads — but that API listens on loopback `:5380` inside the agent's container and only the co-located agent can reach it, so the control plane goes over DNS.
+
+**Behind the appliance DNS VIP ([#1470](https://github.com/spatiumnorth/spatiumddi/issues/1470)).** With `dns_vip` set the DNS pods drop hostNetwork and sit behind a MetalLB LoadBalancer, so the node address in `DNSServer.host` accepts nothing on `:53`. For an agent-managed server (BIND9 or Technitium), a transfer whose TCP connection is *refused* is retried once at that server's own pod address, on the same port and with the same key (`axfr_zone_records(fallback_hosts=…)`, fed by `transfer_fallback_hosts`). The pod address is `DNSServer.last_seen_ip`: the agent heartbeats the in-cluster API Service from its pod, so the heartbeat's source is exactly where that member's daemon listens. The VIP itself is never dialled: in-cluster traffic to it is balanced across every pod labelled `spatium.io/dns-vip`, every member of every DNS group, so a per-server drift row read through it would describe an arbitrary member, and a member whose daemon is down would read as in sync. Only a refusal triggers the retry (a timeout or no-route is reported as it is), and nothing is retried when `dns_vip` is unset. A pod that restarted takes a new address, so a transfer in the seconds before its next heartbeat can fail; the next run succeeds. Windows, cloud and operator-run servers are never redirected.
 
 **The transfer is TSIG-signed** ([#734](https://github.com/spatiumnorth/spatiumddi/issues/734)). `allow transfer` defaults to `none` → `zoneTransfer: Deny`, which used to mean drift could never read anything on a stock install. So when the group has TSIG keys, `_zone_options_payload` renders `zoneTransfer: Allow` **plus** `zoneTransferTsigKeyNames`, and the control plane signs with the group key.
 

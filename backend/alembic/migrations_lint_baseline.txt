@@ -100,6 +100,8 @@ backend/alembic/versions/97190c1b0325_dns_server_api_key_encrypted_bytes.py:alte
 backend/alembic/versions/99e91dcae1e2_release_schema_head.py:drop_table:40
 backend/alembic/versions/a07f6c12e5d3_dns_zone_forwarders.py:drop_column:47
 backend/alembic/versions/a07f6c12e5d3_dns_zone_forwarders.py:drop_column:48
+backend/alembic/versions/a1903c5e7b24_appliance_cluster_transition_id.py:drop_column:47
+backend/alembic/versions/a1903c5e7b24_appliance_cluster_transition_id.py:drop_column:48
 backend/alembic/versions/a1b2c3d4e5f6_add_dns_assignment_to_ipam.py:drop_column:41
 backend/alembic/versions/a1b2c3d4e5f6_add_dns_assignment_to_ipam.py:drop_column:42
 backend/alembic/versions/a1b2c3d4e5f6_add_dns_assignment_to_ipam.py:drop_column:43
@@ -599,6 +601,7 @@ backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:350
 backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:353
 backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:357
 backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:359
+backend/alembic/versions/d9d0f6ddc446_backup_target_last_run_node.py:drop_column:38
 backend/alembic/versions/d9e4c12a7f85_aggregation_snooze.py:drop_column:39
 backend/alembic/versions/d9f3b21e8c54_wan_circuits.py:drop_table:187
 backend/alembic/versions/e1a4b8c92f3d_appliance_apt_settings.py:drop_column:104

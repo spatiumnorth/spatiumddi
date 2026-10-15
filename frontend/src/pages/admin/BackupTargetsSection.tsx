@@ -18,6 +18,7 @@ import {
 
 import {
   backupTargetsApi,
+  formatApiError,
   type BackupArchiveListing,
   type BackupTarget,
   type BackupTargetCreate,
@@ -199,6 +200,19 @@ function TargetRow({
                     )
                   </code>
                 )}
+                {target.last_run_node && (
+                  <span
+                    title={
+                      target.kind === "local_volume"
+                        ? "A local volume is per node on a multi-node appliance: this archive is on this node's disk, and only this node's api can list, download or restore it."
+                        : "The node whose pod wrote this archive."
+                    }
+                  >
+                    {" "}
+                    on node{" "}
+                    <code className="font-mono">{target.last_run_node}</code>
+                  </span>
+                )}
               </span>
             )}
             {target.retention_keep_last_n != null && (
@@ -307,6 +321,13 @@ function TargetRow({
             <>
               <CheckCircle2 className="mr-1 inline h-3.5 w-3.5" />
               wrote <code className="font-mono">{runMut.data.filename}</code>
+              {runMut.data.node_name && (
+                <>
+                  {" "}
+                  on node{" "}
+                  <code className="font-mono">{runMut.data.node_name}</code>
+                </>
+              )}
               {runMut.data.bytes != null && (
                 <>
                   {" — "}
@@ -390,66 +411,102 @@ function ArchiveList({
           Loading…
         </div>
       ) : q.isError ? (
-        <div className="text-destructive">
-          {(q.error as Error)?.message || "failed to list"}
-        </div>
-      ) : (q.data ?? []).length === 0 ? (
-        <div className="text-muted-foreground">
-          No archives at this destination yet.
+        <div className="break-words text-destructive">
+          {formatApiError(q.error, "failed to list")}
         </div>
       ) : (
-        <ul className="space-y-1">
-          {(q.data ?? []).map((a: BackupArchiveListing) => (
-            <li
-              key={a.filename}
-              className="flex items-center gap-2 rounded border bg-background px-2 py-1"
+        <>
+          {q.data?.note && (
+            // #1838 — on a multi-node appliance a local volume is one
+            // node's disk; the server says whose, and where the last
+            // run's archive went if it is not in this list.
+            <div
+              role="note"
+              className="mb-1 rounded border border-amber-500/40 bg-amber-500/5 px-2 py-1 text-amber-700 dark:text-amber-300"
             >
-              <code className="flex-1 truncate font-mono">{a.filename}</code>
-              <span className="text-muted-foreground">
-                {(a.size_bytes / 1024 / 1024).toFixed(2)} MB
-              </span>
-              <span className="text-muted-foreground">
-                {new Date(a.created_at).toLocaleString()}
-              </span>
-              <button
-                type="button"
-                onClick={() => downloadMut.mutate(a.filename)}
-                disabled={
-                  downloadMut.isPending && downloadMut.variables === a.filename
-                }
-                title="Download to your computer"
-                className="rounded p-1 hover:bg-accent disabled:opacity-50"
-              >
-                {downloadMut.isPending &&
-                downloadMut.variables === a.filename ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                ) : (
-                  <Download className="h-3 w-3" />
-                )}
-              </button>
-              <button
-                type="button"
-                onClick={() => setRestoring(a.filename)}
-                title="Restore from this archive"
-                className="rounded p-1 hover:bg-primary/10"
-              >
-                <RefreshCw className="h-3 w-3 text-primary" />
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  if (confirm(`Delete archive ${a.filename}?`)) {
-                    deleteMut.mutate(a.filename);
-                  }
-                }}
-                title="Delete"
-                className="rounded p-1 hover:bg-destructive/10"
-              >
-                <Trash2 className="h-3 w-3 text-destructive" />
-              </button>
-            </li>
-          ))}
-        </ul>
+              {q.data.note}
+            </div>
+          )}
+          {(q.data?.archives ?? []).length === 0 ? (
+            <div className="text-muted-foreground">
+              No archives at this destination yet.
+            </div>
+          ) : (
+            <ul className="space-y-1">
+              {(q.data?.archives ?? []).map((a: BackupArchiveListing) => (
+                <li
+                  key={a.filename}
+                  className="flex items-center gap-2 rounded border bg-background px-2 py-1"
+                >
+                  <code className="min-w-0 flex-1 truncate font-mono">
+                    {a.filename}
+                  </code>
+                  {a.node_name && (
+                    <span
+                      className="shrink-0 text-muted-foreground"
+                      title="The node whose disk holds this archive"
+                    >
+                      node <code className="font-mono">{a.node_name}</code>
+                    </span>
+                  )}
+                  <span className="text-muted-foreground">
+                    {(a.size_bytes / 1024 / 1024).toFixed(2)} MB
+                  </span>
+                  <span className="text-muted-foreground">
+                    {new Date(a.created_at).toLocaleString()}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => downloadMut.mutate(a.filename)}
+                    disabled={
+                      downloadMut.isPending &&
+                      downloadMut.variables === a.filename
+                    }
+                    title="Download to your computer"
+                    className="rounded p-1 hover:bg-accent disabled:opacity-50"
+                  >
+                    {downloadMut.isPending &&
+                    downloadMut.variables === a.filename ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <Download className="h-3 w-3" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRestoring(a.filename)}
+                    title="Restore from this archive"
+                    className="rounded p-1 hover:bg-primary/10"
+                  >
+                    <RefreshCw className="h-3 w-3 text-primary" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (confirm(`Delete archive ${a.filename}?`)) {
+                        deleteMut.mutate(a.filename);
+                      }
+                    }}
+                    title="Delete"
+                    className="rounded p-1 hover:bg-destructive/10"
+                  >
+                    <Trash2 className="h-3 w-3 text-destructive" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+      {downloadMut.isError && (
+        <div className="mt-1 break-words text-destructive">
+          {formatApiError(downloadMut.error, "download failed")}
+        </div>
+      )}
+      {deleteMut.isError && (
+        <div className="mt-1 break-words text-destructive">
+          {formatApiError(deleteMut.error, "delete failed")}
+        </div>
       )}
       {restoring && (
         <RestoreFromArchiveModal
@@ -586,7 +643,7 @@ function RestoreFromArchiveModal({
           </Field>
           {restoreMut.isError && (
             <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-              {(restoreMut.error as Error)?.message || "restore failed"}
+              {formatApiError(restoreMut.error, "restore failed")}
             </div>
           )}
           {restoreMut.data && (
@@ -761,7 +818,7 @@ function TargetFormModal({
       return backupTargetsApi.update(existing!.id, body);
     },
     onSuccess: onSaved,
-    onError: (err: Error) => setError(err.message || "save failed"),
+    onError: (err: Error) => setError(formatApiError(err, "save failed")),
   });
 
   const { dialogProps, titleProps } = useModalDialog(onClose);

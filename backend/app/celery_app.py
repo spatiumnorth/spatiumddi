@@ -332,6 +332,12 @@ celery_app.conf.update(
             "task": "app.tasks.upgrade_orchestrator.release_lingering_shared_tag_hold",
             "schedule": schedule(run_every=60.0),
         },
+        # Every 60 s, re-drive a `running` rolling upgrade whose drive is
+        # gone (#1713): nothing else resumes one that exited early.
+        "upgrade-orphaned-run-resume": {
+            "task": "app.tasks.upgrade_orchestrator.resume_orphaned_runs",
+            "schedule": schedule(run_every=60.0),
+        },
         # Every 5 min, re-run the IPAM/ASN/VRF matcher over every active
         # Looking Glass route — catches IPAM edits made between RIB
         # pushes that a route's own re-announce wouldn't otherwise

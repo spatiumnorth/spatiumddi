@@ -361,8 +361,9 @@ async def _bytes_present_in_active_store(image_id: uuid.UUID) -> bool:
     headers = {"X-Mirror-Auth": mirror_auth_token("get", image_id)}
     async with httpx.AsyncClient(timeout=_MIRROR_HTTP_TIMEOUT) as client:
         try:
-            # Starlette routes a GET as HEAD too, so this costs headers
-            # rather than the 1-4 GiB body.
+            # The mirror serves an explicit HEAD route (FastAPI's APIRoute
+            # does not turn a GET into a HEAD, #1919), so this costs
+            # headers rather than the 1-4 GiB body.
             resp = await client.head(_mirror_url(image_id), headers=headers)
         except httpx.HTTPError as exc:
             raise HTTPException(

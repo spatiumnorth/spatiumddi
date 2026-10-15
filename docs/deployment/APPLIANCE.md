@@ -577,6 +577,12 @@ demoted, and a node can't be **revoked** while it's a live cluster member
 — it must be demoted first (revoking a live etcd member would break
 quorum).
 
+A demoted member's row reads `leaving` from the moment of the demote. Until
+its leave runner starts, the node goes on reporting `ready`, and that report
+is ignored (#1806): only the runner's own `leaving`, `left` or `failed` moves
+the row. A promoted node's row reads `joining` the same way, ignoring a
+`left` left over from an earlier demote.
+
 A demoted node leaves etcd **before** it resets itself (#1541). Its leave
 runner removes its own etcd member while the node still votes, stops k3s,
 and asks the node it joined whether the member is gone; only then does it
@@ -592,6 +598,20 @@ replacement is promoted), and re-creates the slot-image mirror's volume on
 a live node if the removed node held it. On a one-node control plane the
 api and worker roll out by retiring the old pod first, so each rollout there
 costs a brief api outage.
+
+A promote stamps a fresh transition id and time on the row, and the heartbeat
+hands the node the id and the promote's age (#1903). The node's join sidecar can
+still say `ready <seed>` from an earlier membership, as on a box Replace evicted
+that is still running, so the node echoes the id of the join it actually fired,
+and only for a verdict written after that fire. The control plane applies a
+reported `ready` or `failed` for a promote only when the ids match or the verdict
+is younger than the promote. Ages are compared, never timestamps, so a node clock
+that disagrees with the control plane's cannot settle or block a promote. The
+supervisor fires the join over a same-seed `ready` only when that `ready` is
+provably older than the promote; anything ambiguous, such as a node whose join an
+older supervisor fired before being upgraded, is reported and not re-fired. On a
+box that still holds the seed's join drop-in, the fired join re-drives without
+wiping k3s (#1052) and settles once the node is Ready.
 
 A demote is refused (409) while any control-plane member is unhealthy — no
 heartbeat for 90 s, or a k8s Node that is NotReady or missing — and the
@@ -1087,6 +1107,52 @@ Operators who want the strict form set `hard`.
 Nothing is emitted in `hard` mode (the appliance's shape — required
 anti-affinity already pins one replica per node, #590), in `none` mode, at
 `replicas: 1`, or when the operator supplied their own list.
+
+### Memory sizing for named (#1725)
+
+`dns-bind9` carries a memory request of 256Mi and a limit of 2Gi
+(`dnsBind9.resources` in `charts/spatiumddi-appliance/values.yaml`). Without
+a limit, one ~580k-entry catalog blocklist in a group with a view took the
+pod to 2.8-3.6 GB on a 6 GiB node; the kubelet then evicted the worker,
+Postgres and the api, and the kernel killed named. With the limit the kernel
+kills named inside the pod's own cgroup instead, and the control plane stays
+up.
+
+Unlike the api, worker and Postgres limits, this one is **not** sized from
+the node's RAM. The role chart is one HelmChart for the whole cluster and
+every node's supervisor writes it, so it must render the same everywhere
+(#1137), and a DaemonSet has one limit for all its pods. A node whose
+blocklists need more raises it for the cluster with a HelmChartConfig:
+
+```yaml
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: spatiumddi-appliance
+  namespace: kube-system
+spec:
+  valuesContent: |
+    dnsBind9:
+      resources:
+        limits:
+          memory: 4Gi
+```
+
+Size it from the table in [`DNS.md` section 8.0](../features/DNS.md): a
+582k-entry list in a group with one view needs about 4 GiB for named, so a
+node of 8 GiB or more. On a 6 GiB floor node, expect that list to be killed
+by its limit rather than to fit; the server then reports its daemon as not
+serving, naming the OOM kill, and the **Agent daemon not serving** alert
+fires (see `DNS.md` 8.0). The agent also derives named's `max-cache-size`
+from the limit (a quarter of it, split across the recursive views), so the
+resolver caches cannot take the RPZ's share.
+
+The request (256Mi) is what the scheduler reserves; the limit is a ceiling,
+so the pod is Burstable and a 3 GiB DNS-only node still schedules. Under node
+memory pressure the kubelet evicts pods using more than their request in
+PriorityClass order, and `dns-bind9` runs in `spatium-service`, the highest
+of the three (#983), so the control plane is evicted before it: the limit,
+not eviction, is what stops it.
 
 ### What is deliberately not set
 
@@ -3037,7 +3103,12 @@ so a first-time operator never gets stuck looking for the upload.
    judged), `mirror_disk_headroom` (mirror PVC; skipped if not
    configured; an uploaded target the mirror already holds needs only
    the margin),
-   `version_path`, `quorum`. Any `fail` blocks Plan; `warn` lets
+   `version_path`, `quorum`. With an uploaded image the disk checks
+   size the need from it (#1919): a node needs twice the image + 1 GiB
+   (the staged `.raw.xz`, then the new slot's container images
+   imported beside the old slot's on its first boot), the mirror the
+   image + 1 GiB. A URL source, whose size is unknown until it is
+   downloaded, is judged as a 4 GiB image. Any `fail` blocks Plan; `warn` lets
    Plan proceed but flags the row.
 5. Clicks **Plan**. A `system_upgrade_run` row is inserted in
    `state='planned'` with the captured node order + the preflight
@@ -3050,6 +3121,29 @@ so a first-time operator never gets stuck looking for the upload.
    health-gate → DaemonSet-ready gate → uncordon → settle pause.
 7. Live progress streams into the Plan banner (per-node state pills
    + ETA). Halt / Resume / Abort buttons exposed.
+   A Halt or Abort takes effect when the node in flight ends: the drive
+   finishes the node it is on (cutting a drain or an apply short would
+   leave it half-changed), then writes what happened to that node into
+   the run's history and stops, leaving the run `halted` or `aborted` and
+   the run's events as the operator left them (#1702). Abort does not
+   free the upgrade Lease: the drive releases its own once it has
+   stopped, so a new Plan and Start are refused meanwhile (#1707). A
+   drive whose Lease was taken over by another writes nothing to the run
+   (#1704). A Lease read the API did not answer counts as unknown,
+   not lost: the drive starts no new node until a renewal lands, and
+   gives up (finishing only the node it is on) 8 minutes after its last
+   renewal, before the Lease could lapse for anyone else. If a drive
+   exits with the run still `running`, a beat sweep re-drives it once
+   the Lease has been free on two sweeps a minute apart (#1713). If the drive itself died, the Lease lapses after its
+   10-minute duration; a superadmin can free it sooner with
+   **Force release** beside the Lease pill (`POST
+   /api/v1/upgrades/lease/force-release`). That is refused while the
+   holder has renewed the Lease within the last 300 s (a live drive
+   renews every 200 s), and it is audited
+   (`upgrade.lease_force_released`) and recorded on the run. A failed or
+   aborted run's shared-tag hold (#1710) is not ended by the beat task
+   while the aborted drive still holds the Lease: the node it is
+   finishing may yet boot the new slot.
    Each node's own preflight judges `/var` only on the nodes the run
    has still to upgrade: upgrading a node is what shrinks its `/var`,
    so the nodes already done are not asked again (#1709).

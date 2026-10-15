@@ -9,6 +9,10 @@ Read-only (Phase A):
     GET   /lease                           — current mutex state for
                                               surfacing "an upgrade is
                                               in flight" on the Fleet UI.
+    POST  /lease/force-release             — superadmin: free a Lease a
+                                              dead drive left held
+                                              (#1707); refused while the
+                                              holder still renews.
 
 State-machine endpoints (Phase D):
 
@@ -37,7 +41,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.permissions import require_permission
 from app.services.appliance.slot_image_target import (
     SlotImageResolutionError,
@@ -85,13 +89,17 @@ class LeaseStateOut(BaseModel):
     dependencies=[Depends(require_permission("read", "appliance"))],
     summary="Run pre-flight safety checks for a rolling upgrade to <target>",
 )
-async def get_preflight(target: str) -> PreflightReportOut:
+async def get_preflight(target: str, slot_image_id: uuid.UUID | None = None) -> PreflightReportOut:
+    """``slot_image_id`` is the uploaded image the Plan will name (#1919): the
+    disk checks then size the need from it and apply the "already on the
+    mirror" exemption, as the Plan's own preflight does. Without it they
+    judge the 4 GiB default, so a preview could refuse what Plan accepts."""
     if not target or len(target) > 64:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "target must be a 1-64 char release tag (e.g. 2026.06.01-1 or 1.0.0)",
         )
-    report = await preflight.run_all(target_version=target)
+    report = await preflight.run_all(target_version=target, slot_image_id=slot_image_id)
     return PreflightReportOut(**report.to_dict())
 
 
@@ -102,6 +110,35 @@ async def get_preflight(target: str) -> PreflightReportOut:
     summary="Current state of the cluster-wide upgrade mutex",
 )
 async def get_lease_state() -> LeaseStateOut:
+    state = mutex.get_state()
+    return LeaseStateOut(
+        held=state.held,
+        holder=state.holder,
+        renew_time=state.renew_time,
+        transitions=state.transitions,
+        expired=state.expired,
+    )
+
+
+@router.post(
+    "/lease/force-release",
+    response_model=LeaseStateOut,
+    summary="Free the upgrade Lease a dead drive left held",
+)
+async def post_force_release_lease(current_user: SuperAdmin, db: DB) -> LeaseStateOut:
+    """Abort leaves the Lease to the drive it stopped (#1707), so a drive
+    that died holds it until it lapses (10 min). This frees it sooner. It
+    is refused (409) while the holder still renews it, since that drive is
+    alive and still changing the cluster. Superadmin only, and audited."""
+    try:
+        await orchestrator.force_release_lease(
+            db,
+            actor_user_id=current_user.id,
+            actor_display=current_user.display_name,
+            actor_source=current_user.auth_source,
+        )
+    except orchestrator.LeaseForceReleaseRefused as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
     state = mutex.get_state()
     return LeaseStateOut(
         held=state.held,
@@ -375,6 +412,13 @@ async def post_start(run_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Up
     # run with no live lease is a dead driver's, and Start resumes it.
     if run.state == "running":
         lease = mutex.get_state()
+        if lease.held and (lease.holder or "").startswith("<"):
+            # #1713 — the Lease could not be read: whether a drive holds it
+            # is unknown, which is not a reason to enqueue a second one.
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                f"the upgrade Lease could not be read ({lease.holder}); retry shortly",
+            )
         if lease.held:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,

@@ -24,6 +24,7 @@ from .drivers.technitium import TechnitiumDriver
 from .heartbeat import HeartbeatClient
 from .ingest import IngestWorker, PowerDNSIngestWorker
 from .metrics import MetricsPoller
+from .oom_watch import STABLE_SECONDS, OomWatch, cgroup_memory_limit_bytes, is_oom_status
 from .query_log_shipper import QueryLogShipper
 from .spool import SpoolManager
 from .sync import SyncLoop
@@ -78,9 +79,16 @@ def build_spool_manager(cfg: AgentConfig) -> SpoolManager:
     return manager
 
 
-def _clear_deferred_status(heartbeat) -> None:
+def _clear_deferred_status(heartbeat, oom: OomWatch | None = None) -> None:
     if heartbeat.daemon_status.get("reason") == DEFERRED_DAEMON_STATUS["reason"]:
-        heartbeat.daemon_status = {"status": "ok"}
+        # An OOM record (#1725) outlives the deferral: the daemon being
+        # launched is not the daemon surviving its config.
+        oom_status = oom.daemon_status() if oom is not None else None
+        heartbeat.daemon_status = oom_status or {"status": "ok"}
+
+
+#: The process each daemon-managing driver supervises, for the OOM reason.
+_DAEMON_NAMES = {"bind9": "named", "powerdns": "pdns_server", "technitium": "Technitium"}
 
 
 def _select_driver(cfg: AgentConfig) -> DriverBase:
@@ -106,7 +114,21 @@ def run(cfg: AgentConfig) -> int:
     driver = _select_driver(cfg)
     spools = build_spool_manager(cfg)
     heartbeat = HeartbeatClient(cfg, token_ref, driver=driver, spool_manager=spools)
-    syncer = SyncLoop(cfg, token_ref, driver, heartbeat)
+    # #1725 — the OOM-kill baseline is read before anything can start the
+    # daemon (the sync loop's cache bootstrap below may), so a kill during
+    # that first apply still counts.
+    oom = OomWatch(
+        cfg.state_dir,
+        daemon=_DAEMON_NAMES.get(cfg.driver, cfg.driver),
+        limit_bytes=cgroup_memory_limit_bytes(),
+    )
+    syncer = SyncLoop(cfg, token_ref, driver, heartbeat, oom_watch=oom)
+    # The daemon was killed by the container's memory limit on an earlier
+    # run: say so from the first heartbeat on, so a crash loop does not read
+    # ``ok`` between restarts. A verdict the sync bootstrap set stands.
+    oom_status = oom.daemon_status()
+    if oom_status is not None and not heartbeat.daemon_status:
+        heartbeat.daemon_status = oom_status
 
     # Spawn daemon before threads so the first poll can reload it if needed
     driver.start_daemon()
@@ -222,6 +244,7 @@ def run(cfg: AgentConfig) -> int:
     # after ``start_daemon`` deferred), not from the tick that first noticed
     # it: the re-log then reads 1, 2, 4, 8 … s, the schedule's own numbers.
     loop_started = time.monotonic()
+    up_since: float | None = None
     waiting = False
     waiting_ticks = 0
     while not stopping.is_set():
@@ -252,7 +275,16 @@ def run(cfg: AgentConfig) -> int:
                     )
                     waiting = False
                     waiting_ticks = 0
-                    _clear_deferred_status(heartbeat)
+                    _clear_deferred_status(heartbeat, oom)
+                # #1725 — the OOM record clears only once the daemon has stayed
+                # up longer than a crash loop's back-off.
+                if up_since is None:
+                    up_since = time.monotonic()
+                elif oom.record and time.monotonic() - up_since >= STABLE_SECONDS:
+                    log.info("dns_daemon_oom_record_cleared", stable_s=STABLE_SECONDS)
+                    oom.clear()
+                    if is_oom_status(heartbeat.daemon_status):
+                        heartbeat.daemon_status = {"status": "ok"}
                 # #1067 — a daemon that is up, and about which nothing else has
                 # been said, is ``ok``. Until now a normal boot (rendered config
                 # present, ``named`` started at once) left ``daemon_status`` as
@@ -277,6 +309,10 @@ def run(cfg: AgentConfig) -> int:
                     driver.daemon_restarting() or driver.daemon_running()
                 ):
                     log.error("dns_daemon_exited", driver=cfg.driver)
+                    if oom.fired():
+                        # Persisted before the exit, so the restarted agent
+                        # reports it (#1725).
+                        oom.note_daemon_killed()
                     return 2
             elif driver.daemon_restarting():
                 pass  # ``daemon_pid`` cleared mid-restart: not a deferred start

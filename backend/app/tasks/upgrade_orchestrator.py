@@ -31,10 +31,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
+from typing import Any
 
 import structlog
 from celery import shared_task
+from redis.exceptions import RedisError
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
@@ -83,14 +87,30 @@ async def _async_drive(run_id: str) -> dict[str, str]:
             # and the run sits in ``planned`` / ``running`` with no error
             # (#1449).
             await db.rollback()
-            row = await db.get(SystemUpgradeRun, rid)
-            if row is not None and row.state in ("planned", "running"):
+            # Row-locked and holder-checked (#1704): the run is marked only
+            # while it is still this drive's. After a takeover it is the new
+            # drive's, and after a Halt or Abort the state is the operator's.
+            row = (
+                await db.execute(
+                    select(SystemUpgradeRun)
+                    .where(SystemUpgradeRun.id == rid)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if (
+                row is not None
+                and row.state in ("planned", "running")
+                and row.lease_holder in (None, me)
+            ):
                 row.state = "failed"
                 row.last_error = f"orchestrator crashed: {exc}"
                 from datetime import UTC, datetime  # noqa: PLC0415
 
                 row.finished_at = datetime.now(UTC)
                 await db.commit()
+            else:
+                await db.commit()  # ends the row lock; nothing to write
             # A failed run holds the lease for nothing; left held, the next
             # Start is refused until it expires. Only this drive's, never
             # another drive's that took it over.
@@ -179,3 +199,165 @@ def release_lingering_shared_tag_hold() -> dict[str, str] | None:
     by node). Without it the control plane would stay on the old tag until
     a rolling run succeeded."""
     return asyncio.run(_async_release_lingering_hold())
+
+
+# A `running` rolling run whose Lease is free is re-driven only after it has
+# been seen free on two consecutive sweeps this far apart or more, and at most
+# once per ``_REDRIVE_COOLDOWN_S`` (#1713). A Lease seen held resets the count.
+_ORPHAN_SEEN_TTL_S = 600
+_REDRIVE_COOLDOWN_S = 600
+_ORPHAN_MIN_AGE_S = 45
+# A drive that handed itself on released the Lease for the hand-off; the task
+# carrying the run on hops between workers meanwhile (#1449, #1710). Within
+# these windows of the hand-off the run is in transit, not orphaned.
+_HANDOFF_GRACE_S = _MAX_HANDOFF_HOPS * _HANDOFF_HOP_DELAY_S + 150
+_VERSION_HANDOFF_GRACE_S = _MAX_VERSION_HOPS * _HANDOFF_HOP_DELAY_S + 300
+
+
+def _redrive_kwargs(progress: dict[str, Any], now: float) -> dict[str, Any] | None:
+    """The ``drive_upgrade_run`` kwargs that carry a run on as its last drive
+    meant to, or None while a hand-off it made is still in transit.
+
+    A re-drive keeps the hand-off's request: a drive that handed off before
+    draining its own node asked not to run there (#1449), and one that moved
+    the shared tags asked for a worker off the old tag (#1710). Dropping
+    either would land the re-driven drive exactly where it must not be."""
+    from datetime import datetime  # noqa: PLC0415
+
+    from app.services.upgrades import shared_tags  # noqa: PLC0415
+
+    def _ts(value: Any) -> float:
+        try:
+            return datetime.fromisoformat(str(value)).timestamp()
+        except ValueError:
+            return 0.0
+
+    kwargs: dict[str, Any] = {}
+    events = list((progress or {}).get("events") or [])
+    # The last takeover: a hand-off before it has already been picked up.
+    taken_over_at = max(
+        (_ts(e.get("at")) for e in events if e.get("event") == "lease_takeover"), default=0.0
+    )
+    handoff = next((e for e in reversed(events) if e.get("event") == "drive_handoff"), None)
+    if handoff is not None:
+        at = _ts(handoff.get("at"))
+        if at >= taken_over_at and now - at < _HANDOFF_GRACE_S:
+            return None
+        if handoff.get("node"):
+            # Still the node a drive must not run on while it drains it.
+            kwargs["avoid_node"] = str(handoff["node"])
+    record = dict((progress or {}).get(shared_tags.PROGRESS_KEY) or {})
+    flip = dict(record.get("flip") or {})
+    if flip.get("handed_off_at") and record.get("from_tag"):
+        at = _ts(flip["handed_off_at"])
+        if at >= taken_over_at and now - at < _VERSION_HANDOFF_GRACE_S:
+            return None
+        kwargs["avoid_version"] = str(record["from_tag"])
+    return kwargs
+
+
+def _sweep_redis() -> Any:
+    from app.core.redis_client import make_sync_redis  # noqa: PLC0415
+
+    return make_sync_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+
+
+async def _running_runs() -> list[tuple[uuid.UUID, dict[str, Any]]]:
+    from app.models.system_upgrade import SystemUpgradeRun  # noqa: PLC0415
+
+    async with task_session() as db:
+        rows = await db.execute(
+            select(SystemUpgradeRun.id, SystemUpgradeRun.progress).where(
+                SystemUpgradeRun.state == "running", SystemUpgradeRun.kind == "cluster_rolling"
+            )
+        )
+        return [(rid, dict(progress or {})) for rid, progress in rows.all()]
+
+
+def resume_orphaned_runs_sync(
+    runs: list[tuple[uuid.UUID, dict[str, Any]]], redis_client: Any, *, now: float | None = None
+) -> list[str]:
+    """For each ``running`` run, re-enqueue its drive when none is driving it.
+
+    A drive that exits while its run is still ``running`` (its Lease lost, its
+    worker killed, a task acked after a clean return) leaves nothing to carry
+    the run on (#1713). "No drive" is read off the Lease, the mutex: free
+    (never held, released, or expired) on two consecutive sweeps. An
+    unanswered Lease read is skipped, never taken for "free", and resets
+    nothing. The re-driven task still has to ``acquire`` the Lease, so a drive
+    that came back in the meantime wins and this one is refused: the sweep
+    never assumes it.
+    """
+    from app.services.appliance import k8s  # noqa: PLC0415
+    from app.services.upgrades import mutex  # noqa: PLC0415
+
+    if not runs or k8s.get_config() is None:
+        return []  # nothing running, or a deployment with no Lease
+    try:
+        state = mutex.read_state_strict()
+    except mutex.LeaseUnknownError as exc:
+        logger.warning("upgrade_orphan_sweep_lease_unknown", error=str(exc))
+        return []
+    now = time.time() if now is None else now
+    redriven: list[str] = []
+    for rid, progress in runs:
+        seen_key = f"spatium:upgrade:orphan-seen:{rid}"
+        if state.held:
+            # A live drive renews it. The next free sighting starts over.
+            redis_client.delete(seen_key)
+            continue
+        kwargs = _redrive_kwargs(progress, now)
+        if kwargs is None:
+            redis_client.delete(seen_key)
+            continue  # a hand-off is still carrying the run on
+        first = redis_client.get(seen_key)
+        if first is None:
+            redis_client.set(seen_key, str(now), ex=_ORPHAN_SEEN_TTL_S)
+            continue
+        if now - float(first) < _ORPHAN_MIN_AGE_S:
+            continue
+        # SET NX: of two sweeps (a second beat, a slow first), one re-drives.
+        if not redis_client.set(
+            f"spatium:upgrade:redrive:{rid}", str(now), nx=True, ex=_REDRIVE_COOLDOWN_S
+        ):
+            continue
+        redis_client.delete(seen_key)
+        drive_upgrade_run.apply_async(args=[str(rid)], kwargs=kwargs)  # type: ignore[attr-defined]
+        logger.warning("upgrade_orphaned_run_redriven", run_id=str(rid), **kwargs)
+        redriven.append(str(rid))
+    return redriven
+
+
+@shared_task(name="app.tasks.upgrade_orchestrator.resume_orphaned_runs")
+def resume_orphaned_runs() -> list[str]:
+    """Beat, every minute (#1713): re-drive a ``running`` rolling run whose
+    drive is gone. Nothing else does: ``drive_upgrade_run`` is enqueued by
+    Start, Resume and the drive's own hand-offs only, and a task is acked when
+    it returns, so a drive that exited cleanly is never redelivered.
+
+    No-op without a kubeapi (docker-compose has no Lease and no rolling run).
+    Redis unreachable: nothing is re-driven this tick, since the two-sighting
+    count and the cooldown live there and re-driving without them could
+    enqueue a drive every minute."""
+    from app.services.appliance import k8s  # noqa: PLC0415
+
+    if k8s.get_config() is None:
+        return []
+    runs = asyncio.run(_running_runs())
+    if not runs:
+        return []
+    try:
+        r = _sweep_redis()
+    except Exception as exc:  # noqa: BLE001 — a sentinel lookup that failed
+        logger.warning("upgrade_orphan_sweep_redis_unavailable", error=str(exc))
+        return []
+    try:
+        return resume_orphaned_runs_sync(runs, r)
+    except RedisError as exc:  # Redis down mid-sweep
+        logger.warning("upgrade_orphan_sweep_failed", error=str(exc))
+        return []
+    finally:
+        try:
+            r.close()
+        except Exception:  # noqa: BLE001 — closing a broken client
+            pass

@@ -51,6 +51,7 @@ from app.services.appliance.removable import REMOVABLE_ROOT
 from app.services.backup.targets.base import (
     ARCHIVE_NAME_RE,
     ArchiveListing,
+    ArchiveNotFoundError,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
@@ -83,7 +84,11 @@ class LocalVolumeDestination(BackupDestination):
                 "scheduled runs and the api lists and restores them. The "
                 "Docker Compose file and the appliance mount "
                 "/var/lib/spatiumddi/backups that way; Test connection "
-                "warns when a path is not on a volume."
+                "warns when a path is not on a volume. On a multi-node "
+                "appliance the volume is per node: an archive stays on the "
+                "disk of the node that wrote it and can only be listed, "
+                "downloaded or restored through that node. Use S3, SCP, "
+                "SMB or NFS for a cluster."
             ),
         ),
         ConfigFieldSpec(
@@ -206,6 +211,7 @@ class LocalVolumeDestination(BackupDestination):
                         filename=entry.name,
                         size_bytes=stat.st_size,
                         created_at=datetime.fromtimestamp(stat.st_mtime, UTC),
+                        node_name=_this_node() or None,
                     )
                 )
             rows.sort(key=lambda r: r.created_at, reverse=True)
@@ -233,7 +239,10 @@ class LocalVolumeDestination(BackupDestination):
             # served here — escaping the configured root the listing
             # deliberately never leaves.
             if target.is_symlink() or not target.is_file():
-                raise BackupDestinationError(f"archive {safe!r} not found at {root}")
+                # The api appends where the archive probably is on a
+                # multi-node appliance (#1838, services.backup.node_local);
+                # the driver has no database to tell one node from three.
+                raise ArchiveNotFoundError(f"archive {safe!r} not found at {root}")
             return target.read_bytes()
 
         try:
@@ -307,6 +316,11 @@ class LocalVolumeDestination(BackupDestination):
         if warning:
             outcome["warning"] = warning
         return outcome
+
+
+def _this_node() -> str:
+    """The k8s node this pod runs on; empty off the appliance."""
+    return os.environ.get("NODE_NAME", "").strip()
 
 
 def _not_on_a_volume_warning(root: Path) -> str | None:

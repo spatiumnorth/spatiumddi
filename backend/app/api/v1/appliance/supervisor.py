@@ -265,6 +265,86 @@ def _evicted_row_ignores_report(
     return row_state == CLUSTER_JOIN_STATE_LEFT and reported != CLUSTER_JOIN_STATE_LEFT
 
 
+def _stale_report_in_transition(
+    row_state: str | None, desired_role: str | None, reported: str
+) -> bool:
+    """PURE (#1806): a report that contradicts the transition the control plane
+    has already started must not move the row.
+
+    Demote/promote stamp ``leaving`` / ``joining`` on the row first; the node's
+    supervisor only learns of it on its next heartbeat response, and until its
+    host runner writes its own ``.state`` it keeps reporting the LAST verdict —
+    ``ready`` for a member, ``left`` for a node that was once demoted. Applied,
+    that overwrote ``leaving`` with ``ready`` (the Fleet showed a demoting member
+    as a healthy one for the whole leave) or ``joining`` with ``left``.
+
+    Guarded by explicit state: while the row says ``leaving`` for a demote, a
+    reported ``ready`` / ``joining`` is the pre-leave state and is ignored; while
+    it says ``joining`` for a promote, a reported ``left`` / ``leaving`` is the
+    pre-join state. ``left`` / ``failed`` / ``leaving`` (demote) and ``ready`` /
+    ``failed`` / ``joining`` (promote) still apply: they are the runner's own
+    progress, which is what ends the transition."""
+    if desired_role == DESIRED_CLUSTER_ROLE_NONE and row_state == CLUSTER_JOIN_STATE_LEAVING:
+        return reported in (CLUSTER_JOIN_STATE_READY, CLUSTER_JOIN_STATE_JOINING)
+    if desired_role == DESIRED_CLUSTER_ROLE_MEMBER and row_state == CLUSTER_JOIN_STATE_JOINING:
+        return reported in (CLUSTER_JOIN_STATE_LEFT, CLUSTER_JOIN_STATE_LEAVING)
+    return False
+
+
+def _unproven_join_verdict(
+    row_tid: str | None,
+    desired_role: str | None,
+    reported: str,
+    reported_tid: str | None,
+    reported_age_s: float | None = None,
+    transition_age_s: float | None = None,
+) -> bool:
+    """PURE (#1903): a terminal join verdict that does not belong to the promote
+    in flight.
+
+    A node keeps the last verdict its host runner wrote — ``ready <seed>`` for a
+    box that was a member before Replace evicted it. Promoted again, it reports
+    that ``ready`` (or an old ``failed``) before any join runs, and applying it
+    settles the node as a member of a cluster it never joined. The supervisor
+    echoes the id of the join it FIRED (``""`` while the sidecar predates that
+    fire); a matching id proves the verdict is this promote's. A supervisor
+    that does not send the field at all (None) is not judged: it cannot prove
+    anything, and refusing it would strand every pre-#1903 node.
+
+    A verdict written AFTER the promote proves it too, whatever the id: a node
+    whose join an older supervisor fired (then upgraded before the ``ready`` was
+    applied) holds no fire record, and refusing its fresh ``ready`` would have it
+    re-fire the join over a working membership. Both ages are durations measured
+    on their own clocks — ``reported_age_s`` is the node's now minus its sidecar's
+    mtime, ``transition_age_s`` the control plane's now minus the promote — so no
+    node clock is ever compared with this one. Taken at different instants, the
+    comparison errs towards accepting a verdict written a heartbeat's latency
+    before the promote, never towards refusing a fresh one."""
+    if desired_role != DESIRED_CLUSTER_ROLE_MEMBER or not row_tid or reported_tid is None:
+        return False
+    if reported not in (CLUSTER_JOIN_STATE_READY, CLUSTER_JOIN_STATE_FAILED):
+        return False
+    if reported_tid == row_tid:
+        return False
+    if (
+        reported_age_s is not None
+        and transition_age_s is not None
+        and 0 <= reported_age_s < transition_age_s
+    ):
+        return False
+    return True
+
+
+def _transition_age_s(row: Appliance) -> float | None:
+    """Seconds since the promote in flight was stamped (#1903), on this clock."""
+    if row.cluster_transition_at is None:
+        return None
+    at = row.cluster_transition_at
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=UTC)
+    return max(0.0, (datetime.now(UTC) - at).total_seconds())
+
+
 # The last ignored report logged per row (this process), so a node that keeps
 # reporting the same state costs one log line, not one per heartbeat.
 _ignored_join_reports_logged: dict[uuid.UUID, str] = {}
@@ -1418,6 +1498,13 @@ class SupervisorHeartbeatRequest(BaseModel):
     k3s_join_token: str | None = None
     cluster_join_state: str | None = None
     cluster_join_reason: str | None = None
+    # #1903 — the promote this report belongs to: the id of the join the
+    # supervisor fired, ``""`` when the sidecar's verdict predates that fire,
+    # absent (None) from a supervisor that does not know the field.
+    cluster_transition_id: str | None = None
+    # #1903 — seconds since the node's join sidecar was written, on the node's
+    # own clock. A verdict younger than the promote proves it without an id.
+    cluster_join_state_age_s: float | None = None
     # #272 Phase 7b — the node's real routable k3s InternalIP. Distinct
     # from ``last_seen_ip`` (the supervisor POD's source IP, 10.42.x.x,
     # since it heartbeats from inside the cluster). The promote endpoint
@@ -1619,6 +1706,13 @@ class SupervisorHeartbeatResponse(BaseModel):
     desired_cluster_role: Literal["member", "none"] | None = None
     desired_k3s_server_url: str | None = None
     desired_k3s_join_token: str | None = None
+    # #1903 — id of the promote asking for the join; echoed back on the report.
+    desired_cluster_transition_id: str | None = None
+    # #1903 — that promote's age in seconds (a duration, never a timestamp, so
+    # the node compares it with its own sidecar's age and no clocks meet). The
+    # supervisor fires over a same-seed ``ready`` only when the ``ready`` is
+    # older than the promote by more than a margin; otherwise it reports.
+    desired_cluster_transition_age_s: float | None = None
     # #272 Phase 7b — the node IPs (as ``/32`` CIDRs) of every OTHER
     # control-plane peer this node must reach (and be reachable from) on
     # the k3s server ports (6443 apiserver, 2379/2380 etcd, 10250
@@ -2182,6 +2276,41 @@ async def supervisor_heartbeat(
                 row_state=row.cluster_join_state,
                 reported=body.cluster_join_state,
             )
+    elif body.cluster_join_state is not None and _unproven_join_verdict(
+        row.cluster_transition_id,
+        row.desired_cluster_role,
+        body.cluster_join_state,
+        body.cluster_transition_id,
+        body.cluster_join_state_age_s,
+        _transition_age_s(row),
+    ):
+        # #1903 — a ready / failed left over from before this promote's join.
+        if _ignored_join_reports_logged.get(row.id) != body.cluster_join_state:
+            _ignored_join_reports_logged[row.id] = body.cluster_join_state
+            logger.info(
+                "control_plane_unproven_join_report_ignored",
+                appliance_id=str(row.id),
+                hostname=row.hostname,
+                row_state=row.cluster_join_state,
+                reported=body.cluster_join_state,
+                reported_transition=body.cluster_transition_id,
+                reported_age_s=body.cluster_join_state_age_s,
+            )
+    elif body.cluster_join_state is not None and _stale_report_in_transition(
+        row.cluster_join_state, row.desired_cluster_role, body.cluster_join_state
+    ):
+        # #1806 — the node still reports the state from before the transition
+        # the control plane started; keep the row's own.
+        if _ignored_join_reports_logged.get(row.id) != body.cluster_join_state:
+            _ignored_join_reports_logged[row.id] = body.cluster_join_state
+            logger.info(
+                "control_plane_stale_transition_report_ignored",
+                appliance_id=str(row.id),
+                hostname=row.hostname,
+                row_state=row.cluster_join_state,
+                desired=row.desired_cluster_role,
+                reported=body.cluster_join_state,
+            )
     elif body.cluster_join_state is not None:
         _ignored_join_reports_logged.pop(row.id, None)
         # #590 — stamp only on a real CHANGE, so the staleness clock the
@@ -2680,10 +2809,9 @@ async def supervisor_heartbeat(
     # A node "runs the apiserver" (so 6443 must accept from the pod /
     # service CIDR) when it's a control-plane variant OR a settled /
     # in-flight / leaving CP member. pod/service CIDR are sent only for
-    # those nodes so a plain worker doesn't pointlessly open 6443.
-    runs_apiserver = _runs_apiserver(row)
-    firewall_pod_cidrs = _split_cidr_csv(row.pod_cidr) if runs_apiserver else []
-    firewall_service_cidrs = _split_cidr_csv(row.service_cidr) if runs_apiserver else []
+    # those nodes so a plain worker doesn't pointlessly open 6443; a CP
+    # member that reports none gets the cluster's (#1721).
+    firewall_pod_cidrs, firewall_service_cidrs = await _firewall_cluster_cidrs(db, row)
 
     # #277 — committed control-plane size (settled primary + members,
     # floored at 1). The seed supervisor scales CNPG instances +
@@ -2897,6 +3025,16 @@ async def supervisor_heartbeat(
         desired_cluster_role=row.desired_cluster_role,  # type: ignore[arg-type]
         desired_k3s_server_url=row.desired_k3s_server_url,
         desired_k3s_join_token=desired_join_token,
+        desired_cluster_transition_id=(
+            row.cluster_transition_id
+            if row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+            else None
+        ),
+        desired_cluster_transition_age_s=(
+            _transition_age_s(row)
+            if row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER and row.cluster_transition_id
+            else None
+        ),
         cluster_peer_cidrs=cluster_peer_cidrs,
         firewall_pod_cidrs=firewall_pod_cidrs,
         firewall_service_cidrs=firewall_service_cidrs,
@@ -2970,15 +3108,15 @@ async def firewall_render_inputs(db: DB, row: Appliance) -> dict[str, Any]:
     (they also feed response telemetry); this is the read-path twin.
     """
     role_assignment = await _build_role_assignment(db, row)
-    runs_apiserver = _runs_apiserver(row)
+    pod_cidrs, service_cidrs = await _firewall_cluster_cidrs(db, row)
     cfg_row = (
         await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
     ).scalar_one_or_none()
     return {
         "role_assignment": role_assignment.model_dump(),
         "cluster_peer_cidrs": await _cluster_peer_cidrs(db, row),
-        "pod_cidrs": _split_cidr_csv(row.pod_cidr) if runs_apiserver else [],
-        "service_cidrs": _split_cidr_csv(row.service_cidr) if runs_apiserver else [],
+        "pod_cidrs": pod_cidrs,
+        "service_cidrs": service_cidrs,
         "cp_member_count": await _committed_cp_count(db),
         "vip_configured": bool((cfg_row.control_plane_vip or "") if cfg_row else ""),
         "firewall_enabled": bool(cfg_row.firewall_enabled) if cfg_row else False,
@@ -4574,6 +4712,40 @@ async def _firewall_peer_members(db: DB) -> list[Appliance]:
     return [r for r in rows if r.cluster_join_state != CLUSTER_JOIN_STATE_LEFT]
 
 
+async def _firewall_cluster_cidrs(db: DB, row: Appliance) -> tuple[list[str], list[str]]:
+    """The pod and service networks ``row``'s ``kubeapi`` (6443) and
+    ``kubelet`` (10250) rules admit (#285 Phase 1, #1721).
+
+    Only a node that runs the apiserver gets any (``_runs_apiserver``), and
+    its own report comes first. A promoted member reports none: an
+    Additional node pins no CIDRs (#995 item 14) and inherits the
+    cluster's when it joins, so its supervisor finds no drop-in to read
+    and its row stays empty. Built from that empty row, the member's
+    ``kubeapi`` rule admitted only its peers and it had no ``kubelet``
+    rule, so its own pods' calls to its own apiserver and kubelet (they
+    arrive from a pod address) were dropped. So for a network the row
+    lacks, take the one the cluster's other control-plane nodes report:
+    k3s refuses a server whose cluster-cidr / service-cidr differ from
+    the datastore's, so every server of the cluster runs with the same
+    pair. Shared by the heartbeat render and ``firewall_render_inputs``
+    so both stay byte-identical.
+    """
+    if not _runs_apiserver(row):
+        return [], []
+    pod = _split_cidr_csv(row.pod_cidr)
+    svc = _split_cidr_csv(row.service_cidr)
+    if pod and svc:
+        return pod, svc
+    cluster_pod: set[str] = set()
+    cluster_svc: set[str] = set()
+    for member in await _firewall_peer_members(db):
+        if member.id == row.id:
+            continue
+        cluster_pod.update(_split_cidr_csv(member.pod_cidr))
+        cluster_svc.update(_split_cidr_csv(member.service_cidr))
+    return pod or sorted(cluster_pod), svc or sorted(cluster_svc)
+
+
 async def _cluster_peer_cidrs(db: DB, row: Appliance) -> list[str]:
     """Host CIDRs (``/32`` v4 + ``/128`` v6) of every OTHER control-plane
     peer ``row`` must open its k3s server ports to (#272 Phase 7b, #285).
@@ -4794,6 +4966,8 @@ async def promote_control_plane(
         row.cluster_join_state = CLUSTER_JOIN_STATE_JOINING
         row.cluster_join_state_at = datetime.now(UTC)  # #590 staleness clock
         row.cluster_join_reason = None
+        row.cluster_transition_id = str(uuid.uuid4())  # #1903
+        row.cluster_transition_at = row.cluster_join_state_at
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -6263,11 +6437,13 @@ async def schedule_appliance_upgrade(
     # multi-node rolling orchestrator cannot drift apart on what the host
     # is told to fetch (#787) — the drift that re-introduced #386 there.
     #
-    # The URL is composed against ``request.base_url``: the operator-facing
-    # scheme + host the frontend reached us on (X-Forwarded-Host / -Proto
-    # when nginx is in front), which is necessarily reachable from the
-    # appliance subnet because that is where the supervisor already
-    # heartbeats.
+    # The URL is composed against ``request.base_url``: the scheme + Host the
+    # request carried. The Host header is passed through verbatim by the
+    # frontend nginx and by any proxy that preserves it; the scheme is the
+    # TCP peer's, or a trusted proxy's X-Forwarded-Proto (TrustedProxyMiddleware).
+    # X-Forwarded-Host is NOT read anywhere, so a proxy that rewrites Host
+    # changes this URL. It is necessarily reachable from the appliance subnet
+    # because that is where the supervisor already heartbeats.
     try:
         target = await resolve_slot_image_target(
             db,
