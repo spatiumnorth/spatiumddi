@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Drift and pull-from-server reach an agent-managed BIND9 or Technitium
+  behind the appliance's DNS VIP (#1470).** With `dns_vip` set the DNS
+  pods drop hostNetwork, so the node address a server row carries
+  refuses TCP/53 and every drift report and scheduled pull failed for
+  the whole group. When the node address actively refuses the
+  connection, the transfer is now retried at that server's own pod
+  address (where its agent heartbeats from), with the same TSIG key.
+  The VIP is deliberately not used: it reaches an arbitrary member, so
+  a server whose daemon is down would have read as in sync. A timeout
+  or unreachable host is not retried, and nothing changes when no DNS
+  VIP is set. The other half of #1470, a connection refusal reported as
+  a refused zone transfer, has its own entry below.
+
 - **A rolling-upgrade Plan is no longer refused for disk room the image
   does not need (#1919).** #1885's "the target is already on the mirror"
   exemption was never reached: the mirror asked for its presence with a

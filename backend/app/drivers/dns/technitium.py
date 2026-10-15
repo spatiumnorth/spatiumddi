@@ -50,6 +50,7 @@ CLAUDE.md non-negotiable #10: this driver speaks only neutral
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -277,6 +278,7 @@ class TechnitiumDriver(DNSDriver):
         *,
         tsig: TsigKey | None = None,
         include_apex_ns: bool = False,
+        fallback_hosts: Sequence[str] = (),
     ) -> list[RecordData]:
         """AXFR the zone off the Technitium host, for the #61 drift report.
 
@@ -314,6 +316,7 @@ class TechnitiumDriver(DNSDriver):
                 server_id=str(getattr(server, "id", "")),
                 tsig=tsig,
                 include_apex_ns=include_apex_ns,
+                fallback_hosts=fallback_hosts,
             )
         except Exception as exc:
             # A bare "REFUSED" tells the operator nothing about what to do.

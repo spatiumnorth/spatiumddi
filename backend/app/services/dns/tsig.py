@@ -298,6 +298,48 @@ def _answered_badkey(exc: BaseException) -> bool:
     return False
 
 
+async def resolve_transfer_vip(db: AsyncSession) -> str:
+    """The appliance's DNS resolver VIP, or ``""`` when none is configured.
+
+    #1470 — with ``dns_vip`` set the appliance's DNS pods drop hostNetwork and
+    sit behind a MetalLB LoadBalancer, so the node address a ``DNSServer`` row
+    carries answers nothing on :53. The VIP itself is only the SIGNAL that
+    this is happening; it is never dialled (see ``transfer_fallback_hosts``).
+    Resolved once per drift / sync call, because the drift fan-out touches no
+    DB.
+    """
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+
+    ps = await db.get(PlatformSettings, 1)
+    return ((ps.dns_vip if ps else "") or "").strip()
+
+
+def transfer_fallback_hosts(server: DNSServer, vip: str) -> list[str]:
+    """Extra addresses to AXFR ``server`` from when its own refuses (#1470).
+
+    The member's OWN address, never the VIP. Behind the VIP the pod keeps an
+    address of its own on the cluster network, and its agent heartbeats the
+    in-cluster API Service from it, so ``last_seen_ip`` is exactly where this
+    member's daemon listens. The VIP is the wrong target for a per-server
+    read: kube-proxy balances in-cluster traffic to it across every pod
+    labelled ``spatium.io/dns-vip`` — every member of every DNS group in the
+    cluster — so a drift row read through it describes an arbitrary member,
+    and a member whose daemon is down would read as in sync because another
+    one answered.
+
+    Only offered when ``dns_vip`` is set (outside VIP mode the node address
+    is where the daemon listens, so a refusal there is a real answer) and
+    only to an agent-managed server: Windows, cloud and an operator's own
+    BIND9 are reached at their own address and must not be redirected.
+    """
+    if not vip or not transfer_needs_tsig(server):
+        return []
+    own = (getattr(server, "last_seen_ip", None) or "").strip()
+    if not own or own in {server.host, vip}:
+        return []
+    return [own]
+
+
 async def pull_zone_records_signed(
     driver: Any,
     server: Any,
@@ -351,6 +393,8 @@ __all__ = [
     "is_view_transfer_key",
     "legacy_group_key",
     "pull_zone_records_signed",
+    "resolve_transfer_vip",
+    "transfer_fallback_hosts",
     "resolve_group_transfer_key",
     "resolve_view_transfer_key",
     "rotate_group_tsig_key",
