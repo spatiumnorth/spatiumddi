@@ -599,6 +599,7 @@ backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:350
 backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:353
 backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:357
 backend/alembic/versions/d9a4c3b7e812_add_dhcp_models.py:drop_table:359
+backend/alembic/versions/d9d0f6ddc446_backup_target_last_run_node.py:drop_column:38
 backend/alembic/versions/d9e4c12a7f85_aggregation_snooze.py:drop_column:39
 backend/alembic/versions/d9f3b21e8c54_wan_circuits.py:drop_table:187
 backend/alembic/versions/e1a4b8c92f3d_appliance_apt_settings.py:drop_column:104

@@ -73,6 +73,7 @@ Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if 
 | `API_PORT` | `8000` | Host port for the API |
 | `API_BIND` | `127.0.0.1` | Host address the API port is published on. Widening it (e.g. `0.0.0.0`) lets LAN clients reach the API directly; if you do, narrow `TRUSTED_PROXY_CIDRS` to the frontend's address, since the API believes `X-Real-IP` from those peers (#1221) |
 | `TRUSTED_PROXY_CIDRS` | private, loopback, CGNAT and ULA ranges | Peers whose `X-Real-IP` / `X-Forwarded-Proto` the API applies. `*` trusts every peer |
+| `FRONTEND_TRUSTED_PROXY_CIDRS` | unset (trust no proxy) | Your own reverse proxy in front of the frontend: the frontend nginx keeps its `X-Forwarded-Proto` and takes the client address from its `X-Forwarded-For`. List only the proxy. See [`REVERSE_PROXY.md`](REVERSE_PROXY.md) |
 | `DATABASE_URL` | auto-constructed | Override only if using an external PostgreSQL |
 | `REDIS_URL` | `redis://redis:6379/0` | Override to point at an external Redis |
 | `DEBUG` | `false` | Enable FastAPI debug mode |
@@ -114,6 +115,12 @@ EOF
 
 ## 5. TLS / HTTPS
 
+Options A and B put a reverse proxy in front of the frontend. Whatever proxy
+you use, read [`REVERSE_PROXY.md`](REVERSE_PROXY.md) too: it covers the
+settings that make sign-in, SSO and the login throttle work behind one
+(External URL, `FRONTEND_TRUSTED_PROXY_CIDRS`, streaming), with examples for nginx,
+Caddy, Traefik, HAProxy and Nginx Proxy Manager.
+
 ### Option A: Terminate TLS at the host with nginx (recommended for VMs)
 
 Place a reverse proxy in front of the `spatiumddi-frontend-1` container:
@@ -132,9 +139,21 @@ server {
         proxy_set_header   X-Real-IP $remote_addr;
         proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto https;
+        proxy_http_version 1.1;
+        proxy_buffering    off;          # AI chat / log streams
+        proxy_read_timeout 3600s;
+        client_max_body_size 4g;
     }
 }
 ```
+
+Then set `FRONTEND_TRUSTED_PROXY_CIDRS` in `.env` to the address the proxy
+connects from (a proxy on the Docker host itself usually arrives from the
+compose network's gateway, e.g. `172.18.0.1`; the frontend's access log shows
+it) and set **Settings > General > External URL** to the public `https://`
+URL. Without the first the frontend nginx overwrites the proxy's
+`X-Forwarded-Proto` and client address, so every user shares one login
+throttle bucket and SSO callbacks are built as `http://`.
 
 ### Option B: Caddy (automatic Let's Encrypt — simplest for appliance installs)
 
@@ -148,7 +167,18 @@ Caddy handles ACME certificate issuance and renewal automatically.
 
 ### Option C: TLS inside the nginx container
 
-Mount your certificate files and an updated `nginx.conf` into the frontend container:
+Mount your certificate files and a replacement nginx **template** into the
+frontend container. Do not mount a file over
+`/etc/nginx/conf.d/default.conf`: the image's entrypoint renders that file at
+every start from `/etc/nginx/templates/default.conf.template`
+(substituting `API_UPSTREAM_HOST`, `API_UPSTREAM_PORT`,
+`NGINX_LOCAL_RESOLVERS` and the trusted-proxy blocks), so a mounted file is
+overwritten.
+
+Start from the repository's `frontend/default.conf.template` (or the TLS
+variant in `charts/spatiumddi/templates/frontend-tls-config.yaml`, which
+already has the `listen 443 ssl` server and the certificate paths), keep its
+`${...}` placeholders, and mount your edited copy:
 
 ```yaml
 # In docker-compose.override.yml
@@ -157,8 +187,9 @@ services:
     ports:
       - "443:443"
     volumes:
-      - /etc/letsencrypt:/etc/letsencrypt:ro
-      - ./nginx-ssl.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt/live/ddi.example.com/fullchain.pem:/etc/nginx/tls/tls.crt:ro
+      - /etc/letsencrypt/live/ddi.example.com/privkey.pem:/etc/nginx/tls/tls.key:ro
+      - ./default.conf.template:/etc/nginx/templates/default.conf.template:ro
 ```
 
 ### ACME / DNS Challenge (for IPAM-integrated certificate management)

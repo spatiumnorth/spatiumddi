@@ -9,7 +9,6 @@ import structlog.contextvars
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.acme_well_known import router as acme_well_known_router
 from app.api.docs import install_api_docs
@@ -19,7 +18,7 @@ from app.api.v1.router import api_v1_router
 from app.config import settings
 from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
-from app.core.request_meta import TrustedProxyMiddleware
+from app.core.request_meta import LoggingTrustedHostMiddleware, TrustedProxyMiddleware
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
 from app.services.feature_modules import require_module
@@ -830,6 +829,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # keep it to one cheap query per tick + a single regenerate per
     # membership change. Appliance-mode only.
     cert_reconcile_task: asyncio.Task[None] | None = None
+    cert_deploy_task: asyncio.Task[None] | None = None
     if settings.appliance_mode:
 
         async def _cert_reconcile_loop() -> None:
@@ -850,12 +850,47 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         cert_reconcile_task = asyncio.create_task(_cert_reconcile_loop())
 
+        # #1895 — the Celery worker cannot patch the TLS Secret, so a
+        # Let's Encrypt cert it issues / renews is deployed here: on a
+        # Redis wake from the worker, and on a 60 s tick as the safety net
+        # for a missed wake (or an api that was down when it fired).
+        async def _cert_deploy_loop() -> None:
+            from app.core.agent_wake import (  # noqa: PLC0415
+                APPLIANCE_CERT_DEPLOY,
+                WakeResult,
+                wake_subscription,
+            )
+            from app.services.appliance.bootstrap import (  # noqa: PLC0415
+                sync_active_cert_to_secret,
+            )
+
+            while True:
+                try:
+                    async with wake_subscription([APPLIANCE_CERT_DEPLOY]) as sub:
+                        result = await sub.wait(60.0)
+                    if result is WakeResult.UNAVAILABLE:
+                        await asyncio.sleep(30)  # Redis down: tick-only
+                    out = await sync_active_cert_to_secret()
+                    if out.get("status") not in ("in-sync", "locked", "no-active-cert"):
+                        logger.info("appliance_cert_deploy_sync", **out)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("appliance_cert_deploy_sync_failed", error=str(exc))
+                    await asyncio.sleep(30)
+
+        cert_deploy_task = asyncio.create_task(_cert_deploy_loop())
+
     yield
 
     if cert_reconcile_task is not None:
         cert_reconcile_task.cancel()
         with suppress(asyncio.CancelledError):
             await cert_reconcile_task
+    if cert_deploy_task is not None:
+        cert_deploy_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cert_deploy_task
     logger.info("shutdown", service="api")
 
 
@@ -994,7 +1029,7 @@ def create_app() -> FastAPI:
     # lock the API to their real hostnames. (TrustedHostMiddleware
     # short-circuits ``["*"]`` so there's no per-request cost when open.)
     app.add_middleware(
-        TrustedHostMiddleware,
+        LoggingTrustedHostMiddleware,
         allowed_hosts=settings.trusted_hosts_list,
     )
 

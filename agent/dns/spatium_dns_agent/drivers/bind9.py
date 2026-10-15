@@ -1102,6 +1102,100 @@ def _keyfile_is_ksk(path: str) -> bool:
     return False
 
 
+# BIND's own rule for which keys belong in the parent's DS set: the CDS it
+# publishes covers exactly the keys whose kasp ``DSState`` is rumoured or
+# omnipresent (``syncpublish`` in lib/dns/dnssec.c). A key still hidden has a
+# DNSKEY that has not propagated yet; one unretentive or hidden after being
+# in the chain is being withdrawn at the end of a rollover.
+_DS_SUBMITTABLE_STATES = frozenset({"rumoured", "omnipresent"})
+
+
+def _key_ds_state(key_path: str) -> str | None:
+    """The ``DSState`` from the ``.state`` file beside a ``.key`` file.
+
+    None when there is no state file or it carries no ``DSState`` line,
+    i.e. a key BIND does not manage through dnssec-policy.
+    """
+    state_path = key_path[: -len(".key")] + ".state"
+    try:
+        with open(state_path) as f:
+            for line in f:
+                name, sep, value = line.partition(":")
+                if sep and name.strip() == "DSState":
+                    return value.strip().lower() or None
+    except OSError:
+        return None
+    return None
+
+
+def _ds_from_key_dir(zone: str, key_dir: str) -> list[str]:
+    """SHA-256 DS records (``<zone>. IN DS tag alg 2 HEX``) for a zone's KSKs.
+
+    Same output as ``dnssec-dsfromkey -2`` but computed with dnspython, so it
+    needs no BIND tools in the image (#1854). Only keys BIND itself would
+    put in its CDS are included: those whose ``DSState`` is rumoured or
+    omnipresent. A KSK whose DNSKEY has not propagated yet (hidden) or that
+    is being withdrawn after a rollover (unretentive / hidden) is left out,
+    so the card never asks the operator to publish a DS the parent must not
+    trust yet, or to keep one BIND has finished with. A key with no
+    ``.state`` file (not managed by dnssec-policy) is included, as before.
+
+    A signed zone that yields no DS is logged, never reported empty in
+    silence: ``dnssec_ds_pending`` when BIND has not made a KSK's DS
+    submittable yet, ``dnssec_ds_unavailable`` when there is no key at all.
+    """
+    import dns.dnssec
+    import dns.name
+    import dns.rdata
+    import dns.rdataclass
+    import dns.rdatatype
+
+    out: list[str] = []
+    if not os.path.isdir(key_dir):
+        log.warning("dnssec_ds_unavailable", zone=zone, reason="key_dir_missing", key_dir=key_dir)
+        return out
+    origin = dns.name.from_text(zone)
+    held: list[str] = []
+    for fn in sorted(os.listdir(key_dir)):
+        if not fn.endswith(".key") or not fn.startswith(f"K{zone}.+"):
+            continue
+        path = os.path.join(key_dir, fn)
+        try:
+            if not _keyfile_is_ksk(path):
+                continue
+            ds_state = _key_ds_state(path)
+            if ds_state is not None and ds_state not in _DS_SUBMITTABLE_STATES:
+                held.append(f"{fn}:{ds_state}")
+                continue
+            with open(path) as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith(";") or " DNSKEY " not in s:
+                        continue
+                    rdata_text = s.split(" DNSKEY ", 1)[1]
+                    key = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.DNSKEY, rdata_text)
+                    ds = dns.dnssec.make_ds(origin, key, "SHA256")
+                    out.append(f"{origin.to_text()} IN DS {ds.to_text().upper()}")
+                    break
+        except Exception as e:  # noqa: BLE001 — one bad key file must not hide the others
+            log.warning("dsfromkey_failed", zone=zone, file=fn, error=str(e))
+    if not out:
+        if held:
+            log.info("dnssec_ds_pending", zone=zone, reason="ds_not_yet_submittable", keys=held)
+        else:
+            log.warning("dnssec_ds_unavailable", zone=zone, reason="no_ksk_key_file", key_dir=key_dir)
+    return out
+
+
+def _ds_key_tag(ds_record: str) -> int | None:
+    """The key tag of a ``<owner> IN DS <tag> <alg> <type> <digest>`` line."""
+    parts = ds_record.split()
+    try:
+        return int(parts[parts.index("DS") + 1])
+    except (ValueError, IndexError):
+        return None
+
+
 def _render_dnssec_policies(policies: list[dict[str, Any]]) -> str:
     """Render top-level ``dnssec-policy "<name>" { ... };`` blocks (issue #49).
 
@@ -2983,9 +3077,11 @@ class Bind9Driver(DriverBase):
         and return report entries for ``POST /dns/agents/dnssec-state``.
 
         BIND owns the private keys (inline-signing); this is a read-only
-        mirror via ``rndc dnssec -status`` + ``dnssec-dsfromkey``. Best
-        effort — a zone still mid-key-generation just reports empty DS, and
-        the next sync picks it up.
+        mirror via ``rndc dnssec -status`` + a DS computed in-process from
+        the KSK key files (#1854). Best effort — a zone still
+        mid-key-generation, or whose DS BIND has not made submittable yet,
+        reports empty DS, and the periodic refresh in the sync loop picks
+        it up.
         """
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -3018,33 +3114,23 @@ class Bind9Driver(DriverBase):
             if res.returncode == 0:
                 keys = _parse_dnssec_status(res.stdout)
         # DS rrset(s) from the KSK public-key files BIND wrote into the
-        # key-directory. The CDS records BIND publishes are an alternative,
-        # but dnssec-dsfromkey is deterministic + version-stable.
+        # key-directory, computed in-process with dnspython (#1854). This
+        # used to shell out to ``dnssec-dsfromkey`` behind a ``shutil.which``
+        # guard, and the appliance image has no such binary (Alpine ships it
+        # in a separate package), so every signed zone silently reported an
+        # empty DS. No binary means nothing to be missing from an image.
         key_dir = "/var/cache/bind/keys"
-        if shutil.which("dnssec-dsfromkey") and os.path.isdir(key_dir):
-            for fn in sorted(os.listdir(key_dir)):
-                if not fn.endswith(".key") or not fn.startswith(f"K{zone}.+"):
-                    continue
-                path = os.path.join(key_dir, fn)
-                try:
-                    if not _keyfile_is_ksk(path):
-                        continue
-                    dres = subprocess.run(
-                        ["dnssec-dsfromkey", "-2", path],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
-                    for ln in dres.stdout.splitlines():
-                        ln = ln.strip()
-                        if ln and " DS " in ln:
-                            ds_records.append(ln)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("dsfromkey_failed", zone=zone, file=fn, error=str(e))
-        # Attach DS to the KSK key entries so the per-key UI can show them.
+        ds_records = _ds_from_key_dir(zone, key_dir)
+        # Attach each DS to the key it was derived from, so the per-key UI
+        # shows a key's own DS (and none for a key that is not submittable).
+        by_tag: dict[int, list[str]] = {}
+        for ds in ds_records:
+            tag = _ds_key_tag(ds)
+            if tag is not None:
+                by_tag.setdefault(tag, []).append(ds)
         for k in keys:
             if k.get("key_type") in ("ksk", "csk"):
-                k["ds_records"] = ds_records
+                k["ds_records"] = by_tag.get(k.get("key_tag"), [])
         return {"zone_name": zone + ".", "ds_records": ds_records, "keys": keys}
 
     def _dnssec_rollover(self, op: dict[str, Any]) -> dict[str, Any] | None:

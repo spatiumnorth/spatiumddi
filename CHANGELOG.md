@@ -100,6 +100,142 @@ the formatter handles the rest.
   upgrade. k3s runs every server of a cluster with the same pair.
   Nothing is written to the node's row.
 
+- **Running behind your own reverse proxy now works, and is documented
+  (#1868).** The frontend nginx wrote `X-Forwarded-Proto $scheme` and
+  `X-Real-IP $remote_addr` on every `/api/` location, so behind a
+  TLS-terminating proxy the api always saw `http` and the proxy's address:
+  OIDC / SAML callbacks were built as `http://` while External URL was
+  empty, and every user shared one login-throttle bucket (a busy morning
+  returned `429` to the organisation; audit rows, `last_login_ip` and the
+  allow-list guards recorded the proxy). **nginx header change:** the
+  frontend reads a new `FRONTEND_TRUSTED_PROXY_CIDRS` (Compose `.env`, the
+  chart's `frontend.trustedProxyCidrs`, `k8s/base/frontend.yaml`) and keeps
+  an outer proxy's `X-Forwarded-Proto`, with the client address from
+  `X-Forwarded-For` (`real_ip_recursive`), only from a listed peer. **Unset
+  keeps today's behaviour**: no proxy is trusted. It is deliberately not the
+  api's `TRUSTED_PROXY_CIDRS`, which names the frontend (the api's peer) and
+  needs no change: sharing one list would make the frontend trust the
+  compose / pod network, and any install that had set the api's list to the
+  private ranges would have let a LAN client choose its own recorded address
+  on upgrade. The Helm TLS frontend (one server for
+  :80 and :443) no longer 301s a request a trusted proxy marks
+  `X-Forwarded-Proto: https`, which looped behind a TLS-terminating proxy,
+  sends `Strict-Transport-Security` only on https (its own TLS, or a
+  trusted proxy's), never on plain HTTP to :80, and gains the AI-chat
+  stream location it lacked. The cluster-health,
+  container-log and nmap streams are served unbuffered with a one hour
+  timeout. The api now logs `sso_external_url_not_set` when an SSO endpoint
+  falls back to the request URL, `trusted_hosts_refused_host` for the Host a
+  `TRUSTED_HOSTS` 400 refused, and `reverse_proxy_sub_path_unsupported` for
+  `X-Forwarded-Prefix`. New [`REVERSE_PROXY.md`](docs/deployment/REVERSE_PROXY.md)
+  covers the topology (sub-paths unsupported), required settings and headers,
+  streaming, nginx / Caddy / Traefik / HAProxy / Nginx Proxy Manager /
+  Ingress examples and a troubleshooting table; DOCKER.md Option C no longer
+  mounts a file over the entrypoint's rendered `default.conf`, and a stale
+  `X-Forwarded-Host` comment is corrected.
+
+- **A `local_volume` backup on a multi-node appliance is per node, and now
+  says so (#1838).** The default backups directory is a per-node hostPath,
+  so an archive exists only on the disk of the node whose pod wrote it. A
+  restore, download or drill answered by another node's api returned a bare
+  "archive not found" 502, the archive list depended on which replica
+  answered, and a drill there reported `failed` ("the destination holds no
+  archives") about a target that was fine. Now each successful run records
+  the node that wrote it (`last_run_node`, on the target, the run-now
+  response, the Backup page and `list_backup_targets`). A miss names the
+  node that answered and, when known, the node holding the archive, and
+  says nothing was restored. On an appliance with two or more control-plane
+  nodes, Test connection warns that the target is per node, and the archive
+  list carries `node_name` per archive plus an `X-Archive-Listing-Note`
+  header, shown on the Backup page, saying whose disk the list is and that
+  the last run's archive is held by another node rather than missing. A
+  drill whose node cannot see the newest archive reports `error` (no
+  verdict) when it sees nothing, and notes it when it drilled an older
+  one. A single-node appliance and Compose see no cluster wording. The
+  Backup page's restore, download, delete, save and drill errors now show
+  the server's reason instead of "Request failed with status code 502".
+  Archives are not moved: the remedy on a cluster is a network destination
+  (S3, SCP, SMB, NFS).
+
+- **A delete the approval queue took is reported as queued, not as nothing
+  (#1915).** With `governance.approvals` on, deleting an IP space, block or
+  subnet answers `202` and the object stays. The IPAM tree's Delete… dialogs,
+  Edit Space and Edit Block read any 2xx as "deleted" and closed with no word;
+  Edit Subnet said "Submitted for approval", but in its red error box. All five
+  now say it in a neutral status box, leave the object (and the tree selection)
+  in place, refresh the approval queue, and stop offering Move to Trash again,
+  since a second click filed a second change request. The Copilot's card for
+  a risky proposal the queue took read "approved"; it now reads "awaiting
+  approval".
+
+- **IPAM no longer writes a twin beside a record an operator already
+  wrote (#1867).** An address allocated at a name and value an operator
+  had written by hand into the zone got an `auto_generated` copy beside
+  it, so the zone held two identical rows (PowerDNS refused the zone for
+  such a pair until #1379), while the record API refuses the same
+  duplicate with a 409 (#1230). The IPAM sync now adopts the operator's record,
+  for the A / AAAA and the PTR alike, on every path that writes them:
+  allocating an address, the bulk-edit DNS zone, DDNS from a lease and
+  Sync DNS. The address links to the existing row, nothing is created,
+  and the row stays the operator's, so deleting the address (or the
+  lease expiring) leaves it served. Only an operator-written row is
+  adopted: a different value still gets its own record, and a record
+  another address generated is not taken over. Renaming an address onto
+  a name and value the operator wrote retracts IPAM's own row and adopts
+  theirs too, and Sync DNS no longer reports an adopted record as
+  missing. Twins stored by an earlier release stay until one is deleted,
+  which #1230 made safe.
+
+- **Starting an MFA enrolment re-checks an external account at its own
+  provider (#1354).** An account with no local password used to pass
+  the enrolment step-up with any session younger than 10 minutes,
+  which is a sign-in time, not a check. An LDAP, RADIUS or TACACS+
+  account now re-verifies its password against its own provider
+  (backup servers included, wrong answers spend the step-up budget),
+  and an OIDC or SAML account is sent back to its IdP, forced to
+  authenticate again (`prompt=login` + `max_age=0`, `ForceAuthn`),
+  with a fresh `auth_time` / `AuthnInstant` required. The callback
+  leaves a single-use proof bound to that user and sign-in, which
+  `enroll/begin` takes. The 10-minute window remains only for an
+  account whose provider is gone or disabled. New
+  `POST /auth/mfa/enroll/reauth`; `GET /auth/mfa/status` gains
+  `enrol_provider_name` and two `enrol_requires` values.
+
+- **A Let's Encrypt certificate issued or renewed on an appliance is now
+  deployed to the Web UI without an api restart (#1895).** Issuance runs
+  in the Celery worker, whose ServiceAccount deliberately cannot patch
+  the `spatium-appliance-tls` Secret, so the renewed certificate sat in
+  the database and the old one kept being served. The worker now wakes
+  the api over Redis after committing, and the api deploys the active
+  certificate (also on a 60 s reconcile tick, under an advisory lock, and
+  only when the Secret differs; a frontend roll that fails after the
+  Secret was patched is retried rather than read as converged). The
+  worker no longer attempts the patch or logs
+  `appliance_cert_secret_patch_failed` on every renewal, and the
+  `secret_expiring` alert judges the certificate actually served (from a
+  snapshot the api publishes, since the worker cannot read the Secret),
+  flagging when the stored one is not deployed. The active certificate
+  was always redeployed over a differing Secret at api start; that is
+  now continuous, so a certificate written into the Secret by hand is
+  replaced within a minute.
+
+- **A BIND9-signed zone on the appliance now gets its DS (#1854).**
+  The agent derived the DS by running `dnssec-dsfromkey` only when that
+  binary was on `PATH`, and the Alpine dns-bind9 image does not carry
+  it, so every signed zone reported an empty DS with nothing logged and
+  the zone card had no record to paste at the parent. The agent now
+  computes the SHA-256 DS from the KSK `.key` file in-process with
+  dnspython, so no binary can be missing from an image, and a signed
+  zone that still yields no DS logs why (`dnssec_ds_pending` or
+  `dnssec_ds_unavailable`) instead of reporting empty in silence. The DS
+  shown follows BIND's own CDS rule: only a KSK whose `DSState` is
+  rumoured or omnipresent gets one, so a newly signed zone shows its DS
+  once BIND considers the DNSKEY propagated (about two hours on the
+  `default` policy), and a KSK withdrawn after a rollover drops out. The
+  agent now re-reads DNSSEC state every 5 minutes rather than only after a
+  config reload, so those changes reach the card without one, and each
+  key in the per-key table carries its own DS rather than every KSK's.
+
 - **Trashing a subnet now withdraws its own DNS records, instead of
   leaving them answering from a zone that stays (#1906).** When one of
   two subnets sharing a /24 reverse zone went to Trash, the zone was
@@ -4316,6 +4452,9 @@ the formatter handles the rest.
   rows queues a whole-RRset update op per agent server and bumps the
   zone serial. Agentless groups other than `technitium_api` get the row
   change and no push. Downgrade is a no-op.
+- `d9d0f6ddc446` — #1838: nullable `backup_target.last_run_node`, the
+  node whose pod wrote `last_run_filename`. No backfill: an existing row
+  cannot say where its archive was written, so NULL (unknown) stays.
 
 ## 2026.10.02-1 — 2026-10-02
 

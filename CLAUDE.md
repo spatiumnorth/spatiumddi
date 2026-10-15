@@ -56,6 +56,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/deployment/DNS_AGENT.md` | DNS agent/container architecture — image layout, auto-registration, config sync, K8s shape |
 | `docs/deployment/DOCKER.md` | Docker Compose setup, ports, first-time setup, TLS, HA, password reset |
 | `docs/deployment/TOPOLOGIES.md` | Six reference deployment topologies — single VM, separated agents, DNS+DHCP HA, HA control plane (Patroni / Redis Sentinel), hybrid cloud, K8s — with SVG diagrams + sizing notes |
+| `docs/deployment/REVERSE_PROXY.md` | Running behind your own reverse proxy — supported topology (root of its own hostname, no sub-paths), External URL + `FRONTEND_TRUSTED_PROXY_CIDRS` + `TRUSTED_HOSTS`, required headers, SSE settings, nginx / Caddy / Traefik / HAProxy / NPM / K8s Ingress examples, troubleshooting table |
 | `docs/deployment/KUBERNETES.md` | Umbrella Helm chart walkthrough — HPA, Ingress / LoadBalancer, CloudNativePG + Redis Sentinel HA (see also `k8s/README.md` + `charts/spatiumddi/README.md`) |
 | `docs/deployment/BAREMETAL.md` | Bare-metal/VM paths — Docker Compose on a host, OS appliance; the Compose Patroni overlay is documented as non-functional in 1.0 (#1236, real Compose HA is #137). No Ansible playbooks; that path is planned, not implemented |
 | `docs/deployment/WINDOWS.md` | Windows Server prerequisites — WinRM, service accounts (DnsAdmins / DHCP Users), firewall, zone dynamic-updates; shared by Windows DNS + Windows DHCP |
