@@ -84,6 +84,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A delete the approval queue took is reported as queued from the IPAM
+  tree, Edit Space, Edit Block and the IP Spaces list (#1915).** With
+  `governance.approvals` on, deleting an IP space, block or subnet answers
+  `202` and the object stays; those dialogs read any 2xx as "deleted" and
+  closed with no word (the list did nothing visible), while Edit Subnet said
+  "Submitted for approval". They now show that message, leave the object in
+  place, and refresh the approval queue.
+
 - **Deleting a DNS zone permanently from the Trash now removes it from
   agentless servers too (#1830).** A zone is never torn down at
   soft-delete (a hosted zone re-created on restore gets a new id and NS

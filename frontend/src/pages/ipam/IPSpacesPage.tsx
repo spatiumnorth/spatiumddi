@@ -2,6 +2,12 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { ipamApi, type IPSpace } from "@/lib/api";
 import { zebraBodyCls } from "@/lib/utils";
 import { Trash2 } from "lucide-react";
+import { useState } from "react";
+import {
+  APPROVAL_QUEUED_MESSAGE,
+  CHANGE_REQUEST_QUERY_KEY,
+  handleApprovalQueued,
+} from "@/lib/approvalQueue";
 
 export function IPSpacesPage() {
   const qc = useQueryClient();
@@ -10,9 +16,20 @@ export function IPSpacesPage() {
     queryFn: ipamApi.listSpaces,
   });
 
+  const [notice, setNotice] = useState<string | null>(null);
   const deleteMutation = useMutation({
     mutationFn: (id: string) => ipamApi.deleteSpace(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["spaces"] }),
+    onSuccess: (resp) => {
+      // Two-person approval (#62): a covered delete returns 202 and the
+      // space is still there. Say so instead of looking like a no-op (#1915).
+      if (handleApprovalQueued(resp)) {
+        setNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
+      setNotice(null);
+      qc.invalidateQueries({ queryKey: ["spaces"] });
+    },
   });
 
   if (isLoading) return <p className="text-muted-foreground">Loading…</p>;
@@ -20,6 +37,14 @@ export function IPSpacesPage() {
   return (
     <div className="space-y-4">
       <h1 className="text-2xl font-bold tracking-tight">IP Spaces</h1>
+      {notice && (
+        <div
+          role="status"
+          className="rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400"
+        >
+          {notice}
+        </div>
+      )}
       {spaces?.length === 0 && (
         <p className="text-sm text-muted-foreground">No IP spaces yet.</p>
       )}

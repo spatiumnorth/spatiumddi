@@ -11352,7 +11352,15 @@ export function EditSpaceModal({
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMutation = useMutation({
     mutationFn: () => ipamApi.deleteSpace(space.id),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // Two-person approval (#62): a covered delete returns 202 with a
+      // queued change-request instead of deleting. Say so and leave the
+      // space in place (#1915).
+      if (handleApprovalQueued(resp)) {
+        setDeleteError(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["spaces"] });
       onDeleted();
     },
@@ -12000,7 +12008,7 @@ export function CreateBlockModal({
 
 // ─── Edit Block Modal ─────────────────────────────────────────────────────────
 
-function EditBlockModal({
+export function EditBlockModal({
   block,
   onClose,
   onDeleted,
@@ -12139,7 +12147,13 @@ function EditBlockModal({
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMutation = useMutation({
     mutationFn: () => ipamApi.deleteBlock(block.id),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // Two-person approval (#62): queued, not deleted (#1915).
+      if (handleApprovalQueued(resp)) {
+        setDeleteError(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks"] });
       onDeleted?.();
@@ -15145,12 +15159,23 @@ function SpaceSection({
   const [subnetDeleteError, setSubnetDeleteError] = useState<string | null>(
     null,
   );
+  const [subnetDeleteNotice, setSubnetDeleteNotice] = useState<string | null>(
+    null,
+  );
   const deleteSubnet = useMutation({
     // The single-subnet ConfirmDestroyModal already requires the
     // operator to tick "…and all its contents will be permanently
     // deleted" before this fires, so cascade is the right semantics.
     mutationFn: (id: string) => ipamApi.deleteSubnet(id, true),
-    onSuccess: () => {
+    onSuccess: (resp, id) => {
+      // Two-person approval (#62): queued, not deleted (#1915). Leave the
+      // subnet selected and the dialog open with the notice.
+      if (handleApprovalQueued(resp)) {
+        setSubnetDeleteNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
+      if (selectedSubnetId === id) onSelectSubnet(null);
       qc.invalidateQueries({ queryKey: ["subnets", space.id] });
       setSubnetToDelete(null);
       setSubnetDeleteError(null);
@@ -15169,9 +15194,18 @@ function SpaceSection({
   });
 
   const [blockDeleteError, setBlockDeleteError] = useState<string | null>(null);
+  const [blockDeleteNotice, setBlockDeleteNotice] = useState<string | null>(
+    null,
+  );
   const deleteBlockMut = useMutation({
     mutationFn: (id: string) => ipamApi.deleteBlock(id),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // Two-person approval (#62): queued, not deleted (#1915).
+      if (handleApprovalQueued(resp)) {
+        setBlockDeleteNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["blocks", space.id] });
       qc.invalidateQueries({ queryKey: ["subnets", space.id] });
       setBlockToDelete(null);
@@ -15446,12 +15480,15 @@ function SpaceSection({
           checkLabel={`I understand ${blockToDelete.network} and everything inside it will be moved to Trash.`}
           isPending={deleteBlockMut.isPending}
           error={blockDeleteError}
+          notice={blockDeleteNotice}
           onClose={() => {
             setBlockToDelete(null);
             setBlockDeleteError(null);
+            setBlockDeleteNotice(null);
           }}
           onConfirm={() => {
             setBlockDeleteError(null);
+            setBlockDeleteNotice(null);
             deleteBlockMut.mutate(blockToDelete.id);
           }}
         />
@@ -15494,13 +15531,15 @@ function SpaceSection({
           checkLabel={`I understand ${subnetToDelete.network} and its contents will be moved to Trash.`}
           isPending={deleteSubnet.isPending}
           error={subnetDeleteError}
+          notice={subnetDeleteNotice}
           onClose={() => {
             setSubnetToDelete(null);
             setSubnetDeleteError(null);
+            setSubnetDeleteNotice(null);
           }}
           onConfirm={() => {
-            if (selectedSubnetId === subnetToDelete.id) onSelectSubnet(null);
             setSubnetDeleteError(null);
+            setSubnetDeleteNotice(null);
             deleteSubnet.mutate(subnetToDelete.id);
           }}
         />
