@@ -593,6 +593,21 @@ the formatter handles the rest.
   check is not fixed here: a node whose STATE does not mount no longer
   runs as someone else.
 
+- **k3s and first-boot no longer start without the `/etc` overlay
+  (#1910).** The node's own `/etc` (its hostname, machine-id, the k3s
+  drop-ins that carry its role label and CIDRs, the appliance `.env` and
+  role-config) is the overlay's upper layer, and `etc.mount` is only
+  wanted by `local-fs.target`, so a boot whose overlay failed to mount
+  went on. `k3s.service` and `spatiumddi-firstboot.service` were only
+  ordered after it: after a power-off k3s started on the slot's bare
+  `/etc` and registered a new Node, `localhost`, without the role or
+  CIDRs, and first-boot generated a fresh `.env` as on a first boot.
+  Both now require the overlay, as the host runners' reload units
+  already do, so on such a boot they stay down, and the console's k3s
+  row reads "held — /etc overlay not mounted" instead of "disabled".
+  Why the overlay failed to mount is not fixed here: a node whose
+  overlay does not mount no longer runs as someone else.
+
 - **Sync with Servers on a group syncs each server, not the primary once
   per server (#1697).** The per-server loop called the per-zone sync with
   no server, which resolved the zone's primary every time, so an

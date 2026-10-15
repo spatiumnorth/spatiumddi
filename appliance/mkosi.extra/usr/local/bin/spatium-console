@@ -3482,6 +3482,21 @@ def active_slot_upgrade() -> dict | None:
     return p
 
 
+def _etc_overlay_missing() -> bool:
+    """#1910 — True on an installed slot whose /etc overlay did not mount.
+
+    /etc is an overlay (etc.mount: lower /usr/lib/etc.image, upper
+    /var/persist/etc); without it the slot's bare /etc is all there is,
+    and k3s, which requires the overlay, stays down. The live ISO runs
+    without the overlay by design, so it never counts."""
+    try:
+        if "boot=live" in Path("/proc/cmdline").read_text(encoding="utf-8").split():
+            return False
+    except OSError:
+        pass
+    return Path("/usr/lib/etc.image").is_dir() and not os.path.ismount("/etc")
+
+
 def k3s_status() -> tuple[str, str] | None:
     """Issue #183 Phase 1 — derive a (label, style) tuple for the
     console's 'k3s' row, or ``None`` when k3s isn't baked into this
@@ -3533,6 +3548,14 @@ def k3s_status() -> tuple[str, str] | None:
         unit_state = "unknown"
 
     if unit_state in ("inactive", "unknown"):
+        if _etc_overlay_missing():
+            # #1910 — k3s.service Requires=etc.mount: on a boot whose
+            # overlay failed it never started, and "disabled" would send
+            # the operator to the wrong fix.
+            return (
+                f"{version} · held — /etc overlay not mounted (journalctl -b -u etc.mount)",
+                "bold red",
+            )
         return (f"{version} · disabled (systemctl enable --now k3s)", "yellow")
     if unit_state == "failed":
         return (f"{version} · failed — journalctl -u k3s", "bold red")
