@@ -84,6 +84,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A `local_volume` backup on a multi-node appliance is per node, and now
+  says so (#1838).** The default backups directory is a per-node hostPath,
+  so an archive exists only on the disk of the node whose pod wrote it. A
+  restore, download or drill answered by another node's api returned a bare
+  "archive not found" 502, the archive list depended on which replica
+  answered, and a drill there reported `failed` ("the destination holds no
+  archives") about a target that was fine. Now each successful run records
+  the node that wrote it (`last_run_node`, on the target, the run-now
+  response, the Backup page and `list_backup_targets`). A miss names the
+  node that answered and, when known, the node holding the archive, and
+  says nothing was restored. On an appliance with two or more control-plane
+  nodes, Test connection warns that the target is per node, and the archive
+  list carries `node_name` per archive plus an `X-Archive-Listing-Note`
+  header, shown on the Backup page, saying whose disk the list is and that
+  the last run's archive is held by another node rather than missing. A
+  drill whose node cannot see the newest archive reports `error` (no
+  verdict) when it sees nothing, and notes it when it drilled an older
+  one. A single-node appliance and Compose see no cluster wording. The
+  Backup page's restore, download, delete, save and drill errors now show
+  the server's reason instead of "Request failed with status code 502".
+  Archives are not moved: the remedy on a cluster is a network destination
+  (S3, SCP, SMB, NFS).
+
 - **A delete the approval queue took is reported as queued, not as nothing
   (#1915).** With `governance.approvals` on, deleting an IP space, block or
   subnet answers `202` and the object stays. The IPAM tree's Delete… dialogs,
@@ -4379,6 +4402,9 @@ the formatter handles the rest.
   rows queues a whole-RRset update op per agent server and bumps the
   zone serial. Agentless groups other than `technitium_api` get the row
   change and no push. Downgrade is a no-op.
+- `d9d0f6ddc446` — #1838: nullable `backup_target.last_run_node`, the
+  node whose pod wrote `last_run_filename`. No backfill: an existing row
+  cannot say where its archive was written, so NULL (unknown) stays.
 
 ## 2026.10.02-1 — 2026-10-02
 
