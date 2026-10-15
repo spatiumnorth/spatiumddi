@@ -239,7 +239,7 @@ describe("DNS: a refused zone delete", () => {
   }
 
   /** Zones tab → select every zone → Delete N → Continue → acknowledge →
-   *  Delete: the steps an operator takes. */
+   *  Move to Trash: the steps an operator takes. */
   async function bulkDelete(count: number) {
     show(<DNSPage />, "/dns?group=grp-1&tab=zones");
     fireEvent.click(await screen.findByLabelText("Select all filtered zones"));
@@ -251,7 +251,7 @@ describe("DNS: a refused zone delete", () => {
     );
     fireEvent.click(within(topDialog()).getByRole("checkbox"));
     fireEvent.click(
-      within(topDialog()).getByRole("button", { name: /^Delete$/ }),
+      within(topDialog()).getByRole("button", { name: /^Move to Trash$/ }),
     );
   }
 
@@ -332,7 +332,7 @@ describe("DNS: a refused zone delete", () => {
     );
     fireEvent.click(within(topDialog()).getByRole("checkbox"));
     fireEvent.click(
-      within(topDialog()).getByRole("button", { name: /^Delete$/ }),
+      within(topDialog()).getByRole("button", { name: /^Move to Trash$/ }),
     );
 
     await waitFor(() => expect(deleteZone).toHaveBeenCalledTimes(1));
