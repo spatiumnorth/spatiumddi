@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.pagination import paginate
@@ -96,3 +96,18 @@ async def test_paginate_helper_total_excludes_trash(db_session: AsyncSession) ->
     )
     assert len(rows) == 3
     assert total == 6
+
+
+@pytest.mark.asyncio
+async def test_nested_subquery_count_is_filtered_and_opt_out_still_sees_trash(
+    db_session: AsyncSession,
+) -> None:
+    """The filter lands inside a subquery however deep it is nested, and a
+    statement that opts out with ``include_deleted`` still counts the trashed
+    rows: Trash, restore and purge depend on that."""
+    _, zone = await _seed(db_session)
+    inner = select(DNSRecord.id).where(DNSRecord.zone_id == zone.id).subquery()
+    nested = select(func.count()).select_from(select(inner.c.id).subquery())
+    assert (await db_session.execute(nested)).scalar_one() == 6
+    opted_out = nested.execution_options(include_deleted=True)
+    assert (await db_session.execute(opted_out)).scalar_one() == 10
