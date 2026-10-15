@@ -2721,10 +2721,9 @@ async def supervisor_heartbeat(
     # A node "runs the apiserver" (so 6443 must accept from the pod /
     # service CIDR) when it's a control-plane variant OR a settled /
     # in-flight / leaving CP member. pod/service CIDR are sent only for
-    # those nodes so a plain worker doesn't pointlessly open 6443.
-    runs_apiserver = _runs_apiserver(row)
-    firewall_pod_cidrs = _split_cidr_csv(row.pod_cidr) if runs_apiserver else []
-    firewall_service_cidrs = _split_cidr_csv(row.service_cidr) if runs_apiserver else []
+    # those nodes so a plain worker doesn't pointlessly open 6443; a CP
+    # member that reports none gets the cluster's (#1721).
+    firewall_pod_cidrs, firewall_service_cidrs = await _firewall_cluster_cidrs(db, row)
 
     # #277 — committed control-plane size (settled primary + members,
     # floored at 1). The seed supervisor scales CNPG instances +
@@ -3011,15 +3010,15 @@ async def firewall_render_inputs(db: DB, row: Appliance) -> dict[str, Any]:
     (they also feed response telemetry); this is the read-path twin.
     """
     role_assignment = await _build_role_assignment(db, row)
-    runs_apiserver = _runs_apiserver(row)
+    pod_cidrs, service_cidrs = await _firewall_cluster_cidrs(db, row)
     cfg_row = (
         await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
     ).scalar_one_or_none()
     return {
         "role_assignment": role_assignment.model_dump(),
         "cluster_peer_cidrs": await _cluster_peer_cidrs(db, row),
-        "pod_cidrs": _split_cidr_csv(row.pod_cidr) if runs_apiserver else [],
-        "service_cidrs": _split_cidr_csv(row.service_cidr) if runs_apiserver else [],
+        "pod_cidrs": pod_cidrs,
+        "service_cidrs": service_cidrs,
         "cp_member_count": await _committed_cp_count(db),
         "vip_configured": bool((cfg_row.control_plane_vip or "") if cfg_row else ""),
         "firewall_enabled": bool(cfg_row.firewall_enabled) if cfg_row else False,
@@ -4613,6 +4612,40 @@ async def _firewall_peer_members(db: DB) -> list[Appliance]:
     # only a leaver that has fully reported ``left`` (its etcd surgery is
     # done, so it no longer needs — nor should be granted — peer access).
     return [r for r in rows if r.cluster_join_state != CLUSTER_JOIN_STATE_LEFT]
+
+
+async def _firewall_cluster_cidrs(db: DB, row: Appliance) -> tuple[list[str], list[str]]:
+    """The pod and service networks ``row``'s ``kubeapi`` (6443) and
+    ``kubelet`` (10250) rules admit (#285 Phase 1, #1721).
+
+    Only a node that runs the apiserver gets any (``_runs_apiserver``), and
+    its own report comes first. A promoted member reports none: an
+    Additional node pins no CIDRs (#995 item 14) and inherits the
+    cluster's when it joins, so its supervisor finds no drop-in to read
+    and its row stays empty. Built from that empty row, the member's
+    ``kubeapi`` rule admitted only its peers and it had no ``kubelet``
+    rule, so its own pods' calls to its own apiserver and kubelet (they
+    arrive from a pod address) were dropped. So for a network the row
+    lacks, take the one the cluster's other control-plane nodes report:
+    k3s refuses a server whose cluster-cidr / service-cidr differ from
+    the datastore's, so every server of the cluster runs with the same
+    pair. Shared by the heartbeat render and ``firewall_render_inputs``
+    so both stay byte-identical.
+    """
+    if not _runs_apiserver(row):
+        return [], []
+    pod = _split_cidr_csv(row.pod_cidr)
+    svc = _split_cidr_csv(row.service_cidr)
+    if pod and svc:
+        return pod, svc
+    cluster_pod: set[str] = set()
+    cluster_svc: set[str] = set()
+    for member in await _firewall_peer_members(db):
+        if member.id == row.id:
+            continue
+        cluster_pod.update(_split_cidr_csv(member.pod_cidr))
+        cluster_svc.update(_split_cidr_csv(member.service_cidr))
+    return pod or sorted(cluster_pod), svc or sorted(cluster_svc)
 
 
 async def _cluster_peer_cidrs(db: DB, row: Appliance) -> list[str]:

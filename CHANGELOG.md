@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A promoted control-plane member's own pods reach its own
+  apiserver and kubelet (#1721).** A pod's packet to its own node's
+  address arrives from the pod's own address, so the node's firewall
+  decides it. The kubeapi (6443) and kubelet (10250) rules admit the
+  pod and service networks the control plane hands each node, and those
+  came from the node's own report only. A promoted member reports none:
+  an Additional node pins no CIDRs (#995 item 14). So a member admitted
+  only its peers to 6443 and had no kubelet rule, and its pods timed out
+  on its own node's 6443 and 10250 every time. The `kubernetes` Service
+  also lost every connection it sent to the member's own apiserver,
+  including the supervisor's own readiness probe. A control-plane node
+  whose report lacks a network now gets the one the cluster's other
+  control-plane nodes report, on its next heartbeat and with no node
+  upgrade. k3s runs every server of a cluster with the same pair.
+  Nothing is written to the node's row.
+
 - **Running behind your own reverse proxy now works, and is documented
   (#1868).** The frontend nginx wrote `X-Forwarded-Proto $scheme` and
   `X-Real-IP $remote_addr` on every `/api/` location, so behind a

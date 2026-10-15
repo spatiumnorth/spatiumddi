@@ -111,3 +111,36 @@ async def test_effective_reflects_operator_fleet_rule(
     r = await client.get(f"{FW}/appliances/{a.id}/effective", headers=h)
     assert r.status_code == 200, r.text
     assert 'udp dport 514 accept comment "syslog"' in r.json()["layers"]["overlay"]
+
+
+async def test_effective_member_without_networks_renders_the_clusters(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1721 — the read-path twin (firewall_render_inputs) derives a promoted
+    member's pod / service networks the way the heartbeat does: a member that
+    reports none gets the cluster's, so its kubeapi rule admits its own pods
+    and it gets a kubelet rule, as the seed does."""
+    h = await _admin(db_session)
+    await _appliance(
+        db_session,
+        variant="control-plane",
+        cluster_role="primary",
+        node_ip="192.168.1.11",
+        node_ips=["192.168.1.11"],
+        pod_cidr="10.42.0.0/16",
+        service_cidr="10.43.0.0/16",
+    )
+    member = await _appliance(
+        db_session, cluster_role="member", node_ip="192.168.1.12", node_ips=["192.168.1.12"]
+    )
+    await db_session.commit()
+    r = await client.get(f"{FW}/appliances/{member.id}/effective", headers=h)
+    assert r.status_code == 200, r.text
+    lines = r.json()["firewall_conf"].splitlines()
+    kubeapi = [ln for ln in lines if 'comment "kubeapi-v4"' in ln]
+    kubelet = [ln for ln in lines if 'comment "kubelet-v4"' in ln]
+    assert len(kubeapi) == 1 and "tcp dport 6443 accept" in kubeapi[0]
+    for net in ("10.42.0.0/16", "10.43.0.0/16", "192.168.1.11/32"):
+        assert net in kubeapi[0], kubeapi[0]
+    assert len(kubelet) == 1 and "tcp dport 10250 accept" in kubelet[0]
+    assert "10.42.0.0/16" in kubelet[0] and "10.43.0.0/16" in kubelet[0]
