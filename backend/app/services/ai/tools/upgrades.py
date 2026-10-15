@@ -18,6 +18,7 @@ access only.
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -44,6 +45,15 @@ class FindUpgradePreflightArgs(BaseModel):
         ),
         min_length=1,
         max_length=64,
+    )
+    slot_image_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "The uploaded upgrade image the Plan would name. The disk "
+            "checks then size the need from its size and skip the room "
+            "for an image the mirror already holds, as the Plan does; "
+            "without it they judge a 4 GiB image."
+        ),
     )
 
 
@@ -78,7 +88,9 @@ async def find_upgrade_preflight(
 ) -> dict[str, Any]:
     if (err := _superadmin_gate(user)) is not None:
         return err
-    report = await preflight.run_all(target_version=args.target_version)
+    report = await preflight.run_all(
+        target_version=args.target_version, slot_image_id=args.slot_image_id
+    )
     return report.to_dict()
 
 
