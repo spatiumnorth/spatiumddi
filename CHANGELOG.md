@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **IPAM no longer writes a twin beside a record an operator already
+  wrote (#1867).** An address allocated at a name and value an operator
+  had written by hand into the zone got an `auto_generated` copy beside
+  it, so the zone held two identical rows (PowerDNS refused the zone for
+  such a pair until #1379), while the record API refuses the same
+  duplicate with a 409 (#1230). The IPAM sync now adopts the operator's record,
+  for the A / AAAA and the PTR alike, on every path that writes them:
+  allocating an address, the bulk-edit DNS zone, DDNS from a lease and
+  Sync DNS. The address links to the existing row, nothing is created,
+  and the row stays the operator's, so deleting the address (or the
+  lease expiring) leaves it served. Only an operator-written row is
+  adopted: a different value still gets its own record, and a record
+  another address generated is not taken over. Renaming an address onto
+  a name and value the operator wrote retracts IPAM's own row and adopts
+  theirs too, and Sync DNS no longer reports an adopted record as
+  missing. Twins stored by an earlier release stay until one is deleted,
+  which #1230 made safe.
+
 - **Starting an MFA enrolment re-checks an external account at its own
   provider (#1354).** An account with no local password used to pass
   the enrolment step-up with any session younger than 10 minutes,
