@@ -154,6 +154,7 @@ from app.services.dns.server_move import (
     catalog_unsupported_message,
     ensure_group_catalog_compatible,
     ensure_group_single_driver,
+    lock_server_row,
     move_server_to_group,
 )
 from app.services.dns.technitium_options import (
@@ -2181,6 +2182,10 @@ async def update_server(
     current_user: SuperAdmin,
 ) -> ServerResponse:
     server = await _require_server(group_id, server_id, db)
+    if body.group_id is not None and body.group_id != server.group_id:
+        # #1703 — before ANY write to the row, or the first autoflush takes the
+        # weaker lock and the move deadlocks against the worker's render.
+        await lock_server_row(db, server.id)
     # #1540 — a driver change on update is the other path that used to
     # manufacture a mixed group. Enforce single-driver against the OTHER
     # members of the group the server stays in. When the same request

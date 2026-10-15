@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Moving a DNS server to another group no longer deadlocks against the
+  worker's bundle render and answers 500 (#1703).** The worker's render holds
+  `FOR KEY SHARE` on the server's row (the bundle insert's foreign key) and
+  then needs `FOR NO KEY UPDATE`; the move wrote the row in two steps, the
+  second (`group_id`, a unique-index column) needing `FOR UPDATE`, so each
+  side held half of what the other wanted and Postgres aborted the move
+  (40P01). The move now takes `SELECT ... FOR UPDATE` on the row before its
+  first write, in the server PUT and in the Fleet roles PUT, so a render and a
+  move of one server run one after the other. The render path is unchanged.
 - **A rolling upgrade no longer drops its Lease on one unanswered
   kubeapi read, and a `running` run whose drive is gone is resumed
   (#1713).** A node reboot or a loaded host makes a Lease read time out;

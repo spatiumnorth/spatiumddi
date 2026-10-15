@@ -44,7 +44,11 @@ from app.models.appliance import Appliance
 from app.models.audit import AuditLog
 from app.models.dns import DNSServer, DNSServerGroup
 from app.services.appliance.ownership import current_dns_drivers, own_server_condition
-from app.services.dns.server_move import ServerMoveError, move_server_to_group
+from app.services.dns.server_move import (
+    ServerMoveError,
+    lock_server_row,
+    move_server_to_group,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -235,6 +239,10 @@ async def move_appliance_dns_servers(
     outcome = ApplianceDnsMove()
     drivers = current_dns_drivers(appliance)
     own_dns = await appliance_own_dns_servers(db, appliance)
+    for srv in own_dns:
+        if srv.group_id != target_group.id:
+            # #1703 — strongest lock before any write to the row (see the helper).
+            await lock_server_row(db, srv.id)
     old_drivers: dict[Any, str] = {}
     if not own_dns and drivers:
         adoptee = await appliance_adoptable_dns_server(db, appliance, target_group)

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 from sqlalchemy import delete as sa_delete
@@ -233,6 +234,24 @@ async def _elect_primary(
     return candidate
 
 
+async def lock_server_row(db: AsyncSession, server_id: Any) -> None:
+    """Take ``FOR UPDATE`` on the ``dns_server`` row, before any write to it (#1703).
+
+    The move's UPDATE changes ``group_id`` — a column of the unique index
+    ``uq_dns_server_group_name`` — so Postgres takes ``FOR UPDATE`` for it,
+    which conflicts with the ``FOR KEY SHARE`` a worker's bundle insert holds
+    through its foreign key. Meanwhile the demotion UPDATE that ran first held
+    ``FOR NO KEY UPDATE``, which the worker's own ``UPDATE dns_server`` needs:
+    each side held half of what the other wanted (40P01). Taking the strongest
+    lock first makes a render and a move of one server run one after the other.
+
+    Selects the id only, so no pending attribute on the instance is refreshed.
+    Call it BEFORE the caller mutates the server (the autoflush would take the
+    weaker lock first, which is the inversion).
+    """
+    await db.execute(select(DNSServer.id).where(DNSServer.id == server_id).with_for_update())
+
+
 async def move_server_to_group(
     db: AsyncSession, server: DNSServer, target_group: DNSServerGroup
 ) -> ServerMoveResult | None:
@@ -248,6 +267,7 @@ async def move_server_to_group(
     old_group_id = server.group_id
     if old_group_id == target_group.id:
         return None
+    await lock_server_row(db, server.id)
 
     # ── Refusals ──────────────────────────────────────────────────────
     #
