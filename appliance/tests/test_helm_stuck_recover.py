@@ -142,11 +142,12 @@ def test_a_fresh_failure_is_left_alone_under_the_threshold(tmp_path: Path) -> No
     assert not any("delete" in c for c in calls)
 
 
-def test_the_unit_wants_k3s_instead_of_requiring_it() -> None:
+def test_the_unit_orders_after_k3s_but_never_requires_or_starts_it() -> None:
     """Requires= took a running recovery tick down with every k3s restart —
-    the moment the recovery is needed. The runner already bails when the
-    API is not ready, so Wants= + After= is the whole ordering it needs."""
+    the moment the recovery is needed. Wants= started k3s from a tick that
+    landed while the cluster join runner held it stopped (#1723). The runner
+    already bails when the API is not ready, so After= is the whole ordering
+    it needs."""
     unit = UNIT.read_text()
-    assert "Wants=k3s.service" in unit
-    assert "Requires=k3s.service" not in unit
-    assert "After=k3s.service" in unit
+    assert not re.search(r"^(Wants|Requires|BindsTo)=.*\bk3s\.service\b", unit, re.MULTILINE)
+    assert re.search(r"^After=.*\bk3s\.service\b", unit, re.MULTILINE)
