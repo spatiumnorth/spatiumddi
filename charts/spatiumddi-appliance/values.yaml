@@ -274,14 +274,14 @@ dhcpKea:
     repository: ghcr.io/spatiumnorth/dhcp-kea
   # Scheduling weight for the DHCP server pod — see dnsBind9.resources.
   # Measured 2026-09-03 on a 5632 MiB / 3 vCPU appliance under a 35k-device
+  # DORA ramp: as a BestEffort pod Kea was given 7.5 % of a CPU while the
+  # api ran at 110 %, its socket queue overflowed and only 37 % of the
+  # DISCOVERs on the wire were answered. Requests only, no limits.
+  #
   # Memory (#1828): 128Mi. Kea's working set is 66-72 Mi at idle on the
   # measured appliances, which sat ABOVE the 64Mi this carried, and the
   # kubelet evicts a pod over its memory request ahead of pods within theirs
   # before it ever looks at the PriorityClass.
-  #
-  # DORA ramp: as a BestEffort pod Kea was given 7.5 % of a CPU while the
-  # api ran at 110 %, its socket queue overflowed and only 37 % of the
-  # DISCOVERs on the wire were answered. Requests only, no limits.
   #
   # 500m is the value every measured cell used (#967): what does the work
   # under contention is the cgroup weight the request derives to, and
