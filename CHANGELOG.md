@@ -91,9 +91,10 @@ the formatter handles the rest.
   subquery and skipped it: the page query was filtered and the count was not.
   A zone with four of ten records trashed listed six rows under `total: 10`,
   so the pager offered pages that came back empty. The filter now looks inside
-  subquery FROMs, which fixes every list that counts this way (zone and
-  group-wide records, and the rest of the `Page[...]` endpoints over a
-  soft-deleted model).
+  subquery FROMs (and CTEs), with the criterion placed inside the subquery.
+  The lists this changes are the zone and group-wide record lists; the other
+  count-over-subquery sites count models that are not soft-deleted. A
+  statement that opts out with `include_deleted` still counts Trash.
 
 - **An imported zone no longer has to stay delegated to the server it was
   migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
