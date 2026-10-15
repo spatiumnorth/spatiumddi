@@ -3599,6 +3599,24 @@ def control_plane_reachable(env: dict[str, str], timeout: float = 2.0) -> bool |
         return False
 
 
+def _state_not_mounted() -> bool:
+    """#1910 — True when the STATE partition is present but not mounted.
+
+    The supervisor's identity lives on STATE (/var/persist/spatium-supervisor
+    links into /var/lib/spatium-state). When STATE did not mount,
+    spatium-etc-render stops rather than let the supervisor mint a new
+    identity on the empty mountpoint, so the Identity row says why it is
+    held. The live ISO never counts."""
+    try:
+        if "boot=live" in Path("/proc/cmdline").read_text(encoding="utf-8").split():
+            return False
+    except OSError:
+        pass
+    return Path("/dev/disk/by-label/state").exists() and not os.path.ismount(
+        "/var/lib/spatium-state"
+    )
+
+
 def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple[str, str] | None:
     """#170 — derive a (label, style) tuple for the console's
     'Identity' row, or ``None`` when the role doesn't pair against
@@ -3621,6 +3639,10 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
     """
     if role not in ("appliance", "application"):
         return None
+    if _state_not_mounted():
+        # #1910 — every file below is on STATE; without it they read as
+        # "Bootstrapping…", and the node is not bootstrapping, it is held.
+        return ("Held — STATE not mounted (journalctl -b -u spatium-etc-render)", "bold red")
     state_dir = Path("/var/persist/spatium-supervisor")
     approval_state_file = state_dir / "approval-state"
     identity_dir = state_dir / "identity"

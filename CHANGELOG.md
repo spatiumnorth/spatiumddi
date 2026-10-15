@@ -572,6 +572,27 @@ the formatter handles the rest.
   section's `ON DELETE CASCADE` reach from the model metadata and
   fails when it differs from what the section declares.
 
+- **A node whose STATE partition did not mount at boot no longer comes
+  back with a new identity (#1910).** STATE is mounted `nofail`, so a
+  boot whose STATE check was stopped part-way, as after a hard power-off,
+  went on with `/var/lib/spatium-state` as an empty directory on `/var`.
+  `spatium-etc-render` wrote the node's identity paths into it, the
+  supervisor's identity link resolved into it, and the supervisor minted
+  a new identity its control plane did not know: the appliance stopped
+  heartbeating as itself. The render now starts the STATE mount, and
+  with it the check, itself when the partition is present but not
+  mounted, up to three times. When STATE still does not mount it stops
+  before reading or writing anything there, says so in the journal and
+  on the kernel log, and keeps the hostname the last good boot rendered
+  into `/etc`; the supervisor has no identity to start with and does not
+  make one. k3s, DNS and DHCP keep running. The console's Identity row
+  reads "Held — STATE not mounted" instead of "Bootstrapping…". The
+  render was also only ordered after `local-fs.target`, which a `nofail`
+  mount does not hold back, so a slow STATE check could lose that race
+  on any boot; the render now waits for the mount. What stopped the
+  check is not fixed here: a node whose STATE does not mount no longer
+  runs as someone else.
+
 - **Sync with Servers on a group syncs each server, not the primary once
   per server (#1697).** The per-server loop called the per-zone sync with
   no server, which resolved the zone's primary every time, so an
