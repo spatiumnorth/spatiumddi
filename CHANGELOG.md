@@ -105,6 +105,13 @@ the formatter handles the rest.
   fields is not judged, so older nodes behave as before. The same check
   drops a stale `failed` (the gap noted on #1806).
 
+- **The MAC-sighting sniffer no longer re-imports scapy and re-walks the
+  layer chain on every frame (#1109, Part 4).** `parse_sighting_packet`
+  ran seven `from scapy... import` statements and up to six `haslayer`
+  walks per ARP / ND packet. The layer classes are now resolved once on
+  first use and the chain is walked once; the extracted `(MAC, IP)` pairs
+  are unchanged. Parts 1 and 3 shipped earlier; the DNS half of Part 2
+  shipped with #1111, whose DHCP / looking-glass half remains open.
 - **A rolling upgrade no longer drops its Lease on one unanswered
   kubeapi read, and a `running` run whose drive is gone is resumed
   (#1713).** A node reboot or a loaded host makes a Lease read time out;
@@ -4428,8 +4435,6 @@ the formatter handles the rest.
 
 ### Migrations
 
-- `a1903c5e7b24` — #1903, additive: nullable `appliance.cluster_transition_id`
-  and `appliance.cluster_transition_at`. Downgrade drops both.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column
@@ -4503,6 +4508,8 @@ the formatter handles the rest.
 - `d9d0f6ddc446` — #1838: nullable `backup_target.last_run_node`, the
   node whose pod wrote `last_run_filename`. No backfill: an existing row
   cannot say where its archive was written, so NULL (unknown) stays.
+- `a1903c5e7b24` — #1903, additive: nullable `appliance.cluster_transition_id`
+  and `appliance.cluster_transition_at`. Downgrade drops both.
 
 ## 2026.10.02-1 — 2026-10-02
 
