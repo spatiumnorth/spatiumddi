@@ -260,7 +260,8 @@ def test_hsts_only_where_tls_terminates() -> None:
     # peer (``$spatium_proxy_trusted`` = 1); anyone else gets $scheme.
     source, entries = _map(text, "spatium_forwarded_proto")
     assert source == "$spatium_proxy_trusted:$http_x_forwarded_proto", source
-    assert entries.pop("default") == "$scheme", entries
+    default = entries.pop("default")
+    assert default == "$scheme", entries
     for key in entries:
         assert re.match(r"~\*?\^1:|1:", key), (
             f"`{key}` would take X-Forwarded-Proto from an untrusted client"
