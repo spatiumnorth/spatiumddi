@@ -93,14 +93,17 @@ def test_a_death_with_the_oom_killer_is_recorded(supervised, oom_events) -> None
         _events(oom_events, 1)
         sv.drv.die()
 
-    assert sv.run({1: sv.drv.launch, 3: oom_kill}) == 2
+    rc = sv.run({1: sv.drv.launch, 3: oom_kill})
+
+    assert rc == 2
     assert ("error", "dns_daemon_exited", {"driver": "bind9"}) in sv.spy.calls
     assert (sv.drv.state_dir / "daemon_oom.json").exists()
 
 
 def test_a_plain_death_records_nothing(supervised, oom_events) -> None:  # noqa: F811
     sv = supervised
-    assert sv.run({1: sv.drv.launch, 3: sv.drv.die}) == 2
+    rc = sv.run({1: sv.drv.launch, 3: sv.drv.die})
+    assert rc == 2
     assert not (sv.drv.state_dir / "daemon_oom.json").exists()
 
 
@@ -115,7 +118,8 @@ def test_the_restarted_agent_reports_not_serving_until_the_daemon_stays_up(
         seen.append(dict(sv.idles[0].daemon_status))  # idles[0] is the heartbeat
 
     # The daemon coming up is not the daemon surviving: still degraded.
-    assert sv.run({1: look, 2: sv.drv.launch, 4: look, 5: sv.sigterm}) == 0
+    rc = sv.run({1: look, 2: sv.drv.launch, 4: look, 5: sv.sigterm})
+    assert rc == 0
     assert all(s.get("reason", "").startswith("oom_killed:") for s in seen), seen
     assert (sv.drv.state_dir / "daemon_oom.json").exists()
 
@@ -128,16 +132,14 @@ def test_the_record_clears_once_the_daemon_stays_up(
     monkeypatch.setattr(supervisor, "STABLE_SECONDS", 0.0)
     seen: list[dict[str, Any]] = []
 
-    assert (
-        sv.run(
-            {
-                1: sv.drv.launch,
-                4: lambda: seen.append(dict(sv.idles[0].daemon_status)),
-                5: sv.sigterm,
-            }
-        )
-        == 0
+    rc = sv.run(
+        {
+            1: sv.drv.launch,
+            4: lambda: seen.append(dict(sv.idles[0].daemon_status)),
+            5: sv.sigterm,
+        }
     )
+    assert rc == 0
     assert seen == [{"status": "ok"}]
     assert not (sv.drv.state_dir / "daemon_oom.json").exists()
 
