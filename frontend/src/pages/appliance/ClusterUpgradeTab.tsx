@@ -216,6 +216,18 @@ function LeasePill({ lease }: { lease: UpgradeLeaseState | undefined }) {
         Lease free
       </span>
     );
+  // "<unreachable>" / "<rbac-missing>" / "<forbidden>": the API could not
+  // read the Lease, so nobody knows who holds it (#1713). Not a holder to
+  // force-release; the server would refuse an unreadable Lease anyway.
+  if (lease.holder?.startsWith("<"))
+    return (
+      <span
+        className="break-all rounded-md bg-amber-500/10 px-1.5 py-0.5 font-mono text-xs text-amber-700 dark:text-amber-300"
+        title="The Lease could not be read, so it is treated as held: no new run starts until it can be."
+      >
+        Lease unknown · {lease.holder}
+      </span>
+    );
   const renewed = lease.renew_time ? Date.parse(lease.renew_time) : NaN;
   const idleS = Number.isNaN(renewed) ? null : (Date.now() - renewed) / 1000;
   // Only offered once the holder looks dead; the server decides.

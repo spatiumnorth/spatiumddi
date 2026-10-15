@@ -408,6 +408,13 @@ async def post_start(run_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Up
     # run with no live lease is a dead driver's, and Start resumes it.
     if run.state == "running":
         lease = mutex.get_state()
+        if lease.held and (lease.holder or "").startswith("<"):
+            # #1713 — the Lease could not be read: whether a drive holds it
+            # is unknown, which is not a reason to enqueue a second one.
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                f"the upgrade Lease could not be read ({lease.holder}); retry shortly",
+            )
         if lease.held:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,

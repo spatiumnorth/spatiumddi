@@ -91,15 +91,23 @@ the formatter handles the rest.
   lost a Lease it still held, and it exited after the node in flight
   with the run left `running` and nothing to re-drive it (seen twice:
   one of three nodes upgraded, run idle for 2 h 50 min). An unanswered
-  read is now unknown: the renewal retries every 15 s until the Lease
-  could genuinely have expired (600 s after the last renewal), and
-  only a Lease seen held by another, or a refused write, ends the
-  drive. `get_state` reports an unanswered read as held by
-  `<unreachable>`, never as free. A new beat sweep, every minute,
-  re-enqueues `drive_upgrade_run` for a `running` rolling run once the
-  Lease has been free on two sweeps 45 s or more apart, at most once
-  per 10 min; the re-driven task still has to take the Lease, so a
-  live drive wins.
+  read is now unknown, not lost: the drive starts no new node while its
+  Lease is unknown, retries the renewal every 15 s, and gives up 480 s
+  after the last renewal that landed, two minutes before anyone else
+  may take the Lease over. It keeps renewing while the node in flight
+  finishes, so no second drive starts beside it. Only a Lease seen held
+  by another, or a refused write, ends the drive at once. `get_state`
+  reports an unanswered read as held by `<unreachable>`, never as free;
+  Start answers 503 for it instead of enqueueing a drive, the Cluster
+  Upgrade tab shows "Lease unknown" with no Force release, and the
+  drive's own per-node preflight treats it as a warning rather than
+  failing the node. A new beat sweep, every minute, re-enqueues
+  `drive_upgrade_run` for a `running` rolling run once the Lease has
+  been free on two consecutive sweeps 45 s or more apart, at most once
+  per 10 min, keeping a hand-off's "not on this node" or "not on the
+  old tag" request and leaving a hand-off still in transit alone. The
+  re-driven task still has to take the Lease, so a live drive wins. It
+  does nothing on docker-compose, and nothing while Redis is down.
 - **A BIND9-signed zone on the appliance now gets its DS (#1854).**
   The agent derived the DS by running `dnssec-dsfromkey` only when that
   binary was on `PATH`, and the Alpine dns-bind9 image does not carry

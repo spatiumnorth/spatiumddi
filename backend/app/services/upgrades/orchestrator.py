@@ -114,9 +114,20 @@ def detect_cnpg_cluster_name(namespace: str | None = None) -> str:
 # before expiration.
 LEASE_DURATION_S = 600  # 10 min
 _LEASE_RENEW_INTERVAL_S = LEASE_DURATION_S / 3.0
-# An unanswered renewal is retried this often until the Lease could have
-# expired (#1713).
+# An unanswered renewal is retried this often (#1713).
 _LEASE_RENEW_RETRY_S = 15.0
+# #1713 — how long a drive may go on treating its Lease as held with no
+# renewal confirmed. It must end strictly before anyone else may take the
+# Lease over: a would-be acquirer reads ``renewTime`` (stamped by THIS
+# worker's clock, after the renewal attempt started) and takes over once its
+# own clock says ``leaseDurationSeconds`` have passed. The margin covers the
+# skew between the two clocks and the length of the renewal call itself (a
+# read and a write, each up to the kubeapi helpers' 10 s timeout), since the
+# give-up is only checked when a call returns.
+_LEASE_EXPIRY_MARGIN_S = 120.0
+_LEASE_SAFE_HOLD_S = LEASE_DURATION_S - _LEASE_EXPIRY_MARGIN_S
+# Patched by tests; asyncio's own clock must stay real.
+_monotonic = time.monotonic
 
 
 # When the per-node primitive succeeds the orchestrator gates the next
@@ -725,64 +736,90 @@ async def _record_node_after_stop(
     )
 
 
-async def _lease_renewal_loop(stop_event: asyncio.Event, holder: str) -> None:
+async def _lease_renewal_loop(
+    stop_event: asyncio.Event,
+    holder: str,
+    until: asyncio.Event | None = None,
+    renewed_at: float | None = None,
+    lease_ok: asyncio.Event | None = None,
+) -> None:
     """Background task — renew the upgrade Lease every
-    ``LEASE_DURATION_S / 3`` seconds until ``stop_event`` is set.
+    ``LEASE_DURATION_S / 3`` seconds until ``until`` is set (default:
+    ``stop_event``).
 
-    On renewal failure (someone else claimed the lease, or kubeapi
-    transient) we set ``stop_event`` so the main drive loop exits
-    cleanly. The drive loop checks ``stop_event`` between per-node
-    iterations; we DON'T abort an in-flight per-node primitive
-    because canceling a mid-drain / mid-cordon would leave the
-    cluster in an ambiguous state. The next orchestrator that picks
-    up the row resumes from the row's progress.
+    On a lost Lease (seen held by someone else, or gone, or a write refused
+    with a conflict) we set ``stop_event`` so the main drive loop exits
+    cleanly, and stop renewing. The drive loop checks ``stop_event`` between
+    per-node iterations; we DON'T abort an in-flight per-node primitive
+    because canceling a mid-drain / mid-cordon would leave the cluster in an
+    ambiguous state. The next orchestrator that picks up the row resumes
+    from the row's progress.
+
+    #1713 — a renewal the kubeapi did not answer is UNKNOWN, not lost: the
+    Lease is most likely still ours. ``lease_ok`` is cleared, which pauses
+    the drive before its next node, and the renewal is retried every
+    ``_LEASE_RENEW_RETRY_S``. Once ``_LEASE_SAFE_HOLD_S`` has passed since
+    the last renewal that landed (measured from when that attempt STARTED,
+    which is no later than the ``renewTime`` it wrote), the drive gives up:
+    ``stop_event`` is set while the Lease is still unexpired for everyone
+    else. With a separate ``until`` the retries go on after that, so a
+    renewal that lands keeps the Lease ours while the node in flight
+    finishes, and nothing else starts a drive beside it.
     """
-    # When the Lease was last known renewed (or acquired): it can only have
-    # expired LEASE_DURATION_S after this, however many renewals went unanswered.
-    last_ok = time.monotonic()
-    while not stop_event.is_set():
+    done = until or stop_event
+    confirmed = _monotonic() if renewed_at is None else renewed_at
+    gave_up = False
+    wait_s = _LEASE_RENEW_INTERVAL_S
+    while not done.is_set():
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=_LEASE_RENEW_INTERVAL_S)
-            return  # stop_event set during the wait
+            await asyncio.wait_for(done.wait(), timeout=wait_s)
+            return  # done during the wait
         except TimeoutError:
             pass
-        while True:
-            try:
-                ok, err = mutex.renew(holder=holder, lease_duration_seconds=LEASE_DURATION_S)
-            except mutex.LeaseUnknownError as exc:
-                # #1713 — the kubeapi did not answer (a node rebooting, a host
-                # under load). The Lease is unknown, not lost: retry until it
-                # could genuinely have expired, then give up.
-                remaining = LEASE_DURATION_S - (time.monotonic() - last_ok)
-                if remaining <= 0:
-                    logger.warning("upgrade_lease_renew_failed", error=f"unanswered: {exc}")
-                    stop_event.set()
-                    return
+        attempt_started = _monotonic()
+        try:
+            ok, err = mutex.renew(holder=holder, lease_duration_seconds=LEASE_DURATION_S)
+        except mutex.LeaseUnknownError as exc:
+            if lease_ok is not None:
+                lease_ok.clear()
+            left = _LEASE_SAFE_HOLD_S - (_monotonic() - confirmed)
+            if left > 0:
                 logger.warning(
                     "upgrade_lease_renew_unanswered",
                     error=str(exc),
-                    lease_remaining_s=round(remaining, 1),
+                    give_up_in_s=round(left, 1),
                 )
-                try:
-                    await asyncio.wait_for(
-                        stop_event.wait(), timeout=min(_LEASE_RENEW_RETRY_S, remaining)
-                    )
-                    return
-                except TimeoutError:
-                    continue
-            except Exception as exc:  # noqa: BLE001 — any failure here means "not renewed"
-                # An error the kubeapi helpers do not map (#1704) would end this
-                # task silently, leaving the drive running on a Lease nothing
-                # renews. Treat it as a lost Lease.
-                logger.warning("upgrade_lease_renew_crashed", error=str(exc))
+                wait_s = min(_LEASE_RENEW_RETRY_S, left)
+                continue
+            if not gave_up:
+                gave_up = True
+                logger.warning("upgrade_lease_renew_failed", error=f"unanswered: {exc}")
                 stop_event.set()
-                return
-            break
-        if not ok:
-            logger.warning("upgrade_lease_renew_failed", error=err)
+                if done is stop_event:
+                    return
+            wait_s = _LEASE_RENEW_RETRY_S
+            continue
+        except Exception as exc:  # noqa: BLE001 — any failure here means "not renewed"
+            # An error the kubeapi helpers do not map (#1704) would end this
+            # task silently, leaving the drive running on a Lease nothing
+            # renews. Treat it as a lost Lease.
+            logger.warning("upgrade_lease_renew_crashed", error=str(exc))
+            if lease_ok is not None:
+                lease_ok.clear()
             stop_event.set()
             return
-        last_ok = time.monotonic()
+        if not ok:
+            logger.warning("upgrade_lease_renew_failed", error=err)
+            if lease_ok is not None:
+                lease_ok.clear()
+            stop_event.set()
+            return
+        confirmed = attempt_started
+        if lease_ok is not None:
+            lease_ok.set()
+        if gave_up:
+            logger.info("upgrade_lease_renew_recovered")
+        wait_s = _LEASE_RENEW_INTERVAL_S
 
 
 async def drive_upgrade(
@@ -823,6 +860,9 @@ async def drive_upgrade(
     # and a second task under the pod's name renewed the first one's lease
     # and ran a second drive loop beside it.
     me = holder or mutex.drive_identity()
+    # #1713 — when this drive's Lease was last confirmed, from before the
+    # acquire that writes its renewTime.
+    acquire_started = _monotonic()
     if run.state == "planned":
         # First call — acquire the lease.
         ok, err = mutex.acquire(holder=me, lease_duration_seconds=LEASE_DURATION_S)
@@ -858,11 +898,19 @@ async def drive_upgrade(
         return run
 
     stop_event = asyncio.Event()
-    renewal_task = asyncio.create_task(_lease_renewal_loop(stop_event, me))
+    # The renewal outlives a give-up (#1713): it ends with the drive, so a
+    # renewal that lands keeps the Lease while the node in flight finishes.
+    renewal_done = asyncio.Event()
+    lease_ok = asyncio.Event()
+    lease_ok.set()
+    renewal_task = asyncio.create_task(
+        _lease_renewal_loop(stop_event, me, renewal_done, acquire_started, lease_ok)
+    )
     try:
-        await _drive_loop(db, run, stop_event, me)
+        await _drive_loop(db, run, stop_event, me, lease_ok=lease_ok)
     finally:
         stop_event.set()
+        renewal_done.set()
         # Wait for the renewal loop to exit cleanly. The ``await`` IS
         # the side-effect — it blocks until the task finishes after
         # the ``stop_event.set()`` above. github-code-quality's
@@ -883,6 +931,8 @@ async def _drive_loop(
     run: SystemUpgradeRun,
     stop_event: asyncio.Event,
     holder: str | None = None,
+    *,
+    lease_ok: asyncio.Event | None = None,
 ) -> None:
     """The per-node iteration. Each cycle:
 
@@ -904,6 +954,7 @@ async def _drive_loop(
     # #1544 — the namespace the chart-bump poll reads the release's
     # Deployments in; the per-node control-plane gate reads the same one.
     release_namespace: str = run.plan.get("release_namespace") or chart_bump.DEFAULT_RELEASE_NS
+    paused = False
 
     while True:
         if stop_event.is_set():
@@ -912,6 +963,12 @@ async def _drive_loop(
             # mis-attribute a transient kubeapi blip as a real
             # upgrade failure.
             logger.warning("upgrade_drive_exit_lease_lost", run_id=str(run.id))
+            if holder and lease_ok is not None and lease_ok.is_set():
+                # #1713 — the renewal gave up, then landed again while the
+                # node in flight finished: the Lease is still this drive's.
+                # Free it (only ours, as a compare-and-swap) so the orphan
+                # sweep resumes the run now rather than after it lapses.
+                mutex.release_if_held(holder=holder)
             return
 
         await db.refresh(run)
@@ -930,6 +987,23 @@ async def _drive_loop(
             # A second drive took the Lease over (#1704): the run is its.
             logger.warning("upgrade_drive_exit_lease_taken", run_id=str(run.id))
             return
+        if lease_ok is not None and not lease_ok.is_set():
+            # #1713 — the last renewal went unanswered: the Lease is unknown,
+            # so start nothing new (a node, a hand-off, the tag flip, the
+            # chart bump) until one lands. The renewal sets ``stop_event``
+            # before the Lease could lapse; re-checked every retry so a Halt
+            # or Abort is still seen.
+            if not paused:
+                paused = True
+                logger.warning("upgrade_drive_paused_lease_unknown", run_id=str(run.id))
+            try:
+                await asyncio.wait_for(lease_ok.wait(), timeout=_LEASE_RENEW_RETRY_S)
+            except TimeoutError:
+                pass
+            continue
+        if paused:
+            paused = False
+            logger.info("upgrade_drive_resumed_lease_confirmed", run_id=str(run.id))
 
         per_node_progress = dict(run.progress.get("per_node") or {})
         completed_nodes = [

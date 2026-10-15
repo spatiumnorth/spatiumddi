@@ -134,6 +134,17 @@ def check_inflight_conflict(
             message="the upgrade lease is held by this run",
             detail={"holder": state.holder, "transitions": state.transitions},
         )
+    if own_holder and state.holder == "<unreachable>":
+        # #1713 — the kubeapi did not answer the read. The run asking holds
+        # the Lease by its own renewals, which stop the drive if it is lost;
+        # failing its node on a read nobody answered would fail the run on
+        # the reboot blip that follows every node.
+        return PreflightResult(
+            name="inflight_conflict",
+            level="warn",
+            message="the upgrade lease could not be read; this run's renewals hold it",
+            detail={"holder": state.holder},
+        )
     if state.held and not state.expired:
         return PreflightResult(
             name="inflight_conflict",
