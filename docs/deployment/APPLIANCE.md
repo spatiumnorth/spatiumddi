@@ -3089,7 +3089,12 @@ so a first-time operator never gets stuck looking for the upload.
    judged), `mirror_disk_headroom` (mirror PVC; skipped if not
    configured; an uploaded target the mirror already holds needs only
    the margin),
-   `version_path`, `quorum`. Any `fail` blocks Plan; `warn` lets
+   `version_path`, `quorum`. With an uploaded image the disk checks
+   size the need from it (#1919): a node needs twice the image + 1 GiB
+   (the staged `.raw.xz`, then the new slot's container images
+   imported beside the old slot's on its first boot), the mirror the
+   image + 1 GiB. A URL source, whose size is unknown until it is
+   downloaded, is judged as a 4 GiB image. Any `fail` blocks Plan; `warn` lets
    Plan proceed but flags the row.
 5. Clicks **Plan**. A `system_upgrade_run` row is inserted in
    `state='planned'` with the captured node order + the preflight

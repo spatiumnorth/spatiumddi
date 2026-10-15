@@ -156,15 +156,89 @@ async def test_node_need_follows_the_plan_images_size(
 ) -> None:
     _stub_others(monkeypatch)
     monkeypatch.setattr(settings, "slot_image_mirror_url", "")
-    # 3.5 GiB free: short of the 4+1 GiB default, room for 1.79+1 GiB.
-    await _node(db_session, int(3.5 * GIB))
+    # 4.75 GiB free: short of the 4+1 GiB default, room for 2 x 1.79 + 1 GiB
+    # (the staged .raw.xz, then the new slot's images imported beside the
+    # old ones on first boot).
+    await _node(db_session, int(4.75 * GIB))
 
     sized = await preflight.run_all(target_version="2026.10.15-900", slot_image_id=IMAGE)
     unsized = await preflight.run_all(target_version="2026.10.15-900")
 
     disk = [r for r in sized.results if r.name == "disk_headroom"][0]
     assert disk.level == "ok", disk.message
+    assert disk.detail["needed_bytes"] == 2 * 1_921_378_068 + GIB
     assert sized.can_start is True
     # Unknown size (no image named) stays fail-closed at the 4 GiB default.
     udisk = [r for r in unsized.results if r.name == "disk_headroom"][0]
     assert udisk.level == "fail"
+
+
+@pytest.mark.asyncio
+async def test_node_need_is_not_the_compressed_image_alone(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3.5 GiB holds the 1.79 GiB .raw.xz + 1 GiB, but not the image set the
+    new slot imports into containerd on its first boot: refused, not failed
+    mid-upgrade."""
+    _stub_others(monkeypatch)
+    monkeypatch.setattr(settings, "slot_image_mirror_url", "")
+    await _node(db_session, int(3.5 * GIB))
+
+    report = await preflight.run_all(target_version="2026.10.15-900", slot_image_id=IMAGE)
+
+    disk = [r for r in report.results if r.name == "disk_headroom"][0]
+    assert disk.level == "fail", disk.message
+    assert report.can_start is False
+
+
+@pytest.mark.asyncio
+async def test_mirror_need_follows_the_plan_images_size(
+    db_session: AsyncSession, mirror_app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mirror stores the compressed file, so it needs 1x the image +
+    1 GiB: 3 GiB free passes a 1.79 GiB image it does not yet hold."""
+    _stub_others(monkeypatch)
+    _route_httpx_to(monkeypatch, mirror_app)
+    monkeypatch.setattr(
+        slot_image_mirror.shutil,
+        "disk_usage",
+        lambda _p: type("U", (), {"free": 3 * GIB, "total": 20 * GIB, "used": 17 * GIB})(),
+    )
+    await _node(db_session, 10 * GIB)
+    (Path(os.environ["SPATIUM_SLOT_IMAGE_DIR"]) / f"{IMAGE}.raw.xz").unlink()
+
+    report = await preflight.run_all(target_version="2026.10.15-900", slot_image_id=IMAGE)
+
+    mirror = [r for r in report.results if r.name == "mirror_disk_headroom"][0]
+    assert mirror.level == "ok", mirror.message
+    assert mirror.detail["needed_bytes"] == 1_921_378_068 + GIB
+
+
+@pytest.mark.asyncio
+async def test_preview_preflight_judges_the_named_image_like_plan(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The UI enables Plan only on a passing preview, so the preview must
+    size the need from the same image the Plan names, or it refuses what
+    the Plan would accept. Same for the copilot's preflight tool."""
+    from app.api.v1 import upgrades as upgrades_api
+    from app.services.ai.tools import upgrades as upgrade_tools
+
+    _stub_others(monkeypatch)
+    monkeypatch.setattr(settings, "slot_image_mirror_url", "")
+    monkeypatch.setattr(upgrade_tools, "_superadmin_gate", lambda _u: None)
+    await _node(db_session, int(4.75 * GIB))
+
+    named = await upgrades_api.get_preflight(target="2026.10.15-900", slot_image_id=IMAGE)
+    unnamed = await upgrades_api.get_preflight(target="2026.10.15-900")
+    tool = await upgrade_tools.find_upgrade_preflight(
+        db_session,
+        None,  # type: ignore[arg-type]
+        upgrade_tools.FindUpgradePreflightArgs(
+            target_version="2026.10.15-900", slot_image_id=IMAGE
+        ),
+    )
+
+    assert named.can_start is True
+    assert unnamed.can_start is False
+    assert tool["can_start"] is True

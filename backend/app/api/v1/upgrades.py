@@ -89,13 +89,17 @@ class LeaseStateOut(BaseModel):
     dependencies=[Depends(require_permission("read", "appliance"))],
     summary="Run pre-flight safety checks for a rolling upgrade to <target>",
 )
-async def get_preflight(target: str) -> PreflightReportOut:
+async def get_preflight(target: str, slot_image_id: uuid.UUID | None = None) -> PreflightReportOut:
+    """``slot_image_id`` is the uploaded image the Plan will name (#1919): the
+    disk checks then size the need from it and apply the "already on the
+    mirror" exemption, as the Plan's own preflight does. Without it they
+    judge the 4 GiB default, so a preview could refuse what Plan accepts."""
     if not target or len(target) > 64:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "target must be a 1-64 char release tag (e.g. 2026.06.01-1 or 1.0.0)",
         )
-    report = await preflight.run_all(target_version=target)
+    report = await preflight.run_all(target_version=target, slot_image_id=slot_image_id)
     return PreflightReportOut(**report.to_dict())
 
 

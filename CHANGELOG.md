@@ -90,9 +90,19 @@ the formatter handles the rest.
   HEAD, FastAPI's `APIRoute` does not turn a GET route into a HEAD, and the
   mirror answered 405, which the check reads as unknown. The mirror now
   serves HEAD on the image route (200 stored, 404 not, no body, same auth as
-  the GET). Separately, `disk_headroom` and `mirror_disk_headroom` asked for
-  a 4 GiB image whatever the Plan's; they now size the need from the
-  uploaded image's `size_bytes` (an unknown size keeps the 4 GiB default).
+  the GET); the re-upload presence check, which sent the same HEAD and got a
+  502 against a real mirror, works too. Separately, `disk_headroom` and
+  `mirror_disk_headroom` asked for a 4 GiB image whatever the Plan's; they
+  now size the need from the uploaded image's `size_bytes`. The mirror needs
+  the image + 1 GiB, since it stores the compressed file. A node needs
+  **twice** the image + 1 GiB: it stages the compressed file on `/var`, and
+  on the new slot's first boot imports that slot's container images beside
+  the old slot's, which is the larger write (~1.6x the image, measured). An
+  unknown size keeps the 4 GiB default. **Run preflight** in the UI, `GET
+  /upgrades/preflight` (new `slot_image_id` parameter) and the
+  `find_upgrade_preflight` copilot tool now judge the image the Plan will
+  name. Before, the preview judged neither the size nor the mirror
+  exemption, and the UI only enables Plan on a passing preview.
 
 - **A rolling upgrade no longer drops its Lease on one unanswered
   kubeapi read, and a `running` run whose drive is gone is resumed
