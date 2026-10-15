@@ -88,8 +88,6 @@ def test_missing_dir_is_logged(tmp_path: Path, capsys) -> None:
 
 def test_each_key_gets_its_own_ds(monkeypatch) -> None:
     """A per-key DS is the DS of THAT key, not every KSK's DS."""
-    import spatium_dns_agent.drivers.bind9 as b
-
     ds_a = "example.test. IN DS 100 13 2 AA"
     ds_b = "example.test. IN DS 200 13 2 BB"
     keys = [
@@ -103,10 +101,10 @@ def test_each_key_gets_its_own_ds(monkeypatch) -> None:
         returncode = 0
         stdout = ""
 
-    monkeypatch.setattr(b, "_ds_from_key_dir", lambda zone, key_dir: [ds_a, ds_b])
-    monkeypatch.setattr(b.shutil, "which", lambda name: "/usr/sbin/rndc")
-    monkeypatch.setattr(b, "_parse_dnssec_status", lambda text: [dict(k) for k in keys])
-    monkeypatch.setattr(b.subprocess, "run", lambda *a, **kw: _Res())
+    monkeypatch.setattr("spatium_dns_agent.drivers.bind9._ds_from_key_dir", lambda zone, key_dir: [ds_a, ds_b])
+    monkeypatch.setattr("spatium_dns_agent.drivers.bind9.shutil.which", lambda name: "/usr/sbin/rndc")
+    monkeypatch.setattr("spatium_dns_agent.drivers.bind9._parse_dnssec_status", lambda text: [dict(k) for k in keys])
+    monkeypatch.setattr("spatium_dns_agent.drivers.bind9.subprocess.run", lambda *a, **kw: _Res())
     d = Bind9Driver.__new__(Bind9Driver)
     monkeypatch.setattr(d, "_rndc_base", lambda: ["rndc"], raising=False)
 
