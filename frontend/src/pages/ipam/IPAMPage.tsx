@@ -7739,7 +7739,7 @@ function DriftRow({
   );
 }
 
-function EditSubnetModal({
+export function EditSubnetModal({
   subnet,
   onClose,
   onDeleted,
@@ -7993,6 +7993,9 @@ function EditSubnetModal({
   });
 
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  // A delete the approval queue took (#62) is not an error: it gets the
+  // neutral box, and the dialog stops offering to send it again (#1915).
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
   const deleteMutation = useMutation({
     // EditSubnetModal's two-step delete already requires the
     // operator to tick "…and all its contents will be permanently
@@ -8003,8 +8006,8 @@ function EditSubnetModal({
       // queued change-request instead of deleting. Surface the message,
       // refresh the approval queue, and leave the subnet in place.
       if (handleApprovalQueued(resp)) {
-        setDeleteError(APPROVAL_QUEUED_MESSAGE);
-        qc.invalidateQueries({ queryKey: ["change-requests"] });
+        setDeleteNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
         return;
       }
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
@@ -8027,6 +8030,7 @@ function EditSubnetModal({
   function resetDelete() {
     setDeleteStep(0);
     setDeleteError(null);
+    setDeleteNotice(null);
     setDeleteChecked(false);
   }
 
@@ -8108,19 +8112,29 @@ function EditSubnetModal({
               {deleteError}
             </div>
           )}
+          {deleteNotice && (
+            <div
+              role="status"
+              className="rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400"
+            >
+              {deleteNotice}
+            </div>
+          )}
           <div className="flex justify-end gap-2">
             <button
               onClick={resetDelete}
               className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
-              Cancel
+              {deleteNotice ? "Close" : "Cancel"}
             </button>
             <button
               onClick={() => {
                 setDeleteError(null);
                 deleteMutation.mutate();
               }}
-              disabled={!deleteChecked || deleteMutation.isPending}
+              disabled={
+                !deleteChecked || deleteMutation.isPending || !!deleteNotice
+              }
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
               {deleteMutation.isPending ? "Deleting…" : "Move to Trash"}
@@ -11067,6 +11081,7 @@ export function ConfirmDestroyModal({
   // Non-error feedback shown in a neutral box — used for the #62
   // two-person approval queue "Submitted for approval" message, where
   // the delete returned 202 instead of executing.
+  // While it is set the dialog offers Close and no longer offers to delete.
   notice?: string | null;
 }) {
   const [step, setStep] = useState<1 | 2>(1);
@@ -11083,7 +11098,10 @@ export function ConfirmDestroyModal({
             </div>
           )}
           {notice && (
-            <div className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400">
+            <div
+              role="status"
+              className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400"
+            >
               {notice}
             </div>
           )}
@@ -11130,7 +11148,10 @@ export function ConfirmDestroyModal({
           </div>
         )}
         {notice && (
-          <div className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400">
+          <div
+            role="status"
+            className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400"
+          >
             {notice}
           </div>
         )}
@@ -11139,11 +11160,13 @@ export function ConfirmDestroyModal({
             onClick={onClose}
             className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
           >
-            Cancel
+            {notice ? "Close" : "Cancel"}
           </button>
           <button
             onClick={onConfirm}
-            disabled={!checked || isPending}
+            // Once the approval queue has taken the request (#1915), sending
+            // it again would file a second change request for the same delete.
+            disabled={!checked || isPending || !!notice}
             className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
           >
             {isPending ? "Deleting…" : "Move to Trash"}
@@ -11350,6 +11373,8 @@ export function EditSpaceModal({
   const [saveError, setSaveError] = useState<string | null>(null);
 
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  // Queued for approval (#62) is not an error — neutral box (#1915).
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
   const deleteMutation = useMutation({
     mutationFn: () => ipamApi.deleteSpace(space.id),
     onSuccess: (resp) => {
@@ -11357,7 +11382,7 @@ export function EditSpaceModal({
       // queued change-request instead of deleting. Say so and leave the
       // space in place (#1915).
       if (handleApprovalQueued(resp)) {
-        setDeleteError(APPROVAL_QUEUED_MESSAGE);
+        setDeleteNotice(APPROVAL_QUEUED_MESSAGE);
         qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
         return;
       }
@@ -11409,7 +11434,13 @@ export function EditSpaceModal({
   // ── Delete step 2: final confirm with checkbox ──
   if (deleteStep === 2) {
     return (
-      <Modal title="Move to Trash" onClose={() => setDeleteStep(0)}>
+      <Modal
+        title="Move to Trash"
+        onClose={() => {
+          setDeleteStep(0);
+          setDeleteNotice(null);
+        }}
+      >
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">
             <strong className="text-foreground">{space.name}</strong>, with
@@ -11432,19 +11463,32 @@ export function EditSpaceModal({
               {deleteError}
             </p>
           )}
+          {deleteNotice && (
+            <div
+              role="status"
+              className="rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400"
+            >
+              {deleteNotice}
+            </div>
+          )}
           <div className="flex justify-end gap-2">
             <button
-              onClick={() => setDeleteStep(0)}
+              onClick={() => {
+                setDeleteStep(0);
+                setDeleteNotice(null);
+              }}
               className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
-              Cancel
+              {deleteNotice ? "Close" : "Cancel"}
             </button>
             <button
               onClick={() => {
                 setDeleteError(null);
                 deleteMutation.mutate();
               }}
-              disabled={!deleteChecked || deleteMutation.isPending}
+              disabled={
+                !deleteChecked || deleteMutation.isPending || !!deleteNotice
+              }
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
               {deleteMutation.isPending ? "Deleting…" : "Move to Trash"}
@@ -12145,12 +12189,14 @@ export function EditBlockModal({
   });
 
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  // Queued for approval (#62) is not an error — neutral box (#1915).
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
   const deleteMutation = useMutation({
     mutationFn: () => ipamApi.deleteBlock(block.id),
     onSuccess: (resp) => {
       // Two-person approval (#62): queued, not deleted (#1915).
       if (handleApprovalQueued(resp)) {
-        setDeleteError(APPROVAL_QUEUED_MESSAGE);
+        setDeleteNotice(APPROVAL_QUEUED_MESSAGE);
         qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
         return;
       }
@@ -12206,7 +12252,13 @@ export function EditBlockModal({
   // ── Delete step 2 ──
   if (deleteStep === 2) {
     return (
-      <Modal title="Move to Trash" onClose={() => setDeleteStep(0)}>
+      <Modal
+        title="Move to Trash"
+        onClose={() => {
+          setDeleteStep(0);
+          setDeleteNotice(null);
+        }}
+      >
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">
             <strong className="text-foreground font-mono">
@@ -12231,19 +12283,32 @@ export function EditBlockModal({
               {deleteError}
             </p>
           )}
+          {deleteNotice && (
+            <div
+              role="status"
+              className="rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400"
+            >
+              {deleteNotice}
+            </div>
+          )}
           <div className="flex justify-end gap-2">
             <button
-              onClick={() => setDeleteStep(0)}
+              onClick={() => {
+                setDeleteStep(0);
+                setDeleteNotice(null);
+              }}
               className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
-              Cancel
+              {deleteNotice ? "Close" : "Cancel"}
             </button>
             <button
               onClick={() => {
                 setDeleteError(null);
                 deleteMutation.mutate();
               }}
-              disabled={!deleteChecked || deleteMutation.isPending}
+              disabled={
+                !deleteChecked || deleteMutation.isPending || !!deleteNotice
+              }
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
               {deleteMutation.isPending ? "Deleting…" : "Move to Trash"}
@@ -15028,7 +15093,7 @@ function BulkEditSubnetsModal({
 
 // ─── Space Section in tree ────────────────────────────────────────────────────
 
-function SpaceSection({
+export function SpaceSection({
   space,
   selectedSubnetId,
   selectedBlockId,

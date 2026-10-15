@@ -5,9 +5,13 @@
  *
  * With `governance.approvals` on and a policy matching, DELETE on an IP
  * space / block / subnet answers 202 with a queued change request and the
- * object stays. The IPAM delete dialogs read the response as "deleted":
- * they closed on the 202 with no word, while Edit Subnet said "Submitted
- * for approval".
+ * object stays. The IPAM tree's Delete… dialogs, Edit Space and Edit Block
+ * read the response as "deleted": they closed on the 202 with no word,
+ * while Edit Subnet said "Submitted for approval" — in its red error box.
+ *
+ * Each now says so in a neutral status box (a queued request is not an
+ * error), leaves the object where it is, and stops offering to send the
+ * delete again, since a second click would file a second change request.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -22,7 +26,7 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
-import type { IPBlock, IPSpace } from "@/lib/api";
+import type { IPBlock, IPSpace, Subnet } from "@/lib/api";
 
 type Answer = (...args: unknown[]) => unknown;
 const answers: Record<string, Record<string, Answer>> = {};
@@ -50,12 +54,39 @@ vi.mock("@/lib/api", async () => {
   return { ...actual, ...stubs };
 });
 
+// Radix's context menu opens fine under jsdom but then stalls the event loop
+// for ~25 s (layout reads jsdom does slowly), so each row's menu is rendered
+// inline as plain buttons. What is under test is the dialog the item opens.
+vi.mock("@/components/ui/context-menu", () => {
+  const Pass = ({ children }: { children?: ReactNode }) => <>{children}</>;
+  return {
+    ContextMenu: Pass,
+    ContextMenuTrigger: Pass,
+    ContextMenuPortal: Pass,
+    ContextMenuGroup: Pass,
+    ContextMenuContent: Pass,
+    ContextMenuLabel: () => null,
+    ContextMenuSeparator: () => null,
+    ContextMenuItem: ({
+      children,
+      onSelect,
+    }: {
+      children?: ReactNode;
+      onSelect?: () => void;
+    }) => (
+      <button type="button" onClick={() => onSelect?.()}>
+        {children}
+      </button>
+    ),
+  };
+});
+
 vi.mock("@/hooks/useFeatureModules", () => ({
   useFeatureModules: () => ({ ready: true, enabled: () => true }),
 }));
 
-const { EditSpaceModal, EditBlockModal } = await import("./IPAMPage");
-const { IPSpacesPage } = await import("./IPSpacesPage");
+const { EditSpaceModal, EditBlockModal, EditSubnetModal, SpaceSection } =
+  await import("./IPAMPage");
 
 afterEach(() => {
   cleanup();
@@ -78,19 +109,42 @@ function open(ui: ReactNode) {
 
 const topDialog = () => screen.getAllByRole("dialog").at(-1)!;
 
+/** Tick the final step's box and press its destructive button. */
+async function confirmMoveToTrash() {
+  fireEvent.click(within(topDialog()).getByRole("checkbox"));
+  const confirm = within(topDialog()).getByRole("button", {
+    name: "Move to Trash",
+  }) as HTMLButtonElement;
+  await waitFor(() => expect(confirm.disabled).toBe(false));
+  fireEvent.click(confirm);
+}
+
 async function walkDelete(openLabel: RegExp) {
   fireEvent.click(screen.getByRole("button", { name: "Danger zone" }));
   fireEvent.click(screen.getByRole("button", { name: openLabel }));
   fireEvent.click(
     within(topDialog()).getByRole("button", { name: "Continue" }),
   );
-  fireEvent.click(within(topDialog()).getByRole("checkbox"));
-  const confirm = within(topDialog())
-    .getAllByRole("button")
-    .filter((b) => !/^(Cancel|Close)/.test(b.textContent ?? ""))
-    .at(-1) as HTMLButtonElement;
-  await waitFor(() => expect(confirm.disabled).toBe(false));
-  fireEvent.click(confirm);
+  await confirmMoveToTrash();
+}
+
+/** The queued message is a neutral status, not an error, and the dialog
+ *  no longer offers to send the delete a second time. */
+async function expectQueuedNotice(deleteCall: ReturnType<typeof vi.fn>) {
+  const notice = await within(topDialog()).findByRole("status");
+  expect(notice.textContent).toMatch(/Submitted for approval/);
+  expect(notice.className).not.toMatch(/destructive/);
+  expect(
+    (
+      within(topDialog()).getByRole("button", {
+        name: "Move to Trash",
+      }) as HTMLButtonElement
+    ).disabled,
+  ).toBe(true);
+  expect(
+    within(topDialog()).getByRole("button", { name: "Close" }),
+  ).toBeTruthy();
+  expect(deleteCall).toHaveBeenCalledTimes(1);
 }
 
 describe("a delete the approval queue took", () => {
@@ -106,7 +160,7 @@ describe("a delete the approval queue took", () => {
       />,
     );
     await walkDelete(/^Delete this IP space/);
-    await screen.findByText(/Submitted for approval/);
+    await expectQueuedNotice(deleteSpace);
     expect(onDeleted).not.toHaveBeenCalled();
   });
 
@@ -124,21 +178,118 @@ describe("a delete the approval queue took", () => {
       />,
     );
     await walkDelete(/^Delete this block/);
-    await screen.findByText(/Submitted for approval/);
+    await expectQueuedNotice(deleteBlock);
     expect(onDeleted).not.toHaveBeenCalled();
   });
 
-  it("the IP Spaces list says so too", async () => {
+  it("Edit Subnet says it in a status, not its error box", async () => {
+    const deleteSubnet = vi.fn(() => QUEUED);
+    answers.ipamApi = { deleteSubnet };
+    const onDeleted = vi.fn();
+    open(
+      <EditSubnetModal
+        subnet={
+          {
+            id: "sn-1",
+            space_id: "sp-1",
+            block_id: "b-1",
+            network: "10.73.5.0/24",
+          } as Subnet
+        }
+        onClose={() => {}}
+        onDeleted={onDeleted}
+      />,
+    );
+    await walkDelete(/^Delete this subnet/);
+    await expectQueuedNotice(deleteSubnet);
+    expect(onDeleted).not.toHaveBeenCalled();
+  });
+});
+
+describe("the IPAM tree's Delete… on a delete the approval queue took", () => {
+  const space = { id: "sp-1", name: "lab" } as IPSpace;
+  const block = {
+    id: "b-1",
+    space_id: "sp-1",
+    parent_block_id: null,
+    network: "10.73.0.0/16",
+  } as IPBlock;
+  const subnet = {
+    id: "sn-1",
+    space_id: "sp-1",
+    block_id: "b-1",
+    network: "10.73.5.0/24",
+    utilization_percent: 0,
+    total_ips: 254,
+  } as Subnet;
+
+  function openTree(onSelectSubnet = vi.fn()) {
+    open(
+      <SpaceSection
+        space={space}
+        selectedSubnetId={subnet.id}
+        selectedBlockId={null}
+        isSpaceSelected={false}
+        onSelectSpace={() => {}}
+        onSelectSubnet={onSelectSubnet}
+        onSelectBlock={() => {}}
+      />,
+    );
+    return onSelectSubnet;
+  }
+
+  /** Pick the Delete… of the row naming `network`, Continue, confirm. */
+  async function startDelete(network: string) {
+    // The tree's rows render their menus inline here (see the mock above);
+    // each row's Delete… follows its own network in document order.
+    await screen.findByText(network);
+    const items = screen.getAllByText("Delete…");
+    const row = screen.getAllByText(network)[0];
+    const item = items.find(
+      (el) =>
+        row.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING,
+    )!;
+    fireEvent.click(item);
+    fireEvent.click(
+      within(topDialog()).getByRole("button", { name: "Continue" }),
+    );
+    await confirmMoveToTrash();
+  }
+
+  it("a subnet stays selected and the dialog says it was submitted", async () => {
+    const deleteSubnet = vi.fn(() => QUEUED);
     answers.ipamApi = {
-      listSpaces: () =>
-        Promise.resolve([
-          { id: "sp-1", name: "lab", description: "", is_default: false },
-        ]),
-      deleteSpace: () => QUEUED,
+      listBlocks: () => Promise.resolve([block]),
+      listSubnets: () => Promise.resolve([subnet]),
+      deleteSubnet,
     };
-    open(<IPSpacesPage />);
-    const row = (await screen.findByText("lab")).closest("tr")!;
-    fireEvent.click(within(row).getByRole("button"));
-    await screen.findByText(/Submitted for approval/);
+    const onSelectSubnet = openTree();
+    await startDelete(subnet.network);
+    await expectQueuedNotice(deleteSubnet);
+    expect(onSelectSubnet).not.toHaveBeenCalledWith(null);
+  });
+
+  it("a block: the dialog says it was submitted", async () => {
+    const deleteBlock = vi.fn(() => QUEUED);
+    answers.ipamApi = {
+      listBlocks: () => Promise.resolve([block]),
+      listSubnets: () => Promise.resolve([subnet]),
+      deleteBlock,
+    };
+    openTree();
+    await startDelete(block.network);
+    await expectQueuedNotice(deleteBlock);
+  });
+
+  it("a real delete still closes the dialog and clears the selection", async () => {
+    answers.ipamApi = {
+      listBlocks: () => Promise.resolve([block]),
+      listSubnets: () => Promise.resolve([subnet]),
+      deleteSubnet: () => Promise.resolve({ status: 204, data: "" }),
+    };
+    const onSelectSubnet = openTree();
+    await startDelete(subnet.network);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(onSelectSubnet).toHaveBeenCalledWith(null);
   });
 });

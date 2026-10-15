@@ -21,6 +21,10 @@ import {
 } from "lucide-react";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
+  APPROVAL_QUEUED_MESSAGE,
+  CHANGE_REQUEST_QUERY_KEY,
+} from "@/lib/approvalQueue";
+import {
   aiApi,
   nmapApi,
   streamChatTurn,
@@ -1336,7 +1340,7 @@ function YesNoCard({
  *  rejected earlier). The DB / API still call the fields
  *  ``applied_at`` and ``discarded_at`` — the rename is UI-only.
  */
-function ProposalCard({
+export function ProposalCard({
   proposalId,
   operation,
   previewText,
@@ -1356,6 +1360,12 @@ function ProposalCard({
 
   const applyMut = useMutation({
     mutationFn: () => aiApi.applyProposal(proposalId),
+    onSuccess: (resp) => {
+      // A risky op the two-person approval gate took (#62) is queued, not
+      // done: refresh the approval queue so the request shows (#1915).
+      if (resp?.result?.queued_for_approval === true)
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+    },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ["ai-proposal", proposalId] });
     },
@@ -1376,9 +1386,18 @@ function ProposalCard({
     !discarded &&
     new Date(proposal.expires_at).getTime() < Date.now();
   const pending = !applied && !discarded && !expired;
+  // The server stamps ``applied_at`` on a proposal the approval gate queued
+  // (#62) and returns ``result.queued_for_approval``: nothing has changed
+  // yet, so it must not read as done (#1915).
+  const queued = applied && proposal?.result?.queued_for_approval === true;
 
   let badge: { text: string; cls: string };
-  if (applied) {
+  if (queued) {
+    badge = {
+      text: "awaiting approval",
+      cls: "bg-blue-500/10 text-blue-600 border-blue-500/30",
+    };
+  } else if (applied) {
     badge = {
       text: "approved",
       cls: "bg-emerald-500/10 text-emerald-600 border-emerald-500/30",
@@ -1415,6 +1434,14 @@ function ProposalCard({
         <div className="mt-2 whitespace-pre-wrap break-words font-sans text-xs text-foreground/90">
           {proposal?.preview_text || previewText || "(no preview)"}
         </div>
+        {queued && (
+          <div
+            role="status"
+            className="mt-2 rounded border border-blue-500/30 bg-blue-500/5 p-2 text-xs text-blue-600 dark:text-blue-400"
+          >
+            {APPROVAL_QUEUED_MESSAGE}
+          </div>
+        )}
         {applied && proposal?.result && (
           <details className="mt-2 text-xs">
             <summary className="cursor-pointer text-muted-foreground">
