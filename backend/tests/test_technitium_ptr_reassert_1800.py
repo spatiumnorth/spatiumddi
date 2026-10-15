@@ -255,6 +255,7 @@ async def test_agentless_technitium_api_applies_the_reassert_after_the_delete(
 
     monkeypatch.setattr(record_ops, "get_driver", lambda name: Fake())
     await enqueue_record_op(db_session, fwd, "delete", _a_delete())
+    await db_session.commit()  # #1539 — the provider is written by the commit
     assert calls == [("delete", FWD, "A"), ("create", REV, "PTR")]
 
 
@@ -371,6 +372,7 @@ async def test_an_agentless_ipam_address_delete_ends_on_the_ptr_delete(
 
     monkeypatch.setattr(record_ops, "get_driver", lambda name: Fake())
     await _sync_dns_record(db_session, ip, subnet, action="delete")
+    await db_session.commit()  # #1539 — the provider is written by the commit
     ptr_calls = [c for c in calls if c[2] == "PTR"]
     assert ptr_calls and ptr_calls[-1][0] == "delete", calls
 

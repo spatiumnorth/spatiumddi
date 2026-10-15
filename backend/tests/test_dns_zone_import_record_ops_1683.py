@@ -267,7 +267,22 @@ async def test_an_agentless_failure_is_surfaced_not_reported_as_success(
     ops = await _ops(db_session, server)
     assert [(o.state, o.next_attempt_at is not None) for o in ops] == [("pending", True)]
     assert body["provider_warning"] and "503 provider unavailable" in body["provider_warning"]
-    assert (await _last_import_audit(db_session, zone)).result == "error"
+    # #1539 — the import's own audit row is written before the provider is
+    # called, so the refusal is audited as its own row.
+    failed = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "agentless_push_failed",
+                    AuditLog.resource_type == "dns_record_op",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [a.result for a in failed] == ["error"]
+    assert "503 provider unavailable" in (failed[0].error_detail or "")
 
 
 async def test_a_synthesised_zone_refuses_the_import(
