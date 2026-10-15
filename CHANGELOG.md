@@ -755,6 +755,15 @@ the formatter handles the rest.
   node still reporting `left` while its row says `joining`) is guarded the
   same way.
 
+- **A member upgraded after it joined comes out of a demote with its
+  supervisor running (#1866).** The leave put back the bootstrap
+  manifests the member set aside when it joined, and those name the
+  build it joined on. After a slot upgrade the node holds only the new
+  build's images, so the supervisor never started (ErrImageNeverPull)
+  and the row never left `leaving`. The leave now renders the bootstrap
+  manifests again for the build the node runs, as its next boot would,
+  before it restarts k3s.
+
 - **A demoted member whose k3s takes a while to come back no longer
   ends the leave `failed` (#1859).** The leave wipes the node's image
   store with its cluster identity, so its fresh k3s imports every image
