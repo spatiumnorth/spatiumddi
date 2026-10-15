@@ -91,14 +91,19 @@ the formatter handles the rest.
   sidecar already said ready for that seed, and the heartbeat applied the
   reported `ready` (it is the real success signal on a promote), so the
   row became a member with no join having run. Each promote now stamps a
-  fresh `cluster_transition_id`, the heartbeat answers it as
-  `desired_cluster_transition_id`, and the supervisor records the id when
-  it fires the join and echoes it only for a verdict written after that
-  fire. The control plane applies a `ready` / `failed` for a promote only
-  when the ids match, and the supervisor fires the join over a `ready`
-  that is not that promote's. A supervisor that does not send the field
-  is not judged, so older nodes behave as before. The same check drops a
-  stale `failed` (the gap noted on #1806).
+  fresh `cluster_transition_id` and its time; the heartbeat answers the id
+  and the promote's age, the supervisor records the id when it fires the
+  join and reports it, with the age of its sidecar verdict, only for a
+  verdict written after that fire. The control plane applies a `ready` /
+  `failed` for a promote only when the ids match or the verdict is younger
+  than the promote, and the supervisor fires the join over a same-seed
+  `ready` only when that `ready` is provably older than the promote.
+  Ages, not timestamps, cross the wire, so no node clock is compared with
+  the control plane's. A supervisor upgraded mid-join (its join fired
+  before the fire record existed) therefore settles from its fresh `ready`
+  instead of re-firing the join. A supervisor that does not send the
+  fields is not judged, so older nodes behave as before. The same check
+  drops a stale `failed` (the gap noted on #1806).
 
 - **A rolling upgrade no longer drops its Lease on one unanswered
   kubeapi read, and a `running` run whose drive is gone is resumed
@@ -4423,8 +4428,8 @@ the formatter handles the rest.
 
 ### Migrations
 
-- `a1903c5e7b24` — #1903, additive: nullable `appliance.cluster_transition_id`.
-  Downgrade drops it.
+- `a1903c5e7b24` — #1903, additive: nullable `appliance.cluster_transition_id`
+  and `appliance.cluster_transition_at`. Downgrade drops both.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column

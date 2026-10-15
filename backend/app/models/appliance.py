@@ -892,6 +892,15 @@ class Appliance(Base):
     # membership (a Replace-evicted box that is still up) cannot settle a
     # re-promote. NULL = no promote has stamped one.
     cluster_transition_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # #1903 — when that promote was stamped. Never compared with a node's clock:
+    # the heartbeat hands the node its AGE (control-plane now minus this), and the
+    # node compares that with the age of its sidecar verdict (node now minus the
+    # file's mtime). A verdict younger than the promote was written after it, so a
+    # node whose join a pre-#1903 supervisor fired is not re-fired over its fresh
+    # ``ready`` just because it holds no fire record for the id.
+    cluster_transition_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # #590 — when ``cluster_join_state`` last CHANGED. No cluster transition
     # has a timeout (each converges only on a supervisor report), so this is
     # the only way to tell a healthy multi-minute k3s join from one that will

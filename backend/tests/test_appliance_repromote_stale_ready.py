@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
@@ -124,6 +124,12 @@ def test_unproven_verdict_rule() -> None:
     assert not f("T2", "member", "ready", None)  # a supervisor that predates the field
     assert not f(None, "member", "ready", "")  # no promote stamped an id
     assert not f("T2", None, "ready", "")  # nothing in flight
+    # A verdict younger than the promote is this promote's, id or not: the join
+    # an older supervisor fired (then upgraded) holds no fire record.
+    assert not f("T2", "member", "ready", "", 5.0, 300.0)
+    assert f("T2", "member", "ready", "", 3600.0, 300.0)
+    assert f("T2", "member", "ready", "", 5.0, None)  # no promote age: nothing proven
+    assert f("T2", "member", "ready", "", -1.0, 300.0)  # an age from the future
 
 
 async def test_stale_ready_does_not_settle_a_repromote(
@@ -134,6 +140,7 @@ async def test_stale_ready_does_not_settle_a_repromote(
     await db_session.refresh(evicted)
     tid = evicted.cluster_transition_id
     assert tid and evicted.cluster_join_state == CLUSTER_JOIN_STATE_JOINING
+    assert evicted.cluster_transition_at is not None
 
     # The answer names the promote the node must prove.
     out = await _beat(
@@ -209,3 +216,61 @@ async def test_a_supervisor_without_the_field_still_settles(
     )
     await db_session.refresh(evicted)
     assert evicted.cluster_role == CLUSTER_ROLE_MEMBER
+
+
+async def test_a_ready_younger_than_the_promote_settles_without_an_id(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Supervisor upgraded mid-join: the join was fired before the fire record
+    existed, so the node echoes ``""``; its ``ready`` is younger than the promote,
+    so it proves the promote and the row settles — the supervisor is never asked
+    to fire again over a working membership."""
+    admin, evicted, etok, other, _ = await _setup(db_session)
+    await _promote(client, admin, evicted, other)
+    await db_session.refresh(evicted)
+    evicted.cluster_transition_at = datetime.now(UTC) - timedelta(minutes=5)
+    await db_session.commit()
+
+    # Before the ready lands, the answer carries the promote's age, not its time.
+    out = await _beat(client, evicted, etok, cluster_join_state="joining")
+    assert 290 <= out["desired_cluster_transition_age_s"] <= 400
+
+    out = await _beat(
+        client,
+        evicted,
+        etok,
+        cluster_join_state="ready",
+        cluster_join_reason="https://10.0.0.1:6443",
+        cluster_transition_id="",
+        cluster_join_state_age_s=12.0,
+    )
+    await db_session.refresh(evicted)
+    assert evicted.cluster_role == CLUSTER_ROLE_MEMBER
+    assert evicted.desired_cluster_role is None
+    assert out["desired_cluster_role"] is None
+    assert out["desired_cluster_transition_age_s"] is None
+
+
+async def test_a_ready_older_than_the_promote_does_not_settle(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    admin, evicted, etok, other, _ = await _setup(db_session)
+    await _promote(client, admin, evicted, other)
+    await db_session.refresh(evicted)
+    evicted.cluster_transition_at = datetime.now(UTC) - timedelta(minutes=5)
+    await db_session.commit()
+
+    out = await _beat(
+        client,
+        evicted,
+        etok,
+        cluster_join_state="ready",
+        cluster_join_reason="https://10.0.0.1:6443",
+        cluster_transition_id="",
+        cluster_join_state_age_s=86400.0,
+    )
+    await db_session.refresh(evicted)
+    assert evicted.cluster_join_state == CLUSTER_JOIN_STATE_JOINING
+    assert evicted.cluster_role is None
+    assert out["desired_cluster_role"] == "member"
+    assert out["desired_cluster_transition_id"] == evicted.cluster_transition_id
