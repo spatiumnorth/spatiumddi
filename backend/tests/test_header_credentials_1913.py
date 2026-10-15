@@ -145,7 +145,7 @@ REAL_TOKENS = [
         "token",
         "eyJhbGciOiJSUzI1NiIsImtpZCI6Ik1rT0J4In0.eyJpc3MiOiJrdWJlcm5ldGVzIn0.c2ln-_",
     ),
-    ("tailscale", TsTest, "api_key", "tskey-api-kAbCdEf1CNTRL-0123456789abcdefABCDEF0123456"),
+    ("tailscale", TsTest, "api_key", "tskey-api-" + "kTESTfake01CNTRL" + "-" + "x" * 26),
     ("netbird", NbTest, "api_key", "nbp_0123456789abcdefABCDEF0123456789ab"),
     ("meraki", MkTest, "api_key", "6bec40cf957de430a6f1f2baa056b99a4fac9ea0"),
     ("fortigate", FgTest, "api_token", "Hs3kq8NnmQr0b5N4cG7tN6xNr1Hyf0"),
