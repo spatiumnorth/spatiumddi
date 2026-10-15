@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, KeyRound, ShieldCheck, Smartphone, Loader2 } from "lucide-react";
 import { authApi, formatApiError, type MfaEnrolBeginResponse } from "@/lib/api";
@@ -78,9 +78,47 @@ function MfaPanel() {
       setEnrolling(data);
     },
   });
-  // #1241 — starting an enrolment needs a step-up: a local account's
-  // password, or an SSO account's recent sign-in.
-  const needsPassword = status?.enrol_requires === "password";
+  // #1241 / #1354 — starting an enrolment needs a step-up: a password
+  // (local, or checked at the account's own LDAP / RADIUS / TACACS+
+  // provider), a forced re-login at the OIDC / SAML IdP, or — only when the
+  // provider is gone or off — a recent sign-in.
+  const needsPassword =
+    status?.enrol_requires === "password" ||
+    status?.enrol_requires === "provider_password";
+  const needsReauth = status?.enrol_requires === "provider_reauth";
+  const providerName = status?.enrol_provider_name ?? null;
+  const reauth = useMutation({
+    mutationFn: () => authApi.mfaEnrollReauth(),
+    // Leaves the app for the IdP; the callback brings the browser back here.
+    onSuccess: (data) => window.location.assign(data.authorize_url),
+  });
+  // Back from the IdP: ok means the re-login is proven, so carry straight on
+  // into the enrolment; failed says so. The param is cleared at once so a
+  // reload does not repeat it, and the ref keeps strict-mode's second effect
+  // from spending the single-use proof twice. It waits for the status and
+  // acts only for an account that re-authenticates at an IdP: the param is
+  // just a URL, so a crafted ``?mfa_reauth=ok`` link must not send a local or
+  // directory account's begin without its password, which would spend one of
+  // its step-up attempts per click (the server still gates every begin).
+  const [params, setParams] = useSearchParams();
+  const reauthResult = params.get("mfa_reauth");
+  const handled = useRef(false);
+  const [reauthFailed, setReauthFailed] = useState(false);
+  useEffect(() => {
+    if (!reauthResult || handled.current || !status) return;
+    handled.current = true;
+    setParams(
+      (p) => {
+        p.delete("mfa_reauth");
+        return p;
+      },
+      { replace: true },
+    );
+    if (status.enrol_requires !== "provider_reauth" || status.enabled) return;
+    if (reauthResult === "ok") enrollBegin.mutate(undefined);
+    else setReauthFailed(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reauthResult, status]);
   const signInTooOld =
     status?.enrol_requires === "recent_sign_in" && !status.enrol_sign_in_recent;
   // With no status there is no way to know which step-up applies, so the
@@ -135,18 +173,55 @@ function MfaPanel() {
                 start within {status?.enrol_sign_in_window_minutes} minutes.
               </p>
             )}
+            {needsReauth && (
+              <p className="text-xs text-muted-foreground">
+                To set up two-factor authentication you will be sent to{" "}
+                {providerName ? (
+                  <strong>{providerName}</strong>
+                ) : (
+                  "your identity provider"
+                )}{" "}
+                to sign in again, then brought back here.
+              </p>
+            )}
+            {reauthFailed && (
+              <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                Re-authentication did not complete, so nothing was changed. Try
+                again.
+              </p>
+            )}
             <button
               type="button"
-              onClick={() =>
-                needsPassword
-                  ? setAskPassword(true)
-                  : enrollBegin.mutate(undefined)
+              onClick={() => {
+                setReauthFailed(false);
+                if (needsReauth) reauth.mutate();
+                else if (needsPassword) setAskPassword(true);
+                else enrollBegin.mutate(undefined);
+              }}
+              disabled={
+                !status ||
+                enrollBegin.isPending ||
+                reauth.isPending ||
+                signInTooOld
               }
-              disabled={!status || enrollBegin.isPending || signInTooOld}
               className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
-              {enrollBegin.isPending ? "Generating…" : "Set up authenticator"}
+              {enrollBegin.isPending
+                ? "Generating…"
+                : needsReauth
+                  ? reauth.isPending
+                    ? "Redirecting…"
+                    : `Re-authenticate${providerName ? ` with ${providerName}` : ""} to set up`
+                  : "Set up authenticator"}
             </button>
+            {reauth.isError && (
+              <p className="text-xs text-destructive">
+                {formatApiError(
+                  reauth.error,
+                  "Could not start re-authentication",
+                )}
+              </p>
+            )}
             {!askPassword && enrollBegin.isError && (
               <p className="text-xs text-destructive">
                 {formatApiError(enrollBegin.error, "Could not start set-up")}
@@ -186,6 +261,9 @@ function MfaPanel() {
 
       {askPassword && (
         <EnrolPasswordModal
+          providerName={
+            status?.enrol_requires === "provider_password" ? providerName : null
+          }
           pending={enrollBegin.isPending}
           error={
             enrollBegin.isError
@@ -566,11 +644,13 @@ function RegenerateRecoveryModal({
 /** #1241 — a local account confirms its password before an authenticator
  *  is attached to it, so a hijacked session cannot enrol its own. */
 function EnrolPasswordModal({
+  providerName,
   pending,
   error,
   onClose,
   onSubmit,
 }: {
+  providerName?: string | null;
   pending: boolean;
   error: string;
   onClose: () => void;
@@ -587,7 +667,9 @@ function EnrolPasswordModal({
         }}
       >
         <p className="text-xs text-muted-foreground">
-          Enter your current password to set up two-factor authentication.
+          {providerName
+            ? `Enter your ${providerName} password to set up two-factor authentication. It is checked with ${providerName}, not stored here.`
+            : "Enter your current password to set up two-factor authentication."}
         </p>
         <input
           type="password"

@@ -318,6 +318,67 @@ def release_if_held(
     return False
 
 
+@dataclass(frozen=True)
+class ForceReleaseOutcome:
+    """What :func:`force_release_idle` did. ``outcome`` is ``released``,
+    ``no_lease`` (no Lease on this deployment), ``not_held``, ``alive`` (the
+    holder renewed within ``min_idle_s``), ``unreadable`` (the kubeapi did
+    not answer) or ``write_failed`` (the clear was refused: renewed or taken
+    over since the read, or the kubeapi said no). ``idle_s`` is how long ago the holder last renewed.
+    """
+
+    outcome: str
+    state: LeaseState | None = None
+    idle_s: float | None = None
+    error: str | None = None
+
+
+def force_release_idle(*, min_idle_s: float, namespace: str | None = None) -> ForceReleaseOutcome:
+    """An operator's way out when the drive that holds the Lease has died
+    (#1707): Abort leaves the Lease to the drive, so a dead one's lapses
+    only after ``leaseDurationSeconds``.
+
+    Refused while the holder is alive, read off the Lease itself: a drive
+    renews every third of the duration, so a ``renewTime`` older than
+    ``min_idle_s`` means it missed a renewal. The read is direct, not
+    through :func:`_read`, which reports an unanswered read as "not held"
+    (#1713). The clear is a compare-and-swap on the version read, so a
+    renewal or takeover landing in between makes it fail rather than free a
+    live drive's Lease."""
+    if k8s.get_config() is None:
+        return ForceReleaseOutcome(outcome="no_lease")
+    try:
+        status, body = k8s.get_lease(LEASE_NAME, namespace=namespace)
+    except k8s.KubeapiUnavailableError as exc:
+        return ForceReleaseOutcome(outcome="unreadable", error=str(exc))
+    if status == 404:
+        return ForceReleaseOutcome(outcome="not_held")
+    if status != 200 or body is None:
+        return ForceReleaseOutcome(outcome="unreadable", error=f"lease read returned {status}")
+    state = _parse_lease(body)
+    if not state.holder:
+        return ForceReleaseOutcome(outcome="not_held", state=state)
+    idle_s: float | None = None
+    if state.renew_time:
+        try:
+            renewed = datetime.fromisoformat(state.renew_time.replace("Z", "+00:00"))
+            idle_s = (datetime.now(UTC) - renewed).total_seconds()
+        except ValueError:
+            idle_s = None  # unparseable: as _parse_lease, treated as expired
+    if idle_s is not None and idle_s < min_idle_s:
+        return ForceReleaseOutcome(outcome="alive", state=state, idle_s=idle_s)
+    version = (body.get("metadata") or {}).get("resourceVersion")
+    try:
+        ok, err = k8s.clear_lease_holder(
+            LEASE_NAME, namespace=namespace, resource_version=str(version) if version else None
+        )
+    except k8s.KubeapiUnavailableError as exc:
+        return ForceReleaseOutcome(outcome="unreadable", state=state, idle_s=idle_s, error=str(exc))
+    if not ok:
+        return ForceReleaseOutcome(outcome="write_failed", state=state, idle_s=idle_s, error=err)
+    return ForceReleaseOutcome(outcome="released", state=state, idle_s=idle_s)
+
+
 def release(*, holder: str | None = None, namespace: str | None = None) -> tuple[bool, str | None]:
     """Release the lease by setting an empty holder.
 

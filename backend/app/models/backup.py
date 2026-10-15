@@ -90,6 +90,11 @@ class BackupTarget(Base):
     last_run_status: Mapped[str] = mapped_column(String(20), nullable=False, default="never")
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_run_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The k8s node whose pod wrote ``last_run_filename`` (#1838). A
+    # ``local_volume`` target is a per-node hostPath on a multi-node
+    # appliance, so this is where that archive physically is. NULL is
+    # unknown (a pre-#1838 run, or Compose, which has no node name).
+    last_run_node: Mapped[str | None] = mapped_column(String(253), nullable=True)
     last_run_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     last_run_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_run_error: Mapped[str | None] = mapped_column(Text, nullable=True)

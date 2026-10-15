@@ -9,6 +9,10 @@ Read-only (Phase A):
     GET   /lease                           — current mutex state for
                                               surfacing "an upgrade is
                                               in flight" on the Fleet UI.
+    POST  /lease/force-release             — superadmin: free a Lease a
+                                              dead drive left held
+                                              (#1707); refused while the
+                                              holder still renews.
 
 State-machine endpoints (Phase D):
 
@@ -37,7 +41,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.permissions import require_permission
 from app.services.appliance.slot_image_target import (
     SlotImageResolutionError,
@@ -102,6 +106,35 @@ async def get_preflight(target: str) -> PreflightReportOut:
     summary="Current state of the cluster-wide upgrade mutex",
 )
 async def get_lease_state() -> LeaseStateOut:
+    state = mutex.get_state()
+    return LeaseStateOut(
+        held=state.held,
+        holder=state.holder,
+        renew_time=state.renew_time,
+        transitions=state.transitions,
+        expired=state.expired,
+    )
+
+
+@router.post(
+    "/lease/force-release",
+    response_model=LeaseStateOut,
+    summary="Free the upgrade Lease a dead drive left held",
+)
+async def post_force_release_lease(current_user: SuperAdmin, db: DB) -> LeaseStateOut:
+    """Abort leaves the Lease to the drive it stopped (#1707), so a drive
+    that died holds it until it lapses (10 min). This frees it sooner. It
+    is refused (409) while the holder still renews it, since that drive is
+    alive and still changing the cluster. Superadmin only, and audited."""
+    try:
+        await orchestrator.force_release_lease(
+            db,
+            actor_user_id=current_user.id,
+            actor_display=current_user.display_name,
+            actor_source=current_user.auth_source,
+        )
+    except orchestrator.LeaseForceReleaseRefused as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
     state = mutex.get_state()
     return LeaseStateOut(
         held=state.held,

@@ -86,8 +86,8 @@ spec:
             #   containerPort: 8443
             #   protocol: TCP
           resources:
-            requests: { cpu: 100m, memory: 128Mi }
-            limits:   { cpu: 500m, memory: 512Mi }
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 2Gi }
           volumeMounts:
             - name: agent-state
               mountPath: /var/lib/spatium-dns-agent

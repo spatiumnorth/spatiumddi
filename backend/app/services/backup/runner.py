@@ -34,6 +34,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
@@ -159,6 +160,7 @@ async def claim_backup_run(
                 last_run_status="in_progress",
                 last_run_at=started,
                 last_run_filename=None,
+                last_run_node=None,
                 last_run_bytes=None,
                 last_run_duration_ms=None,
                 last_run_error=None,
@@ -453,6 +455,7 @@ async def run_backup_for_target(
         "duration_ms": None,
         "error": None,
         "deleted": 0,
+        "node_name": None,
     }
 
     try:
@@ -476,6 +479,10 @@ async def run_backup_for_target(
         duration_ms = int((finished - started).total_seconds() * 1000)
         target.last_run_status = "success"
         target.last_run_filename = filename
+        # #1838 — where the archive physically is when the destination
+        # is node-local (a ``local_volume`` hostPath on a multi-node
+        # appliance). Empty on Compose, which stores NULL (unknown).
+        target.last_run_node = settings.node_name or None
         target.last_run_bytes = len(archive_bytes)
         target.last_run_duration_ms = duration_ms
         if target.schedule_cron:
@@ -487,6 +494,7 @@ async def run_backup_for_target(
                 "bytes": len(archive_bytes),
                 "duration_ms": duration_ms,
                 "deleted": deleted,
+                "node_name": target.last_run_node,
             }
         )
         action = "backup_target_run_success"

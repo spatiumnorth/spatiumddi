@@ -113,15 +113,31 @@ dnsBind9:
   priorityClassName: spatium-service  # #983 — see ``priorityClasses`` above
   image:
     repository: ghcr.io/spatiumnorth/dns-bind9
-  # Scheduling weight for the serving pod. Requests only, no limits: a
-  # request lifts the pod out of BestEffort QoS (cgroup cpu.weight 1, the
-  # lowest on the node) so the control plane's bursts cannot starve the
-  # data plane; a CPU limit would throttle the bursts the data plane
-  # exists to serve. Sized as a floor, not a measurement of need.
+  # CPU: a request only, no limit. A request lifts the pod out of
+  # BestEffort QoS (cgroup cpu.weight 1, the lowest on the node) so the
+  # control plane's bursts cannot starve the data plane; a CPU limit would
+  # throttle the bursts the data plane exists to serve.
+  #
+  # Memory (#1725): a request AND a limit. With no limit, loading one ~580k
+  # entry catalog blocklist into a group with a view took the pod to
+  # 2.8-3.6 GB on a 6 GiB node, which pushed the node under the kubelet's
+  # eviction threshold: the worker, Postgres and the api were evicted and
+  # then named was OOM-killed. The limit makes the overload this pod's own
+  # (the kernel kills named inside its cgroup) instead of the node's. It is
+  # ONE value for the whole cluster, not sized per node: the role chart is
+  # shared and must render the same on every node (#1137), and a DaemonSet
+  # takes one limit for all its pods. 2Gi holds the common lists; a list in
+  # the hundreds of thousands of entries needs more, see the sizing table in
+  # docs/features/DNS.md (8.x). Raise it with a HelmChartConfig on this chart
+  # (docs/deployment/APPLIANCE.md). The agent also derives named's
+  # ``max-cache-size`` from this limit (a quarter of it) so the resolver
+  # cache cannot eat the RPZ's share.
   resources:
     requests:
       cpu: 250m
-      memory: 64Mi
+      memory: 256Mi
+    limits:
+      memory: 2Gi
   # Pass-through to the agent via env. The supervisor fills these in
   # when assigning the DNS role.
   # controlPlaneUrl is the EXTERNAL operator-facing URL. #409 — the

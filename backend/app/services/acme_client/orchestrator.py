@@ -12,8 +12,9 @@ Drives one :class:`~app.models.acme_client.ACMEOrder` from ``pending`` to
 5. generate a fresh cert key + CSR, finalize the order, poll to
    ``valid``, download the full PEM chain;
 6. land the chain in an :class:`~app.models.appliance.ApplianceCertificate`
-   row (``source="letsencrypt"``), make it the sole active cert, deploy
-   it to nginx (tolerating deploy failure);
+   row (``source="letsencrypt"``), make it the sole active cert, and wake
+   the api to deploy it to nginx (#1895 — the worker cannot patch the
+   TLS Secret);
 7. ALWAYS clean up every challenge TXT in a ``finally`` block.
 
 The whole thing is idempotent + re-runnable: a re-run from any state
@@ -23,7 +24,6 @@ re-derives what it needs. Called from the Celery task
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime
 
@@ -34,6 +34,7 @@ from cryptography.x509 import load_pem_x509_csr
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.agent_wake import APPLIANCE_CERT_DEPLOY, publish_wake
 from app.core.crypto import decrypt_str, encrypt_str
 from app.db import task_session
 from app.models.acme_client import (
@@ -51,7 +52,6 @@ from app.models.appliance import (
 from app.models.audit import AuditLog
 from app.services.acme_client import dns01, http01
 from app.services.acme_client.engine import ACMEClient, ACMEProtocolError
-from app.services.appliance.deployment import deploy_and_reload
 from app.services.appliance.tls import (
     CSRSubject,
     generate_csr_and_key,
@@ -427,8 +427,8 @@ async def _store_certificate(
 
     Idempotent on the order's stable name: a re-run for the same order
     updates the existing row in place rather than colliding on the
-    unique ``name``. The row is made the sole active cert and deployed
-    to nginx (deploy failure logged, never raised).
+    unique ``name``. The row is made the sole active cert; the api deploys
+    it to nginx on the wake published here (#1895).
     """
     info = parse_pem_certificate(chain_pem)
     name = f"letsencrypt-{order.id}"
@@ -497,16 +497,13 @@ async def _store_certificate(
     await db.commit()
     await db.refresh(row)
 
-    # Deploy + reload — tolerate failure (DB is the source of truth; the
-    # api boot's ensure_self_signed_cert re-deploys the active row). Run
-    # the blocking kubeapi PATCH/roll off the event loop (non-negotiable
-    # #2 — deploy_and_reload makes synchronous http.client round-trips).
-    try:
-        await asyncio.to_thread(
-            deploy_and_reload, row.cert_pem or chain_pem, key_pem, name=row.name
-        )
-    except Exception as exc:  # noqa: BLE001 — never let a deploy hiccup fail issuance
-        logger.warning("acme_client_cert_deploy_failed", cert_id=str(row.id), error=str(exc))
+    # The Secret patch is NOT made here (#1895): this runs in the Celery
+    # worker, whose ServiceAccount deliberately cannot patch
+    # ``spatium-appliance-tls`` (#983 / #1445). Hand the deploy to the api —
+    # it reconciles the active row into the Secret on this wake, and on a
+    # periodic tick if the wake is missed. The DB commit above is the source
+    # of truth; publish_wake never raises.
+    await publish_wake(APPLIANCE_CERT_DEPLOY)
 
     # #50 — a renewal rewrites cert_pem in place, so any DoT/DoH listener
     # serving this row needs to pick up the new material.

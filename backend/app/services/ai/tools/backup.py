@@ -133,7 +133,8 @@ class ListBackupTargetsArgs(BaseModel):
         "List all configured backup targets (superadmin only). "
         "Each row carries id / name / kind / enabled / "
         "schedule_cron / retention / last_run_status / last_run_at "
-        "/ last_run_filename / last_run_bytes / last_run_error / "
+        "/ last_run_filename / last_run_node / last_run_bytes / "
+        "last_run_error / "
         "next_run_at. Use for 'did all my backups succeed last "
         "night?', 'which targets are scheduled?', or 'list failed "
         "backup runs'. Destination credentials are NOT returned; "
@@ -168,6 +169,10 @@ async def list_backup_targets(
             "last_run_status": t.last_run_status,
             "last_run_at": (t.last_run_at.isoformat() if t.last_run_at else None),
             "last_run_filename": t.last_run_filename,
+            # #1838 — the node that wrote that archive. A local_volume
+            # target is per node on a multi-node appliance, so this is the
+            # only node that can list, download or restore it.
+            "last_run_node": t.last_run_node,
             "last_run_bytes": t.last_run_bytes,
             "last_run_duration_ms": t.last_run_duration_ms,
             "last_run_error": t.last_run_error,

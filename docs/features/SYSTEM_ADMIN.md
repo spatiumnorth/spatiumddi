@@ -491,6 +491,35 @@ where it is reachable — `s3` (a key without `DeleteObject`) and `https_put`
 destination that grants write but not unlink is not a configuration those
 protocols really produce.
 
+#### `local_volume` on a multi-node appliance (#1838)
+
+The default `/var/lib/spatiumddi/backups` is a hostPath, so it is **per node**:
+an archive stays on the disk of the node whose pod wrote it, and only the api on
+that node can list, download, restore or drill it. Scheduled runs land on
+whichever node's worker picked up the job, so the archives spread across nodes,
+and retention prunes each node's directory separately. Losing a node loses its
+archives. On a cluster, use a network destination (S3, SCP, SMB, NFS).
+
+SpatiumDDI does not move the archives, but it says where they are:
+
+- Each successful run records the node that wrote it, `last_run_node`, shown
+  next to the last run on the Backup page and returned by the targets API and
+  `list_backup_targets`.
+- With two or more control-plane nodes, Test connection warns that the target
+  is per node.
+- The archive list carries `node_name` per archive and an
+  `X-Archive-Listing-Note` header, shown above the list, saying whose disk it
+  is and, when the last run's archive is absent, which node holds it.
+- A download or restore that misses answers 502 naming the node that answered
+  and, when the run recorded it, the node holding the archive. Nothing is
+  restored. Copy the archive off that node and use **Restore from file**, or
+  retry until the request reaches that node's api.
+- A drill on a node that cannot see the newest archive reports `error` (no
+  verdict) instead of `failed` when it sees no archive at all, and notes it in
+  the `archive_available` check when it drilled an older one.
+
+A single-node appliance and Compose never see this wording.
+
 #### Removable (USB) disks on the appliance
 
 The single-appliance operator with no NAS and no cloud account backs up to a USB

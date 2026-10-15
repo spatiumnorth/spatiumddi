@@ -118,6 +118,186 @@ the formatter handles the rest.
   mounts a file over the entrypoint's rendered `default.conf`, and a stale
   `X-Forwarded-Host` comment is corrected.
 
+- **A `local_volume` backup on a multi-node appliance is per node, and now
+  says so (#1838).** The default backups directory is a per-node hostPath,
+  so an archive exists only on the disk of the node whose pod wrote it. A
+  restore, download or drill answered by another node's api returned a bare
+  "archive not found" 502, the archive list depended on which replica
+  answered, and a drill there reported `failed` ("the destination holds no
+  archives") about a target that was fine. Now each successful run records
+  the node that wrote it (`last_run_node`, on the target, the run-now
+  response, the Backup page and `list_backup_targets`). A miss names the
+  node that answered and, when known, the node holding the archive, and
+  says nothing was restored. On an appliance with two or more control-plane
+  nodes, Test connection warns that the target is per node, and the archive
+  list carries `node_name` per archive plus an `X-Archive-Listing-Note`
+  header, shown on the Backup page, saying whose disk the list is and that
+  the last run's archive is held by another node rather than missing. A
+  drill whose node cannot see the newest archive reports `error` (no
+  verdict) when it sees nothing, and notes it when it drilled an older
+  one. A single-node appliance and Compose see no cluster wording. The
+  Backup page's restore, download, delete, save and drill errors now show
+  the server's reason instead of "Request failed with status code 502".
+  Archives are not moved: the remedy on a cluster is a network destination
+  (S3, SCP, SMB, NFS).
+
+- **A delete the approval queue took is reported as queued, not as nothing
+  (#1915).** With `governance.approvals` on, deleting an IP space, block or
+  subnet answers `202` and the object stays. The IPAM tree's Delete… dialogs,
+  Edit Space and Edit Block read any 2xx as "deleted" and closed with no word;
+  Edit Subnet said "Submitted for approval", but in its red error box. All five
+  now say it in a neutral status box, leave the object (and the tree selection)
+  in place, refresh the approval queue, and stop offering Move to Trash again,
+  since a second click filed a second change request. The Copilot's card for
+  a risky proposal the queue took read "approved"; it now reads "awaiting
+  approval".
+
+- **IPAM no longer writes a twin beside a record an operator already
+  wrote (#1867).** An address allocated at a name and value an operator
+  had written by hand into the zone got an `auto_generated` copy beside
+  it, so the zone held two identical rows (PowerDNS refused the zone for
+  such a pair until #1379), while the record API refuses the same
+  duplicate with a 409 (#1230). The IPAM sync now adopts the operator's record,
+  for the A / AAAA and the PTR alike, on every path that writes them:
+  allocating an address, the bulk-edit DNS zone, DDNS from a lease and
+  Sync DNS. The address links to the existing row, nothing is created,
+  and the row stays the operator's, so deleting the address (or the
+  lease expiring) leaves it served. Only an operator-written row is
+  adopted: a different value still gets its own record, and a record
+  another address generated is not taken over. Renaming an address onto
+  a name and value the operator wrote retracts IPAM's own row and adopts
+  theirs too, and Sync DNS no longer reports an adopted record as
+  missing. Twins stored by an earlier release stay until one is deleted,
+  which #1230 made safe.
+
+- **Starting an MFA enrolment re-checks an external account at its own
+  provider (#1354).** An account with no local password used to pass
+  the enrolment step-up with any session younger than 10 minutes,
+  which is a sign-in time, not a check. An LDAP, RADIUS or TACACS+
+  account now re-verifies its password against its own provider
+  (backup servers included, wrong answers spend the step-up budget),
+  and an OIDC or SAML account is sent back to its IdP, forced to
+  authenticate again (`prompt=login` + `max_age=0`, `ForceAuthn`),
+  with a fresh `auth_time` / `AuthnInstant` required. The callback
+  leaves a single-use proof bound to that user and sign-in, which
+  `enroll/begin` takes. The 10-minute window remains only for an
+  account whose provider is gone or disabled. New
+  `POST /auth/mfa/enroll/reauth`; `GET /auth/mfa/status` gains
+  `enrol_provider_name` and two `enrol_requires` values.
+
+- **A Let's Encrypt certificate issued or renewed on an appliance is now
+  deployed to the Web UI without an api restart (#1895).** Issuance runs
+  in the Celery worker, whose ServiceAccount deliberately cannot patch
+  the `spatium-appliance-tls` Secret, so the renewed certificate sat in
+  the database and the old one kept being served. The worker now wakes
+  the api over Redis after committing, and the api deploys the active
+  certificate (also on a 60 s reconcile tick, under an advisory lock, and
+  only when the Secret differs; a frontend roll that fails after the
+  Secret was patched is retried rather than read as converged). The
+  worker no longer attempts the patch or logs
+  `appliance_cert_secret_patch_failed` on every renewal, and the
+  `secret_expiring` alert judges the certificate actually served (from a
+  snapshot the api publishes, since the worker cannot read the Secret),
+  flagging when the stored one is not deployed. The active certificate
+  was always redeployed over a differing Secret at api start; that is
+  now continuous, so a certificate written into the Secret by hand is
+  replaced within a minute.
+
+- **A BIND9-signed zone on the appliance now gets its DS (#1854).**
+  The agent derived the DS by running `dnssec-dsfromkey` only when that
+  binary was on `PATH`, and the Alpine dns-bind9 image does not carry
+  it, so every signed zone reported an empty DS with nothing logged and
+  the zone card had no record to paste at the parent. The agent now
+  computes the SHA-256 DS from the KSK `.key` file in-process with
+  dnspython, so no binary can be missing from an image, and a signed
+  zone that still yields no DS logs why (`dnssec_ds_pending` or
+  `dnssec_ds_unavailable`) instead of reporting empty in silence. The DS
+  shown follows BIND's own CDS rule: only a KSK whose `DSState` is
+  rumoured or omnipresent gets one, so a newly signed zone shows its DS
+  once BIND considers the DNSKEY propagated (about two hours on the
+  `default` policy), and a KSK withdrawn after a rollover drops out. The
+  agent now re-reads DNSSEC state every 5 minutes rather than only after a
+  config reload, so those changes reach the card without one, and each
+  key in the per-key table carries its own DS rather than every KSK's.
+
+- **Trashing a subnet now withdraws its own DNS records, instead of
+  leaving them answering from a zone that stays (#1906).** When one of
+  two subnets sharing a /24 reverse zone went to Trash, the zone was
+  correctly kept for the survivor, but the deleted subnet's host A
+  records, their PTRs and its gateway PTR kept being served, with no
+  page showing them. Trashing a subnet, block or space now retracts
+  the auto-generated A / AAAA / PTR records of every subnet it takes
+  through the record-op queue (agents and agentless primaries alike)
+  and trashes them under the same batch; Restore re-asserts them, and
+  purging the subnet drops them. A reverse zone that goes to Trash
+  with its subnet is unchanged. Hand-made records are left alone.
+  **This changes #1151's behaviour on purpose:** a trashed subnet's
+  records used to keep answering until the purge withdrew them (#1152
+  left that as an open question and the delete dialog described it);
+  they are now withdrawn when the subnet goes to Trash, and the dialog
+  says so. A restore can now refuse (409, naming the record) when an
+  identical record was created by hand while the subnet sat in Trash.
+
+- **The BIND9 pod has a memory limit, and named's cache is bounded
+  (#1725).** `dns-bind9` had none: loading a ~580k-entry catalog
+  blocklist into a group with a view took it to 2.8-3.6 GB, so on a
+  6 GiB appliance the kubelet evicted the worker, Postgres and the api
+  and then the kernel killed named. The appliance chart, the umbrella
+  chart's DNS agents, `k8s/dns` and the Compose files now carry a
+  256Mi request and a 2Gi limit (Compose: `DNS_BIND9_MEM_LIMIT`), so an
+  overload is the pod's own. The agent also writes `max-cache-size`
+  (a quarter of the container's memory limit) into named.conf, since
+  BIND's default is 90 % of the host's RAM for each view's cache (the
+  quarter is split across the recursive views); override with
+  `NAMED_MAX_CACHE_SIZE`. A named killed by the limit is no longer a
+  silent crash loop: the agent reads the container's OOM-kill counter,
+  persists the kill across the restart, and reports the daemon as not
+  serving with the reason until it stays up for 10 minutes, which raises
+  the default-on **Agent daemon not serving** alert. The appliance limit is one cluster-wide value
+  rather than sized per node (the role chart must render identically on
+  every node, #1137); a list that needs more raises it with a
+  HelmChartConfig. Sizing guidance is in `DNS.md` 8.0 and
+  `APPLIANCE.md`. A new chart check refuses a BIND9 container with no
+  memory limit or one under 1Gi.
+
+- **A demoting control-plane member's row read `ready` for the whole
+  leave (#1806).** Demote stamps `leaving`, but the node keeps reporting
+  its last verdict (`ready`) until its leave runner writes its own state,
+  and the heartbeat applied it, so Fleet and the cluster view showed a
+  member being removed as healthy. While a demote is `leaving`, a reported
+  `ready` / `joining` is now ignored; the runner's own `leaving`, `left`
+  and `failed` still apply. The mirror race on promote (a once-demoted
+  node still reporting `left` while its row says `joining`) is guarded the
+  same way.
+
+- **A Halt or Abort mid-node, and a drive that lost the upgrade Lease,
+  no longer get overwritten by the drive (#1702, #1704, #1707).** A
+  rolling-upgrade drive kept its own copy of the run for the whole of a
+  node and wrote it back when the node ended, so a node that failed turned
+  a `halted` or `aborted` run `failed` (with a new `finished_at` and an
+  upgrade-failed alert), and a node that succeeded dropped the operator's
+  `halted`, `aborted` and `resumed` events from the run's history. A
+  drive whose Lease another drive had taken over could do the same, and
+  so could its crash handler. Every terminal write now re-reads the run
+  under a row lock and goes ahead only if the run is still `running` and
+  this drive is still its holder; Halt, Resume and Abort take the same
+  lock. A node that ends after a stop is recorded under
+  `progress.per_node` and a `node_ended_after_stop` event, and the state
+  is left alone. Abort also no longer frees the Lease at once: the
+  aborted drive releases its own when it stops, so a second run cannot
+  plan and start while a node is still being worked on (a run that never
+  started has no drive, and still frees it). A drive that died holds the
+  Lease until it lapses (10 min); a superadmin can free it sooner with
+  **Force release** (`POST /upgrades/lease/force-release`), which is
+  refused while the holder still renews it and is audited. Halt and Abort
+  are also honoured between nodes and around the end-of-roll flip: a Halt
+  while the shared-tag hold (#1710) is being placed now stops the node it
+  was meant to stop, and the flip's own record writes no longer drop
+  events committed meanwhile. The fence's row lock is never held across
+  a kubeapi call, the post-upgrade verify or alert delivery. A lease
+  renewal that dies of an unexpected error now stops the drive, as a
+  refused one does.
+
 - **Deleting a DNS zone permanently from the Trash now removes it from
   agentless servers too (#1830).** A zone is never torn down at
   soft-delete (a hosted zone re-created on restore gets a new id and NS
@@ -4256,6 +4436,9 @@ the formatter handles the rest.
   rows queues a whole-RRset update op per agent server and bumps the
   zone serial. Agentless groups other than `technitium_api` get the row
   change and no push. Downgrade is a no-op.
+- `d9d0f6ddc446` — #1838: nullable `backup_target.last_run_node`, the
+  node whose pod wrote `last_run_filename`. No backfill: an existing row
+  cannot say where its archive was written, so NULL (unknown) stays.
 
 ## 2026.10.02-1 — 2026-10-02
 

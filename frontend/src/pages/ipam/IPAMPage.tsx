@@ -7739,7 +7739,7 @@ function DriftRow({
   );
 }
 
-function EditSubnetModal({
+export function EditSubnetModal({
   subnet,
   onClose,
   onDeleted,
@@ -7993,6 +7993,9 @@ function EditSubnetModal({
   });
 
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  // A delete the approval queue took (#62) is not an error: it gets the
+  // neutral box, and the dialog stops offering to send it again (#1915).
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
   const deleteMutation = useMutation({
     // EditSubnetModal's two-step delete already requires the
     // operator to tick "…and all its contents will be permanently
@@ -8003,8 +8006,8 @@ function EditSubnetModal({
       // queued change-request instead of deleting. Surface the message,
       // refresh the approval queue, and leave the subnet in place.
       if (handleApprovalQueued(resp)) {
-        setDeleteError(APPROVAL_QUEUED_MESSAGE);
-        qc.invalidateQueries({ queryKey: ["change-requests"] });
+        setDeleteNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
         return;
       }
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
@@ -8027,6 +8030,7 @@ function EditSubnetModal({
   function resetDelete() {
     setDeleteStep(0);
     setDeleteError(null);
+    setDeleteNotice(null);
     setDeleteChecked(false);
   }
 
@@ -8087,11 +8091,11 @@ function EditSubnetModal({
             </strong>{" "}
             and its DHCP scopes will be moved to Trash, with the reverse zones
             created for it unless another subnet still uses one. The addresses
-            you allocated stay with it, and their A/AAAA records keep resolving
-            while it is in Trash. You can restore them together within 30 days
-            from Administration → Trash; after that the nightly purge deletes
-            the subnet and its addresses for good and withdraws their DNS
-            records.
+            you allocated stay with it, and the DNS records published for them
+            stop resolving while it is in Trash. You can restore them together
+            within 30 days from Administration → Trash, which publishes those
+            records again; after that the nightly purge deletes the subnet, its
+            addresses and their records for good.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -8108,19 +8112,29 @@ function EditSubnetModal({
               {deleteError}
             </div>
           )}
+          {deleteNotice && (
+            <div
+              role="status"
+              className="rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400"
+            >
+              {deleteNotice}
+            </div>
+          )}
           <div className="flex justify-end gap-2">
             <button
               onClick={resetDelete}
               className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
-              Cancel
+              {deleteNotice ? "Close" : "Cancel"}
             </button>
             <button
               onClick={() => {
                 setDeleteError(null);
                 deleteMutation.mutate();
               }}
-              disabled={!deleteChecked || deleteMutation.isPending}
+              disabled={
+                !deleteChecked || deleteMutation.isPending || !!deleteNotice
+              }
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
               {deleteMutation.isPending ? "Deleting…" : "Move to Trash"}
@@ -8366,12 +8380,13 @@ function EditSubnetModal({
             Deleting a subnet moves it and its DHCP scopes to Trash, restorable
             together for 30 days, along with the reverse zones created for it
             (except one another subnet still uses). The addresses you allocated
-            stay with it and come back on restore, and their A/AAAA records keep
-            resolving while it is in Trash. Addresses from DHCP (leases and
-            reservations) are removed straight away with their DNS records;
-            reservations come back with their scope on restore. Purging the
-            subnet from Trash deletes its addresses and withdraws their DNS
-            records. The deletion is gated by a confirm in the next step.
+            stay with it and come back on restore; the DNS records published for
+            them stop resolving while it is in Trash and are published again on
+            restore. Addresses from DHCP (leases and reservations) are removed
+            straight away with their DNS records; reservations come back with
+            their scope on restore. Purging the subnet from Trash deletes its
+            addresses and their records for good. The deletion is gated by a
+            confirm in the next step.
           </p>
           <button
             onClick={() => setDeleteStep(1)}
@@ -11067,6 +11082,7 @@ export function ConfirmDestroyModal({
   // Non-error feedback shown in a neutral box — used for the #62
   // two-person approval queue "Submitted for approval" message, where
   // the delete returned 202 instead of executing.
+  // While it is set the dialog offers Close and no longer offers to delete.
   notice?: string | null;
 }) {
   const [step, setStep] = useState<1 | 2>(1);
@@ -11083,7 +11099,10 @@ export function ConfirmDestroyModal({
             </div>
           )}
           {notice && (
-            <div className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400">
+            <div
+              role="status"
+              className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400"
+            >
               {notice}
             </div>
           )}
@@ -11130,7 +11149,10 @@ export function ConfirmDestroyModal({
           </div>
         )}
         {notice && (
-          <div className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400">
+          <div
+            role="status"
+            className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400"
+          >
             {notice}
           </div>
         )}
@@ -11139,11 +11161,13 @@ export function ConfirmDestroyModal({
             onClick={onClose}
             className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
           >
-            Cancel
+            {notice ? "Close" : "Cancel"}
           </button>
           <button
             onClick={onConfirm}
-            disabled={!checked || isPending}
+            // Once the approval queue has taken the request (#1915), sending
+            // it again would file a second change request for the same delete.
+            disabled={!checked || isPending || !!notice}
             className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
           >
             {isPending ? "Deleting…" : "Move to Trash"}
@@ -11350,9 +11374,19 @@ export function EditSpaceModal({
   const [saveError, setSaveError] = useState<string | null>(null);
 
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  // Queued for approval (#62) is not an error — neutral box (#1915).
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
   const deleteMutation = useMutation({
     mutationFn: () => ipamApi.deleteSpace(space.id),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // Two-person approval (#62): a covered delete returns 202 with a
+      // queued change-request instead of deleting. Say so and leave the
+      // space in place (#1915).
+      if (handleApprovalQueued(resp)) {
+        setDeleteNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["spaces"] });
       onDeleted();
     },
@@ -11401,7 +11435,13 @@ export function EditSpaceModal({
   // ── Delete step 2: final confirm with checkbox ──
   if (deleteStep === 2) {
     return (
-      <Modal title="Move to Trash" onClose={() => setDeleteStep(0)}>
+      <Modal
+        title="Move to Trash"
+        onClose={() => {
+          setDeleteStep(0);
+          setDeleteNotice(null);
+        }}
+      >
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">
             <strong className="text-foreground">{space.name}</strong>, with
@@ -11424,19 +11464,32 @@ export function EditSpaceModal({
               {deleteError}
             </p>
           )}
+          {deleteNotice && (
+            <div
+              role="status"
+              className="rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400"
+            >
+              {deleteNotice}
+            </div>
+          )}
           <div className="flex justify-end gap-2">
             <button
-              onClick={() => setDeleteStep(0)}
+              onClick={() => {
+                setDeleteStep(0);
+                setDeleteNotice(null);
+              }}
               className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
-              Cancel
+              {deleteNotice ? "Close" : "Cancel"}
             </button>
             <button
               onClick={() => {
                 setDeleteError(null);
                 deleteMutation.mutate();
               }}
-              disabled={!deleteChecked || deleteMutation.isPending}
+              disabled={
+                !deleteChecked || deleteMutation.isPending || !!deleteNotice
+              }
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
               {deleteMutation.isPending ? "Deleting…" : "Move to Trash"}
@@ -12000,7 +12053,7 @@ export function CreateBlockModal({
 
 // ─── Edit Block Modal ─────────────────────────────────────────────────────────
 
-function EditBlockModal({
+export function EditBlockModal({
   block,
   onClose,
   onDeleted,
@@ -12137,9 +12190,17 @@ function EditBlockModal({
   });
 
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  // Queued for approval (#62) is not an error — neutral box (#1915).
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
   const deleteMutation = useMutation({
     mutationFn: () => ipamApi.deleteBlock(block.id),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // Two-person approval (#62): queued, not deleted (#1915).
+      if (handleApprovalQueued(resp)) {
+        setDeleteNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks"] });
       onDeleted?.();
@@ -12192,7 +12253,13 @@ function EditBlockModal({
   // ── Delete step 2 ──
   if (deleteStep === 2) {
     return (
-      <Modal title="Move to Trash" onClose={() => setDeleteStep(0)}>
+      <Modal
+        title="Move to Trash"
+        onClose={() => {
+          setDeleteStep(0);
+          setDeleteNotice(null);
+        }}
+      >
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">
             <strong className="text-foreground font-mono">
@@ -12217,19 +12284,32 @@ function EditBlockModal({
               {deleteError}
             </p>
           )}
+          {deleteNotice && (
+            <div
+              role="status"
+              className="rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400"
+            >
+              {deleteNotice}
+            </div>
+          )}
           <div className="flex justify-end gap-2">
             <button
-              onClick={() => setDeleteStep(0)}
+              onClick={() => {
+                setDeleteStep(0);
+                setDeleteNotice(null);
+              }}
               className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
-              Cancel
+              {deleteNotice ? "Close" : "Cancel"}
             </button>
             <button
               onClick={() => {
                 setDeleteError(null);
                 deleteMutation.mutate();
               }}
-              disabled={!deleteChecked || deleteMutation.isPending}
+              disabled={
+                !deleteChecked || deleteMutation.isPending || !!deleteNotice
+              }
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
               {deleteMutation.isPending ? "Deleting…" : "Move to Trash"}
@@ -15014,7 +15094,7 @@ function BulkEditSubnetsModal({
 
 // ─── Space Section in tree ────────────────────────────────────────────────────
 
-function SpaceSection({
+export function SpaceSection({
   space,
   selectedSubnetId,
   selectedBlockId,
@@ -15145,12 +15225,23 @@ function SpaceSection({
   const [subnetDeleteError, setSubnetDeleteError] = useState<string | null>(
     null,
   );
+  const [subnetDeleteNotice, setSubnetDeleteNotice] = useState<string | null>(
+    null,
+  );
   const deleteSubnet = useMutation({
     // The single-subnet ConfirmDestroyModal already requires the
     // operator to tick "…and all its contents will be permanently
     // deleted" before this fires, so cascade is the right semantics.
     mutationFn: (id: string) => ipamApi.deleteSubnet(id, true),
-    onSuccess: () => {
+    onSuccess: (resp, id) => {
+      // Two-person approval (#62): queued, not deleted (#1915). Leave the
+      // subnet selected and the dialog open with the notice.
+      if (handleApprovalQueued(resp)) {
+        setSubnetDeleteNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
+      if (selectedSubnetId === id) onSelectSubnet(null);
       qc.invalidateQueries({ queryKey: ["subnets", space.id] });
       setSubnetToDelete(null);
       setSubnetDeleteError(null);
@@ -15169,9 +15260,18 @@ function SpaceSection({
   });
 
   const [blockDeleteError, setBlockDeleteError] = useState<string | null>(null);
+  const [blockDeleteNotice, setBlockDeleteNotice] = useState<string | null>(
+    null,
+  );
   const deleteBlockMut = useMutation({
     mutationFn: (id: string) => ipamApi.deleteBlock(id),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // Two-person approval (#62): queued, not deleted (#1915).
+      if (handleApprovalQueued(resp)) {
+        setBlockDeleteNotice(APPROVAL_QUEUED_MESSAGE);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
       qc.invalidateQueries({ queryKey: ["blocks", space.id] });
       qc.invalidateQueries({ queryKey: ["subnets", space.id] });
       setBlockToDelete(null);
@@ -15446,12 +15546,15 @@ function SpaceSection({
           checkLabel={`I understand ${blockToDelete.network} and everything inside it will be moved to Trash.`}
           isPending={deleteBlockMut.isPending}
           error={blockDeleteError}
+          notice={blockDeleteNotice}
           onClose={() => {
             setBlockToDelete(null);
             setBlockDeleteError(null);
+            setBlockDeleteNotice(null);
           }}
           onConfirm={() => {
             setBlockDeleteError(null);
+            setBlockDeleteNotice(null);
             deleteBlockMut.mutate(blockToDelete.id);
           }}
         />
@@ -15494,13 +15597,15 @@ function SpaceSection({
           checkLabel={`I understand ${subnetToDelete.network} and its contents will be moved to Trash.`}
           isPending={deleteSubnet.isPending}
           error={subnetDeleteError}
+          notice={subnetDeleteNotice}
           onClose={() => {
             setSubnetToDelete(null);
             setSubnetDeleteError(null);
+            setSubnetDeleteNotice(null);
           }}
           onConfirm={() => {
-            if (selectedSubnetId === subnetToDelete.id) onSelectSubnet(null);
             setSubnetDeleteError(null);
+            setSubnetDeleteNotice(null);
             deleteSubnet.mutate(subnetToDelete.id);
           }}
         />

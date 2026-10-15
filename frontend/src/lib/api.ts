@@ -2418,8 +2418,17 @@ export interface MfaStatusResponse {
   enabled: boolean;
   enrolment_pending: boolean;
   recovery_codes_remaining: number;
-  /** What starting an enrolment asks for (#1241). */
-  enrol_requires: "password" | "recent_sign_in";
+  /** What starting an enrolment asks for (#1241, #1354): the local
+   *  password; the password at the account's own LDAP / RADIUS / TACACS+
+   *  provider; a forced re-login at its OIDC / SAML IdP; or, only when the
+   *  provider is gone or off, a recent sign-in. */
+  enrol_requires:
+    | "password"
+    | "provider_password"
+    | "provider_reauth"
+    | "recent_sign_in";
+  /** The provider named by `provider_password` / `provider_reauth`. */
+  enrol_provider_name: string | null;
   /** For `recent_sign_in`: false means sign out and back in first. */
   enrol_sign_in_recent: boolean;
   /** How recent that sign-in must be, in minutes. */
@@ -3032,6 +3041,12 @@ export interface BackupTarget {
   last_run_status: string;
   last_run_at: string | null;
   last_run_filename: string | null;
+  /**
+   * The node whose pod wrote `last_run_filename` (#1838). A `local_volume`
+   * target is per node on a multi-node appliance, so this is the only node
+   * that can list, download or restore that archive. Null when unknown.
+   */
+  last_run_node: string | null;
   last_run_bytes: number | null;
   last_run_duration_ms: number | null;
   last_run_error: string | null;
@@ -3138,6 +3153,18 @@ export interface BackupArchiveListing {
   filename: string;
   size_bytes: number;
   created_at: string;
+  /** The node whose disk holds the archive (`local_volume` on the
+   *  appliance, #1838); null for network destinations. */
+  node_name?: string | null;
+}
+
+/** An archive listing plus the server's `X-Archive-Listing-Note` (#1838):
+ *  on a multi-node appliance a `local_volume` listing is one node's disk,
+ *  and the note says so, or that the last run's archive is on another
+ *  node rather than missing. */
+export interface BackupArchiveList {
+  archives: BackupArchiveListing[];
+  note: string | null;
 }
 
 export interface BackupRunNowOutcome {
@@ -3147,6 +3174,8 @@ export interface BackupRunNowOutcome {
   duration_ms: number | null;
   deleted: number;
   error: string | null;
+  /** The node whose pod wrote the archive (#1838); null off the appliance. */
+  node_name?: string | null;
 }
 
 export interface BackupTestOutcome {
@@ -3183,10 +3212,16 @@ export const backupTargetsApi = {
     api
       .post<BackupTestOutcome>(`/backup/targets/${id}/test`)
       .then((r) => r.data),
-  listArchives: (id: string) =>
+  listArchives: (id: string): Promise<BackupArchiveList> =>
     api
       .get<BackupArchiveListing[]>(`/backup/targets/${id}/archives`)
-      .then((r) => r.data),
+      .then((r) => {
+        const note = r.headers?.["x-archive-listing-note"];
+        return {
+          archives: r.data,
+          note: typeof note === "string" && note ? note : null,
+        };
+      }),
   /**
    * Restore-verification drills (issue #702) — replay this target's
    * newest archive into a throwaway database and assert against the
@@ -9763,6 +9798,13 @@ export const authApi = {
     api
       .post<MfaEnrolBeginResponse>("/auth/mfa/enroll/begin", { password })
       .then((r) => r.data),
+  /** #1354 — start the forced IdP re-login an OIDC / SAML account needs
+   *  before `mfaEnrollBegin`. Navigate the browser to `authorize_url`; it
+   *  returns to /account?mfa_reauth=ok|failed. */
+  mfaEnrollReauth: () =>
+    api
+      .post<{ authorize_url: string }>("/auth/mfa/enroll/reauth")
+      .then((r) => r.data),
   mfaEnrollVerify: (code: string) =>
     api.post("/auth/mfa/enroll/verify", { code }),
   mfaDisable: (password: string | undefined, code: string) =>
@@ -12380,6 +12422,12 @@ export const clusterUpgradesApi = {
       .then((r) => r.data),
   lease: () =>
     api.get<UpgradeLeaseState>("/upgrades/lease").then((r) => r.data),
+  // #1707 — superadmin: free a Lease a dead drive left held. Refused (409)
+  // while the holder still renews it.
+  forceReleaseLease: () =>
+    api
+      .post<UpgradeLeaseState>("/upgrades/lease/force-release")
+      .then((r) => r.data),
   plan: (body: ClusterUpgradePlanRequest) =>
     api
       .post<ClusterUpgradePlanResponse>("/upgrades/plan", body)

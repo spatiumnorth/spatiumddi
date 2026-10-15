@@ -15,6 +15,7 @@ import {
 
 import {
   backupTargetsApi,
+  formatApiError,
   type BackupTarget,
   type RestoreDrill,
   type RestoreDrillAssertion,
@@ -341,7 +342,7 @@ export function RestoreDrillsSection() {
 
         {runDrill.isError && (
           <div className="border-t px-4 py-2 text-xs text-rose-600 dark:text-rose-400">
-            {(runDrill.error as Error).message}
+            {formatApiError(runDrill.error, "drill failed")}
           </div>
         )}
         <p className="border-t px-4 py-2 text-xs text-muted-foreground">
