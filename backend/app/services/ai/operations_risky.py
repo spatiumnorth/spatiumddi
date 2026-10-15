@@ -304,6 +304,7 @@ async def _apply_delete_subnet(
     from app.services.dhcp.config_bundle import build_config_bundle
     from app.services.dhcp.lease_cleanup import delete_leases_for_scope
     from app.services.dhcp.windows_writethrough import push_scope_delete
+    from app.services.dns.record_ops import retract_trashed_subnet_records
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
 
     subnet = await db.get(Subnet, args.subnet_id)
@@ -335,8 +336,18 @@ async def _apply_delete_subnet(
         )
         wake_group_ids = await _push_agentless_scope_deletes(db, batch)
         await _purge_leases_for_scope_batch(db, batch)
-        await apply_soft_delete(db, batch, user.id)
+        deleted_at = await apply_soft_delete(db, batch, user.id)
+        # spatiumddi#1906 — the subnet's own A / PTR / gateway PTR in zones that
+        # STAY (a reverse zone kept for a sibling, the forward zone) are
+        # retracted and ride the batch; restore re-asserts them.
+        records_retracted, record_wake_ids = await retract_trashed_subnet_records(
+            db, batch, deleted_at, user.id
+        )
+        dns_wake_group_ids |= record_wake_ids
         for row in batch.rows:
+            old_value = batch.audit_old_value(row)
+            if row.obj is subnet and records_retracted:
+                old_value["dns_records_retracted"] = records_retracted
             db.add(
                 _audit(
                     user,
@@ -344,7 +355,7 @@ async def _apply_delete_subnet(
                     row.resource_type,
                     str(row.obj.id),
                     row.display,
-                    old_value=batch.audit_old_value(row),
+                    old_value=old_value,
                 )
             )
         await db.commit()
@@ -572,7 +583,14 @@ async def _apply_delete_block(
     # agentless write-through the scope + subnet paths do (#616). Before the stamp.
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     await _purge_leases_for_scope_batch(db, batch)
-    await apply_soft_delete(db, batch, user.id)
+    deleted_at = await apply_soft_delete(db, batch, user.id)
+    # spatiumddi#1906 — every trashed subnet's DNS records are retracted with it.
+    from app.core.agent_wake import dns_group_channel  # noqa: PLC0415
+    from app.services.dns.record_ops import retract_trashed_subnet_records  # noqa: PLC0415
+
+    _retracted, dns_wake_group_ids = await retract_trashed_subnet_records(
+        db, batch, deleted_at, user.id
+    )
     for row in batch.rows:
         db.add(
             _audit(
@@ -587,6 +605,8 @@ async def _apply_delete_block(
     await db.commit()
     for gid in wake_group_ids:
         collect_wake(dhcp_group_channel(gid))
+    for gid in dns_wake_group_ids:
+        collect_wake(dns_group_channel(gid))
     return {"block_id": str(args.block_id), "mode": "soft_delete"}
 
 
@@ -709,7 +729,14 @@ async def _apply_delete_space(
     # agentless write-through the scope + subnet paths do (#616). Before the stamp.
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     await _purge_leases_for_scope_batch(db, batch)
-    await apply_soft_delete(db, batch, user.id)
+    deleted_at = await apply_soft_delete(db, batch, user.id)
+    # spatiumddi#1906 — every trashed subnet's DNS records are retracted with it.
+    from app.core.agent_wake import dns_group_channel  # noqa: PLC0415
+    from app.services.dns.record_ops import retract_trashed_subnet_records  # noqa: PLC0415
+
+    _retracted, dns_wake_group_ids = await retract_trashed_subnet_records(
+        db, batch, deleted_at, user.id
+    )
     for row in batch.rows:
         db.add(
             _audit(
@@ -724,6 +751,8 @@ async def _apply_delete_space(
     await db.commit()
     for gid in wake_group_ids:
         collect_wake(dhcp_group_channel(gid))
+    for gid in dns_wake_group_ids:
+        collect_wake(dns_group_channel(gid))
     return {"space_id": str(args.space_id), "mode": "soft_delete"}
 
 

@@ -117,11 +117,20 @@ function CustomOptionRow({
   );
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
-
-  // Reflect external changes to opt.code (e.g. template apply).
+  // Reflect changes to the row's code into the box (a catalogue pick, a
+  // typed code committed on blur / Enter, a template apply). The box never
+  // writes the code per keystroke (#1685): doing so let this effect rewrite
+  // "4" to "4 —" before the "3" of "43" landed, and turned the row into a
+  // standard option (3, 6, 15, 42…) mid-way through typing a longer code,
+  // dropping it out of the custom list.
+  //
+  // Keyed on the row object, not just its code: rows are keyed by index, so
+  // deleting one hands this instance the next row, which may carry the same
+  // code — and the box must not keep the deleted row's half-typed text.
+  // Nothing replaces the object while the operator types in the box.
   useEffect(() => {
     setQuery(opt.code ? `${opt.code} — ${opt.name ?? ""}`.trim() : "");
-  }, [opt.code, opt.name]);
+  }, [opt]);
 
   useEffect(() => {
     function onDoc(e: MouseEvent) {
@@ -162,6 +171,25 @@ function CustomOptionRow({
     setOpen(false);
   }
 
+  // Commit a typed code to the row, so an operator can type "42" + Tab and
+  // have a custom code (known to the catalogue or not) stick. Text that
+  // doesn't start with a number leaves the code alone and the box settles
+  // back to "<code> — <name>".
+  function commitTyped() {
+    const numMatch = /^(\d+)/.exec(query.trim());
+    if (numMatch) {
+      const n = parseInt(numMatch[1], 10);
+      if (!Number.isNaN(n) && n !== opt.code) {
+        // The name follows the code: a stale name from the previous code
+        // would otherwise travel with the new one.
+        const def = catalog.find((d) => d.code === n);
+        onChange({ ...opt, code: n, name: def?.name });
+        return;
+      }
+    }
+    setQuery(opt.code ? `${opt.code} — ${opt.name ?? ""}`.trim() : "");
+  }
+
   return (
     <div className="space-y-1">
       <div className="flex items-start gap-2">
@@ -171,21 +199,20 @@ function CustomOptionRow({
             placeholder="Search code or name…"
             value={query}
             onChange={(e) => {
-              const v = e.target.value;
-              setQuery(v);
+              setQuery(e.target.value);
               setOpen(true);
-              // Live numeric typing — reflect into the row immediately so
-              // the operator can still type "42" + tab and have a custom
-              // unknown code stick. Name resolution happens on pick.
-              const numMatch = /^(\d+)/.exec(v.trim());
-              if (numMatch) {
-                const n = parseInt(numMatch[1], 10);
-                if (!Number.isNaN(n) && n !== opt.code) {
-                  onChange({ ...opt, code: n });
-                }
-              }
             }}
             onFocus={() => setOpen(true)}
+            onBlur={commitTyped}
+            onKeyDown={(e) => {
+              // Enter commits the typed code instead of submitting the
+              // surrounding form with the row still on its old code.
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitTyped();
+                setOpen(false);
+              }
+            }}
           />
           {open && matches.length > 0 && (
             <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-y-auto rounded-md border bg-popover shadow-md">
@@ -193,6 +220,11 @@ function CustomOptionRow({
                 <button
                   key={def.code}
                   type="button"
+                  // Keep focus in the box: a blur here would commit the
+                  // partly-typed code first, and a standard code ("6" on
+                  // the way to 60) moves the row out of this list before
+                  // the click lands.
+                  onMouseDown={(e) => e.preventDefault()}
                   onClick={() => pick(def)}
                   className="block w-full px-3 py-1.5 text-left text-xs hover:bg-accent"
                 >
@@ -219,6 +251,10 @@ function CustomOptionRow({
         />
         <button
           type="button"
+          // No blur-commit on the way to a delete: committing a half-typed
+          // standard code ("6") would move this row out of the list, and the
+          // click would then land on the next row's button.
+          onMouseDown={(e) => e.preventDefault()}
           onClick={onRemove}
           className="rounded p-1 text-muted-foreground hover:text-destructive"
         >

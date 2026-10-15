@@ -9,6 +9,10 @@ Read-only (Phase A):
     GET   /lease                           — current mutex state for
                                               surfacing "an upgrade is
                                               in flight" on the Fleet UI.
+    POST  /lease/force-release             — superadmin: free a Lease a
+                                              dead drive left held
+                                              (#1707); refused while the
+                                              holder still renews.
 
 State-machine endpoints (Phase D):
 
@@ -37,13 +41,14 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.permissions import require_permission
 from app.services.appliance.slot_image_target import (
     SlotImageResolutionError,
     SlotImageTarget,
     new_refire_nonce,
     resolve_slot_image_target,
+    slot_image_url_problem,
 )
 from app.services.upgrades import mutex, orchestrator, preflight
 
@@ -101,6 +106,35 @@ async def get_preflight(target: str) -> PreflightReportOut:
     summary="Current state of the cluster-wide upgrade mutex",
 )
 async def get_lease_state() -> LeaseStateOut:
+    state = mutex.get_state()
+    return LeaseStateOut(
+        held=state.held,
+        holder=state.holder,
+        renew_time=state.renew_time,
+        transitions=state.transitions,
+        expired=state.expired,
+    )
+
+
+@router.post(
+    "/lease/force-release",
+    response_model=LeaseStateOut,
+    summary="Free the upgrade Lease a dead drive left held",
+)
+async def post_force_release_lease(current_user: SuperAdmin, db: DB) -> LeaseStateOut:
+    """Abort leaves the Lease to the drive it stopped (#1707), so a drive
+    that died holds it until it lapses (10 min). This frees it sooner. It
+    is refused (409) while the holder still renews it, since that drive is
+    alive and still changing the cluster. Superadmin only, and audited."""
+    try:
+        await orchestrator.force_release_lease(
+            db,
+            actor_user_id=current_user.id,
+            actor_display=current_user.display_name,
+            actor_source=current_user.auth_source,
+        )
+    except orchestrator.LeaseForceReleaseRefused as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
     state = mutex.get_state()
     return LeaseStateOut(
         held=state.held,
@@ -189,23 +223,15 @@ class PlanRequest(BaseModel):
     @field_validator("slot_image_url")
     @classmethod
     def _validate_slot_image_url(cls, v: str | None) -> str | None:
-        # Review polish — catch operator typos at plan time rather than
-        # surfacing a confusing "unsupported scheme" error 30 min into
-        # the rolling upgrade when the host runner finally tries to
-        # GET the URL. Only http(s) is accepted; file:// + s3:// are
-        # deliberately not supported by spatium-upgrade-slot apply.
+        # Catch it at plan time rather than as a node's stage step waiting
+        # out its whole timeout: the supervisor fetches only https:// (and
+        # file://) and refuses anything else with a log line and no trigger
+        # (#1752). One rule, shared with the resolver every scheduler uses.
         if v is None:
             return v
-        from urllib.parse import urlparse  # noqa: PLC0415
-
-        try:
-            parsed = urlparse(v)
-        except ValueError as exc:
-            raise ValueError(f"slot_image_url is not a parseable URL: {exc}") from exc
-        if parsed.scheme not in ("http", "https"):
-            raise ValueError(f"slot_image_url scheme must be http or https, got {parsed.scheme!r}")
-        if not parsed.netloc:
-            raise ValueError("slot_image_url must include a host")
+        problem = slot_image_url_problem(v)
+        if problem:
+            raise ValueError(problem)
         return v
 
     @model_validator(mode="after")

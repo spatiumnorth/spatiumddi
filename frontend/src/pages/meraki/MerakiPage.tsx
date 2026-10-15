@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Boxes,
   Network,
@@ -43,7 +44,11 @@ export function MerakiPage() {
     NEEDS_SUPERADMIN,
   );
   const qc = useQueryClient();
-  const { data: orgs = [], isFetching } = useQuery({
+  const {
+    data: orgs = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["meraki-orgs"],
     queryFn: merakiApi.list,
   });
@@ -142,7 +147,9 @@ export function MerakiPage() {
           {orgs.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No Meraki organizations configured yet.
+                <ListEmpty error={listError} what="Meraki organizations">
+                  No Meraki organizations configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}

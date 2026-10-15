@@ -453,6 +453,8 @@ async def test_orchestrator_calls_chart_bump_after_all_nodes(
     run = _FakeRun()
     db = MagicMock()
     db.get = AsyncMock(return_value=run)
+    # The drive re-reads the run under a row lock before each write (#1702).
+    db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=run)))
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()
@@ -510,6 +512,8 @@ async def test_orchestrator_flips_to_failed_on_chart_bump_failure(
     run = _FakeRun()
     db = MagicMock()
     db.get = AsyncMock(return_value=run)
+    # The drive re-reads the run under a row lock before each write (#1702).
+    db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=run)))
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()

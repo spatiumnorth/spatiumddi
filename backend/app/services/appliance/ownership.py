@@ -75,9 +75,16 @@ async def hostname_is_unambiguous(db: AsyncSession, appliance: Appliance) -> boo
 async def own_server_condition(db: AsyncSession, appliance: Appliance, model: Any) -> Any:
     """SQL condition selecting ``model`` (DNSServer / DHCPServer) rows that
     belong to ``appliance``: the FK, or the unambiguous hostname match on an
-    agent-based row not owned by another appliance."""
+    agent-based row not owned by another appliance.
+
+    The hostname branch is for an APPROVED appliance only (#1810): a
+    pending or revoked one (a stale duplicate, a re-paired box's old entry)
+    never ran an agent under that identity, so a row merely sharing its
+    hostname is not provably its own — deleting it must not take the live
+    appliance's servers with it."""
     conds = [model.appliance_id == appliance.id]
-    if await hostname_is_unambiguous(db, appliance):
+    approved = appliance.state == APPLIANCE_STATE_APPROVED
+    if approved and await hostname_is_unambiguous(db, appliance):
         conds.append(
             (
                 sa_func.lower(sa_func.rtrim(sa_func.trim(model.host), "."))
