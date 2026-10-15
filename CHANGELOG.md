@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS Pools and DNSSEC Policies pages no longer offer writes the API
+  refuses (#1879).** Every pool write (create, edit, delete, check now) and
+  every DNSSEC-policy write takes a superadmin, but the top-level DNS Pools
+  page and the DNSSEC Policies page rendered New Pool, Check now, Delete,
+  New policy, Edit and Delete enabled for everyone, so a DNS Editor filled in
+  the form and was then refused. They are now disabled with the reason
+  "Requires superadmin" for anyone else, as the zone's own Pools tab already
+  was (#1877). The IP detail's Reputation **Check now** was gated on editing
+  the address, while `POST /dnsbl/check` asks write on `dnsbl`, which no
+  built-in role but superadmin holds; it now follows that grant, so an IPAM
+  Editor sees it disabled with the reason instead of a 403. The DNS import
+  page let a non-superadmin upload an archive or enter a PowerDNS /
+  Technitium key before refusing it; every `/dns/import` route takes a
+  superadmin, so its Preview import and Test connection buttons now say so.
+
 - **Delete Zone no longer says the zone is permanently deleted (#1880).**
   The dialog, its confirm checkbox, the "Confirm Permanent Deletion"
   title and the bulk zone delete all said the zone and its records would
