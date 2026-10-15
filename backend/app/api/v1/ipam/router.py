@@ -6901,6 +6901,9 @@ class DnsSyncPreviewResponse(BaseModel):
     # a subnet wider than a /24 spans several (#1840). ``reverse_zone_id`` /
     # ``reverse_zone_name`` are the first of them. Empty on block/space scope.
     reverse_zone_names: list[str] = []
+    # #1932 — why the subnet has no reverse zone when its DNS group runs a
+    # cloud driver that has not opted in: its PTRs are skipped. Else null.
+    reverse_zone_skipped_reason: str | None = None
     missing: list[_DnsSyncMissingResp]
     mismatched: list[_DnsSyncMismatchResp]
     stale: list[_DnsSyncStaleResp]
@@ -6985,6 +6988,7 @@ async def dns_sync_preview(
         reverse_zone_id=report.reverse_zone_id,
         reverse_zone_name=report.reverse_zone_name,
         reverse_zone_names=report.reverse_zone_names,
+        reverse_zone_skipped_reason=report.reverse_zone_skipped_reason,
         missing=[_DnsSyncMissingResp(**m.__dict__) for m in report.missing],
         mismatched=[_DnsSyncMismatchResp(**m.__dict__) for m in report.mismatched],
         stale=[_DnsSyncStaleResp(**s.__dict__) for s in report.stale],

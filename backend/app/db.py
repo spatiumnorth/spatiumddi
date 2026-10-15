@@ -257,11 +257,26 @@ def _referenced_soft_delete_models(statement: Any, models: tuple[type, ...]) -> 
         classes: set[Any] = set()
         table_names: set[Any] = set()
         froms = statement.get_final_froms() if hasattr(statement, "get_final_froms") else []
-        for fr in froms or []:
+        # A FROM that is a subquery hides the entities inside it: the
+        # ``select(count()).select_from(base.subquery())`` shape every
+        # paginated list uses for its ``total`` showed up as one anonymous
+        # name, so the count skipped the filter its page query got (#1933).
+        pending = list(froms or [])
+        seen: set[int] = set()
+        while pending:
+            fr = pending.pop()
+            if id(fr) in seen:
+                continue
+            seen.add(id(fr))
             mapper = getattr(fr, "_annotations", {}).get("parententity")
             if mapper is not None:
                 classes.add(getattr(mapper, "class_", None))
             table_names.add(getattr(fr, "name", None))
+            inner = getattr(fr, "element", None)
+            if inner is not None and hasattr(inner, "get_final_froms"):
+                for d in getattr(inner, "column_descriptions", None) or []:
+                    entities.add(d.get("entity"))
+                pending.extend(inner.get_final_froms() or [])
     except Exception:  # pragma: no cover — defensive, never block a query
         # Same conservative answer the per-model version gave: assume every
         # model is present rather than risk leaking soft-deleted rows.

@@ -290,7 +290,16 @@ config-driven, not op-driven (unlike PowerDNS's REST sign):
    rumoured` or `omnipresent` get a DS, which is BIND's own CDS rule
    (`syncpublish` in `lib/dns/dnssec.c`); a key with no `.state` file is
    included. The sync loop re-collects every 5 minutes and posts only a
-   change, because those transitions happen hours after the reload. The
+   change, because those transitions happen hours after the reload. After a
+   report, a manual rollover op, or a read that could not finish (`rndc`
+   not answering for the zone yet, a zone with no key yet, a report the
+   control plane did not take) it looks again after 20 s (checked between
+   config long-polls, which hold up to 30 s, so within about a minute),
+   doubling up to the 5 minutes while the zone stays unreadable, so keys BIND changes on its
+   own (a re-key after the key directory was lost, a rollover) reach the
+   control plane without a structural reload. A zone `rndc` cannot answer
+   for is left out of the report, keeping its last reported keys, rather
+   than reported as having none (#1934). The
    control plane mirrors it into `DNSZone.dnssec_ds_records` + `DNSKey` rows
    (replace-per-zone) for the operator's DS-export + key-status view.
 4. **Manual rollover.** `POST .../dnssec/rollover` enqueues a
@@ -693,7 +702,7 @@ The shared base [`drivers/dns/_cloud_base.py`](https://github.com/spatiumnorth/s
 
 - **No ConfigBundle / long-poll.** The `render_*` methods return `""` and the `reload_*` methods are no-ops — agentless drivers never render daemon config. `validate_config` accepts anything.
 - **Credentials in the existing column.** The per-provider credential dict is Fernet-encrypted in the existing `DNSServer.credentials_encrypted` column — no new credential store. `_load_credentials` decrypts it, raising a clean `CloudDNSError` when unset vs. when the API rejects the key.
-- **Record writes run from the control plane.** Once the driver name is listed in `AGENTLESS_DRIVERS` (registry §5), the API's `record_ops._apply_agentless` writes a `pending` `DNSRecordOp` row inside the request's transaction and calls `apply_record_change` from an after-commit hook (#1539), recording each op as `applied`, or rescheduled with backoff on an error — exactly the path Windows DNS uses. The default batch loop in `DNSDriver` isolates a per-op failure into a `RecordChangeResult(ok=False)`.
+- **Record writes run from the control plane.** Once the driver name is listed in `AGENTLESS_DRIVERS` (registry §5), the API's `record_ops._apply_agentless` writes a `pending` `DNSRecordOp` row inside the request's transaction and calls `apply_record_change` from an after-commit hook (#1539), recording each op as `applied`, or rescheduled with backoff on an error — exactly the path Windows DNS uses. A zone auto-created in the group (a subnet's reverse zone) is marked `agentless_create_due_at` and created at the provider in that same after-commit dispatch, ahead of its record ops (#1932); any dispatch of an op whose zone is still marked, inline or from the retry sweep, creates the zone first, and the sweep retries a marked zone every 5 minutes. The mark clears once the zone is at the provider, so a zone deleted at the provider afterwards is not re-created. **Cloud groups opt in:** a provider bills per hosted zone and a subnet gets one reverse zone per /24 it spans (a /17 makes 128), so in a group running a cloud driver (`CLOUD_DNS_DRIVERS`) reverse zones are auto-created only when the group's `auto_reverse_zones_at_provider` is on (Edit Server Group → *Auto-create reverse zones at the provider*; off by default, and every group existing at the upgrade starts off). Opted out, the subnet gets no reverse zone and its PTRs are skipped, logged as `reverse_zone_skipped_cloud_optout` and named in the subnet's IPAM DNS sync report (`reverse_zone_skipped_reason`); forward records are unaffected, and reverse zones the group already holds are kept. Turning it on takes effect at the next IPAM DNS sync of each subnet, or the reverse-zone backfill. `technitium_api` and Windows DNS groups ignore the setting. The default batch loop in `DNSDriver` isolates a per-op failure into a `RecordChangeResult(ok=False)`.
 - **Zone create / delete via `apply_zone_change(server, zone, op)`** (`op` ∈ `create` / `delete`) — cloud providers have no rename, so the caller sends delete+create. Routed through the same write-through pattern as Windows zone CRUD (§3.5): pushed to the provider before the SpatiumDDI DB commit so the two states stay consistent.
 - **Reads via `pull_zones_from_server` / `pull_zone_records`** — the same method names Windows DNS exposes, returning the same neutral dict / `RecordData` shape (record names relative to the apex, `@` for apex). So the existing `sync-from-server` drift path *and* the cloud import service (§ MIGRATION.md) both work against any cloud driver with no per-provider glue.
 
