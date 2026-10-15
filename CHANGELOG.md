@@ -99,6 +99,49 @@ the formatter handles the rest.
   up to 5 minutes while a zone stays unreadable, and leaves a zone `rndc`
   cannot answer for out of the report instead of clearing its keys.
 
+- **The DNS Pools and DNSSEC Policies pages no longer offer writes the API
+  refuses (#1879).** Every pool write (create, edit, delete, check now) and
+  every DNSSEC-policy write takes a superadmin, but the top-level DNS Pools
+  page and the DNSSEC Policies page rendered New Pool, Check now, Delete,
+  New policy, Edit and Delete enabled for everyone, so a DNS Editor filled in
+  the form and was then refused. They are now disabled with the reason
+  "Requires superadmin" for anyone else, as the zone's own Pools tab already
+  was (#1877). The IP detail's Reputation **Check now** was gated on editing
+  the address, while `POST /dnsbl/check` asks write on `dnsbl`, which no
+  built-in role but superadmin holds; it now follows that grant, so an IPAM
+  Editor sees it disabled with the reason instead of a 403. The DNS import
+  page let a non-superadmin upload an archive or enter a PowerDNS /
+  Technitium key before refusing it; every `/dns/import` route takes a
+  superadmin, so its Preview import and Test connection buttons now say so.
+
+- **Delete Zone no longer says the zone is permanently deleted (#1880).**
+  The dialog, its confirm checkbox, the "Confirm Permanent Deletion"
+  title and the bulk zone delete all said the zone and its records would
+  be permanently deleted, while the console sends the soft delete and the
+  zone goes to Trash. They now say the zone and its records move to Trash,
+  and that a superadmin can restore them from Administration → Trash
+  (restoring is superadmin-only, so the dialog does not tell a DNS Editor
+  they can undo it themselves). The same untrue "cannot be undone" is gone
+  from the DNS records grid's single-record delete. "Permanent" stays on
+  the paths that are: group, TSIG key and blocking-list deletes, and
+  Trash's purge. Same class as #1152 / #1398 for IPAM.
+
+- **An imported zone no longer has to stay delegated to the server it was
+  migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
+  BIND9, PowerDNS and Technitium importers keep the source's apex NS, which the
+  agent then serves as the zone's NS set. Preview now lists, per zone, an apex
+  NS naming a host outside the target group (`foreign_apex_ns`, plus a
+  warning), and the import page offers to replace it with the group's own
+  servers that have a DNS hostname. The box starts unticked, because an outside
+  NS can be deliberate (a hidden primary whose public NS are a provider's). The
+  commit API takes `apex_ns_policy: "replace"`, and so does the Copilot's
+  `commit_dns_import`. Replacing is audited, leaves delegations below the apex
+  alone, moves a SOA primary name that named the old host, and keeps the rows
+  with a warning when the group has no server with a hostname. Sync with
+  Servers no longer pushes a stored apex NS to a server whose read cannot see
+  the apex NS (a zone transfer drops it); on agent-managed BIND9 that push
+  failed every run for want of a TSIG key.
+
 - **An agentless DNS record op no longer reaches the provider before
   the database commits (#1539).** Windows DNS, the cloud providers and
   `technitium_api` were called in the middle of the request, so a commit
@@ -4208,6 +4251,15 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
+  **On the upgrade itself, expect up to two minutes of 500s from
+  appliance host-state reads (#1661).** After the reboot into the new
+  slot, k3s keeps serving the previous release's api until the new
+  control chart rolls it, and that api has no gid 2770, so
+  `GET /api/v1/appliance/slot-upgrade` (and the setup-state and
+  system-info reads) answer `500` until the new api is Ready — about
+  90 s in testing, mixed in with the 502s the rollout already causes.
+  The upgrade completes normally; retry once the new api serves. This
+  happens once, on the upgrade that introduces the tightened directory.
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already

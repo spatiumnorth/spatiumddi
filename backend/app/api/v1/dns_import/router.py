@@ -43,6 +43,7 @@ from app.services.dns_import import (
     test_powerdns_connection,
     test_technitium_connection,
 )
+from app.services.dns_import.apex_ns import annotate_apex_ns
 from app.services.dns_import.canonical import (
     ConflictAction,
     ImportedRecord,
@@ -108,6 +109,10 @@ class ImportedZoneOut(BaseModel):
     # payload (see the ``soa`` note above). None rather than "public" so an
     # unclassified row shows no pill instead of a reassuring wrong one.
     name_scope: str | None = None
+    # #1892 — apex NS targets that name no server of the target group (the
+    # source server's own name, typically). Derived by the preview, never
+    # round-tripped; the UI offers ``apex_ns_policy="replace"`` from it.
+    foreign_apex_ns: list[str] = Field(default_factory=list)
 
 
 class ZoneConflictOut(BaseModel):
@@ -157,6 +162,10 @@ class CommitIn(BaseModel):
     # left untouched can be omitted; the commit defaults them to
     # skip-on-conflict / create-otherwise.
     conflict_actions: dict[str, ConflictDecision] = Field(default_factory=dict)
+    # #1892 — "replace" swaps an imported apex NS that names a host outside the
+    # target group for the group's own servers. Default keeps the rows as
+    # imported; preview lists the zones this would change.
+    apex_ns_policy: Literal["keep", "replace"] = "keep"
 
 
 class WindowsDNSPreviewIn(BaseModel):
@@ -328,6 +337,7 @@ def _zone_to_pydantic(z: ImportedZone, tlds: frozenset[str] | None = None) -> Im
         forwarders=list(z.forwarders),
         skipped_record_types=dict(z.skipped_record_types),
         parse_warnings=list(z.parse_warnings),
+        foreign_apex_ns=list(z.foreign_apex_ns),
     )
 
 
@@ -494,6 +504,7 @@ async def bind9_preview(
         target_view_id=str(target_view_id) if target_view_id else None,
         user=current_user.display_name,
     )
+    await annotate_apex_ns(db, preview, target_group_id)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
@@ -531,6 +542,7 @@ async def bind9_commit(
             target_view_id=body.target_view_id,
             conflict_actions=actions,
             current_user=current_user,
+            apex_ns_policy=body.apex_ns_policy,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -654,6 +666,7 @@ async def windows_dns_preview(
         target_view_id=str(body.target_view_id) if body.target_view_id else None,
         user=current_user.display_name,
     )
+    await annotate_apex_ns(db, preview, body.target_group_id)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
@@ -691,6 +704,7 @@ async def windows_dns_commit(
             target_view_id=body.target_view_id,
             conflict_actions=actions,
             current_user=current_user,
+            apex_ns_policy=body.apex_ns_policy,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -793,6 +807,7 @@ async def powerdns_preview(
         target_view_id=str(body.target_view_id) if body.target_view_id else None,
         user=current_user.display_name,
     )
+    await annotate_apex_ns(db, preview, body.target_group_id)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
@@ -830,6 +845,7 @@ async def powerdns_commit(
             target_view_id=body.target_view_id,
             conflict_actions=actions,
             current_user=current_user,
+            apex_ns_policy=body.apex_ns_policy,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -920,6 +936,7 @@ async def technitium_preview(
         target_view_id=str(body.target_view_id) if body.target_view_id else None,
         user=current_user.display_name,
     )
+    await annotate_apex_ns(db, preview, body.target_group_id)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
@@ -956,6 +973,7 @@ async def technitium_commit(
             target_view_id=body.target_view_id,
             conflict_actions=actions,
             current_user=current_user,
+            apex_ns_policy=body.apex_ns_policy,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -1051,6 +1069,7 @@ async def cloud_dns_preview(
         target_group_id=str(body.target_group_id),
         user=current_user.display_name,
     )
+    await annotate_apex_ns(db, preview, body.target_group_id)
     return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
@@ -1091,6 +1110,7 @@ async def cloud_dns_commit(
             target_view_id=body.target_view_id,
             conflict_actions=actions,
             current_user=current_user,
+            apex_ns_policy=body.apex_ns_policy,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))

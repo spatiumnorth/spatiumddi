@@ -73,6 +73,7 @@ async def find_dns_import_preview(
                 "name": z.name,
                 "kind": z.kind,
                 "records": len(z.records),
+                "foreign_apex_ns": list(z.foreign_apex_ns),
             }
             for z in preview.zones[:100]
         ],

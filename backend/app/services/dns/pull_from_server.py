@@ -289,6 +289,14 @@ def _normalize_name(v: str, zone_name: str, relative_targets: bool) -> str:
 RecordKey = tuple[str, str, str, int | None, int | None, int | None]
 
 
+def is_apex_ns(r: RecordData | DNSRecord, zone_name: str) -> bool:
+    """An NS record at the zone apex (``@`` or the zone's own FQDN)."""
+    if r.record_type.upper() != "NS":
+        return False
+    name = (r.name or "").strip().lower()
+    return name in ("@", "", zone_name.strip().lower().rstrip(".") + ".")
+
+
 def _key(r: RecordData | DNSRecord, zone_name: str, *, relative_targets: bool) -> RecordKey:
     """Identity key for dedup: (name, type, canonical-value, priority,
     weight, port). TTL-only differences don't count — neither does
@@ -640,6 +648,7 @@ async def _additive_push(
     db_rows: list[DNSRecord],
     *,
     apply: bool,
+    skip_apex_ns: bool = False,
 ) -> PushResult:
     """For every DB row whose key isn't on the wire, send a create op via
     the driver. Errors are collected, not raised, so one bad record
@@ -668,6 +677,10 @@ async def _additive_push(
     for row in db_rows:
         rtype = row.record_type.upper()
         if rtype not in pushable_types:
+            continue
+        # #1893 — the caller found the read cannot see the apex NS; see
+        # ``sync_zone_with_server``.
+        if skip_apex_ns and is_apex_ns(row, zone.name):
             continue
         if _key(row, zone.name, relative_targets=rel) in on_wire_keys:
             continue
@@ -874,6 +887,18 @@ async def sync_zone_with_server(
     db_rows = list(db_rows_res.scalars().all())
     rel = targets_are_relative(primary)
     db_keys = {_key(r, zone.name, relative_targets=rel) for r in db_rows}
+    # #1893 — a read that carries no apex NS at all (the AXFR helper drops it
+    # by design) cannot tell whether the server has the stored one, so every
+    # run read it as missing and pushed it again (on agent-managed BIND9 the
+    # control-plane push then fails for want of a TSIG key, every run). Every
+    # zone has an apex NS set, so an empty one means the read could not see
+    # it: the stored apex NS stays out of the push set. Decided on the read
+    # as returned, before the filters below: ``without_server_apex_ns`` drops
+    # a ``technitium_api`` server's own apex NS, and that read CAN see the
+    # apex, so a stored apex NS the server lacks is still pushed there. A
+    # read that carries one (a provider's) is compared like any record, and
+    # delegations below the apex are always compared.
+    read_sees_apex_ns = any(is_apex_ns(r, zone.name) for r in on_wire)
     on_wire = without_agent_ns_glue(on_wire, primary, zone.name, db_keys)
     on_wire = without_server_apex_ns(on_wire, primary, zone.name, db_keys)
 
@@ -890,7 +915,16 @@ async def sync_zone_with_server(
     if apply and pull_result.imported:
         await db.flush()
 
-    push_result = await _additive_push(db, primary, driver, zone, on_wire, db_rows, apply=apply)
+    push_result = await _additive_push(
+        db,
+        primary,
+        driver,
+        zone,
+        on_wire,
+        db_rows,
+        apply=apply,
+        skip_apex_ns=not read_sees_apex_ns,
+    )
 
     logger.info(
         "dns.sync_with_server",
