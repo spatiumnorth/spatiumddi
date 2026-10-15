@@ -84,6 +84,28 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Saving an SSH setting no longer leaves `ssh.service` failed (#1632).**
+  The appliance runs sshd socket-activated: `ssh.socket` holds the port.
+  The runner applied a change with `systemctl reload ssh.service`, whose
+  `ExecReload` is `sshd -t` plus `kill -HUP`; sshd answers SIGHUP by
+  re-executing itself, cannot bind the port the socket owns and dies, while
+  both reload commands exit 0. The log said "sshd reloaded" over a failed
+  unit, with no sshd running until the next connection. Under socket
+  activation the runner now restarts `ssh.service` (the socket keeps the
+  port, open sessions survive, `KillMode=process`), which also clears a unit
+  an earlier save left failed, and judges success by whether the unit is
+  active afterwards. A failed apply now fails the trigger and leaves the
+  applied-hash sidecar unwritten, so Fleet shows it as not applied instead of
+  green. Also fixed on the way: under socket activation sshd ignores `Port`,
+  so a changed `ssh_port` opened the firewall for a port nothing listened on.
+  The runner now writes an `ssh.socket` `ListenStream` drop-in and re-binds
+  the socket, which needs `ssh.service` stopped first (systemd refuses to
+  start the socket while its service runs). Because the port now really
+  moves, the move is guarded: it happens only after the firewall has loaded
+  the rule for the new port, and if the socket cannot bind the new port the
+  previous listen port and the previous firewall fragment are both put back,
+  so SSH stays reachable where it was.
+
 - **A reverse zone auto-created in an agentless group now reaches the
   provider, so its PTRs stop failing "No such zone was found" (#1932).**
   IPAM auto-sync, DDNS and subnet create wrote the reverse zone row and
