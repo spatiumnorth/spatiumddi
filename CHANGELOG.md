@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **IPAM delete dialogs no longer promise a non-superadmin a restore
+  (#1930).** The subnet, block and IP space deletes (the tree's Delete…,
+  Edit's Danger zone and both bulk deletes) said "You can restore them from
+  Administration → Trash", but Trash's list and restore are superadmin-only,
+  so an IPAM Editor was promised an undo they cannot perform. They now say
+  that a superadmin can restore them from Administration → Trash, the same
+  wording as the DNS zone delete (#1880). What the dialogs send and how they
+  are gated is unchanged.
+
 - **The DNS agent no longer copies its whole config cache through memory
   on each apply (#1705).** `save_config` built the bundle as one string
   and encoded it again, and `commit_config` read `current.json` and
