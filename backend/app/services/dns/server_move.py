@@ -57,6 +57,7 @@ from app.services.appliance.ownership import owning_appliance_for_dns_server
 from app.services.dns import technitium_api_scope
 from app.services.dns.dnssec_signers import second_signer_refusal
 from app.services.dns.record_ops import QUEUED_OP_STATES
+from app.services.dns.row_locks import lock_op_ids, lock_zone_state_rows
 from app.services.dns.tsig import ensure_group_tsig_key
 from app.services.dns.tsig_algorithms import group_key_refusal
 
@@ -235,23 +236,33 @@ async def _elect_primary(
 
 
 async def lock_server_row(db: AsyncSession, server_id: Any) -> None:
-    """Take ``FOR UPDATE`` on the ``dns_server`` row, before any write to it (#1703).
+    """Lock everything a group move writes, in the order ``row_locks`` sets
+    (#1703, #1929), before the move's first write to any of it.
 
-    The move's UPDATE changes ``group_id`` — a column of the unique index
-    ``uq_dns_server_group_name`` — so Postgres takes ``FOR UPDATE`` for it,
-    which conflicts with the ``FOR KEY SHARE`` a worker's bundle insert holds
-    through its foreign key. Meanwhile the demotion UPDATE that ran first held
-    ``FOR NO KEY UPDATE``, which the worker's own ``UPDATE dns_server`` needs:
-    each side held half of what the other wanted (40P01). Taking the strongest
-    lock first makes a render and a move of one server run one after the other.
+    Its zone-state rows and queued ops first, then the server row ``FOR
+    UPDATE``. ``FOR UPDATE`` because the move changes ``group_id``, a column
+    of the unique index ``uq_dns_server_group_name``; taken any later, after a
+    weaker write to the row (the primary demotion, a plain field on the same
+    PUT, the Fleet engine switch's driver), it waited for the ``FOR KEY
+    SHARE`` a worker's bundle insert holds while the worker waited for that
+    weaker write: 40P01 (#1703). The zone-state rows and ops come first
+    because that is the order the agent's poll, heartbeat and zone-state
+    report take them in; taking the server row first instead deadlocked the
+    poll, which marks its ops before it writes ``last_config_etag`` (#1929's
+    walk of #1923).
 
-    Selects the id only, so no pending attribute on the instance is refreshed,
-    and runs without autoflush, so a write the caller has already made to the
-    instance is not flushed (with the weaker lock) ahead of it. A write the
-    caller has already FLUSHED holds that weaker lock already, so callers still
-    take this before their first flush of the row.
+    Runs without autoflush, so a write the caller has already made to the
+    instance is not flushed ahead of the locks. A write the caller has already
+    FLUSHED holds the weaker lock already, so callers take this before their
+    first flush of the row.
     """
     with db.no_autoflush:
+        await lock_zone_state_rows(db, DNSServerZoneState.server_id == server_id)
+        await lock_op_ids(
+            db,
+            DNSRecordOp.server_id == server_id,
+            DNSRecordOp.state.in_(QUEUED_OP_STATES),
+        )
         await db.execute(select(DNSServer.id).where(DNSServer.id == server_id).with_for_update())
 
 

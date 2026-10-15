@@ -75,7 +75,17 @@ from app.services.dns.agent_token import (
     verify_agent_token,
 )
 from app.services.dns.bundle_dirty import enqueue_renders
-from app.services.dns.record_ops import ack_op, apply_acks, reset_unacknowledged_ops
+from app.services.dns.record_ops import (
+    ack_op,
+    apply_acks,
+    lock_heartbeat_ops,
+    reset_unacknowledged_ops,
+)
+from app.services.dns.row_locks import (
+    lock_op_ids,
+    lock_server_key_share,
+    lock_zone_state_rows,
+)
 from app.services.dns.server_move import CATALOG_UNSUPPORTED_DRIVERS
 from app.services.dns.soa_timers import (
     AGENT_FEATURES_HEADER,
@@ -864,6 +874,10 @@ async def agent_heartbeat(
     """Heartbeat: updates last_seen_at, processes op ACKs, rotates token if near expiry."""
     server, payload = auth
     now = datetime.now(UTC)
+    # #1929 — the ops this heartbeat writes are locked before the server row
+    # (``row_locks``): its first write to the server row is flushed by the
+    # next statement, so the lock has to come before any of them.
+    await lock_heartbeat_ops(db, server.id, body.ops_ack, now)
     server.last_seen_at = now
     server.last_health_check_at = now
     server.status = "active"
@@ -953,7 +967,7 @@ async def agent_heartbeat(
     # (it restarted, or the long-poll response was lost) to the retry path.
     # After the acks, so an ack arriving now is not reset under it; here and
     # not in the long-poll, because this transaction always commits.
-    await reset_unacknowledged_ops(db, server.id)
+    await reset_unacknowledged_ops(db, server.id, now=now)
 
     rotated_token = None
     rotated_exp = None
@@ -1008,8 +1022,9 @@ async def agent_ops_ack(
 ) -> dict[str, str]:
     """Out-of-band op acknowledgment (also piggybacked on heartbeat)."""
     server, _ = auth
-    op = await db.get(DNSRecordOp, op_id)
-    if op is None or op.server_id != server.id:
+    # #1929 — locked first (``row_locks``): an op a group move deleted is a
+    # 404, not a StaleDataError when the ack's flush finds it gone.
+    if not await lock_op_ids(db, DNSRecordOp.id == op_id, DNSRecordOp.server_id == server.id):
         raise HTTPException(status_code=404, detail="Op not found")
     await ack_op(
         db, str(op_id), body.get("result", "error"), body.get("message"), server_id=server.id
@@ -1063,9 +1078,21 @@ async def agent_zone_state(
     def _key(name: str) -> str:
         return name.rstrip(".").lower()
 
+    # #1929 — lock in ``row_locks`` order before reading anything to write:
+    # this server's state rows, then the server row (``FOR KEY SHARE``, which
+    # waits only for a group move in progress). A move deletes the state rows
+    # and changes the group; read before it, the flush below updated a row
+    # that was gone (StaleDataError) and the report recorded serials for the
+    # zones of a group the server had left. Locked first, the deleted rows
+    # are not returned and the zones are looked up in the group it is in now.
+    await lock_zone_state_rows(db, DNSServerZoneState.server_id == server.id)
+    group_id = await lock_server_key_share(db, server.id)
+    if group_id is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+
     res = await db.execute(
         select(DNSZone).where(
-            DNSZone.group_id == server.group_id,
+            DNSZone.group_id == group_id,
             DNSZone.deleted_at.is_(None),
             func.lower(func.rtrim(DNSZone.name, ".")).in_({_key(e.zone_name) for e in body.zones}),
         )
