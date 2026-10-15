@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -204,6 +205,67 @@ def _stamp_is_stale(stamp: str | None) -> bool:
     return (datetime.now(UTC) - dt).total_seconds() > _STALE_INFLIGHT_SECONDS
 
 
+# #1825 — a trigger that lands while systemd is in a ``daemon-reload`` is
+# never seen: the reload re-creates the path watches, and per systemd.path(5)
+# an already-present file activates the unit only for PathExists= /
+# PathExistsGlob= / DirectoryNotEmpty=, "something similar does not apply to
+# PathChanged=". The runner normally starts within milliseconds, so a trigger
+# still unclaimed after this long was missed.
+_PICKUP_GRACE_SECONDS = 30
+_last_rearm_at = 0.0
+
+
+def _mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _pending_trigger_mtime() -> float | None:
+    """mtime of the apply trigger if the runner has not claimed it yet.
+
+    The runner's first act is to write ``.state`` (so it is newer than the
+    trigger); its terminal act renames the trigger away. A trigger with no
+    ``.state``, or one older than itself, is therefore not started.
+    """
+    trig = _mtime(_TRIGGER_FILE)
+    if trig is None:
+        return None
+    state = _mtime(_STATE_FILE)
+    if state is None or state < trig:
+        return trig
+    return None
+
+
+def _rearm_unclaimed_trigger(trigger_mtime: float) -> None:
+    """Re-fire ``PathChanged=`` for a trigger the watcher missed.
+
+    Opening for write and closing without writing emits IN_CLOSE_WRITE (the
+    event PathChanged= is documented to fire on: "activated if the file
+    which was open for writing gets closed") and leaves the mtime, and with
+    it the heal's clock, untouched. Idempotent: the runner's own start is a
+    no-op if it is already running, and it consumes the trigger when done.
+    A trigger the api cannot open (the supervisor's) is left to the heal.
+    """
+    global _last_rearm_at
+    now = time.time()
+    if now - trigger_mtime < _PICKUP_GRACE_SECONDS:
+        return
+    if now - _last_rearm_at < _PICKUP_GRACE_SECONDS:
+        return
+    _last_rearm_at = now
+    try:
+        with open(_TRIGGER_FILE, "ab"):
+            pass
+    except OSError as exc:
+        logger.warning(
+            "appliance_slot_upgrade_rearm_failed", trigger=str(_TRIGGER_FILE), error=str(exc)
+        )
+        return
+    logger.warning("appliance_slot_upgrade_rearmed", trigger=str(_TRIGGER_FILE))
+
+
 def _upgrade_state_now() -> tuple[UpgradeState, str | None]:
     """Read the .state sidecar the host-side runner maintains. Returns
     ('ready', None) when no upgrade has run recently — ``ready`` is
@@ -218,8 +280,18 @@ def _upgrade_state_now() -> tuple[UpgradeState, str | None]:
     failed forever after the operator has observed it; the
     .failed.<ts> sidecar stays on disk for forensics.
     """
-    if _TRIGGER_FILE.exists() and not _STATE_FILE.exists():
-        return "in-flight", None
+    pending = _pending_trigger_mtime()
+    if pending is not None:
+        # #1825 / #1288 — the runner has not claimed this trigger (no
+        # .state, or one left by a PREVIOUS run, older than the trigger).
+        # Stamp it with the trigger's mtime so #421's heal bounds it: a
+        # stamp-less in-flight could never age out, and a missed
+        # ``PathChanged=`` edge would 409 apply + rollback for good.
+        stamp = datetime.fromtimestamp(pending, UTC).isoformat()
+        if _stamp_is_stale(stamp):
+            return "failed", stamp
+        _rearm_unclaimed_trigger(pending)
+        return "in-flight", stamp
     if _STATE_FILE.exists():
         try:
             text = _STATE_FILE.read_text(encoding="utf-8", errors="replace").strip()
@@ -315,20 +387,10 @@ def schedule_apply(image_url: str, checksum_url: str | None = None) -> None:
         body += checksum_url + "\n"
 
     _TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # Clear any prior .state so the UI reads "in-flight" until the runner
-    # writes its own state.
-    if _STATE_FILE.exists():
-        try:
-            _STATE_FILE.unlink()
-        except OSError as exc:
-            # Best-effort cleanup — the host-side runner will overwrite
-            # .state once it picks up the trigger, so a stale .state from
-            # the previous run is at worst a brief UI mis-read.
-            logger.warning(
-                "appliance_slot_upgrade_state_cleanup_failed",
-                state_file=str(_STATE_FILE),
-                error=str(exc),
-            )
+    # No .state cleanup: the file is root-owned in a sticky dir, so the api's
+    # unlink always failed (EPERM, #1288). A previous run's .state is older
+    # than the trigger written below, which _upgrade_state_now() reads as
+    # "not started" -> in-flight.
     tmp = _TRIGGER_FILE.with_suffix(".new")
     tmp.write_text(body, encoding="utf-8")
     tmp.replace(_TRIGGER_FILE)

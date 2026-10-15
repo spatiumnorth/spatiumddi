@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A slot-upgrade apply that landed during a systemd reload no longer
+  stays `in-flight` for good, and a new apply no longer reads the
+  previous run's `done` (#1825, #1288).** A `daemon-reload` re-creates the
+  path watches, and `PathChanged=` does not fire for a file already there
+  (systemd.path(5)), so a trigger written mid-reload never started the
+  runner; with no `.state` there was no stamp to age, so apply and rollback
+  answered 409 until someone touched the file on the host. The api reader
+  now treats a trigger with no `.state`, or one older than the trigger, as
+  in-flight stamped with the trigger's mtime, so the 300 s heal bounds it
+  and it reads `failed` after that. After a 30 s pickup grace it re-fires
+  the watcher by opening the trigger for write and closing it (mtime, and
+  so the heal clock, unchanged; rate-limited, and a trigger the api cannot
+  open is left to the heal). The same rule fixes #1288: the api's unlink of
+  the root-owned `.state` always failed with EPERM, so it is dropped.
+  The other 21 `PathChanged=` triggers are unchanged.
 - **A rolling upgrade no longer drops its Lease on one unanswered
   kubeapi read, and a `running` run whose drive is gone is resumed
   (#1713).** A node reboot or a loaded host makes a Lease read time out;
