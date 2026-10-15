@@ -169,7 +169,7 @@ def test_the_started_unit_is_the_fstab_mount_of_state() -> None:
 
 CONSOLE = BIN / "spatium-console"
 _CONSOLE_NAMES = {"_state_not_mounted", "pairing_status"}
-HELD = ("Held — STATE not mounted (journalctl -b -u spatium-etc-render)", "bold red")
+HELD = ("Held — STATE not mounted (see /var/log/spatiumddi/etc-render.log)", "bold red")
 
 
 def _console(root: Path, *, state_mounted: bool) -> dict[str, Any]:

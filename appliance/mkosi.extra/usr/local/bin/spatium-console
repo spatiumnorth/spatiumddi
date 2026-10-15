@@ -3665,7 +3665,9 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
     if _state_not_mounted():
         # #1910 — every file below is on STATE; without it they read as
         # "Bootstrapping…", and the node is not bootstrapping, it is held.
-        return ("Held — STATE not mounted (journalctl -b -u spatium-etc-render)", "bold red")
+        # The render writes why to its own log (and the kernel log), not to
+        # its unit's journal, so the row points there.
+        return ("Held — STATE not mounted (see /var/log/spatiumddi/etc-render.log)", "bold red")
     state_dir = Path("/var/persist/spatium-supervisor")
     approval_state_file = state_dir / "approval-state"
     identity_dir = state_dir / "identity"
