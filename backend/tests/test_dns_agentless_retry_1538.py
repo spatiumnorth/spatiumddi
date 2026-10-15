@@ -93,6 +93,8 @@ async def test_agentless_transient_failure_reschedules_instead_of_failing(
     op = await enqueue_record_op(
         db_session, zone, "create", {"name": "www", "type": "A", "value": "10.0.0.2"}
     )
+    # #1539 — the provider is called by the commit, not by the enqueue.
+    await db_session.commit()
 
     assert op is not None
     assert op.state == "pending", "a first transient failure must schedule a retry"

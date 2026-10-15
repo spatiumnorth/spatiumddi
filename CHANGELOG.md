@@ -98,6 +98,28 @@ the formatter handles the rest.
   now looks again 20 s after any report, rollover or failed read, doubling
   up to 5 minutes while a zone stays unreadable, and leaves a zone `rndc`
   cannot answer for out of the report instead of clearing its keys.
+
+- **An agentless DNS record op no longer reaches the provider before
+  the database commits (#1539).** Windows DNS, the cloud providers and
+  `technitium_api` were called in the middle of the request, so a commit
+  that then failed rolled back the record and its op row while the
+  provider kept the write, with nothing recording it. The op row is now
+  written `pending` inside the transaction and the driver is called from
+  an after-commit hook (one call per batch, so Windows still chunks),
+  which marks it `applied` or reschedules it with backoff; a process
+  that dies in between leaves a committed `pending` row the retry sweep
+  replays. A provider refusal gets its own `agentless_push_failed` audit
+  row, because the request's audit row is written before the provider is
+  called. Every caller is covered (record CRUD, import, IPAM sync, DDNS,
+  trash purge, Celery workers) since the hook sits on the session. The
+  hook waits for the outer commit (a savepoint release does not count),
+  claims the rows before calling the provider so the retry sweep can never
+  send the same op at the same time, and holds no database connection
+  during the provider call. A bulk delete or IPAM purge no longer keeps a
+  row on a first provider failure: the delete commits, as a single delete
+  always has, the op is retried, and the bulk-delete response and its
+  notice say the provider has not removed the records yet.
+
 - **IPAM delete dialogs no longer promise a non-superadmin a restore
   (#1930).** The subnet, block and IP space deletes (the tree's Delete…,
   Edit's Danger zone and both bulk deletes) said "You can restore them from
