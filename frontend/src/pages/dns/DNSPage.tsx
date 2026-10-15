@@ -3868,6 +3868,7 @@ function ZoneDetailView({
       let deleted = 0;
       const skipped: { record_id: string; reason: string }[] = [];
       const batches: string[] = [];
+      const providerWarnings: string[] = [];
       for (let i = 0; i < ids.length; i += BULK_DELETE_CHUNK) {
         const res = await dnsApi.bulkDeleteRecords(
           group.id,
@@ -3878,10 +3879,11 @@ function ZoneDetailView({
         deleted += res.deleted;
         skipped.push(...res.skipped);
         if (res.deletion_batch_id) batches.push(res.deletion_batch_id);
+        if (res.provider_warning) providerWarnings.push(res.provider_warning);
       }
-      return { deleted, skipped, batches };
+      return { deleted, skipped, batches, providerWarnings };
     },
-    onSuccess: ({ deleted, skipped, batches }) => {
+    onSuccess: ({ deleted, skipped, batches, providerWarnings }) => {
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
       setSelectedRecords(new Set());
       setConfirmBulkDelete(false);
@@ -3889,14 +3891,21 @@ function ZoneDetailView({
         batches.length > 1
           ? ` across ${batches.length} trash batches, each restored separately`
           : "";
+      // #1539 — the DNS provider is called after the delete commits; a
+      // refusal is retried in the background, and until it lands the
+      // provider keeps serving the records. Say so rather than read clean.
+      const provider =
+        providerWarnings.length > 0
+          ? ` The DNS provider has not removed them yet and will be retried: ${providerWarnings[0]}`
+          : "";
       if (skipped.length > 0) {
         const reasons = Array.from(new Set(skipped.map((s) => s.reason)));
         setBulkDeleteNotice(
-          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}${spread}; ${skipped.length} skipped — ${reasons.join("; ")}`,
+          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}${spread}; ${skipped.length} skipped — ${reasons.join("; ")}.${provider}`,
         );
-      } else if (spread) {
+      } else if (spread || provider) {
         setBulkDeleteNotice(
-          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}${spread}.`,
+          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}${spread}.${provider}`,
         );
       } else {
         setBulkDeleteNotice(null);

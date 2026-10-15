@@ -83,7 +83,9 @@ _MAX_ERROR = 2000
 #   renders ``allow-recursion``).
 # 10 (#1817): the BIND9 agent renders ``allow_recursion`` literally and its
 #   stored default is local + private networks (migration b8e41c7a2d95).
-RENDERER_REVISION = 10
+# 11 (#1706): with views, the group's blocklist zone is no longer shipped into
+#   a group whose every view already carries the group's lists in its own.
+RENDERER_REVISION = 11
 
 
 def _serves(revision: int | None) -> bool:

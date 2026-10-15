@@ -100,6 +100,54 @@ the formatter handles the rest.
   the apex NS (a zone transfer drops it); on agent-managed BIND9 that push
   failed every run for want of a TSIG key.
 
+- **An agentless DNS record op no longer reaches the provider before
+  the database commits (#1539).** Windows DNS, the cloud providers and
+  `technitium_api` were called in the middle of the request, so a commit
+  that then failed rolled back the record and its op row while the
+  provider kept the write, with nothing recording it. The op row is now
+  written `pending` inside the transaction and the driver is called from
+  an after-commit hook (one call per batch, so Windows still chunks),
+  which marks it `applied` or reschedules it with backoff; a process
+  that dies in between leaves a committed `pending` row the retry sweep
+  replays. A provider refusal gets its own `agentless_push_failed` audit
+  row, because the request's audit row is written before the provider is
+  called. Every caller is covered (record CRUD, import, IPAM sync, DDNS,
+  trash purge, Celery workers) since the hook sits on the session. The
+  hook waits for the outer commit (a savepoint release does not count),
+  claims the rows before calling the provider so the retry sweep can never
+  send the same op at the same time, and holds no database connection
+  during the provider call. A bulk delete or IPAM purge no longer keeps a
+  row on a first provider failure: the delete commits, as a single delete
+  always has, the op is retried, and the bulk-delete response and its
+  notice say the provider has not removed the records yet.
+
+- **IPAM delete dialogs no longer promise a non-superadmin a restore
+  (#1930).** The subnet, block and IP space deletes (the tree's Delete…,
+  Edit's Danger zone and both bulk deletes) said "You can restore them from
+  Administration → Trash", but Trash's list and restore are superadmin-only,
+  so an IPAM Editor was promised an undo they cannot perform. They now say
+  that a superadmin can restore them from Administration → Trash, the same
+  wording as the DNS zone delete (#1880). What the dialogs send and how they
+  are gated is unchanged.
+
+- **The DNS agent no longer copies its whole config cache through memory
+  on each apply (#1705).** `save_config` built the bundle as one string
+  and encoded it again, and `commit_config` read `current.json` and
+  wrote it back through memory, each adding about twice the config to
+  the agent's peak (about 237 MiB at 124 MB, the Family filter). The
+  cache is now streamed to disk, compact, fsynced before its rename, and
+  promoted to `previous.json` with a file copy. The ingest sweep also stops
+  re-parsing the cache every 180 s when it has not changed.
+
+- **A group blocklist ships once per view, not twice (#1706).** With
+  views, every view's own RPZ zone already carries the group's lists,
+  yet the group zone was rendered into each view as well, so named
+  loaded the same entries twice per view and the bundle carried them
+  twice. The control plane now omits the group zone when every view has
+  its own, and the agent loads it only into a view without one. Changes
+  served config: the second `zone` and its `response-policy` entry are
+  gone from each view; answers are unchanged.
+
 - **Re-promoting a node that Replace evicted no longer settles it as a
   member from a stale `ready` (#1903).** A replaced box that is still up
   keeps `ready\t<seed url>` in its cluster-join sidecar. Promoted again

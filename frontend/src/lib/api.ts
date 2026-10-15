@@ -6518,6 +6518,7 @@ export const dnsApi = {
         deleted: number;
         skipped: { record_id: string; reason: string }[];
         deletion_batch_id: string | null;
+        provider_warning?: string | null;
       }>(
         `/dns/groups/${groupId}/zones/${zoneId}/records/bulk-delete`,
         { record_ids: recordIds },
