@@ -577,6 +577,12 @@ demoted, and a node can't be **revoked** while it's a live cluster member
 — it must be demoted first (revoking a live etcd member would break
 quorum).
 
+A demoted member's row reads `leaving` from the moment of the demote. Until
+its leave runner starts, the node goes on reporting `ready`, and that report
+is ignored (#1806): only the runner's own `leaving`, `left` or `failed` moves
+the row. A promoted node's row reads `joining` the same way, ignoring a
+`left` left over from an earlier demote.
+
 A demoted node leaves etcd **before** it resets itself (#1541). Its leave
 runner removes its own etcd member while the node still votes, stops k3s,
 and asks the node it joined whether the member is gone; only then does it
