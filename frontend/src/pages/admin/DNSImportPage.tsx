@@ -36,6 +36,11 @@ import {
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ZoneScopePill } from "@/components/ZoneScopePill";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 
 // Tab metadata. Every source is live; ``available: false`` remains the
 // hook for rendering a not-yet-shipped source (so the operator sees the
@@ -110,6 +115,14 @@ interface BindUploadState {
   result: DNSImportCommitResult | null;
   phase: Phase;
   error: string | null;
+}
+
+/** Every DNS import route — preview, test and commit — takes a superadmin
+ *  (`dns_import/router.py`), so the controls that start one say so rather
+ *  than letting a DNS Editor upload an archive and be refused (#1879's
+ *  sweep). Commit is reachable only from a successful preview. */
+function useImportGate(): { disabled?: boolean; title?: string } {
+  return permissionGate(usePermissions().isSuperadmin, NEEDS_SUPERADMIN);
 }
 
 function emptyState(): BindUploadState {
@@ -515,6 +528,7 @@ function WindowsDNSPullForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canPreview = Boolean(state.serverId && state.groupId) && !previewing;
   const eligible = servers.filter((s) => s.has_credentials);
   const hasIneligible = servers.length > eligible.length;
@@ -627,7 +641,8 @@ function WindowsDNSPullForm({
           icon={previewing ? Loader2 : ServerIcon}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling zones…" : "Preview import"}
         </HeaderButton>
@@ -850,6 +865,7 @@ function CloudDNSPullForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canPreview = Boolean(state.serverId && state.groupId) && !previewing;
   const eligible = servers.filter((s) => s.has_credentials);
   const hasIneligible = servers.length > eligible.length;
@@ -969,7 +985,8 @@ function CloudDNSPullForm({
           icon={previewing ? Loader2 : Cloud}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling zones…" : "Preview import"}
         </HeaderButton>
@@ -1180,6 +1197,7 @@ function PowerDNSPullForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canTest =
     Boolean(state.apiUrl && state.apiKey) && !testing && !previewing;
   const canPreview =
@@ -1258,7 +1276,8 @@ function PowerDNSPullForm({
               icon={testing ? Loader2 : Plug}
               iconClassName={testing ? "animate-spin" : undefined}
               onClick={onTest}
-              disabled={!canTest}
+              disabled={!canTest || !!gate.disabled}
+              title={gate.title}
             >
               {testing ? "Testing…" : "Test connection"}
             </HeaderButton>
@@ -1324,7 +1343,8 @@ function PowerDNSPullForm({
           icon={previewing ? Loader2 : Globe}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling zones…" : "Preview import"}
         </HeaderButton>
@@ -1531,6 +1551,7 @@ function TechnitiumPullForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canTest =
     Boolean(state.apiUrl && state.apiToken) && !testing && !previewing;
   const canPreview =
@@ -1591,7 +1612,8 @@ function TechnitiumPullForm({
               icon={testing ? Loader2 : Plug}
               iconClassName={testing ? "animate-spin" : undefined}
               onClick={onTest}
-              disabled={!canTest}
+              disabled={!canTest || !!gate.disabled}
+              title={gate.title}
             >
               {testing ? "Testing…" : "Test connection"}
             </HeaderButton>
@@ -1659,7 +1681,8 @@ function TechnitiumPullForm({
           icon={previewing ? Loader2 : Globe}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling zones…" : "Preview import"}
         </HeaderButton>
@@ -1685,6 +1708,7 @@ function UploadForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canPreview = Boolean(state.file && state.groupId) && !previewing;
   return (
     <div className="rounded-md border bg-muted/20 p-4">
@@ -1771,7 +1795,8 @@ function UploadForm({
           icon={previewing ? Loader2 : Download}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Parsing…" : "Preview import"}
         </HeaderButton>
