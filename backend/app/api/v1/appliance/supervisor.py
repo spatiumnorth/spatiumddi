@@ -291,6 +291,30 @@ def _stale_report_in_transition(
     return False
 
 
+def _unproven_join_verdict(
+    row_tid: str | None,
+    desired_role: str | None,
+    reported: str,
+    reported_tid: str | None,
+) -> bool:
+    """PURE (#1903): a terminal join verdict that does not belong to the promote
+    in flight.
+
+    A node keeps the last verdict its host runner wrote — ``ready <seed>`` for a
+    box that was a member before Replace evicted it. Promoted again, it reports
+    that ``ready`` (or an old ``failed``) before any join runs, and applying it
+    settles the node as a member of a cluster it never joined. The supervisor
+    echoes the id of the join it FIRED (``""`` while the sidecar predates that
+    fire); only a matching id proves the verdict is this promote's. A supervisor
+    that does not send the field at all (None) is not judged: it cannot prove
+    anything, and refusing it would strand every pre-#1903 node."""
+    if desired_role != DESIRED_CLUSTER_ROLE_MEMBER or not row_tid or reported_tid is None:
+        return False
+    if reported not in (CLUSTER_JOIN_STATE_READY, CLUSTER_JOIN_STATE_FAILED):
+        return False
+    return reported_tid != row_tid
+
+
 # The last ignored report logged per row (this process), so a node that keeps
 # reporting the same state costs one log line, not one per heartbeat.
 _ignored_join_reports_logged: dict[uuid.UUID, str] = {}
@@ -1444,6 +1468,10 @@ class SupervisorHeartbeatRequest(BaseModel):
     k3s_join_token: str | None = None
     cluster_join_state: str | None = None
     cluster_join_reason: str | None = None
+    # #1903 — the promote this report belongs to: the id of the join the
+    # supervisor fired, ``""`` when the sidecar's verdict predates that fire,
+    # absent (None) from a supervisor that does not know the field.
+    cluster_transition_id: str | None = None
     # #272 Phase 7b — the node's real routable k3s InternalIP. Distinct
     # from ``last_seen_ip`` (the supervisor POD's source IP, 10.42.x.x,
     # since it heartbeats from inside the cluster). The promote endpoint
@@ -1645,6 +1673,8 @@ class SupervisorHeartbeatResponse(BaseModel):
     desired_cluster_role: Literal["member", "none"] | None = None
     desired_k3s_server_url: str | None = None
     desired_k3s_join_token: str | None = None
+    # #1903 — id of the promote asking for the join; echoed back on the report.
+    desired_cluster_transition_id: str | None = None
     # #272 Phase 7b — the node IPs (as ``/32`` CIDRs) of every OTHER
     # control-plane peer this node must reach (and be reachable from) on
     # the k3s server ports (6443 apiserver, 2379/2380 etcd, 10250
@@ -2207,6 +2237,23 @@ async def supervisor_heartbeat(
                 hostname=row.hostname,
                 row_state=row.cluster_join_state,
                 reported=body.cluster_join_state,
+            )
+    elif body.cluster_join_state is not None and _unproven_join_verdict(
+        row.cluster_transition_id,
+        row.desired_cluster_role,
+        body.cluster_join_state,
+        body.cluster_transition_id,
+    ):
+        # #1903 — a ready / failed left over from before this promote's join.
+        if _ignored_join_reports_logged.get(row.id) != body.cluster_join_state:
+            _ignored_join_reports_logged[row.id] = body.cluster_join_state
+            logger.info(
+                "control_plane_unproven_join_report_ignored",
+                appliance_id=str(row.id),
+                hostname=row.hostname,
+                row_state=row.cluster_join_state,
+                reported=body.cluster_join_state,
+                reported_transition=body.cluster_transition_id,
             )
     elif body.cluster_join_state is not None and _stale_report_in_transition(
         row.cluster_join_state, row.desired_cluster_role, body.cluster_join_state
@@ -2937,6 +2984,11 @@ async def supervisor_heartbeat(
         desired_cluster_role=row.desired_cluster_role,  # type: ignore[arg-type]
         desired_k3s_server_url=row.desired_k3s_server_url,
         desired_k3s_join_token=desired_join_token,
+        desired_cluster_transition_id=(
+            row.cluster_transition_id
+            if row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+            else None
+        ),
         cluster_peer_cidrs=cluster_peer_cidrs,
         firewall_pod_cidrs=firewall_pod_cidrs,
         firewall_service_cidrs=firewall_service_cidrs,
@@ -4868,6 +4920,7 @@ async def promote_control_plane(
         row.cluster_join_state = CLUSTER_JOIN_STATE_JOINING
         row.cluster_join_state_at = datetime.now(UTC)  # #590 staleness clock
         row.cluster_join_reason = None
+        row.cluster_transition_id = str(uuid.uuid4())  # #1903
         db.add(
             AuditLog(
                 user_id=current_user.id,

@@ -599,6 +599,15 @@ a live node if the removed node held it. On a one-node control plane the
 api and worker roll out by retiring the old pod first, so each rollout there
 costs a brief api outage.
 
+A promote stamps a fresh transition id on the row, and the heartbeat hands it
+to the node (#1903). The node's join sidecar can still say `ready <seed>` from
+an earlier membership, as on a box Replace evicted that is still running, so
+the node echoes the id of the join it actually fired, and only for a verdict
+written after that fire. The control plane applies a reported `ready` or
+`failed` for a promote only when the ids match, and the supervisor fires the
+join even over a `ready` that is not that promote's. A re-promoted box
+therefore joins afresh rather than settling from the old verdict.
+
 A demote is refused (409) while any control-plane member is unhealthy — no
 heartbeat for 90 s, or a k8s Node that is NotReady or missing — and the
 error names every unhealthy member. The seed is judged by its k8s Node

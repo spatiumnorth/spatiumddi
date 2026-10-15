@@ -886,6 +886,12 @@ class Appliance(Base):
     # NULL (idle).
     cluster_join_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
     cluster_join_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # #1903 — id of the promote in flight, stamped fresh by every promote. The
+    # supervisor echoes the id of the join it fired; a terminal join verdict is
+    # applied only when it matches, so a stale ``ready`` from a previous
+    # membership (a Replace-evicted box that is still up) cannot settle a
+    # re-promote. NULL = no promote has stamped one.
+    cluster_transition_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     # #590 — when ``cluster_join_state`` last CHANGED. No cluster transition
     # has a timeout (each converges only on a supervisor report), so this is
     # the only way to tell a healthy multi-minute k3s join from one that will

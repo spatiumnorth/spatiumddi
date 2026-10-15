@@ -547,3 +547,41 @@ def test_read_cluster_restore_state(restore_paths: Path) -> None:
     assert appliance_state.read_cluster_restore_state() == ("restoring", "snap-A")
     (restore_paths / "cluster-restore.state").write_text("done\t")
     assert appliance_state.read_cluster_restore_state() == ("done", None)
+
+
+# ── #1903 — a stale ``ready`` from a previous membership ─────────────────────
+
+
+def _transition_paths(monkeypatch: pytest.MonkeyPatch, base: Path) -> None:
+    monkeypatch.setattr(
+        appliance_state, "_CLUSTER_JOIN_TRANSITION", base / "cluster-join.transition"
+    )
+
+
+def test_stale_ready_for_same_seed_does_not_block_a_repromote(
+    appliance_paths: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Replace-evicted box that is still up keeps ``ready\\t<seed>``. A promote
+    against the same seed must still fire the join, and the stale verdict must
+    not be reported as that promote's."""
+    _transition_paths(monkeypatch, appliance_paths)
+    (appliance_paths / "cluster-join.state").write_text("ready\thttps://s:6443\n")
+
+    # What the heartbeat reports before anything has fired: not this promote's.
+    assert appliance_state.reported_cluster_transition_id("T2") == ""
+    assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t", "T2") is True
+
+    # The runner, once it has run, writes its verdict: now it proves T2 ...
+    (appliance_paths / "cluster-join-pending").unlink()
+    sidecar = appliance_paths / "cluster-join.state"
+    sidecar.write_text("ready\thttps://s:6443\n")
+    later = os.stat(sidecar).st_mtime_ns + 10**9
+    os.utime(sidecar, ns=(later, later))
+    assert appliance_state.reported_cluster_transition_id("T2") == "T2"
+    # ... and the idempotence guard (#590) holds again: no wipe of a fresh join.
+    assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t", "T2") is False
+
+
+def test_ready_without_a_transition_id_still_blocks_a_refire(appliance_paths: Path) -> None:
+    (appliance_paths / "cluster-join.state").write_text("ready\thttps://s:6443\n")
+    assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t") is False

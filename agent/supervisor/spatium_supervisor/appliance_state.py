@@ -35,6 +35,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -765,6 +766,14 @@ _CLUSTER_LEAVE_MAX_ATTEMPTS = 3
 # reports again. Owned by the supervisor, so rewriting is permitted.
 _CLUSTER_JOIN_STATE_CONSUMED = Path(
     "/var/lib/spatiumddi-host/release-state/cluster-join.state.consumed"
+)
+# #1903 — which promote the sidecar's verdict belongs to. ``<id>\t<fire_ns>``,
+# written when a join trigger is armed: the control plane's transition id and
+# the wall clock of the fire. A verdict in the sidecar proves that id only when
+# its mtime is at or after the fire — an older ``ready`` is a previous
+# membership's (a Replace-evicted box that is still up keeps one for ever).
+_CLUSTER_JOIN_TRANSITION = Path(
+    "/var/lib/spatiumddi-host/release-state/cluster-join.transition"
 )
 # ONLY ``failed`` is retired — never ``ready`` / ``left``.
 #
@@ -1880,10 +1889,52 @@ def reset_cluster_join_attempts() -> None:
     _reset_cluster_transition_attempts(_CLUSTER_LEAVE_TRIGGER_FILE)
 
 
+def _read_cluster_join_transition() -> tuple[str, int] | None:
+    """``(transition_id, fire_ns)`` of the last join this node fired, or None."""
+    try:
+        raw = _CLUSTER_JOIN_TRANSITION.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    tid, _, fire = raw.partition("\t")
+    try:
+        return (tid, int(fire)) if tid else None
+    except ValueError:
+        return None
+
+
+def cluster_join_verdict_proves(transition_id: str | None) -> bool:
+    """Whether the sidecar's current verdict was written by the join fired for
+    ``transition_id`` (#1903): that id was recorded at fire time and the sidecar
+    has been written since."""
+    if not transition_id:
+        return False
+    fired = _read_cluster_join_transition()
+    sidecar = _read_cluster_join_sidecar()
+    if fired is None or sidecar is None:
+        return False
+    return fired[0] == transition_id and sidecar[2] >= fired[1]
+
+
+def reported_cluster_transition_id(desired_transition_id: str | None) -> str | None:
+    """The ``cluster_transition_id`` a heartbeat reports with the join state
+    (#1903): the id of the join fired, or ``""`` when the verdict being reported
+    is not that join's. None only off-appliance. Read from the fire record, not
+    from the heartbeat response, because the report is built before the response
+    that carries the new promote's id has been read."""
+    if detect_deployment_kind() != "appliance":
+        return None
+    fired = _read_cluster_join_transition()
+    sidecar = _read_cluster_join_sidecar()
+    if fired is None or sidecar is None or sidecar[2] < fired[1]:
+        return ""
+    return fired[0]
+
+
 def maybe_fire_cluster_join(
     desired_cluster_role: str | None,
     server_url: str | None,
     join_token: str | None,
+    transition_id: str | None = None,
 ) -> bool:
     """Write the cluster-join trigger when the control plane asks this
     node to join the k3s control-plane cluster as a server.
@@ -1939,8 +1990,15 @@ def maybe_fire_cluster_join(
     if state == "joining":
         # Runner is mid-flight: it renames the trigger BEFORE it finishes.
         return False
-    if state == "ready" and (target or "") == server_url:
-        # Already a member of this exact seed. The backend clears the
+    if (
+        state == "ready"
+        and (target or "") == server_url
+        and not (transition_id and not cluster_join_verdict_proves(transition_id))
+    ):
+        # Already a member of this exact seed. (#1903 — unless the control
+        # plane names a promote this ``ready`` was not written for: a box that
+        # was evicted by Replace and is still up keeps one for ever, and
+        # skipping on it settles a re-promote with no join.) The backend clears the
         # desired-state once it sees the ``ready`` heartbeat; until then,
         # firing again would wipe the identity we just built.
         return False
@@ -1974,6 +2032,13 @@ def maybe_fire_cluster_join(
     # dir) must not block the join — the backend's clear-on-failed is the
     # primary brake; this is the backstop.
     _record_cluster_transition_fire(_CLUSTER_JOIN_TRIGGER_FILE, fingerprint)
+    if transition_id:
+        try:
+            tmp = _CLUSTER_JOIN_TRANSITION.with_name(_CLUSTER_JOIN_TRANSITION.name + ".new")
+            _write_owner_only(tmp, f"{transition_id}\t{time.time_ns()}\n")
+            tmp.replace(_CLUSTER_JOIN_TRANSITION)
+        except OSError:
+            log.warning("supervisor.cluster_join.transition_record_failed")
     return True
 
 
@@ -4413,6 +4478,8 @@ def collect() -> dict[str, object]:
         "k3s_join_token": read_k3s_join_token() if is_appliance else None,
         "cluster_join_state": (read_cluster_join_state()[0] if is_appliance else None),
         "cluster_join_reason": (read_cluster_join_state()[1] if is_appliance else None),
+        # #1903 — which promote that verdict belongs to; see the function.
+        "cluster_transition_id": reported_cluster_transition_id(None),
         # #272 Phase 7b — the node's real routable InternalIP. The
         # promote endpoint builds the k3s join URL from the seed's
         # node_ip; ``last_seen_ip`` is the supervisor POD IP (10.42.x.x),

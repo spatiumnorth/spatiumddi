@@ -1135,6 +1135,7 @@ def heartbeat_once(
             desired_cluster_role,
             body_out.get("desired_k3s_server_url"),  # type: ignore[arg-type]
             body_out.get("desired_k3s_join_token"),  # type: ignore[arg-type]
+            body_out.get("desired_cluster_transition_id"),  # type: ignore[arg-type]
         ):
             log.info(
                 "supervisor.heartbeat.cluster_join_trigger_fired",
