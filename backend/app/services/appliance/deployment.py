@@ -22,6 +22,10 @@ Called by:
 * ``activate_certificate`` / ``import_signed_cert`` endpoints —
   pushes the freshly-activated cert into the Secret + bumps the
   Deployment annotation.
+* ``sync_active_cert_to_secret`` — the api's continuous reconcile
+  (#1895): a Let's Encrypt cert the Celery worker issues or renews is
+  deployed from here, on the worker's wake or the 60 s tick, because the
+  worker's ServiceAccount cannot patch the Secret. It runs in the api only.
 
 Designed to be fully no-op on non-appliance deploys: if
 ``settings.appliance_mode`` is false we never reach kubeapi.
@@ -29,8 +33,9 @@ Designed to be fully no-op on non-appliance deploys: if
 The exception-leaks-as-warnings semantic is preserved — by the
 time the deployer runs the DB has already been committed (the
 cert IS active, the deployment is just the materialisation), so
-a failed PATCH gets logged + retried on the next API restart's
-``ensure_self_signed_cert`` pass.
+a failed PATCH gets logged + retried by the api's
+``sync_active_cert_to_secret`` tick (and on the next api start's
+``ensure_self_signed_cert`` pass).
 """
 
 from __future__ import annotations
