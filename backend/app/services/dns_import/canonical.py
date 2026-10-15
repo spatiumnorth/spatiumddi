@@ -99,6 +99,9 @@ class ImportedZone:
     # #1892: set by the commit when ``apex_ns_policy="replace"`` rewrote the
     # apex NS set; recorded in the zone's audit row. Never round-tripped.
     apex_ns_replaced: dict[str, Any] | None = None
+    # #1892: apex NS targets naming no server of the target group, set by the
+    # preview so the UI can offer ``apex_ns_policy="replace"``. Derived.
+    foreign_apex_ns: list[str] = field(default_factory=list)
 
     @property
     def record_type_histogram(self) -> dict[str, int]:

@@ -109,6 +109,10 @@ class ImportedZoneOut(BaseModel):
     # payload (see the ``soa`` note above). None rather than "public" so an
     # unclassified row shows no pill instead of a reassuring wrong one.
     name_scope: str | None = None
+    # #1892 — apex NS targets that name no server of the target group (the
+    # source server's own name, typically). Derived by the preview, never
+    # round-tripped; the UI offers ``apex_ns_policy="replace"`` from it.
+    foreign_apex_ns: list[str] = Field(default_factory=list)
 
 
 class ZoneConflictOut(BaseModel):
@@ -333,6 +337,7 @@ def _zone_to_pydantic(z: ImportedZone, tlds: frozenset[str] | None = None) -> Im
         forwarders=list(z.forwarders),
         skipped_record_types=dict(z.skipped_record_types),
         parse_warnings=list(z.parse_warnings),
+        foreign_apex_ns=list(z.foreign_apex_ns),
     )
 
 

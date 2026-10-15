@@ -48,8 +48,13 @@ def _norm(name: str) -> str:
     return name.strip().rstrip(".").lower()
 
 
-def _is_apex(r: ImportedRecord) -> bool:
-    return r.record_type.upper() == "NS" and (r.name or "").strip() in ("@", "")
+def _is_apex(r: ImportedRecord, zone_name: str) -> bool:
+    """An NS at the apex: ``@``, empty, or the zone's own name. The plan
+    round-trips through the client, so the FQDN spelling is accepted too."""
+    if r.record_type.upper() != "NS":
+        return False
+    owner = (r.name or "").strip()
+    return owner in ("@", "") or _norm(owner) == _norm(zone_name)
 
 
 def _target_forms(value: str, zone_name: str) -> set[str]:
@@ -65,6 +70,7 @@ def _target_forms(value: str, zone_name: str) -> set[str]:
 class GroupNames:
     known: set[str]  # name + host of every server in the group
     usable_hosts: list[str]  # enabled servers whose host is a DNS hostname
+    has_servers: bool = True
 
 
 async def group_names(db: AsyncSession, group_id: uuid.UUID) -> GroupNames:
@@ -90,37 +96,54 @@ async def group_names(db: AsyncSession, group_id: uuid.UUID) -> GroupNames:
             ipaddress.ip_address(host)
         except ValueError:
             usable.append(host)
-    return GroupNames(known=known, usable_hosts=usable)
+    return GroupNames(known=known, usable_hosts=usable, has_servers=bool(servers))
 
 
 def foreign_apex_ns(zone: ImportedZone, names: GroupNames) -> list[ImportedRecord]:
-    """Apex NS rows of a primary zone naming no server of the target group."""
-    if zone.zone_type != "primary":
+    """Apex NS rows of a primary zone naming no server of the target group.
+
+    A group with no servers yet has nothing to compare against (and nothing
+    to replace with), so nothing is reported for it."""
+    if zone.zone_type != "primary" or not names.has_servers:
         return []
     return [
         r
         for r in zone.records
-        if _is_apex(r) and not (_target_forms(r.value, zone.name) & names.known)
+        if _is_apex(r, zone.name) and not (_target_forms(r.value, zone.name) & names.known)
     ]
 
 
 async def annotate_apex_ns(
     db: AsyncSession, preview: ImportPreview, target_group_id: uuid.UUID
 ) -> None:
-    """Add one preview warning per zone whose apex NS names a host outside the
-    target group. Read-only: the zone data is not changed."""
+    """Record, per zone, the apex NS naming a host outside the target group
+    (``ImportedZone.foreign_apex_ns``, which the UI offers the replace choice
+    from) and add one preview warning for each such zone. Read-only: the
+    zone's records are not changed."""
     names = await group_names(db, target_group_id)
     for z in preview.zones:
         foreign = foreign_apex_ns(z, names)
         if not foreign:
             continue
-        hosts = ", ".join(sorted({_norm(r.value) for r in foreign}))
+        hosts = sorted({_norm(r.value) for r in foreign})
+        z.foreign_apex_ns = hosts
         preview.warnings.append(
-            f"Zone {z.name!r}: apex NS names {hosts}, which is not a server in the target "
-            "group. The imported zone stays delegated to that host and goes lame once it "
-            "is retired. Commit with apex_ns_policy='replace' to serve the group's own "
-            "servers as the zone's NS set instead."
+            f"{_warning_prefix(z.name)}{', '.join(hosts)}, which is not a server in the "
+            "target group. The imported zone stays delegated to that host and goes lame "
+            "once it is retired. Commit with apex_ns_policy='replace' to serve the "
+            "group's own servers as the zone's NS set instead."
         )
+
+
+def _warning_prefix(zone_name: str) -> str:
+    return f"Zone {zone_name!r}: apex NS names "
+
+
+def is_apex_ns_warning(warning: str, zone_name: str) -> bool:
+    """Whether ``warning`` is the preview's apex NS warning for ``zone_name``;
+    the commit drops it for a zone whose NS it replaced, since the plan's
+    warnings round-trip into the commit result."""
+    return warning.startswith(_warning_prefix(zone_name))
 
 
 def replace_apex_ns(
@@ -144,7 +167,7 @@ def replace_apex_ns(
         )
     drop = {id(r) for r in foreign}
     kept = [r for r in zone.records if id(r) not in drop]
-    have = {_norm(r.value) for r in kept if _is_apex(r)}
+    have = {_norm(r.value) for r in kept if _is_apex(r, zone.name)}
     ttl = foreign[0].ttl
     added = [h for h in names.usable_hosts if h not in have]
     kept.extend(ImportedRecord(name="@", record_type="NS", value=h + ".", ttl=ttl) for h in added)

@@ -6821,7 +6821,15 @@ export interface DNSImportedZone {
    * shape is posted back on commit, where it is ignored server-side.
    */
   name_scope?: ZoneNameScope;
+  /**
+   * #1892 — apex NS targets naming no server of the target group. Derived by
+   * the preview; ignored on commit.
+   */
+  foreign_apex_ns?: string[];
 }
+
+/** #1892 — what commit does with an apex NS outside the target group. */
+export type DNSImportApexNsPolicy = "keep" | "replace";
 
 export interface DNSImportZoneConflict {
   zone_name: string;
@@ -6907,6 +6915,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/bind9/commit", body)
@@ -6930,6 +6939,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/windows-dns/commit", body)
@@ -6965,6 +6975,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/powerdns/commit", body)
@@ -6993,6 +7004,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/technitium/commit", body)
@@ -7018,6 +7030,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/cloud/commit", body)

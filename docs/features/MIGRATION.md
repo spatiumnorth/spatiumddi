@@ -140,14 +140,19 @@ the group's agents serve those rows as the zone's whole NS set (#1153), so the
 managed zone stays delegated to the host it was migrated off and goes lame once
 that host is retired. Preview therefore lists, per primary zone, any apex NS
 whose target is not a server of the target group (matched on the server's name
-or host). Nothing changes by default: an apex NS can be deliberate, and an
-existing install keeps its rows. Commit with `apex_ns_policy: "replace"` to
-swap them: the foreign apex NS rows are not imported, every enabled server in
-the group whose host is a DNS hostname (not an IP, not a single label) becomes
-an apex NS, and a SOA primary name that was foreign follows. Delegations below
-the apex are never touched, the change is recorded in the zone's audit row
-(`apex_ns_replaced`), and a group with no such server keeps the imported rows
-with a warning rather than falling back to a loopback placeholder.
+or host), in the zone's `foreign_apex_ns` and as a warning. A group with no
+servers yet is not compared. Nothing changes unless the operator asks: an apex
+NS outside the group can be deliberate, for example a hidden primary whose
+public name servers are a provider's. The review step shows the affected zones
+with an unticked **Replace them with the target group's servers** box; the
+commit API's `apex_ns_policy: "replace"` (and the Copilot's
+`commit_dns_import`) does the same. Replacing drops the foreign apex NS rows,
+adds every enabled server in the group whose host is a DNS hostname (not an IP,
+not a single label) as an apex NS, and moves a SOA primary name that named a
+foreign host. Delegations below the apex are never touched, the change is
+recorded in the zone's audit row (`apex_ns_replaced`), and a group with no such
+server keeps the imported rows with a warning rather than falling back to the
+agent's loopback placeholder. Existing zones are not rewritten.
 
 See `docs/drivers/DNS_DRIVERS.md` for parser + agentless-driver
 internals.

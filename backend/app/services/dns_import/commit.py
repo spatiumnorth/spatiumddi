@@ -37,7 +37,7 @@ from app.services.dns.record_ops import (
     resolve_primary_server,
 )
 
-from .apex_ns import ApexNsPolicy, group_names, replace_apex_ns
+from .apex_ns import ApexNsPolicy, group_names, is_apex_ns_warning, replace_apex_ns
 from .canonical import (
     ConflictAction,
     ImportedZone,
@@ -658,9 +658,13 @@ async def commit_import(
 
     for parsed in preview.zones:
         if apex_names is not None:
-            parsed, _change, apex_warning = replace_apex_ns(parsed, apex_names)
+            parsed, change, apex_warning = replace_apex_ns(parsed, apex_names)
             if apex_warning:
                 warnings.append(apex_warning)
+            if change is not None:
+                # The plan's preview warning said to commit with "replace";
+                # done, so it no longer belongs in the result.
+                warnings = [w for w in warnings if not is_apex_ns_warning(w, parsed.name)]
         if bind9_target and parsed.forwarders:
             kept, dropped = split_zone_forwarders(parsed.forwarders)
             if dropped:
