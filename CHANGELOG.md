@@ -84,6 +84,34 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A Halt or Abort mid-node, and a drive that lost the upgrade Lease,
+  no longer get overwritten by the drive (#1702, #1704, #1707).** A
+  rolling-upgrade drive kept its own copy of the run for the whole of a
+  node and wrote it back when the node ended, so a node that failed turned
+  a `halted` or `aborted` run `failed` (with a new `finished_at` and an
+  upgrade-failed alert), and a node that succeeded dropped the operator's
+  `halted`, `aborted` and `resumed` events from the run's history. A
+  drive whose Lease another drive had taken over could do the same, and
+  so could its crash handler. Every terminal write now re-reads the run
+  under a row lock and goes ahead only if the run is still `running` and
+  this drive is still its holder; Halt, Resume and Abort take the same
+  lock. A node that ends after a stop is recorded under
+  `progress.per_node` and a `node_ended_after_stop` event, and the state
+  is left alone. Abort also no longer frees the Lease at once: the
+  aborted drive releases its own when it stops, so a second run cannot
+  plan and start while a node is still being worked on (a run that never
+  started has no drive, and still frees it). A drive that died holds the
+  Lease until it lapses (10 min); a superadmin can free it sooner with
+  **Force release** (`POST /upgrades/lease/force-release`), which is
+  refused while the holder still renews it and is audited. Halt and Abort
+  are also honoured between nodes and around the end-of-roll flip: a Halt
+  while the shared-tag hold (#1710) is being placed now stops the node it
+  was meant to stop, and the flip's own record writes no longer drop
+  events committed meanwhile. The fence's row lock is never held across
+  a kubeapi call, the post-upgrade verify or alert delivery. A lease
+  renewal that dies of an unexpected error now stops the drive, as a
+  refused one does.
+
 - **Deleting a DNS zone permanently from the Trash now removes it from
   agentless servers too (#1830).** A zone is never torn down at
   soft-delete (a hosted zone re-created on restore gets a new id and NS
