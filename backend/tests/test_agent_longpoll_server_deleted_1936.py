@@ -104,3 +104,38 @@ async def test_dhcp_longpoll_answers_404_when_its_server_row_is_deleted(
     _delete_row_on_wake(monkeypatch, db_session, DHCPServer, sid)
     resp = await client.get("/api/v1/dhcp/agents/config", headers=headers)
     assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_refresh_error_on_a_row_that_still_exists_is_not_a_404(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a row that is really gone is a 404. Any other refresh error is a
+    bug of ours and must stay one, whatever its message says."""
+    from fastapi import HTTPException
+    from sqlalchemy.exc import InvalidRequestError
+
+    from app.services.agents.server_gone import refresh_agent_server
+
+    grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add(grp)
+    await db_session.flush()
+    server = DNSServer(group_id=grp.id, driver="bind9", host="10.0.0.3", name="still-here")
+    db_session.add(server)
+    await db_session.flush()
+
+    async def _boom(*_a: Any, **_k: Any) -> None:
+        raise InvalidRequestError("Could not refresh instance (but the row is there)")
+
+    monkeypatch.setattr(db_session, "refresh", _boom)
+    with pytest.raises(InvalidRequestError):
+        await refresh_agent_server(db_session, server)
+    monkeypatch.undo()
+
+    await db_session.execute(
+        delete(DNSServer).where(DNSServer.id == server.id),
+        execution_options={"synchronize_session": False},
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await refresh_agent_server(db_session, server)
+    assert exc_info.value.status_code == 404
