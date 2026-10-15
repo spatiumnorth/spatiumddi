@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Check,
   Clipboard,
@@ -47,7 +48,11 @@ export function FirewallFeedsPage() {
     NEEDS_SUPERADMIN,
   );
   const qc = useQueryClient();
-  const { data: feeds = [], isFetching } = useQuery({
+  const {
+    data: feeds = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["firewall-feeds"],
     queryFn: firewallFeedsApi.list,
   });
@@ -125,7 +130,9 @@ export function FirewallFeedsPage() {
           {feeds.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No firewall feeds yet.
+                <ListEmpty error={listError} what="firewall feeds">
+                  No firewall feeds yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}

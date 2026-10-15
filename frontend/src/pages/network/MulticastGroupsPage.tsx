@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { ListPlus, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
 
 import { MulticastDomainsTab } from "./MulticastDomainsPage";
@@ -1212,7 +1213,7 @@ function TabPill({
 // preserves the operator's filter / selection in the same session.
 
 type GroupsTabBodyProps = {
-  query: { refetch: () => void; isFetching: boolean };
+  query: { refetch: () => void; isFetching: boolean; error?: unknown };
   items: MulticastGroupRead[];
   spaceFilter: string;
   setSpaceFilter: (v: string) => void;
@@ -1386,8 +1387,10 @@ function GroupsTabBody({
                   colSpan={8}
                   className="px-3 py-10 text-center text-sm text-muted-foreground"
                 >
-                  No multicast groups yet. Click <strong>New group</strong> to
-                  add the first.
+                  <ListEmpty error={query.error} what="multicast groups">
+                    No multicast groups yet. Click <strong>New group</strong> to
+                    add the first.
+                  </ListEmpty>
                 </td>
               </tr>
             )}

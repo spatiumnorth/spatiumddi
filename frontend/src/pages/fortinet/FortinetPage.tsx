@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Boxes,
   Flame,
@@ -43,7 +44,11 @@ export function FortinetPage() {
     NEEDS_SUPERADMIN,
   );
   const qc = useQueryClient();
-  const { data: firewalls = [], isFetching } = useQuery({
+  const {
+    data: firewalls = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["fortinet-firewalls"],
     queryFn: fortinetApi.list,
   });
@@ -144,7 +149,9 @@ export function FortinetPage() {
           {firewalls.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No FortiGate firewalls configured yet.
+                <ListEmpty error={listError} what="FortiGate firewalls">
+                  No FortiGate firewalls configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}

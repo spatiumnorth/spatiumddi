@@ -53,6 +53,21 @@ _PER_PAGE = 50
 _TTL_DEFAULT = 1800
 
 
+def _is_not_found(response: Any) -> bool:
+    """DigitalOcean's documented not-found answer (#1889): HTTP 404 carrying
+    ``{"id": "not_found", ...}`` (``shared/responses/not_found.yml`` in
+    DigitalOcean's OpenAPI spec). Keyed on the body as well as the status, so
+    a 404 that is not DigitalOcean's own verdict on the resource is never
+    read as "the zone is gone"."""
+    if getattr(response, "status_code", 0) != 404:
+        return False
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        return False
+    return isinstance(body, dict) and body.get("id") == "not_found"
+
+
 class DigitalOceanDNSDriver(CloudDNSDriverBase):
     """Agentless driver for DigitalOcean-hosted authoritative zones."""
 
@@ -360,6 +375,10 @@ class DigitalOceanDNSDriver(CloudDNSDriverBase):
 
             if op == "delete":
                 resp = await client.delete(f"/domains/{bare}")
+                if _is_not_found(resp):
+                    # Already gone at the provider; deleting it is done
+                    # (#1889, as #1537).
+                    return
                 self._unwrap(resp)
                 return
 

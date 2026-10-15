@@ -55,6 +55,10 @@ agent/dhcp/spatium_dhcp_agent/metrics.py
 # that its output still goes through app.openapi()'s wrapper.
 scripts/export_openapi.py
 
+# test_seed_demo_templates.py (#1465) pins that the demo seeder's IPAM template
+# payloads validate against the API's own request model.
+scripts/seed_demo.py
+
 # test_merge_test_durations.py (#1019) loads the shard-durations merge the
 # aggregator runs, and pins that a partial or malformed shard file is refused
 # rather than published as the file the next release balances the shards with.
