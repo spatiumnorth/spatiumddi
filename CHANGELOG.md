@@ -84,6 +84,32 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A reverse zone auto-created in an agentless group now reaches the
+  provider, so its PTRs stop failing "No such zone was found" (#1932).**
+  IPAM auto-sync, DDNS and subnet create wrote the reverse zone row and
+  nothing else; only the zone endpoints pushed it to `technitium_api`,
+  Windows Path B and the cloud drivers, so every PTR op failed and retried.
+  The zone is now marked as not yet at the provider and created after the
+  commit, ahead of its record ops. Whichever path sends one of those ops
+  first, the request or the retry sweep, creates a still-marked zone
+  before it, and ops whose zone cannot be created wait with that error.
+  The mark clears once the zone is at the provider, so a zone that got
+  there once is never created again, even if it is later deleted at the
+  provider. One commit creates at most 16 zones inline (a /17 needs 128);
+  the retry sweep creates the rest, 32 a minute. On upgrade, reverse
+  zones SpatiumDDI auto-created in a `technitium_api` or Windows DNS group
+  are marked and created by the sweep; a zone already at the provider is left
+  as it is. The Copilot's zone create now pushes to the provider before
+  its commit, as the REST create does. Agent-managed groups are unchanged.
+  Groups running a cloud DNS driver (Route 53, Azure DNS, Google Cloud DNS,
+  Cloudflare and the others) only get auto-created reverse zones when the
+  new group setting *Auto-create reverse zones at the provider* is on,
+  because the provider bills per hosted zone and a /17 makes 128. It is off
+  by default and for every existing group, so the upgrade creates nothing
+  at a cloud provider. Opted out, a subnet gets no reverse zone and its PTRs
+  are skipped; the subnet's DNS sync report says why. Reverse zones a cloud
+  group already holds are kept.
+
 - **DNS and DHCP pods no longer rank ahead of the control plane for
   eviction under memory pressure (#1828).** The kubelet ranks a memory
   eviction by whether a pod's usage is over its memory request before it
@@ -4710,6 +4736,14 @@ the formatter handles the rest.
   cannot say where its archive was written, so NULL (unknown) stays.
 - `a1903c5e7b24` — #1903, additive: nullable `appliance.cluster_transition_id`
   and `appliance.cluster_transition_at`. Downgrade drops both.
+- `c4f19a2e7d53` — #1932, additive + data: nullable
+  `dns_zone.agentless_create_due_at` (an auto-created zone whose provider
+  create is outstanding, and when the sweep may next try) and
+  `dns_server_group.auto_reverse_zones_at_provider` (NOT NULL, default
+  false). Backfill marks the non-imported, auto-generated reverse zones in
+  groups with a `technitium_api` or Windows DNS server with credentials and
+  no cloud server, due now; cloud groups are not marked. Downgrade drops
+  both columns.
 
 ## 2026.10.02-1 — 2026-10-02
 
