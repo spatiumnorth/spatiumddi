@@ -146,6 +146,12 @@ non-default topologies (separate namespace, custom api Service name, or a
 pinned external resolver). Full details:
 [chart README → Exposing the UI](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#exposing-the-ui).
 
+Behind an Ingress or any TLS-terminating proxy, also set `frontend.trustedProxyCidrs`
+and add the streaming annotations (`proxy-buffering: "off"`,
+`proxy-read-timeout: "3600"`); without them the login throttle keys on the
+ingress address and the AI chat stream hangs. See
+[`REVERSE_PROXY.md`](REVERSE_PROXY.md).
+
 ### External Postgres / Redis
 
 To skip the in-chart database or cache and point at an existing one:
@@ -675,6 +681,8 @@ The Kubernetes-specific shape:
   values reference, troubleshooting, and a `helm template` dev loop
 - [`k8s/README.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/k8s/README.md) — raw `k8s/base/` manifests, the
   `k8s/ha/` prototypes, the static DNS/DHCP StatefulSets, and TLS/Ingress notes
+- [`REVERSE_PROXY.md`](REVERSE_PROXY.md) — Ingress / reverse-proxy settings,
+  trusted proxies, streaming, troubleshooting
 - [`TOPOLOGIES.md`](TOPOLOGIES.md) — reference production topologies + sizing
 - [`APPLIANCE.md`](APPLIANCE.md) — the self-contained OS appliance (k3s-based,
   multi-node control-plane HA, MetalLB VIP)

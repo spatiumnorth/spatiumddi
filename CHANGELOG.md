@@ -109,6 +109,108 @@ the formatter handles the rest.
   re-driven task still has to take the Lease, so a live drive wins. It
   does nothing on docker-compose, and nothing while Redis is down.
 
+- **A promoted control-plane member's own pods reach its own
+  apiserver and kubelet (#1721).** A pod's packet to its own node's
+  address arrives from the pod's own address, so the node's firewall
+  decides it. The kubeapi (6443) and kubelet (10250) rules admit the
+  pod and service networks the control plane hands each node, and those
+  came from the node's own report only. A promoted member reports none:
+  an Additional node pins no CIDRs (#995 item 14). So a member admitted
+  only its peers to 6443 and had no kubelet rule, and its pods timed out
+  on its own node's 6443 and 10250 every time. The `kubernetes` Service
+  also lost every connection it sent to the member's own apiserver,
+  including the supervisor's own readiness probe. A control-plane node
+  whose report lacks a network now gets the one the cluster's other
+  control-plane nodes report, on its next heartbeat and with no node
+  upgrade. k3s runs every server of a cluster with the same pair.
+  Nothing is written to the node's row.
+
+- **Running behind your own reverse proxy now works, and is documented
+  (#1868).** The frontend nginx wrote `X-Forwarded-Proto $scheme` and
+  `X-Real-IP $remote_addr` on every `/api/` location, so behind a
+  TLS-terminating proxy the api always saw `http` and the proxy's address:
+  OIDC / SAML callbacks were built as `http://` while External URL was
+  empty, and every user shared one login-throttle bucket (a busy morning
+  returned `429` to the organisation; audit rows, `last_login_ip` and the
+  allow-list guards recorded the proxy). **nginx header change:** the
+  frontend reads a new `FRONTEND_TRUSTED_PROXY_CIDRS` (Compose `.env`, the
+  chart's `frontend.trustedProxyCidrs`, `k8s/base/frontend.yaml`) and keeps
+  an outer proxy's `X-Forwarded-Proto`, with the client address from
+  `X-Forwarded-For` (`real_ip_recursive`), only from a listed peer. **Unset
+  keeps today's behaviour**: no proxy is trusted. It is deliberately not the
+  api's `TRUSTED_PROXY_CIDRS`, which names the frontend (the api's peer) and
+  needs no change: sharing one list would make the frontend trust the
+  compose / pod network, and any install that had set the api's list to the
+  private ranges would have let a LAN client choose its own recorded address
+  on upgrade. The Helm TLS frontend (one server for
+  :80 and :443) no longer 301s a request a trusted proxy marks
+  `X-Forwarded-Proto: https`, which looped behind a TLS-terminating proxy,
+  sends `Strict-Transport-Security` only on https (its own TLS, or a
+  trusted proxy's), never on plain HTTP to :80, and gains the AI-chat
+  stream location it lacked. The cluster-health,
+  container-log and nmap streams are served unbuffered with a one hour
+  timeout. The api now logs `sso_external_url_not_set` when an SSO endpoint
+  falls back to the request URL, `trusted_hosts_refused_host` for the Host a
+  `TRUSTED_HOSTS` 400 refused, and `reverse_proxy_sub_path_unsupported` for
+  `X-Forwarded-Prefix`. New [`REVERSE_PROXY.md`](docs/deployment/REVERSE_PROXY.md)
+  covers the topology (sub-paths unsupported), required settings and headers,
+  streaming, nginx / Caddy / Traefik / HAProxy / Nginx Proxy Manager /
+  Ingress examples and a troubleshooting table; DOCKER.md Option C no longer
+  mounts a file over the entrypoint's rendered `default.conf`, and a stale
+  `X-Forwarded-Host` comment is corrected.
+
+- **A `local_volume` backup on a multi-node appliance is per node, and now
+  says so (#1838).** The default backups directory is a per-node hostPath,
+  so an archive exists only on the disk of the node whose pod wrote it. A
+  restore, download or drill answered by another node's api returned a bare
+  "archive not found" 502, the archive list depended on which replica
+  answered, and a drill there reported `failed` ("the destination holds no
+  archives") about a target that was fine. Now each successful run records
+  the node that wrote it (`last_run_node`, on the target, the run-now
+  response, the Backup page and `list_backup_targets`). A miss names the
+  node that answered and, when known, the node holding the archive, and
+  says nothing was restored. On an appliance with two or more control-plane
+  nodes, Test connection warns that the target is per node, and the archive
+  list carries `node_name` per archive plus an `X-Archive-Listing-Note`
+  header, shown on the Backup page, saying whose disk the list is and that
+  the last run's archive is held by another node rather than missing. A
+  drill whose node cannot see the newest archive reports `error` (no
+  verdict) when it sees nothing, and notes it when it drilled an older
+  one. A single-node appliance and Compose see no cluster wording. The
+  Backup page's restore, download, delete, save and drill errors now show
+  the server's reason instead of "Request failed with status code 502".
+  Archives are not moved: the remedy on a cluster is a network destination
+  (S3, SCP, SMB, NFS).
+
+- **A delete the approval queue took is reported as queued, not as nothing
+  (#1915).** With `governance.approvals` on, deleting an IP space, block or
+  subnet answers `202` and the object stays. The IPAM tree's Delete… dialogs,
+  Edit Space and Edit Block read any 2xx as "deleted" and closed with no word;
+  Edit Subnet said "Submitted for approval", but in its red error box. All five
+  now say it in a neutral status box, leave the object (and the tree selection)
+  in place, refresh the approval queue, and stop offering Move to Trash again,
+  since a second click filed a second change request. The Copilot's card for
+  a risky proposal the queue took read "approved"; it now reads "awaiting
+  approval".
+
+- **IPAM no longer writes a twin beside a record an operator already
+  wrote (#1867).** An address allocated at a name and value an operator
+  had written by hand into the zone got an `auto_generated` copy beside
+  it, so the zone held two identical rows (PowerDNS refused the zone for
+  such a pair until #1379), while the record API refuses the same
+  duplicate with a 409 (#1230). The IPAM sync now adopts the operator's record,
+  for the A / AAAA and the PTR alike, on every path that writes them:
+  allocating an address, the bulk-edit DNS zone, DDNS from a lease and
+  Sync DNS. The address links to the existing row, nothing is created,
+  and the row stays the operator's, so deleting the address (or the
+  lease expiring) leaves it served. Only an operator-written row is
+  adopted: a different value still gets its own record, and a record
+  another address generated is not taken over. Renaming an address onto
+  a name and value the operator wrote retracts IPAM's own row and adopts
+  theirs too, and Sync DNS no longer reports an adopted record as
+  missing. Twins stored by an earlier release stay until one is deleted,
+  which #1230 made safe.
+
 - **Starting an MFA enrolment re-checks an external account at its own
   provider (#1354).** An account with no local password used to pass
   the enrolment step-up with any session younger than 10 minutes,
@@ -4375,6 +4477,9 @@ the formatter handles the rest.
   rows queues a whole-RRset update op per agent server and bumps the
   zone serial. Agentless groups other than `technitium_api` get the row
   change and no push. Downgrade is a no-op.
+- `d9d0f6ddc446` — #1838: nullable `backup_target.last_run_node`, the
+  node whose pod wrote `last_run_filename`. No backfill: an existing row
+  cannot say where its archive was written, so NULL (unknown) stays.
 
 ## 2026.10.02-1 — 2026-10-02
 
