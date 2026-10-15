@@ -84,6 +84,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting a DNS zone permanently from the Trash now removes it from
+  agentless servers too (#1830).** A zone is never torn down at
+  soft-delete (a hosted zone re-created on restore gets a new id and NS
+  set), so the permanent delete is its only retraction point. The Trash
+  page's per-row **Delete permanently** removed the row without driving
+  the Windows DNS / cloud / `technitium_api` driver, leaving the zone
+  served with no trace in SpatiumDDI; `?permanent=true` and the 30-day
+  sweep already pushed. The Trash delete and the sweep now share one
+  helper (`services/dns/zone_purge.py`): the provider delete runs first,
+  and a failing provider keeps the zone in the Trash with a 409/502 so it
+  can be retried rather than orphaned. A server disabled since the zone
+  was trashed is skipped, as on every other zone delete, so the zone stays
+  on it.
+
 - **A Factory Reset of Tools, or of any section, emptied far more than
   its card said (#1835).** Every section wiped its tables with
   `TRUNCATE … CASCADE`, which empties every table holding a foreign

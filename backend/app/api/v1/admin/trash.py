@@ -398,10 +398,13 @@ async def permanent_delete_from_trash(
 ) -> None:
     """Hard-delete a soft-deleted row from the trash.
 
-    The agentless write-through (Windows DHCP scope removal, DNS zone delete)
-    already fired at soft-delete time — deleted means deleted on every backend
-    the moment the operator asks for it (#616) — so this endpoint only has to
-    remove the DB row.
+    The agentless write-through for a Windows DHCP scope already fired at
+    soft-delete time (#616). A DNS zone's did NOT: a zone is the one object
+    never torn down at soft-delete (a hosted zone re-created on restore gets a
+    new id + NS set, #632), so this endpoint is its retraction point — it is
+    pushed to every agentless server (Windows DNS, cloud, ``technitium_api``)
+    BEFORE the row goes, and a failing provider keeps the zone in the trash
+    with a 409/502 so it can be retried, never orphaned (#1830).
 
     It does still have to release the IPAM mirror of any reservation it is about
     to destroy: the rows go via FK CASCADE, which runs no Python, so nothing else
@@ -437,6 +440,13 @@ async def permanent_delete_from_trash(
         # first soft-delete normally already cleaned both up).
         await remove_ipam_for_scope_statics(db, target.id)
         await delete_leases_for_scope(db, target.id)
+    elif isinstance(target, DNSZone):
+        # #1830 — retract from agentless servers first; raises (row + audit
+        # untouched) when the provider refuses. Same helper as the 30-day sweep.
+        from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
+
+        await purge_trashed_zone(db, target)
+        dns_wake_group_ids.add(target.group_id)
     elif isinstance(target, Subnet):
         # spatiumddi#1151 — the subnet's addresses go with it (FK CASCADE); the
         # auto-generated A / AAAA / PTR / alias records IPAM published for them
@@ -457,7 +467,8 @@ async def permanent_delete_from_trash(
             new_value=({"dns_records_retracted": records_retracted} if records_retracted else None),
         )
     )
-    await db.delete(target)
+    if not isinstance(target, DNSZone):
+        await db.delete(target)
     await db.commit()
     # This router carries no wake_publishing dependency, so the enqueue's
     # collect_wake had no collector; tell the agents now the ops are committed
