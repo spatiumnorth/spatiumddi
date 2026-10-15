@@ -4236,6 +4236,15 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
+  **On the upgrade itself, expect up to two minutes of 500s from
+  appliance host-state reads (#1661).** After the reboot into the new
+  slot, k3s keeps serving the previous release's api until the new
+  control chart rolls it, and that api has no gid 2770, so
+  `GET /api/v1/appliance/slot-upgrade` (and the setup-state and
+  system-info reads) answer `500` until the new api is Ready — about
+  90 s in testing, mixed in with the 502s the rollout already causes.
+  The upgrade completes normally; retry once the new api serves. This
+  happens once, on the upgrade that introduces the tightened directory.
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
