@@ -60,6 +60,12 @@
 #                      dedicated pass asserting the appliance's api / worker /
 #                      frontend retire first at one replica too, where the
 #                      blocking term rides on the OUTGOING pods (#1541).
+#   shared-env       — dedicated umbrella render: api, worker and beat all carry
+#                      every variable in ``sharedEnv``; api and worker carry
+#                      the slot-image mirror URL / secret, beat and the mirror
+#                      itself do not (#1826).
+#                      The appliance's APPLIANCE_MODE reached only the api, so
+#                      the worker that runs alert evaluation saw it unset.
 #
 # Runs anywhere helm + kubeconform + python3 (with PyYAML) are on PATH; the
 # CI job and ``make charts-lint`` both call it. Rendered manifests are left
@@ -254,6 +260,45 @@ for n in 1 3; do
         --retire-first api --retire-first worker --retire-first frontend \
         "$OUT/umbrella-appliance-cp-$n.yaml" || failures=$((failures + 1))
 done
+# #1826 — the appliance's shared env, as firstboot writes it. Rendered with
+# the mirror on so its URL / secret are in the set too.
+render umbrella-shared-env "$UMBRELLA" \
+    --set slotImageMirror.enabled=true \
+    --set sharedEnv[0].name=APPLIANCE_MODE --set-string sharedEnv[0].value=true \
+    --set sharedEnv[1].name=APPLIANCE_HOSTNAME --set sharedEnv[1].value=node1 \
+    --set sharedEnv[2].name=APPLIANCE_HOST_IPS --set sharedEnv[2].value=10.0.0.1 \
+    --set sharedEnv[3].name=INITIAL_NTP_SERVERS --set sharedEnv[3].value=ntp.example
+echo "── shared env (umbrella, #1826)"
+python3 "$ROOT/.github/scripts/chart-shared-env.py" \
+    --expect VERSION --expect SECRET_KEY --expect DATABASE_URL --expect REDIS_URL \
+    --expect CELERY_BROKER_URL \
+    --expect APPLIANCE_MODE --expect APPLIANCE_HOSTNAME --expect APPLIANCE_HOST_IPS \
+    --expect INITIAL_NTP_SERVERS \
+    --expect-on api:SLOT_IMAGE_MIRROR_URL --expect-on api:SLOT_IMAGE_MIRROR_SECRET \
+    --expect-on worker:SLOT_IMAGE_MIRROR_URL --expect-on worker:SLOT_IMAGE_MIRROR_SECRET \
+    --absent beat:SLOT_IMAGE_MIRROR_SECRET \
+    --absent slot-image-mirror:APPLIANCE_MODE \
+    --absent slot-image-mirror:SLOT_IMAGE_MIRROR_URL \
+    "$OUT/umbrella-shared-env.yaml" || failures=$((failures + 1))
+# Negative control: a worker without the variable must be refused, or the
+# guard above could be passing on a render it cannot read.
+echo "── negative control: a worker missing a shared variable must fail"
+if python3 "$ROOT/.github/scripts/chart-shared-env.py" --expect APPLIANCE_MODE \
+    <(python3 - "$OUT/umbrella-shared-env.yaml" <<'PYEOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+for d in docs:
+    if d.get("kind") == "Deployment" and d["metadata"]["labels"].get("app.kubernetes.io/component") == "worker":
+        for c in d["spec"]["template"]["spec"]["containers"]:
+            c["env"] = [e for e in c["env"] if e["name"] != "APPLIANCE_MODE"]
+print(yaml.safe_dump_all(docs))
+PYEOF
+) >/dev/null 2>&1; then
+    echo "   FAIL: chart-shared-env.py passed a worker without APPLIANCE_MODE" >&2
+    failures=$((failures + 1))
+else
+    echo "   ok: worker without APPLIANCE_MODE refused"
+fi
 POSTURE_ARGS="--require-priority"
 render umbrella-posture "$UMBRELLA" "${UMBRELLA_POSTURE[@]}"
 # ...and again on the HA topology. The CNPG ``Cluster`` and the Sentinel

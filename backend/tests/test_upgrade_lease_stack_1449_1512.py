@@ -281,7 +281,11 @@ async def test_the_crash_handler_releases_the_identity_the_drive_used(
         used.append(holder)
         raise RuntimeError("loop crashed")
 
-    db = SimpleNamespace(rollback=AsyncMock(), get=AsyncMock(return_value=None), commit=AsyncMock())
+    # The crash handler re-reads the run under a row lock (#1704); no such row.
+    missing = SimpleNamespace(scalar_one_or_none=lambda: None)
+    db = SimpleNamespace(
+        rollback=AsyncMock(), execute=AsyncMock(return_value=missing), commit=AsyncMock()
+    )
 
     @asynccontextmanager
     async def _session() -> Any:

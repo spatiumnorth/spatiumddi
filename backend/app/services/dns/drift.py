@@ -31,6 +31,7 @@ from app.services.dns.pull_from_server import (
     _key,
     targets_are_relative,
     without_agent_ns_glue,
+    without_server_apex_ns,
 )
 from app.services.dns.tsig import (
     is_view_transfer_key,
@@ -257,6 +258,7 @@ async def compute_zone_drift(
         db_rows_cmp, on_wire = _compare_apex_ns(db_rows, on_wire, zone.name)
         db_by_key = {_key(r, zone.name, relative_targets=rel): r for r in db_rows_cmp}
         on_wire = without_agent_ns_glue(on_wire, srv, zone.name, set(db_by_key))
+        on_wire = without_server_apex_ns(on_wire, srv, zone.name, set(db_by_key))
         wire_by_key = {_key(r, zone.name, relative_targets=rel): r for r in on_wire}
         entry.extra_on_server = [
             _to_drift_record(r) for k, r in wire_by_key.items() if k not in db_by_key
