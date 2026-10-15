@@ -198,6 +198,7 @@ async def test_agentless_gets_both_ops_in_one_driver_call_in_order(db_session, m
     monkeypatch.setattr(record_ops, "get_driver", lambda name: Fake())
     ip.address = "192.0.2.20"
     await _sync_dns_record(db_session, ip, subnet, action="update")
+    await db_session.commit()  # #1539 — the provider is written by the commit
     ptr_batches = [b for b in batches if any(t == "PTR" for _o, _n, t in b)]
     assert ptr_batches == [[("delete", "10", "PTR"), ("create", "20", "PTR")]], batches
 
@@ -262,6 +263,7 @@ async def test_technitium_api_hostname_rename_ends_on_the_new_target(db_session,
     monkeypatch.setattr(record_ops, "get_driver", lambda name: Fake())
     ip.hostname = "api"
     await _sync_dns_record(db_session, ip, subnet, action="update")
+    await db_session.commit()  # #1539 — the provider is written by the commit
     # Every PTR write lands at the one name, and the last carries only the new
     # target: no second value survives at 10.
     assert {n for _o, n, _m in calls} == {"10"}, calls

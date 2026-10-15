@@ -7730,6 +7730,9 @@ async def create_record(
     )
     await db.commit()
     await db.refresh(record)
+    # #1539 — an agentless op is dispatched by the commit above, so its
+    # outcome is only known now.
+    provider_warning = provider_warning or _agentless_op_warning(op)
     record.provider_warning = provider_warning  # type: ignore[attr-defined]
     return record
 
@@ -7823,6 +7826,7 @@ async def update_record(
         )
     target_serial = bump_zone_serial(zone) if zone is not None else None
     op = None
+    rename_ops: list[Any] = []
     if zone is not None:
         new_payload = {
             "name": record.name,
@@ -7855,9 +7859,8 @@ async def update_record(
             )
             # Surface a failure of either half: a failed delete leaves the old
             # name live, which is the very bug being fixed.
-            op = next((o for o in ops if o is not None and o.last_error), None) or (
-                ops[-1] if ops else None
-            )
+            rename_ops = [o for o in ops if o is not None]
+            op = next((o for o in rename_ops if o.last_error), None) or (ops[-1] if ops else None)
         else:
             op = await enqueue_record_op(
                 db, zone, "update", new_payload, target_serial=target_serial
@@ -7882,6 +7885,11 @@ async def update_record(
     )
     await db.commit()
     await db.refresh(record)
+    # #1539 — an agentless op is dispatched by the commit above, so its
+    # outcome is only known now (either half of a rename may have failed).
+    provider_warning = provider_warning or _agentless_op_warning(
+        next((o for o in rename_ops if o.last_error), None) or op
+    )
     record.provider_warning = provider_warning  # type: ignore[attr-defined]
     return record
 
@@ -8104,6 +8112,11 @@ async def bulk_delete_records(
             detail=f"Bulk delete dispatch failed on zone {zone.name}: {exc}",
         ) from exc
 
+    # #1539 — an agentless provider is called AFTER the commit, so no op is
+    # ``failed`` at this point: the delete is committed and a provider
+    # refusal is retried from the op row (visible in the record-ops view and
+    # audited as ``agentless_push_failed``), never silently dropped.
+    #
     # Per-op state determines the DB delete. A wire delete that came back
     # failed must NOT remove the DB row — if we delete blindly the user
     # sees "deleted" in the UI but the record is still published, and
@@ -8659,6 +8672,7 @@ async def import_zone_commit(
     # (#773), read after the flush.
     target_serial: int | None = None
     provider_warning: str | None = None
+    op_rows: list[Any] = []
     if create_rows or update_rows or delete_payloads:
         target_serial = bump_zone_serial(zone)
         await db.flush()
@@ -8720,6 +8734,8 @@ async def import_zone_commit(
 
     collect_wake(dns_group_channel(zone.group_id))
     await db.commit()
+    # #1539 — agentless ops are dispatched by the commit; read the outcome now.
+    provider_warning = provider_warning or _agentless_batch_warning(op_rows)
 
     logger.info(
         "dns_zone_import",

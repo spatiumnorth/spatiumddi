@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An agentless DNS record op no longer reaches the provider before
+  the database commits (#1539).** Windows DNS, the cloud providers and
+  `technitium_api` were called in the middle of the request, so a commit
+  that then failed rolled back the record and its op row while the
+  provider kept the write, with nothing recording it. The op row is now
+  written `pending` inside the transaction and the driver is called from
+  an after-commit hook (one call per batch, so Windows still chunks),
+  which marks it `applied` or reschedules it with backoff; a process
+  that dies in between leaves a committed `pending` row the retry sweep
+  replays. A provider refusal gets its own `agentless_push_failed` audit
+  row, because the request's audit row is written before the provider is
+  called. Every caller is covered (record CRUD, import, IPAM sync, DDNS,
+  trash purge) since the hook sits on the session. A bulk delete or IPAM
+  purge no longer keeps a row on a first provider failure: the delete
+  commits and the op is retried.
 - **A rolling upgrade no longer drops its Lease on one unanswered
   kubeapi read, and a `running` run whose drive is gone is resumed
   (#1713).** A node reboot or a loaded host makes a Lease read time out;

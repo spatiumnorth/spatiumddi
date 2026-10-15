@@ -4,9 +4,11 @@ Per docs/deployment/DNS_AGENT.md §5: when a record is mutated, compute the
 delta and write RecordOp rows targeting the primary server for that zone.
 Secondaries pick up the changes via native AXFR/IXFR from the primary.
 
-Agentless drivers (Windows DNS today) don't follow this queue — the control
-plane applies the change directly at enqueue time and writes the row as
-``applied`` / ``failed`` so operators still see a per-op audit trail.
+Agentless drivers (Windows DNS, cloud providers, technitium_api) don't follow
+this queue — the control plane applies the change itself, but only AFTER the
+request's transaction commits (#1539): the op row is written ``pending``
+inside the transaction and dispatched from an after-commit hook, which marks
+it ``applied`` or reschedules it so operators still see a per-op audit trail.
 """
 
 from __future__ import annotations
@@ -14,18 +16,22 @@ from __future__ import annotations
 import ipaddress
 import uuid
 from collections.abc import Collection
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, func, or_, select, tuple_, update
+from sqlalchemy import and_, event, func, or_, select, tuple_, update
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import set_committed_value
+from sqlalchemy.util import await_only
 
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.drivers.dns import AGENTLESS_DRIVERS, get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
+from app.models.audit import AuditLog
 from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone
 from app.models.ipam import IPAddress
 from app.services.dns.rrset import rrset_key as record_rrset_key
@@ -364,6 +370,193 @@ def rrset_from_payload(record: dict[str, Any]) -> RRsetData | None:
     )
 
 
+# ── After-commit dispatch for agentless ops (#1539) ─────────────────────────
+#
+# An agentless op used to reach the provider in the middle of the request's
+# transaction. If the commit then failed (audit insert error, deadlock, a
+# dropped connection) the DNSRecord change AND its op row rolled back while
+# the provider kept the write — a change nothing in the database recorded.
+#
+# Now the op row is written ``pending`` inside the transaction (the outbox)
+# and the driver is called only once the commit has succeeded: a
+# ``after_commit`` listener on the session runs the dispatch on a fresh
+# session bound to the same engine and records the outcome on the row. A
+# process that dies between commit and dispatch leaves a committed
+# ``pending`` row, which :func:`apply_pending_agentless_ops` replays once its
+# grace window (``next_attempt_at``) passes. A rolled-back request leaves no
+# row, so there is nothing to dispatch.
+
+#: How long a freshly queued agentless op is protected from the retry sweep
+#: while the committing process dispatches it inline.
+AGENTLESS_DISPATCH_GRACE = timedelta(seconds=120)
+
+_DISPATCH_KEY = "spatium_agentless_dispatch"
+
+
+@dataclass
+class _AgentlessUnit:
+    server_id: uuid.UUID
+    op_rows: list[DNSRecordOp]
+    batched: bool
+
+
+@dataclass
+class _DispatchState:
+    bind: Any
+    units: list[_AgentlessUnit] = field(default_factory=list)
+
+
+def _mark_applied(row: DNSRecordOp, now: datetime) -> None:
+    row.attempts = (row.attempts or 0) + 1
+    row.state = "applied"
+    row.applied_at = now
+    row.last_error = None
+    row.next_attempt_at = None
+    row.updated_at = now
+
+
+_MIRRORED_OP_FIELDS = (
+    "state",
+    "attempts",
+    "applied_at",
+    "last_error",
+    "next_attempt_at",
+    "updated_at",
+)
+
+
+async def _dispatch_agentless_units(bind: Any, units: list[_AgentlessUnit]) -> None:
+    """Call the drivers for committed ``pending`` agentless op rows."""
+    async with AsyncSession(bind, expire_on_commit=False) as s:
+        loaded: dict[uuid.UUID, DNSRecordOp] = {}
+        for unit in units:
+            ids = [r.id for r in unit.op_rows]
+            rows = list(
+                (
+                    await s.execute(
+                        select(DNSRecordOp)
+                        .where(DNSRecordOp.id.in_(ids), DNSRecordOp.state == "pending")
+                        .order_by(DNSRecordOp.created_at, DNSRecordOp.seq)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            server = await s.get(DNSServer, unit.server_id)
+            if not rows or server is None or not server.is_enabled:
+                # Rolled back with a savepoint, already handled, or the server
+                # was paused meanwhile — a committed pending row is the
+                # sweep's to replay.
+                continue
+            pairs: list[tuple[DNSRecordOp, RecordChange]] = []
+            for r in rows:
+                c = _change_from_op_row(r)
+                if c is not None:
+                    pairs.append((r, c))
+            if not pairs:
+                continue
+            for r, _c in pairs:
+                loaded[r.id] = r
+            now = datetime.now(UTC)
+            failures: list[tuple[DNSRecordOp, str]] = []
+            try:
+                driver = get_driver(server.driver)
+                if unit.batched:
+                    results = await driver.apply_record_changes(server, [c for _r, c in pairs])
+                    for (r, _c), res in zip(pairs, results, strict=True):
+                        if res.ok:
+                            _mark_applied(r, now)
+                        else:
+                            failures.append((r, (res.error or "unknown")[:500]))
+                else:
+                    for r, c in pairs:
+                        try:
+                            await driver.apply_record_change(server, c)
+                            _mark_applied(r, datetime.now(UTC))
+                        except Exception as exc:  # noqa: BLE001 — per-op wire error
+                            logger.warning(
+                                "record_op_failed_agentless",
+                                server=str(server.id),
+                                driver=server.driver,
+                                zone=r.zone_name,
+                                op=r.op,
+                                error=str(exc),
+                            )
+                            failures.append((r, str(exc)[:500]))
+            except Exception as exc:  # noqa: BLE001 — whole-batch wire/auth failure
+                logger.warning(
+                    "record_op_batch_failed",
+                    server=str(server.id),
+                    driver=server.driver,
+                    count=len(pairs),
+                    error=str(exc),
+                )
+                failures = [(r, str(exc)[:500]) for r, _c in pairs]
+            if failures:
+                await fail_attempts(db=s, failures=failures, now=datetime.now(UTC))
+                # The request's own audit row was written before the provider
+                # was called, so a provider refusal gets its own (#1539) —
+                # the failure is never visible only in a log line.
+                for r, message in failures:
+                    rec = r.record or {}
+                    s.add(
+                        AuditLog(
+                            user_display_name="<system>",
+                            auth_source="system",
+                            action="agentless_push_failed",
+                            resource_type="dns_record_op",
+                            resource_id=str(r.id),
+                            resource_display=(
+                                f"{r.op} {rec.get('type')} {rec.get('name')}.{r.zone_name}"
+                            )[:500],
+                            result="error",
+                            error_detail=message,
+                            new_value={"state": r.state, "attempts": r.attempts},
+                        )
+                    )
+            await s.flush()
+        await s.commit()
+        by_id = {r.id: r for u in units for r in u.op_rows}
+        for oid, row in loaded.items():
+            orig = by_id.get(oid)
+            if orig is None:
+                continue
+            for name in _MIRRORED_OP_FIELDS:
+                set_committed_value(orig, name, getattr(row, name))
+
+
+def _run_dispatch_after_commit(sync_session: Any) -> None:
+    state: _DispatchState | None = sync_session.info.pop(_DISPATCH_KEY, None)
+    if state is None or not state.units:
+        return
+    try:
+        await_only(_dispatch_agentless_units(state.bind, state.units))
+    except Exception as exc:  # noqa: BLE001 — the DB commit already succeeded
+        # Never fail the request over it: the rows are committed ``pending``
+        # and the beat sweep replays them after the grace window.
+        logger.warning("agentless_dispatch_after_commit_failed", error=str(exc))
+
+
+def _discard_dispatch(sync_session: Any) -> None:
+    sync_session.info.pop(_DISPATCH_KEY, None)
+
+
+def _defer_agentless(
+    db: AsyncSession, server: DNSServer, op_rows: list[DNSRecordOp], *, batched: bool
+) -> None:
+    """Register ``op_rows`` for dispatch once ``db``'s transaction commits."""
+    sync = db.sync_session
+    state: _DispatchState | None = sync.info.get(_DISPATCH_KEY)
+    if state is None:
+        state = _DispatchState(bind=db.bind)
+        sync.info[_DISPATCH_KEY] = state
+        if not sync.info.get(_DISPATCH_KEY + "_listening"):
+            sync.info[_DISPATCH_KEY + "_listening"] = True
+            event.listen(sync, "after_commit", _run_dispatch_after_commit)
+            event.listen(sync, "after_rollback", _discard_dispatch)
+    state.units.append(_AgentlessUnit(server_id=server.id, op_rows=op_rows, batched=batched))
+
+
 async def _apply_agentless(
     db: AsyncSession,
     server: DNSServer,
@@ -372,11 +565,14 @@ async def _apply_agentless(
     record: dict[str, Any],
     target_serial: int | None,
 ) -> DNSRecordOp:
-    """Apply a record op synchronously via the server's driver.
+    """Queue a record op for an agentless server's driver.
 
-    Writes a DNSRecordOp row marked ``applied`` on success or ``failed`` on
-    error. The request path continues either way — a failure is visible in
-    the record-ops dashboard and via the existing IPAM↔DNS sync-check.
+    Writes a ``pending`` DNSRecordOp row inside the caller's transaction and
+    registers it for dispatch AFTER that transaction commits (#1539): a commit
+    that fails leaves the provider untouched. The post-commit dispatch marks
+    the row ``applied``, or reschedules it with backoff on a provider error
+    (#1538) — visible in the record-ops dashboard and replayed by the beat
+    sweep, never dropped.
 
     #783 — the op is stamped with its complete desired RRset first, the same
     way the agent path is (#773). This used to be deliberately skipped here,
@@ -397,64 +593,12 @@ async def _apply_agentless(
         record=record,
         target_serial=target_serial,
         state="pending",
+        next_attempt_at=datetime.now(UTC) + AGENTLESS_DISPATCH_GRACE,
     )
     db.add(op_row)
     await db.flush()
-
-    change = RecordChange(
-        op=op,  # type: ignore[arg-type]
-        zone_name=zone.name,
-        record=RecordData(
-            name=record["name"],
-            record_type=record["type"],
-            value=record["value"],
-            ttl=record.get("ttl"),
-            priority=record.get("priority"),
-            weight=record.get("weight"),
-            port=record.get("port"),
-        ),
-        target_serial=target_serial or 0,
-        rrset=rrset_from_payload(record),
-    )
-
-    try:
-        driver = get_driver(server.driver)
-        await driver.apply_record_change(server, change)
-        op_row.state = "applied"
-        op_row.applied_at = datetime.now(UTC)
-        op_row.attempts = 1
-        op_row.last_error = None
-        logger.info(
-            "record_op_applied_agentless",
-            server=str(server.id),
-            driver=server.driver,
-            zone=zone.name,
-            op=op,
-            name=record["name"],
-            type=record["type"],
-        )
-    except Exception as exc:  # noqa: BLE001 — surface any wire / config error
-        # #1538 — a transient provider error (429, 5xx, WinRM timeout) used
-        # to be terminal: ``failed`` at ``attempts=1`` with nothing ever
-        # retrying it, while the caller reported success. Route it through
-        # the same retry accounting as agent ops (#1232): back to
-        # ``pending`` with backoff until the attempt budget is spent (or
-        # ``superseded`` by a newer op for the RRset), and the beat sweep
-        # :func:`apply_pending_agentless_ops` replays it — the op carries
-        # its whole RRset (#783), so a replay is idempotent.
-        message = str(exc)[:500]
-        logger.warning(
-            "record_op_failed_agentless",
-            server=str(server.id),
-            driver=server.driver,
-            zone=zone.name,
-            op=op,
-            error=str(exc),
-        )
-        await db.flush()
-        await fail_attempts(db, [(op_row, message)], now=datetime.now(UTC))
-
-    await db.flush()
+    # #1539 — the provider is called after the commit, never before it.
+    _defer_agentless(db, server, [op_row], batched=False)
     return op_row
 
 
@@ -625,8 +769,9 @@ async def enqueue_record_op(
 
     * **Agentless** (Windows DNS): exactly one server in the group
       writes — the one marked ``is_primary=True``. Apply immediately
-      via the driver from the control plane; the row lands as
-      ``applied`` or ``failed``.
+      via the driver from the control plane once the caller's
+      transaction commits (#1539); the row lands ``pending`` and is then
+      marked ``applied`` or rescheduled.
     * **Agent-based** (BIND9 / PowerDNS): every enabled, agent-based
       server in the group runs an independent authoritative copy of
       the zone (each renders ``type master`` in its named.conf). A
@@ -1121,13 +1266,14 @@ async def _apply_agentless_batch(
     zone: DNSZone,
     ops: list[dict[str, Any]],
 ) -> list[DNSRecordOp | None]:
-    """Apply many record ops against an agentless server in one driver call.
+    """Queue many record ops for an agentless server, applied in one driver
+    call AFTER the surrounding transaction commits (#1539).
 
-    Writes per-op DNSRecordOp rows (applied / failed) so the audit trail
-    matches what the singular path produces. A whole-batch exception
-    (WinRM auth failure, PS parse error in the generated script) marks
-    every row failed with the same error — per-op failures (a bad
-    record type for example) only mark their own row.
+    Writes per-op ``pending`` DNSRecordOp rows; the post-commit dispatch
+    marks them applied / rescheduled so the audit trail matches the agent
+    path. A whole-batch exception (WinRM auth failure, PS parse error in the
+    generated script) reschedules every row with the same error — per-op
+    failures (a bad record type for example) only reschedule their own row.
 
     #783 — the whole batch is folded and stamped with its desired RRsets in
     ONE query before any row is written, exactly as the agent batch path
@@ -1141,6 +1287,7 @@ async def _apply_agentless_batch(
     await stamp_rrsets_for_ops(db, zone, ops)
 
     op_rows: list[DNSRecordOp] = []
+    due = datetime.now(UTC) + AGENTLESS_DISPATCH_GRACE
     for o in ops:
         row = DNSRecordOp(
             server_id=server.id,
@@ -1149,75 +1296,14 @@ async def _apply_agentless_batch(
             record=o["record"],
             target_serial=o.get("target_serial"),
             state="pending",
+            next_attempt_at=due,
         )
         db.add(row)
         op_rows.append(row)
     await db.flush()
-
-    changes = [
-        RecordChange(
-            op=o["op"],  # type: ignore[arg-type]
-            zone_name=zone.name,
-            record=RecordData(
-                name=o["record"]["name"],
-                record_type=o["record"]["type"],
-                value=o["record"]["value"],
-                ttl=o["record"].get("ttl"),
-                priority=o["record"].get("priority"),
-                weight=o["record"].get("weight"),
-                port=o["record"].get("port"),
-            ),
-            target_serial=o.get("target_serial") or 0,
-            rrset=rrset_from_payload(o["record"]),
-        )
-        for o in ops
-    ]
-
-    driver = get_driver(server.driver)
-    try:
-        results = await driver.apply_record_changes(server, changes)
-    except Exception as exc:  # noqa: BLE001 — whole-batch wire/auth failure
-        logger.warning(
-            "record_op_batch_failed",
-            server=str(server.id),
-            driver=server.driver,
-            zone=zone.name,
-            count=len(op_rows),
-            error=str(exc),
-        )
-        # #1538 — same retry accounting as the singular path: a whole-batch
-        # transient failure reschedules every row instead of terminally
-        # failing the batch at attempt 1.
-        err = str(exc)[:500]
-        await db.flush()
-        await fail_attempts(db, [(row, err) for row in op_rows], now=datetime.now(UTC))
-        await db.flush()
-        return list(op_rows)
-
-    applied_count = 0
-    failures: list[tuple[DNSRecordOp, str]] = []
-    for row, result in zip(op_rows, results, strict=True):
-        if result.ok:
-            row.attempts = 1
-            row.state = "applied"
-            row.applied_at = datetime.now(UTC)
-            row.last_error = None
-            applied_count += 1
-        else:
-            failures.append((row, (result.error or "unknown")[:500]))
-    if failures:
-        await fail_attempts(db, failures, now=datetime.now(UTC))
-    await db.flush()
-
-    logger.info(
-        "record_op_batch_applied_agentless",
-        server=str(server.id),
-        driver=server.driver,
-        zone=zone.name,
-        total=len(results),
-        applied=applied_count,
-        failed=len(results) - applied_count,
-    )
+    # #1539 — one driver call per batch (Windows chunks inside it), made
+    # after the commit rather than inside the transaction.
+    _defer_agentless(db, server, op_rows, batched=True)
     return list(op_rows)
 
 
