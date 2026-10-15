@@ -1492,6 +1492,105 @@ _strip_control_priority_class() {
     sed -i -E 's/^([[:space:]]*)priorityClassName: "spatium-control-plane"$/\1priorityClassName: ""/' "$1"
 }
 
+# #1210 — bring the supervisor-owned SIZING keys of an existing spatium-control
+# HelmChartConfig up to what this boot's HelmChart carries, before that
+# HelmChart is released.
+#
+# helm-controller merges the HelmChartConfig on top of the HelmChart, and the
+# Config survives a slot upgrade. When the new release sizes the control plane
+# differently from the one before it (2026.09.04-1 took fractions of MemTotal,
+# #1115 a whole-node budget), the Config still carries the OLD numbers, so the
+# first helm upgrade of the new release rolls api and worker out under the old
+# sizing; the new supervisor's first heartbeat then finds the effective values
+# differ and rewrites the Config, which is a second spatium-control revision,
+# a second migrate Job (that replaces a running one) and a second rollout.
+#
+# Rewriting the Config here, while the new HelmChart is still held back as
+# ``.deferred``, makes the first revision the final one. Properties that keep
+# this from becoming its own source of churn:
+#   * it only UPDATES keys the Config already carries, to the value the
+#     HelmChart carries. It never adds one, so a Config the supervisor has not
+#     sized yet stays untouched;
+#   * it writes only when something differs, so a reboot of an up-to-date node
+#     changes nothing (a Config write is itself a helm revision);
+#   * the document is re-dumped the way the supervisor dumps it
+#     (``safe_dump(sort_keys=True)``), so the supervisor's own compare against
+#     the CR still holds afterwards;
+#   * a Config or manifest it cannot read is left alone, never fatal.
+# The numbers come from the rendered manifest, not from a second copy of the
+# formula, so this cannot drift from _render_control_helmchart.
+# No ``python3 -`` here: a pipe and a heredoc would both claim stdin (#1001),
+# so the program is a ``-c`` argument and its data arrives as argv.
+reconcile_control_sizing() {
+    local deferred="${CONTROL_MANIFEST}.deferred"
+    [ -f "$deferred" ] || return 0
+    local cur patch
+    if ! cur=$(/usr/local/bin/k3s kubectl --request-timeout=10s -n kube-system \
+            get helmchartconfig spatium-control --ignore-not-found \
+            -o 'jsonpath={.spec.valuesContent}' 2>/dev/null); then
+        echo "WARN: could not read HelmChartConfig kube-system/spatium-control; sizing not reconciled this boot." >&2
+        return 0
+    fi
+    [ -n "$cur" ] || return 0
+    patch=$(python3 -c '
+import json, sys
+import yaml
+
+PATHS = (
+    ("api", "resources", "limits", "memory"),
+    ("worker", "concurrency"),
+    ("worker", "resources", "limits", "memory"),
+    ("postgresql", "resources", "requests", "memory"),
+    ("postgresql", "resources", "limits", "memory"),
+    ("postgresql", "cnpg", "parameters", "shared_buffers"),
+)
+MISSING = object()
+
+
+def dig(doc, path):
+    for key in path:
+        if not isinstance(doc, dict) or key not in doc:
+            return MISSING
+        doc = doc[key]
+    return doc
+
+
+try:
+    chart = None
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        for part in yaml.safe_load_all(fh):
+            if isinstance(part, dict) and part.get("kind") == "HelmChart":
+                chart = yaml.safe_load(part["spec"]["valuesContent"])
+    config = yaml.safe_load(sys.argv[2])
+except Exception:
+    sys.exit(0)
+if not isinstance(chart, dict) or not isinstance(config, dict):
+    sys.exit(0)
+changed = False
+for path in PATHS:
+    want = dig(chart, path)
+    have = dig(config, path)
+    if want is MISSING or have is MISSING or want == have:
+        continue
+    node = config
+    for key in path[:-1]:
+        node = node[key]
+    node[path[-1]] = want
+    changed = True
+if changed:
+    body = yaml.safe_dump(config, sort_keys=True, default_flow_style=False)
+    print(json.dumps({"spec": {"valuesContent": body}}))
+' "$deferred" "$cur" 2>/dev/null) || patch=""
+    [ -n "$patch" ] || return 0
+    if /usr/local/bin/k3s kubectl --request-timeout=10s -n kube-system \
+            patch helmchartconfig spatium-control --type merge -p "$patch" >/dev/null 2>&1; then
+        echo "Reconciled the spatium-control HelmChartConfig sizing with this release's HelmChart (#1210)."
+    else
+        echo "WARN: could not reconcile sizing on HelmChartConfig kube-system/spatium-control; the supervisor corrects it on its first heartbeat." >&2
+    fi
+    return 0
+}
+
 # #1299 — pin 'failurePolicy: retry' on the control release's HelmChartConfig.
 #
 # This is the policy helm-controller applies: a HelmChartConfig's failurePolicy
@@ -1969,6 +2068,7 @@ _strip_control_app_secret() {
 place_deferred_control_manifest() {
     local deferred="${CONTROL_MANIFEST}.deferred"
     [ -f "$deferred" ] || return 0
+    reconcile_control_sizing
     echo "Waiting for the CNPG operator webhook before applying the control chart…"
     local up=0
     for _ in $(seq 1 48); do   # up to 4 min

@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An upgrade no longer rolls the control plane out twice (#1210).** A
+  `spatium-control` HelmChartConfig that survived a slot upgrade still
+  carried the previous release's api / worker sizing, and helm-controller
+  merges it over the new HelmChart, so the first rollout ran the old limits
+  and the new supervisor's first heartbeat then rewrote them: a second
+  revision, a second migrate Job (which replaced a running one twice in the
+  report) and a second api / worker restart. Seen on 5 of 5 upgrades from
+  2026.09.04-1. firstboot now brings the sizing keys an existing Config
+  already carries to the values the new HelmChart renders, before releasing
+  that HelmChart, so the first revision is the final one; it writes nothing
+  when they already agree, so a reboot adds no revision.
+
 - **Delete Zone no longer says the zone is permanently deleted (#1880).**
   The dialog, its confirm checkbox, the "Confirm Permanent Deletion"
   title and the bulk zone delete all said the zone and its records would
