@@ -549,7 +549,7 @@ async def test_the_beat_leaves_an_aborted_runs_hold_while_its_drive_holds_the_le
     async def _no_wake() -> None:
         return None
 
-    monkeypatch.setattr(k8s, "get_config", lambda: object())
+    monkeypatch.setattr(k8s, "get_config", object)
     monkeypatch.setattr(shared_tags, "_apply_pins", lambda tag: (pins.append(tag), (True, None))[1])
     monkeypatch.setattr(shared_tags, "_wake_supervisors", _no_wake)
     lease = mutex.LeaseState(held=True, holder=ME, renew_time=None, transitions=1, expired=False)
@@ -604,7 +604,7 @@ def kube_lease(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         s.body = None
         return True, None
 
-    monkeypatch.setattr(k8s, "get_config", lambda: object())
+    monkeypatch.setattr(k8s, "get_config", object)
     monkeypatch.setattr(k8s, "get_lease", _get)
     monkeypatch.setattr(k8s, "clear_lease_holder", _clear)
     return s
