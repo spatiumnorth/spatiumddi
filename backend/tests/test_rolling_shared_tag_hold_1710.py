@@ -363,7 +363,7 @@ async def test_the_flip_unpins_ends_the_hold_and_hands_off_to_the_new_version(
     monkeypatch.setattr(orch.safety, "verify_post_upgrade", _must_not_verify)
 
     stop = asyncio.Event()
-    await orch._drive_loop(db_session, run, stop, "pod_mine")
+    await orch._drive_loop(db_session, run, stop, "worker-a")
 
     # Both pins are gone: the keys, not set to the target, so nothing pins
     # the charts once the run is over. The supervisor's overrides stay.
@@ -419,7 +419,7 @@ async def test_the_new_version_waits_for_every_moved_workload_then_succeeds(
 
     monkeypatch.setattr(orch.safety, "verify_post_upgrade", _verify)
 
-    await orch._drive_loop(db_session, run, asyncio.Event(), "pod_new")
+    await orch._drive_loop(db_session, run, asyncio.Event(), "worker-a")
 
     await db_session.refresh(run)
     assert run.state == "succeeded"

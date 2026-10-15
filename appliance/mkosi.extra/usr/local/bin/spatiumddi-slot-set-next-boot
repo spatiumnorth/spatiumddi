@@ -24,6 +24,35 @@ TRIGGER=/var/lib/spatiumddi/release-state/slot-set-next-boot-pending
 LOG_DIR=/var/log/spatiumddi
 LOG="$LOG_DIR/slot-upgrade.log"
 
+# #1747 — a power loss right after a write must never leave a state file
+# full of NUL bytes (extended length, unwritten data): the supervisor ships
+# these on every heartbeat and Postgres refuses U+0000, so the api would
+# 422 every heartbeat from the node for good. Durable write = temp file in
+# the SAME directory, fsync it, rename over the target, fsync the directory.
+# ``sync FILE`` (coreutils >= 8.24) fsyncs just that path; a plain ``sync``
+# is the fallback when it is unavailable.
+fsync_path() {  # $@ = paths
+    sync "$@" 2>/dev/null || sync 2>/dev/null || true
+}
+atomic_write() {  # $1 = target path, $2 = content (a newline is appended)
+    local target="$1" tmp
+    tmp=$(mktemp "${target}.XXXXXX") || return 1
+    # mktemp makes 0600; keep the target's mode + group (the supervisor reads
+    # these as a different user), else the world-readable default.
+    if [ -e "$target" ]; then
+        chmod --reference="$target" "$tmp" 2>/dev/null || chmod 0644 "$tmp" 2>/dev/null || true
+        chgrp --reference="$target" "$tmp" 2>/dev/null || true
+    else
+        chmod 0644 "$tmp" 2>/dev/null || true
+    fi
+    if printf '%s\n' "$2" > "$tmp" && fsync_path "$tmp" && mv -f "$tmp" "$target"; then
+        fsync_path "$(dirname "$target")"
+    else
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+}
+
 mkdir -p "$LOG_DIR"
 exec >> "$LOG" 2>&1
 echo
@@ -46,17 +75,17 @@ case "$SLOT" in
 esac
 
 echo "  target slot: $SLOT"
-echo "in-flight $(date -Iseconds)" > "${TRIGGER}.state"
+atomic_write "${TRIGGER}.state" "in-flight $(date -Iseconds)"
 
 if /usr/local/bin/spatium-upgrade-slot set-next-boot "$SLOT"; then
     echo
     echo "  ✓ next-boot armed for $SLOT (reboot to switch)"
-    echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+    atomic_write "${TRIGGER}.state" "done $(date -Iseconds)"
     mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
 else
     echo
     echo "  ✗ set-next-boot failed"
-    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    atomic_write "${TRIGGER}.state" "failed $(date -Iseconds)"
     mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
     exit 1
 fi

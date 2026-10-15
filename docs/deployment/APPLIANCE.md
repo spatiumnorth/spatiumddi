@@ -577,6 +577,12 @@ demoted, and a node can't be **revoked** while it's a live cluster member
 — it must be demoted first (revoking a live etcd member would break
 quorum).
 
+A demoted member's row reads `leaving` from the moment of the demote. Until
+its leave runner starts, the node goes on reporting `ready`, and that report
+is ignored (#1806): only the runner's own `leaving`, `left` or `failed` moves
+the row. A promoted node's row reads `joining` the same way, ignoring a
+`left` left over from an earlier demote.
+
 A demoted node leaves etcd **before** it resets itself (#1541). Its leave
 runner removes its own etcd member while the node still votes, stops k3s,
 and asks the node it joined whether the member is gone; only then does it
@@ -1087,6 +1093,52 @@ Operators who want the strict form set `hard`.
 Nothing is emitted in `hard` mode (the appliance's shape — required
 anti-affinity already pins one replica per node, #590), in `none` mode, at
 `replicas: 1`, or when the operator supplied their own list.
+
+### Memory sizing for named (#1725)
+
+`dns-bind9` carries a memory request of 256Mi and a limit of 2Gi
+(`dnsBind9.resources` in `charts/spatiumddi-appliance/values.yaml`). Without
+a limit, one ~580k-entry catalog blocklist in a group with a view took the
+pod to 2.8-3.6 GB on a 6 GiB node; the kubelet then evicted the worker,
+Postgres and the api, and the kernel killed named. With the limit the kernel
+kills named inside the pod's own cgroup instead, and the control plane stays
+up.
+
+Unlike the api, worker and Postgres limits, this one is **not** sized from
+the node's RAM. The role chart is one HelmChart for the whole cluster and
+every node's supervisor writes it, so it must render the same everywhere
+(#1137), and a DaemonSet has one limit for all its pods. A node whose
+blocklists need more raises it for the cluster with a HelmChartConfig:
+
+```yaml
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: spatiumddi-appliance
+  namespace: kube-system
+spec:
+  valuesContent: |
+    dnsBind9:
+      resources:
+        limits:
+          memory: 4Gi
+```
+
+Size it from the table in [`DNS.md` section 8.0](../features/DNS.md): a
+582k-entry list in a group with one view needs about 4 GiB for named, so a
+node of 8 GiB or more. On a 6 GiB floor node, expect that list to be killed
+by its limit rather than to fit; the server then reports its daemon as not
+serving, naming the OOM kill, and the **Agent daemon not serving** alert
+fires (see `DNS.md` 8.0). The agent also derives named's `max-cache-size`
+from the limit (a quarter of it, split across the recursive views), so the
+resolver caches cannot take the RPZ's share.
+
+The request (256Mi) is what the scheduler reserves; the limit is a ceiling,
+so the pod is Burstable and a 3 GiB DNS-only node still schedules. Under node
+memory pressure the kubelet evicts pods using more than their request in
+PriorityClass order, and `dns-bind9` runs in `spatium-service`, the highest
+of the three (#983), so the control plane is evicted before it: the limit,
+not eviction, is what stops it.
 
 ### What is deliberately not set
 
@@ -2998,7 +3050,11 @@ whereas pointing the bootloader at it cannot be undone remotely.
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches
-   independently.
+   independently. The URL must start with `https://` (or `file://`, for an
+   image already placed on every node): the supervisor refuses any other
+   scheme, cleartext `http://` included, so Plan — and the per-box
+   schedule — answer 422 for one rather than letting each node's stage step
+   wait out its timeout for a download that never starts (#1752).
 
 The tab's source toggle defaults to **Uploaded** when at least one
 image is on file; otherwise falls back to **URL**. The empty-state
@@ -3046,6 +3102,24 @@ so a first-time operator never gets stuck looking for the upload.
    health-gate → DaemonSet-ready gate → uncordon → settle pause.
 7. Live progress streams into the Plan banner (per-node state pills
    + ETA). Halt / Resume / Abort buttons exposed.
+   A Halt or Abort takes effect when the node in flight ends: the drive
+   finishes the node it is on (cutting a drain or an apply short would
+   leave it half-changed), then writes what happened to that node into
+   the run's history and stops, leaving the run `halted` or `aborted` and
+   the run's events as the operator left them (#1702). Abort does not
+   free the upgrade Lease: the drive releases its own once it has
+   stopped, so a new Plan and Start are refused meanwhile (#1707). A
+   drive whose Lease was taken over by another writes nothing to the run
+   (#1704). If the drive itself died, the Lease lapses after its
+   10-minute duration; a superadmin can free it sooner with
+   **Force release** beside the Lease pill (`POST
+   /api/v1/upgrades/lease/force-release`). That is refused while the
+   holder has renewed the Lease within the last 300 s (a live drive
+   renews every 200 s), and it is audited
+   (`upgrade.lease_force_released`) and recorded on the run. A failed or
+   aborted run's shared-tag hold (#1710) is not ended by the beat task
+   while the aborted drive still holds the Lease: the node it is
+   finishing may yet boot the new slot.
    Each node's own preflight judges `/var` only on the nodes the run
    has still to upgrade: upgrading a node is what shrinks its `/var`,
    so the nodes already done are not asked again (#1709).

@@ -3012,7 +3012,7 @@ async def _sync_single_server(
 
     for zone in zones:
         try:
-            result = await sync_zone_with_server(db, zone, apply=True)
+            result = await sync_zone_with_server(db, zone, apply=True, server=server)
             zones_succeeded += 1
             total_imported += result.pull.imported
             total_pushed += result.push.pushed

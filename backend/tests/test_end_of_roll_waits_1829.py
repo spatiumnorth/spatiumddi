@@ -296,7 +296,7 @@ async def test_a_run_started_before_the_hold_ends_through_the_chart_bump_and_wai
     cluster.install(monkeypatch)
     _quiet(monkeypatch, orch)
 
-    await orch._drive_loop(db_session, run, asyncio.Event(), "pod_mine")
+    await orch._drive_loop(db_session, run, asyncio.Event(), "worker-a")
 
     await db_session.refresh(run)
     assert run.state == "succeeded", run.last_error
@@ -339,7 +339,7 @@ async def test_the_flips_run_verifies_once_cnpg_has_recovered(
     monkeypatch.setattr(settings, "version", TO)
     _quiet(monkeypatch, orch)
 
-    await orch._drive_loop(db_session, run, asyncio.Event(), "pod_new")
+    await orch._drive_loop(db_session, run, asyncio.Event(), "worker-a")
 
     await db_session.refresh(run)
     assert run.state == "succeeded", run.last_error

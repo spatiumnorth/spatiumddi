@@ -1930,6 +1930,8 @@ export const ipamApi = {
         deleted_count: number;
         not_found: string[];
         skipped: string[];
+        /** Per-row reason for skips that are not system rows (#1714). */
+        skipped_reasons?: Record<string, string>;
       }>(`/ipam/addresses/bulk-delete`, data)
       .then((r) => r.data),
   bulkEditAddresses: (data: {
@@ -12378,6 +12380,12 @@ export const clusterUpgradesApi = {
       .then((r) => r.data),
   lease: () =>
     api.get<UpgradeLeaseState>("/upgrades/lease").then((r) => r.data),
+  // #1707 — superadmin: free a Lease a dead drive left held. Refused (409)
+  // while the holder still renews it.
+  forceReleaseLease: () =>
+    api
+      .post<UpgradeLeaseState>("/upgrades/lease/force-release")
+      .then((r) => r.data),
   plan: (body: ClusterUpgradePlanRequest) =>
     api
       .post<ClusterUpgradePlanResponse>("/upgrades/plan", body)
