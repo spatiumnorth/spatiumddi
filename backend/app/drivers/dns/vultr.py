@@ -389,6 +389,10 @@ class VultrDNSDriver(CloudDNSDriverBase):
 
             if op == "delete":
                 resp = await client.delete(f"/domains/{label}")
+                if getattr(resp, "status_code", 0) == 404:
+                    # Already gone at the provider; deleting it is done
+                    # (#1889, as #1537).
+                    return
                 self._unwrap(resp)
                 return
 

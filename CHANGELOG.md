@@ -98,6 +98,332 @@ the formatter handles the rest.
   was trashed is skipped, as on every other zone delete, so the zone stays
   on it.
 
+- **A Factory Reset of Tools, or of any section, emptied far more than
+  its card said (#1835).** Every section wiped its tables with
+  `TRUNCATE … CASCADE`, which empties every table holding a foreign
+  key into a truncated one whatever the key's `ON DELETE` rule. So a
+  Tools reset (`nmap_scan`, 0 rows in the preview) took
+  `ip_address.last_profile_scan_id` (`SET NULL`) as a reason to empty
+  `ip_address`, and through it every DNS record, DHCP static, NAT
+  mapping, MAC history row, TLS-certificate target and pinned DNSBL
+  address, then answered `deleted_rows_total: 0`. IPAM, DNS, DHCP,
+  Network modeling and Integrations had the same reach into 46 to 86
+  tables each. The reset now never cascades: a table nothing outside
+  the wipe references is `TRUNCATE`d (the big log tables stay fast),
+  every other one is `DELETE`d children-first so `ON DELETE SET NULL`
+  keys are nulled and the referencing rows survive. The only rows that
+  leave with a section besides its own are those a foreign key
+  declares cannot exist without it (a DHCP scope without its subnet);
+  each section lists them in `cascade_dependents`, and the preview and
+  the impact total now count exactly the rows that go (an Integrations
+  reset counts the records of integration-owned zones, not every
+  record that has a zone). The whole reset runs in one transaction,
+  and a reset a `RESTRICT` key would break (IPAM while an integration,
+  network device or multicast group still points at an IP space) is
+  refused with a 409 naming the referencing table and its row count,
+  before anything is deleted; the reset dialog now shows that message
+  instead of "Request failed with status code 409". `Everything` now orders the wipe by the
+  foreign keys, and the Integrations section covers the six
+  integration tables (`cloud_endpoint`, `fortinet_firewall`,
+  `meraki_org`, `netbird_instance`, `opnsense_router`,
+  `panos_firewall`) it had never listed. A test computes each
+  section's `ON DELETE CASCADE` reach from the model metadata and
+  fails when it differs from what the section declares.
+
+- **Sync with Servers on a group syncs each server, not the primary once
+  per server (#1697).** The per-server loop called the per-zone sync with
+  no server, which resolved the zone's primary every time, so an
+  unreachable server was listed as succeeded with the primary's counts
+  and a secondary was never compared. The zone sync now takes the server
+  being walked, which also fixes the single-server Sync on a server row.
+
+- **Technitium's own apex NS is no longer imported by Sync or listed by
+  drift (#1696, #1809).** The `technitium_api` pull returned the NS
+  Technitium writes at every new primary zone's apex, so the first Sync
+  turned it into an operator-owned record and drift never read in sync.
+  It is dropped unless the zone's SpatiumDDI records hold that NS.
+
+- **A Technitium parent zone's record at a name inside a child zone on
+  the same server is no longer written into the child (#1712).**
+  Technitium files a record under the closest zone it hosts, so the
+  parent's record landed in the child and its `overwrite=true` cleared
+  the child's own RRset. The agent now skips such a record, in the
+  structural render and in record ops, and logs
+  `technitium_record_shadowed_by_child_zone`; the child's own value is
+  served, as on BIND9, and any copy the parent's record left in the child
+  is removed by the child's next reconcile. A record at the child's apex
+  (a delegation NS) is still written: Technitium keeps the parent's side
+  of the cut apart.
+
+- **Regression guard for #1695.** Two records of one type at one name,
+  both missing from a `technitium_api` server, are both put back by Sync
+  and stay: each pushed change carries the complete desired set (since
+  #1760), which the driver replays with only member 0 overwriting.
+
+- **A rolling upgrade no longer accepts an `http://` slot image URL
+  that every appliance then refuses (#1752).** The Plan validator allowed
+  `http` or `https`; the supervisor fetches only `https://` or `file://`
+  (#242) and refuses anything else with a warning log and no trigger, so the
+  run started and each node's stage step waited out its whole timeout (50
+  minutes) with no error naming the cause. The scheme rule now lives in
+  `slot_image_target.py` and is enforced by the Plan validator and by the
+  resolver every scheduler goes through (the per-appliance schedule and the
+  rolling orchestrator), each answering 422 with the reason. It mirrors the
+  supervisor's test exactly — the URL must start with `https://` or
+  `file://` — so `file:/x`, which parses as a `file` URL, is refused as the
+  supervisor refuses it. A test pins the rule against the supervisor's own
+  `allowed_schemes`. Uploaded images are unaffected: their URL is composed
+  from the address the UI was reached on, the appliance's `https://`
+  listener. A run planned before the upgrade keeps the URL it was planned
+  with.
+
+- **SCP backup target: a `known_hosts` line naming its host as `host,ip`
+  was never matched (#1728).** The loader passed the whole host field to
+  paramiko as one name, so `sftp.example,192.0.2.10 ssh-ed25519 AAAA...`
+  (what OpenSSH before 8.5 wrote to `~/.ssh/known_hosts`) matched neither
+  name and Test connection answered "not found in known_hosts" with the
+  right key pinned. Each comma-separated name now finds the key. Fails
+  closed: `@cert-authority` lines pin nothing, a key listed `@revoked` is
+  refused wherever else it appears (compared by key, not by how the line
+  spells it), wildcard patterns (which this store cannot honour) match
+  nothing, and a `!` pattern still withholds every name on its line that
+  it covers, as OpenSSH does — `sftp.example,!*.example` pins nothing. A
+  `known_hosts` left with no usable pin refuses the server.
+
+- **The Roles API accepted every action but `approve`, so a cloned Change
+  Approver could not be saved (#1631).** The validator allow-listed `read`, The time-bound grant dialog (Groups → temporary access) now offers the same actions and resource types as the role editor, from one shared list, so a temporary `approve` on `change_request` can be granted from the page too.
+  `write`, `delete`, `admin` and `*`, while the builtin Change Approver role
+  (and every approval check) uses `approve` on `change_request`; saving a
+  clone 422d. `approve` is now accepted by the Roles and time-bound-grant
+  APIs, and the role editor offers it along with the `change_request`
+  resource type, so a custom approver role can be built there rather than
+  only cloned. A test pins the allow-list against every action the builtin
+  roles and permission checks use.
+
+- **A list a scoped user may not read says so instead of showing as
+  empty (#1865).** Audit Log, Conformity, VRFs, Requests, the
+  integration pages (Kubernetes, Docker, Proxmox, Tailscale, UniFi,
+  Meraki, NetBird, OPNsense, PAN-OS, Fortinet, Cloud), Circuits, ASNs,
+  Overlays, Multicast groups, Network devices, TLS certificate targets,
+  Firewall feeds, Logs, Wake schedules, DNS blocking lists and Nmap
+  scans rendered a refused list read as their empty state ("No audit
+  events found", "No policies yet", "No VRFs yet.") over lists that hold
+  rows. They now share one `ListEmpty` wrapper around the empty copy
+  that shows "You don't have permission to see ..." for a refusal and
+  "Couldn't load ..." for any other failure. Requests also no longer
+  invites a user who cannot submit to ask for an IP, and its poll,
+  Nmap's and the Cloud page's stop once refused. The row counters that
+  sat over those lists ("0 events", "0 total", "0 ASNs") read "—" when
+  the read was refused, and Audit Log's Export PDF, which needs the same
+  grant, is disabled.
+
+- **The app shell stops asking routes its user cannot read (#1864).**
+  The maintenance banner (every 15 s), the first-boot setup banner and
+  the sidebar approvals badge (every 30 s) polled
+  `/appliance/system/info`, `/appliance/system/setup` and
+  `/change-requests?state=pending` for whoever was signed in. A user
+  without `read` on `appliance` or `approve` on `change_request` was
+  refused all three, each console 403 was an error, and each refused
+  appliance read wrote a `denied` row to the audit log: about four a
+  minute per open tab, none of them an access attempt the user made.
+  Each query is now enabled only for a user who holds the grant its
+  route needs, and stops polling once a read is refused.
+
+- **An editor whose write an approval policy queued can see, and
+  cancel, its own change request (#1863).** The list, `?mine=true` and
+  `GET /change-requests/{id}` all demanded `read` on `change_request`
+  before the read rule that scopes a requester to the rows it made, and
+  only the built-in Change Approver holds that grant, so the editor was
+  told "Nothing waiting for approval" while the server let it cancel the
+  request it could not read. The grant is no longer a precondition: the
+  own-rows scope on the list and the 404 on get are the access rule, as
+  the router's own read rule always said. Seeing every row still takes
+  `approve` (or superadmin).
+
+- **IPAM bulk delete no longer leaves a DHCP reservation behind (#1714).**
+  `POST /ipam/addresses/bulk-delete` ran none of the reservation handling
+  the single delete has had since #1656: an IPAM Editor could bulk-delete a
+  `static_dhcp` row the single delete answers 403 for, leaving the
+  reservation served with `ip_address_id` null (permanent) or linked to an
+  orphan (soft). It now applies the same rule per row. A caller without
+  `delete` on `dhcp_static` has those rows skipped, each with a reason in the
+  new `skipped_reasons` map (shown in the bulk dialog); a caller with it has
+  the reservations removed on the server and audited, as the single delete
+  does. Other rows in the selection are still deleted. Both paths (and the
+  orphan purge) now find the linked reservations and word the refusal through
+  one shared helper, so they cannot drift; the purge also catches a
+  reservation linked only from the row's `static_assignment_id` (#1628). As
+  in the single delete, the reservation push runs before any DNS teardown, and
+  a server refusing it aborts the whole request with 502.
+
+- **Deleting an appliance only removes servers provably its own
+  (#1810).** The hostname match on agent-registered DNS / DHCP rows now
+  applies only to an approved appliance, judged on the state it is deleted
+  from. A pending or revoked duplicate (a re-imaged box's stale entry)
+  claims its FK-owned rows only, so deleting it, or previewing the
+  delete, can no longer take a live appliance's servers, with their
+  settings such as the Kea `ha_peer_url`. The Kea HA firewall inputs
+  follow the same rule: an appliance's own HA member and a partner's
+  appliance are matched case-blind and only against approved
+  appliances, so a revoked duplicate's old node IPs no longer replace
+  the live partner's in the listener's allowed sources.
+
+- **A DHCP group change made through the Operator Copilot now moves the
+  appliance's Kea server too (#1902).** `assign_appliance_role` (and the MCP
+  `propose_assign_role` that proposes it) set the appliance's DHCP group
+  pointer alone, so the Kea row stayed in the old group and its agent kept
+  serving there: the DHCP half of #1565, reachable only through the
+  Copilot. It now makes the same move the Fleet roles save does, with the
+  same refusals (a Kea and Windows DHCP mix, v6 scopes for Windows), which
+  preview reports and apply enforces before anything changes. A proposal
+  that changes both the DNS and the DHCP group moves both servers in one
+  transaction: a refusal of either applies neither, and the preview names
+  both refusals. The apply now also wakes the appliance's supervisor, as the
+  Fleet save does, instead of leaving the change to the next heartbeat.
+
+- **`seed_demo.py` seeds its IPAM templates (#1465).** Both templates
+  sent `ddns_hostname_policy: leave_unchanged`, a value the API has never
+  accepted, so each POST answered 422 and the run still ended with
+  "Seed complete" and no templates. They now send `client_or_generated`.
+  The script also records every refused request (409, the re-run path,
+  excepted), lists them at the end and exits 2 instead of printing "Seed
+  complete", so a section that seeds nothing no longer passes unnoticed.
+  A test builds both payloads from the script and validates them against
+  the template create model.
+
+- **The Security dashboard counts failed sign-ins, and the TSIG reveal
+  stops calling the secret hashed (#1836, #1837).** The failed-login
+  panel filtered audit rows on `result="denied"`, but `/auth/login`
+  writes `"failure"` for a bad credential, so a real failed sign-in
+  never appeared; it now reads `"failure"`, matching the Copilot
+  health tool. Provider outages are written as `"error"` and stay out,
+  as they are not guesses. The TSIG key reveal said the secret was
+  "hashed at rest and can't be recovered"; it is Fernet-encrypted
+  (SpatiumDDI must read it to sign updates) and is simply not shown
+  again, so the copy now says that.
+
+- **One Fleet save that switches an appliance's DNS engine and its group
+  moves the server row too (#1856).** The roles PUT moved only rows
+  already carrying the new engine's driver, so when the old engine's
+  row was the one the new agent adopts, it stayed in the old group:
+  the new group listed no server and answered REFUSED until a second
+  save. The appliance's own row now moves as the new engine's row, and
+  a target group running another driver is a 422 before anything changes.
+  When the appliance holds two or more rows of engines it no longer runs
+  (left by earlier saves), the save is a 409 naming them instead of
+  moving a guess: the new agent lands on whichever row carries its own
+  agent id, which the control plane cannot tell. The Operator Copilot's
+  `assign_appliance_role` (and MCP `propose_assign_role`) now moves the
+  server the same way; it used to set the appliance's group pointer
+  alone, which left the server in the old group on any group change.
+
+- **Creating a PXE profile with a name its group already holds is a 409,
+  not a 500 (#1911).** The name-clash check selected the whole profile, The Copilot's `list_pxe_profiles` tool had the same joined-collection read and failed for any profile with a match; it now reads them.
+  whose `matches` collection is eager-joined, so the moment a clash
+  existed `scalar_one_or_none()` raised `InvalidRequestError` and the
+  route's own 409 was unreachable; renaming onto a taken name had the
+  same shape. Both checks now select only the id. No other DHCP / DNS
+  create or rename check loads a joined collection, so none shared it.
+
+- **The DHCP options editor's search box kept only the first digit of a
+  typed code (#1685).** Typing `4` then `3` left the box reading
+  "4 —3", matched nothing and made the row option 4. Each keystroke set
+  the row's code and an effect then rewrote the box to "`<code>` —"
+  before the next digit landed; and a prefix that is itself a standard
+  option (3, 6, 15, 42…) moved the row out of the custom list mid-code, so
+  no code starting with one (31, 60, 150…) could be typed at all. The box
+  now only searches while you type; the code is taken into the row on
+  blur, Enter or a catalogue pick, and its name follows it instead of the
+  previous code's name travelling along. Enter no longer submits the
+  dialog from that box, and a pick or a row delete no longer commits the
+  half-typed text first.
+
+- **A power loss right after a slot apply no longer freezes the node's
+  Fleet row (#1747).** The slot-upgrade runners wrote their state and
+  progress sidecars with a plain redirect and no fsync, so a power loss
+  right after "apply succeeded" could leave `slot-upgrade.log` or a
+  sidecar ending in, or made of, NUL bytes. The supervisor sends the log
+  tail on every heartbeat, Postgres refuses a NUL in a text value, and the
+  api answered 422 to every heartbeat from that node until someone edited
+  the file by hand.
+  - The supervisor strips NUL and other control characters from the log
+    tail and the progress sidecar, and strips NUL from every string in
+    the heartbeat body before sending it, so a NUL in any other field
+    read off a host file cannot freeze the row either.
+  - A NUL-filled, empty or truncated state or progress file reads as
+    unknown. Clearing a failed upgrade, and the passive heal when no
+    upgrade is desired, reset an unreadable state to `ready` the way they
+    already reset `failed`.
+  - The host runners (`spatiumddi-slot-upgrade`, `-slot-set-next-boot`,
+    `-slot-set-default`, `-slot-rollback`, `spatium-upgrade-slot`) write
+    their sidecars to a temp file, fsync it, rename it over the target
+    and fsync the directory. The main runner also fsyncs the log after
+    the apply and, on every exit, the log and the trigger's terminal
+    rename.
+
+- **A subnet wider than a /24 now gets a reverse zone for every /24 it
+  spans, so every address gets its PTR (#1840).** A /17–/23 was given
+  the zone of the /24 holding its network address, so in a /23 every
+  address past the first /24 had no zone and no PTR, with nothing
+  reported. It now gets one zone per /24 (a /23 two, a /20 sixteen, a
+  /17 128), never one enclosing zone, which would make SpatiumDDI
+  authoritative for space outside the subnet. A /9–/16 gets one per /16
+  it contains, and an IPv6 prefix one per nibble-aligned piece (a /55
+  gets both its /56 zones where it used to get only the first, a /45 its
+  eight /48s). The zones are a set: subnet delete trashes all of them
+  (and restore brings them back), a resize grow adds the new range's,
+  and the reverse-zone backfill creates the missing ones. Which zone
+  takes a PTR is decided per address by one shared lookup, also used by
+  the DNS drift check, whose preview now lists every reverse zone of the
+  subnet rather than the first, and which no longer reports another
+  subnet's orphaned PTRs because they share a /24 zone. The Windows
+  cutover checklist counts a wider reverse zone as covering its /24s
+  instead of reporting each one missing. An install's existing first-/24
+  zone keeps serving its addresses; the rest of the set is created on
+  the next allocation or backfill. No migration.
+
+- **Technitium: an hmac-sha224 TSIG key is refused instead of being
+  installed and failing every signed transfer (#1858).** Technitium has
+  no HMAC-SHA224 (`DnsDatagram.GetTsigMacSize` returns 0 for it), so a
+  sha224 key was accepted, installed, pinned on the zones, and every
+  AXFR signed with it answered BADKEY. Creating or changing a key to
+  hmac-sha224 on a `technitium` / `technitium_api` group is now a 422
+  naming the algorithm, as is putting a Technitium server (create,
+  driver change, move, Fleet or Copilot role assignment) into a group
+  that holds one, or moving a zone that uses one into such a group.
+  The zone-move preview reports that refusal, so the Move button is
+  blocked rather than failing on commit. The agent no longer installs or
+  pins a sha224 key already stored and reports it as an apply failure
+  (the `agent_config_rejected` alert fires on it). BIND9 and PowerDNS support all five
+  algorithms, Windows and the cloud drivers use no group TSIG keys, so
+  there was no other gap.
+
+- **DigitalOcean, Linode and Vultr: deleting a zone already absent at
+  the provider is done, not an error (#1889).** The three drivers were
+  left out of #1537, so a zone removed out of band at the provider could
+  never leave the Trash: the retention sweep and "Delete permanently"
+  both failed on the provider's not-found answer. The provider's
+  documented not-found answer on the zone delete now counts as success:
+  DigitalOcean HTTP 404 with `{"id": "not_found"}`, Linode HTTP 404 with
+  its `errors` envelope (or a domain absent from its account's filtered
+  domain list), Vultr HTTP 404. A 404 without that shape, auth,
+  throttling and 5xx still fail.
+
+- **The appliance's Celery worker and beat run in appliance mode
+  (#1826).** `APPLIANCE_MODE` was set only on the api container, so the
+  worker, which runs alert evaluation and the rolling-upgrade
+  orchestrator, saw it unset: `node_pressure` and `cluster_dns_degraded`
+  never fired on schedule, and the worker closed what "Evaluate now"
+  (which runs in the api) opened. The chart gains a `sharedEnv` value
+  appended to the api, worker and beat containers; firstboot writes
+  `APPLIANCE_MODE`, `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and
+  `INITIAL_NTP_SERVERS` there instead of under `api.env`, and the
+  slot-image mirror URL and secret now reach the worker as well as the
+  api (the rolling-upgrade preflight's mirror disk-headroom check never
+  ran there), but not beat. A new chart guard, `chart-shared-env.py`,
+  fails a render where the three disagree. An existing appliance picks it up when firstboot
+  re-renders the control-plane chart values (the next slot upgrade).
+
 - **A lost CNPG primary no longer hangs a Celery task for ~15 minutes
   (#1719).** No Celery-side database engine set asyncpg bounds: neither
   `task_session()` nor the ~55 per-task `create_async_engine` calls the

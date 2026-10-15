@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Check,
   Clipboard,
@@ -65,7 +66,11 @@ export function UnifiPage() {
     NEEDS_SUPERADMIN,
   );
   const qc = useQueryClient();
-  const { data: controllers = [], isFetching } = useQuery({
+  const {
+    data: controllers = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["unifi-controllers"],
     queryFn: unifiApi.listControllers,
   });
@@ -157,7 +162,9 @@ export function UnifiPage() {
           {controllers.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No UniFi controllers configured yet.
+                <ListEmpty error={listError} what="UniFi controllers">
+                  No UniFi controllers configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
