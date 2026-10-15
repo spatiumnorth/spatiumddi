@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Boxes,
   Check,
@@ -103,7 +104,11 @@ export function KubernetesPage() {
     NEEDS_SUPERADMIN,
   );
   const qc = useQueryClient();
-  const { data: clusters = [], isFetching } = useQuery({
+  const {
+    data: clusters = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["kubernetes-clusters"],
     queryFn: kubernetesApi.listClusters,
   });
@@ -199,7 +204,9 @@ export function KubernetesPage() {
           {clusters.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No clusters configured yet.
+                <ListEmpty error={listError} what="Kubernetes clusters">
+                  No clusters configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}
