@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A paginated list's `total` no longer counts rows in Trash (#1933).** The
+  shared `paginate` helper counts through
+  `select(count()).select_from(base.subquery())`, and the global soft-delete
+  filter only looked at the outer statement's FROM, so it saw an anonymous
+  subquery and skipped it: the page query was filtered and the count was not.
+  A zone with four of ten records trashed listed six rows under `total: 10`,
+  so the pager offered pages that came back empty. The filter now looks inside
+  subquery FROMs, which fixes every list that counts this way (zone and
+  group-wide records, and the rest of the `Page[...]` endpoints over a
+  soft-deleted model).
+
 - **An imported zone no longer has to stay delegated to the server it was
   migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
   BIND9, PowerDNS and Technitium importers keep the source's apex NS, which the
