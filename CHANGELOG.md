@@ -755,6 +755,15 @@ the formatter handles the rest.
   node still reporting `left` while its row says `joining`) is guarded the
   same way.
 
+- **A demoted member whose k3s takes a while to come back no longer
+  ends the leave `failed` (#1859).** The leave wipes the node's image
+  store with its cluster identity, so its fresh k3s imports every image
+  again before it reports Ready, and on a slow disk that took longer
+  than the leave's 180 s wait. The node was already wiped, so giving up
+  recovered nothing: the row stayed `failed` while k3s came up anyway.
+  The leave now waits up to 600 s more, as a join that registered with
+  the seed's etcd does.
+
 - **Demoting both members of a three-node cluster no longer takes the
   api down for good when the Redis master ran on one of them (#1860).**
   Sentinel fails over only with a majority of the Sentinels it knows,

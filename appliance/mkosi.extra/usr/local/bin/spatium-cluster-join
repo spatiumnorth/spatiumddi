@@ -94,6 +94,13 @@ ETCD_MEMBER_SIDECAR="${SPATIUM_ETCD_MEMBER_SIDECAR:-/var/lib/spatiumddi-host/rel
 # READY_TIMEOUT, only slow; give it this much longer to turn Ready before the
 # rollback is even considered (a busy/slow seed, or a CPU-starved joiner).
 JOINED_READY_TIMEOUT="${SPATIUM_JOINED_READY_TIMEOUT:-600}"
+# #1859 — and a leave gets this much longer than READY_TIMEOUT. The leave
+# wipes containerd's image store and its import cache with the identity
+# (#1085), so the fresh single-node k3s imports every airgap image again
+# before its kubelet reports Ready, and on a slow disk that outruns
+# READY_TIMEOUT. The node is already wiped by then: failing the leave early
+# recovers nothing, and left the row `failed` while k3s came up anyway.
+LEAVE_READY_TIMEOUT="${SPATIUM_LEAVE_READY_TIMEOUT:-600}"
 # k3s log markers that mean THIS attempt's etcd joined the seed's cluster (so
 # a rollback to a standalone etcd would strand a voter on the seed). A join
 # that died at token-validation / CA-fetch never starts etcd and logs none of
@@ -549,6 +556,14 @@ wait_ready() {
     return 1
 }
 
+# #1859 — the leave's wait for its fresh k3s: READY_TIMEOUT, then up to
+# LEAVE_READY_TIMEOUT more while it is still importing its images.
+leave_wait_ready() {
+    wait_ready && return 0
+    log "LEAVE: k3s not Ready within ${READY_TIMEOUT}s — a wiped node imports every image again first; waiting up to ${LEAVE_READY_TIMEOUT}s more (#1859)"
+    wait_ready "$LEAVE_READY_TIMEOUT"
+}
+
 # #1052 — did THIS join attempt get this node into the seed's etcd?
 #
 # READY_TIMEOUT is the budget for the NODE to report Ready; the etcd side of a
@@ -845,13 +860,13 @@ do_leave() {
 
     log "restarting k3s as a fresh single-node seed"
     clean_k3s_runtime
-    if systemctl start k3s && wait_ready; then
+    if systemctl start k3s && leave_wait_ready; then
         log "LEAVE ok — node is a standalone single-node cluster again"
         write_state left ""
         mv -f "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.done.$(date +%s)" || true
         exit 0
     fi
-    log "LEAVE failed — k3s did not come Ready; manual recovery needed"
+    log "LEAVE failed — k3s did not come Ready within $((READY_TIMEOUT + LEAVE_READY_TIMEOUT))s; manual recovery needed"
     write_state failed "leave failed; k3s not Ready"
     mv -f "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.failed.$(date +%s)" || true
     exit 1
