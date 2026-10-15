@@ -34,7 +34,7 @@ def _lease(holder: str | None, age_s: float = 5.0) -> dict[str, Any]:
 @pytest.fixture
 def kube(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     st: dict[str, Any] = {"get": [(200, _lease(ME))], "updates": 0}
-    monkeypatch.setattr(k8s, "get_config", lambda: object())
+    monkeypatch.setattr(k8s, "get_config", object)
 
     def get_lease(name: str, namespace: str | None = None) -> Any:
         item = st["get"].pop(0) if len(st["get"]) > 1 else st["get"][0]
@@ -379,7 +379,7 @@ def test_sweep_task_is_a_no_op_without_a_kubeapi_and_survives_redis_down(
         def delete(self, k: str) -> int:
             raise RedisConnectionError("down")
 
-    monkeypatch.setattr(k8s, "get_config", lambda: object())
+    monkeypatch.setattr(k8s, "get_config", object)
     monkeypatch.setattr(k8s, "get_lease", lambda *_a, **_k: (200, _lease(None, age_s=900)))
 
     async def runs() -> list[Any]:

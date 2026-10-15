@@ -999,7 +999,7 @@ async def _drive_loop(
             try:
                 await asyncio.wait_for(lease_ok.wait(), timeout=_LEASE_RENEW_RETRY_S)
             except TimeoutError:
-                pass
+                pass  # still unknown: loop round to re-check Halt / Abort and the Lease
             continue
         if paused:
             paused = False
