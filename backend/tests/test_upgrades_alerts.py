@@ -331,6 +331,8 @@ async def test_orchestrator_fires_alert_on_node_failure(
     run = _Run()
     db = MagicMock()
     db.get = AsyncMock(return_value=run)
+    # The drive re-reads the run under a row lock before each write (#1702).
+    db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=run)))
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()
@@ -399,6 +401,8 @@ async def test_orchestrator_fires_alert_on_chart_bump_failure(
     run = _Run()
     db = MagicMock()
     db.get = AsyncMock(return_value=run)
+    # The drive re-reads the run under a row lock before each write (#1702).
+    db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=run)))
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()
@@ -588,6 +592,8 @@ async def test_orchestrator_distinct_alert_when_release_fails(
     run = _Run()
     db = MagicMock()
     db.get = AsyncMock(return_value=run)
+    # The drive re-reads the run under a row lock before each write (#1702).
+    db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=run)))
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock()

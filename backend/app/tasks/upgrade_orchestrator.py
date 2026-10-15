@@ -35,6 +35,7 @@ import uuid
 
 import structlog
 from celery import shared_task
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
@@ -83,14 +84,30 @@ async def _async_drive(run_id: str) -> dict[str, str]:
             # and the run sits in ``planned`` / ``running`` with no error
             # (#1449).
             await db.rollback()
-            row = await db.get(SystemUpgradeRun, rid)
-            if row is not None and row.state in ("planned", "running"):
+            # Row-locked and holder-checked (#1704): the run is marked only
+            # while it is still this drive's. After a takeover it is the new
+            # drive's, and after a Halt or Abort the state is the operator's.
+            row = (
+                await db.execute(
+                    select(SystemUpgradeRun)
+                    .where(SystemUpgradeRun.id == rid)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if (
+                row is not None
+                and row.state in ("planned", "running")
+                and row.lease_holder in (None, me)
+            ):
                 row.state = "failed"
                 row.last_error = f"orchestrator crashed: {exc}"
                 from datetime import UTC, datetime  # noqa: PLC0415
 
                 row.finished_at = datetime.now(UTC)
                 await db.commit()
+            else:
+                await db.commit()  # ends the row lock; nothing to write
             # A failed run holds the lease for nothing; left held, the next
             # Start is refused until it expires. Only this drive's, never
             # another drive's that took it over.

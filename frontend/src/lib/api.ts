@@ -12380,6 +12380,12 @@ export const clusterUpgradesApi = {
       .then((r) => r.data),
   lease: () =>
     api.get<UpgradeLeaseState>("/upgrades/lease").then((r) => r.data),
+  // #1707 — superadmin: free a Lease a dead drive left held. Refused (409)
+  // while the holder still renews it.
+  forceReleaseLease: () =>
+    api
+      .post<UpgradeLeaseState>("/upgrades/lease/force-release")
+      .then((r) => r.data),
   plan: (body: ClusterUpgradePlanRequest) =>
     api
       .post<ClusterUpgradePlanResponse>("/upgrades/plan", body)
