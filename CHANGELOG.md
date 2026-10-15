@@ -448,6 +448,24 @@ the formatter handles the rest.
   config reload, so those changes reach the card without one, and each
   key in the per-key table carries its own DS rather than every KSK's.
 
+- **A signed zone keeps its DNSSEC keys when the appliance's BIND pod is
+  replaced (#1855).** BIND keeps each signed zone's keys in its
+  `key-directory`, `/var/cache/bind/keys`, and the appliance chart left
+  that directory inside the dns-bind9 container. Every new pod (an
+  upgrade, a reboot, an engine switch, an eviction) signed each zone with
+  new keys, so a DS record published at the parent matched no key and
+  validating resolvers answered SERVFAIL for the zone. The chart now keeps
+  `/var/cache/bind` on the node's persistent `/var`, at
+  `/var/lib/spatiumddi/agents/dns-bind9/data`, beside the agent's state.
+  The upgrade that brings this fix still re-keys each signed zone once
+  more, because the keys in use before it were never kept. If you
+  published a DS for a zone an appliance serves, replace it after the
+  upgrade with one made from the key the appliance now serves for the zone
+  (`dig @<appliance> <zone> DNSKEY`). Until the agent next reads BIND's
+  keys (every 5 minutes, #1854, #1934), the zone page can still show the
+  old key and its DS, so compare it with that answer before you copy a
+  DS from it.
+
 - **Trashing a subnet now withdraws its own DNS records, instead of
   leaving them answering from a zone that stays (#1906).** When one of
   two subnets sharing a /24 reverse zone went to Trash, the zone was
