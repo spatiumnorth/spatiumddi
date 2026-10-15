@@ -8625,7 +8625,7 @@ function RecordsTab({
               <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
                 {confirmDelete.record_type}
               </span>
-              ? The record moves to Trash and can be restored from
+              ? The record moves to Trash. A superadmin can restore it from
               Administration → Trash.
             </p>
             {deleteMut.isError && (

@@ -88,12 +88,13 @@ the formatter handles the rest.
   The dialog, its confirm checkbox, the "Confirm Permanent Deletion"
   title and the bulk zone delete all said the zone and its records would
   be permanently deleted, while the console sends the soft delete and the
-  zone goes to Trash. They now say the zone and its records move to Trash
-  and can be restored from Administration → Trash. The same untrue
-  "cannot be undone" is gone from the DNS records grid's single-record
-  delete. "Permanent" stays on the paths that are: group, TSIG key and
-  blocking-list deletes, and Trash's purge. Same class as #1152 / #1398
-  for IPAM.
+  zone goes to Trash. They now say the zone and its records move to Trash,
+  and that a superadmin can restore them from Administration → Trash
+  (restoring is superadmin-only, so the dialog does not tell a DNS Editor
+  they can undo it themselves). The same untrue "cannot be undone" is gone
+  from the DNS records grid's single-record delete. "Permanent" stays on
+  the paths that are: group, TSIG key and blocking-list deletes, and
+  Trash's purge. Same class as #1152 / #1398 for IPAM.
 - **Drift and pull-from-server reach an agent-managed BIND9 or Technitium
   behind the appliance's DNS VIP (#1470).** With `dns_vip` set the DNS
   pods drop hostNetwork, so the node address a server row carries
