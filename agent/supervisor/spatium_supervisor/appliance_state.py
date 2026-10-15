@@ -35,6 +35,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -374,6 +375,67 @@ def _write_sidecar_durable(path: Path, text: str) -> None:
         os.fsync(fh.fileno())
 
 
+# #1825 — a trigger that lands while systemd is in a ``daemon-reload`` is
+# never seen: the reload re-creates the path watch, and ``PathChanged=`` does
+# not fire for a file already there when it comes back (systemd.path(5)).
+# When the watcher sees it the runner writes ``.state`` within milliseconds,
+# so a trigger still unclaimed after this long was missed.
+_PICKUP_GRACE_SECONDS = 30
+_last_rearm_at = 0.0
+
+
+def _pending_trigger_since() -> datetime | None:
+    """When the slot-upgrade trigger was written, if the runner has not
+    claimed it: no ``.state``, or one older than the trigger (an earlier
+    run's). The runner's first act makes ``.state`` newer and its last
+    renames the trigger away, so a running or finished apply is never
+    pending."""
+    try:
+        trig = _TRIGGER_FILE.stat().st_mtime_ns
+    except OSError:
+        return None
+    try:
+        state = _HOST_SLOT_STATE.stat().st_mtime_ns
+    except FileNotFoundError:
+        state = None
+    except OSError:
+        return None
+    if state is not None and state >= trig:
+        return None
+    return datetime.fromtimestamp(trig / 1e9, UTC)
+
+
+def _rearm_missed_trigger(since: datetime) -> None:
+    """#1825 — re-fire ``PathChanged=`` for a trigger the watcher missed.
+
+    Open for write and close without writing: IN_CLOSE_WRITE on the watched
+    file, mtime (and so the reaper's clock) unchanged. No O_CREAT, so a
+    trigger consumed since it was read as pending is not re-created empty;
+    O_NOFOLLOW, so a symlink is not opened through. At most once per grace
+    window. A trigger this process cannot open (the api's per-box apply) is
+    logged and left to the reaper; the api re-arms its own.
+    """
+    global _last_rearm_at
+    now = time.time()
+    waited = now - since.timestamp()
+    if waited < _PICKUP_GRACE_SECONDS or now - _last_rearm_at < _PICKUP_GRACE_SECONDS:
+        return
+    _last_rearm_at = now
+    try:
+        fd = os.open(_TRIGGER_FILE, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return  # consumed since it was read as pending
+    except OSError as exc:
+        log.warning(
+            "supervisor.slot_upgrade.trigger_rearm_failed",
+            waited_seconds=int(waited),
+            error=str(exc),
+        )
+        return
+    os.close(fd)
+    log.warning("supervisor.slot_upgrade.trigger_rearmed", waited_seconds=int(waited))
+
+
 def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     """Read ``state stamp`` from the .state sidecar the host-side
     runner maintains. Returns (state, when) or (None, None) when no
@@ -396,7 +458,18 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     work" signal instead of an empty cell that visually looks like
     "agent hasn't reported yet". ``None`` is reserved for genuinely-
     unknown rows (docker / k8s / pre-8f-2).
+
+    #1825 — a trigger the runner has not claimed reads ``in-flight``,
+    stamped with when it was written, so ``_reap_stale_inflight`` ends it
+    if it is never picked up (before, the Fleet chip read the previous
+    run's state and a missed fleet trigger blocked re-fire for good). One
+    still unclaimed after the pickup grace is re-armed.
     """
+    pending = _pending_trigger_since()
+    if pending is not None:
+        if (datetime.now(UTC) - pending).total_seconds() <= _STALE_INFLIGHT_SECONDS:
+            _rearm_missed_trigger(pending)
+        return "in-flight", pending
     if not _HOST_SLOT_STATE.exists():
         return "ready", None
     try:

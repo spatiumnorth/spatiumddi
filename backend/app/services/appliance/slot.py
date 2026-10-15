@@ -18,6 +18,7 @@ committed.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -215,9 +216,9 @@ _PICKUP_GRACE_SECONDS = 30
 _last_rearm_at = 0.0
 
 
-def _mtime(path: Path) -> float | None:
+def _mtime_ns(path: Path) -> int | None:
     try:
-        return path.stat().st_mtime
+        return path.stat().st_mtime_ns
     except OSError:
         return None
 
@@ -227,14 +228,15 @@ def _pending_trigger_mtime() -> float | None:
 
     The runner's first act is to write ``.state`` (so it is newer than the
     trigger); its terminal act renames the trigger away. A trigger with no
-    ``.state``, or one older than itself, is therefore not started.
+    ``.state``, or one older than itself (#1288: an earlier run's, which the
+    api cannot unlink), is therefore not started.
     """
-    trig = _mtime(_TRIGGER_FILE)
+    trig = _mtime_ns(_TRIGGER_FILE)
     if trig is None:
         return None
-    state = _mtime(_STATE_FILE)
+    state = _mtime_ns(_STATE_FILE)
     if state is None or state < trig:
-        return trig
+        return trig / 1e9
     return None
 
 
@@ -244,9 +246,13 @@ def _rearm_unclaimed_trigger(trigger_mtime: float) -> None:
     Opening for write and closing without writing emits IN_CLOSE_WRITE (the
     event PathChanged= is documented to fire on: "activated if the file
     which was open for writing gets closed") and leaves the mtime, and with
-    it the heal's clock, untouched. Idempotent: the runner's own start is a
-    no-op if it is already running, and it consumes the trigger when done.
-    A trigger the api cannot open (the supervisor's) is left to the heal.
+    it the heal's clock, untouched. No O_CREAT: if the runner consumed the
+    trigger since it was read as pending, this must not leave an empty one
+    behind for the watcher to start the runner on. O_NOFOLLOW: a symlink is
+    not our trigger. Harmless while the runner runs (the path unit watches
+    nothing until its service is inactive again) and after it finishes (the
+    trigger is gone). A trigger the api cannot open (the supervisor's) is
+    left to the heal; the supervisor re-arms its own.
     """
     global _last_rearm_at
     now = time.time()
@@ -256,23 +262,30 @@ def _rearm_unclaimed_trigger(trigger_mtime: float) -> None:
         return
     _last_rearm_at = now
     try:
-        with open(_TRIGGER_FILE, "ab"):
-            pass
+        fd = os.open(_TRIGGER_FILE, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return  # consumed since it was read as pending
     except OSError as exc:
         logger.warning(
             "appliance_slot_upgrade_rearm_failed", trigger=str(_TRIGGER_FILE), error=str(exc)
         )
         return
-    logger.warning("appliance_slot_upgrade_rearmed", trigger=str(_TRIGGER_FILE))
+    os.close(fd)
+    logger.warning(
+        "appliance_slot_upgrade_rearmed",
+        trigger=str(_TRIGGER_FILE),
+        waited_seconds=int(now - trigger_mtime),
+    )
 
 
 def _upgrade_state_now() -> tuple[UpgradeState, str | None]:
     """Read the .state sidecar the host-side runner maintains. Returns
     ('ready', None) when no upgrade has run recently — ``ready`` is
     the green-chip default that signals "agent is healthy + no pending
-    work". Trigger present but no .state yet means the runner hasn't
-    picked it up — counts as 'in-flight' from the operator's
-    perspective.
+    work". A trigger the runner hasn't written state for (no .state, or
+    one older than the trigger, an earlier run's — #1288) counts as
+    'in-flight', stamped with the trigger's mtime so #421's heal ages it;
+    one still unclaimed after _PICKUP_GRACE_SECONDS is re-armed (#1825).
 
     Stale-failed auto-heal: when state == failed AND the un-suffixed
     trigger isn't present, the host runner has already renamed it to
