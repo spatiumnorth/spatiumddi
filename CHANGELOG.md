@@ -755,6 +755,16 @@ the formatter handles the rest.
   node still reporting `left` while its row says `joining`) is guarded the
   same way.
 
+- **Demoting both members of a three-node cluster no longer takes the
+  api down for good when the Redis master ran on one of them (#1860).**
+  Sentinel fails over only with a majority of the Sentinels it knows,
+  so once both members left, the seed's lone Sentinel could never move
+  a master that had been on a member, and the api answered 502 from
+  then on. The demote now moves the master to a node that stays first,
+  while all three Sentinels are up, and keeps every Redis pod on a
+  leaving member from being promoted. It is refused (409) when the
+  master cannot be moved, and nothing is changed.
+
 - **A Halt or Abort mid-node, and a drive that lost the upgrade Lease,
   no longer get overwritten by the drive (#1702, #1704, #1707).** A
   rolling-upgrade drive kept its own copy of the run for the whole of a
