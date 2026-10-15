@@ -247,6 +247,10 @@ async def move_appliance_dns_servers(
     if not own_dns and drivers:
         adoptee = await appliance_adoptable_dns_server(db, appliance, target_group)
         if adoptee is not None:
+            # #1703 — the driver write below and the move after it hit the same
+            # row: lock it first, or the driver UPDATE (flushed by the next
+            # SELECT) takes the weaker lock and the move deadlocks a render.
+            await lock_server_row(db, adoptee.id)
             new_driver = next(iter(drivers))
             logger.info(
                 "appliance_dns_row_readopted",

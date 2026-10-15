@@ -245,11 +245,14 @@ async def lock_server_row(db: AsyncSession, server_id: Any) -> None:
     each side held half of what the other wanted (40P01). Taking the strongest
     lock first makes a render and a move of one server run one after the other.
 
-    Selects the id only, so no pending attribute on the instance is refreshed.
-    Call it BEFORE the caller mutates the server (the autoflush would take the
-    weaker lock first, which is the inversion).
+    Selects the id only, so no pending attribute on the instance is refreshed,
+    and runs without autoflush, so a write the caller has already made to the
+    instance is not flushed (with the weaker lock) ahead of it. A write the
+    caller has already FLUSHED holds that weaker lock already, so callers still
+    take this before their first flush of the row.
     """
-    await db.execute(select(DNSServer.id).where(DNSServer.id == server_id).with_for_update())
+    with db.no_autoflush:
+        await db.execute(select(DNSServer.id).where(DNSServer.id == server_id).with_for_update())
 
 
 async def move_server_to_group(
