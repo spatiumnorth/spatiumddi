@@ -580,7 +580,12 @@ async def release_lingering_hold(db: AsyncSession) -> dict[str, str] | None:
 
     # A failed run's drive has let go already: it fails the run only as it ends.
     lease = mutex.get_state() if run.state == "aborted" and run.lease_holder else None
-    if lease is not None and lease.held and lease.holder == run.lease_holder:
+    # An unreadable Lease (#1713) may be that drive's too: wait for an answer.
+    if (
+        lease is not None
+        and lease.held
+        and (lease.holder == run.lease_holder or (lease.holder or "").startswith("<"))
+    ):
         logger.info("upgrade_shared_tag_release_deferred_drive_alive", run_id=str(run.id))
         return None
     run_id = str(run.id)

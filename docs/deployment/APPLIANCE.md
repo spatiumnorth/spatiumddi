@@ -3110,7 +3110,12 @@ so a first-time operator never gets stuck looking for the upload.
    free the upgrade Lease: the drive releases its own once it has
    stopped, so a new Plan and Start are refused meanwhile (#1707). A
    drive whose Lease was taken over by another writes nothing to the run
-   (#1704). If the drive itself died, the Lease lapses after its
+   (#1704). A Lease read the API did not answer counts as unknown,
+   not lost: the drive starts no new node until a renewal lands, and
+   gives up (finishing only the node it is on) 8 minutes after its last
+   renewal, before the Lease could lapse for anyone else. If a drive
+   exits with the run still `running`, a beat sweep re-drives it once
+   the Lease has been free on two sweeps a minute apart (#1713). If the drive itself died, the Lease lapses after its
    10-minute duration; a superadmin can free it sooner with
    **Force release** beside the Lease pill (`POST
    /api/v1/upgrades/lease/force-release`). That is refused while the

@@ -84,6 +84,31 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A rolling upgrade no longer drops its Lease on one unanswered
+  kubeapi read, and a `running` run whose drive is gone is resumed
+  (#1713).** A node reboot or a loaded host makes a Lease read time out;
+  that was reported as "held by nobody", the drive concluded it had
+  lost a Lease it still held, and it exited after the node in flight
+  with the run left `running` and nothing to re-drive it (seen twice:
+  one of three nodes upgraded, run idle for 2 h 50 min). An unanswered
+  read is now unknown, not lost: the drive starts no new node while its
+  Lease is unknown, retries the renewal every 15 s, and gives up 480 s
+  after the last renewal that landed, two minutes before anyone else
+  may take the Lease over. It keeps renewing while the node in flight
+  finishes, so no second drive starts beside it. Only a Lease seen held
+  by another, or a refused write, ends the drive at once. `get_state`
+  reports an unanswered read as held by `<unreachable>`, never as free;
+  Start answers 503 for it instead of enqueueing a drive, the Cluster
+  Upgrade tab shows "Lease unknown" with no Force release, and the
+  drive's own per-node preflight treats it as a warning rather than
+  failing the node. A new beat sweep, every minute, re-enqueues
+  `drive_upgrade_run` for a `running` rolling run once the Lease has
+  been free on two consecutive sweeps 45 s or more apart, at most once
+  per 10 min, keeping a hand-off's "not on this node" or "not on the
+  old tag" request and leaving a hand-off still in transit alone. The
+  re-driven task still has to take the Lease, so a live drive wins. It
+  does nothing on docker-compose, and nothing while Redis is down.
+
 - **A promoted control-plane member's own pods reach its own
   apiserver and kubelet (#1721).** A pod's packet to its own node's
   address arrives from the pod's own address, so the node's firewall
