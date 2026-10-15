@@ -33,6 +33,9 @@ from app.services.dns.pull_from_server import (
     without_agent_ns_glue,
     without_server_apex_ns,
 )
+from app.services.dns.pull_from_server import (
+    is_apex_ns as _is_apex_ns,
+)
 from app.services.dns.tsig import (
     is_view_transfer_key,
     pull_zone_records_signed,
@@ -82,14 +85,6 @@ class ZoneDriftReport:
     # Conditions that make the diff below less trustworthy than it looks.
     # Rendered verbatim by the UI — keep them operator-readable.
     warnings: list[str] = field(default_factory=list)
-
-
-def _is_apex_ns(r: RecordData | DNSRecord, zone_name: str) -> bool:
-    """An NS record at the zone apex (``@`` or the zone's own FQDN)."""
-    if r.record_type.upper() != "NS":
-        return False
-    name = (r.name or "").strip().lower()
-    return name in ("@", "", zone_name.strip().lower().rstrip(".") + ".")
 
 
 def _renders_apex_ns(srv: DNSServer, driver: object) -> bool:

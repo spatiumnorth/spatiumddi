@@ -287,6 +287,14 @@ def _normalize_name(v: str, zone_name: str, relative_targets: bool) -> str:
 RecordKey = tuple[str, str, str, int | None, int | None, int | None]
 
 
+def is_apex_ns(r: RecordData | DNSRecord, zone_name: str) -> bool:
+    """An NS record at the zone apex (``@`` or the zone's own FQDN)."""
+    if r.record_type.upper() != "NS":
+        return False
+    name = (r.name or "").strip().lower()
+    return name in ("@", "", zone_name.strip().lower().rstrip(".") + ".")
+
+
 def _key(r: RecordData | DNSRecord, zone_name: str, *, relative_targets: bool) -> RecordKey:
     """Identity key for dedup: (name, type, canonical-value, priority,
     weight, port). TTL-only differences don't count — neither does
@@ -623,6 +631,7 @@ async def _additive_push(
     db_rows: list[DNSRecord],
     *,
     apply: bool,
+    skip_unreadable_apex_ns: bool = False,
 ) -> PushResult:
     """For every DB row whose key isn't on the wire, send a create op via
     the driver. Errors are collected, not raised, so one bad record
@@ -647,10 +656,21 @@ async def _additive_push(
     # can zip the driver's per-op results back onto the source rows by
     # index after dispatch.
     pushable_types = _syncable_types(driver, _PUSHABLE_TYPES)
+    # #1893 — a read that carries no apex NS (the AXFR helper drops it by
+    # design) cannot tell whether the server has the stored one, so every run
+    # read it as missing and pushed it again (on agent-managed BIND9 the
+    # control-plane push then fails for want of a TSIG key, every run). Every
+    # zone has an apex NS set, so an empty one means the read could not see
+    # it: leave the stored apex NS out of the push set. A read that does carry
+    # one (a provider's) is compared like any record. Delegations below the
+    # apex are always compared.
+    skip_apex_ns = skip_unreadable_apex_ns and not any(is_apex_ns(r, zone.name) for r in on_wire)
     candidate_rows: list[DNSRecord] = []
     for row in db_rows:
         rtype = row.record_type.upper()
         if rtype not in pushable_types:
+            continue
+        if skip_apex_ns and is_apex_ns(row, zone.name):
             continue
         if _key(row, zone.name, relative_targets=rel) in on_wire_keys:
             continue
@@ -868,7 +888,16 @@ async def sync_zone_with_server(
     if apply and pull_result.imported:
         await db.flush()
 
-    push_result = await _additive_push(db, primary, driver, zone, on_wire, db_rows, apply=apply)
+    push_result = await _additive_push(
+        db,
+        primary,
+        driver,
+        zone,
+        on_wire,
+        db_rows,
+        apply=apply,
+        skip_unreadable_apex_ns=True,
+    )
 
     logger.info(
         "dns.sync_with_server",
