@@ -20,6 +20,9 @@ auth — no JWT / RBAC / session):
 * ``GET  /internal/slot-images/{image_id}``  — stream bytes back.
   StreamingResponse so a 4 GiB download doesn't load into memory.
 
+* ``HEAD /internal/slot-images/{image_id}``  — presence probe: 200 when
+  stored, 404 when not, no body (#1919). Same ``get`` auth as the GET.
+
 * ``DELETE /internal/slot-images/{image_id}`` — remove the file.
   Best-effort; 404 on the file is fine (operator may have rm-rf'd
   the directory between attempts).
@@ -45,7 +48,7 @@ from pathlib import Path
 
 import structlog
 from fastapi import APIRouter, HTTPException, Request, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from app.config import settings
@@ -261,6 +264,28 @@ async def get_image(image_id: uuid.UUID, request: Request) -> FileResponse:
         path,
         media_type="application/octet-stream",
         filename=f"{image_id}.raw.xz",
+    )
+
+
+@router.head(
+    "/{image_id}",
+    summary="(mirror) does the mirror hold this slot image? 200 / 404, no body",
+    response_class=Response,
+)
+async def head_image(image_id: uuid.UUID, request: Request) -> Response:
+    """Presence probe (#1919). FastAPI's ``APIRoute`` does not add HEAD to a
+    GET route (Starlette's plain ``Route`` does), so without this the
+    preflight's and the re-upload check's HEAD answered 405. Same
+    ``get`` auth as the GET it stands in for; never a body."""
+    _verify_auth("get", image_id, request.headers.get(_AUTH_HEADER))
+    path = _image_path(image_id)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+    return Response(
+        status_code=status.HTTP_200_OK,
+        headers={"Content-Length": str(size), "Content-Type": "application/octet-stream"},
     )
 
 

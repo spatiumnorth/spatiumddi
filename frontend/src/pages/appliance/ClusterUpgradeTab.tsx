@@ -289,6 +289,10 @@ function PlanFormPanel() {
   const [sourceMode, setSourceMode] = useState<UpgradeImageSource | null>(null);
   const [cnpgClusterName, setCnpgClusterName] = useState("");
   const [preflightTarget, setPreflightTarget] = useState<string | null>(null);
+  // #1919 — the uploaded image the preflight was run against ("" for a URL
+  // source). The disk checks depend on it, so a verdict for one image must
+  // not unlock Plan for another.
+  const [preflightImageId, setPreflightImageId] = useState("");
   const [planError, setPlanError] = useState<string | null>(null);
 
   const slotImagesQuery = useQuery({
@@ -316,8 +320,12 @@ function PlanFormPanel() {
     isFetching: preflightLoading,
     refetch: refetchPreflight,
   } = useQuery({
-    queryKey: ["upgrades", "preflight", preflightTarget],
-    queryFn: () => clusterUpgradesApi.preflight(preflightTarget as string),
+    queryKey: ["upgrades", "preflight", preflightTarget, preflightImageId],
+    queryFn: () =>
+      clusterUpgradesApi.preflight(
+        preflightTarget as string,
+        preflightImageId || undefined,
+      ),
     enabled: !!preflightTarget && preflightTarget.length > 0,
     refetchOnWindowFocus: false,
     // Preflight verdicts can move between an operator's preflight click
@@ -486,6 +494,9 @@ function PlanFormPanel() {
           disabled={!targetVersion || preflightLoading}
           onClick={() => {
             setPreflightTarget(targetVersion);
+            setPreflightImageId(
+              effectiveSource === "uploaded" ? slotImageId : "",
+            );
             void refetchPreflight();
           }}
           className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
@@ -513,6 +524,8 @@ function PlanFormPanel() {
             // so the worst case is a 409, but the UI shouldn't
             // surface a green Plan button against a stale verdict.
             preflightTarget !== targetVersion ||
+            preflightImageId !==
+              (effectiveSource === "uploaded" ? slotImageId : "") ||
             planMut.isPending
           }
           onClick={() => planMut.mutate()}
@@ -522,7 +535,10 @@ function PlanFormPanel() {
               ? "Preflight failed — resolve before planning."
               : preflightTarget !== targetVersion
                 ? "Re-run preflight against the current target version first."
-                : ""
+                : preflightImageId !==
+                    (effectiveSource === "uploaded" ? slotImageId : "")
+                  ? "Re-run preflight against the selected image first."
+                  : ""
           }
         >
           {planMut.isPending ? (

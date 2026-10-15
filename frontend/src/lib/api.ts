@@ -12417,9 +12417,15 @@ export interface ClusterUpgradePlanRequest {
 }
 
 export const clusterUpgradesApi = {
-  preflight: (target: string) =>
+  // #1919 — ``slotImageId`` is the uploaded image the Plan will name, so the
+  // disk checks size the need from it, exactly as the Plan's own preflight.
+  preflight: (target: string, slotImageId?: string) =>
     api
-      .get<PreflightReport>("/upgrades/preflight", { params: { target } })
+      .get<PreflightReport>("/upgrades/preflight", {
+        params: slotImageId
+          ? { target, slot_image_id: slotImageId }
+          : { target },
+      })
       .then((r) => r.data),
   lease: () =>
     api.get<UpgradeLeaseState>("/upgrades/lease").then((r) => r.data),
