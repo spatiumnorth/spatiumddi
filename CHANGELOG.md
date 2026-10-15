@@ -104,7 +104,9 @@ the formatter handles the rest.
   on upgrade. The Helm TLS frontend (one server for
   :80 and :443) no longer 301s a request a trusted proxy marks
   `X-Forwarded-Proto: https`, which looped behind a TLS-terminating proxy,
-  and gains the AI-chat stream location it lacked. The cluster-health,
+  sends `Strict-Transport-Security` only on https (its own TLS, or a
+  trusted proxy's), never on plain HTTP to :80, and gains the AI-chat
+  stream location it lacked. The cluster-health,
   container-log and nmap streams are served unbuffered with a one hour
   timeout. The api now logs `sso_external_url_not_set` when an SSO endpoint
   falls back to the request URL, `trusted_hosts_refused_host` for the Host a

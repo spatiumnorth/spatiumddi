@@ -60,6 +60,21 @@ data:
         "http:0" 1;
     }
 
+    # HSTS only where the browser's own connection is https (RFC 6797 §7.2:
+    # never over plain HTTP). This server answers :80 too since #1868, so the
+    # header is a map value; nginx omits an add_header whose value is empty.
+    # Keyed on $spatium_forwarded_proto, not $scheme: behind a proxy that
+    # terminates TLS and talks http to :80 the browser IS on https, and the
+    # header from here is what that browser should see (a proxy that sets its
+    # own HSTS is unaffected; it can hide ours). That variable takes
+    # X-Forwarded-Proto only from a trusted peer, so a client reaching :80
+    # directly cannot switch HSTS on with a forged header, and a direct :80
+    # request (the probe, an ACME challenge, the redirect) never carries it.
+    map $spatium_forwarded_proto $spatium_hsts {
+        default "";
+        https "max-age=31536000";
+    }
+
     # One server for both ports (was two, a :80 redirect-only block and
     # this one): the :80 listener has to serve the whole application for a
     # proxy that terminates TLS and talks http, and two copies of every
@@ -116,8 +131,9 @@ data:
         # re-minted when a promote grows its SANs. ``includeSubDomains`` is
         # left out on purpose: the appliance serves no subdomains of its
         # hostname, and in a DDI product those names are often other hosts
-        # in a zone the operator runs.
-        add_header Strict-Transport-Security "max-age=31536000" always;
+        # in a zone the operator runs. Empty, so not sent, on plain HTTP:
+        # see ``map … $spatium_hsts`` above.
+        add_header Strict-Transport-Security $spatium_hsts always;
 
         resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
 
@@ -151,7 +167,7 @@ data:
             add_header X-Frame-Options "DENY" always;
             add_header X-Content-Type-Options "nosniff" always;
             add_header Referrer-Policy "no-referrer" always;
-            add_header Strict-Transport-Security "max-age=31536000" always;
+            add_header Strict-Transport-Security $spatium_hsts always;
             try_files /_starting.html =503;
         }
 
@@ -172,7 +188,7 @@ data:
             add_header Retry-After 2 always;
             add_header X-Upstream-Status $upstream_status always;
             add_header X-Content-Type-Options "nosniff" always;
-            add_header Strict-Transport-Security "max-age=31536000" always;
+            add_header Strict-Transport-Security $spatium_hsts always;
             if ($upstream_status ~ "504") {
                 return 504 '{"detail":"The api did not answer in time; retry shortly."}';
             }
@@ -314,7 +330,7 @@ data:
             add_header X-Frame-Options "DENY" always;
             add_header X-Content-Type-Options "nosniff" always;
             add_header Referrer-Policy "no-referrer" always;
-            add_header Strict-Transport-Security "max-age=31536000" always;
+            add_header Strict-Transport-Security $spatium_hsts always;
             error_page 502 504 @api_unavailable;
             set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
             proxy_pass         $api_upstream;
@@ -435,7 +451,7 @@ data:
             add_header X-Frame-Options "DENY" always;
             add_header X-Content-Type-Options "nosniff" always;
             add_header Referrer-Policy "no-referrer" always;
-            add_header Strict-Transport-Security "max-age=31536000" always;
+            add_header Strict-Transport-Security $spatium_hsts always;
         }
 
         gzip on;
