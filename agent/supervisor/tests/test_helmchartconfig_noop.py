@@ -359,23 +359,29 @@ def test_an_upgrade_over_an_old_sizing_config_converges_in_one_revision(
 
         # firstboot's real function, against a stub apiserver
         src = _firstboot().read_text(encoding="utf-8")
-        fn = re.search(r"^reconcile_control_sizing\(\) \{.*?^\}$", src, re.S | re.MULTILINE)
-        assert fn, "firstboot no longer defines reconcile_control_sizing"
+        fns = [
+            re.search(rf"^{name}\(\) \{{.*?^\}}$", src, re.S | re.MULTILINE)
+            for name in ("control_sizing_patch", "apply_control_sizing_patch")
+        ]
+        assert all(fns), "firstboot no longer defines the #1210 sizing functions"
         stub = tmp_path / "stub"
         stub.mkdir()
         (stub / "config").write_text(_yaml(old_config))
+        (stub / "live").write_text(_yaml(chart_values))  # the released chart, applied
         k3s = tmp_path / "k3s"
         k3s.write_text(
             '#!/bin/sh\nS="$STUB"\n[ "$1" = kubectl ] && shift\nargs="$*"\n'
             'case "$args" in\n  *"get helmchartconfig"*) cat "$S/config";;\n'
+            '  *"get helmchart "*) cat "$S/live";;\n'
             '  *"patch helmchartconfig"*) printf "%s" "${args#*-p }" > "$S/patched";;\nesac\n'
         )
         k3s.chmod(0o755)
         (tmp_path / "spatium-control.yaml.deferred").write_text(manifest)
         script = (
             f'CONTROL_MANIFEST="{tmp_path}/spatium-control.yaml"\n'
-            + fn.group(0).replace("/usr/local/bin/k3s", str(k3s))
-            + "\nreconcile_control_sizing\n"
+            + "\n".join(f.group(0) for f in fns if f).replace("/usr/local/bin/k3s", str(k3s))
+            + f'\np=$(control_sizing_patch "{tmp_path}/spatium-control.yaml.deferred")\n'
+            + f'apply_control_sizing_patch "{tmp_path}/spatium-control.yaml.deferred" "$p"\n'
         )
         subprocess.run(
             [shutil.which("dash") or "sh", "-c", script],

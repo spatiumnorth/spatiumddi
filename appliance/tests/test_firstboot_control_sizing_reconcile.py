@@ -7,10 +7,15 @@ and worker out under the OLD limits, and the supervisor's first heartbeat then
 rewrote the Config: a second spatium-control revision, a second migrate Job and a
 second rollout.
 
-``reconcile_control_sizing`` runs while the new HelmChart is still ``.deferred`` and
-rewrites the Config's sizing keys to the values that HelmChart carries.  These tests
-drive the real function under ``sh`` (dash on the appliance) against a stub ``k3s``
-and a real rendered-looking manifest, and assert on what is PATCHED.
+``control_sizing_patch`` computes, while the new HelmChart is still ``.deferred``, the
+Config's sizing keys at the values that HelmChart carries, and
+``apply_control_sizing_patch`` writes them as soon as k3s has applied the released
+HelmChart -- so helm-controller runs ONE job carrying the new image and the new
+sizing.  (Patched before the release, the Config change re-runs the PREVIOUS
+release's HelmChart instead: measured against k3s v1.36.4, that is a rollout on the
+old image followed by a second one.)  These tests drive the real functions under
+``sh`` (dash on the appliance) against a stub ``k3s`` and a real rendered-looking
+manifest, and assert on what is PATCHED and when.
 
 HOW TO RUN: python3 -m pytest appliance/tests/test_firstboot_control_sizing_reconcile.py -v
 """
@@ -40,6 +45,15 @@ case "$args" in
   *"get helmchartconfig spatium-control"*)
     [ -f "$S/apierr" ] && { echo refused >&2; exit 1; }
     [ -f "$S/config" ] && cat "$S/config"
+    exit 0 ;;
+  *"get helmchart spatium-control"*)
+    # The deploy controller applies the released manifest after a few polls.
+    n=$(cat "$S/polls" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$S/polls"
+    if [ -f "$S/live" ] && [ "$n" -ge "$(cat "$S/live_after" 2>/dev/null || echo 1)" ]; then
+      cat "$S/live"
+    else
+      cat "$S/stale" 2>/dev/null
+    fi
     exit 0 ;;
   *"patch helmchartconfig spatium-control --type merge -p "*)
     printf '%s' "${args#*-p }" > "$S/patched"
@@ -93,7 +107,7 @@ def _extract(name: str) -> str:
 
 
 def _run(tmp_path: Path, config: dict | None, *, manifest: str | None = None,
-         apierr: bool = False, patch_fails: bool = False):
+         apierr: bool = False, patch_fails: bool = False, live_after: int | None = 3):
     stub = tmp_path / "stub"
     stub.mkdir(parents=True)
     k3s = tmp_path / "k3s"
@@ -105,11 +119,27 @@ def _run(tmp_path: Path, config: dict | None, *, manifest: str | None = None,
         if on:
             (stub / flag).touch()
     control = tmp_path / "spatium-control.yaml"
+    deferred = Path(f"{control}.deferred")
     if manifest is not None:
-        Path(f"{control}.deferred").write_text(manifest)
-    body = _extract("reconcile_control_sizing").replace("/usr/local/bin/k3s", str(k3s))
-    script = f'set -eu\nCONTROL_MANIFEST="{control}"\n{body}\nreconcile_control_sizing\necho rc=$?\n'
-    proc = subprocess.run([SHELL, "-c", script], env={**os.environ, "STUB": str(stub)},
+        deferred.write_text(manifest)
+        # Before the release the live HelmChart is the previous release's.
+        (stub / "stale").write_text('image:\n  tag: "2026.09.04-1"\n')
+        if live_after is not None:
+            values = yaml.safe_load_all(manifest)
+            live = next(d for d in values if d.get("kind") == "HelmChart")
+            (stub / "live").write_text(live["spec"]["valuesContent"])
+            (stub / "live_after").write_text(str(live_after))
+    body = "\n".join(
+        _extract(n) for n in ("control_sizing_patch", "apply_control_sizing_patch")
+    ).replace("/usr/local/bin/k3s", str(k3s))
+    script = (
+        f'set -eu\nCONTROL_MANIFEST="{control}"\n{body}\n'
+        f'p=$(control_sizing_patch "{deferred}")\n'
+        f'apply_control_sizing_patch "{deferred}" "$p"\necho rc=$?\n'
+    )
+    env = {**os.environ, "STUB": str(stub), "CONTROL_SIZING_WAIT_STEP": "0",
+           "CONTROL_SIZING_WAIT_TICKS": "8"}
+    proc = subprocess.run([SHELL, "-c", script], env=env,
                           capture_output=True, text=True, check=False)
     patched = (stub / "patched").read_text() if (stub / "patched").exists() else None
     new_values = None
@@ -185,8 +215,41 @@ def test_an_unreadable_apiserver_or_a_refused_patch_never_fails(tmp_path: Path) 
     assert "WARN: could not reconcile" in proc.stderr
 
 
-def test_it_runs_before_the_control_chart_is_released() -> None:
+def test_the_patch_waits_for_the_released_helmchart(tmp_path: Path) -> None:
+    proc, patched, _ = _run(tmp_path, _old_config(), manifest=_manifest(), live_after=3)
+    assert patched is not None, proc.stderr
+    calls = (tmp_path / "stub" / "calls.log").read_text().splitlines()
+    polls = [i for i, c in enumerate(calls) if "get helmchart spatium-control" in c]
+    patch = next(i for i, c in enumerate(calls) if "patch helmchartconfig" in c)
+    # Patched while the previous release's HelmChart is live, the Config change
+    # would re-run THAT chart: a rollout on the old image, then a second one.
+    assert len(polls) == 3 and polls[-1] < patch
+    assert "was not seen applied" not in proc.stderr
+
+
+def test_a_helmchart_never_seen_applied_is_still_reconciled(tmp_path: Path) -> None:
+    proc, patched, _ = _run(tmp_path, _old_config(), manifest=_manifest(), live_after=None)
+    assert proc.stdout.strip().endswith("rc=0")
+    assert patched is not None
+    assert "was not seen applied" in proc.stderr
+
+
+def test_nothing_to_patch_does_not_wait(tmp_path: Path) -> None:
+    cfg = yaml.safe_load(CHART_VALUES)
+    cfg.pop("image")
+    _run(tmp_path, cfg, manifest=_manifest(), live_after=None)
+    calls = (tmp_path / "stub" / "calls.log").read_text()
+    assert "get helmchart spatium-control" not in calls
+
+
+def test_it_is_written_right_behind_the_released_chart() -> None:
     src = SCRIPT.read_text(encoding="utf-8")
-    body = _extract("place_deferred_control_manifest")
-    assert body.index("reconcile_control_sizing") < body.index("release_control_manifest")
-    assert src.index("reconcile_control_sizing() {") < src.index("place_deferred_control_manifest() {")
+    body = _extract("release_control_manifest")
+    mv = body.index('mv -f "$deferred" "$CONTROL_MANIFEST"')
+    # Computed from the final bytes (after any priority-class strip), before
+    # the release; written after it.
+    assert body.index("_strip_control_priority_class") < body.index("control_sizing_patch")
+    assert body.index("control_sizing_patch") < mv < body.index("apply_control_sizing_patch")
+    # And no longer before the webhook wait, when the old HelmChart is live.
+    assert "sizing" not in _extract("place_deferred_control_manifest")
+    assert src.index("apply_control_sizing_patch() {") < src.index("release_control_manifest() {")

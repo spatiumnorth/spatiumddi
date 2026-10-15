@@ -92,9 +92,14 @@ the formatter handles the rest.
   revision, a second migrate Job (which replaced a running one twice in the
   report) and a second api / worker restart. Seen on 5 of 5 upgrades from
   2026.09.04-1. firstboot now brings the sizing keys an existing Config
-  already carries to the values the new HelmChart renders, before releasing
-  that HelmChart, so the first revision is the final one; it writes nothing
-  when they already agree, so a reboot adds no revision.
+  already carries to the values the new HelmChart renders, and writes them
+  the moment k3s has applied that HelmChart, so helm-controller runs one job
+  carrying the new image and the new sizing. The timing is the fix. Measured
+  against k3s v1.36.4's helm-controller, patching the Config before the
+  release instead re-runs the previous release's chart: a rollout on the old
+  image, then a second one. A patch that loses the race costs a second
+  revision on the new image seconds later rather than minutes later. It
+  writes nothing when the two already agree, so a reboot adds no revision.
 
 - **Delete Zone no longer says the zone is permanently deleted (#1880).**
   The dialog, its confirm checkbox, the "Confirm Permanent Deletion"

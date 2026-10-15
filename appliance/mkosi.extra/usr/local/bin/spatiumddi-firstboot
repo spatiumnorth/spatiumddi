@@ -1493,8 +1493,8 @@ _strip_control_priority_class() {
 }
 
 # #1210 — bring the supervisor-owned SIZING keys of an existing spatium-control
-# HelmChartConfig up to what this boot's HelmChart carries, before that
-# HelmChart is released.
+# HelmChartConfig up to what this boot's HelmChart carries, in the same
+# helm-controller pass that installs that HelmChart.
 #
 # helm-controller merges the HelmChartConfig on top of the HelmChart, and the
 # Config survives a slot upgrade. When the new release sizes the control plane
@@ -1505,9 +1505,24 @@ _strip_control_priority_class() {
 # differ and rewrites the Config, which is a second spatium-control revision,
 # a second migrate Job (that replaces a running one) and a second rollout.
 #
-# Rewriting the Config here, while the new HelmChart is still held back as
-# ``.deferred``, makes the first revision the final one. Properties that keep
-# this from becoming its own source of churn:
+# WHEN the Config is patched is the whole fix, and was measured against k3s
+# v1.36.4's helm-controller with a stub chart:
+#   * patched BEFORE the new HelmChart is placed, the Config change re-runs the
+#     HelmChart still live (the PREVIOUS release's), so api and worker roll out
+#     on the old image with the new limits, and the new chart is a second
+#     revision a few seconds later. Two rollouts, deterministically;
+#   * patched as soon as the live HelmChart carries this boot's values, the
+#     job helm-controller just created for (new chart, old Config) is replaced
+#     before its pod reaches `helm upgrade` (the pod takes ~4-5 s to get
+#     there), so one revision carries the new image AND the new sizing. A
+#     patch that loses that race costs a second revision on the new image
+#     seconds later, not minutes later after the migration has started.
+# So control_sizing_patch computes the patch while the chart is still held
+# back (no work left between the placement and the write), and
+# apply_control_sizing_patch waits for k3s's deploy controller (a 15 s file
+# scan) to apply the HelmChart and then writes at once.
+#
+# Properties that keep this from becoming its own source of churn:
 #   * it only UPDATES keys the Config already carries, to the value the
 #     HelmChart carries. It never adds one, so a Config the supervisor has not
 #     sized yet stays untouched;
@@ -1518,13 +1533,16 @@ _strip_control_priority_class() {
 #     the CR still holds afterwards;
 #   * a Config or manifest it cannot read is left alone, never fatal.
 # The numbers come from the rendered manifest, not from a second copy of the
-# formula, so this cannot drift from _render_control_helmchart.
+# formula, so this cannot drift from _render_control_helmchart. The keys are
+# the ones the supervisor rewrites on every heartbeat anyway, so an operator
+# value in them never survived the supervisor either.
 # No ``python3 -`` here: a pipe and a heredoc would both claim stdin (#1001),
-# so the program is a ``-c`` argument and its data arrives as argv.
-reconcile_control_sizing() {
-    local deferred="${CONTROL_MANIFEST}.deferred"
-    [ -f "$deferred" ] || return 0
-    local cur patch
+# so the programs are ``-c`` arguments and their data arrives as argv.
+
+# $1 = the manifest about to be released. Prints the merge patch, or nothing.
+control_sizing_patch() {
+    local manifest="$1" cur
+    [ -f "$manifest" ] || return 0
     if ! cur=$(/usr/local/bin/k3s kubectl --request-timeout=10s -n kube-system \
             get helmchartconfig spatium-control --ignore-not-found \
             -o 'jsonpath={.spec.valuesContent}' 2>/dev/null); then
@@ -1532,7 +1550,7 @@ reconcile_control_sizing() {
         return 0
     fi
     [ -n "$cur" ] || return 0
-    patch=$(python3 -c '
+    python3 -c '
 import json, sys
 import yaml
 
@@ -1580,8 +1598,38 @@ for path in PATHS:
 if changed:
     body = yaml.safe_dump(config, sort_keys=True, default_flow_style=False)
     print(json.dumps({"spec": {"valuesContent": body}}))
-' "$deferred" "$cur" 2>/dev/null) || patch=""
+' "$manifest" "$cur" 2>/dev/null || true
+}
+
+# $1 = the released manifest, $2 = the patch from control_sizing_patch.
+apply_control_sizing_patch() {
+    local manifest="$1" patch="$2" live i applied=0
     [ -n "$patch" ] || return 0
+    i=0
+    while [ "$i" -lt "${CONTROL_SIZING_WAIT_TICKS:-60}" ]; do   # 0.5 s each
+        live=$(/usr/local/bin/k3s kubectl --request-timeout=5s -n kube-system \
+            get helmchart spatium-control -o 'jsonpath={.spec.valuesContent}' 2>/dev/null) || live=""
+        if [ -n "$live" ] && python3 -c '
+import sys
+import yaml
+
+try:
+    want = None
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        for part in yaml.safe_load_all(fh):
+            if isinstance(part, dict) and part.get("kind") == "HelmChart":
+                want = yaml.safe_load(part["spec"]["valuesContent"])
+    sys.exit(0 if want is not None and yaml.safe_load(sys.argv[2]) == want else 1)
+except Exception:
+    sys.exit(1)
+' "$manifest" "$live" 2>/dev/null; then
+            applied=1
+            break
+        fi
+        i=$((i + 1))
+        sleep "${CONTROL_SIZING_WAIT_STEP:-0.5}"
+    done
+    [ "$applied" = 1 ] || echo "WARN: the released spatium-control HelmChart was not seen applied; reconciling its sizing anyway." >&2
     if /usr/local/bin/k3s kubectl --request-timeout=10s -n kube-system \
             patch helmchartconfig spatium-control --type merge -p "$patch" >/dev/null 2>&1; then
         echo "Reconciled the spatium-control HelmChartConfig sizing with this release's HelmChart (#1210)."
@@ -1665,8 +1713,13 @@ release_control_manifest() {
         echo "      The ranking returns on the first boot where that release is healthy." >&2
         _strip_control_priority_class "$deferred"
     fi
+    # #1210 — computed from the final bytes, before the release, so the write
+    # lands right behind the HelmChart (see control_sizing_patch).
+    local sizing_patch
+    sizing_patch=$(control_sizing_patch "$deferred")
     mv -f "$deferred" "$CONTROL_MANIFEST"
     chmod 0600 "$CONTROL_MANIFEST"
+    apply_control_sizing_patch "$CONTROL_MANIFEST" "$sizing_patch"
 }
 
 # #554 — is this a TRIAL boot (running slot != durable default)? Blocking
@@ -2068,7 +2121,6 @@ _strip_control_app_secret() {
 place_deferred_control_manifest() {
     local deferred="${CONTROL_MANIFEST}.deferred"
     [ -f "$deferred" ] || return 0
-    reconcile_control_sizing
     echo "Waiting for the CNPG operator webhook before applying the control chart…"
     local up=0
     for _ in $(seq 1 48); do   # up to 4 min

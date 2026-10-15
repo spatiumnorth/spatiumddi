@@ -519,11 +519,14 @@ state on its heartbeat:
   HelmChart, so the first rollout ran the old limits and the new supervisor's
   first heartbeat rewrote them, a second `spatium-control` revision, a second
   migrate Job (which replaces a running one) and a second api / worker
-  rollout. firstboot's `reconcile_control_sizing` now brings the sizing keys
-  an existing Config already carries (api / worker memory and concurrency,
-  the Postgres requests / limits and `shared_buffers`) to the values this
-  boot's HelmChart renders, while that HelmChart is still held back as
-  `.deferred`, so the first revision is the final one. It only updates keys
+  rollout. firstboot now brings the sizing keys an existing Config already
+  carries (api / worker memory and concurrency, the Postgres requests /
+  limits and `shared_buffers`) to the values this boot's HelmChart renders.
+  It computes them while that HelmChart is still held back as `.deferred`
+  and writes them as soon as k3s has applied it, so helm-controller's job
+  for the new chart is replaced, before it runs, by one carrying the new
+  sizing too. Patching earlier would re-run the previous release's chart: a
+  rollout on the old image followed by a second one. It only updates keys
   already present and writes only on a difference (a Config write is itself
   a helm revision), so a reboot of an up-to-date node changes nothing. The
   fix lives in the release being upgraded **to**; the release being left
