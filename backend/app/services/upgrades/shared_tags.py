@@ -121,6 +121,37 @@ def _store(run: SystemUpgradeRun, record: dict[str, Any]) -> None:
     run.progress = {**(run.progress or {}), PROGRESS_KEY: record}
 
 
+async def _commit_record(
+    db: AsyncSession, run: SystemUpgradeRun, record: dict[str, Any], *, holder: str | None
+) -> bool:
+    """Write ``record`` as the run's ``progress.shared_tags`` and commit, as a
+    merge onto the row re-read under ``FOR UPDATE`` (#1702).
+
+    Writing ``run.progress`` whole from a copy read before a kubeapi call
+    would put back the ``progress.events`` it was read with, dropping a
+    Halt, Resume or Abort that landed during the call. Only this key is
+    written. With ``holder`` (the drive's Lease identity), the write is
+    refused, and False returned, when another drive has taken the run over:
+    the record is that drive's now. The ``expire`` stops the read from
+    autoflushing this session's stale copy first."""
+    run_id = run.id
+    db.expire(run)
+    fresh = (
+        await db.execute(
+            select(SystemUpgradeRun)
+            .where(SystemUpgradeRun.id == run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if fresh is None or (holder and fresh.lease_holder not in (None, holder)):
+        await db.commit()
+        return False
+    _store(fresh, record)
+    await db.commit()
+    return True
+
+
 def holds(run: SystemUpgradeRun) -> bool:
     """True when this run placed a hold (released or not): its end of
     roll is the flip, not the old chart bump."""
@@ -423,6 +454,7 @@ async def flip(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
     if flip_rec.get("state") in (FLIP_FLIPPED, FLIP_SETTLED):
         return StepOutcome(ok=True, mode=MODE_HOLD, detail=flip_rec)
     from_tag = str(record.get("from_tag") or "")
+    holder = run.lease_holder
     if flip_rec.get("state") != FLIP_FLIPPING:
         try:
             current = _list_workloads(RELEASE_NAMESPACE)
@@ -435,8 +467,8 @@ async def flip(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
         ]
         flip_rec = {"state": FLIP_FLIPPING, "started_at": _now_iso(), "workloads": workloads}
         record["flip"] = flip_rec
-        _store(run, record)
-        await db.commit()
+        if not await _commit_record(db, run, record, holder=holder):
+            return StepOutcome(ok=False, mode=MODE_HOLD, error="the run has another drive now")
 
     ok, err = _apply_pins(None)
     if not ok:
@@ -444,8 +476,8 @@ async def flip(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
     now = _now_iso()
     flip_rec.update(state=FLIP_FLIPPED, flipped_at=now)
     record.update(flip=flip_rec, released_at=now, release_reason="flip")
-    _store(run, record)
-    await db.commit()
+    if not await _commit_record(db, run, record, holder=holder):
+        return StepOutcome(ok=False, mode=MODE_HOLD, error="the run has another drive now")
     await _wake_supervisors()
     logger.info(
         "upgrade_shared_tags_flipped",
@@ -540,16 +572,29 @@ async def release_lingering_hold(db: AsyncSession) -> dict[str, str] | None:
     version = str(versions.pop())
     if k8s.get_config() is None:
         return None
+    # An aborted run's drive keeps the Lease until the node it was on ends
+    # (#1707), and that node may still boot the new slot: one version
+    # across the members now says nothing about a minute from now. Wait
+    # for the drive to let go (or its Lease to lapse).
+    from app.services.upgrades import mutex  # noqa: PLC0415
+
+    # A failed run's drive has let go already: it fails the run only as it ends.
+    lease = mutex.get_state() if run.state == "aborted" and run.lease_holder else None
+    if lease is not None and lease.held and lease.holder == run.lease_holder:
+        logger.info("upgrade_shared_tag_release_deferred_drive_alive", run_id=str(run.id))
+        return None
+    run_id = str(run.id)
     ok, err = _apply_pins(None)
     if not ok:
-        logger.warning("upgrade_shared_tag_release_failed", run_id=str(run.id), error=err)
+        logger.warning("upgrade_shared_tag_release_failed", run_id=run_id, error=err)
         return None
     record.update(released_at=_now_iso(), release_reason=f"uniform:{version}")
-    _store(run, record)
-    await db.commit()
+    # A merge onto the locked row: the aborted drive may have written its
+    # node's outcome while the pins were coming off.
+    await _commit_record(db, run, record, holder=None)
     await _wake_supervisors()
-    logger.info("upgrade_shared_tag_hold_released", run_id=str(run.id), version=version)
-    return {"run_id": str(run.id), "version": version}
+    logger.info("upgrade_shared_tag_hold_released", run_id=run_id, version=version)
+    return {"run_id": run_id, "version": version}
 
 
 __all__ = [

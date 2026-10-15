@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, func, or_, select, tuple_
+from sqlalchemy import and_, func, or_, select, tuple_, update
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -1007,6 +1007,38 @@ async def enqueue_record_ops_bulk(
 _RETRACT_CHUNK = 5000
 
 
+async def _queue_record_deletes(
+    db: AsyncSession, records: list[DNSRecord]
+) -> tuple[set[uuid.UUID], int]:
+    """Queue one ``delete`` op per record, per zone in one batch, and return
+    ``(groups_to_wake, zones_touched)``. A record whose zone is gone or in the
+    trash is skipped: a trashed zone is not served, nothing is on the wire.
+    The records must still be live rows when this runs — the RRset stamp reads
+    the zone's members and removes each op's own value."""
+    by_zone: dict[uuid.UUID, tuple[DNSZone, list[DNSRecord]]] = {}
+    for rec in records:
+        zone = rec.zone
+        if zone is None or zone.deleted_at is not None:
+            continue  # a zone in the trash is not served: nothing on the wire
+        by_zone.setdefault(zone.id, (zone, []))[1].append(rec)
+    wake: set[uuid.UUID] = set()
+    # #1800 — reverse zones first, so a Technitium A/AAAA delete finds its PTR's
+    # delete already queued and the re-assert queues no create that delete
+    # would only undo.
+    for zone, recs in sorted(by_zone.values(), key=lambda zr: zr[0].kind != "reverse"):
+        target_serial = bump_zone_serial(zone)
+        await enqueue_record_ops_batch(
+            db,
+            zone,
+            [
+                {"op": "delete", "record": record_op_payload(r), "target_serial": target_serial}
+                for r in recs
+            ],
+        )
+        wake.add(zone.group_id)
+    return wake, len(by_zone)
+
+
 async def retract_address_records(
     db: AsyncSession, subnet_ids: Collection[uuid.UUID]
 ) -> tuple[int, set[uuid.UUID]]:
@@ -1065,27 +1097,7 @@ async def retract_address_records(
     if not records:
         return 0, set()
 
-    by_zone: dict[uuid.UUID, tuple[DNSZone, list[DNSRecord]]] = {}
-    for rec in records:
-        zone = rec.zone
-        if zone is None or zone.deleted_at is not None:
-            continue  # a zone in the trash is not served: nothing on the wire
-        by_zone.setdefault(zone.id, (zone, []))[1].append(rec)
-    wake: set[uuid.UUID] = set()
-    # #1800 — reverse zones first, so a Technitium A/AAAA delete finds its PTR's
-    # delete already queued and the re-assert queues no create that delete
-    # would only undo.
-    for zone, recs in sorted(by_zone.values(), key=lambda zr: zr[0].kind != "reverse"):
-        target_serial = bump_zone_serial(zone)
-        await enqueue_record_ops_batch(
-            db,
-            zone,
-            [
-                {"op": "delete", "record": record_op_payload(r), "target_serial": target_serial}
-                for r in recs
-            ],
-        )
-        wake.add(zone.group_id)
+    wake, zones = await _queue_record_deletes(db, records)
 
     # After the enqueue: the RRset stamp reads the zone's live members and
     # removes each op's own value (rrset._fold), so the victims are still rows.
@@ -1098,7 +1110,7 @@ async def retract_address_records(
         "ipam_address_records_retracted",
         subnets=len(ids),
         records=len(records),
-        zones=len(by_zone),
+        zones=zones,
     )
     return len(records), wake
 
@@ -1415,3 +1427,62 @@ async def ack_op(
 ) -> None:
     """One ack; see :func:`apply_acks`."""
     await apply_acks(db, server_id, [{"op_id": op_id, "result": result, "message": message}])
+
+
+async def retract_trashed_subnet_records(
+    db: AsyncSession, batch: Any, now: datetime, user_id: uuid.UUID | None
+) -> tuple[int, set[uuid.UUID]]:
+    """Withdraw the auto-generated DNS records of every subnet in a soft-delete
+    ``batch`` and trash them with it (spatiumddi#1906).
+
+    A soft-deleted subnet keeps its ``ip_address`` rows, so nothing ever took
+    the A / AAAA / PTR / gateway PTR IPAM published for them out of service:
+    in a reverse zone kept for a surviving sibling (#1066) or a forward zone
+    the subnet only shared, they went on answering — authoritatively — for
+    addresses IPAM no longer held. They are retracted through the record-op
+    queue (agents and agentless primaries alike, #632) and stamped with the
+    batch, so a restore brings them back and ``push_records_restore`` re-asserts
+    them.
+
+    Call AFTER ``apply_soft_delete``: records of a zone that itself rides the
+    batch (the auto-created reverse zone, #1066) are already stamped and hidden
+    — they are not served, and restore with their zone — so only the records
+    in zones that STAY are found. Hand-made records are left alone, as on the
+    permanent path (#1151). Returns ``(records_retracted, dns_group_ids)``.
+    """
+    subnet_ids = [row.obj.id for row in batch.rows if row.resource_type == "subnet"]
+    if not subnet_ids:
+        return 0, set()
+    records: list[DNSRecord] = []
+    for start in range(0, len(subnet_ids), _RETRACT_CHUNK):
+        chunk = subnet_ids[start : start + _RETRACT_CHUNK]
+        records.extend(
+            (
+                await db.execute(
+                    select(DNSRecord)
+                    .where(
+                        DNSRecord.auto_generated.is_(True),
+                        DNSRecord.deleted_at.is_(None),
+                        DNSRecord.ip_address_id.in_(
+                            select(IPAddress.id).where(IPAddress.subnet_id.in_(chunk))
+                        ),
+                    )
+                    .options(selectinload(DNSRecord.zone))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    if not records:
+        return 0, set()
+    wake, _zones = await _queue_record_deletes(db, records)
+    ids = [r.id for r in records]
+    for start in range(0, len(ids), _RETRACT_CHUNK):
+        await db.execute(
+            update(DNSRecord)
+            .where(DNSRecord.id.in_(ids[start : start + _RETRACT_CHUNK]))
+            .values(deleted_at=now, deleted_by_user_id=user_id, deletion_batch_id=batch.batch_id)
+            .execution_options(synchronize_session="evaluate")
+        )
+    logger.info("ipam_trashed_subnet_records_retracted", subnets=len(subnet_ids), records=len(ids))
+    return len(ids), wake

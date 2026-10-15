@@ -408,9 +408,18 @@ so there is no private-key custody.
   stanza (and a top-level `dnssec-policy { }` block for custom policies),
   BIND auto-generates keys in `key-directory` and signs.
 - **DS export.** After signing the agent runs `rndc dnssec -status` +
-  `dnssec-dsfromkey` and reports the DS rrset + per-key state back via
+  computes the SHA-256 DS from the KSK key files (in-process, no BIND
+  tools needed) and reports the DS rrset + per-key state back via
   `POST /dns/agents/dnssec-state`; the card surfaces the DS records to
   paste at the parent registrar, plus a per-key table (tag / type / state).
+  The DS shown is the set BIND itself would publish as CDS: only keys whose
+  `DSState` is rumoured or omnipresent. So a newly signed zone shows **no
+  DS until its DNSKEY has propagated** (on the built-in `default` policy
+  about two hours: DNSKEY TTL + publish-safety + propagation delay), and a
+  KSK being withdrawn at the end of a rollover drops out of the card when
+  BIND withdraws it. The agent re-reads this state every 5 minutes, not
+  only after a config change, so both transitions reach the card on their
+  own.
 - **Manual rollover.** The card's per-key **Roll** button
   (`POST .../dnssec/rollover`) enqueues a `dnssec_rollover` op; the agent
   runs `rndc dnssec -rollover -key <tag>`. Routine rollover is automatic
@@ -630,6 +639,8 @@ Every subnet can be assigned:
 - A **reverse DNS zone** (for auto-creating PTR records)
 
 When a subnet is created or edited, the UI prompts: *"Auto-create reverse zone for 10.1.2.0/24?"* — which generates `2.1.10.in-addr.arpa.` on the designated server group.
+
+A subnet gets one reverse zone per `/24` it spans (#1840), never one enclosing zone: a `/16` zone for a `10.1.2.0/23` would make SpatiumDDI authoritative for addresses outside the subnet and shadow reverse DNS someone else serves. A `/24` or longer gets its own `/24` (`2.1.10.in-addr.arpa.`; a `/25` shares its `/24`'s zone with its neighbours), a `/23` gets two, a `/20` sixteen and a `/17` 128. The bound for wide subnets is the `/16`: a `/9`–`/16` gets one zone per `/16` it contains (a `/16` its one `/16` zone, a `/12` sixteen), and a `/8` or wider one per `/8`, because per-`/24` would mean up to 32,768 zones and each `/16` lies wholly inside the subnet anyway. IPv6 uses one zone per nibble-aligned piece: a `/48`, `/56` and `/64` get one zone each, and a `/55` gets its two `/56` zones. The zones of a subnet are a set: delete retires every zone of it (a zone another subnet still lives in is re-linked to that subnet instead), a resize grow adds the zones for the new range, and the reverse-zone backfill creates the missing ones. Which zone takes an address's PTR is decided per address, as the most specific reverse zone in the subnet's group that covers it, so an install's earlier first-`/24` zone for a `/23` keeps serving its addresses and the second `/24`'s zone is added on the next allocation or backfill.
 
 > **Overlapping IP spaces (#844).** The same CIDR in two IP spaces computes the same reverse zone name, and a DNS group can hold only one zone by that name — sharing it would merge two tenants' PTRs into one RRset (cross-tenant hostname disclosure). SpatiumDDI therefore refuses to attach a second space's subnet to a reverse zone another space's subnet created (the IPs get no PTR, logged as `reverse_zone_cross_space_conflict`), and PTR sync skips reverse zones linked to a different space's subnet. **Overlapping IP spaces need a separate DNS server group per space.** Operator-created reverse zones with no linked subnet stay shared — no space can be attributed to them.
 
@@ -933,6 +944,67 @@ view "guest" {
   address made both features fail with "The peer didn't know the key we
   used".
 
+### 8.0 Memory sizing for large blocklists (issue #1725)
+
+named holds every RPZ zone in memory, and the agent builds the zone files
+beside it. Measured on a 6 GiB appliance with the Hagezi Gambling list
+(582,305 entries) in a group with one view, which renders the list into two
+RPZ zones:
+
+| | Measured |
+|---|---|
+| named, resident | 1.6 - 2.2 GB (about 1.4 kB per entry per zone) |
+| agent while it renders | about 1.0 - 1.2 GB, plus short-lived children |
+| the pod's peak | 2.8 GB on the first apply, 3.6 GB on the next |
+
+Before #1725 the pod had no memory limit, so that peak was the node's: the
+kubelet evicted the worker, Postgres and the api, then the kernel killed
+named. The pod now carries a memory request (256Mi) and a limit (2Gi), so an
+overload kills named inside its own cgroup and leaves the control plane
+alone. That is a DNS outage on that node, not a platform outage, but it is
+still an outage: **size the limit for the lists you subscribe to.**
+
+Rule of thumb for the limit: 400 MB for named and the agent at idle, plus
+about 3 kB per blocklist entry per RPZ zone while an apply is in flight
+(named and the agent's render each hold a copy). A group with views writes a
+list once per view that carries it (the one-copy-per-view fix is #1706, so
+the factor falls with it). So 582k entries x 2 zones is about 3.9 GB and
+needs a node with 8 GiB or more; one list on a group with no views is about
+half that.
+
+Where to change it:
+
+- Appliance: `dnsBind9.resources` on the role chart, as a HelmChartConfig
+  (see `docs/deployment/APPLIANCE.md`, "Memory sizing for named"). The limit
+  is one value for the whole cluster; the role chart renders the same on
+  every node.
+- Umbrella chart: `dnsAgents.servers[].resources`.
+- Docker Compose: `DNS_BIND9_MEM_LIMIT` in `.env` (default `2g`).
+- Raw manifests: edit `k8s/dns/bind9-statefulset.yaml`.
+
+**When the limit is hit.** The kernel kills named inside the pod, the agent
+exits, and the orchestrator restarts the container into the same config, so
+a list that does not fit is a crash loop on that server. The agent reads the
+container's OOM-kill counter, records the kill in its state directory, and
+from the restart on reports the daemon as not serving with the reason
+(`oom_killed: named was killed for exceeding the container's 2 GiB memory
+limit …`). That is the red chip on the server row and, after its 5-minute
+grace, the default-on **Agent daemon not serving** alert. The record clears
+once named has stayed up for 10 minutes. If a structural apply was in flight
+when named died, the apply's own failure (`agent_config_rejected`) names the
+OOM kill instead. If the kernel picks the agent rather than named, nothing
+can be written first: the pod's last state (`OOMKilled`) is the record.
+
+**Resolver cache.** BIND's `max-cache-size` sizes one cache, every view with
+recursion has its own, and the default is 90 % of physical memory for each:
+named reads the host's RAM, not the container's limit. The agent therefore
+writes an explicit `max-cache-size` into `options {}`: a quarter of the
+container's memory limit, split across the views that recurse (at least
+32m each). So a 2Gi limit gives `512m` with no views and `256m` with two
+recursive views. With no limit it writes nothing and BIND keeps its default.
+Set `NAMED_MAX_CACHE_SIZE` (a BIND size such as `256m`, applied per view, as
+BIND does) on the agent to override it.
+
 ### 8.1 Content filtering / family filter (issue #878)
 
 Two independent ways to filter adult content, and they compose:
@@ -1222,6 +1294,10 @@ Every DNS server group has a **Sync with Servers** button on its detail header. 
 > **AXFR against an agent-managed BIND9 or Technitium group is TSIG-signed** ([#734](https://github.com/spatiumnorth/spatiumddi/issues/734)). Both agents grant `allow-transfer` to the group's TSIG *key* rather than to a source address — behind an HA VIP the request can come from any control-plane node, and on the appliance the address isn't knowable at render time — so the control plane signs with the group key, resolved by `resolve_group_transfer_key`. A group with **no** TSIG key can't be transferred from at all; that surfaces as `unsupported` naming the missing key, not as a generic error pointing at an `allow-transfer` the agent owns and you can't edit. A refused transfer is always surfaced as an error rather than an empty diff — an empty diff would read as "in sync", which is the worst possible answer.
 
 The UI surfaces per-server results with zones-imported / zones-pushed / errors, plus a per-zone table.
+
+**Each zone is synced with the server being walked (#1697).** The per-zone sync reads and writes the server named on that row, not the zone's primary, so a server whose API or transfer is unreachable shows its zones as failed instead of repeating the primary's result. The single-server sync (`POST /dns/groups/{gid}/servers/{sid}/sync-from-server`) runs the same loop, so it now syncs with that server too. The per-zone *Sync with server* button on a zone, and the scheduled pull, still sync with the zone's primary.
+
+**Technitium's own apex NS is not imported (#1696, #1809).** The agentless `technitium_api` pull returns the NS Technitium writes at the apex of every primary zone it creates; Sync leaves it out and drift does not list it as extra. An apex NS the zone really holds in SpatiumDDI is still compared like any other record, and an NS below the apex (a delegation) is always handled normally.
 
 **Name targets are read the way the driver reads them (#1794).** A CNAME / DNAME / NS / PTR / MX / SRV / NAPTR / SVCB / HTTPS target with no trailing dot is relative to the zone on BIND9, Technitium (both drivers) and Windows without WinRM credentials, so `a.b` means `a.b.<zone>.`; on the cloud drivers and Windows over WinRM the name is taken as given, so `a.b` is already absolute. Drift and sync compare on that reading, so neither reports a false difference nor imports a duplicate.
 

@@ -36,6 +36,8 @@ import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ListEmpty } from "@/components/ui/list-read-error";
+import { pollUnlessRefused } from "@/lib/refusal";
 import {
   Ban,
   Check,
@@ -605,7 +607,7 @@ export default function RequestsPage() {
   const list = useQuery({
     queryKey: ["provisioning-requests", "list", stateFilter],
     queryFn: () => requestsApi.list(stateFilter ? { state: stateFilter } : {}),
-    refetchInterval: 30000,
+    refetchInterval: pollUnlessRefused(30000),
   });
 
   const rows = list.data ?? [];
@@ -618,7 +620,9 @@ export default function RequestsPage() {
           <p className="text-sm text-muted-foreground">
             {canApprove
               ? "Requests waiting on an approver. Approving provisions the resource under your identity."
-              : "Ask for an IP, subnet, DNS record or DHCP reservation. An approver reviews it before anything is created."}
+              : !canSubmit
+                ? "Requests made through the self-service portal."
+                : "Ask for an IP, subnet, DNS record or DHCP reservation. An approver reviews it before anything is created."}
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -674,8 +678,10 @@ export default function RequestsPage() {
                 <td colSpan={5} className="px-3 py-10 text-center">
                   <Inbox className="mx-auto mb-2 h-6 w-6 text-muted-foreground" />
                   <p className="text-sm text-muted-foreground">
-                    No requests{stateFilter ? ` in state "${stateFilter}"` : ""}
-                    .
+                    <ListEmpty error={list.error} what="requests">
+                      No requests
+                      {stateFilter ? ` in state "${stateFilter}"` : ""}.
+                    </ListEmpty>
                   </p>
                 </td>
               </tr>

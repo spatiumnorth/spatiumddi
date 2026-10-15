@@ -1656,9 +1656,10 @@ POST requires ``write`` on subnet / ip_block):
     ``replace_default_placeholders``.
 - Affected counts: IPs in subnet, DHCP scopes / pools / static
   assignments, auto-generated DNS records, active leases.
-- Reverse zones: which already exist for the old CIDR, which will be
-  created for the new CIDR (``ensure_reverse_zone_for_subnet`` is
-  called idempotently on commit).
+- Reverse zones: the old CIDR's set and the zones the new CIDR adds —
+  one per ``/24`` it spans, so growing a ``/24`` to a ``/22`` lists
+  three (#1840; ``ensure_reverse_zones_for_subnet`` is called
+  idempotently on commit).
 - ``conflicts`` — non-empty means the commit will 4xx; the UI disables
   the confirm button.
 - ``warnings`` — non-blocking items (DHCP pools won't auto-expand, the
@@ -1692,9 +1693,9 @@ and ``resource_display`` ``"{old_cidr} → {new_cidr}"``.
   ``config_etag``, and enqueues a pending ``apply_config`` op (mirroring
   the subnet-delete path). Agentless drivers (Windows DHCP read-only)
   are skipped — they have no write surface.
-- ``ensure_reverse_zone_for_subnet`` runs after the CIDR mutation so any
-  new reverse-zone coverage is created. Idempotent when the zone
-  already exists.
+- ``ensure_reverse_zones_for_subnet`` runs after the CIDR mutation so the
+  reverse zones for the new range are created. Idempotent for the zones
+  that already exist.
 - Forward A/AAAA and PTR records for IPs inside the old CIDR are *not*
   touched — their values and names are unchanged by a grow.
 
@@ -1769,6 +1770,22 @@ submit re-checks fresh.
 - PTR collisions — every IP gets at most one PTR, handled separately
   by the Sync DNS classifier.
 - Empty MAC / empty hostname — nothing to collide with.
+
+**A record an operator already wrote is adopted, not duplicated.** When an
+address's A / AAAA or PTR would be identical (same zone, name, type and
+value) to a record a person wrote by hand, IPAM links the address to that
+row and creates no `auto_generated` copy ([#1867](https://github.com/spatiumnorth/spatiumddi/issues/1867)).
+This is the same rule the record API applies with its 409 on a duplicate
+(#1230), and it holds on every path that publishes records: allocation,
+bulk-edit DNS zone, DDNS from a lease and Sync DNS. The adopted row stays the
+operator's (`auto_generated` false, no `ip_address_id`), so deleting the
+address or expiring the lease leaves it served. A record with the same name
+but another value is a different record and still gets its own, and a
+generated record belonging to another address is never adopted. Renaming
+an address onto a name and value the operator wrote retracts IPAM's own row
+and adopts theirs; renaming an adopted address away writes a new record for
+IPAM and leaves the operator's alone. Sync DNS counts an adopted record as
+present, not missing.
 
 ### ✅ 15.12 DHCP Pool Awareness in IP Listing & Allocation
 
@@ -1941,6 +1958,13 @@ its records).
   "move to Trash. You can restore from Admin → Trash within 30
   days." Hard-delete is reachable via the Permanent button on the
   Trash row.
+- A trashed subnet stops publishing: the auto-generated A / AAAA / PTR
+  records IPAM wrote for its addresses (gateway PTR included) are
+  retracted through the record-op queue and trashed under the same
+  batch, so a Restore re-asserts them (#1906). Records in a reverse
+  zone that goes to Trash with the subnet ride that zone; records in
+  a zone that stays (a /24 reverse zone kept for a sibling /25, the
+  forward zone) are what this covers. Hand-made records are untouched.
 - IP addresses are deliberately NOT soft-deletable — they
   cascade-delete with their parent subnet, and the parent subnet
   is the recoverable unit.

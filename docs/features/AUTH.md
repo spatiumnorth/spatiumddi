@@ -62,18 +62,32 @@ session alone doesn't prove and an SSO account has no local password.
   Authenticator / Authy / 1Password / Bitwarden, enters a 6-digit code
   to confirm enrolment, and the next page shows 10 single-use backup
   codes (persisted hashed). Backup codes are only shown once.
-  **Starting an enrolment needs a step-up (#1241)**, because it decides
-  whose authenticator the account trusts from then on: a local user
-  re-enters their password; an external-auth user must have signed in with
-  their identity provider within the last 10 minutes
-  (`MFA_ENROL_SIGN_IN_WINDOW`), and is told to sign out and back in
-  otherwise. The sign-in time is the session's `created_at`, which a token
-  refresh carries forward rather than restamps, so a stolen session cannot
-  refresh its way into looking recent; a request with no session (an API
-  token) fails closed. `GET /auth/mfa/status` reports which one applies
-  (`enrol_requires`), whether the current sign-in is still recent
-  (`enrol_sign_in_recent`) and the window itself
-  (`enrol_sign_in_window_minutes`). A refused attempt answers `403` and is
+  **Starting an enrolment needs a step-up (#1241, #1354)**, because it
+  decides whose authenticator the account trusts from then on. What it asks
+  for depends on where the account's password lives:
+
+  | Account | Step-up |
+  |---|---|
+  | Local | The local password |
+  | LDAP / RADIUS / TACACS+ | The password, re-verified against **that account's own provider** (`user.auth_provider_id`). The provider's own authenticate function runs, so its backup servers and fail-over apply; the answer must resolve to the same external id the account is linked on, so the same password for a different directory account proves nothing. A wrong password spends the step-up budget below. A directory that does not answer is `503` and spends nothing |
+  | OIDC / SAML | A **forced re-authentication at its own IdP**: `POST /auth/mfa/enroll/reauth` returns the IdP URL (`prompt=login` + `max_age=0` for OIDC, `ForceAuthn="true"` for SAML) and the Account page navigates there. The callback is the provider's ordinary callback URL, so nothing changes at the IdP, and tells itself apart by a `purpose` in the signed flow token. The OIDC ID token must carry an `auth_time` no earlier than the flow's start (30 s of skew allowed) and not in the future, and a token with no `auth_time` is refused; the SAML Assertion's `AuthnInstant` gets the same test and is spent once like a login's. The IdP's subject must be the account's own. The result is a **single-use proof** in Redis (5 minutes, `GETDEL`) bound to the user and the sign-in, and `enroll/begin` takes it. A callback signs nobody in |
+  | An external account whose provider is deleted, disabled, or of a type that can do neither | A sign-in within the last 10 minutes (`MFA_ENROL_SIGN_IN_WINDOW`): the session's `created_at`, which a token refresh carries forward rather than restamps, so a stolen session cannot refresh its way into looking recent; a request with no session (an API token) fails closed. This is the only place the window survives, because such an account cannot sign in again either |
+
+  The proof is bound to the sign-in (its `created_at`), not to the
+  `UserSession` row, because the return trip reloads the SPA and its
+  refresh rotates the row. Another sign-in of the same user cannot take
+  it, and a replayed callback (the same `state` + code, or the same
+  Response) leaves no second one. A hijacker who shares the victim's
+  refresh cookie shares the sign-in, so the proof's protection is the IdP
+  login itself: they cannot produce it, only race the user to a proof the
+  user just made. Redis down is `503` (the step-up fails closed), and a
+  re-authentication that does not complete audits `mfa.enrol_reauth` /
+  `denied` with the reason. `GET /auth/mfa/status` reports which step-up
+  applies (`enrol_requires`: `password`, `provider_password`,
+  `provider_reauth` or `recent_sign_in`), the provider's name
+  (`enrol_provider_name`), and for the window fallback whether the current
+  sign-in is still recent (`enrol_sign_in_recent`,
+  `enrol_sign_in_window_minutes`). A refused attempt answers `403` and is
   audited as `mfa.enrol_begin` / `denied`. Wrong answers to any MFA step-up
   (begin, the first code at verify, disable, regenerate recovery codes)
   count toward a per-account budget of 5 per 15 minutes, after which the

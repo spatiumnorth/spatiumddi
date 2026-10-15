@@ -689,6 +689,9 @@ def _consume_with_nameid_format(
         def get_last_assertion_not_on_or_after(self) -> int | None:
             return None
 
+        def get_last_response_xml(self) -> str:
+            return ""
+
     monkeypatch.setattr(saml_mod, "OneLogin_Saml2_Settings", lambda *_a, **_k: None)
     monkeypatch.setattr(saml_mod, "OneLogin_Saml2_Auth", _FakeAuth)
     cfg = saml_mod.SAMLConfig(

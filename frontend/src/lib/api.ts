@@ -491,6 +491,10 @@ export interface DnsSyncPreview {
   forward_zone_name: string | null;
   reverse_zone_id: string | null;
   reverse_zone_name: string | null;
+  /** Every reverse zone the subnet's addresses resolve to, in address
+   * order — a subnet wider than a /24 spans several (#1840). The two
+   * fields above are the first of them. Empty on block/space scope. */
+  reverse_zone_names?: string[];
   missing: DnsSyncMissing[];
   mismatched: DnsSyncMismatch[];
   stale: DnsSyncStale[];
@@ -1926,6 +1930,8 @@ export const ipamApi = {
         deleted_count: number;
         not_found: string[];
         skipped: string[];
+        /** Per-row reason for skips that are not system rows (#1714). */
+        skipped_reasons?: Record<string, string>;
       }>(`/ipam/addresses/bulk-delete`, data)
       .then((r) => r.data),
   bulkEditAddresses: (data: {
@@ -2412,8 +2418,17 @@ export interface MfaStatusResponse {
   enabled: boolean;
   enrolment_pending: boolean;
   recovery_codes_remaining: number;
-  /** What starting an enrolment asks for (#1241). */
-  enrol_requires: "password" | "recent_sign_in";
+  /** What starting an enrolment asks for (#1241, #1354): the local
+   *  password; the password at the account's own LDAP / RADIUS / TACACS+
+   *  provider; a forced re-login at its OIDC / SAML IdP; or, only when the
+   *  provider is gone or off, a recent sign-in. */
+  enrol_requires:
+    | "password"
+    | "provider_password"
+    | "provider_reauth"
+    | "recent_sign_in";
+  /** The provider named by `provider_password` / `provider_reauth`. */
+  enrol_provider_name: string | null;
   /** For `recent_sign_in`: false means sign out and back in first. */
   enrol_sign_in_recent: boolean;
   /** How recent that sign-in must be, in minutes. */
@@ -5000,6 +5015,10 @@ export interface ZoneMovePreview {
   /** #1784 — why the experimental technitium_api target refuses this zone.
    *  Non-null means the commit refuses — not waivable by acknowledgement. */
   technitium_api_refusal?: string | null;
+  /** #1858 — a TSIG key the zone uses has, in the target group, an
+   *  algorithm a target driver cannot use (Technitium has no hmac-sha224).
+   *  Non-null means the commit refuses — not waivable by acknowledgement. */
+  tsig_algorithm_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -9779,6 +9798,13 @@ export const authApi = {
     api
       .post<MfaEnrolBeginResponse>("/auth/mfa/enroll/begin", { password })
       .then((r) => r.data),
+  /** #1354 — start the forced IdP re-login an OIDC / SAML account needs
+   *  before `mfaEnrollBegin`. Navigate the browser to `authorize_url`; it
+   *  returns to /account?mfa_reauth=ok|failed. */
+  mfaEnrollReauth: () =>
+    api
+      .post<{ authorize_url: string }>("/auth/mfa/enroll/reauth")
+      .then((r) => r.data),
   mfaEnrollVerify: (code: string) =>
     api.post("/auth/mfa/enroll/verify", { code }),
   mfaDisable: (password: string | undefined, code: string) =>
@@ -12396,6 +12422,12 @@ export const clusterUpgradesApi = {
       .then((r) => r.data),
   lease: () =>
     api.get<UpgradeLeaseState>("/upgrades/lease").then((r) => r.data),
+  // #1707 — superadmin: free a Lease a dead drive left held. Refused (409)
+  // while the holder still renews it.
+  forceReleaseLease: () =>
+    api
+      .post<UpgradeLeaseState>("/upgrades/lease/force-release")
+      .then((r) => r.data),
   plan: (body: ClusterUpgradePlanRequest) =>
     api
       .post<ClusterUpgradePlanResponse>("/upgrades/plan", body)

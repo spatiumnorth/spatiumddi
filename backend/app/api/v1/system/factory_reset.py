@@ -36,6 +36,7 @@ from app.services.factory_reset import (
     preview_factory_reset,
 )
 from app.services.factory_reset.runner import (
+    FactoryResetBlockedError,
     FactoryResetCooldownError,
     verify_user_password,
 )
@@ -270,6 +271,8 @@ async def execute(body: ExecuteRequest, db: DB, current_user: CurrentUser) -> Ex
             calling_user_display=current_user.username,
             db_url=str(settings.database_url),
         )
+    except FactoryResetBlockedError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except FactoryResetMutexError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except FactoryResetCooldownError as exc:

@@ -1075,6 +1075,38 @@ spec:
       tls:
         enabled: true
         secretName: spatium-appliance-tls
+    # #1826 — env for the api, worker AND beat. The worker runs alert
+    # evaluation and the rolling-upgrade orchestrator; with APPLIANCE_MODE
+    # unset there every ``appliance_mode`` gate read as off (node_pressure,
+    # cluster_dns_degraded, the orchestrator's kubeapi calls). Chart
+    # ``sharedEnv`` appends this list to all three; do not put a variable the
+    # Celery side reads under api.env.
+    sharedEnv:
+      - name: APPLIANCE_MODE
+        value: "true"
+      # #1003 item 2 — the installer's Time source answer. Seeds the
+      # INITIAL platform_settings.ntp_pool_servers so the #154 chrony
+      # plane pushes what the operator typed instead of the platform
+      # default, which is what used to overwrite it three minutes into
+      # the first boot. Ignored once the settings row exists.
+      - name: INITIAL_NTP_SERVERS
+        value: "${INITIAL_NTP_SERVERS_VAL}"
+      # #272 HA — stable identity for the self-signed Web UI cert.
+      # The api Deployment runs N replicas (one per control-plane
+      # node), all sharing one cluster TLS Secret. WITHOUT these the
+      # cert bootstrap falls back to the POD name/IP, so every replica
+      # regenerates a cert for its own ephemeral identity and clobbers
+      # the Secret — the operator-reported "3 certificates" churn.
+      # These env values are identical for every replica (the host's
+      # hostname + globally-scoped IPs, computed once at firstboot),
+      # so the first node's cert is generated once and every replica
+      # just re-deploys it. Operators add other node IPs as SANs via a
+      # CSR. (The control-plane VIP, when one is set on promote, is
+      # threaded separately as APPLIANCE_EXTRA_CERT_SANS.)
+      - name: APPLIANCE_HOSTNAME
+        value: "${APPLIANCE_HOSTNAME_VAL}"
+      - name: APPLIANCE_HOST_IPS
+        value: "${APPLIANCE_HOST_IPS_VAL}"
     # Phase 11 wave 3 — flip the api into appliance-mode so the
     # cert upload / activate endpoints write to the Kubernetes
     # Secret instead of the docker-compose volume + SIGHUP path.
@@ -1111,8 +1143,6 @@ ${API_SIZING_YAML}
       autoscaling:
         enabled: false
       env:
-        - name: APPLIANCE_MODE
-          value: "true"
         # Agent pre-shared keys — the api validates incoming
         # registrations from DNS / DHCP / Looking Glass agents against
         # these. Without them the api returns 503 "<X>_AGENT_KEY is not
@@ -1128,29 +1158,6 @@ ${API_SIZING_YAML}
           value: "${DHCP_AGENT_KEY_VAL}"
         - name: LG_AGENT_KEY
           value: "${LG_AGENT_KEY_VAL}"
-        # #1003 item 2 — the installer's Time source answer. Seeds the
-        # INITIAL platform_settings.ntp_pool_servers so the #154 chrony
-        # plane pushes what the operator typed instead of the platform
-        # default, which is what used to overwrite it three minutes into
-        # the first boot. Ignored once the settings row exists.
-        - name: INITIAL_NTP_SERVERS
-          value: "${INITIAL_NTP_SERVERS_VAL}"
-        # #272 HA — stable identity for the self-signed Web UI cert.
-        # The api Deployment runs N replicas (one per control-plane
-        # node), all sharing one cluster TLS Secret. WITHOUT these the
-        # cert bootstrap falls back to the POD name/IP, so every replica
-        # regenerates a cert for its own ephemeral identity and clobbers
-        # the Secret — the operator-reported "3 certificates" churn.
-        # These env values are identical for every replica (the host's
-        # hostname + globally-scoped IPs, computed once at firstboot),
-        # so the first node's cert is generated once and every replica
-        # just re-deploys it. Operators add other node IPs as SANs via a
-        # CSR. (The control-plane VIP, when one is set on promote, is
-        # threaded separately as APPLIANCE_EXTRA_CERT_SANS.)
-        - name: APPLIANCE_HOSTNAME
-          value: "${APPLIANCE_HOSTNAME_VAL}"
-        - name: APPLIANCE_HOST_IPS
-          value: "${APPLIANCE_HOST_IPS_VAL}"
       serviceAccount:
         enabled: true
       # #296 Phase A-H — the rolling-upgrade orchestrator needs three
