@@ -220,13 +220,12 @@ async def test_copilot_commit_honours_the_policy(
     import app.services.ai.operations_writes  # noqa: F401 — registers the operations
     import app.services.dns_import as dns_import
     from app.services.ai.operations import get_operation
-    from app.services.dns_import import parse_bind9_archive
 
     user, _ = await _admin(db_session)
     grp = await _group(db_session, ["ns1.example.com"])
 
     async def _fake_pull(**_: Any) -> Any:
-        return parse_bind9_archive(_archive())
+        return dns_import.parse_bind9_archive(_archive())
 
     monkeypatch.setattr(dns_import, "parse_powerdns_server", _fake_pull)
     op = get_operation("commit_dns_import")
