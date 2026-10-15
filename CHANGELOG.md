@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS agent no longer copies its whole config cache through memory
+  on each apply (#1705).** `save_config` built the bundle as one string
+  and encoded it again, and `commit_config` read `current.json` and
+  wrote it back through memory, each adding about twice the config to
+  the agent's peak (about 237 MiB at 124 MB, the Family filter). The
+  cache is now streamed to disk, compact, fsynced before its rename, and
+  promoted to `previous.json` with a file copy. The ingest sweep also stops
+  re-parsing the cache every 180 s when it has not changed.
+
+- **A group blocklist ships once per view, not twice (#1706).** With
+  views, every view's own RPZ zone already carries the group's lists,
+  yet the group zone was rendered into each view as well, so named
+  loaded the same entries twice per view and the bundle carried them
+  twice. The control plane now omits the group zone when every view has
+  its own, and the agent loads it only into a view without one. Changes
+  served config: the second `zone` and its `response-policy` entry are
+  gone from each view; answers are unchanged.
+
 - **Re-promoting a node that Replace evicted no longer settles it as a
   member from a stale `ready` (#1903).** A replaced box that is still up
   keeps `ready\t<seed url>` in its cluster-join sidecar. Promoted again

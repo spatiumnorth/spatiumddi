@@ -258,6 +258,46 @@ class IngestWorker:
         self.token_ref = token_ref
         self._stop = threading.Event()
         self.dns_port = int(os.environ.get("DNS_LOOPBACK_PORT") or "53")
+        # (#1705) What the sweep needs from the cached bundle, keyed by the
+        # cache file's identity, so an unchanged config is not re-read and
+        # re-parsed (hundreds of MiB with a big blocklist) every sweep.
+        self._cache_key: tuple[Any, ...] | None = None
+        self._cache_val: tuple[dict[str, Any] | None, list[str]] = (None, [])
+
+    def _sweep_inputs(self) -> tuple[dict[str, Any] | None, list[str]] | None:
+        """``(loopback key, dynamic primary zone names)``; ``None`` = no cache."""
+        cfg_dir = self.cfg.state_dir / "config"
+        try:
+            st = (cfg_dir / "current.json").stat()
+            etag = (cfg_dir / "current.etag").read_text().strip()
+        except OSError:
+            etag, st = None, None
+        key = (st.st_mtime_ns, st.st_size, etag) if st is not None else None
+        if key is not None and key == self._cache_key:
+            return self._cache_val
+        bundle, _etag = load_config(self.cfg.state_dir)
+        if not bundle:
+            return None
+        # Loopback key = the group key the control plane appends first.
+        tsig_keys = bundle.get("tsig_keys") or []
+        loop_key = tsig_keys[0] if tsig_keys else None
+        # Dedupe zone names — a split-horizon zone appears once per view in
+        # the payload, but the live daemon serves one authoritative copy per
+        # name for AXFR purposes.
+        names: list[str] = []
+        seen: set[str] = set()
+        for zone in bundle.get("zones", []):
+            if not zone.get("dynamic_update_enabled"):
+                continue
+            if zone.get("type", "primary") not in ("primary", "master"):
+                continue
+            zname = (zone.get("name") or "").rstrip(".")
+            if not zname or zname in seen:
+                continue
+            seen.add(zname)
+            names.append(zname)
+        self._cache_key, self._cache_val = key, (loop_key, names)
+        return self._cache_val
 
     def stop(self) -> None:
         self._stop.set()
@@ -364,25 +404,11 @@ class IngestWorker:
             log.warning("dns_ingest_ship_http_error", zone=zone, error=str(exc))
 
     def _sweep(self) -> None:
-        bundle, _etag = load_config(self.cfg.state_dir)
-        if not bundle:
+        inputs = self._sweep_inputs()
+        if inputs is None:
             return
-        # Loopback key = the group key the control plane appends first.
-        tsig_keys = bundle.get("tsig_keys") or []
-        loop_key = tsig_keys[0] if tsig_keys else None
-        # Dedupe zone names — a split-horizon zone appears once per view in
-        # the payload, but the live daemon serves one authoritative copy per
-        # name for AXFR purposes.
-        seen: set[str] = set()
-        for zone in bundle.get("zones", []):
-            if not zone.get("dynamic_update_enabled"):
-                continue
-            if zone.get("type", "primary") not in ("primary", "master"):
-                continue
-            zname = (zone.get("name") or "").rstrip(".")
-            if not zname or zname in seen:
-                continue
-            seen.add(zname)
+        loop_key, names = inputs
+        for zname in names:
             records = self._read_live_zone(zname, loop_key)
             if records is None:
                 continue
