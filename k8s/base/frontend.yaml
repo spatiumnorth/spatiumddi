@@ -45,6 +45,17 @@ spec:
           ports:
             - name: http
               containerPort: 80
+          # #1868 — behind an ingress / reverse proxy, uncomment and list the
+          # proxy's pod CIDR (ingress-nginx's pod network) or address. The
+          # frontend nginx then keeps the proxy's X-Forwarded-Proto and takes
+          # the real client IP from its X-Forwarded-For. List only the proxy:
+          # every listed peer can choose the client address it reports. Unset
+          # = trust no proxy. The api needs no change (its TRUSTED_PROXY_CIDRS
+          # default already covers these pods). See
+          # docs/deployment/REVERSE_PROXY.md.
+          # env:
+          #   - name: FRONTEND_TRUSTED_PROXY_CIDRS
+          #     value: "10.42.0.0/16"
           # Probe nginx's OWN health, not ``/`` (#767). ``/`` is the SPA
           # fallback, which now gates on an auth_request probe of the api
           # and answers 503 while the api is unreachable — probing it

@@ -84,6 +84,40 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Running behind your own reverse proxy now works, and is documented
+  (#1868).** The frontend nginx wrote `X-Forwarded-Proto $scheme` and
+  `X-Real-IP $remote_addr` on every `/api/` location, so behind a
+  TLS-terminating proxy the api always saw `http` and the proxy's address:
+  OIDC / SAML callbacks were built as `http://` while External URL was
+  empty, and every user shared one login-throttle bucket (a busy morning
+  returned `429` to the organisation; audit rows, `last_login_ip` and the
+  allow-list guards recorded the proxy). **nginx header change:** the
+  frontend reads a new `FRONTEND_TRUSTED_PROXY_CIDRS` (Compose `.env`, the
+  chart's `frontend.trustedProxyCidrs`, `k8s/base/frontend.yaml`) and keeps
+  an outer proxy's `X-Forwarded-Proto`, with the client address from
+  `X-Forwarded-For` (`real_ip_recursive`), only from a listed peer. **Unset
+  keeps today's behaviour**: no proxy is trusted. It is deliberately not the
+  api's `TRUSTED_PROXY_CIDRS`, which names the frontend (the api's peer) and
+  needs no change: sharing one list would make the frontend trust the
+  compose / pod network, and any install that had set the api's list to the
+  private ranges would have let a LAN client choose its own recorded address
+  on upgrade. The Helm TLS frontend (one server for
+  :80 and :443) no longer 301s a request a trusted proxy marks
+  `X-Forwarded-Proto: https`, which looped behind a TLS-terminating proxy,
+  sends `Strict-Transport-Security` only on https (its own TLS, or a
+  trusted proxy's), never on plain HTTP to :80, and gains the AI-chat
+  stream location it lacked. The cluster-health,
+  container-log and nmap streams are served unbuffered with a one hour
+  timeout. The api now logs `sso_external_url_not_set` when an SSO endpoint
+  falls back to the request URL, `trusted_hosts_refused_host` for the Host a
+  `TRUSTED_HOSTS` 400 refused, and `reverse_proxy_sub_path_unsupported` for
+  `X-Forwarded-Prefix`. New [`REVERSE_PROXY.md`](docs/deployment/REVERSE_PROXY.md)
+  covers the topology (sub-paths unsupported), required settings and headers,
+  streaming, nginx / Caddy / Traefik / HAProxy / Nginx Proxy Manager /
+  Ingress examples and a troubleshooting table; DOCKER.md Option C no longer
+  mounts a file over the entrypoint's rendered `default.conf`, and a stale
+  `X-Forwarded-Host` comment is corrected.
+
 - **A `local_volume` backup on a multi-node appliance is per node, and now
   says so (#1838).** The default backups directory is a per-node hostPath,
   so an archive exists only on the disk of the node whose pod wrote it. A

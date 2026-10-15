@@ -13,7 +13,11 @@ import ipaddress
 import re
 from typing import Any
 
+import structlog
 from fastapi import Request
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+logger = structlog.get_logger(__name__)
 
 # Strip C0 controls + DEL. Newlines/tabs in particular enable log forging
 # when the value is later written to a text log.
@@ -42,6 +46,28 @@ def clean_user_agent(raw: str | None) -> str | None:
 DEFAULT_TRUSTED_PROXY_CIDRS = (
     "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,fc00::/7"
 )
+
+_prefix_warned = False
+
+
+def _warn_sub_path_once(prefix: str) -> None:
+    """#1868 — a proxy mounting SpatiumDDI under a sub-path is not supported
+    (no router basename, absolute asset and API paths, refresh cookie scoped to
+    /api/v1/auth). It fails as a blank page or 404s on assets with nothing
+    pointing at the cause, so name it, once per process."""
+    global _prefix_warned
+    if _prefix_warned:
+        return
+    _prefix_warned = True
+    logger.warning(
+        "reverse_proxy_sub_path_unsupported",
+        forwarded_prefix=prefix[:100],
+        hint=(
+            "A proxy sent X-Forwarded-Prefix; SpatiumDDI must be served from the root of "
+            "its own hostname (docs/deployment/REVERSE_PROXY.md)."
+        ),
+    )
+
 
 TrustedNetworks = tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] | None
 
@@ -117,6 +143,9 @@ class TrustedProxyMiddleware:
                 real = _valid_ip(headers.get(b"x-real-ip", b"").decode("latin-1"))
                 if real:
                     scope["client"] = (real, port)
+                prefix = headers.get(b"x-forwarded-prefix", b"").decode("latin-1").strip()
+                if prefix.strip("/"):
+                    _warn_sub_path_once(clean_user_agent(prefix) or "")
                 proto = headers.get(b"x-forwarded-proto", b"").decode("latin-1")
                 proto = proto.split(",")[0].strip().lower()
                 if proto in ("http", "https"):
@@ -147,3 +176,48 @@ def get_trusted_client_ip(request: Request) -> str | None:
     reach the api directly can send one, which is exactly #1221.
     """
     return request.client.host if request.client else None
+
+
+class LoggingTrustedHostMiddleware(TrustedHostMiddleware):
+    """``TrustedHostMiddleware`` that names a refused Host in the log (#1868).
+
+    Starlette answers ``400 Invalid host header`` and says nothing else, so an
+    operator whose reverse proxy rewrites ``Host`` to the upstream name (nginx
+    ``proxy_pass`` without ``proxy_set_header Host``) sees a 400 on every call
+    and no clue why. Logged once per distinct Host, capped, so a scanner
+    cannot turn it into a log flood.
+    """
+
+    _seen: set[str] = set()
+    _MAX_SEEN = 50
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if not self.allow_any and scope["type"] in ("http", "websocket"):
+            host = ""
+            for key, value in scope.get("headers", []):
+                if key == b"host":
+                    host = value.decode("latin-1").split(":")[0].lower()
+                    break
+            if (
+                host
+                and host not in self._seen
+                and len(self._seen) < self._MAX_SEEN
+                and not self._allowed(host)
+            ):
+                self._seen.add(host)
+                logger.warning(
+                    "trusted_hosts_refused_host",
+                    host=clean_user_agent(host),
+                    hint=(
+                        "TRUSTED_HOSTS does not list this Host header. Behind a reverse "
+                        "proxy, either forward the public Host unchanged or add the name "
+                        "the proxy sends (docs/deployment/REVERSE_PROXY.md)."
+                    ),
+                )
+        await super().__call__(scope, receive, send)
+
+    def _allowed(self, host: str) -> bool:
+        return any(
+            host == pattern or (pattern.startswith("*.") and host.endswith(pattern[1:]))
+            for pattern in self.allowed_hosts
+        )

@@ -387,14 +387,13 @@ The URL whose scheme decides all this is the admin-set **External URL**
 otherwise the incoming request URL — the same value the SP metadata
 advertises as the ACS, i.e. the origin the IdP actually posts to.
 **Behind a TLS-terminating proxy, set the External URL to the public
-`https://` address.** Relying on `X-Forwarded-Proto` alone is not enough
-with the shipped Docker Compose stack: the frontend container's nginx
-listens on `:80` and hard-sets `X-Forwarded-Proto $scheme`, so it
-overwrites the `https` an outer terminator sent (the TLS recipes in
-[DOCKER.md §5](../deployment/DOCKER.md) Options A and B both put the
-terminator *in front of* that container). The request then looks like
-plain HTTP to the API, and the SP metadata would advertise an `http://`
-ACS URL anyway. The forwarded header does carry the real scheme where
+`https://` address.** Relying on `X-Forwarded-Proto` alone is not enough:
+the frontend container's nginx only keeps the `https` an outer terminator
+sent when that terminator is listed in `FRONTEND_TRUSTED_PROXY_CIDRS` (unset, it
+trusts no proxy and writes its own scheme, so the request looks like plain
+HTTP to the API and the SP metadata would advertise an `http://` ACS URL).
+The api logs `sso_external_url_not_set` whenever it falls back. See
+[REVERSE_PROXY.md](../deployment/REVERSE_PROXY.md). The forwarded header does carry the real scheme where
 nginx itself terminates TLS: DOCKER.md Option C, and the Helm chart's
 TLS-enabled frontend.
 

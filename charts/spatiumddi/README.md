@@ -74,6 +74,13 @@ ingress:
     cert-manager.io/cluster-issuer: letsencrypt-prod
 ```
 
+Behind an Ingress, also set `frontend.trustedProxyCidrs` to the ingress
+controller's pod network (so the login throttle and audit log see the real
+client, and the api sees `https`) and turn off response buffering for the
+streaming endpoints (`nginx.ingress.kubernetes.io/proxy-buffering: "off"`,
+`proxy-read-timeout: "3600"`). See
+[`docs/deployment/REVERSE_PROXY.md`](../../docs/deployment/REVERSE_PROXY.md).
+
 Or, without an Ingress, flip the frontend service to `LoadBalancer`:
 
 ```yaml

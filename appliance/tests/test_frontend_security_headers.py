@@ -51,7 +51,11 @@ SECURITY_SET = {
     "x-content-type-options": '"nosniff"',
     "referrer-policy": '"no-referrer"',
 }
-HSTS = ("strict-transport-security", '"max-age=31536000"')
+# The appliance block listens on :80 as well as :443 (#1868), so HSTS cannot
+# be a literal there: it is a map variable that is empty, and so not sent,
+# unless the request reached the browser over https.
+HSTS = ("strict-transport-security", "$spatium_hsts")
+HSTS_VALUE = "max-age=31536000"
 
 
 def _text(path: Path) -> str:
@@ -97,7 +101,8 @@ def _headers(body: str) -> dict[str, str]:
 
 def _https_server(path: Path) -> str:
     """The server block that serves the console: the image's only block, or
-    the appliance ConfigMap's :443 block (its :80 block just redirects)."""
+    the appliance ConfigMap's one block, which listens on both :80 and :443
+    (#1868)."""
     servers = [body for _, body in _blocks(_text(path), r"server")]
     if path == APPLIANCE_TEMPLATE:
         servers = [body for body in servers if re.search(r"listen\s+443\s+ssl", body)]
@@ -199,26 +204,69 @@ def _every_add_header(text: str) -> list[tuple[str, str]]:
     ]
 
 
-def test_hsts_only_where_tls_terminates() -> None:
-    """The appliance's :443 block sends HSTS as #400 set it: one year, with
-    no ``includeSubDomains`` (the appliance serves no subdomains of its
-    hostname) and no ``preload``. Plain HTTP must not send it (RFC 6797
-    §7.2): not the appliance's :80 redirect, and not the image's block, which
-    leaves TLS to whatever fronts it."""
-    tls = _headers(_https_server(APPLIANCE_TEMPLATE))
-    assert tls.get(HSTS[0]) == HSTS[1], tls.get(HSTS[0])
-    for name, value in _every_add_header(_text(APPLIANCE_TEMPLATE)):
-        if name == HSTS[0]:
-            assert (
-                value == HSTS[1]
-            ), f"every HSTS header must read {HSTS[1]}, got {value}"
-    plain = [
-        body
-        for _, body in _blocks(_text(APPLIANCE_TEMPLATE), r"server")
-        if not re.search(r"listen\s+443\s+ssl", body)
+def _map(text: str, var: str) -> tuple[str, dict[str, str]]:
+    """The ``map <source> $<var> { … }`` in ``text``, as (source, entries).
+    Entry values keep their quotes stripped; comments are dropped."""
+    found = [
+        (head, body)
+        for head, body in _blocks(text, r"map")
+        if re.search(rf"\s\${var}$", head)
     ]
-    assert len(plain) == 1, "expected the appliance ConfigMap's :80 redirect block"
-    assert all(name != HSTS[0] for name, _ in _every_add_header(plain[0]))
+    assert len(found) == 1, f"want one `map … ${var}`, got {len(found)}"
+    head, body = found[0]
+    source = head.split()[1].strip('"')
+    entries = {}
+    for line in body.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        match = re.fullmatch(r'("[^"]*"|\S+)\s+("[^"]*"|\S+);', line)
+        assert match, f"unparsed line in map ${var}: {line!r}"
+        key, value = (part.strip('"') for part in match.groups())
+        entries[key] = value
+    return source, entries
+
+
+def test_hsts_only_where_tls_terminates() -> None:
+    """The appliance sends HSTS as #400 set it: one year, with no
+    ``includeSubDomains`` (the appliance serves no subdomains of its
+    hostname) and no ``preload``. Plain HTTP must not send it (RFC 6797
+    §7.2). Since #1868 one server block answers :80 and :443, so every HSTS
+    header there must be the ``$spatium_hsts`` map value, empty (nginx then
+    omits the header) unless the request is https as this server sees it:
+    its own TLS, or a TRUSTED proxy's ``X-Forwarded-Proto: https``. A client
+    talking straight to :80 must not be able to switch it on. The image's
+    block, which leaves TLS to whatever fronts it, never sends it."""
+    text = _text(APPLIANCE_TEMPLATE)
+    server = _https_server(APPLIANCE_TEMPLATE)
+    assert re.search(r"listen\s+80\b", server), "the console block stopped listening on :80?"
+    tls = _headers(server)
+    assert tls.get(HSTS[0]) == HSTS[1], tls.get(HSTS[0])
+    emitted = [v for n, v in _every_add_header(text) if n == HSTS[0]]
+    assert emitted, "the appliance ConfigMap sends no HSTS at all"
+    for value in emitted:
+        assert value == HSTS[1], (
+            f"every HSTS header must be the conditional {HSTS[1]}, got {value}: "
+            "this block also answers plain HTTP on :80 (RFC 6797 §7.2)"
+        )
+
+    source, entries = _map(text, "spatium_hsts")
+    assert source == "$spatium_forwarded_proto", source
+    assert entries == {"https": HSTS_VALUE, "default": ""}, entries
+    for value in entries.values():
+        assert not re.search(r"includesubdomains|preload", value, re.I), value
+
+    # The scheme it keys on believes X-Forwarded-Proto only from a trusted
+    # peer (``$spatium_proxy_trusted`` = 1); anyone else gets $scheme.
+    source, entries = _map(text, "spatium_forwarded_proto")
+    assert source == "$spatium_proxy_trusted:$http_x_forwarded_proto", source
+    default = entries.pop("default")
+    assert default == "$scheme", entries
+    for key in entries:
+        assert re.match(r"~\*?\^1:|1:", key), (
+            f"`{key}` would take X-Forwarded-Proto from an untrusted client"
+        )
+
     assert all(
         name != HSTS[0] for name, _ in _every_add_header(_text(IMAGE_TEMPLATE))
     ), "the plain-HTTP image template must not send Strict-Transport-Security"
