@@ -431,11 +431,13 @@ def agentless_dispatch_lease(count: int) -> timedelta:
 
 @dataclass
 class _AgentlessUnit:
-    server_id: uuid.UUID
+    #: None on a zone-provision unit, which covers every agentless server
+    #: of the zone's group.
+    server_id: uuid.UUID | None
     op_rows: list[DNSRecordOp]
     batched: bool
     #: Set on a zone-provision unit (#1932): create this zone at the
-    #: provider; ``op_rows`` is empty.
+    #: provider before the record ops queued after it; ``op_rows`` is empty.
     zone_id: uuid.UUID | None = None
 
 
@@ -549,14 +551,25 @@ async def _dispatch_claimed(
 
     errors: dict[uuid.UUID, str | None] = {}
     if pairs:
-        # #1932 — a RETRIED op is one whose provider call already failed,
-        # most plausibly because the zone was never created there (the
-        # after-commit zone push failed, or the zone predates this fix).
-        # Create-if-missing first; the drivers treat "already exists" as a
-        # no-op, so this is harmless when the zone is in fact present.
-        retried = {r.zone_name for r in rows if r.attempts > 0}
-        if retried:
-            await _provision_zones_by_name(bind, server, retried)
+        # #1932 — a zone SpatiumDDI auto-created and has not yet confirmed at
+        # the provider is created before its ops are sent, by whichever path
+        # sends them first. Ops whose zone still could not be created are held
+        # back with that error instead of failing "no such zone".
+        blocked = await _ensure_pending_zones_for_ops(bind, server, {r.zone_name for r in rows})
+        if blocked:
+            by_id = {r.id: r for r in rows}
+            kept: list[tuple[uuid.UUID, RecordChange]] = []
+            for oid, change in pairs:
+                zone_error = blocked.get(by_id[oid].zone_name)
+                if zone_error is None:
+                    kept.append((oid, change))
+                else:
+                    errors[oid] = (
+                        f"zone {by_id[oid].zone_name} could not be created at the provider: "
+                        f"{zone_error}"
+                    )[:500]
+            pairs = kept
+    if pairs:
         try:
             driver = get_driver(server.driver)
             if batched:
@@ -669,90 +682,192 @@ async def _dispatch_claimed(
     return {r.id: r for r in current}
 
 
-async def _create_zone_at_provider(server: DNSServer, zone: DNSZone) -> None:
-    """Idempotent ``create`` of ``zone`` on one agentless server. Never raises:
-    the caller is past the DB commit, and a failure is recovered by the op
-    retry path, which re-ensures the zone (#1932)."""
+# #1932 — a zone SpatiumDDI auto-creates (a subnet's reverse zone, from IPAM
+# create / auto-sync / DDNS) has to reach an agentless group's provider before
+# any record op for it can. ``DNSZone.agentless_create_due_at`` records that the
+# create is outstanding: set in the creating transaction, cleared once every
+# agentless server of the group holds the zone. It is the ONLY thing that makes
+# SpatiumDDI create a zone outside a zone endpoint, so a zone that reached the
+# provider once is never re-created behind the operator's back — deleting it
+# there is a deliberate act, which Sync with Servers and the drift report also
+# leave alone.
+#: Retry interval for an outstanding provider create, on the sweep path.
+AGENTLESS_ZONE_CREATE_RETRY = timedelta(minutes=5)
+#: Zone creates run inline from one commit; the rest are the sweep's. A
+#: /17 subnet auto-creates 128 reverse zones (#1840), and the request that
+#: created them waits on its own after-commit dispatch.
+AGENTLESS_INLINE_ZONE_CREATES = 16
+#: Zone creates per retry-sweep tick (one provider call per zone and server;
+#: Route 53 throttles its API at a few requests per second per account).
+AGENTLESS_SWEEP_ZONE_CREATES = 32
+
+
+async def _create_zone_at_provider(server: DNSServer, zone: DNSZone) -> str | None:
+    """Create ``zone`` on one agentless server. Returns None when the zone is
+    there afterwards, else the error. Never raises: callers are past a commit.
+
+    A provider that already holds a zone of this name counts as present —
+    whether the driver adopts it (an empty Technitium zone, a Route 53 zone
+    from this row's own earlier attempt) or refuses to adopt it
+    (``CloudDNSConflictError``): either way the record ops have a zone to
+    write into, and a foreign zone is the operator's to resolve."""
+    from app.drivers.dns._cloud_base import CloudDNSConflictError  # noqa: PLC0415
+
     try:
         driver = get_driver(server.driver)
         if not hasattr(driver, "apply_zone_change"):
-            return
+            return None
         await driver.apply_zone_change(server, zone, "create")
-    except Exception as exc:  # noqa: BLE001 — post-commit; retried via the op path
+    except CloudDNSConflictError as exc:
+        logger.info(
+            "dns.zone.provision_agentless_exists",
+            server=str(server.id),
+            zone=zone.name,
+            detail=str(exc)[:500],
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 — post-commit; retried
         logger.warning(
             "dns.zone.provision_agentless_failed",
             server=str(server.id),
             zone=zone.name,
             error=str(exc)[:500],
         )
+        return str(exc)[:500] or exc.__class__.__name__
+    return None
 
 
-async def _provision_zone_at_provider(bind: Any, server_id: uuid.UUID, zone_id: uuid.UUID) -> None:
-    async with AsyncSession(bind, expire_on_commit=False) as s:
-        server = await s.get(DNSServer, server_id)
-        zone = await s.get(DNSZone, zone_id)
-    if (
-        server is None
-        or zone is None
-        or not server.is_enabled
-        or not is_agentless(server.driver)
-        or zone.group_id != server.group_id
-    ):
-        return  # rolled back, moved, trashed or paused meanwhile
-    await _create_zone_at_provider(server, zone)
-
-
-async def _provision_zones_by_name(bind: Any, server: DNSServer, names: set[str]) -> None:
-    async with AsyncSession(bind, expire_on_commit=False) as s:
-        zones = (
-            (
-                await s.execute(
-                    select(DNSZone).where(
-                        DNSZone.group_id == server.group_id,
-                        DNSZone.name.in_(sorted(names)),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-    for zone in zones:
-        await _create_zone_at_provider(server, zone)
-
-
-async def provision_zone_at_agentless_servers(db: AsyncSession, zone: DNSZone) -> int:
-    """Have a zone this transaction auto-created reach the group's agentless
-    servers (#1932). Returns how many servers it was queued for.
-
-    The zone endpoints push synchronously through the router's
-    ``_push_zone_to_agentless_servers`` and fail the request on a provider
-    error. The auto-create paths (reverse zones from IPAM / DDNS / auto-sync,
-    the Copilot's zone create) run inside a larger transaction that must not
-    fail over a provider, so the create is registered with the same
-    after-commit state as the record ops (#1539) and runs at the root commit
-    — and because the zone row is flushed BEFORE the caller enqueues its
-    record ops, the zone unit sits ahead of them in the queue and is sent
-    first. A failed create is not lost: the ops that follow fail, and their
-    retry re-ensures the zone. Agent-managed servers are untouched (the
-    bundle carries their zones).
-    """
+async def _agentless_zone_targets(s: AsyncSession, group_id: uuid.UUID) -> list[DNSServer]:
+    """The group's agentless servers with credentials, enabled or not."""
     servers = (
         (
-            await db.execute(
+            await s.execute(
                 select(DNSServer).where(
-                    DNSServer.group_id == zone.group_id,
+                    DNSServer.group_id == group_id,
                     DNSServer.credentials_encrypted.isnot(None),
-                    DNSServer.is_enabled.is_(True),
                 )
             )
         )
         .scalars()
         .all()
     )
-    targets = [s for s in servers if is_agentless(s.driver)]
-    for server in targets:
-        _defer_agentless(db, server, [], batched=False, zone_id=zone.id)
-    return len(targets)
+    return [srv for srv in servers if is_agentless(srv.driver)]
+
+
+async def _ensure_zone_at_provider(bind: Any, zone_id: uuid.UUID) -> dict[uuid.UUID, str | None]:
+    """Create an outstanding zone on its group's enabled agentless servers.
+
+    Does nothing unless ``agentless_create_due_at`` is set. Clears it when
+    every agentless server holds the zone; otherwise pushes it back by
+    :data:`AGENTLESS_ZONE_CREATE_RETRY` (a paused server counts as not yet
+    holding it, so the zone follows it once it is resumed). Returns the
+    per-server outcome (None = present). No connection is held across a
+    provider call."""
+    async with AsyncSession(bind, expire_on_commit=False) as s:
+        zone = await s.get(DNSZone, zone_id)
+        if zone is None or zone.deleted_at is not None or zone.agentless_create_due_at is None:
+            return {}
+        group_id = zone.group_id
+        servers = await _agentless_zone_targets(s, group_id)
+    outcomes: dict[uuid.UUID, str | None] = {}
+    for server in servers:
+        if server.is_enabled:
+            outcomes[server.id] = await _create_zone_at_provider(server, zone)
+    done = len(outcomes) == len(servers) and all(e is None for e in outcomes.values())
+    async with AsyncSession(bind) as s:
+        await s.execute(
+            update(DNSZone)
+            .where(
+                DNSZone.id == zone_id,
+                DNSZone.group_id == group_id,
+                DNSZone.agentless_create_due_at.is_not(None),
+            )
+            .values(
+                agentless_create_due_at=(
+                    None if done else datetime.now(UTC) + AGENTLESS_ZONE_CREATE_RETRY
+                )
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await s.commit()
+    return outcomes
+
+
+async def provision_zone_at_agentless_servers(db: AsyncSession, zone: DNSZone) -> bool:
+    """Have a zone this transaction auto-created reach its group's agentless
+    servers (#1932). Returns whether a provider create was queued.
+
+    The zone endpoints push synchronously (the router's
+    ``_push_zone_to_agentless_servers``) and fail the request on a provider
+    error. An auto-created reverse zone is a side effect of a larger
+    transaction that must not fail over a provider, so the zone is marked
+    (``agentless_create_due_at``) and the create runs after the commit, ahead
+    of the record ops the caller enqueues next. Whatever sends one of those
+    ops — the inline dispatch or the retry sweep, in either order — creates a
+    still-marked zone first, and a create that fails holds its ops back with
+    that error rather than letting them fail "no such zone". Agent-managed
+    groups are untouched: the bundle carries their zones.
+    """
+    if not await _agentless_zone_targets(db, zone.group_id):
+        return False
+    # The grace leaves the first attempt to the committing process, as for
+    # its record ops; the sweep picks the zone up if that process dies.
+    zone.agentless_create_due_at = datetime.now(UTC) + AGENTLESS_DISPATCH_GRACE
+    await db.flush()
+    _defer_unit(db, _AgentlessUnit(server_id=None, op_rows=[], batched=False, zone_id=zone.id))
+    return True
+
+
+async def _ensure_pending_zones_for_ops(
+    bind: Any, server: DNSServer, zone_names: Collection[str]
+) -> dict[str, str]:
+    """Create any still-outstanding zone among ``zone_names`` before its ops
+    are sent. Returns ``{zone_name: error}`` for zones ``server`` still lacks."""
+    async with AsyncSession(bind) as s:
+        pending = (
+            await s.execute(
+                select(DNSZone.id, DNSZone.name).where(
+                    DNSZone.group_id == server.group_id,
+                    DNSZone.name.in_(sorted(set(zone_names))),
+                    DNSZone.agentless_create_due_at.is_not(None),
+                )
+            )
+        ).all()
+    blocked: dict[str, str] = {}
+    for zone_id, name in pending:
+        outcomes = await _ensure_zone_at_provider(bind, zone_id)
+        error = outcomes.get(server.id)
+        if error is not None:
+            blocked[name] = error
+    return blocked
+
+
+async def provision_pending_agentless_zones(
+    bind: Any, *, now: datetime | None = None, limit: int = AGENTLESS_SWEEP_ZONE_CREATES
+) -> int:
+    """Sweep half of #1932: create the outstanding zones whose retry is due
+    (a failed create, more inline creates than one commit runs, or a process
+    that died before its dispatch). Returns how many zones it tried."""
+    now = now or datetime.now(UTC)
+    async with AsyncSession(bind) as s:
+        due = (
+            (
+                await s.execute(
+                    select(DNSZone.id)
+                    .where(
+                        DNSZone.agentless_create_due_at.is_not(None),
+                        DNSZone.agentless_create_due_at <= now,
+                    )
+                    .order_by(DNSZone.agentless_create_due_at)
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    for zone_id in due:
+        await _ensure_zone_at_provider(bind, zone_id)
+    return len(due)
 
 
 def _merge_units(units: list[_AgentlessUnit]) -> list[_AgentlessUnit]:
@@ -786,9 +901,16 @@ def _merge_units(units: list[_AgentlessUnit]) -> list[_AgentlessUnit]:
 async def _dispatch_agentless_units(bind: Any, units: list[_AgentlessUnit]) -> None:
     """Claim and send the agentless op rows a committed transaction queued."""
     targets = {r.id: r for u in units for r in u.op_rows}
+    zone_creates = 0
     for unit in _merge_units(units):
         if unit.zone_id is not None:
-            await _provision_zone_at_provider(bind, unit.server_id, unit.zone_id)
+            # Past the cap, the zone stays marked: the dispatch of its own ops
+            # (below, or the sweep's) or the sweep's zone pass creates it.
+            if zone_creates < AGENTLESS_INLINE_ZONE_CREATES:
+                zone_creates += 1
+                await _ensure_zone_at_provider(bind, unit.zone_id)
+            continue
+        if unit.server_id is None:
             continue
         claimed_at = datetime.now(UTC)
         async with AsyncSession(bind, expire_on_commit=False) as s:
@@ -839,9 +961,12 @@ def _defer_agentless(
     op_rows: list[DNSRecordOp],
     *,
     batched: bool,
-    zone_id: uuid.UUID | None = None,
 ) -> None:
     """Register ``op_rows`` for dispatch once ``db``'s transaction commits."""
+    _defer_unit(db, _AgentlessUnit(server_id=server.id, op_rows=op_rows, batched=batched))
+
+
+def _defer_unit(db: AsyncSession, unit: _AgentlessUnit) -> None:
     sync = db.sync_session
     state: _DispatchState | None = sync.info.get(_DISPATCH_KEY)
     if state is None:
@@ -851,9 +976,7 @@ def _defer_agentless(
             sync.info[_LISTENING_KEY] = True
             event.listen(sync, "after_commit", _on_after_commit)
             event.listen(sync, "after_transaction_end", _on_after_transaction_end)
-    state.units.append(
-        _AgentlessUnit(server_id=server.id, op_rows=op_rows, batched=batched, zone_id=zone_id)
-    )
+    state.units.append(unit)
 
 
 async def _apply_agentless(
@@ -1656,6 +1779,10 @@ async def apply_pending_agentless_ops(
     """
     now = now or datetime.now(UTC)
     counts = {"applied": 0, "rescheduled": 0, "skipped": 0, "recovered": 0}
+    # #1932 — outstanding auto-created zones first, so a due op finds its
+    # zone (the op dispatch would also create it, but a zone with no ops
+    # yet has only this path). Own short sessions; ``db`` holds nothing yet.
+    counts["zones"] = await provision_pending_agentless_zones(db.bind, now=now)
 
     stale = (
         (

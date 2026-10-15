@@ -2621,13 +2621,13 @@ async def _apply_create_dns_zone(
     db.add(zone)
     await db.flush()
 
-    # #1932 — the REST create pushes the zone to agentless servers; the
-    # Copilot's create must too, or its zone exists only in SpatiumDDI.
-    from app.services.dns.record_ops import (  # noqa: PLC0415
-        provision_zone_at_agentless_servers,
-    )
+    # #1932 — push the create to the group's agentless servers before the
+    # commit, exactly as the REST create does (#798 lockstep): a provider
+    # refusal fails the apply and the row rolls back, and a zone found
+    # already there is adopted and recorded in the audit row.
+    from app.api.v1.dns.router import _push_zone_to_agentless_servers  # noqa: PLC0415
 
-    await provision_zone_at_agentless_servers(db, zone)
+    adopted_on = await _push_zone_to_agentless_servers(db, zone, "create")
 
     # #811: enqueue the sign op the same way the REST create does — the
     # Copilot fronts the REST API and the two must stay in lockstep (#798).
@@ -2656,6 +2656,7 @@ async def _apply_create_dns_zone(
                 "dnssec_enabled": args.dnssec_enabled,
                 "driver_hint": args.driver_hint,
                 "via": "ai_proposal",
+                **({"adopted_existing_on": adopted_on} if adopted_on else {}),
             },
         )
     )

@@ -89,10 +89,18 @@ the formatter handles the rest.
   IPAM auto-sync, DDNS and subnet create wrote the reverse zone row and
   nothing else; only the zone endpoints pushed it to `technitium_api`,
   Windows Path B and the cloud drivers, so every PTR op failed and retried.
-  The create is now queued in the same after-commit dispatch as the record
-  ops (#1539), ahead of them, and the Copilot's zone create does the same. A
-  failed create is recovered by the ops' own retry, which creates the zone
-  first (an existing zone is a no-op). Agent-managed groups are unchanged.
+  The zone is now marked as not yet at the provider and created after the
+  commit, ahead of its record ops. Whichever path sends one of those ops
+  first, the request or the retry sweep, creates a still-marked zone
+  before it, and ops whose zone cannot be created wait with that error.
+  The mark clears once the zone is at the provider, so a zone that got
+  there once is never created again, even if it is later deleted at the
+  provider. One commit creates at most 16 zones inline (a /17 needs 128);
+  the retry sweep creates the rest, 32 a minute. On upgrade, reverse
+  zones SpatiumDDI auto-created in a group with an agentless server are
+  marked and created by the sweep; a zone already at the provider is left
+  as it is. The Copilot's zone create now pushes to the provider before
+  its commit, as the REST create does. Agent-managed groups are unchanged.
 - **An imported zone no longer has to stay delegated to the server it was
   migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
   BIND9, PowerDNS and Technitium importers keep the source's apex NS, which the
@@ -4561,6 +4569,11 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `c4f19a2e7d53` — #1932, additive + data: nullable
+  `dns_zone.agentless_create_due_at` (an auto-created zone whose provider
+  create is outstanding, and when the sweep may next try). Backfill marks
+  the non-imported, auto-generated reverse zones in groups with an agentless
+  server with credentials, due now. Downgrade drops the column.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column

@@ -1047,6 +1047,15 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
     last_serial: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #1932 — set when SpatiumDDI auto-created this zone (a subnet's reverse
+    # zone) in a group with agentless servers and has not yet confirmed the
+    # zone at the provider; the value is when the agentless retry sweep may
+    # next try. NULL means nothing is outstanding. It is what lets a record op
+    # create its zone first without ever re-creating a zone that already
+    # reached the provider once (an operator may have deleted it there).
+    agentless_create_due_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Zone-level ACL overrides (inherit from server options if null)
     allow_query: Mapped[list | None] = mapped_column(JSONB, nullable=True)

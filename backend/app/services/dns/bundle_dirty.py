@@ -169,7 +169,11 @@ _ALWAYS_BOOKKEEPING: frozenset[str] = frozenset({"created_at", "modified_at", "u
 _NOT_RENDERED: dict[type, frozenset[str]] = {
     # The agents' /dnssec-state report stamps these after every structural
     # reload; the DS set is for the operator and the registrar, not BIND.
-    DNSZone: frozenset({"dnssec_synced_at", "dnssec_ds_records", "last_pushed_at"}),
+    # ``agentless_create_due_at`` is the #1932 provider-create marker, which
+    # only the agentless dispatch reads.
+    DNSZone: frozenset(
+        {"dnssec_synced_at", "dnssec_ds_records", "last_pushed_at", "agentless_create_due_at"}
+    ),
     # The 30 s pool health check (``tasks.dns_pool_healthcheck``).
     DNSPool: frozenset({"last_checked_at", "next_check_at"}),
     # Feed refresh bookkeeping; the entries themselves are their own rows.
