@@ -886,7 +886,10 @@ The guest VLAN is `10.20.0.0/16`; everyone else should be unfiltered.
    matches nothing and gets no answer.
 3. **Blocklists tab** → the funnel icon on the adult/gambling list →
    tick `guest`, leave *Whole group* unticked → **Save scope**.
-4. Threat lists stay on *Whole group*: they apply inside every view.
+4. Threat lists stay on *Whole group*: they apply inside every view. Each
+   view's own RPZ zone already carries the group's lists, so the group zone
+   is not loaded a second time beside it (#1706); it is rendered only into a
+   view that has no zone of its own.
 
 The rendered config puts the RPZ inside the matching view only:
 
