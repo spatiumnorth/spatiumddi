@@ -215,10 +215,13 @@ def _to_response(c: KubernetesCluster) -> ClusterResponse:
     )
 
 
-def _require_usable_credentials(api_server_url: str, token: str) -> None:
+def _require_usable_credentials(api_server_url: str, token: str) -> str:
     """422 for a token that cannot be a bearer token, or a URL httpx cannot
     parse, before a client is built from them (#1913). The token may come
-    from the request body or from the stored cluster."""
+    from the request body or from the stored cluster, so surrounding
+    whitespace (a stored token saved with its trailing newline before the
+    schema stripped it) is dropped here too. Returns the token to send."""
+    token = token.strip()
     problem = header_credential_problem(token, "token")
     if problem:
         raise HTTPException(status_code=422, detail=problem)
@@ -231,6 +234,7 @@ def _require_usable_credentials(api_server_url: str, token: str) -> None:
             status_code=422,
             detail="api_server_url must be an http(s) URL such as https://k8s.example:6443",
         )
+    return token
 
 
 async def _probe_cluster(
@@ -704,7 +708,7 @@ async def test_connection(
             detail="api_server_url and token are required (either in body or via stored cluster_id)",
         )
 
-    _require_usable_credentials(api_server_url, token)
+    token = _require_usable_credentials(api_server_url, token)
 
     # SECURITY (#400, L5): advisory SSRF guard — log the resolved API
     # server IP so operators can audit what the control plane dialed.
@@ -764,7 +768,7 @@ async def detect_cidrs(body: DetectCIDRsRequest, db: DB, _: SuperAdmin) -> Detec
             detail="api_server_url and token are required (either in body or via stored cluster_id)",
         )
 
-    _require_usable_credentials(api_server_url, token)
+    token = _require_usable_credentials(api_server_url, token)
 
     return await _detect_cidrs(
         api_server_url=api_server_url,

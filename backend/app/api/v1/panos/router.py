@@ -188,8 +188,6 @@ class TestConnectionResponse(BaseModel):
     # store it (the operator supplied creds once, not a raw key).
     api_key: str | None = None
 
-    _check_api_key = field_validator("api_key")(header_secret)
-
 
 class FirewallObjectResponse(BaseModel):
     id: uuid.UUID

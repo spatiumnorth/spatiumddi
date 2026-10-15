@@ -162,8 +162,6 @@ class NodeResponse(BaseModel):
     created_at: datetime
     modified_at: datetime
 
-    _check_token_id = field_validator("token_id")(header_secret)
-
 
 class TestConnectionRequest(BaseModel):
     node_id: uuid.UUID | None = None

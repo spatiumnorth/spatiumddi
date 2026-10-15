@@ -117,6 +117,11 @@ async def _deliver_one(
         )
     except httpx.HTTPError as exc:
         return None, f"transport: {exc}"
+    except ValueError as exc:
+        # A stored header httpx cannot encode (UnicodeEncodeError) saved
+        # before the subscription schema refused it (#1913): a failed
+        # delivery, not an exception out of the outbox drain.
+        return None, f"headers: {exc}"
 
     if 200 <= resp.status_code < 300:
         return resp.status_code, None
