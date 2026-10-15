@@ -1,0 +1,12 @@
+[Unit]
+Description=Detect a pre-#1621 release-state directory before it is tightened (#1661)
+DefaultDependencies=no
+After=local-fs.target
+Before=systemd-tmpfiles-setup.service spatium-release-state-transition.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatium-release-state-transition detect
+
+[Install]
+WantedBy=multi-user.target

@@ -84,6 +84,8 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Upgrading from a build older than #1621 no longer 500s the slot-upgrade status for ~90 s after the reboot (#1661).** The booted slot tightens `/var/lib/spatiumddi/release-state` to `1770 root:2770` at sysinit while k3s still serves the outgoing api (old image, uid 1000, no gid 2770), so every status read died on `PermissionError`. A new `spatium-release-state-transition` unit pair stamps a still world-writable directory before tmpfiles tightens it, hands the directory and the two slot-upgrade sidecars to uid 1000 (mode stays 1770), and restores `root:2770` once every api pod runs the booted image tag, at a 900 s deadline, on unit stop, or on the next boot. Installs already on 1770 and fresh installs are untouched.
+
 - **The DNS Pools and DNSSEC Policies pages no longer offer writes the API
   refuses (#1879).** Every pool write (create, edit, delete, check now) and
   every DNSSEC-policy write takes a superadmin, but the top-level DNS Pools

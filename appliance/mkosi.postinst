@@ -74,6 +74,8 @@ for unit in chrony.service ssh.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
             spatium-ssh-hostkeys.service \
+            spatium-release-state-detect.service \
+            spatium-release-state-transition.service \
             spatium-console.service \
             spatium-etc-reconcile.service \
             qemu-guest-agent.service \
@@ -306,6 +308,11 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-bootstrap.service"
 # GHSA-vvh9-6gfw-wphp — generates SSH host keys where etc-render did not.
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-ssh-hostkeys.service"
+# #1661 — bridge the outgoing api pod across the #1621 release-state
+# tightening on an upgrade from an older build; bounded and self-closing.
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-release-state-detect.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-release-state-transition.service"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-release-state-transition"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-rollback.path"

@@ -1,0 +1,125 @@
+#!/bin/bash
+# spatium-release-state-transition — keep the OUTGOING api pod working while
+# a slot upgrade from a build older than #1621 settles (#1661).
+#
+# #1621 tightened /var/lib/spatiumddi/release-state from 1777 to 1770
+# root:2770 and gave the api pod supplementalGroups [2770]. The first boot
+# of the new slot applies that at sysinit (systemd-tmpfiles), but k3s
+# starts the OLD release's pods first: the outgoing api (old image, uid
+# 1000, no 2770) keeps serving until the booted chart replaces it, and
+# every status read in that window dies on PermissionError — a 500 for
+# ~90 s. The old release cannot be changed, so the new build bridges it.
+#
+# Modes (one script so the unit files and the tests share one definition):
+#   detect  Before tmpfiles tightens anything: if the directory is still
+#           world-writable (a pre-#1621 install), stamp /run so the rest
+#           of this boot knows a transition is needed. A fresh install, or
+#           one already on 1770, never gets a stamp.
+#   open    After tmpfiles: make uid 1000 the OWNER of the directory and of
+#           the two 0660 slot-upgrade sidecars the old api reads. Mode stays
+#           1770; group stays 2770. Nothing else gains access — uid 1000 is
+#           the api pod's identity and the installer admin (sudo), both
+#           already trusted with every trigger here.
+#   close   Restore root:2770 on all of it and drop the stamp. Idempotent.
+#   wait    Poll until EVERY api pod runs the booted image tag, then close.
+#           Closes at the deadline regardless, and on any exit (trap).
+#
+# Bounded and self-closing: the stamp is in /run, so a reboot re-runs
+# detect on a directory tmpfiles has already re-owned to root (no stamp, no
+# reopening); the wait loop has its own deadline; the unit has
+# RuntimeMaxSec= and an ExecStopPost= close.
+#
+# Env overrides exist for appliance/tests only.
+
+set -u
+
+RS_DIR="${SPATIUM_RS_DIR:-/var/lib/spatiumddi/release-state}"
+STAMP="${SPATIUM_RS_STAMP:-/run/spatium-release-state-transition}"
+VERSION_FILE="${SPATIUM_RS_VERSION_FILE:-/usr/lib/spatiumddi/spatiumddi-version}"
+KUBECTL="${SPATIUM_RS_KUBECTL:-/usr/local/bin/k3s kubectl}"
+HOST_GID=2770
+OLD_API_UID="${SPATIUM_RS_API_UID:-1000}"
+DEADLINE="${SPATIUM_RS_DEADLINE:-900}"
+POLL="${SPATIUM_RS_POLL:-5}"
+SIDECARS="slot-upgrade-pending.state slot-upgrade.progress"
+
+log() { echo "spatium-release-state-transition: $*" >&2; }
+
+cmd_detect() {
+    [ -d "$RS_DIR" ] || return 0
+    local mode
+    mode=$(stat -c '%a' -- "$RS_DIR" 2>/dev/null) || return 0
+    if (( (8#$mode & 2) != 0 )); then
+        : > "$STAMP"
+        log "release-state is mode $mode (pre-#1621): bridging the outgoing api"
+    fi
+    return 0
+}
+
+cmd_open() {
+    [ -e "$STAMP" ] || return 0
+    [ -d "$RS_DIR" ] || return 0
+    chown "$OLD_API_UID:$HOST_GID" "$RS_DIR" || log "chown of $RS_DIR failed"
+    chmod 1770 "$RS_DIR"
+    local f
+    for f in $SIDECARS; do
+        [ -e "$RS_DIR/$f" ] && chown "$OLD_API_UID:$HOST_GID" "$RS_DIR/$f" 2>/dev/null
+    done
+    log "opened to uid $OLD_API_UID until the booted api serves"
+    return 0
+}
+
+cmd_close() {
+    if [ -d "$RS_DIR" ]; then
+        chown "0:$HOST_GID" "$RS_DIR"
+        chmod 1770 "$RS_DIR"
+        local f
+        for f in $SIDECARS; do
+            [ -e "$RS_DIR/$f" ] && chown "0:$HOST_GID" "$RS_DIR/$f" 2>/dev/null
+        done
+    fi
+    rm -f "$STAMP"
+    return 0
+}
+
+# 0 when at least one api pod exists and every one runs the booted tag.
+api_on_booted_image() {
+    local tag images line
+    tag=$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null) || return 1
+    [ -n "$tag" ] || return 1
+    # shellcheck disable=SC2086
+    images=$($KUBECTL --request-timeout=10s -n spatium get pods \
+        -l app.kubernetes.io/component=api \
+        -o jsonpath='{range .items[*]}{.spec.containers[0].image}{"\n"}{end}' 2>/dev/null) \
+        || return 1
+    [ -n "$images" ] || return 1
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        [ "${line##*:}" = "$tag" ] || return 1
+    done <<< "$images"
+    return 0
+}
+
+cmd_wait() {
+    [ -e "$STAMP" ] || return 0
+    trap cmd_close EXIT
+    local waited=0
+    while [ "$waited" -lt "$DEADLINE" ]; do
+        if api_on_booted_image; then
+            log "booted api is serving; closing"
+            return 0
+        fi
+        sleep "$POLL"
+        waited=$((waited + POLL))
+    done
+    log "deadline (${DEADLINE}s) reached; closing"
+    return 0
+}
+
+case "${1:-}" in
+    detect) cmd_detect ;;
+    open)   cmd_open ;;
+    close)  cmd_close ;;
+    wait)   cmd_wait ;;
+    *) echo "usage: $0 detect|open|close|wait" >&2; exit 2 ;;
+esac

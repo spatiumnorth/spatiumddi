@@ -2749,6 +2749,21 @@ baseline fstab + a snapshotted `/usr/lib/etc.image/`. Every
 GitHub release attaches the slot image + its SHA-256 sidecar
 at versioned + `/latest/` URLs.
 
+#### Upgrading from a build older than #1621 (#1661)
+
+Since #1621 `/var/lib/spatiumddi/release-state` is `1770 root:2770` and the
+api pod carries `supplementalGroups: [2770]`. After the reboot into a slot
+that applies this to a pre-#1621 install (directory still `1777`), k3s keeps
+serving the OUTGOING api, which has neither the group nor a way to be
+changed, until the booted chart replaces it. To keep status reads from
+failing in that window, `spatium-release-state-detect.service` (before
+tmpfiles) notes the legacy mode and `spatium-release-state-transition.service`
+temporarily makes uid 1000 the owner of the directory and the two slot-upgrade
+sidecars (mode stays 1770). It restores `root:2770` once every api pod runs
+the booted image tag, after 900 s regardless, whenever the unit stops, and on
+the next boot via tmpfiles. Fresh installs and installs already on 1770 never
+open it.
+
 ### Rolling back: the database stays on `/var` (#1227)
 
 A slot swap replaces the root filesystem. PostgreSQL lives on the
