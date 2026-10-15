@@ -84,8 +84,6 @@ the formatter handles the rest.
 
 ### Fixed
 
-- **Upgrading from a build older than #1621 no longer 500s the slot-upgrade status for ~90 s after the reboot (#1661).** The booted slot tightens `/var/lib/spatiumddi/release-state` to `1770 root:2770` at sysinit while k3s still serves the outgoing api (old image, uid 1000, no gid 2770), so every status read died on `PermissionError`. A new `spatium-release-state-transition` unit pair stamps a still world-writable directory before tmpfiles tightens it, hands the directory and the two slot-upgrade sidecars to uid 1000 (mode stays 1770), and restores `root:2770` once every api pod runs the booted image tag, at a 900 s deadline, on unit stop, or on the next boot. Installs already on 1770 and fresh installs are untouched.
-
 - **The DNS Pools and DNSSEC Policies pages no longer offer writes the API
   refuses (#1879).** Every pool write (create, edit, delete, check now) and
   every DNSSEC-policy write takes a superadmin, but the top-level DNS Pools
@@ -4238,6 +4236,15 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
+  **On the upgrade itself, expect up to two minutes of 500s from
+  appliance host-state reads (#1661).** After the reboot into the new
+  slot, k3s keeps serving the previous release's api until the new
+  control chart rolls it, and that api has no gid 2770, so
+  `GET /api/v1/appliance/slot-upgrade` (and the setup-state and
+  system-info reads) answer `500` until the new api is Ready — about
+  90 s in testing, mixed in with the 502s the rollout already causes.
+  The upgrade completes normally; retry once the new api serves. This
+  happens once, on the upgrade that introduces the tightened directory.
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
