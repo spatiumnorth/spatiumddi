@@ -66,6 +66,7 @@ from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     CLUSTER_ROLE_PRIMARY,
     Appliance,
+    ApplianceUpgradeImage,
 )
 from app.services.appliance.ownership import k8s_node_name
 from app.services.upgrades import mutex
@@ -912,6 +913,32 @@ class PreflightReport:
         }
 
 
+_DEFAULT_SLOT_IMAGE_BYTES = 4 * 1024 * 1024 * 1024
+
+
+async def _slot_image_size(slot_image_id: uuid.UUID | None) -> int:
+    """Bytes the run's image needs: the uploaded row's ``size_bytes`` when
+    the Plan names one, else the 4 GiB default (fail closed on unknown,
+    #1919). The default also stands when the row is gone or unreadable."""
+    if slot_image_id is None:
+        return _DEFAULT_SLOT_IMAGE_BYTES
+    try:
+        async with AsyncSessionLocal() as db:
+            size = (
+                await db.execute(
+                    select(ApplianceUpgradeImage.size_bytes).where(
+                        ApplianceUpgradeImage.id == slot_image_id
+                    )
+                )
+            ).scalar_one_or_none()
+    except Exception as e:  # pragma: no cover - DB unavailable keeps the default
+        logger.warning("preflight_image_size_query_failed", error=str(e))
+        return _DEFAULT_SLOT_IMAGE_BYTES
+    if size is None or size <= 0:
+        return _DEFAULT_SLOT_IMAGE_BYTES
+    return int(size)
+
+
 async def run_all(
     *,
     target_version: str,
@@ -934,11 +961,16 @@ async def run_all(
     of checks starts to dominate latency we can parallelise via
     ``asyncio.gather``.
     """
+    image_bytes = await _slot_image_size(slot_image_id)
     results: list[PreflightResult] = [
         check_inflight_conflict(namespace=namespace, own_holder=own_holder),
         await check_replication_lag(),
-        await check_node_disk_headroom(nodes=disk_nodes, target_version=target_version),
-        await check_mirror_disk_headroom(slot_image_id=slot_image_id),
+        await check_node_disk_headroom(
+            nodes=disk_nodes, target_version=target_version, slot_image_size_bytes=image_bytes
+        ),
+        await check_mirror_disk_headroom(
+            slot_image_id=slot_image_id, slot_image_size_bytes=image_bytes
+        ),
         check_version_path(target_version=target_version),
         check_quorum(),
         await check_kea_ha_version_skew(),

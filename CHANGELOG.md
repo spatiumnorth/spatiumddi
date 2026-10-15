@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A rolling-upgrade Plan is no longer refused for disk room the image
+  does not need (#1919).** #1885's "the target is already on the mirror"
+  exemption was never reached: the mirror asked for its presence with a
+  HEAD, FastAPI's `APIRoute` does not turn a GET route into a HEAD, and the
+  mirror answered 405, which the check reads as unknown. The mirror now
+  serves HEAD on the image route (200 stored, 404 not, no body, same auth as
+  the GET). Separately, `disk_headroom` and `mirror_disk_headroom` asked for
+  a 4 GiB image whatever the Plan's; they now size the need from the
+  uploaded image's `size_bytes` (an unknown size keeps the 4 GiB default).
+
 - **A rolling upgrade no longer drops its Lease on one unanswered
   kubeapi read, and a `running` run whose drive is gone is resumed
   (#1713).** A node reboot or a loaded host makes a Lease read time out;
