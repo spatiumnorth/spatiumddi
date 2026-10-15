@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Check,
   Pencil,
@@ -469,6 +470,7 @@ export function VRFsPage() {
     data: vrfs = [],
     isFetching,
     refetch,
+    error: listError,
   } = useQuery({
     queryKey: ["vrfs", tagFilters],
     queryFn: () =>
@@ -512,7 +514,7 @@ export function VRFsPage() {
           <RouteIcon className="h-5 w-5 text-muted-foreground" />
           <h1 className="text-base font-semibold">VRFs</h1>
           <span className="text-xs text-muted-foreground">
-            {vrfs.length} total
+            {listError ? "—" : `${vrfs.length} total`}
             {selected.size > 0 && (
               <span className="ml-2 text-primary">
                 {selected.size} selected
@@ -606,7 +608,9 @@ export function VRFsPage() {
                   colSpan={10}
                   className="px-4 py-8 text-center text-muted-foreground"
                 >
-                  No VRFs yet. Click <strong>+ New VRF</strong> to create one.
+                  <ListEmpty error={listError} what="VRFs">
+                    No VRFs yet. Click <strong>+ New VRF</strong> to create one.
+                  </ListEmpty>
                 </td>
               </tr>
             )}

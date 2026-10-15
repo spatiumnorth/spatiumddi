@@ -606,7 +606,9 @@ async def list_pxe_profiles(
     if args.search:
         stmt = stmt.where(func.lower(DHCPPXEProfile.name).like(f"%{args.search.lower()}%"))
     stmt = stmt.order_by(DHCPPXEProfile.name.asc()).limit(args.limit)
-    rows = (await db.execute(stmt)).scalars().all()
+    # ``matches`` is a joined-eager collection, so the rows need ``unique()``
+    # (#1911); without it any profile with a match raised InvalidRequestError.
+    rows = (await db.execute(stmt)).unique().scalars().all()
     return [
         {
             "id": str(p.id),

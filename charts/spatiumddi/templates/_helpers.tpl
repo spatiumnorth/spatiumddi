@@ -350,6 +350,48 @@ the same set for kombu.
 {{- end -}}
 
 {{/*
+Env shared by the api, worker AND beat — and deliberately NOT by the migrate
+Job or the slot-image mirror, which also include commonEnv. (#1826) The three
+run the same image and read the same ``settings``, but their env used to be
+written three times with the api getting the appliance block: the worker and
+beat ran with ``APPLIANCE_MODE`` unset, so every ``appliance_mode`` gate
+(``node_pressure``, ``cluster_dns_degraded``, the rolling-upgrade
+orchestrator, ...) evaluated as off in the one process that runs alert
+evaluation. Put anything the Celery side reads in ``sharedEnv`` (values.yaml),
+not in ``api.env``. ``.github/scripts/chart-shared-env.py`` fails a render
+where one of the three lacks a variable another carries from this list.
+
+The slot-image mirror client env is a separate helper
+(``spatiumddi.slotImageMirrorClientEnv``) because beat never talks to the
+mirror and has no use for its shared secret.
+*/}}
+{{- define "spatiumddi.sharedEnv" -}}
+{{- with .Values.sharedEnv }}
+{{- toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Slot-image mirror client env, for the api AND the worker (#1826). The api
+proxies upgrade-image byte ops to the mirror; the worker runs the
+rolling-upgrade preflight, whose mirror disk-headroom check needs the URL and
+signs its request with the secret. Before #1826 only the api had them, so the
+worker's preflight reported "no mirror configured". Not beat: it only
+enqueues, so it gets no copy of the secret.
+*/}}
+{{- define "spatiumddi.slotImageMirrorClientEnv" -}}
+{{- if .Values.slotImageMirror.enabled }}
+- name: SLOT_IMAGE_MIRROR_URL
+  value: "http://{{ include "spatiumddi.fullname" . }}-slot-image-mirror.{{ .Release.Namespace }}.svc:8000"
+- name: SLOT_IMAGE_MIRROR_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.fullname" . }}-slot-image-mirror-auth
+      key: secret
+{{- end }}
+{{- end -}}
+
+{{/*
 Common env block for api / worker / beat. Only $(POSTGRES_PASSWORD) and
 $(REDIS_PASSWORD) reference secrets; everything else is inline.
 */}}

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   Boxes,
   Check,
@@ -69,7 +70,11 @@ export function PanosPage() {
     NEEDS_SUPERADMIN,
   );
   const qc = useQueryClient();
-  const { data: firewalls = [], isFetching } = useQuery({
+  const {
+    data: firewalls = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["panos-firewalls"],
     queryFn: panosApi.list,
   });
@@ -159,7 +164,9 @@ export function PanosPage() {
           {firewalls.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No Palo Alto firewalls configured yet.
+                <ListEmpty error={listError} what="Palo Alto firewalls">
+                  No Palo Alto firewalls configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}

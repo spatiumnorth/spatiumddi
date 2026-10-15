@@ -2662,7 +2662,9 @@ def test_record_of_the_parent_survives_retiring_the_child_zone(tmp_path: Path) -
     """QA walk on #1497: Technitium files a record added to ``p1`` under the
     closest zone it hosts, here ``kid.p1``, and ``zones/delete`` of the child
     takes it along. The parent's reconcile has to run after the retire, or
-    the name is NXDOMAIN until the next structural pass."""
+    the name is NXDOMAIN until the next structural pass. (Since #1712 the
+    record is not written into the child in the first place; it lands in the
+    parent once the child is gone.)"""
     zones: dict[str, list[dict[str, Any]]] = {}
 
     def _daemon(path: str, params: dict[str, Any], _n: int) -> dict[str, Any]:
@@ -2704,7 +2706,10 @@ def test_record_of_the_parent_survives_retiring_the_child_zone(tmp_path: Path) -
         "records": [{"name": "www.kid", "type": "A", "value": "192.0.2.11"}],
     }
     _apply({"zones": [{"name": "kid.p1.", "type": "primary", "records": []}, parent]})
-    assert [r["domain"] for r in zones["kid.p1"]] == ["www.kid.p1"]
+    # #1712: while the child exists it owns the name, so the parent's record is
+    # not written (Technitium would file it under the child, and its
+    # overwrite would clear the child's own RRset).
+    assert zones["kid.p1"] == []
 
     _apply({"zones": [parent]})
     assert "kid.p1" not in zones
@@ -4158,12 +4163,33 @@ def test_the_catalog_consumer_signs_with_its_producers_key(tmp_path: Path) -> No
 # TSIG algorithms
 
 
-@pytest.mark.parametrize("algorithm", ["hmac-sha224", "hmac-sha384-192", "hmac-sha512-256"])
+@pytest.mark.parametrize("algorithm", ["hmac-sha384-192", "hmac-sha512-256"])
 def test_every_algorithm_technitium_accepts_is_installed(tmp_path: Path, algorithm: str) -> None:
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, lambda *_: {"status": "ok"})
     d._sync_tsig_keys("t", [{"name": "k", "secret": "s", "algorithm": algorithm}])
     assert calls[0][3]["tsigKeys"] == f"k|s|{algorithm}"
+
+
+def test_hmac_sha224_is_not_installed_or_pinned_and_is_reported(tmp_path: Path) -> None:
+    """#1858: Technitium has no HMAC-SHA224 (BADKEY on every signed request)."""
+    keys = [
+        {"name": "k224", "secret": "s", "algorithm": "hmac-sha224"},
+        {"name": "k256", "secret": "s", "algorithm": "hmac-sha256"},
+    ]
+    d, calls = _secondary_calls(
+        tmp_path,
+        {"zones": [_zone("a.test")], "options": {"allow_transfer": ["any"]}, "tsig_keys": keys},
+    )
+    installed = next(c[3]["tsigKeys"] for c in calls if c[2] == "settings/set" and "tsigKeys" in c[3])
+    assert installed == "k256|s|hmac-sha256"
+    pinned = next(
+        c[3]["zoneTransferTsigKeyNames"]
+        for c in calls
+        if c[2] == "zones/options/set" and "zoneTransferTsigKeyNames" in c[3]
+    )
+    assert pinned == "k256"
+    assert any("k224" in r and "hmac-sha224" in r for r in d._refused_zones)
 
 
 def test_a_skipped_key_is_an_apply_failure_and_is_not_pinned(tmp_path: Path) -> None:

@@ -175,6 +175,7 @@ from app.services.dns.tld_registry import (
     store_snapshot,
 )
 from app.services.dns.tsig import group_key_names, rotate_group_tsig_key
+from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
@@ -1062,7 +1063,7 @@ def resolved_zone_kind(name: str, kind: str | None, zone_type: str) -> str:
     Add Record pre-fills PTR. IPAM publishes PTR records only into kind
     "reverse" zones (``_resolve_reverse_zone``), and the reverse-zone
     auto-create finds a zone of the computed name and creates nothing beside it
-    (``ensure_reverse_zone_for_subnet``). Stored as anything else, such a zone
+    (``ensure_reverse_zones_for_subnet``). Stored as anything else, such a zone
     silently gets no PTR, for a gateway or a host, while the DNS-sync summary
     reads in sync. So for a primary zone ``None`` (the request did not say)
     takes the kind from the name, and a kind the name contradicts raises
@@ -3011,7 +3012,7 @@ async def _sync_single_server(
 
     for zone in zones:
         try:
-            result = await sync_zone_with_server(db, zone, apply=True)
+            result = await sync_zone_with_server(db, zone, apply=True, server=server)
             zones_succeeded += 1
             total_imported += result.pull.imported
             total_pushed += result.push.pushed
@@ -4422,6 +4423,10 @@ async def create_tsig_key(
 ) -> TSIGKeyResponse:
     """Create a TSIG key. Secret is returned in the response *exactly once*."""
     await _require_group(group_id, db)
+    # #1858 — an algorithm a driver in the group cannot use is refused, not
+    # installed and left to fail every signed transfer with BADKEY.
+    if refusal := tsig_key_refusal(body.algorithm, await _group_driver_names(db, group_id)):
+        raise HTTPException(status_code=422, detail=refusal)
     existing = await db.execute(
         select(DNSTSIGKey).where(DNSTSIGKey.group_id == group_id, DNSTSIGKey.name == body.name)
     )
@@ -4486,6 +4491,14 @@ async def update_tsig_key(
     if key is None or key.group_id != group_id:
         raise HTTPException(status_code=404, detail="TSIG key not found")
     changes = body.model_dump(exclude_unset=True)
+    # #1858 — only a CHANGE of algorithm is refused: re-saving a key the group
+    # already holds (the form posts every field) must keep working.
+    new_algo = changes.get("algorithm")
+    if new_algo and new_algo != key.algorithm:
+        if refusal := tsig_key_refusal(
+            new_algo, await _group_driver_names(db, group_id), key=key.name
+        ):
+            raise HTTPException(status_code=422, detail=refusal)
     if changes.get("name") and changes["name"] != key.name:
         clash = await db.execute(
             select(DNSTSIGKey).where(
@@ -6644,6 +6657,10 @@ class ZoneMovePreviewResponse(BaseModel):
     #: #1784 — the experimental technitium_api target refuses this zone;
     #: non-null means the commit refuses, not waivable by acknowledgement.
     technitium_api_refusal: str | None = None
+    #: #1858 — a TSIG key the zone uses resolves in the target to an
+    #: algorithm a target driver cannot use; non-null means the commit
+    #: refuses, not waivable by acknowledgement.
+    tsig_algorithm_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -6681,6 +6698,7 @@ class ZoneMovePreviewResponse(BaseModel):
             acl_names_lost=plan.acl_names_lost,
             key_names_lost=plan.key_names_lost,
             technitium_api_refusal=plan.technitium_api_refusal,
+            tsig_algorithm_refusal=plan.tsig_algorithm_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )

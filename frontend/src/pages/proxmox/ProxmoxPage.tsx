@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import {
   AlertTriangle,
   Check,
@@ -78,7 +79,11 @@ export function ProxmoxPage() {
     NEEDS_SUPERADMIN,
   );
   const qc = useQueryClient();
-  const { data: nodes = [], isFetching } = useQuery({
+  const {
+    data: nodes = [],
+    isFetching,
+    error: listError,
+  } = useQuery({
     queryKey: ["proxmox-nodes"],
     queryFn: proxmoxApi.listNodes,
   });
@@ -168,7 +173,9 @@ export function ProxmoxPage() {
           {nodes.length === 0 ? (
             <div className="p-8 text-center">
               <p className="text-sm text-muted-foreground">
-                No Proxmox endpoints configured yet.
+                <ListEmpty error={listError} what="Proxmox endpoints">
+                  No Proxmox endpoints configured yet.
+                </ListEmpty>
               </p>
               <button
                 onClick={() => setShowCreate(true)}

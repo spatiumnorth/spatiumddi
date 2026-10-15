@@ -1656,9 +1656,10 @@ POST requires ``write`` on subnet / ip_block):
     ``replace_default_placeholders``.
 - Affected counts: IPs in subnet, DHCP scopes / pools / static
   assignments, auto-generated DNS records, active leases.
-- Reverse zones: which already exist for the old CIDR, which will be
-  created for the new CIDR (``ensure_reverse_zone_for_subnet`` is
-  called idempotently on commit).
+- Reverse zones: the old CIDR's set and the zones the new CIDR adds —
+  one per ``/24`` it spans, so growing a ``/24`` to a ``/22`` lists
+  three (#1840; ``ensure_reverse_zones_for_subnet`` is called
+  idempotently on commit).
 - ``conflicts`` — non-empty means the commit will 4xx; the UI disables
   the confirm button.
 - ``warnings`` — non-blocking items (DHCP pools won't auto-expand, the
@@ -1692,9 +1693,9 @@ and ``resource_display`` ``"{old_cidr} → {new_cidr}"``.
   ``config_etag``, and enqueues a pending ``apply_config`` op (mirroring
   the subnet-delete path). Agentless drivers (Windows DHCP read-only)
   are skipped — they have no write surface.
-- ``ensure_reverse_zone_for_subnet`` runs after the CIDR mutation so any
-  new reverse-zone coverage is created. Idempotent when the zone
-  already exists.
+- ``ensure_reverse_zones_for_subnet`` runs after the CIDR mutation so the
+  reverse zones for the new range are created. Idempotent for the zones
+  that already exist.
 - Forward A/AAAA and PTR records for IPs inside the old CIDR are *not*
   touched — their values and names are unchanged by a grow.
 
