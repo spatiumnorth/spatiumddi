@@ -101,6 +101,67 @@ the formatter handles the rest.
   `FOR UPDATE` before its first write to it, in the server PUT and in the
   Fleet roles PUT; a request that waited for a move skips the rows it deleted,
   and a zone-state report records nothing for the group the server left.
+
+- **A slot-upgrade apply that landed during a systemd reload no longer
+  stays pending for good, and a new apply no longer reads the previous
+  run's `done` (#1825, #1288).** A `daemon-reload` re-creates the path
+  watches, and `PathChanged=` does not fire for a file already there
+  (systemd.path(5)), so a trigger written mid-reload never started the
+  runner. On the per-box path the status read `in-flight` with no stamp,
+  so nothing aged it and apply and rollback answered 409 until someone
+  touched the file on the host. On the fleet path the heartbeat reported
+  the previous run's state while the stranded trigger and the fire-once
+  marker stopped the supervisor writing it again. Both the api and the
+  supervisor now read a trigger with no `.state`, or one older than the
+  trigger, as `in-flight` stamped with the trigger's mtime, so the
+  existing 300 s heal reports it `failed`. After 30 s unclaimed, each
+  re-fires the watcher by opening the trigger for write and closing it:
+  the mtime, and so the heal's clock, does not move; at most once per
+  30 s; a trigger that has gone is not re-created, and one the process
+  cannot open (the other writer's) is left to the heal. The same reading
+  fixes #1288: the api's unlink of the root-owned `.state` always failed
+  with EPERM, so it is dropped. The other `PathChanged=` triggers are
+
+- **Drift and pull-from-server reach an agent-managed BIND9 or Technitium
+  behind the appliance's DNS VIP (#1470).** With `dns_vip` set the DNS
+  pods drop hostNetwork, so the node address a server row carries
+  refuses TCP/53 and every drift report and scheduled pull failed for
+  the whole group. When the node address actively refuses the
+  connection, the transfer is now retried at that server's own pod
+  address (where its agent heartbeats from), with the same TSIG key.
+  The VIP is deliberately not used: it reaches an arbitrary member, so
+  a server whose daemon is down would have read as in sync. A timeout
+  or unreachable host is not retried, and nothing changes when no DNS
+  VIP is set. The other half of #1470, a connection refusal reported as
+  a refused zone transfer, has its own entry below.
+
+- **A rolling-upgrade Plan is no longer refused for disk room the image
+  does not need (#1919).** #1885's "the target is already on the mirror"
+  exemption was never reached: the mirror asked for its presence with a
+  HEAD, FastAPI's `APIRoute` does not turn a GET route into a HEAD, and the
+  mirror answered 405, which the check reads as unknown. The mirror now
+  serves HEAD on the image route (200 stored, 404 not, no body, same auth as
+  the GET); the re-upload presence check, which sent the same HEAD and got a
+  502 against a real mirror, works too. Separately, `disk_headroom` and
+  `mirror_disk_headroom` asked for a 4 GiB image whatever the Plan's; they
+  now size the need from the uploaded image's `size_bytes`. The mirror needs
+  the image + 1 GiB, since it stores the compressed file. A node needs
+  **twice** the image + 1 GiB: it stages the compressed file on `/var`, and
+  on the new slot's first boot imports that slot's container images beside
+  the old slot's, which is the larger write (~1.6x the image, measured). An
+  unknown size keeps the 4 GiB default. **Run preflight** in the UI, `GET
+  /upgrades/preflight` (new `slot_image_id` parameter) and the
+  `find_upgrade_preflight` copilot tool now judge the image the Plan will
+  name. Before, the preview judged neither the size nor the mirror
+  exemption, and the UI only enables Plan on a passing preview.
+
+- **The MAC-sighting sniffer no longer re-imports scapy and re-walks the
+  layer chain on every frame (#1109, Part 4).** `parse_sighting_packet`
+  ran seven `from scapy... import` statements and up to six `haslayer`
+  walks per ARP / ND packet. The layer classes are now resolved once on
+  first use and the chain is walked once; the extracted `(MAC, IP)` pairs
+  are unchanged. Parts 1 and 3 shipped earlier; the DNS half of Part 2
+  shipped with #1111, whose DHCP / looking-glass half remains open.
 - **A rolling upgrade no longer drops its Lease on one unanswered
   kubeapi read, and a `running` run whose drive is gone is resumed
   (#1713).** A node reboot or a loaded host makes a Lease read time out;
