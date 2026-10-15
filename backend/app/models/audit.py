@@ -85,7 +85,7 @@ class AuditLog(Base):
     # Correlation
     request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    # result: success | denied | error
+    # result: success | denied | error | failure (a rejected sign-in, #1836)
     result: Mapped[str] = mapped_column(String(20), nullable=False, default="success")
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 

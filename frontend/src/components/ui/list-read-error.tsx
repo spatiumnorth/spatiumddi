@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+
 import { isRefused, listReadErrorMessage } from "@/lib/refusal";
 import { cn } from "@/lib/utils";
 
@@ -28,4 +30,33 @@ export function ListReadError({
       {listReadErrorMessage(error, what)}
     </span>
   );
+}
+
+/**
+ * The one way a list page fills the spot where its empty-state copy goes
+ * (#1865). `error` is the list query's error: when the read failed, in
+ * particular when the server refused the reader (403), it renders
+ * {@link ListReadError} in place of `children`, since an empty-state sentence
+ * ("No VRFs yet.") over a list the reader may not see is false. With no
+ * error it renders `children` untouched, so a list that really is empty
+ * still says so.
+ *
+ * Wrap only the empty branch: the caller has already decided there are no
+ * rows to show.
+ */
+export function ListEmpty({
+  error,
+  what,
+  children,
+  className,
+}: {
+  error: unknown;
+  what: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  if (error) {
+    return <ListReadError error={error} what={what} className={className} />;
+  }
+  return <>{children}</>;
 }

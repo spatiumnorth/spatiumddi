@@ -491,6 +491,10 @@ export interface DnsSyncPreview {
   forward_zone_name: string | null;
   reverse_zone_id: string | null;
   reverse_zone_name: string | null;
+  /** Every reverse zone the subnet's addresses resolve to, in address
+   * order — a subnet wider than a /24 spans several (#1840). The two
+   * fields above are the first of them. Empty on block/space scope. */
+  reverse_zone_names?: string[];
   missing: DnsSyncMissing[];
   mismatched: DnsSyncMismatch[];
   stale: DnsSyncStale[];
@@ -1926,6 +1930,8 @@ export const ipamApi = {
         deleted_count: number;
         not_found: string[];
         skipped: string[];
+        /** Per-row reason for skips that are not system rows (#1714). */
+        skipped_reasons?: Record<string, string>;
       }>(`/ipam/addresses/bulk-delete`, data)
       .then((r) => r.data),
   bulkEditAddresses: (data: {
@@ -4983,6 +4989,10 @@ export interface ZoneMovePreview {
   /** #1784 — why the experimental technitium_api target refuses this zone.
    *  Non-null means the commit refuses — not waivable by acknowledgement. */
   technitium_api_refusal?: string | null;
+  /** #1858 — a TSIG key the zone uses has, in the target group, an
+   *  algorithm a target driver cannot use (Technitium has no hmac-sha224).
+   *  Non-null means the commit refuses — not waivable by acknowledgement. */
+  tsig_algorithm_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */

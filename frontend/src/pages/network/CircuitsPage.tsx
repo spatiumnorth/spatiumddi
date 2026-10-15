@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import {
   circuitsApi,
@@ -849,7 +850,9 @@ export function CircuitsPage() {
                     className="px-3 py-6 text-center text-muted-foreground"
                     colSpan={13}
                   >
-                    No circuits yet — click "New circuit" to add one.
+                    <ListEmpty error={query.error} what="circuits">
+                      No circuits yet — click "New circuit" to add one.
+                    </ListEmpty>
                   </td>
                 </tr>
               )}
