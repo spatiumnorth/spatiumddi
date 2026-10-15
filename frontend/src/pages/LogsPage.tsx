@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { useSearchParams } from "react-router-dom";
 import {
   Activity,
@@ -98,6 +99,7 @@ export function LogsPage() {
   const {
     data: sources,
     isLoading: sourcesLoading,
+    error: sourcesError,
     refetch: refetchSources,
   } = useQuery({
     queryKey: ["logs-sources"],
@@ -108,6 +110,7 @@ export function LogsPage() {
   const {
     data: agentSources,
     isLoading: agentSourcesLoading,
+    error: agentSourcesError,
     refetch: refetchAgentSources,
   } = useQuery({
     queryKey: ["logs-agent-sources"],
@@ -142,7 +145,7 @@ export function LogsPage() {
   const hasAgents = !!agentSources && agentSources.length > 0;
 
   if (!hasWindows && !hasAgents) {
-    return <EmptyLogsState />;
+    return <EmptyLogsState error={sourcesError ?? agentSourcesError} />;
   }
 
   function refreshAll() {
@@ -268,7 +271,7 @@ function TabButton({
   );
 }
 
-function EmptyLogsState() {
+function EmptyLogsState({ error }: { error?: unknown }) {
   return (
     <div className="flex h-full flex-col">
       <div className="border-b px-6 py-4">
@@ -280,11 +283,21 @@ function EmptyLogsState() {
       <div className="flex flex-1 items-center justify-center p-10">
         <div className="max-w-md rounded-lg border border-dashed p-10 text-center">
           <ScrollText className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-          <p className="text-sm font-medium">No log sources yet</p>
-          <p className="mt-2 text-xs text-muted-foreground">
-            Register a Windows DNS or DHCP server with WinRM credentials
-            configured and its logs will appear here.
-          </p>
+          {error ? (
+            <p className="text-sm">
+              <ListEmpty error={error} what="log sources">
+                No log sources yet
+              </ListEmpty>
+            </p>
+          ) : (
+            <>
+              <p className="text-sm font-medium">No log sources yet</p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Register a Windows DNS or DHCP server with WinRM credentials
+                configured and its logs will appear here.
+              </p>
+            </>
+          )}
         </div>
       </div>
     </div>

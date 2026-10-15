@@ -15,39 +15,17 @@ import { StepUpSection } from "@/components/StepUpSection";
 import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { ResourceIdPicker } from "@/components/ownership/ResourceIdPicker";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import {
+  GRANT_ACTIONS,
+  GRANT_RESOURCE_TYPES,
+} from "@/lib/permissionVocabulary";
 
-// What a new grant row offers: a mirror of docs/PERMISSIONS.md, keep these in
-// sync. A role can hold more than these lists name — the built-in roles do
-// (`approve`, `appliance`, `change_request`, …) — so each select also offers
-// the value its row holds (`withHeld`), and shows it (#1394).
-const ACTIONS = ["read", "write", "delete", "admin", "*"] as const;
-const RESOURCE_TYPES = [
-  "*",
-  "ip_space",
-  "ip_block",
-  "subnet",
-  "ip_address",
-  "address_set",
-  "vlan",
-  "dns_group",
-  "dns_zone",
-  "dns_record",
-  "dns_blocklist",
-  "dhcp_server",
-  "dhcp_scope",
-  "dhcp_pool",
-  "dhcp_static",
-  "dhcp_client_class",
-  "audit_log",
-  "user",
-  "group",
-  "role",
-  "auth_provider",
-  "custom_field",
-  "manage_ipam_templates",
-  "settings",
-  "api_token",
-] as const;
+// What a new grant row offers: the shared vocabulary (lib/permissionVocabulary).
+// A role can hold more than these lists name — the built-in roles do
+// (`appliance`, …) — so each select also offers the value its row holds
+// (`withHeld`), and shows it (#1394).
+const ACTIONS = GRANT_ACTIONS;
+const RESOURCE_TYPES = GRANT_RESOURCE_TYPES;
 
 /** A list's options plus the value a grant holds, when the list does not
  * name it. A controlled select whose value is not among its options shows

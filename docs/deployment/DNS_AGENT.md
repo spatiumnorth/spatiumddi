@@ -193,8 +193,11 @@ front of the stored bytes and streams them. Whatever the group's record
 count, the api never holds the group's record set as Python objects and
 never serialises a multi-megabyte body on the request loop; the DB runs
 the records query once per change, not once per agent per poll. The worker
-has no HTTP liveness probe and its per-task engine carries no
-`command_timeout`, so a render of a million-row group simply runs.
+has no HTTP liveness probe, and the render's engine carries the long
+per-statement bound (`TASK_DB_LONG_COMMAND_TIMEOUT`, 900 s) rather than the
+120 s every other Celery task gets, so a render of a million-row group runs
+to completion while a black-holed database still fails it in minutes
+(#1719).
 
 *What says a stored bundle is current.* `dns_server.bundle_dirty_seq` is
 bumped **in the same transaction** as every change that feeds the bundle
@@ -918,6 +921,17 @@ dns-bind9-ns1:
 > group (#1565). Before, Fleet moved only the appliance's pointer, so its
 > env and firewall followed the new group while the server kept serving the
 > old one.
+>
+> A save that switches the DNS engine and the group together moves the row
+> too (#1856): the row still carries the old engine's driver, but it is the
+> one the new engine's agent adopts (by agent id, or by hostname in the new
+> group), so it moves as the new engine's row. A new group that runs another
+> driver is a 422 before anything changes. If the appliance holds two or more
+> rows of engines it no longer runs, the save is a 409 naming them: the new
+> agent goes to whichever row carries its own agent id, which the control
+> plane cannot tell, so delete the stale row(s) under DNS → Server groups and
+> save again. The Operator Copilot's role assignment moves the row the same
+> way.
 
 ---
 

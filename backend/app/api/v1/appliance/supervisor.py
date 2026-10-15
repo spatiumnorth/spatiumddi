@@ -112,6 +112,10 @@ from app.services.appliance.ca import (
     sign_supervisor_cert,
     verify_session_token,
 )
+from app.services.appliance.cluster_dns_group import (
+    cluster_dns_group_refusal,
+    promote_dns_group_refusal,
+)
 from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.group_names import group_name_problem
 from app.services.appliance.lldp import lldp_bundle
@@ -158,6 +162,7 @@ from app.services.appliance.storage_health import (
 from app.services.appliance.syslog import syslog_bundle
 from app.services.appliance.tls_pins import signed_pin_set
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
+from app.services.upgrades import shared_tags as upgrade_shared_tags
 from app.services.upgrades.safety import assert_no_upgrade_in_flight
 from app.services.upgrades.schema_rollback import check_release_can_run
 from app.services.upgrades.schema_rollback import enforce as enforce_schema_rollback
@@ -1752,6 +1757,14 @@ class SupervisorHeartbeatResponse(BaseModel):
     # mount a disk it cannot see. Empty-shape block still sent, because
     # an empty desired set is how an EJECT reaches the host.
     removable_settings: dict[str, Any] = Field(default_factory=dict)
+    # #1710 — a rolling upgrade holds the cluster's shared charts on the tag
+    # it runs until every node reports ``target_version``: ``{"run_id",
+    # "from_tag", "target_version"}`` while it does, for each node of the
+    # run, else null. A supervisor whose host already runs the target writes
+    # nothing to the shared role chart until the hold ends, so the agents on
+    # the nodes still on the old slot keep images they have. Absent from
+    # old control planes, which reads as no hold.
+    shared_chart_hold: dict[str, str] | None = None
 
 
 def _s(v: object, limit: int = 255) -> str | None:
@@ -2920,6 +2933,14 @@ async def supervisor_heartbeat(
         firewall_settings=firewall_block,
         removable_settings=removable_bundle_safe(row.desired_removable_mounts),
         long_poll=long_poll,
+        # Only a settled member shares the charts: a node demoted out of the
+        # cluster after a failed run runs its own, and must not defer to a
+        # hold on charts it no longer reads.
+        shared_chart_hold=(
+            await upgrade_shared_tags.heartbeat_hold(db, row.hostname)
+            if row.cluster_role in (CLUSTER_ROLE_PRIMARY, CLUSTER_ROLE_MEMBER)
+            else None
+        ),
     )
 
 
@@ -3812,6 +3833,9 @@ async def delete_appliance(
                 "or factory-reset / reinstall this box to decommission it.",
             )
 
+    # Ownership is judged on the state the appliance is deleted FROM (#1810):
+    # only an approved appliance may claim a row by hostname.
+    dependents = await _find_appliance_dependents(db, row)
     state_at_delete = row.state
     row.state = APPLIANCE_STATE_REVOKED
     row.revoked_at = datetime.now(UTC)
@@ -3824,7 +3848,6 @@ async def delete_appliance(
     # the supervisor's next heartbeat post-reauthorize re-runs role
     # assignment and the agent containers re-register, recreating the
     # rows automatically. Eventual consistency, but operator-invisible.
-    dependents = await _find_appliance_dependents(db, row)
     dependent_dns_names = [d.name for d in dependents.dns]
     dependent_dhcp_names = [d.name for d in dependents.dhcp]
     if dependents.dns or dependents.dhcp:
@@ -4096,151 +4119,9 @@ _DNS_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium"}
 # #1715 / #1749 — the ownership matching (``_own_server_condition``,
 # ``_current_dns_drivers``) lives in ``app.services.appliance.ownership`` so
 # the DNS / DHCP server moves (server -> appliance) use the very same rules as
-# Fleet (appliance -> server).
-
-
-async def _appliance_own_dns_servers(db: DB, appliance: Appliance) -> list[Any]:
-    """The dns_server row(s) of the appliance's CURRENT DNS engine (#1715).
-
-    An engine switch leaves the old engine's row behind in its old group;
-    moving it would clash on name or driver in the target, so only rows of
-    the current engine are returned (``_retire_stale_engine_rows`` deals
-    with the old one when it is in the way).
-    """
-    from app.models.dns import DNSServer  # noqa: PLC0415
-
-    drivers = _current_dns_drivers(appliance)
-    if not drivers:
-        return []
-    own = await _own_server_condition(db, appliance, DNSServer)
-    return list(
-        (await db.execute(select(DNSServer).where(own, DNSServer.driver.in_(sorted(drivers)))))
-        .scalars()
-        .all()
-    )
-
-
-async def _retire_stale_engine_rows(
-    db: DB, appliance: Appliance, target_group: Any, current_user: Any
-) -> list[str]:
-    """Delete this appliance's OWN dns_server rows in ``target_group`` that
-    belong to a DNS engine it no longer runs (#1715).
-
-    An engine switch (bind9 -> technitium) registers a new row for the new
-    engine and leaves the old engine's row where it was: same name (the
-    hostname), old driver, no agent behind it any more — the role swap
-    removes the node label, so the old engine's DaemonSet pod is gone.
-    Moving the appliance back to that group then clashes with its own dead
-    row on name and on driver, and the operator gets a 409 / 422 about a
-    row they can't see the point of. So the dead row is retired the way the
-    server DELETE does it (audit row, wakes, delete; zone state / record ops
-    / metrics cascade on the FK).
-
-    Only ever a row that is (a) this appliance's by FK or the unambiguous
-    hostname match, (b) of a driver that is NOT the currently assigned
-    engine, and (c) silent for longer than the agent-stale window. A row
-    whose agent is still reporting — the old pod has not stopped yet, right
-    after a switch — is refused with an actionable 409 instead of deleted:
-    deleting a live agent's row only makes it re-register.
-
-    Returns the retired rows' names, for the role-assignment audit row.
-    """
-    from app.core.agent_wake import collect_wake, dns_group_channel, dns_server_channel
-    from app.models.dns import DNSServer  # noqa: PLC0415
-    from app.tasks.dns import AGENT_STALE_AFTER  # noqa: PLC0415
-
-    drivers = _current_dns_drivers(appliance)
-    if not drivers:
-        return []
-    own = await _own_server_condition(db, appliance, DNSServer)
-    stale = (
-        (
-            await db.execute(
-                select(DNSServer)
-                .where(
-                    own,
-                    DNSServer.group_id == target_group.id,
-                    DNSServer.driver.not_in(sorted(drivers)),
-                )
-                .order_by(DNSServer.name)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    now = datetime.now(UTC)
-    retired: list[str] = []
-    for srv in stale:
-        if srv.last_seen_at is not None and now - srv.last_seen_at < AGENT_STALE_AFTER:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                (
-                    f"Group {target_group.name!r} still holds this appliance's "
-                    f"{srv.driver} server {srv.name!r}, and its agent reported "
-                    f"{int((now - srv.last_seen_at).total_seconds())}s ago. "
-                    "It is retired automatically once it stops reporting "
-                    f"(about {int(AGENT_STALE_AFTER.total_seconds())}s after the "
-                    "engine switch) — save again then, or delete it under DNS → "
-                    "Server groups."
-                ),
-            )
-        db.add(
-            AuditLog(
-                user_id=current_user.id,
-                user_display_name=current_user.display_name,
-                auth_source=current_user.auth_source,
-                action="delete",
-                resource_type="dns_server",
-                resource_id=str(srv.id),
-                resource_display=srv.name,
-                old_value={
-                    "group_id": str(srv.group_id),
-                    "driver": srv.driver,
-                    "host": srv.host,
-                    "agent_id": str(srv.agent_id) if srv.agent_id else None,
-                    "last_seen_at": srv.last_seen_at.isoformat() if srv.last_seen_at else None,
-                },
-                new_value={
-                    "reason": "retired_stale_engine_row",
-                    "appliance_id": str(appliance.id),
-                    "assigned_engine": sorted(drivers),
-                },
-                result="success",
-            )
-        )
-        collect_wake(dns_server_channel(srv.id), dns_group_channel(srv.group_id))
-        logger.info(
-            "appliance_stale_dns_row_retired",
-            appliance_id=str(appliance.id),
-            server_id=str(srv.id),
-            server_name=srv.name,
-            driver=srv.driver,
-            group_id=str(srv.group_id),
-        )
-        retired.append(srv.name)
-        await db.delete(srv)
-    if retired:
-        # The move's name-clash / single-driver / primary checks query the
-        # target group; they must not see the rows just retired.
-        await db.flush()
-    return retired
-
-
-async def _appliance_own_dhcp_servers(db: DB, appliance: Appliance) -> list[Any]:
-    """The appliance's agent-based (kea) dhcp_server rows (#1715); same
-    matching rules as ``_appliance_own_dns_servers``. ``dhcp_server.name``
-    is globally unique and kea is the only agent engine, so there is no
-    stale-engine row to retire on this side."""
-    from app.models.dhcp import DHCPServer  # noqa: PLC0415
-
-    if "dhcp" not in (appliance.assigned_roles or []):
-        return []
-    own = await _own_server_condition(db, appliance, DHCPServer)
-    return list(
-        (await db.execute(select(DHCPServer).where(own, DHCPServer.driver == "kea")))
-        .scalars()
-        .all()
-    )
+# Fleet (appliance -> server). Moving the appliance's own DNS row(s) on a group
+# change lives in ``app.services.appliance.dns_group_move``, shared with the
+# Copilot's ``assign_appliance_role`` (#1856).
 
 
 class ApplianceRolesUpdate(BaseModel):
@@ -4360,6 +4241,24 @@ async def update_appliance_roles(
                         f"capability {cap_key}=true; cannot assign role {r!r}."
                     ),
                 )
+
+    # #1427 — a control-plane cluster serves one DNS server group; refused
+    # before anything below changes the row or moves a server.
+    refusal = await cluster_dns_group_refusal(
+        db,
+        row,
+        roles=list(body.roles) if body.roles is not None else list(row.assigned_roles or []),
+        group_id=(
+            body.dns_group_id
+            if "dns_group_id" in body.model_fields_set
+            else row.assigned_dns_group_id
+        ),
+        prev_roles=prev_dns_roles,
+        prev_group_id=prev_dns_group_id,
+    )
+    if refusal is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, refusal)
+    if body.roles is not None:
         row.assigned_roles = list(body.roles)
 
     # #1562 — presence in the payload decides, not non-None: an
@@ -4385,19 +4284,21 @@ async def update_appliance_roles(
             if problem is not None:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
             # #1565 — the pointer alone moved the appliance's env and firewall
-            # to the new group while its registered server kept serving the old
-            # one (re-registration never moves a row, by design). Move the
-            # appliance's own DNS server(s) with it, through #934's move, in this
-            # transaction; a move it refuses (a name clash, a mixed-driver group)
-            # refuses the whole PUT, so the pointer and the server can't disagree.
-            from app.services.dns.server_move import ServerMoveError, move_server_to_group
+            # to the new group while its registered server kept serving the
+            # old one (re-registration never moves a row, by design). Move the
+            # appliance's own DNS server(s) with it — on an engine-AND-group
+            # save, the row the new engine's agent adopts (#1856) — in this
+            # transaction; a move it refuses (a name clash, a mixed-driver
+            # group, an ambiguous row) refuses the whole PUT, so the pointer
+            # and the server can't disagree.
+            from app.services.appliance.dns_group_move import move_appliance_dns_servers
+            from app.services.dns.server_move import ServerMoveError
 
-            own_dns = await _appliance_own_dns_servers(db, row)
-            if (
-                not own_dns
-                and _current_dns_drivers(row)
-                and dns_group.id != row.assigned_dns_group_id
-            ):
+            try:
+                dns_move = await move_appliance_dns_servers(db, row, dns_group, current_user)
+            except ServerMoveError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+            if dns_move.registers_new_server:
                 # #1762 — no server row yet: the agent will register into this
                 # group as a new signer, so apply the same refusal a move gets.
                 # Only on a pointer change, so re-saving an unchanged
@@ -4405,35 +4306,8 @@ async def update_appliance_roles(
                 # catalog refusal below, the order move_server_to_group uses
                 # for an existing server (compatibility first, then signers).
                 signer_check = (dns_group, next(iter(_current_dns_drivers(row))))
-            if any(srv.group_id != dns_group.id for srv in own_dns):
-                # #1715 — the appliance's own dead row of a previous engine
-                # would block the move on name and driver; retire it first.
-                retired_servers = await _retire_stale_engine_rows(db, row, dns_group, current_user)
-            for server in own_dns:
-                try:
-                    result = await move_server_to_group(db, server, dns_group)
-                except ServerMoveError as exc:
-                    raise HTTPException(
-                        status_code=exc.status_code,
-                        detail=f"Can't move this appliance's DNS server {server.name!r}: {exc.detail}",
-                    ) from exc
-                if result is None:
-                    continue
-                moved_servers.append({"dns_server": str(server.id), "name": server.name})
-                db.add(
-                    AuditLog(
-                        user_id=current_user.id,
-                        user_display_name=current_user.display_name,
-                        auth_source=current_user.auth_source,
-                        action="update",
-                        resource_type="dns_server",
-                        resource_id=str(server.id),
-                        resource_display=server.name,
-                        changed_fields=["group_id"],
-                        new_value={**result.as_audit_value(), "via_appliance_id": str(row.id)},
-                        result="success",
-                    )
-                )
+            retired_servers = dns_move.retired
+            moved_servers.extend(dns_move.moved)
             row.assigned_dns_group_id = dns_group.id
     # #1782 — Technitium cannot do catalog zones (#1766). The own-server move
     # above refuses it for a server that already exists, but an appliance
@@ -4455,6 +4329,15 @@ async def update_appliance_roles(
                     f"DNS server group {target.name!r} has catalog zones enabled. "
                     + catalog_unsupported_message({"technitium"}),
                 )
+            # #1858 — and not into a group holding a key Technitium cannot use.
+            if target is not None:
+                from app.services.dns.tsig_algorithms import group_key_refusal
+
+                if key_problem := await group_key_refusal(db, target.id, {"technitium"}):
+                    raise HTTPException(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        f"DNS server group {target.name!r}: {key_problem}",
+                    )
     if signer_check is not None:
         from app.services.dns.dnssec_signers import second_signer_refusal
 
@@ -4477,45 +4360,12 @@ async def update_appliance_roles(
             if problem is not None:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
             # #1565 — likewise the appliance's DHCP server(s), with the checks
-            # the DHCP server PUT applies to a group change.
-            from app.api.v1.dhcp.servers import (
-                _assert_driver_mix_allowed,
-                _assert_no_v6_scopes_for_windows,
-            )
-            from app.core.agent_wake import collect_wake, dhcp_group_channel, dhcp_server_channel
+            # the DHCP server PUT applies to a group change (shared with the
+            # Copilot's assign_appliance_role, #1902).
+            from app.services.appliance.dhcp_group_move import move_appliance_dhcp_servers
 
-            for dserver in await _appliance_own_dhcp_servers(db, row):
-                if dserver.server_group_id == dhcp_group.id:
-                    continue
-                await _assert_driver_mix_allowed(
-                    db, dhcp_group.id, dserver.driver, exclude_server_id=dserver.id
-                )
-                await _assert_no_v6_scopes_for_windows(db, dhcp_group.id, dserver.driver)
-                old_gid = dserver.server_group_id
-                dserver.server_group_id = dhcp_group.id
-                collect_wake(dhcp_server_channel(dserver.id))
-                for gid in (old_gid, dhcp_group.id):
-                    if gid is not None:
-                        collect_wake(dhcp_group_channel(gid))
-                moved_servers.append({"dhcp_server": str(dserver.id), "name": dserver.name})
-                db.add(
-                    AuditLog(
-                        user_id=current_user.id,
-                        user_display_name=current_user.display_name,
-                        auth_source=current_user.auth_source,
-                        action="update",
-                        resource_type="dhcp_server",
-                        resource_id=str(dserver.id),
-                        resource_display=dserver.name,
-                        changed_fields=["server_group_id"],
-                        old_value={"server_group_id": str(old_gid) if old_gid else None},
-                        new_value={
-                            "server_group_id": str(dhcp_group.id),
-                            "via_appliance_id": str(row.id),
-                        },
-                        result="success",
-                    )
-                )
+            dhcp_move = await move_appliance_dhcp_servers(db, row, dhcp_group, current_user)
+            moved_servers.extend(dhcp_move.moved)
             row.assigned_dhcp_group_id = dhcp_group.id
 
     if body.tags is not None:
@@ -4915,6 +4765,13 @@ async def promote_control_plane(
                 "a k3s control-plane cluster — only OS-appliance nodes can.",
             )
         targets.append(row)
+
+    # #1427 — a cluster serves one DNS server group: a joiner running DNS in
+    # another group would flip every DNS agent of the cluster to whichever
+    # member wrote the shared chart last.
+    dns_refusal = await promote_dns_group_refusal(db, members, targets)
+    if dns_refusal is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, dns_refusal)
 
     new_total = current_count + len(targets)
     if new_total % 2 == 0:

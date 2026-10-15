@@ -3678,6 +3678,7 @@ async def _preview_assign_appliance_role(
         cap_key = {
             "dns-bind9": "can_run_dns_bind9",
             "dns-powerdns": "can_run_dns_powerdns",
+            "dns-technitium": "can_run_dns_technitium",
             "dhcp": "can_run_dhcp",
             "observer": "can_run_observer",
         }.get(r)
@@ -3695,9 +3696,24 @@ async def _preview_assign_appliance_role(
     catalog_problem = await _assign_role_catalog_problem(db, row, args)
     if catalog_problem is not None:
         return PreviewResult(ok=False, detail=catalog_problem)
+    cluster_dns_problem = await _assign_role_cluster_dns_problem(db, row, args)
+    if cluster_dns_problem is not None:
+        return PreviewResult(ok=False, detail=cluster_dns_problem)
     signer_problem = await _assign_role_signer_problem(db, row, args, lock=False)
     if signer_problem is not None:
         return PreviewResult(ok=False, detail=signer_problem)
+    # #1856 / #1902 — both server moves' refusals, so an operator changing
+    # the DNS and DHCP groups in one proposal sees every reason it won't apply.
+    move_problems = [
+        problem
+        for problem in (
+            await _assign_role_dns_move_problem(db, row, args),
+            await _assign_role_dhcp_move_problem(db, user, row, args),
+        )
+        if problem is not None
+    ]
+    if move_problems:
+        return PreviewResult(ok=False, detail=" ".join(move_problems))
 
     preview_lines = [
         f"Assign roles to **{row.hostname}** ({appliance_uuid})",
@@ -3793,12 +3809,41 @@ async def _assign_role_signer_problem(
     return await second_signer_refusal(db, group, driver=driver, lock=lock)
 
 
+async def _assign_role_cluster_dns_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#1427 — same refusal as the REST role-assign route: a control-plane
+    cluster serves one DNS server group, so a member may not run DNS in
+    another. Only on a change, so an unchanged assignment re-saves."""
+    from app.services.appliance.cluster_dns_group import (  # noqa: PLC0415
+        cluster_dns_group_refusal,
+    )
+
+    if "dns_group_id" in args.model_fields_set:
+        try:
+            group_id = UUID(args.dns_group_id) if args.dns_group_id else None
+        except ValueError:
+            return None  # _assign_role_group_problem reports the bad UUID
+    else:
+        group_id = row.assigned_dns_group_id
+    return await cluster_dns_group_refusal(
+        db,
+        row,
+        roles=list(args.roles),
+        group_id=group_id,
+        prev_roles=set(row.assigned_roles or []),
+        prev_group_id=row.assigned_dns_group_id,
+    )
+
+
 async def _assign_role_catalog_problem(
     db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
 ) -> str | None:
-    """#1782 — same refusal as the REST role-assign route: a Technitium
-    appliance must not be pointed at a catalog-enabled DNS group (#1766).
-    Only on a change, so a pre-existing assignment can still be re-saved."""
+    """#1782 / #1858 — same refusals as the REST role-assign route: a
+    Technitium appliance must not be pointed at a catalog-enabled DNS group
+    (#1766), nor at one holding a TSIG key Technitium cannot use
+    (hmac-sha224). Only on a change, so a pre-existing assignment can still
+    be re-saved."""
     from app.models.dns import DNSServerGroup  # noqa: PLC0415
     from app.services.dns.server_move import catalog_unsupported_message  # noqa: PLC0415
 
@@ -3816,29 +3861,130 @@ async def _assign_role_catalog_problem(
     if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
         return None
     group = await db.get(DNSServerGroup, group_id)
-    if group is None or not group.catalog_zones_enabled:
+    if group is None:
         return None
+    if not group.catalog_zones_enabled:
+        # #1858 — same refusal as the REST route: a key Technitium cannot use.
+        from app.services.dns.tsig_algorithms import group_key_refusal  # noqa: PLC0415
+
+        key_problem = await group_key_refusal(db, group.id, {"technitium"})
+        return f"DNS server group {group.name!r}: {key_problem}" if key_problem else None
     return f"DNS server group {group.name!r} has catalog zones enabled. " + (
         catalog_unsupported_message({"technitium"})
     )
 
 
+async def _assign_role_dns_move_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#1856 — the ambiguous-row refusal the apply's server move makes,
+    reported at preview. Read-only: the move's other refusals (name clash,
+    mixed driver, catalog, second signer) need the move itself and are
+    re-checked at apply, which refuses the whole proposal before it commits.
+    """
+    from app.models.dns import DNSServer, DNSServerGroup  # noqa: PLC0415
+    from app.services.appliance.dns_group_move import (  # noqa: PLC0415
+        appliance_adoptable_dns_server,
+    )
+    from app.services.appliance.ownership import (  # noqa: PLC0415
+        DNS_ROLE_DRIVER,
+        own_server_condition,
+    )
+    from app.services.dns.server_move import ServerMoveError  # noqa: PLC0415
+
+    if not args.dns_group_id or "dns_group_id" not in args.model_fields_set:
+        return None
+    drivers = {DNS_ROLE_DRIVER[r] for r in args.roles if r in DNS_ROLE_DRIVER}
+    if not drivers:
+        return None
+    try:
+        group = await db.get(DNSServerGroup, UUID(args.dns_group_id))
+    except ValueError:
+        return None  # _assign_role_group_problem reports it
+    if group is None:
+        return None
+    own = await own_server_condition(db, row, DNSServer)
+    has_current = (
+        await db.execute(select(DNSServer.id).where(own, DNSServer.driver.in_(sorted(drivers))))
+    ).first()
+    if has_current is not None:
+        return None
+    try:
+        await appliance_adoptable_dns_server(db, row, group)
+    except ServerMoveError as exc:
+        return exc.detail
+    return None
+
+
+async def _assign_role_dhcp_move_problem(
+    db: AsyncSession, user: User, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#1902 — the refusals the apply's Kea server move makes (a mixed
+    Kea / Windows group, v6 scopes for Windows), reported at preview. Read-only."""
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
+    from app.services.appliance.dhcp_group_move import (  # noqa: PLC0415
+        move_appliance_dhcp_servers,
+    )
+
+    if not args.dhcp_group_id or "dhcp_group_id" not in args.model_fields_set:
+        return None
+    try:
+        group = await db.get(DHCPServerGroup, UUID(args.dhcp_group_id))
+    except ValueError:
+        return None  # _assign_role_group_problem reports it
+    if group is None:
+        return None
+    try:
+        await move_appliance_dhcp_servers(
+            db, row, group, user, dry_run=True, roles=list(args.roles)
+        )
+    except HTTPException as exc:
+        return str(exc.detail)
+    return None
+
+
 async def _apply_assign_appliance_role(
     db: AsyncSession, user: User, args: AssignApplianceRoleArgs
 ) -> dict[str, Any]:
+    from app.core.agent_wake import collecting_wakes  # noqa: PLC0415
     from app.models.appliance import Appliance  # noqa: PLC0415
-    from app.models.audit import AuditLog  # noqa: PLC0415
-    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
-    from app.models.dns import DNSServerGroup  # noqa: PLC0415
 
     # SECURITY (#400, C2): RBAC backstop — matches the REST role-assign
     # route's require_permission("admin", "appliance").
     enforce_operation_permission(user, _OPERATIONS["assign_appliance_role"])
 
     appliance_uuid = UUID(args.appliance_id)
-    row = await db.get(Appliance, appliance_uuid)
+    # #1856 — FOR UPDATE, like the REST route (#1715): two saves on one
+    # appliance must not race the server move below on stale reads.
+    row = await db.get(Appliance, appliance_uuid, with_for_update=True)
     if row is None:
         raise ValueError(f"Appliance {args.appliance_id} not found.")
+    # The /ai router mounts without ``wake_publishing``; open the collector
+    # here so the move's wakes publish after the commit below (and are
+    # dropped if it raises).
+    async with collecting_wakes():
+        return await _apply_assign_appliance_role_locked(db, user, args, row)
+
+
+async def _apply_assign_appliance_role_locked(
+    db: AsyncSession, user: User, args: AssignApplianceRoleArgs, row: Any
+) -> dict[str, Any]:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.core.agent_wake import appliance_channel, collect_wake  # noqa: PLC0415
+    from app.models.audit import AuditLog  # noqa: PLC0415
+    from app.models.dhcp import DHCPServerGroup  # noqa: PLC0415
+    from app.models.dns import DNSServerGroup  # noqa: PLC0415
+    from app.services.appliance.dhcp_group_move import (  # noqa: PLC0415
+        move_appliance_dhcp_servers,
+    )
+    from app.services.appliance.dns_group_move import (  # noqa: PLC0415
+        move_appliance_dns_servers,
+    )
+    from app.services.dns.server_move import ServerMoveError  # noqa: PLC0415
+
     # Re-checked at apply: a group can be renamed between preview and apply.
     group_problem = await _assign_role_group_problem(db, args)
     if group_problem is not None:
@@ -3846,6 +3992,9 @@ async def _apply_assign_appliance_role(
     catalog_problem = await _assign_role_catalog_problem(db, row, args)
     if catalog_problem is not None:
         raise ValueError(catalog_problem)
+    cluster_dns_problem = await _assign_role_cluster_dns_problem(db, row, args)
+    if cluster_dns_problem is not None:
+        raise ValueError(cluster_dns_problem)
     signer_problem = await _assign_role_signer_problem(db, row, args, lock=True)
     if signer_problem is not None:
         raise ValueError(signer_problem)
@@ -3855,11 +4004,22 @@ async def _apply_assign_appliance_role(
     # omitted field leaves the current assignment alone. (Proposals
     # persist args with exclude_unset=True so the distinction survives
     # the store/re-validate round-trip.)
+    moved_servers: list[dict[str, Any]] = []
+    retired_servers: list[str] = []
     if "dns_group_id" in args.model_fields_set:
         if args.dns_group_id:
             dns_group = await db.get(DNSServerGroup, UUID(args.dns_group_id))
             if dns_group is None:
                 raise ValueError(f"DNS group {args.dns_group_id} not found.")
+            # #1565 / #1856 — the same server move the REST route makes: the
+            # pointer alone would leave the appliance's server serving the old
+            # group. A refusal raises, and the proposal applies nothing.
+            try:
+                dns_move = await move_appliance_dns_servers(db, row, dns_group, user)
+            except ServerMoveError as exc:
+                raise ValueError(exc.detail) from exc
+            moved_servers = dns_move.moved
+            retired_servers = dns_move.retired
             row.assigned_dns_group_id = dns_group.id
         else:
             row.assigned_dns_group_id = None
@@ -3868,6 +4028,14 @@ async def _apply_assign_appliance_role(
             dhcp_group = await db.get(DHCPServerGroup, UUID(args.dhcp_group_id))
             if dhcp_group is None:
                 raise ValueError(f"DHCP group {args.dhcp_group_id} not found.")
+            # #1565 / #1902 — the same Kea server move the REST route makes: the
+            # pointer alone would leave the appliance's server in the old group.
+            # A refusal raises, and the proposal applies nothing.
+            try:
+                dhcp_move = await move_appliance_dhcp_servers(db, row, dhcp_group, user)
+            except HTTPException as exc:
+                raise ValueError(str(exc.detail)) from exc
+            moved_servers.extend(dhcp_move.moved)
             row.assigned_dhcp_group_id = dhcp_group.id
         else:
             row.assigned_dhcp_group_id = None
@@ -3886,14 +4054,21 @@ async def _apply_assign_appliance_role(
                 "dns_group_id": args.dns_group_id,
                 "dhcp_group_id": args.dhcp_group_id,
                 "via": "ai_proposal",
+                **({"moved_servers": moved_servers} if moved_servers else {}),
+                **({"retired_servers": retired_servers} if retired_servers else {}),
             },
         )
     )
+    # #358 Phase 1 — wake the supervisor heartbeat, as the Fleet roles PUT
+    # does, so the new roles and groups apply without waiting a heartbeat.
+    # Collected, so it publishes after the commit (and not on a refusal).
+    collect_wake(appliance_channel(row.id))
     await db.commit()
     return {
         "appliance_id": str(row.id),
         "hostname": row.hostname,
         "roles": list(args.roles),
+        **({"moved_servers": moved_servers} if moved_servers else {}),
     }
 
 

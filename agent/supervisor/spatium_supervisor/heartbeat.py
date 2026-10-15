@@ -62,6 +62,7 @@ from .service_lifecycle import (
     LifecycleResult,
     apply_role_assignment,
     reconcile_node_labels,
+    record_shared_chart_hold,
     role_release_fingerprint,
     tear_down_supervised_services,
 )
@@ -737,6 +738,25 @@ def _server_firewall_body_is_usable(
     return False
 
 
+def _strip_nul(value: Any, path: str, hits: list[str]) -> Any:
+    """A copy of ``value`` with U+0000 removed from every string (keys
+    included); the dotted path of each value that carried one is appended
+    to ``hits`` (#1747)."""
+    if isinstance(value, str):
+        if "\x00" in value:
+            hits.append(path or "<body>")
+            return value.replace("\x00", "")
+        return value
+    if isinstance(value, dict):
+        return {
+            _strip_nul(k, path, hits): _strip_nul(v, f"{path}.{k}" if path else str(k), hits)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_strip_nul(v, f"{path}[{i}]", hits) for i, v in enumerate(value)]
+    return value
+
+
 def heartbeat_once(
     cfg: SupervisorConfig,
     appliance_id: uuid.UUID,
@@ -869,6 +889,16 @@ def heartbeat_once(
         except Exception as exc:  # noqa: BLE001
             log.warning("supervisor.heartbeat.cert_auth_skipped", error=str(exc))
 
+    # #1747 — Postgres refuses U+0000 in a text value, so ONE NUL anywhere in
+    # this body (a host sidecar left NUL-filled by a power loss) makes the
+    # api answer 422 to every heartbeat and the node's Fleet row freezes for
+    # good. The slot-upgrade readers scrub their own values; this is the
+    # backstop for every other field read off a host file.
+    nul_fields: list[str] = []
+    body = _strip_nul(body, "", nul_fields)
+    if nul_fields:
+        log.warning("supervisor.heartbeat.nul_stripped", fields=nul_fields[:20])
+
     try:
         resp = client.post(
             url, json=body, headers=headers, timeout=float(hold_s) + 10.0
@@ -956,6 +986,9 @@ def heartbeat_once(
     # #358 Phase 1b — True when the control plane long-poll-held this
     # heartbeat (new server); lets the loop re-arm the hold immediately.
     held = bool(body_out.get("long_poll"))
+    # #1710 — keep the rolling upgrade's hold on the shared charts (or clear
+    # it) before anything below applies the role chart.
+    record_shared_chart_hold(cfg.state_dir / _ROLE_ENV_FILENAME, body_out.get("shared_chart_hold"))
 
     # #170 Wave D follow-up — pick up cert + CA chain on the first
     # heartbeat after approval. Subsequent heartbeats include the

@@ -254,17 +254,6 @@ def _validate_gateable(action: str | None, resource_type: str | None) -> None:
             )
 
 
-def _require_read(user: CurrentUser) -> None:
-    """Reads on the queue need ``read,change_request`` (or superadmin)."""
-    if is_effective_superadmin(user):
-        return
-    if not user_has_permission(user, "read", RESOURCE_TYPE_CHANGE_REQUEST):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Permission denied: need 'read' on '{RESOURCE_TYPE_CHANGE_REQUEST}'",
-        )
-
-
 def _can_see_all_change_requests(user: User) -> bool:
     """READ RULE (#1): who may see EVERY change request (not just their own).
 
@@ -280,6 +269,10 @@ def _can_see_all_change_requests(user: User) -> bool:
     only the rows they themselves requested (``requested_by_user_id ==
     caller.id``). The list endpoint forces that scope; get/{id} 404s on a row
     the caller may not see (404, not 403, so existence isn't confirmed).
+
+    ``read`` on ``change_request`` is NOT a precondition (#1863): the scope is
+    the gate. An editor whose write a policy queued holds no such grant, and
+    still has to see — and be able to cancel — the request it made.
     """
     return is_effective_superadmin(user) or user_has_permission(
         user, "approve", RESOURCE_TYPE_CHANGE_REQUEST
@@ -306,7 +299,9 @@ async def list_requests(
     ALWAYS scoped to their own requests regardless of the ``mine`` flag — a
     plain ``{read, change_request}`` holder can never enumerate the platform
     queue (which leaks args / preview / target / requester / approver)."""
-    _require_read(current_user)
+    # No ``read`` gate (#1863): the own-rows scope below IS the access rule.
+    # A requester whose write a policy queued holds no ``read,change_request``
+    # (only Change Approver does), yet must see — and cancel — its own row.
     if _can_see_all_change_requests(current_user):
         scope_user_id = current_user.id if mine else None
     else:
@@ -508,7 +503,7 @@ async def delete_policy(
 
 @router.get("/{cr_id}", response_model=ChangeRequestResponse)
 async def get_request(cr_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ChangeRequestResponse:
-    _require_read(current_user)
+    # No ``read`` gate (#1863) — the 404 below is the access rule.
     cr = await get_change_request(db, cr_id)
     # READ RULE (#1): 404 (not 403) unless the caller is the requester, holds
     # approve, or is a superadmin — so a non-eligible caller can't even confirm

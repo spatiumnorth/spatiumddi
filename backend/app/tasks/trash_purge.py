@@ -20,6 +20,7 @@ import structlog
 from sqlalchemy import and_, delete, or_, select
 
 from app.celery_app import celery_app
+from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
 from app.db import task_session
 from app.models.audit import AuditLog
@@ -194,19 +195,19 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     agent-based zone, so those purge normally. Returns ``(purged, skipped)``.
     ``include_deleted`` because these rows are soft-deleted by definition.
 
-    Retry caveat (#632): the provider teardown is not transactional with the DB,
-    and the cloud / Windows drivers raise "zone not found" on a delete of an
-    already-absent zone (they resolve the provider zone-id first). So a zone that
-    was partially torn down (one agentless member deleted, another failed) — or
-    torn down just before a failed terminal ``_sweep`` commit — can stay
-    ``skipped`` every later sweep, lingering soft-deleted rather than orphaning at
-    the provider. That is the safe failure (the DB keeps the row; an operator can
-    permanent-delete it). Making the drivers treat absent-on-delete as success —
-    which also hardens the permanent zone-delete path — is the real fix, tracked
-    separately.
+    Retry (#632): the provider teardown is not transactional with the DB, so a
+    zone torn down just before a failed terminal ``_sweep`` commit, or torn down
+    on one agentless member while another failed, is pushed again on the next
+    sweep. Windows DNS, ``technitium_api``, Cloudflare, Route 53, Azure, Google
+    and Hetzner report a delete of an already-absent zone as a no-op (#1528,
+    #1537), so the retry converges. DigitalOcean, Linode and Vultr still raise
+    on an absent zone, so such a zone stays ``skipped`` every later sweep: the
+    safe failure (the row is kept, nothing is orphaned), but no delete path
+    can remove it until those drivers treat absence as done too. The Trash
+    page's permanent delete goes through the same helper and fails the same
+    way (#1830).
     """
-    from app.api.v1.dns.router import _push_zone_to_agentless_servers  # noqa: PLC0415
-    from app.services.dns.record_ops import sweep_zone_ops  # noqa: PLC0415
+    from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
 
     res = await db.execute(
         select(DNSZone)
@@ -217,7 +218,7 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     skipped = 0
     for zone in res.scalars().all():
         try:
-            await _push_zone_to_agentless_servers(db, zone, "delete")
+            await purge_trashed_zone(db, zone)
         except Exception as exc:  # noqa: BLE001 — best-effort; retry next sweep
             # A dead / rejecting provider must NOT let the row Core-DELETE (that
             # orphans the hosted zone forever). Leave it soft-deleted + logged;
@@ -231,21 +232,6 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
                 hint="left soft-deleted; next daily sweep retries the provider push",
             )
             continue
-        # Ops queued before the soft-delete started sweeping them (#964 review)
-        # have no zone FK to cascade through; sweep defensively so a pre-fix
-        # trash row does not leave a failed queue behind.
-        await sweep_zone_ops(db, zone, zone.group_id)
-        # Core DELETE (not ORM ``db.delete``) — leans on the DB-level FK ON
-        # DELETE CASCADE to remove this zone's still-present soft-deleted records
-        # (they were excluded from the record pass precisely so they'd ride this
-        # delete, atomic with the teardown). An ORM delete would instead fire an
-        # ``all, delete-orphan`` cascade lazy-load per zone — wasted work that
-        # also couples correctness to the soft-delete filter hiding those rows.
-        # ``include_deleted`` bypasses that filter so the WHERE matches this
-        # tombstoned row.
-        await db.execute(
-            delete(DNSZone).where(DNSZone.id == zone.id).execution_options(include_deleted=True)
-        )
         purged += 1
     if purged:
         await db.flush()
@@ -253,7 +239,7 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
 
 
 async def _sweep() -> dict[str, Any]:
-    async with task_session() as db:
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         ps_res = await db.execute(select(PlatformSettings).limit(1))
         ps = ps_res.scalar_one_or_none()
         purge_days = 30

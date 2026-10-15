@@ -83,6 +83,7 @@ from app.services.dns.soa_timers import (
     renders_soa_timers,
 )
 from app.services.dns.tsig import ensure_group_tsig_key
+from app.services.dns.tsig_algorithms import UNSUPPORTED_TSIG_ALGORITHMS, group_key_refusal
 from app.services.feature_modules import is_module_enabled
 from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as QUERY_LOG_RETENTION_HOURS
 
@@ -454,6 +455,18 @@ async def agent_register(
             driver=body.driver,
             issue="#1766",
         )
+
+    # #1858 — same posture for a key Technitium cannot use (hmac-sha224): the
+    # agent skips installing it, the group's keys page shows why.
+    if body.driver in UNSUPPORTED_TSIG_ALGORITHMS:
+        if key_problem := await group_key_refusal(db, group.id, {body.driver}):
+            logger.warning(
+                "dns_agent_tsig_algorithm_unsupported",
+                server_id=str(server.id),
+                group=group.name,
+                driver=body.driver,
+                detail=key_problem,
+            )
 
     # Mint token
     token, exp = mint_agent_token(

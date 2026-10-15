@@ -51,11 +51,13 @@ from app.models.dns import (
     DNSServerGroup,
     DNSServerZoneState,
 )
+from app.services.appliance.cluster_dns_group import cluster_dns_group_refusal
 from app.services.appliance.ownership import owning_appliance_for_dns_server
 from app.services.dns import technitium_api_scope
 from app.services.dns.dnssec_signers import second_signer_refusal
 from app.services.dns.record_ops import QUEUED_OP_STATES
 from app.services.dns.tsig import ensure_group_tsig_key
+from app.services.dns.tsig_algorithms import group_key_refusal
 
 logger = structlog.get_logger(__name__)
 
@@ -172,6 +174,10 @@ async def ensure_group_single_driver(
             f"{driver!r}. A server group is single-driver — {hint}",
             status_code=422,
         )
+    # #1858 — a Technitium server cannot use an hmac-sha224 key the group
+    # already holds; joining would install it and fail every signed transfer.
+    if refusal := await group_key_refusal(db, group_id, {driver}):
+        raise ServerMoveError(f"Group {group_name!r}: {refusal}", status_code=422)
     # #1784 — the experimental agentless Technitium driver supports ONE
     # server per group. Enforced on every path that puts a server in a group
     # (create, driver change, move) because they all come through here.
@@ -285,6 +291,25 @@ async def move_server_to_group(
     if refusal is not None:
         raise ServerMoveError(refusal, status_code=422)
 
+    # #1427 — the move repoints the owning appliance's DNS group (below), and
+    # a control-plane cluster serves one: refuse a cluster member's server a
+    # group the cluster's other DNS members are not in. The roles PUT, which
+    # moves the appliance's own servers through here, has already refused or
+    # passed the same group, so it never trips this.
+    appliance = await owning_appliance_for_dns_server(db, server)
+    if appliance is not None and appliance.assigned_dns_group_id == old_group_id:
+        roles = list(appliance.assigned_roles or [])
+        refusal = await cluster_dns_group_refusal(
+            db,
+            appliance,
+            roles=roles,
+            group_id=target_group.id,
+            prev_roles=set(roles),
+            prev_group_id=appliance.assigned_dns_group_id,
+        )
+        if refusal is not None:
+            raise ServerMoveError(refusal, status_code=422)
+
     # ── Purge state that belongs to the old group ─────────────────────
     zone_state_purged = (
         await db.execute(
@@ -365,8 +390,8 @@ async def move_server_to_group(
     # appliance deliberately assigned elsewhere is not ours to redirect.
     appliance_repointed_id: uuid.UUID | None = None
     # Found by FK, else by the same hostname rule Fleet uses (#1749): agents
-    # register by hostname and never set ``appliance_id``.
-    appliance = await owning_appliance_for_dns_server(db, server)
+    # register by hostname and never set ``appliance_id``. Looked up with the
+    # refusals above.
     if appliance is not None and appliance.assigned_dns_group_id == old_group_id:
         appliance.assigned_dns_group_id = target_group.id
         appliance_repointed_id = appliance.id

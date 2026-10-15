@@ -1,0 +1,59 @@
+// The action and resource_type vocabulary a grant can be made from, shared by
+// the role editor (RolesPage) and the time-bound grant dialog
+// (CreateTimeBoundGrantModal) so the two cannot drift apart again (#1631: the
+// role editor learned `approve` / `change_request` and the grant dialog did
+// not). Mirrors docs/PERMISSIONS.md; there is no server enumeration endpoint
+// by design, so keep it in sync with the spec table when new types land.
+
+// 'admin' implies read/write/delete on the type; `approve` only means
+// anything on `change_request`.
+export const GRANT_ACTIONS = [
+  "read",
+  "write",
+  "delete",
+  "admin",
+  "approve",
+  "*",
+] as const;
+
+export const GRANT_RESOURCE_TYPES = [
+  "*",
+  "ip_space",
+  "ip_block",
+  "subnet",
+  "ip_address",
+  "address_set",
+  "vlan",
+  "vrf",
+  "asn",
+  "domain",
+  "dns_group",
+  "dns_zone",
+  "dns_record",
+  "dns_blocklist",
+  "dhcp_server",
+  "dhcp_scope",
+  "dhcp_pool",
+  "dhcp_static",
+  "dhcp_client_class",
+  "audit_log",
+  "user",
+  "group",
+  "role",
+  "auth_provider",
+  "custom_field",
+  "manage_ipam_templates",
+  "settings",
+  "api_token",
+  "acme_account",
+  "customer",
+  "site",
+  "provider",
+  "circuit",
+  "network_service",
+  "overlay_network",
+  "routing_policy",
+  "application_category",
+  "conformity",
+  "change_request",
+] as const;

@@ -81,6 +81,11 @@ class SlotImageTarget:
     # second full slot apply of an image it already staged. Carried in the
     # run plan so every node in a run, and every resume of it, agrees.
     nonce: str | None = None
+    # #1709 — the uploaded image this URL serves, when it is one of ours. An
+    # upload streams its bytes to the slot-image mirror, so the mirror
+    # headroom check needs no room for it once the mirror holds it. None for
+    # an operator-pasted external URL.
+    image_id: uuid.UUID | None = None
 
     def as_plan_fields(self) -> dict[str, object]:
         """Serialise into an ``UpgradeRun.plan`` JSON blob."""
@@ -90,6 +95,7 @@ class SlotImageTarget:
             "slot_image_tls_insecure": self.tls_insecure,
             "slot_image_nonce": self.nonce,
             "slot_image_architecture": self.architecture,
+            "slot_image_id": str(self.image_id) if self.image_id else None,
         }
 
     @classmethod
@@ -108,7 +114,59 @@ class SlotImageTarget:
             # to UNKNOWN and fall through to the host runner's check,
             # which is the same answer they had when they were planned.
             architecture=plan.get("slot_image_architecture"),
+            # Absent in a plan written before #1709: the check then asks for
+            # room as it did when the run was planned.
+            image_id=_uuid_or_none(plan.get("slot_image_id")),
         )
+
+
+# #1752 — the schemes the supervisor will fetch a slot image over. MUST match
+# ``allowed_schemes`` in ``agent/supervisor/spatium_supervisor/appliance_state.py``
+# (#242: no cleartext ``http://`` OS-image fetch); a drift test pins the two.
+# The supervisor refuses anything else silently (a warning log, no trigger),
+# so a URL outside this set makes a rolling upgrade wait out its whole stage
+# timeout per node. Every operator-supplied slot image URL is checked here
+# (the Plan validator and ``resolve_slot_image_target``). An uploaded image's
+# URL is composed from the address the UI was reached on, which on an
+# appliance is the frontend's https:// listener.
+SUPERVISOR_ALLOWED_URL_SCHEMES: tuple[str, ...] = ("https", "file")
+
+
+def slot_image_url_problem(url: str) -> str | None:
+    """Why the supervisor would refuse ``url``, or None when it would accept it.
+
+    Mirrors the supervisor's own test exactly: the stripped, fragment-less URL
+    must START with ``https://`` or ``file://`` (case-insensitive). A parse of
+    the scheme is not the same test — ``file:/x`` parses as scheme ``file``
+    and the supervisor still refuses it.
+    """
+    fetch_url = url.strip().split("#", 1)[0]
+    lowered = fetch_url.lower()
+    if not any(lowered.startswith(f"{s}://") for s in SUPERVISOR_ALLOWED_URL_SCHEMES):
+        allowed = " or ".join(f"{x}://" for x in SUPERVISOR_ALLOWED_URL_SCHEMES)
+        got = fetch_url.split(":", 1)[0][:32] if ":" in fetch_url else ""
+        return (
+            f"slot image URL must start with {allowed} (got {got + ':' if got else 'no scheme'}): "
+            "appliances refuse any other OS-image fetch, including cleartext http://, "
+            "so the upgrade would wait for a download that never starts"
+        )
+    if lowered.startswith("https://"):
+        from urllib.parse import urlsplit  # noqa: PLC0415
+
+        try:
+            host = urlsplit(fetch_url).hostname
+        except ValueError as exc:
+            return f"slot image URL is not parseable: {exc}"
+        if not host:
+            return "slot image URL must include a host"
+    return None
+
+
+def _uuid_or_none(value: object) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(value)) if value else None
+    except ValueError:
+        return None
 
 
 def supervisor_strips_url_fragment(row: Appliance) -> bool:
@@ -157,6 +215,9 @@ async def resolve_slot_image_target(
         raise SlotImageResolutionError("Pass exactly one of slot_image_id or slot_image_url.")
 
     if slot_image_url is not None:
+        problem = slot_image_url_problem(slot_image_url)
+        if problem:
+            raise SlotImageResolutionError(problem)
         return SlotImageTarget(url=slot_image_url)
 
     assert slot_image_id is not None  # narrowed by the check above
@@ -180,6 +241,7 @@ async def resolve_slot_image_target(
         sha256=image.sha256,
         tls_insecure=True,
         architecture=image.architecture,
+        image_id=image.id,
     )
 
 

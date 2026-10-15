@@ -19,6 +19,7 @@ import structlog
 from sqlalchemy import delete, select
 
 from app.celery_app import celery_app
+from app.config import settings
 from app.db import task_session
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.models.settings import PlatformSettings
@@ -29,7 +30,7 @@ DEFAULT_RETENTION_DAYS = 7
 
 
 async def _sweep() -> dict[str, int]:
-    async with task_session() as db:
+    async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         res = await db.execute(select(PlatformSettings).limit(1))
         ps = res.scalar_one_or_none()
         retention_days = DEFAULT_RETENTION_DAYS

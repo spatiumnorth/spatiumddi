@@ -287,10 +287,13 @@ describe("DNS: Delete Server Group", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: /Delete Group$/ }),
     );
-    let said = words(topDialog());
-    fireEvent.click(
+    // The dialog first reads what the group still holds; Continue appears
+    // only once that answer is in.
+    const proceed = await waitFor(() =>
       within(topDialog()).getByRole("button", { name: /^Continue$/ }),
     );
+    let said = words(topDialog());
+    fireEvent.click(proceed);
     said += ` ${words(topDialog())}`;
 
     expect(said).toContain("retiring");
@@ -338,7 +341,9 @@ describe("DNS: Delete Server Group", () => {
       await screen.findByRole("button", { name: /Delete Group$/ }),
     );
     fireEvent.click(
-      within(topDialog()).getByRole("button", { name: /^Continue$/ }),
+      await waitFor(() =>
+        within(topDialog()).getByRole("button", { name: /^Continue$/ }),
+      ),
     );
     fireEvent.click(within(topDialog()).getByRole("checkbox"));
     fireEvent.click(
