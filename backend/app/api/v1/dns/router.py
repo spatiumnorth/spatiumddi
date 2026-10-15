@@ -336,6 +336,9 @@ class ServerGroupCreate(BaseModel):
     # operator pins a private IP into a zone in this group, forcing a
     # typed-CIDR confirm. Off by default — existing groups unaffected.
     is_public_facing: bool = False
+    # #1932 — auto-create subnet reverse zones in a cloud DNS group. Off by
+    # default: the provider bills per hosted zone. Other drivers ignore it.
+    auto_reverse_zones_at_provider: bool = False
 
     @field_validator("group_type")
     @classmethod
@@ -354,6 +357,7 @@ class ServerGroupUpdate(BaseModel):
     catalog_zones_enabled: bool | None = None
     catalog_zone_name: str | None = None
     is_public_facing: bool | None = None
+    auto_reverse_zones_at_provider: bool | None = None
 
     @field_validator("group_type")
     @classmethod
@@ -373,6 +377,7 @@ class ServerGroupResponse(BaseModel):
     catalog_zones_enabled: bool
     catalog_zone_name: str
     is_public_facing: bool = False
+    auto_reverse_zones_at_provider: bool = False
     # #934 follow-up — the distinct drivers of the servers currently in this
     # group. Empty means an empty group, which is compatible with anything.
     # A group is single-driver, so one entry is the normal case; two or more
@@ -411,6 +416,7 @@ class ServerGroupResponse(BaseModel):
             catalog_zones_enabled=g.catalog_zones_enabled,
             catalog_zone_name=g.catalog_zone_name,
             is_public_facing=g.is_public_facing,
+            auto_reverse_zones_at_provider=g.auto_reverse_zones_at_provider,
             server_drivers=sorted(drivers or []),
             catalog_unsupported_warning=(
                 catalog_unsupported_message(drivers or [])
@@ -1824,6 +1830,7 @@ async def update_group(
             "catalog_zones_enabled",
             "catalog_zone_name",
             "is_public_facing",
+            "auto_reverse_zones_at_provider",
         },
     )
     # #1784 — only turning catalog zones ON is refused: turning an

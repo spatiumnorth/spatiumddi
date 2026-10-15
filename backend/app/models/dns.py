@@ -173,6 +173,14 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Boolean, nullable=False, default=True, server_default="true"
     )
 
+    # #1932 — whether IPAM / DDNS auto-create a subnet's reverse zones in this
+    # group when it runs a cloud DNS driver (``CLOUD_DNS_DRIVERS``). Off by
+    # default: a cloud provider bills per hosted zone and a /17 makes 128 of
+    # them (#1840). Groups on any other driver ignore it.
+    auto_reverse_zones_at_provider: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
     servers: Mapped[list["DNSServer"]] = relationship(
         "DNSServer", back_populates="group", cascade="all, delete-orphan"
     )

@@ -97,10 +97,18 @@ the formatter handles the rest.
   there once is never created again, even if it is later deleted at the
   provider. One commit creates at most 16 zones inline (a /17 needs 128);
   the retry sweep creates the rest, 32 a minute. On upgrade, reverse
-  zones SpatiumDDI auto-created in a group with an agentless server are
-  marked and created by the sweep; a zone already at the provider is left
+  zones SpatiumDDI auto-created in a `technitium_api` or Windows DNS group
+  are marked and created by the sweep; a zone already at the provider is left
   as it is. The Copilot's zone create now pushes to the provider before
   its commit, as the REST create does. Agent-managed groups are unchanged.
+  Groups running a cloud DNS driver (Route 53, Azure DNS, Google Cloud DNS,
+  Cloudflare and the others) only get auto-created reverse zones when the
+  new group setting *Auto-create reverse zones at the provider* is on,
+  because the provider bills per hosted zone and a /17 makes 128. It is off
+  by default and for every existing group, so the upgrade creates nothing
+  at a cloud provider. Opted out, a subnet gets no reverse zone and its PTRs
+  are skipped; the subnet's DNS sync report says why. Reverse zones a cloud
+  group already holds are kept.
 - **An imported zone no longer has to stay delegated to the server it was
   migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
   BIND9, PowerDNS and Technitium importers keep the source's apex NS, which the
@@ -4571,9 +4579,12 @@ the formatter handles the rest.
 
 - `c4f19a2e7d53` — #1932, additive + data: nullable
   `dns_zone.agentless_create_due_at` (an auto-created zone whose provider
-  create is outstanding, and when the sweep may next try). Backfill marks
-  the non-imported, auto-generated reverse zones in groups with an agentless
-  server with credentials, due now. Downgrade drops the column.
+  create is outstanding, and when the sweep may next try) and
+  `dns_server_group.auto_reverse_zones_at_provider` (NOT NULL, default
+  false). Backfill marks the non-imported, auto-generated reverse zones in
+  groups with a `technitium_api` or Windows DNS server with credentials and
+  no cloud server, due now; cloud groups are not marked. Downgrade drops
+  both columns.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column

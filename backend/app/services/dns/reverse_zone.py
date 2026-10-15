@@ -46,6 +46,37 @@ logger = structlog.get_logger(__name__)
 # per allocation forever; warn once per (subnet, zone) pair per process, and
 # demote repeats to debug. Log suppression only — never consulted for logic.
 _cross_space_warned: set[tuple[str, str]] = set()
+# #1932 — the same dedupe for the cloud opt-out skip below.
+_cloud_optout_warned: set[tuple[str, str]] = set()
+
+
+def cloud_reverse_optout_message(group_name: str, driver: str) -> str:
+    """Why a subnet in a cloud DNS group gets no reverse zone (#1932). One
+    sentence, shown in the IPAM DNS sync report and logged."""
+    return (
+        f"No reverse zone is created for this subnet: DNS group {group_name!r} "
+        f"runs the cloud driver {driver!r}, which bills per hosted zone, and "
+        f"auto-creating reverse zones there is off. PTR records are skipped. "
+        f"Turn on 'Auto-create reverse zones at the provider' on the group to "
+        f"create them, or create the reverse zone yourself."
+    )
+
+
+async def cloud_reverse_optout_driver(db: AsyncSession, group: DNSServerGroup) -> str | None:
+    """The cloud driver that keeps reverse zones from being auto-created in
+    ``group``, or None when they may be (#1932): the group runs a
+    ``CLOUD_DNS_DRIVERS`` driver and has not opted in."""
+    if group.auto_reverse_zones_at_provider:
+        return None
+    from app.drivers.dns import CLOUD_DNS_DRIVERS  # noqa: PLC0415
+    from app.models.dns import DNSServer  # noqa: PLC0415
+
+    drivers = (
+        (await db.execute(select(DNSServer.driver).where(DNSServer.group_id == group.id)))
+        .scalars()
+        .all()
+    )
+    return next((d for d in sorted(set(drivers)) if d in CLOUD_DNS_DRIVERS), None)
 
 
 def compute_reverse_zone_names(network: str) -> list[str]:
@@ -202,8 +233,29 @@ async def ensure_reverse_zones_for_subnet(
         .all()
     )
     by_name = {z.name: z for z in found}
+    # #1932 — a cloud group that has not opted in gets no NEW reverse zone.
+    # Ones it already holds are still returned, as they were.
+    optout_driver = (
+        await cloud_reverse_optout_driver(db, group)
+        if any(n not in by_name for n in names)
+        else None
+    )
+    if optout_driver is not None:
+        key = (str(subnet.id), str(group.id))
+        log_fn = logger.debug if key in _cloud_optout_warned else logger.warning
+        _cloud_optout_warned.add(key)
+        log_fn(
+            "reverse_zone_skipped_cloud_optout",
+            subnet_id=str(subnet.id),
+            network=str(subnet.network),
+            group_id=str(group.id),
+            driver=optout_driver,
+            missing=sum(1 for n in names if n not in by_name),
+        )
     out: list[DNSZone] = []
     for name in names:
+        if optout_driver is not None and name not in by_name:
+            continue
         zone = await _ensure_zone_named(db, subnet, group, name, by_name.get(name), current_user)
         if zone is not None:
             out.append(zone)

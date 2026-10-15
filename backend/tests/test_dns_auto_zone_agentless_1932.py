@@ -63,21 +63,27 @@ def provider(monkeypatch: pytest.MonkeyPatch) -> type[_FakeTechnitium]:
     _FakeTechnitium.log = []
     _FakeTechnitium.zones = {FWD}
     _FakeTechnitium.fail_zone_create = False
-    monkeypatch.setitem(_DRIVERS, "technitium_api", _DRIVERS["technitium_api"])
-    register_driver("technitium_api", _FakeTechnitium)  # type: ignore[arg-type]
+    for name in ("technitium_api", "route53"):
+        monkeypatch.setitem(_DRIVERS, name, _DRIVERS[name])
+        register_driver(name, _FakeTechnitium)  # type: ignore[arg-type]
     return _FakeTechnitium
 
 
 async def _setup(
-    db: AsyncSession, *, agentless: bool, network: str = "10.55.7.0/24"
+    db: AsyncSession,
+    *,
+    agentless: bool,
+    network: str = "10.55.7.0/24",
+    driver: str | None = None,
+    opt_in: bool = False,
 ) -> tuple[Subnet, DNSServerGroup]:
-    grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}", auto_reverse_zones_at_provider=opt_in)
     db.add(grp)
     await db.flush()
     db.add(
         DNSServer(
             group_id=grp.id,
-            driver="technitium_api" if agentless else "technitium",
+            driver=driver or ("technitium_api" if agentless else "technitium"),
             host="10.0.0.1",
             name="ns1",
             is_primary=True,
@@ -304,3 +310,114 @@ async def test_copilot_zone_create_pushes_once_before_the_commit(
             db_session, user, CreateDNSZoneArgs(name="cp2.example.com", group_id=str(grp.id))
         )
     assert exc.value.status_code == 502
+
+
+# ── Cloud groups: reverse zones are opt-in (cost) ────────────────────────────
+
+
+async def test_cloud_group_not_opted_in_gets_no_reverse_zone_and_says_why(
+    db_session: AsyncSession, provider: type[_FakeTechnitium]
+) -> None:
+    """A cloud provider bills per hosted zone: without the group's opt-in the
+    reverse zone is not created at all, so no PTR is queued against a zone the
+    provider will never have, and the IPAM DNS sync report says why. The
+    forward record is unaffected."""
+    from app.services.dns.sync_check import compute_subnet_dns_drift
+
+    subnet, grp = await _setup(db_session, agentless=True, driver="route53")
+    await _autosync(db_session, subnet)
+
+    assert [e for e in provider.log if e[0] == "zone-create"] == []
+    assert ("record-create", f"A:{FWD}") in provider.log
+    assert not any(e[1].startswith("PTR:") for e in provider.log)
+    zones = (await db_session.execute(select(DNSZone).where(DNSZone.name == REV))).scalars().all()
+    assert zones == []
+    ops = (await db_session.execute(select(DNSRecordOp))).scalars().all()
+    assert ops and all(o.zone_name == FWD for o in ops)
+
+    report = await compute_subnet_dns_drift(db_session, subnet.id)
+    assert report.reverse_zone_skipped_reason is not None
+    assert "route53" in report.reverse_zone_skipped_reason
+    assert grp.name in report.reverse_zone_skipped_reason
+
+
+async def test_cloud_group_opted_in_behaves_like_technitium_api(
+    db_session: AsyncSession, provider: type[_FakeTechnitium]
+) -> None:
+    from app.services.dns.sync_check import compute_subnet_dns_drift
+
+    subnet, _grp = await _setup(db_session, agentless=True, driver="route53", opt_in=True)
+    await _autosync(db_session, subnet)
+
+    ptr = ("record-create", f"PTR:{REV}")
+    assert provider.log.index(("zone-create", REV)) < provider.log.index(ptr)
+    ops = (await db_session.execute(select(DNSRecordOp))).scalars().all()
+    assert ops and all(o.state == "applied" for o in ops)
+    report = await compute_subnet_dns_drift(db_session, subnet.id)
+    assert report.reverse_zone_skipped_reason is None
+
+
+async def test_technitium_api_ignores_the_cloud_opt_in(
+    db_session: AsyncSession, provider: type[_FakeTechnitium]
+) -> None:
+    """The setting is for cloud drivers only: an opted-out technitium_api group
+    still gets its reverse zone."""
+    subnet, grp = await _setup(db_session, agentless=True)
+    assert grp.auto_reverse_zones_at_provider is False
+    await _autosync(db_session, subnet)
+    assert REV in provider.zones
+
+
+async def test_upgrade_backfill_marks_only_non_cloud_agentless_groups(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The migration's backfill marks the reverse zones the bug left behind in
+    technitium_api / Windows groups, and never a cloud group's: cloud groups
+    start opted out, so the upgrade creates nothing at a cloud provider."""
+    import importlib.util
+    from pathlib import Path
+
+    from alembic import op as alembic_op
+
+    path = next(Path(__file__).parents[1].glob("alembic/versions/c4f19a2e7d53_*.py"))
+    spec = importlib.util.spec_from_file_location("mig_1932", path)
+    assert spec is not None and spec.loader is not None
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+    statements: list[Any] = []
+    monkeypatch.setattr(alembic_op, "add_column", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(alembic_op, "execute", statements.append, raising=False)
+    mig.upgrade()
+    assert len(statements) == 1
+
+    zones: dict[str, DNSZone] = {}
+    for driver in ("technitium_api", "windows_dns", "route53", "technitium"):
+        grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+        db_session.add(grp)
+        await db_session.flush()
+        agentless = driver != "technitium"
+        db_session.add(
+            DNSServer(
+                group_id=grp.id,
+                driver=driver,
+                host="10.0.0.1",
+                name=f"s-{driver}",
+                is_primary=True,
+                credentials_encrypted=b"x" if agentless else None,
+                agent_id=None if agentless else uuid.uuid4(),
+            )
+        )
+        zone = DNSZone(
+            group_id=grp.id,
+            name=f"{len(zones) + 1}.10.in-addr.arpa.",
+            kind="reverse",
+            is_auto_generated=True,
+        )
+        db_session.add(zone)
+        zones[driver] = zone
+    await db_session.flush()
+    await db_session.execute(statements[0])
+    for zone in zones.values():
+        await db_session.refresh(zone)
+    marked = {d for d, z in zones.items() if z.agentless_create_due_at is not None}
+    assert marked == {"technitium_api", "windows_dns"}
