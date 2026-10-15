@@ -89,13 +89,13 @@ async def test_the_drive_hands_off_instead_of_draining_its_own_node(
     monkeypatch.setattr(orch.per_node, "single_node_upgrade", _single)
 
     stop = asyncio.Event()
-    await orch._drive_loop(db_session, run, stop, "node-a-pod_mine")
+    await orch._drive_loop(db_session, run, stop, "worker-a")
 
     assert driven == []
     assert enqueued == [(run.id, "node-a")]
     assert released == [orch._LEASE_RELEASE_ATTEMPTS]
     # The drive releases its OWN per-drive identity (#1512), never the pod's.
-    assert holders == ["node-a-pod_mine"]
+    assert holders == ["worker-a"]
     # The renewal loop is stopped before the release, or a renew would write
     # this pod back in as the holder.
     assert stop.is_set()

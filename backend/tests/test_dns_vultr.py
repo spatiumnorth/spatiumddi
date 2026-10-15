@@ -514,6 +514,32 @@ async def test_apply_zone_delete(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fake.calls[0]["path"] == "/domains/example.org"
 
 
+# ── #1889 — deleting a zone already absent at the provider is done ──────
+async def test_apply_zone_delete_already_absent_is_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(
+        {"delete": [_FakeResponse(404, {"error": "Invalid domain.", "status": 404})]}
+    )
+    driver = _patch_client(monkeypatch, fake)
+    zone = type("Z", (), {"name": "gone.example."})()
+
+    await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+    assert [c["method"] for c in fake.calls] == ["delete"]
+
+
+async def test_apply_zone_delete_other_errors_still_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for status in (401, 429, 500):
+        fake = _FakeClient({"delete": [_FakeResponse(status, {"error": "nope"})]})
+        driver = _patch_client(monkeypatch, fake)
+        zone = type("Z", (), {"name": "gone.example."})()
+        with pytest.raises(CloudDNSError):
+            await driver._apply_zone(_Server(), _CREDS, zone, "delete")
+
+
 # ── Error surfacing ─────────────────────────────────────────────────────
 async def test_error_envelope_raises_clouddnserror(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {"error": "Invalid API key.", "status": 401}

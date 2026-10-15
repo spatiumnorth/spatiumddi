@@ -34,6 +34,7 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 - **k3s static binary** (~70 MB) at `/usr/local/bin/k3s`; `kubectl` / `crictl` / `ctr` symlink to it.
 - **k3s airgap images** (CoreDNS / local-path / pause / metrics-server) as zst-compressed tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst`. k3s auto-imports them into containerd at boot.
 - **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.10.2-alpine for the Control plane role.
+- **Control-plane environment** is written once, under the chart's `sharedEnv` value, which the umbrella chart appends to the api, worker AND beat containers (#1826). That is where `APPLIANCE_MODE`, `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and `INITIAL_NTP_SERVERS` live. When the slot-image mirror is on, its URL and secret go to the api and the worker (the worker's upgrade preflight checks the mirror's free space), not to beat. The worker runs alert evaluation (`node_pressure`, `cluster_dns_degraded`) and the rolling-upgrade orchestrator, so a variable only the api carries makes every `appliance_mode` gate read as off there. Agent pre-shared keys stay under `api.env`: only the api reads them. `charts-render-check.sh` fails a render where api, worker and beat disagree on the shared set, or where beat carries the mirror secret.
 - **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Appliance installs (and the supervisor on the Control plane); the umbrella chart drives the Control plane. Built at release time + signed.
 - **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
 
@@ -3003,7 +3004,11 @@ whereas pointing the bootloader at it cannot be undone remotely.
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches
-   independently.
+   independently. The URL must start with `https://` (or `file://`, for an
+   image already placed on every node): the supervisor refuses any other
+   scheme, cleartext `http://` included, so Plan — and the per-box
+   schedule — answer 422 for one rather than letting each node's stage step
+   wait out its timeout for a download that never starts (#1752).
 
 The tab's source toggle defaults to **Uploaded** when at least one
 image is on file; otherwise falls back to **URL**. The empty-state
@@ -3051,6 +3056,24 @@ so a first-time operator never gets stuck looking for the upload.
    health-gate → DaemonSet-ready gate → uncordon → settle pause.
 7. Live progress streams into the Plan banner (per-node state pills
    + ETA). Halt / Resume / Abort buttons exposed.
+   A Halt or Abort takes effect when the node in flight ends: the drive
+   finishes the node it is on (cutting a drain or an apply short would
+   leave it half-changed), then writes what happened to that node into
+   the run's history and stops, leaving the run `halted` or `aborted` and
+   the run's events as the operator left them (#1702). Abort does not
+   free the upgrade Lease: the drive releases its own once it has
+   stopped, so a new Plan and Start are refused meanwhile (#1707). A
+   drive whose Lease was taken over by another writes nothing to the run
+   (#1704). If the drive itself died, the Lease lapses after its
+   10-minute duration; a superadmin can free it sooner with
+   **Force release** beside the Lease pill (`POST
+   /api/v1/upgrades/lease/force-release`). That is refused while the
+   holder has renewed the Lease within the last 300 s (a live drive
+   renews every 200 s), and it is audited
+   (`upgrade.lease_force_released`) and recorded on the run. A failed or
+   aborted run's shared-tag hold (#1710) is not ended by the beat task
+   while the aborted drive still holds the Lease: the node it is
+   finishing may yet boot the new slot.
    Each node's own preflight judges `/var` only on the nodes the run
    has still to upgrade: upgrading a node is what shrinks its `/var`,
    so the nodes already done are not asked again (#1709).
