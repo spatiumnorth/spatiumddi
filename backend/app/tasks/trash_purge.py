@@ -111,7 +111,7 @@ async def _retract_records_from_providers(
     Scoped to records whose zone's *primary* is agentless AND enabled: that
     mirrors ``enqueue_record_op``'s dispatch (agent-based BIND9 / PowerDNS records
     dropped from their bundle 30 days ago, and a disabled agentless primary, both
-    push nothing), so ``retracted`` only counts pushes that actually applied.
+    push nothing), so ``retracted`` only counts retractions that were actually queued.
     Records whose whole zone is being purged this sweep are excluded in the query
     — the zone teardown in ``_purge_dns_zones`` retracts them wholesale, and the
     explicit record DELETE in ``_sweep`` likewise skips them.
@@ -151,9 +151,11 @@ async def _retract_records_from_providers(
         if primary is None or not is_agentless(primary.driver) or not primary.is_enabled:
             continue
         op = await enqueue_record_op(db, zone, "delete", record_op_payload(record))
-        # Count only pushes that actually landed — a disabled primary returns
-        # None (handled above) and a rejecting provider lands ``failed``.
-        if op is not None and op.state == "applied":
+        # Count retractions that were queued — the provider is called after
+        # the sweep commits (#1539) and a refusing provider is retried from
+        # the op row, which carries the whole payload. A disabled primary
+        # returns None (handled above).
+        if op is not None and op.state in ("applied", "pending"):
             retracted += 1
     if retracted:
         await db.flush()

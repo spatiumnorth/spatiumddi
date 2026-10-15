@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 # Stable enum the importer stamps on every row it creates. Keep in
 # sync with the values the migration writes into ``import_source``.
@@ -96,6 +96,12 @@ class ImportedZone:
     forwarders: list[str] = field(default_factory=list)
     skipped_record_types: dict[str, int] = field(default_factory=dict)
     parse_warnings: list[str] = field(default_factory=list)
+    # #1892: set by the commit when ``apex_ns_policy="replace"`` rewrote the
+    # apex NS set; recorded in the zone's audit row. Never round-tripped.
+    apex_ns_replaced: dict[str, Any] | None = None
+    # #1892: apex NS targets naming no server of the target group, set by the
+    # preview so the UI can offer ``apex_ns_policy="replace"``. Derived.
+    foreign_apex_ns: list[str] = field(default_factory=list)
 
     @property
     def record_type_histogram(self) -> dict[str, int]:

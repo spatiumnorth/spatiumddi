@@ -196,9 +196,12 @@ key "{{ key.name }}" {
 {%- for view in views %}
 {# Per-view RPZ (issue #24): each view owns its blocklist + the
    response-policy directive. ``view_name == none`` is a group-level
-   blocklist that applies to EVERY view; BIND9 forbids top-level
-   ``zone {}`` alongside views, so RPZ can't be hoisted out. #}
-{%- set view_bls = blocklists | selectattr("view_name", "in", [view.name, none]) | list %}
+   blocklist; a view's own zone already folds the group's lists in, so it
+   is loaded only into a view with no zone of its own (#1706, as the agent
+   renderer does). BIND9 forbids top-level ``zone {}`` alongside views, so
+   RPZ can't be hoisted out. #}
+{%- set view_bls = blocklists | selectattr("view_name", "equalto", view.name) | list %}
+{%- if not view_bls %}{% set view_bls = blocklists | selectattr("view_name", "none") | list %}{% endif %}
 view "{{ view.name }}" {
     match-clients { {% for c in view.match_clients %}{{ c }}; {% endfor %}};
     {%- if view.match_destinations %}

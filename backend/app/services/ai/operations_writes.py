@@ -1622,6 +1622,15 @@ class CommitDNSImportArgs(BaseModel):
     api_key: str | None = Field(default=None, description="PowerDNS API key (powerdns).")
     server_name: str = "localhost"
     target_view_id: uuid.UUID | None = None
+    apex_ns_policy: Literal["keep", "replace"] = Field(
+        default="keep",
+        description=(
+            "'replace' swaps an imported apex NS that names a host outside the "
+            "target group (the source server's own name) for the group's own "
+            "servers; 'keep' imports it as is. The preview lists the affected "
+            "zones under foreign_apex_ns (#1892)."
+        ),
+    )
 
 
 async def _dns_import_pull(db: AsyncSession, args: CommitDNSImportArgs) -> Any:
@@ -1670,14 +1679,27 @@ async def _dns_import_pull(db: AsyncSession, args: CommitDNSImportArgs) -> Any:
         target_group_id=args.target_group_id,
         target_view_id=args.target_view_id,
     )
+    from app.services.dns_import.apex_ns import annotate_apex_ns  # noqa: PLC0415
+
+    await annotate_apex_ns(db, preview, args.target_group_id)
     return preview
 
 
-def _dns_preview_text(preview: Any) -> str:
+def _dns_preview_text(preview: Any, apex_ns_policy: str = "keep") -> str:
     conflicts = len(preview.conflicts)
+    foreign = sum(1 for z in preview.zones if z.foreign_apex_ns)
+    apex = ""
+    if foreign:
+        apex = f"; {foreign} zone(s) have an apex NS outside the target group, which will be " + (
+            "REPLACED by the group's servers"
+            if apex_ns_policy == "replace"
+            else "KEPT (the zone stays delegated to the source)"
+        )
     return (
         f"Import {len(preview.zones)} zone(s) / {preview.total_records} record(s) from "
-        f"{preview.source}" + (f"; {conflicts} conflict(s) will be SKIPPED" if conflicts else "")
+        f"{preview.source}"
+        + (f"; {conflicts} conflict(s) will be SKIPPED" if conflicts else "")
+        + apex
     )
 
 
@@ -1692,7 +1714,9 @@ async def _preview_commit_dns_import(
         return PreviewResult(ok=False, detail=str(exc))
     if not preview.zones:
         return PreviewResult(ok=False, detail="No zones found to import from the source")
-    return PreviewResult(ok=True, detail="ready", preview_text=_dns_preview_text(preview))
+    return PreviewResult(
+        ok=True, detail="ready", preview_text=_dns_preview_text(preview, args.apex_ns_policy)
+    )
 
 
 async def _apply_commit_dns_import(
@@ -1711,6 +1735,7 @@ async def _apply_commit_dns_import(
         target_view_id=args.target_view_id,
         conflict_actions={},
         current_user=user,
+        apex_ns_policy=args.apex_ns_policy,
     )
     return {
         "zones_created": result.total_zones_created,
