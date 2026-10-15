@@ -190,12 +190,18 @@ dnsPowerdns:
     repository: ghcr.io/spatiumnorth/dns-powerdns
   # Scheduling weight for the serving pod — see dnsBind9.resources. The
   # three DNS drivers are interchangeable roles on the same node, so they
-  # carry the same floor: whichever one the operator assigns must not be
+  # carry the same weight: whichever one the operator assigns must not be
   # the BestEffort pod the control plane starves.
+  #
+  # Memory (#1828): 128Mi, above the pod's idle working set. The kubelet
+  # ranks evictions by "is usage over the memory REQUEST" BEFORE it looks at
+  # priority, so a serving pod running above its request is evicted ahead of
+  # every pod within its own request, whatever the PriorityClasses say. A
+  # request is therefore only a floor if the pod stays under it.
   resources:
     requests:
       cpu: 250m
-      memory: 64Mi
+      memory: 128Mi
   controlPlaneUrl: ""
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
@@ -226,13 +232,14 @@ dnsTechnitium:
   image:
     repository: ghcr.io/spatiumnorth/dns-technitium
   # Scheduling weight for the serving pod — see dnsBind9.resources. The
-  # memory request is the same 64Mi floor the other DNS roles carry; it is
-  # a scheduling and eviction-ranking floor, not a sizing estimate, and
-  # Technitium's .NET runtime idles well above it. Requests only.
+  # memory request is 256Mi like BIND's (#1828): the .NET runtime idles well
+  # above the 64Mi floor this used to carry, and a serving pod over its
+  # request is ranked for eviction ahead of pods within theirs, regardless of
+  # PriorityClass. Requests only.
   resources:
     requests:
       cpu: 250m
-      memory: 64Mi
+      memory: 256Mi
   controlPlaneUrl: ""
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
@@ -271,6 +278,11 @@ dhcpKea:
   # api ran at 110 %, its socket queue overflowed and only 37 % of the
   # DISCOVERs on the wire were answered. Requests only, no limits.
   #
+  # Memory (#1828): 128Mi. Kea's working set is 66-72 Mi at idle on the
+  # measured appliances, which sat ABOVE the 64Mi this carried, and the
+  # kubelet evicts a pod over its memory request ahead of pods within theirs
+  # before it ever looks at the PriorityClass.
+  #
   # 500m is the value every measured cell used (#967): what does the work
   # under contention is the cgroup weight the request derives to, and
   # 500m (weight 20) holds ~48 % of the CPU against the api + worker where
@@ -281,7 +293,7 @@ dhcpKea:
   resources:
     requests:
       cpu: 500m
-      memory: 64Mi
+      memory: 128Mi
   controlPlaneUrl: ""
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
@@ -321,10 +333,12 @@ lookingGlass:
   # weight on the node, and a starved collector misses keepalives until
   # the peer's hold timer expires and the session flaps — louder than a
   # dropped query. Requests only, no limits, same shape as dnsBind9.
+  # Memory is 128Mi (#1828) so the pod stays within its request, which is
+  # what keeps it behind the control plane in the kubelet's eviction order.
   resources:
     requests:
       cpu: 50m
-      memory: 64Mi
+      memory: 128Mi
   # Same precedence + rationale as dnsBind9.controlPlaneUrl /
   # inClusterApiUrl above: external operator-facing URL (Application
   # appliance, self-signed) takes priority over the in-cluster Service

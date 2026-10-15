@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DNS and DHCP pods no longer rank ahead of the control plane for
+  eviction under memory pressure (#1828).** The kubelet ranks a memory
+  eviction by whether a pod's usage is over its memory request before it
+  looks at the PriorityClass, and the serving pods requested 64Mi while
+  Kea (66-72 Mi), BIND and PowerDNS/Technitium used more at idle, so under
+  pressure they went ahead of the database, the cache and the UI whatever
+  `spatium-service` says. The role chart now requests 128Mi for Kea,
+  PowerDNS and the looking-glass collector and 256Mi for Technitium (BIND
+  already did, #1725). A new test fails any `spatium-service` role
+  requesting less than 128Mi.
+
 - **An agent's config long-poll answers 404, not 500, when its server row is
   deleted under it (#1936).** `DELETE .../servers/{id}` wakes the server's
   channel and removes the row; the open long-poll woke and refreshed a row that
