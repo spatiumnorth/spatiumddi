@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Trashing a subnet now withdraws its own DNS records, instead of
+  leaving them answering from a zone that stays (#1906).** When one of
+  two subnets sharing a /24 reverse zone went to Trash, the zone was
+  correctly kept for the survivor, but the deleted subnet's host A
+  records, their PTRs and its gateway PTR kept being served, with no
+  page showing them. Trashing a subnet, block or space now retracts
+  the auto-generated A / AAAA / PTR records of every subnet it takes
+  through the record-op queue (agents and agentless primaries alike)
+  and trashes them under the same batch; Restore re-asserts them, and
+  purging the subnet drops them. A reverse zone that goes to Trash
+  with its subnet is unchanged. Hand-made records are left alone.
+  **This changes #1151's behaviour on purpose:** a trashed subnet's
+  records used to keep answering until the purge withdrew them (#1152
+  left that as an open question and the delete dialog described it);
+  they are now withdrawn when the subnet goes to Trash, and the dialog
+  says so. A restore can now refuse (409, naming the record) when an
+  identical record was created by hand while the subnet sat in Trash.
+
 - **The BIND9 pod has a memory limit, and named's cache is bounded
   (#1725).** `dns-bind9` had none: loading a ~580k-entry catalog
   blocklist into a group with a view took it to 2.8-3.6 GB, so on a

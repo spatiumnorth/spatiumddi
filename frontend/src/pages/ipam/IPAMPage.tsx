@@ -8087,11 +8087,11 @@ function EditSubnetModal({
             </strong>{" "}
             and its DHCP scopes will be moved to Trash, with the reverse zones
             created for it unless another subnet still uses one. The addresses
-            you allocated stay with it, and their A/AAAA records keep resolving
-            while it is in Trash. You can restore them together within 30 days
-            from Administration → Trash; after that the nightly purge deletes
-            the subnet and its addresses for good and withdraws their DNS
-            records.
+            you allocated stay with it, and the DNS records published for them
+            stop resolving while it is in Trash. You can restore them together
+            within 30 days from Administration → Trash, which publishes those
+            records again; after that the nightly purge deletes the subnet, its
+            addresses and their records for good.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -8366,12 +8366,13 @@ function EditSubnetModal({
             Deleting a subnet moves it and its DHCP scopes to Trash, restorable
             together for 30 days, along with the reverse zones created for it
             (except one another subnet still uses). The addresses you allocated
-            stay with it and come back on restore, and their A/AAAA records keep
-            resolving while it is in Trash. Addresses from DHCP (leases and
-            reservations) are removed straight away with their DNS records;
-            reservations come back with their scope on restore. Purging the
-            subnet from Trash deletes its addresses and withdraws their DNS
-            records. The deletion is gated by a confirm in the next step.
+            stay with it and come back on restore; the DNS records published for
+            them stop resolving while it is in Trash and are published again on
+            restore. Addresses from DHCP (leases and reservations) are removed
+            straight away with their DNS records; reservations come back with
+            their scope on restore. Purging the subnet from Trash deletes its
+            addresses and their records for good. The deletion is gated by a
+            confirm in the next step.
           </p>
           <button
             onClick={() => setDeleteStep(1)}
