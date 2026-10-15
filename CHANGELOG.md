@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A delete the approval queue took is reported as queued, not as nothing
+  (#1915).** With `governance.approvals` on, deleting an IP space, block or
+  subnet answers `202` and the object stays. The IPAM tree's Delete… dialogs,
+  Edit Space and Edit Block read any 2xx as "deleted" and closed with no word;
+  Edit Subnet said "Submitted for approval", but in its red error box. All five
+  now say it in a neutral status box, leave the object (and the tree selection)
+  in place, refresh the approval queue, and stop offering Move to Trash again,
+  since a second click filed a second change request. The Copilot's card for
+  a risky proposal the queue took read "approved"; it now reads "awaiting
+  approval".
+
 - **IPAM no longer writes a twin beside a record an operator already
   wrote (#1867).** An address allocated at a name and value an operator
   had written by hand into the zone got an `auto_generated` copy beside
