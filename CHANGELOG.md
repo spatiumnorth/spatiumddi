@@ -104,6 +104,13 @@ the formatter handles the rest.
   name. Before, the preview judged neither the size nor the mirror
   exemption, and the UI only enables Plan on a passing preview.
 
+- **The MAC-sighting sniffer no longer re-imports scapy and re-walks the
+  layer chain on every frame (#1109, Part 4).** `parse_sighting_packet`
+  ran seven `from scapy... import` statements and up to six `haslayer`
+  walks per ARP / ND packet. The layer classes are now resolved once on
+  first use and the chain is walked once; the extracted `(MAC, IP)` pairs
+  are unchanged. Parts 1 and 3 shipped earlier; the DNS half of Part 2
+  shipped with #1111, whose DHCP / looking-glass half remains open.
 - **A rolling upgrade no longer drops its Lease on one unanswered
   kubeapi read, and a `running` run whose drive is gone is resumed
   (#1713).** A node reboot or a loaded host makes a Lease read time out;
