@@ -106,6 +106,79 @@ the formatter handles the rest.
   previous listen port and the previous firewall fragment are both put back,
   so SSH stays reachable where it was.
 
+- **A reverse zone auto-created in an agentless group now reaches the
+  provider, so its PTRs stop failing "No such zone was found" (#1932).**
+  IPAM auto-sync, DDNS and subnet create wrote the reverse zone row and
+  nothing else; only the zone endpoints pushed it to `technitium_api`,
+  Windows Path B and the cloud drivers, so every PTR op failed and retried.
+  The zone is now marked as not yet at the provider and created after the
+  commit, ahead of its record ops. Whichever path sends one of those ops
+  first, the request or the retry sweep, creates a still-marked zone
+  before it, and ops whose zone cannot be created wait with that error.
+  The mark clears once the zone is at the provider, so a zone that got
+  there once is never created again, even if it is later deleted at the
+  provider. One commit creates at most 16 zones inline (a /17 needs 128);
+  the retry sweep creates the rest, 32 a minute. On upgrade, reverse
+  zones SpatiumDDI auto-created in a `technitium_api` or Windows DNS group
+  are marked and created by the sweep; a zone already at the provider is left
+  as it is. The Copilot's zone create now pushes to the provider before
+  its commit, as the REST create does. Agent-managed groups are unchanged.
+  Groups running a cloud DNS driver (Route 53, Azure DNS, Google Cloud DNS,
+  Cloudflare and the others) only get auto-created reverse zones when the
+  new group setting *Auto-create reverse zones at the provider* is on,
+  because the provider bills per hosted zone and a /17 makes 128. It is off
+  by default and for every existing group, so the upgrade creates nothing
+  at a cloud provider. Opted out, a subnet gets no reverse zone and its PTRs
+  are skipped; the subnet's DNS sync report says why. Reverse zones a cloud
+  group already holds are kept.
+
+- **DNS and DHCP pods no longer rank ahead of the control plane for
+  eviction under memory pressure (#1828).** The kubelet ranks a memory
+  eviction by whether a pod's usage is over its memory request before it
+  looks at the PriorityClass, and the serving pods requested 64Mi while
+  Kea (66-72 Mi), BIND and PowerDNS/Technitium used more at idle, so under
+  pressure they went ahead of the database, the cache and the UI whatever
+  `spatium-service` says. The role chart now requests 128Mi for Kea,
+  PowerDNS and the looking-glass collector and 256Mi for Technitium (BIND
+  already did, #1725). A new test fails any `spatium-service` role
+  requesting less than 128Mi.
+
+- **An agent's config long-poll answers 404, not 500, when its server row is
+  deleted under it (#1936).** `DELETE .../servers/{id}` wakes the server's
+  channel and removes the row; the open long-poll woke and refreshed a row that
+  no longer existed, which SQLAlchemy raised as `Could not refresh instance`
+  and the API answered with an unhandled 500. The DNS and DHCP long-polls (and
+  the DNS inline-render refresh) now answer 404 for a vanished row, the same
+  as for a token whose server is unknown at the start of a request, which is
+  what makes the agent discard its JWT and re-register.
+
+- **A paginated list's `total` no longer counts rows in Trash (#1933).** The
+  shared `paginate` helper counts through
+  `select(count()).select_from(base.subquery())`, and the global soft-delete
+  filter only looked at the outer statement's FROM, so it saw an anonymous
+  subquery and skipped it: the page query was filtered and the count was not.
+  A zone with four of ten records trashed listed six rows under `total: 10`,
+  so the pager offered pages that came back empty. The filter now looks inside
+  subquery FROMs (and CTEs), with the criterion placed inside the subquery.
+  The lists this changes are the zone and group-wide record lists; the other
+  count-over-subquery sites count models that are not soft-deleted. A
+  statement that opts out with `include_deleted` still counts Trash.
+
+- **The control plane's DNSSEC keys for a BIND zone follow the keys BIND
+  serves (#1934).** When BIND changed a zone's keys without a structural
+  reload (a pod replacement that re-keyed the zone, a manual or
+  policy-driven rollover), the zone page kept the old key and a DS made from
+  it. The reported build predated #1886, whose 5-minute re-read is what
+  first let a key change with no reload reach the control plane at all
+  (nothing was refused: no report was sent). That re-read still had gaps:
+  a read or report that failed waited a full 5 minutes to try again, a
+  manual rollover's report was the pre-rollover key set (BIND generates the
+  successor after `rndc` returns), and an `rndc` that could not answer for
+  the zone yet was reported as "no keys", clearing the key rows. The agent
+  now looks again 20 s after any report, rollover or failed read, doubling
+  up to 5 minutes while a zone stays unreadable, and leaves a zone `rndc`
+  cannot answer for out of the report instead of clearing its keys.
+
 - **The DNS Pools and DNSSEC Policies pages no longer offer writes the API
   refuses (#1879).** Every pool write (create, edit, delete, check now) and
   every DNSSEC-policy write takes a superadmin, but the top-level DNS Pools
@@ -4258,6 +4331,15 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
+  **On the upgrade itself, expect up to two minutes of 500s from
+  appliance host-state reads (#1661).** After the reboot into the new
+  slot, k3s keeps serving the previous release's api until the new
+  control chart rolls it, and that api has no gid 2770, so
+  `GET /api/v1/appliance/slot-upgrade` (and the setup-state and
+  system-info reads) answer `500` until the new api is Ready — about
+  90 s in testing, mixed in with the 502s the rollout already causes.
+  The upgrade completes normally; retry once the new api serves. This
+  happens once, on the upgrade that introduces the tightened directory.
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
@@ -4676,6 +4758,14 @@ the formatter handles the rest.
   cannot say where its archive was written, so NULL (unknown) stays.
 - `a1903c5e7b24` — #1903, additive: nullable `appliance.cluster_transition_id`
   and `appliance.cluster_transition_at`. Downgrade drops both.
+- `c4f19a2e7d53` — #1932, additive + data: nullable
+  `dns_zone.agentless_create_due_at` (an auto-created zone whose provider
+  create is outstanding, and when the sweep may next try) and
+  `dns_server_group.auto_reverse_zones_at_provider` (NOT NULL, default
+  false). Backfill marks the non-imported, auto-generated reverse zones in
+  groups with a `technitium_api` or Windows DNS server with credentials and
+  no cloud server, due now; cloud groups are not marked. Downgrade drops
+  both columns.
 
 ## 2026.10.02-1 — 2026-10-02
 

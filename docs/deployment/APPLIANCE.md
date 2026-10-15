@@ -159,7 +159,7 @@ answered ~5 % of the queries the load generator sent — the control plane
 had failed over, the data plane had nothing to serve with. Assign the DNS
 and DHCP roles on every node you expect to keep serving during a failover.
 
-The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). RAM has a hard floor as well, and the installer does not enforce it: the kubelet sets aside 2 GiB on every node (`kube-reserved` 1 GiB, `system-reserved` 512 MiB and the 512 MiB `memory.available` eviction threshold — #1124) and schedules pods only into what is left. A single-node control plane requests about 1.6 GiB, so it needs **at least 4 GiB of RAM** to start at all, and a DNS / DHCP appliance **at least 3 GiB**; below that the pods stay `Pending` on `Insufficient memory`. That includes an existing install: a slot upgrade to a release carrying #1124 on a smaller box comes back with nothing schedulable. 8 GiB remains the comfortable recommendation for a control plane. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
+The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). RAM has a hard floor as well, and the installer does not enforce it: the kubelet sets aside 2 GiB on every node (`kube-reserved` 1 GiB, `system-reserved` 512 MiB and the 512 MiB `memory.available` eviction threshold — #1124) and schedules pods only into what is left. A single-node control plane requests about 1.6 GiB, so it needs **at least 4 GiB of RAM** to start at all, and a DNS / DHCP appliance **at least 3 GiB**; below that the pods stay `Pending` on `Insufficient memory`. The serving roles add their own requests on top of that: BIND and Technitium 256Mi, Kea, PowerDNS and the looking-glass collector 128Mi each. They are sized above the pods' idle working sets because the kubelet evicts a pod running over its memory request before any pod within its request, whatever the PriorityClasses say (#1828). A single node with the control plane plus the DNS and DHCP roles therefore requests about 2 GiB, which uses up all the allocatable memory a 4 GiB node has. That includes an existing install: a slot upgrade to a release carrying #1124 on a smaller box comes back with nothing schedulable. 8 GiB remains the comfortable recommendation for a control plane. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
 
 ### Appliance management surfaces (k3s-aware)
 
@@ -2748,6 +2748,24 @@ amd64.raw.xz` with the kernel + initrd baked in + the image-
 baseline fstab + a snapshotted `/usr/lib/etc.image/`. Every
 GitHub release attaches the slot image + its SHA-256 sidecar
 at versioned + `/latest/` URLs.
+
+#### Upgrading from a build older than #1621: a short window of 500s (#1661)
+
+Since #1621 `/var/lib/spatiumddi/release-state` is `1770 root:2770` and
+the api pod carries `supplementalGroups: [2770]`. The booted slot applies
+that mode at sysinit, but k3s first restarts the previous release's api,
+which has no gid 2770 and cannot be changed after the fact. Until the new
+control chart replaces it, that api answers `500` on reads of the
+directory: `GET /api/v1/appliance/slot-upgrade`, and the setup-state and
+system-info reads. In testing this lasted about 90 s and overlapped the
+502s the pod rollout causes anyway. The upgrade itself is unaffected;
+retry once the new api serves. It happens once, on the upgrade that
+introduces the tightened directory.
+
+This is documented rather than bridged on purpose. Bridging it means a
+boot-time unit that hands the trigger directory to the api's uid until
+the new api is up, in the directory every root host runner trusts, to
+avoid a one-time status-read error that no UI page depends on.
 
 ### Rolling back: the database stays on `/var` (#1227)
 

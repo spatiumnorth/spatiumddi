@@ -49,6 +49,7 @@ from app.services.agents.ingest_receipt import (
     claim_batch,
     duplicate_response,
 )
+from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
@@ -581,7 +582,7 @@ async def agent_config_longpoll(
             # Pick up server-row column changes a wake signals (fleet markers,
             # group, maintenance) — read off this cached instance, since the
             # bundle re-queries collections but not the server row.
-            await db.refresh(server)
+            await refresh_agent_server(db, server)
             bundle = await build_config_bundle(db, server)
             # Issue #153 — fold the rendered snmpd.conf hash into the ETag
             # mix below so a Settings → Appliance → SNMP change wakes the
