@@ -92,13 +92,19 @@ the formatter handles the rest.
   both reload commands exit 0. The log said "sshd reloaded" over a failed
   unit, with no sshd running until the next connection. Under socket
   activation the runner now restarts `ssh.service` (the socket keeps the
-  port, sessions survive, `KillMode=process`) and judges success by whether
-  the unit is active afterwards. A failed apply now fails the trigger and
-  leaves the applied-hash sidecar unwritten, so Fleet shows it as not
-  applied instead of green. Also fixed on the way: under socket activation
-  sshd ignores `Port`, so a changed `ssh_port` opened the firewall for a port
-  nothing listened on; the runner now writes an `ssh.socket` `ListenStream`
-  drop-in and re-binds the socket when the port changes.
+  port, open sessions survive, `KillMode=process`), which also clears a unit
+  an earlier save left failed, and judges success by whether the unit is
+  active afterwards. A failed apply now fails the trigger and leaves the
+  applied-hash sidecar unwritten, so Fleet shows it as not applied instead of
+  green. Also fixed on the way: under socket activation sshd ignores `Port`,
+  so a changed `ssh_port` opened the firewall for a port nothing listened on.
+  The runner now writes an `ssh.socket` `ListenStream` drop-in and re-binds
+  the socket, which needs `ssh.service` stopped first (systemd refuses to
+  start the socket while its service runs). Because the port now really
+  moves, the move is guarded: it happens only after the firewall has loaded
+  the rule for the new port, and if the socket cannot bind the new port the
+  previous listen port and the previous firewall fragment are both put back,
+  so SSH stays reachable where it was.
 
 - **Delete Zone no longer says the zone is permanently deleted (#1880).**
   The dialog, its confirm checkbox, the "Confirm Permanent Deletion"

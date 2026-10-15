@@ -32,7 +32,9 @@
 #      bad port change can't lock the operator out.
 #   7. Apply to sshd: restart ssh.service under socket activation (a reload
 #      re-execs sshd, which cannot bind the port ssh.socket holds, #1632),
-#      otherwise reload; success = the unit is active afterwards.
+#      re-binding ssh.socket first when the port changed (rolled back, with
+#      the firewall fragment, if it cannot bind); otherwise reload. Success
+#      = the unit is active afterwards.
 #   8. Write the hash sidecar + the per-host applied key-count sidecar.
 #
 # Apply flow when disabled (the pristine default: password auth on, no
@@ -108,8 +110,10 @@ fi
 
 # Apply the sshd drop-in (#1632).
 #
-# Debian trixie runs sshd SOCKET-ACTIVATED: ssh.socket holds :22 and hands the
-# listening fd to ssh.service. `systemctl reload ssh.service` is the wrong
+# On the appliance sshd runs SOCKET-ACTIVATED: the image enables both
+# ssh.socket and ssh.service, so ssh.socket holds the port and hands the
+# listening fd to ssh.service (Accept=no, so one long-running sshd, not
+# per-connection sshd@.service). `systemctl reload ssh.service` is the wrong
 # tool there. The unit's ExecReload is `sshd -t` + `kill -HUP $MAINPID`, and
 # sshd answers SIGHUP by re-executing itself and binding its OWN listeners,
 # which fails ("Cannot bind any address") because the socket unit owns the
@@ -117,44 +121,65 @@ fi
 # ssh.service goes `failed` and no sshd runs until the next connection makes
 # the socket start a fresh one.
 #
-# So under socket activation we RESTART ssh.service instead: the socket stays
-# bound across it (queued connections wait, none are refused) and the new sshd
-# inherits the fd. ssh.service has KillMode=process, so established sessions
-# survive. A changed port is not an sshd matter at all under socket
-# activation: the new ListenStream (sync_socket_listen above) only binds once
-# the SOCKET is restarted after a daemon-reload, so $1 = "socket" asks for that.
-# Without socket activation a plain reload is correct (sshd binds its own
-# listeners) and is still used.
+# So under socket activation we RESTART ssh.service instead (and start it if
+# an earlier reload left it failed): the socket stays bound across it and the
+# new sshd inherits the fd. ssh.service has KillMode=process, so established
+# sessions survive. Without socket activation a plain reload is correct (sshd
+# binds its own listeners) and is still used.
+#
+# Under socket activation sshd IGNORES sshd_config's Port, so a changed
+# ssh_port only takes effect through the socket's own ListenStream. Debian
+# trixie ships no generator that derives it (README.Debian: override it with
+# an ssh.socket.d drop-in), so sync_socket_listen writes one. Re-binding the
+# socket has two traps, both verified against trixie's systemd:
+#   - after daemon-reload a running socket whose ListenStream changed closes
+#     its fd ("not functional until restarted");
+#   - systemd REFUSES to start an Accept=no socket while its service is
+#     active ("Socket service ssh.service already active, refusing").
+# So a port change stops ssh.service, restarts ssh.socket, then starts
+# ssh.service. Until the stop, the running sshd keeps serving the OLD port on
+# its own copy of the fd, so the only listener gap is that sequence itself.
+# If the socket cannot bind the new port, the previous drop-in is restored
+# and the socket re-bound on the old port, and SOCK_ROLLED_BACK=1 tells the
+# caller to restore the previous firewall fragment too: a listener on the old
+# port behind a firewall that only opens the new one is the lockout.
 #
 # Success is whatever systemd reports AFTER the action, never the exit code
 # of the action: that was the original bug, a "successful" reload that left
 # the unit failed. A false return makes the caller fail the trigger, so the
 # hash sidecar stays unwritten and Fleet shows the config as not applied.
-# Under socket activation sshd runs on the fd ssh.socket hands it and IGNORES
-# sshd_config's Port, so a changed ssh_port only takes effect through the
-# socket's own ListenStream. Debian trixie ships no generator that derives it
-# (README.Debian: override it with an ssh.socket.d drop-in), so write one.
-# $1 = the port ("22" removes the drop-in: the unit's own ListenStream=22
-# stands). Sets SOCK_ARG=socket when the drop-in changed, i.e. the socket must
-# be re-bound for the new port to listen.
 SOCKET_DROPIN=/etc/systemd/system/ssh.socket.d/spatiumddi-listen.conf
 SOCK_ARG=""
+SOCK_PREV_EXISTS=0
+SOCK_PREV_CONTENT=""
+SOCK_ROLLED_BACK=0
+
+# $1 = the port ("22" removes the drop-in: the unit's own ListenStream=22
+# stands). Sets SOCK_ARG=socket when the drop-in changed, i.e. the socket must
+# be re-bound for the new port to listen, and records the previous drop-in so
+# reload_sshd can put it back.
 sync_socket_listen() {
     local port="$1" want
     # No ssh.socket unit on this image: nothing to configure.
     systemctl cat ssh.socket >/dev/null 2>&1 || return 0
+    SOCK_PREV_EXISTS=0
+    SOCK_PREV_CONTENT=""
+    if [ -f "$SOCKET_DROPIN" ]; then
+        SOCK_PREV_EXISTS=1
+        SOCK_PREV_CONTENT="$(cat "$SOCKET_DROPIN")"
+    fi
     want="# Managed by SpatiumDDI (spatiumddi-ssh-reload): sshd_config Port is ignored under socket activation.
 [Socket]
 ListenStream=
 ListenStream=$port"
     if [ "$port" = "22" ]; then
-        if [ -f "$SOCKET_DROPIN" ]; then
+        if [ "$SOCK_PREV_EXISTS" = 1 ]; then
             rm -f "$SOCKET_DROPIN"
             SOCK_ARG="socket"
         fi
         return 0
     fi
-    if [ -f "$SOCKET_DROPIN" ] && [ "$(cat "$SOCKET_DROPIN")" = "$want" ]; then
+    if [ "$SOCK_PREV_EXISTS" = 1 ] && [ "$SOCK_PREV_CONTENT" = "$want" ]; then
         return 0
     fi
     mkdir -p "$(dirname "$SOCKET_DROPIN")"
@@ -163,43 +188,70 @@ ListenStream=$port"
     SOCK_ARG="socket"
 }
 
+restore_socket_listen() {
+    if [ "$SOCK_PREV_EXISTS" = 1 ]; then
+        printf '%s\n' "$SOCK_PREV_CONTENT" > "$SOCKET_DROPIN"
+        chmod 0644 "$SOCKET_DROPIN"
+    else
+        rm -f "$SOCKET_DROPIN"
+    fi
+}
+
+# is-active, read after a short settle: a SIGHUP re-exec dies asynchronously,
+# after `systemctl reload` has already returned.
+active_after_settle() {
+    sleep "${SSH_SETTLE_SECONDS:-1}"
+    systemctl is-active --quiet "$1" 2>/dev/null
+}
+
 reload_sshd() {
-    local restart_socket="${1:-}"
+    local restart_socket="${1:-}" socket_active=0
+    # Read BEFORE daemon-reload, which can leave a changed socket unit
+    # non-functional. An inactive socket means sshd listens by itself; the
+    # drop-in is then inert and must not be used to switch models.
+    systemctl is-active --quiet ssh.socket 2>/dev/null && socket_active=1
     systemctl daemon-reload >/dev/null 2>&1 || echo "  ! systemctl daemon-reload failed"
-    if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    if [ "$socket_active" = 1 ]; then
         if [ "$restart_socket" = "socket" ]; then
-            if ! systemctl restart ssh.socket >/dev/null 2>&1; then
-                echo "  ✗ ssh.socket restart failed"
+            systemctl stop ssh.service >/dev/null 2>&1 || true
+            if ! systemctl restart ssh.socket >/dev/null 2>&1 \
+                || ! systemctl is-active --quiet ssh.socket 2>/dev/null; then
+                echo "  ✗ ssh.socket could not bind the new listen port; restoring the previous one"
+                restore_socket_listen
+                SOCK_ROLLED_BACK=1
+                systemctl daemon-reload >/dev/null 2>&1 || true
+                if systemctl restart ssh.socket >/dev/null 2>&1; then
+                    echo "  ✓ ssh.socket restored on its previous listen port"
+                else
+                    echo "  ✗ ssh.socket could not be restored either"
+                fi
+                systemctl start ssh.service >/dev/null 2>&1 || true
                 return 1
             fi
-            echo "  ✓ ssh.socket restarted (listen port re-read)"
+            echo "  ✓ ssh.socket re-bound (listen port changed)"
         fi
-        # Only a RUNNING sshd needs bouncing: an idle socket starts a fresh
-        # one, on the new config, with the next connection.
-        if systemctl is-active --quiet ssh.service 2>/dev/null; then
-            if ! systemctl restart ssh.service >/dev/null 2>&1; then
-                echo "  ✗ ssh.service restart failed"
-                systemctl status ssh.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
-                return 1
-            fi
-            if ! systemctl is-active --quiet ssh.service 2>/dev/null; then
-                echo "  ✗ ssh.service is not active after restart"
-                return 1
-            fi
-            echo "  ✓ ssh.service restarted (socket-activated)"
-        else
-            echo "  ✓ sshd idle under ssh.socket; the new config applies on the next connection"
+        # restart also STARTS a stopped or failed ssh.service, which clears a
+        # failed unit an earlier reload left behind.
+        if ! systemctl restart ssh.service >/dev/null 2>&1; then
+            echo "  ✗ ssh.service restart failed"
+            systemctl status ssh.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+            return 1
+        fi
+        if ! active_after_settle ssh.service; then
+            echo "  ✗ ssh.service is not active after restart"
+            return 1
         fi
         if ! systemctl is-active --quiet ssh.socket 2>/dev/null; then
             echo "  ✗ ssh.socket is not active after apply"
             return 1
         fi
+        echo "  ✓ ssh.service restarted (socket-activated)"
         return 0
     fi
     # No socket activation: sshd listens by itself, a reload re-execs cleanly.
     if systemctl reload ssh.service >/dev/null 2>&1 \
         || systemctl reload sshd.service >/dev/null 2>&1; then
-        if systemctl is-active --quiet ssh.service 2>/dev/null; then
+        if active_after_settle ssh.service; then
             echo "  ✓ sshd reloaded"
             return 0
         fi
@@ -210,15 +262,37 @@ reload_sshd() {
     return 1
 }
 
-# nftables reload so /etc/nftables.d/ drop-in changes take effect. Same
-# best-effort pattern as the SNMP runner.
+# nftables reload so /etc/nftables.d/ drop-in changes take effect. Returns
+# the reload's status; the enabled path refuses to move the ssh listener when
+# it fails (#1632), the disabled path stays best-effort.
 nft_reload() {
     if systemctl reload nftables.service >/dev/null 2>&1; then
         echo "  ✓ nftables reloaded"
-    else
-        echo "  ! nftables reload failed (ssh port may stay closed until next boot)"
-        systemctl status nftables.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+        return 0
     fi
+    echo "  ! nftables reload failed (ssh port may stay closed until next boot)"
+    systemctl status nftables.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+    return 1
+}
+
+# The firewall fragment as it was before this run, so a failed apply can put
+# back the rule for the port sshd is STILL listening on (#1632). Since the
+# socket drop-in makes ssh_port real, a fragment for the new port in front of
+# a listener left on the old one is a lockout, not a cosmetic mismatch.
+NFT_PREV_EXISTS=0
+NFT_PREV_CONTENT=""
+if [ -f "$NFT_DROPIN" ]; then
+    NFT_PREV_EXISTS=1
+    NFT_PREV_CONTENT="$(cat "$NFT_DROPIN")"
+fi
+restore_nft_fragment() {
+    if [ "$NFT_PREV_EXISTS" = 1 ]; then
+        printf '%s\n' "$NFT_PREV_CONTENT" > "$NFT_DROPIN"
+        chmod 0644 "$NFT_DROPIN"
+    else
+        rm -f "$NFT_DROPIN"
+    fi
+    systemctl reload nftables.service >/dev/null 2>&1 || true
 }
 
 MARKER=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
@@ -449,17 +523,23 @@ PYEOF
         # reload nftables` fails atomically and the new port never opens,
         # and on the next boot the bad fragment fails the whole
         # transactional `nft -f` (fail-open, no input filtering). Mirror the
-        # firewall runner: validate, and on failure drop the fragment before
-        # erroring so the master config still loads clean. Since #1001 this
-        # runs before the sshd drop-in is installed, so an abort here leaves
-        # the ssh port unchanged rather than moved-but-unreachable.
+        # firewall runner: validate, and on failure put the previous fragment
+        # back (it loaded before, and it opens the port sshd still listens
+        # on) so the master config still loads clean. Since #1001 this runs
+        # before the sshd drop-in is installed, so an abort here leaves the
+        # ssh port unchanged rather than moved-but-unreachable.
         if ! nft -c -f "$NFT_MAIN" 2>/tmp/spatium-ssh-nft-check.err; then
             sed 's/^/      /' /tmp/spatium-ssh-nft-check.err
-            rm -f "$NFT_DROPIN"
-            systemctl reload nftables.service >/dev/null 2>&1 || true
-            fail "rendered ssh nft drop-in failed nft -c -f — fragment removed"
+            restore_nft_fragment
+            fail "rendered ssh nft drop-in failed nft -c -f — previous fragment restored"
         fi
-        nft_reload
+        # The new port must really be open before the listener moves to it
+        # (#1632): a fragment that passed -c but did not load leaves the new
+        # port closed, and sshd on it unreachable.
+        if ! nft_reload; then
+            restore_nft_fragment
+            fail "nftables did not load the ssh fragment — previous fragment restored, sshd not moved"
+        fi
 
         # Atomic install of authorized_keys (owned by admin, 0600, dir 0700).
         install -d -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0700 "$(dirname "$AK_FILE")"
@@ -479,6 +559,9 @@ PYEOF
         echo "  ✓ sshd drop-in installed"
 
         if ! reload_sshd "$SOCK_ARG"; then
+            # The socket went back to its previous port: the firewall goes
+            # back with it, or it would open only a port nothing listens on.
+            [ "$SOCK_ROLLED_BACK" = 1 ] && restore_nft_fragment
             # The config is installed but sshd is not running it: leave the
             # hash sidecar alone so Fleet reports "not applied" (#1632).
             fail "sshd did not come back after applying the config"
@@ -497,7 +580,7 @@ PYEOF
         sync_socket_listen 22
         if [ -f "$NFT_DROPIN" ]; then
             rm -f "$NFT_DROPIN"
-            nft_reload
+            nft_reload || true
         fi
         # Stub authorized_keys so an operator who SSHes in sees the note.
         # Preserve any existing content first (#550): an operator may have
@@ -515,6 +598,7 @@ EOF
             chmod 0600 "$AK_FILE"
         fi
         if ! reload_sshd "$SOCK_ARG"; then
+            [ "$SOCK_ROLLED_BACK" = 1 ] && restore_nft_fragment
             fail "sshd did not come back after removing the managed config"
         fi
         : > "$HASH_SIDECAR"

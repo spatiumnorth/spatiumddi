@@ -1,14 +1,22 @@
 """spatiumddi-ssh-reload must not leave ssh.service failed (#1632).
 
-Debian trixie runs sshd socket-activated: ``ssh.socket`` holds :22.  A
-``systemctl reload ssh.service`` sends SIGHUP, sshd re-execs itself, cannot
-bind the port the socket owns and dies, while the reload command itself exits
-0 -- so the runner logged success over a failed unit.
+The appliance image enables both ``ssh.socket`` and ``ssh.service``, so sshd
+runs socket-activated: the socket holds the port and hands the fd to
+``ssh.service``.  A ``systemctl reload ssh.service`` sends SIGHUP, sshd
+re-execs itself, cannot bind the port the socket owns and dies, while the
+reload command itself exits 0 -- so the runner logged success over a failed
+unit.
 
-These tests extract ``reload_sshd`` / ``current_ssh_port`` from the shipped
-script and run them under **bash** against a stub ``systemctl`` that models
-that behaviour, then assert on the unit state the stub ends in -- never on the
-exit code of the action.
+These tests extract the apply functions from the shipped script and run them
+under **bash** against a stub ``systemctl`` that models the systemd behaviour
+verified on Debian trixie (systemd 257, openssh-server 1:10.0p1-7+deb13u4):
+
+- a reload under an active socket leaves the service dead, exit 0;
+- systemd REFUSES to (re)start an ``Accept=no`` socket while its service is
+  active ("Socket service ssh.service already active, refusing").
+
+They assert on the unit state the stub ends in -- never on the exit code of
+the action.
 
 HOW TO RUN: python3 -m pytest appliance/tests/test_ssh_reload_socket_activation.py -v
 """
@@ -18,8 +26,6 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
-
-import pytest
 
 SCRIPT = (
     Path(__file__).resolve().parent.parent
@@ -33,31 +39,48 @@ SCRIPT = (
 STUB = r"""#!/bin/bash
 S="$STATE"
 echo "$*" >> "$S/calls"
-quiet=""
-[ "${1:-}" = "is-active" ] && { shift; [ "${1:-}" = "--quiet" ] && shift; [ -f "$S/$1.active" ]; exit $?; }
+if [ "${1:-}" = "is-active" ]; then
+  shift; [ "${1:-}" = "--quiet" ] && shift; [ -f "$S/$1.active" ]; exit $?
+fi
 case "$1 ${2:-}" in
   "daemon-reload "*) exit 0 ;;
+  "cat ssh.socket") exit 0 ;;
   "reload ssh.service")
     # sshd re-execs on SIGHUP; under socket activation it cannot bind and dies,
     # but ExecReload (sshd -t; kill -HUP) has already exited 0.
     if [ -f "$S/ssh.socket.active" ]; then rm -f "$S/ssh.service.active"; fi
     exit 0 ;;
-  "restart ssh.service")
-    [ -n "${FAIL_SERVICE_RESTART:-}" ] && exit 1
+  "stop ssh.service") rm -f "$S/ssh.service.active"; exit 0 ;;
+  "start ssh.service"|"restart ssh.service")
+    [ -n "${FAIL_SERVICE_RESTART:-}" ] && { rm -f "$S/ssh.service.active"; exit 1; }
     touch "$S/ssh.service.active"; exit 0 ;;
   "restart ssh.socket")
-    [ -n "${FAIL_SOCKET_RESTART:-}" ] && exit 1
+    rm -f "$S/ssh.socket.active"
+    # systemd refuses to start an Accept=no socket while its service runs.
+    [ -f "$S/ssh.service.active" ] && exit 1
+    if [ -n "${FAIL_SOCKET_RESTART_ONCE:-}" ] && [ ! -f "$S/socket-failed-once" ]; then
+      touch "$S/socket-failed-once"; exit 1
+    fi
     touch "$S/ssh.socket.active"; exit 0 ;;
+  "reload nftables.service") echo reloaded >> "$S/nft-reloads"; exit 0 ;;
   "status "*) echo "stub status"; exit 0 ;;
 esac
 exit 0
 """
 
+FUNCTIONS = (
+    "sync_socket_listen",
+    "restore_socket_listen",
+    "active_after_settle",
+    "reload_sshd",
+    "restore_nft_fragment",
+)
+
 
 def _functions() -> str:
     text = SCRIPT.read_text(encoding="utf-8")
     out = []
-    for name in ("sync_socket_listen", "reload_sshd"):
+    for name in FUNCTIONS:
         m = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", text, re.S | re.M)
         assert m, f"{name} not found in the shipped script"
         out.append(m.group(0))
@@ -83,27 +106,39 @@ def _run(
         (state / "ssh.socket.active").touch()
     if service:
         (state / "ssh.service.active").touch()
-    tmp_path.mkdir(parents=True, exist_ok=True)
+    # The shipped script runs under `set -euo pipefail`; so do the tests.
     snippet = (
-        f'SOCKET_DROPIN="{tmp_path}/ssh.socket.d/spatiumddi-listen.conf"\nSOCK_ARG=""\n'
+        f'SOCKET_DROPIN="{tmp_path}/ssh.socket.d/spatiumddi-listen.conf"\n'
+        f'NFT_DROPIN="{tmp_path}/50-spatium-ssh.nft"\n'
+        'SOCK_ARG=""\nSOCK_PREV_EXISTS=0\nSOCK_PREV_CONTENT=""\nSOCK_ROLLED_BACK=0\n'
+        'NFT_PREV_EXISTS=0\nNFT_PREV_CONTENT=""\n'
         f"{_functions()}\n{call}\n"
     )
     proc = subprocess.run(
-        ["bash", "-uo", "pipefail", "-c", snippet],
+        ["bash", "-euo", "pipefail", "-c", snippet],
         capture_output=True,
         text=True,
-        env={"PATH": f"{bindir}:/usr/bin:/bin", "STATE": str(state), **(env or {})},
+        env={
+            "PATH": f"{bindir}:/usr/bin:/bin",
+            "STATE": str(state),
+            "SSH_SETTLE_SECONDS": "0",
+            **(env or {}),
+        },
         check=False,
     )
     return proc, state
 
 
+def _calls(state: Path) -> list[str]:
+    return (state / "calls").read_text().splitlines()
+
+
 def test_socket_activated_apply_leaves_the_service_active(tmp_path: Path) -> None:
-    proc, state = _run(tmp_path, "reload_sshd; echo rc=$?", socket=True, service=True)
+    proc, state = _run(tmp_path, "reload_sshd && echo rc=0", socket=True, service=True)
     assert "rc=0" in proc.stdout, proc.stdout + proc.stderr
     assert (state / "ssh.service.active").exists(), "ssh.service was left failed"
     assert (state / "ssh.socket.active").exists()
-    calls = (state / "calls").read_text()
+    calls = _calls(state)
     assert "reload ssh.service" not in calls, "a reload re-execs sshd and dies under the socket"
     assert "restart ssh.service" in calls
 
@@ -116,35 +151,86 @@ def test_the_old_reload_would_have_failed_the_unit(tmp_path: Path) -> None:
     assert not (state / "ssh.service.active").exists()
 
 
-def test_idle_socket_is_not_forced_to_start_sshd(tmp_path: Path) -> None:
-    proc, state = _run(tmp_path, "reload_sshd; echo rc=$?", socket=True, service=False)
-    assert "rc=0" in proc.stdout
-    assert "restart ssh.service" not in (state / "calls").read_text()
-
-
-def test_a_port_change_rebinds_the_socket(tmp_path: Path) -> None:
-    proc, state = _run(tmp_path, "reload_sshd socket; echo rc=$?", socket=True, service=True)
-    assert "rc=0" in proc.stdout
-    calls = (state / "calls").read_text().splitlines()
-    # daemon-reload first (the generator re-reads Port), socket before service.
-    assert calls.index("daemon-reload") < calls.index("restart ssh.socket")
-    assert calls.index("restart ssh.socket") < calls.index("restart ssh.service")
-
-
-def test_without_socket_activation_a_reload_is_used_and_verified(tmp_path: Path) -> None:
-    proc, state = _run(tmp_path, "reload_sshd; echo rc=$?", socket=False, service=True)
-    assert "rc=0" in proc.stdout
-    assert "reload ssh.service" in (state / "calls").read_text()
+def test_a_service_an_earlier_reload_left_failed_is_started(tmp_path: Path) -> None:
+    # A node upgraded from a build with the bug can carry ssh.service failed;
+    # the next apply must clear it, not leave it for the next connection.
+    proc, state = _run(tmp_path, "reload_sshd && echo rc=0", socket=True, service=False)
+    assert "rc=0" in proc.stdout, proc.stdout + proc.stderr
     assert (state / "ssh.service.active").exists()
 
 
-@pytest.mark.parametrize(
-    "env",
-    [{"FAIL_SERVICE_RESTART": "1"}, {"FAIL_SOCKET_RESTART": "1"}],
-)
-def test_a_failed_apply_is_reported_not_swallowed(tmp_path: Path, env: dict[str, str]) -> None:
-    arg = "socket" if "FAIL_SOCKET_RESTART" in env else ""
-    proc, _ = _run(tmp_path, f"reload_sshd {arg}; echo rc=$?", socket=True, service=True, env=env)
+def test_a_port_change_stops_the_service_before_rebinding_the_socket(tmp_path: Path) -> None:
+    proc, state = _run(tmp_path, "reload_sshd socket && echo rc=0", socket=True, service=True)
+    assert "rc=0" in proc.stdout, proc.stdout + proc.stderr
+    calls = _calls(state)
+    # systemd refuses to start the socket while its service is active, so the
+    # stop must come first; the stub fails the restart otherwise.
+    assert calls.index("daemon-reload") < calls.index("stop ssh.service")
+    assert calls.index("stop ssh.service") < calls.index("restart ssh.socket")
+    assert calls.index("restart ssh.socket") < calls.index("restart ssh.service")
+    assert (state / "ssh.socket.active").exists()
+    assert (state / "ssh.service.active").exists()
+
+
+def test_a_socket_that_cannot_bind_the_new_port_is_put_back(tmp_path: Path) -> None:
+    proc, state = _run(
+        tmp_path,
+        'sync_socket_listen 2222; SOCK_ARG=""; sync_socket_listen 2223; '
+        'reload_sshd "$SOCK_ARG" || echo "rc=1 rolled=$SOCK_ROLLED_BACK"',
+        socket=True,
+        service=True,
+        env={"FAIL_SOCKET_RESTART_ONCE": "1"},
+    )
+    assert "rc=1 rolled=1" in proc.stdout, proc.stdout + proc.stderr
+    body = (tmp_path / "ssh.socket.d" / "spatiumddi-listen.conf").read_text()
+    assert "ListenStream=2222" in body and "2223" not in body
+    assert (state / "ssh.socket.active").exists(), "socket left down after rollback"
+    assert (state / "ssh.service.active").exists(), "sshd left down after rollback"
+
+
+def test_rolling_back_to_no_drop_in_removes_it(tmp_path: Path) -> None:
+    proc, _ = _run(
+        tmp_path,
+        'sync_socket_listen 2222; reload_sshd "$SOCK_ARG" || echo "rc=1 rolled=$SOCK_ROLLED_BACK"',
+        socket=True,
+        service=True,
+        env={"FAIL_SOCKET_RESTART_ONCE": "1"},
+    )
+    assert "rc=1 rolled=1" in proc.stdout, proc.stdout + proc.stderr
+    assert not (tmp_path / "ssh.socket.d" / "spatiumddi-listen.conf").exists()
+
+
+def test_an_inactive_socket_is_not_used_to_switch_models(tmp_path: Path) -> None:
+    proc, state = _run(tmp_path, "reload_sshd socket && echo rc=0", socket=False, service=True)
+    assert "rc=0" in proc.stdout, proc.stdout + proc.stderr
+    calls = _calls(state)
+    assert "restart ssh.socket" not in calls
+    assert "reload ssh.service" in calls
+    assert (state / "ssh.service.active").exists()
+
+
+def test_a_failed_apply_is_reported_not_swallowed(tmp_path: Path) -> None:
+    proc, _ = _run(
+        tmp_path,
+        "reload_sshd || echo rc=1",
+        socket=True,
+        service=True,
+        env={"FAIL_SERVICE_RESTART": "1"},
+    )
+    assert "rc=1" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_a_reload_that_kills_sshd_is_caught_after_the_settle(tmp_path: Path) -> None:
+    # The reload path must judge by the unit state, not by `systemctl reload`'s
+    # exit code. Model a host whose socket is NOT active per the precheck but
+    # whose reload still leaves sshd dead.
+    proc, state = _run(
+        tmp_path,
+        'systemctl() { if [ "$1" = reload ]; then rm -f "$STATE/ssh.service.active"; return 0; fi; '
+        'command systemctl "$@"; }; reload_sshd || echo rc=1',
+        socket=False,
+        service=True,
+    )
     assert "rc=1" in proc.stdout, proc.stdout + proc.stderr
 
 
@@ -179,8 +265,42 @@ def test_going_back_to_22_removes_the_drop_in_and_rebinds(tmp_path: Path) -> Non
     assert not (tmp_path / "ssh.socket.d" / "spatiumddi-listen.conf").exists()
 
 
+def test_restore_nft_fragment_puts_the_previous_rule_back(tmp_path: Path) -> None:
+    proc, state = _run(
+        tmp_path,
+        'NFT_PREV_EXISTS=1; NFT_PREV_CONTENT="tcp dport 2222 accept"; '
+        'echo "tcp dport 2223 accept" > "$NFT_DROPIN"; restore_nft_fragment',
+        socket=True,
+        service=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "50-spatium-ssh.nft").read_text() == "tcp dport 2222 accept\n"
+    assert (state / "nft-reloads").exists()
+
+
+def test_restore_nft_fragment_removes_a_fragment_that_did_not_exist(tmp_path: Path) -> None:
+    proc, _ = _run(
+        tmp_path,
+        'echo "tcp dport 2223 accept" > "$NFT_DROPIN"; restore_nft_fragment',
+        socket=True,
+        service=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not (tmp_path / "50-spatium-ssh.nft").exists()
+
+
 def test_callers_no_longer_swallow_the_result() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
     assert "reload_sshd || true" not in text, (
         "a failed sshd apply must fail the trigger so the hash sidecar stays unwritten"
     )
+    # Both callers put the firewall back when the socket went back.
+    assert text.count('[ "$SOCK_ROLLED_BACK" = 1 ] && restore_nft_fragment') == 2
+
+
+def test_the_listener_moves_only_after_the_firewall_loaded() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    enabled = text[text.index("    enabled)") : text.index("    disabled)")]
+    nft_gate = enabled.index("if ! nft_reload; then")
+    assert nft_gate < enabled.index('install -o root -g root -m 0644 "$SSHD_TMP" "$SSHD_DROPIN"')
+    assert nft_gate < enabled.index('sync_socket_listen "$PORT"')
