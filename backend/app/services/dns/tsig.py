@@ -298,6 +298,31 @@ def _answered_badkey(exc: BaseException) -> bool:
     return False
 
 
+async def resolve_transfer_vip(db: AsyncSession) -> str:
+    """The appliance's DNS resolver VIP, or ``""`` when none is configured.
+
+    #1470 — with ``dns_vip`` set the DNS pods drop hostNetwork and sit behind
+    a MetalLB LoadBalancer, so the node address a ``DNSServer`` row carries
+    answers nothing on :53 and only the VIP reaches the daemon. Resolved once
+    per drift / sync call, because the drift fan-out touches no DB.
+    """
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+
+    ps = await db.get(PlatformSettings, 1)
+    return ((ps.dns_vip if ps else "") or "").strip()
+
+
+def transfer_fallback_hosts(server: DNSServer, vip: str) -> list[str]:
+    """Extra addresses to AXFR ``server`` from when its own refuses (#1470).
+
+    Only an agent-managed server of a driver whose agent grants the signed
+    transfer can sit behind the appliance VIP; Windows, cloud and an
+    operator's own BIND9 are reached at their own address and must not be
+    redirected anywhere.
+    """
+    return [vip] if vip and transfer_needs_tsig(server) else []
+
+
 async def pull_zone_records_signed(
     driver: Any,
     server: Any,
@@ -351,6 +376,8 @@ __all__ = [
     "is_view_transfer_key",
     "legacy_group_key",
     "pull_zone_records_signed",
+    "resolve_transfer_vip",
+    "transfer_fallback_hosts",
     "resolve_group_transfer_key",
     "resolve_view_transfer_key",
     "rotate_group_tsig_key",

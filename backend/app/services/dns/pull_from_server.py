@@ -40,7 +40,9 @@ from app.services.dns.serial import bump_zone_serial
 from app.services.dns.tsig import (
     pull_zone_records_signed,
     resolve_group_transfer_key,
+    resolve_transfer_vip,
     resolve_view_transfer_key,
+    transfer_fallback_hosts,
     transfer_needs_tsig,
 )
 from app.services.technitium.rdata import (
@@ -384,6 +386,15 @@ def without_server_apex_ns(
     ]
 
 
+async def _fallback_kwargs(db: AsyncSession, server: Any) -> dict[str, Any]:
+    """``pull_zone_records`` kwargs naming the appliance DNS VIP as the address
+    to retry on a refused connection (#1470); empty when it cannot apply."""
+    if not transfer_needs_tsig(server):
+        return {}
+    hosts = transfer_fallback_hosts(server, await resolve_transfer_vip(db))
+    return {"fallback_hosts": hosts} if hosts else {}
+
+
 async def _resolve_primary_and_driver(
     db: AsyncSession, zone: DNSZone, server: Any | None = None
 ) -> tuple[Any, Any, list[TsigKey | None], str | None]:
@@ -568,7 +579,12 @@ async def pull_zone_from_server(
     primary, driver, keys, view_name = await _resolve_primary_and_driver(db, zone)
 
     on_wire, _key_used = await pull_zone_records_signed(
-        driver, primary, zone.name, keys, view_name=view_name
+        driver,
+        primary,
+        zone.name,
+        keys,
+        view_name=view_name,
+        **await _fallback_kwargs(db, primary),
     )
 
     db_rows_res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))
@@ -840,7 +856,12 @@ async def sync_zone_with_server(
     primary, driver, keys, view_name = await _resolve_primary_and_driver(db, zone, server)
 
     on_wire, _key_used = await pull_zone_records_signed(
-        driver, primary, zone.name, keys, view_name=view_name
+        driver,
+        primary,
+        zone.name,
+        keys,
+        view_name=view_name,
+        **await _fallback_kwargs(db, primary),
     )
 
     # Snapshot DB state BEFORE the pull so we can compute the push set

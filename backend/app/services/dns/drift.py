@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
 import structlog
 from sqlalchemy import select
@@ -37,7 +38,9 @@ from app.services.dns.tsig import (
     is_view_transfer_key,
     pull_zone_records_signed,
     resolve_group_transfer_key,
+    resolve_transfer_vip,
     resolve_view_transfer_key,
+    transfer_fallback_hosts,
     transfer_needs_tsig,
 )
 
@@ -185,6 +188,8 @@ async def compute_zone_drift(
     # one derived key per view into that view alone; sign with the key of the
     # view holding this zone's copy, and keep the group key as the fallback
     # for an agent that predates the view keys.
+    # #1470 — behind the appliance's DNS VIP the node address refuses :53.
+    transfer_vip = await resolve_transfer_vip(db) if needs_tsig else ""
     view_transfer = await resolve_view_transfer_key(db, zone) if needs_tsig else None
     view_key, view_name = view_transfer if view_transfer is not None else (None, None)
     # server_id -> the transfer was addressed to the zone's own view.
@@ -231,7 +236,11 @@ async def compute_zone_drift(
             # authorised by address; handing either a key it never granted
             # turns a working pull into NOTAUTH.
             keys = [None]
-        pull_kwargs = {"include_apex_ns": True} if _renders_apex_ns(srv, driver) else {}
+        pull_kwargs: dict[str, Any] = (
+            {"include_apex_ns": True} if _renders_apex_ns(srv, driver) else {}
+        )
+        if fallback := transfer_fallback_hosts(srv, transfer_vip):
+            pull_kwargs["fallback_hosts"] = fallback
         try:
             on_wire, used = await pull_zone_records_signed(
                 driver, srv, zone.name, keys, view_name=view_name, **pull_kwargs

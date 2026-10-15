@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Drift and pull-from-server reach an agent-managed BIND9 or Technitium
+  that answers only on the appliance's DNS VIP (#1470).** With
+  `dns_vip` set the DNS pods drop hostNetwork, so the node address a
+  server row carries refuses TCP/53 and every drift report and
+  scheduled pull failed for the whole group. When the node address
+  actively refuses the connection, the zone transfer is now retried
+  against the VIP (same port, same TSIG key). A timeout or unreachable
+  host never falls back, so a down node is still reported down. The
+  VIP reaches whichever member the load balancer picks. The
+  misreported-as-TSIG half of #1470 was fixed in an earlier release.
+
 - **A rolling upgrade no longer drops its Lease on one unanswered
   kubeapi read, and a `running` run whose drive is gone is resumed
   (#1713).** A node reboot or a loaded host makes a Lease read time out;
