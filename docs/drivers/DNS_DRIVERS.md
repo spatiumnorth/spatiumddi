@@ -283,8 +283,14 @@ config-driven, not op-driven (unlike PowerDNS's REST sign):
    the key-directory and signs on load.
 3. **DS + key-state report.** After a reload the agent's `collect_dnssec_state`
    runs `rndc dnssec -status <zone>` (parsed by the version-tolerant
-   `_parse_dnssec_status`) + `dnssec-dsfromkey` over the KSK key files, and
-   POSTs the DS rrset + per-key state to `/dns/agents/dnssec-state`. The
+   `_parse_dnssec_status`) + a DS computed in-process (dnspython `make_ds`,
+   SHA-256) from the KSK key files — no `dnssec-dsfromkey` binary, which the
+   Alpine image does not carry — and POSTs the DS rrset + per-key state to
+   `/dns/agents/dnssec-state`. Only KSKs whose `.state` file says `DSState:
+   rumoured` or `omnipresent` get a DS, which is BIND's own CDS rule
+   (`syncpublish` in `lib/dns/dnssec.c`); a key with no `.state` file is
+   included. The sync loop re-collects every 5 minutes and posts only a
+   change, because those transitions happen hours after the reload. The
    control plane mirrors it into `DNSZone.dnssec_ds_records` + `DNSKey` rows
    (replace-per-zone) for the operator's DS-export + key-status view.
 4. **Manual rollover.** `POST .../dnssec/rollover` enqueues a

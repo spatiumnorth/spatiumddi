@@ -1942,6 +1942,13 @@ its records).
   "move to Trash. You can restore from Admin → Trash within 30
   days." Hard-delete is reachable via the Permanent button on the
   Trash row.
+- A trashed subnet stops publishing: the auto-generated A / AAAA / PTR
+  records IPAM wrote for its addresses (gateway PTR included) are
+  retracted through the record-op queue and trashed under the same
+  batch, so a Restore re-asserts them (#1906). Records in a reverse
+  zone that goes to Trash with the subnet ride that zone; records in
+  a zone that stays (a /24 reverse zone kept for a sibling /25, the
+  forward zone) are what this covers. Hand-made records are untouched.
 - IP addresses are deliberately NOT soft-deletable — they
   cascade-delete with their parent subnet, and the parent subnet
   is the recoverable unit.

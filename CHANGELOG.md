@@ -99,6 +99,119 @@ the formatter handles the rest.
   `POST /auth/mfa/enroll/reauth`; `GET /auth/mfa/status` gains
   `enrol_provider_name` and two `enrol_requires` values.
 
+- **A Let's Encrypt certificate issued or renewed on an appliance is now
+  deployed to the Web UI without an api restart (#1895).** Issuance runs
+  in the Celery worker, whose ServiceAccount deliberately cannot patch
+  the `spatium-appliance-tls` Secret, so the renewed certificate sat in
+  the database and the old one kept being served. The worker now wakes
+  the api over Redis after committing, and the api deploys the active
+  certificate (also on a 60 s reconcile tick, under an advisory lock, and
+  only when the Secret differs; a frontend roll that fails after the
+  Secret was patched is retried rather than read as converged). The
+  worker no longer attempts the patch or logs
+  `appliance_cert_secret_patch_failed` on every renewal, and the
+  `secret_expiring` alert judges the certificate actually served (from a
+  snapshot the api publishes, since the worker cannot read the Secret),
+  flagging when the stored one is not deployed. The active certificate
+  was always redeployed over a differing Secret at api start; that is
+  now continuous, so a certificate written into the Secret by hand is
+  replaced within a minute.
+
+- **A BIND9-signed zone on the appliance now gets its DS (#1854).**
+  The agent derived the DS by running `dnssec-dsfromkey` only when that
+  binary was on `PATH`, and the Alpine dns-bind9 image does not carry
+  it, so every signed zone reported an empty DS with nothing logged and
+  the zone card had no record to paste at the parent. The agent now
+  computes the SHA-256 DS from the KSK `.key` file in-process with
+  dnspython, so no binary can be missing from an image, and a signed
+  zone that still yields no DS logs why (`dnssec_ds_pending` or
+  `dnssec_ds_unavailable`) instead of reporting empty in silence. The DS
+  shown follows BIND's own CDS rule: only a KSK whose `DSState` is
+  rumoured or omnipresent gets one, so a newly signed zone shows its DS
+  once BIND considers the DNSKEY propagated (about two hours on the
+  `default` policy), and a KSK withdrawn after a rollover drops out. The
+  agent now re-reads DNSSEC state every 5 minutes rather than only after a
+  config reload, so those changes reach the card without one, and each
+  key in the per-key table carries its own DS rather than every KSK's.
+
+- **Trashing a subnet now withdraws its own DNS records, instead of
+  leaving them answering from a zone that stays (#1906).** When one of
+  two subnets sharing a /24 reverse zone went to Trash, the zone was
+  correctly kept for the survivor, but the deleted subnet's host A
+  records, their PTRs and its gateway PTR kept being served, with no
+  page showing them. Trashing a subnet, block or space now retracts
+  the auto-generated A / AAAA / PTR records of every subnet it takes
+  through the record-op queue (agents and agentless primaries alike)
+  and trashes them under the same batch; Restore re-asserts them, and
+  purging the subnet drops them. A reverse zone that goes to Trash
+  with its subnet is unchanged. Hand-made records are left alone.
+  **This changes #1151's behaviour on purpose:** a trashed subnet's
+  records used to keep answering until the purge withdrew them (#1152
+  left that as an open question and the delete dialog described it);
+  they are now withdrawn when the subnet goes to Trash, and the dialog
+  says so. A restore can now refuse (409, naming the record) when an
+  identical record was created by hand while the subnet sat in Trash.
+
+- **The BIND9 pod has a memory limit, and named's cache is bounded
+  (#1725).** `dns-bind9` had none: loading a ~580k-entry catalog
+  blocklist into a group with a view took it to 2.8-3.6 GB, so on a
+  6 GiB appliance the kubelet evicted the worker, Postgres and the api
+  and then the kernel killed named. The appliance chart, the umbrella
+  chart's DNS agents, `k8s/dns` and the Compose files now carry a
+  256Mi request and a 2Gi limit (Compose: `DNS_BIND9_MEM_LIMIT`), so an
+  overload is the pod's own. The agent also writes `max-cache-size`
+  (a quarter of the container's memory limit) into named.conf, since
+  BIND's default is 90 % of the host's RAM for each view's cache (the
+  quarter is split across the recursive views); override with
+  `NAMED_MAX_CACHE_SIZE`. A named killed by the limit is no longer a
+  silent crash loop: the agent reads the container's OOM-kill counter,
+  persists the kill across the restart, and reports the daemon as not
+  serving with the reason until it stays up for 10 minutes, which raises
+  the default-on **Agent daemon not serving** alert. The appliance limit is one cluster-wide value
+  rather than sized per node (the role chart must render identically on
+  every node, #1137); a list that needs more raises it with a
+  HelmChartConfig. Sizing guidance is in `DNS.md` 8.0 and
+  `APPLIANCE.md`. A new chart check refuses a BIND9 container with no
+  memory limit or one under 1Gi.
+
+- **A demoting control-plane member's row read `ready` for the whole
+  leave (#1806).** Demote stamps `leaving`, but the node keeps reporting
+  its last verdict (`ready`) until its leave runner writes its own state,
+  and the heartbeat applied it, so Fleet and the cluster view showed a
+  member being removed as healthy. While a demote is `leaving`, a reported
+  `ready` / `joining` is now ignored; the runner's own `leaving`, `left`
+  and `failed` still apply. The mirror race on promote (a once-demoted
+  node still reporting `left` while its row says `joining`) is guarded the
+  same way.
+
+- **A Halt or Abort mid-node, and a drive that lost the upgrade Lease,
+  no longer get overwritten by the drive (#1702, #1704, #1707).** A
+  rolling-upgrade drive kept its own copy of the run for the whole of a
+  node and wrote it back when the node ended, so a node that failed turned
+  a `halted` or `aborted` run `failed` (with a new `finished_at` and an
+  upgrade-failed alert), and a node that succeeded dropped the operator's
+  `halted`, `aborted` and `resumed` events from the run's history. A
+  drive whose Lease another drive had taken over could do the same, and
+  so could its crash handler. Every terminal write now re-reads the run
+  under a row lock and goes ahead only if the run is still `running` and
+  this drive is still its holder; Halt, Resume and Abort take the same
+  lock. A node that ends after a stop is recorded under
+  `progress.per_node` and a `node_ended_after_stop` event, and the state
+  is left alone. Abort also no longer frees the Lease at once: the
+  aborted drive releases its own when it stops, so a second run cannot
+  plan and start while a node is still being worked on (a run that never
+  started has no drive, and still frees it). A drive that died holds the
+  Lease until it lapses (10 min); a superadmin can free it sooner with
+  **Force release** (`POST /upgrades/lease/force-release`), which is
+  refused while the holder still renews it and is audited. Halt and Abort
+  are also honoured between nodes and around the end-of-roll flip: a Halt
+  while the shared-tag hold (#1710) is being placed now stops the node it
+  was meant to stop, and the flip's own record writes no longer drop
+  events committed meanwhile. The fence's row lock is never held across
+  a kubeapi call, the post-upgrade verify or alert delivery. A lease
+  renewal that dies of an unexpected error now stops the drive, as a
+  refused one does.
+
 - **Deleting a DNS zone permanently from the Trash now removes it from
   agentless servers too (#1830).** A zone is never torn down at
   soft-delete (a hosted zone re-created on restore gets a new id and NS
