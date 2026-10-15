@@ -44,11 +44,28 @@ function useLayerSeq(): number {
 const escStack = createLayerStack();
 const trapStack = createLayerStack();
 
-/** True while any dialog is open. Non-dialog Esc handlers (the copilot
- *  drawer, popovers) consult it so one Esc does not dismiss them as well as
- *  the dialog over them. */
+/** True while any dialog (or overlay layer) is open. Non-dialog Esc handlers
+ *  (the copilot drawer, popovers) consult it so one Esc does not dismiss them
+ *  as well as the dialog over them. */
 export function hasOpenModal(): boolean {
   return escStack.size() > 0 || trapStack.size() > 0;
+}
+
+/** Make an overlay that is not built on these hooks (the search palette) the
+ *  topmost layer while `active`, so the dialogs under it neither take its Esc
+ *  nor pull its Tab back into themselves. The overlay handles its own Esc and
+ *  must stop it propagating. */
+export function useOverlayLayer(active: boolean): void {
+  useEffect(() => {
+    if (!active) return;
+    const seq = ++layerSeq;
+    const esc = escStack.push(seq);
+    const trap = trapStack.push(seq);
+    return () => {
+      esc.remove();
+      trap.remove();
+    };
+  }, [active]);
 }
 
 /**
@@ -171,14 +188,12 @@ export function useFocusTrap<T extends HTMLElement>() {
       );
 
     // Respect an existing autoFocus inside the dialog; otherwise focus the
-    // first control that is not the title bar's close button, falling back
-    // to the dialog container (tabindex -1) so screen readers announce it.
+    // dialog container itself (tabindex -1) so screen readers announce it and
+    // the operator tabs into the content. Never a control: the first one can
+    // be a confirm's destructive button, which Enter would then fire.
     if (!node.contains(document.activeElement)) {
       node.setAttribute("tabindex", "-1");
-      const first = focusables().find(
-        (el) => el.getAttribute("aria-label") !== "Close dialog",
-      );
-      (first ?? node).focus();
+      node.focus();
     }
 
     // Bound on the document, not the dialog: focus can sit outside it (the
