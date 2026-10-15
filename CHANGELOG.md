@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Kubernetes Detect CIDRs answered 500 when the token held a non-ASCII
+  character (#1913).** The bearer token goes straight into an
+  `Authorization` header; httpx encodes header values as ASCII and raises
+  while building the client, outside the one `except` the probe had, so a
+  token with a pasted smart quote, accent, space or line break was a 500
+  from `POST /kubernetes/clusters/detect-cidrs` (and test-connection), against
+  the helper's own "never raises" promise. A token that cannot be a bearer
+  token, or an `api_server_url` httpx cannot parse, is now a 422 saying what
+  is wrong, and `_detect_cidrs` returns a message instead of raising whatever
+  fails. The check lives in one helper (`app/core/header_credentials.py`)
+  and also guards the Tailscale, NetBird, Meraki, FortiGate, UniFi, PAN-OS
+  and Proxmox credential fields, which build their headers the same way.
+
 - **An imported zone no longer has to stay delegated to the server it was
   migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
   BIND9, PowerDNS and Technitium importers keep the source's apex NS, which the

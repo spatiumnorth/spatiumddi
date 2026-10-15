@@ -31,6 +31,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1._common import StatusResponse
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.header_credentials import header_credential_problem, header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
 from app.models.audit import AuditLog
@@ -92,6 +93,8 @@ class ClusterBase(BaseModel):
 class ClusterCreate(ClusterBase):
     token: str  # plaintext; encrypted before persist
 
+    _check_token = field_validator("token")(header_secret)
+
 
 class ClusterUpdate(BaseModel):
     """Partial update — any unset field is left unchanged.
@@ -112,6 +115,8 @@ class ClusterUpdate(BaseModel):
     service_cidr: str | None = None
     sync_interval_seconds: int | None = None
     mirror_pods: bool | None = None
+
+    _check_token = field_validator("token")(header_secret)
 
 
 class ClusterResponse(BaseModel):
@@ -150,6 +155,8 @@ class TestConnectionRequest(BaseModel):
     ca_bundle_pem: str | None = None
     token: str | None = None
 
+    _check_token = field_validator("token")(header_secret)
+
 
 class TestConnectionResponse(BaseModel):
     ok: bool
@@ -168,6 +175,8 @@ class DetectCIDRsRequest(BaseModel):
     api_server_url: str | None = None
     ca_bundle_pem: str | None = None
     token: str | None = None
+
+    _check_token = field_validator("token")(header_secret)
 
 
 class DetectCIDRsResponse(BaseModel):
@@ -204,6 +213,24 @@ def _to_response(c: KubernetesCluster) -> ClusterResponse:
         created_at=c.created_at,
         modified_at=c.modified_at,
     )
+
+
+def _require_usable_credentials(api_server_url: str, token: str) -> None:
+    """422 for a token that cannot be a bearer token, or a URL httpx cannot
+    parse, before a client is built from them (#1913). The token may come
+    from the request body or from the stored cluster."""
+    problem = header_credential_problem(token, "token")
+    if problem:
+        raise HTTPException(status_code=422, detail=problem)
+    try:
+        url = httpx.URL(api_server_url)
+    except (httpx.InvalidURL, UnicodeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"api_server_url is not a valid URL: {exc}")
+    if url.scheme not in ("http", "https") or not url.host:
+        raise HTTPException(
+            status_code=422,
+            detail="api_server_url must be an http(s) URL such as https://k8s.example:6443",
+        )
 
 
 async def _probe_cluster(
@@ -455,6 +482,10 @@ async def _detect_cidrs(
             service_cidr=None,
             messages=[f"TLS error: {exc}"],
         )
+    except Exception as exc:  # noqa: BLE001 — honour "never raises" (#1913)
+        # e.g. httpx refusing to build the client from a header value it
+        # cannot encode; keep whatever was detected before the failure.
+        messages.append(f"Detection failed: {exc}")
 
     return DetectCIDRsResponse(
         pod_cidr=pod_cidr,
@@ -673,6 +704,8 @@ async def test_connection(
             detail="api_server_url and token are required (either in body or via stored cluster_id)",
         )
 
+    _require_usable_credentials(api_server_url, token)
+
     # SECURITY (#400, L5): advisory SSRF guard — log the resolved API
     # server IP so operators can audit what the control plane dialed.
     # Not hard-blocked: a co-located k3s appliance legitimately points
@@ -730,6 +763,8 @@ async def detect_cidrs(body: DetectCIDRsRequest, db: DB, _: SuperAdmin) -> Detec
             status_code=422,
             detail="api_server_url and token are required (either in body or via stored cluster_id)",
         )
+
+    _require_usable_credentials(api_server_url, token)
 
     return await _detect_cidrs(
         api_server_url=api_server_url,

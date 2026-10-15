@@ -22,6 +22,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1._common import StatusResponse
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
 from app.models.audit import AuditLog
@@ -96,6 +97,8 @@ class FirewallCreate(FirewallBase):
             raise ValueError("api_key is required")
         return v
 
+    _check_api_key = field_validator("api_key")(header_secret)
+
 
 class FirewallUpdate(BaseModel):
     name: str | None = None
@@ -118,6 +121,8 @@ class FirewallUpdate(BaseModel):
     mirror_interfaces: bool | None = None
     mirror_dhcp_leases: bool | None = None
     sync_interval_seconds: int | None = None
+
+    _check_api_key = field_validator("api_key")(header_secret)
 
 
 class FirewallResponse(BaseModel):
@@ -171,6 +176,8 @@ class TestConnectionRequest(BaseModel):
     username: str | None = None
     password: str | None = None
 
+    _check_api_key = field_validator("api_key")(header_secret)
+
 
 class TestConnectionResponse(BaseModel):
     ok: bool
@@ -180,6 +187,8 @@ class TestConnectionResponse(BaseModel):
     # When the probe minted a key via keygen, return it so the create form can
     # store it (the operator supplied creds once, not a raw key).
     api_key: str | None = None
+
+    _check_api_key = field_validator("api_key")(header_secret)
 
 
 class FirewallObjectResponse(BaseModel):
