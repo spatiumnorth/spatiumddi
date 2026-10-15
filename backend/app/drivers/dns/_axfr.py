@@ -153,10 +153,11 @@ async def axfr_zone_records(
     REFUSED the TCP connection — the host is up and nothing listens on the
     port. That is the signature of an appliance DNS pod behind the MetalLB
     resolver VIP: it dropped hostNetwork, so the node address the server row
-    carries answers nothing on :53 and only the VIP reaches the daemon. A
-    timeout or "no route" is deliberately NOT a trigger — that is a node that
-    is down, and reading another member through the VIP would report a dead
-    server as healthy.
+    carries answers nothing on :53, and the caller passes the member's own
+    pod address instead. A timeout or "no route" is deliberately NOT a
+    trigger. Every fallback must address the SAME server as ``host`` — this
+    is a per-server read, and an address that reaches another member would
+    report that member's state as this one's.
 
     A key that cannot be turned into a keyring raises rather than falling
     back to an unsigned transfer: silently degrading would turn a
@@ -202,7 +203,9 @@ async def axfr_zone_records(
                 f"is valid base64 and that {tsig.algorithm!r} is a supported algorithm."
             ) from exc
 
-    used_host = host
+    # Names every address actually dialled, so a failure after a fallback
+    # does not report a pod address the operator has never seen on its own.
+    used_host = f"{host}:{port}"
 
     def _axfr() -> dns.zone.Zone:
         nonlocal used_host
@@ -211,7 +214,7 @@ async def axfr_zone_records(
         except ConnectionRefusedError as exc:
             refused: Exception = exc
         for fb in fallback_hosts:
-            used_host = fb
+            used_host = f"{host}:{port} (retried at {fb}:{port})"
             try:
                 zone = _axfr_host(fb)
             except ConnectionRefusedError as exc:
@@ -254,9 +257,7 @@ async def axfr_zone_records(
         # blank reason reach the operator — drift reports and pull-imports
         # both surface this string verbatim.
         detail = str(exc).strip() or type(exc).__name__
-        raise RuntimeError(
-            f"{what} from {used_host}:{port} failed: {detail}.{_hint(exc, port)}"
-        ) from exc
+        raise RuntimeError(f"{what} from {used_host} failed: {detail}.{_hint(exc, port)}") from exc
 
     def _absolutize(target: Any) -> str:
         """Return ``target`` as its absolute form with trailing dot.

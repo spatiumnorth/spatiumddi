@@ -387,8 +387,9 @@ def without_server_apex_ns(
 
 
 async def _fallback_kwargs(db: AsyncSession, server: Any) -> dict[str, Any]:
-    """``pull_zone_records`` kwargs naming the appliance DNS VIP as the address
-    to retry on a refused connection (#1470); empty when it cannot apply."""
+    """``pull_zone_records`` kwargs naming the server's own pod address to retry
+    on a refused connection behind the appliance DNS VIP (#1470); empty when
+    it cannot apply."""
     if not transfer_needs_tsig(server):
         return {}
     hosts = transfer_fallback_hosts(server, await resolve_transfer_vip(db))

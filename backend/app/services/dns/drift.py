@@ -188,7 +188,8 @@ async def compute_zone_drift(
     # one derived key per view into that view alone; sign with the key of the
     # view holding this zone's copy, and keep the group key as the fallback
     # for an agent that predates the view keys.
-    # #1470 — behind the appliance's DNS VIP the node address refuses :53.
+    # #1470 — behind the appliance's DNS VIP the node address refuses :53;
+    # each member is then retried at its own pod address, never the VIP.
     transfer_vip = await resolve_transfer_vip(db) if needs_tsig else ""
     view_transfer = await resolve_view_transfer_key(db, zone) if needs_tsig else None
     view_key, view_name = view_transfer if view_transfer is not None else (None, None)
