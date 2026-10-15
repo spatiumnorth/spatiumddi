@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import json
 import tracemalloc
 import uuid
 from typing import Any
@@ -201,7 +202,8 @@ async def _fixture(db: AsyncSession, *, views: bool) -> DNSServer:
 # Re-pinned again at RENDERER_REVISION 9 (#1786), which adds
 # ``options.allow_recursion`` to a BIND9 bundle on top of 8's NOTIFY fields.
 # And again at 10 (#1817), whose ``allow_recursion`` default is local +
-# private networks.
+# private networks. The "views" pin moved at 11 (#1706): the group zone is no
+# longer shipped beside each view's own zone.
 # The gzip bytes are deliberately not pinned: deflate's output is a property of
 # the zlib build, not of the render (the desk's pin, taken in another image,
 # does not reproduce in the dev image for the identical body). The test pins
@@ -215,10 +217,10 @@ PINNED_AT_1C00A7E4: dict[str, dict[str, str]] = {
         ),
     },
     "views": {
-        "body_sha256": "fad6ae7a3e2163121c5b40df04254a0b5ac85e8f1b0ac5613a37f20f8b6aead1",
-        "etag": "sha256:a5f3951e2f02426ce27c89e98fb0ad720f5942d3b5b7ca2855cddae749d393c1",
+        "body_sha256": "505014ceebd98a9cbe2d4614e77324b9bbfebef907da7c231a4322c8a48f2603",
+        "etag": "sha256:80bec85335698702464bcb18d7d8b116424e6adf7e14235c6d9d5d8ccbec7cf1",
         "structural_etag": (
-            "sha256:9eb09462aafa3aa7af290d3032352447598f90be957d81d4677c05ba5da36e4c"
+            "sha256:3bbdde64940616ef52b9589565741b531e4063c4076498c6582b508127ebb47a"
         ),
     },
 }
@@ -260,6 +262,40 @@ async def test_the_streamed_bundle_is_the_one_stored_before(
     assert row.body_bytes == outcome.body_bytes == len(reference_json)
     # ... and against what the renderer stored before #1662.
     assert got == PINNED_AT_1C00A7E4[shape], f"{shape}: {got!r}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False])
+async def test_group_lists_ship_once_per_view_1706(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch, stream: bool
+) -> None:
+    """With views, a view's own zone already carries the group's lists, so
+    the group zone is not shipped beside it (it was, into every view)."""
+    db_session.add(PlatformSettings(id=1))
+    await db_session.flush()
+    server = await _fixture(db_session, views=True)
+    await db_session.commit()
+
+    if stream:
+        outcome = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+        await db_session.commit()
+        assert outcome.bundle is not None
+        stored = await store.load_body(db_session, outcome.bundle)
+        assert stored is not None
+        bundle = json.loads(gzip.decompress(stored))
+    else:
+        bundle = json.loads(store.encode_body((await render_bundle_body(db_session, server)).body))
+
+    lists = bundle["blocklists"]
+    assert sorted(bl["rpz_zone_name"] for bl in lists) == [
+        "spatium-blocklist-external.rpz.",
+        "spatium-blocklist-internal.rpz.",
+    ]
+    assert all(bl["view_name"] is not None for bl in lists)
+    # Each view's zone carries the group's entries once.
+    for bl in lists:
+        domains = [e["domain"] for e in bl["entries"]]
+        assert "ads.example" in domains
 
 
 @pytest.mark.asyncio
@@ -437,12 +473,13 @@ async def _tricky_fixture(db: AsyncSession, *, view_only: bool) -> DNSServer:
 
 # ``_tricky_fixture`` rendered by origin/main's renderer (c36b6c91, before
 # #1662): body sha256, ETag, structural ETag. Re-pinned at RENDERER_REVISION 8
-# (#1523), 9 (#1786) and 10 (#1817), as ``PINNED_AT_1C00A7E4`` above.
+# (#1523), 9 (#1786), 10 (#1817) and 11 (#1706; the False pin only), as
+# ``PINNED_AT_1C00A7E4`` above.
 PINNED_TRICKY_AT_MAIN: dict[bool, tuple[str, str, str]] = {
     False: (
-        "8a8d06ea3d47cef38eccaaf2b0f8e88e46f136aaa210615f2d9367db87761e65",
-        "sha256:db9a32e1fc1aa8a84f6a03beaa95bc9a51b73ee62965c8b52ad7b4e930a1e667",
-        "sha256:78f9aad65c670e37f791946c6e03df2deb74d60f503a7e0b5693f7adfdc67a1c",
+        "dbfe07df07de4182b0624b0f52e8be70de81ec5e7e8141aa53f6b2b5b448d83f",
+        "sha256:b7b566b44135d37249c9735fe8cbcb9589c968239646ede041b26f26fda91c58",
+        "sha256:f3486cb9c1fca17783a4f7304fd36125f2539ff45d526256a527c0841c6364e3",
     ),
     True: (
         "56b2a4a38a166f1a0aaa6b2aefc247bdbb483947398ac7531c44f4c7e36d817e",
@@ -476,7 +513,8 @@ async def test_adversarial_shapes_stream_to_the_materialised_bytes(
             "spatium-blocklist-internal.rpz.",
             "spatium-blocklist-lab.rpz.",
             "spatium-blocklist-external.rpz.",
-            "spatium-blocklist.rpz.",
+            # No group zone (#1706): each view's own zone already carries the
+            # group's lists.
         ]
 
     encoded = await agent_config.encode_bundle_body(db_session, server)
@@ -491,7 +529,11 @@ async def test_adversarial_shapes_stream_to_the_materialised_bytes(
         hashlib.sha256(reference_json).hexdigest(),
         encoded.etag,
         encoded.structural_etag,
-    ) == PINNED_TRICKY_AT_MAIN[view_only]
+    ) == PINNED_TRICKY_AT_MAIN[view_only], (
+        hashlib.sha256(reference_json).hexdigest(),
+        encoded.etag,
+        encoded.structural_etag,
+    )
 
 
 @pytest.mark.asyncio

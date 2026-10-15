@@ -371,7 +371,7 @@ def test_render_server_config_views_put_rpz_inside_view() -> None:
     response-policy directive must render INSIDE the owning view block,
     never at the top level — BIND9 rejects top-level ``zone {}``
     alongside ``view {}``. A ``view_name=None`` blocklist is group-level
-    and replicates into every view."""
+    and lands only in a view with no zone of its own (#1706)."""
     b = ConfigBundle(
         server_id=str(uuid.uuid4()),
         server_name="ns1",
@@ -420,6 +420,64 @@ def test_render_server_config_views_put_rpz_inside_view() -> None:
     # And the RPZ zone is NOT declared before the view block opens.
     preamble = out.split('view "internal" {', 1)[0]
     assert 'zone "spatium-blocklist-internal.rpz." {' not in preamble
+
+
+def test_render_server_config_group_rpz_only_in_a_view_without_its_own_1706() -> None:
+    """#1706: a view's own RPZ zone already folds in the group's lists, so the
+    group zone is not loaded beside it; a view with no zone of its own still
+    falls back to it. Mirrors the agent's BIND9 renderer."""
+
+    def _bl(zone: str, view: str | None) -> EffectiveBlocklistData:
+        return EffectiveBlocklistData(
+            rpz_zone_name=zone,
+            entries=(
+                BlocklistEntry(
+                    domain="ads.example.com",
+                    action="block",
+                    block_mode="nxdomain",
+                    sinkhole_ip=None,
+                    target=None,
+                    is_wildcard=False,
+                ),
+            ),
+            exceptions=frozenset(),
+            view_name=view,
+        )
+
+    def _view(name: str, clients: str, order: int) -> ViewData:
+        return ViewData(
+            name=name,
+            match_clients=(clients,),
+            match_destinations=(),
+            recursion=True,
+            order=order,
+        )
+
+    b = ConfigBundle(
+        server_id=str(uuid.uuid4()),
+        server_name="ns1",
+        driver="bind9",
+        roles=("authoritative",),
+        options=ServerOptions(),
+        acls=(),
+        views=(_view("internal", "10.0.0.0/8", 0), _view("external", "any", 1)),
+        zones=(),
+        tsig_keys=(),
+        blocklists=(
+            _bl("spatium-blocklist-internal.rpz.", "internal"),
+            _bl("spatium-blocklist.rpz.", None),
+        ),
+        generated_at=datetime(2026, 4, 14, 12, 0, tzinfo=UTC),
+    )
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id=b.server_id, name=b.server_name), b.options, bundle=b
+    )
+    internal = out.split('view "internal" {', 1)[1].split('view "external" {', 1)[0]
+    external = out.split('view "external" {', 1)[1]
+    assert 'zone "spatium-blocklist-internal.rpz.";' in internal
+    assert 'zone "spatium-blocklist.rpz."' not in internal
+    assert 'zone "spatium-blocklist.rpz.";' in external
+    assert "spatium-blocklist-internal" not in external
 
 
 # ── RPZ rendering ─────────────────────────────────────────────────────────

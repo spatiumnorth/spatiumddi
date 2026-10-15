@@ -8092,10 +8092,10 @@ export function EditSubnetModal({
             and its DHCP scopes will be moved to Trash, with the reverse zones
             created for it unless another subnet still uses one. The addresses
             you allocated stay with it, and the DNS records published for them
-            stop resolving while it is in Trash. You can restore them together
-            within 30 days from Administration → Trash, which publishes those
-            records again; after that the nightly purge deletes the subnet, its
-            addresses and their records for good.
+            stop resolving while it is in Trash. A superadmin can restore them
+            together within 30 days from Administration → Trash, which publishes
+            those records again; after that the nightly purge deletes the
+            subnet, its addresses and their records for good.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -8377,16 +8377,16 @@ export function EditSubnetModal({
       {tab === "danger" && onDeleted && (
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
-            Deleting a subnet moves it and its DHCP scopes to Trash, restorable
-            together for 30 days, along with the reverse zones created for it
-            (except one another subnet still uses). The addresses you allocated
-            stay with it and come back on restore; the DNS records published for
-            them stop resolving while it is in Trash and are published again on
-            restore. Addresses from DHCP (leases and reservations) are removed
-            straight away with their DNS records; reservations come back with
-            their scope on restore. Purging the subnet from Trash deletes its
-            addresses and their records for good. The deletion is gated by a
-            confirm in the next step.
+            Deleting a subnet moves it and its DHCP scopes to Trash. A
+            superadmin can restore them together for 30 days, along with the
+            reverse zones created for it (except one another subnet still uses).
+            The addresses you allocated stay with it and come back on restore;
+            the DNS records published for them stop resolving while it is in
+            Trash and are published again on restore. Addresses from DHCP
+            (leases and reservations) are removed straight away with their DNS
+            records; reservations come back with their scope on restore. Purging
+            the subnet from Trash deletes its addresses and their records for
+            good. The deletion is gated by a confirm in the next step.
           </p>
           <button
             onClick={() => setDeleteStep(1)}
@@ -11130,9 +11130,9 @@ export function ConfirmDestroyModal({
       <div className="space-y-4">
         <p className="text-sm text-muted-foreground">{description}</p>
         <p className="text-sm text-muted-foreground">
-          Deleted objects go to Trash: you can restore them from Administration
-          → Trash within 30 days, after which the nightly purge deletes them for
-          good.
+          Deleted objects go to Trash: a superadmin can restore them from
+          Administration → Trash within 30 days, after which the nightly purge
+          deletes them for good.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input
@@ -11445,9 +11445,10 @@ export function EditSpaceModal({
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">
             <strong className="text-foreground">{space.name}</strong>, with
-            every block and subnet inside it, will be moved to Trash. You can
-            restore them together within 30 days from Administration → Trash;
-            after that the nightly purge deletes them for good.
+            every block and subnet inside it, will be moved to Trash. A
+            superadmin can restore them together within 30 days from
+            Administration → Trash; after that the nightly purge deletes them
+            for good.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -11629,9 +11630,9 @@ export function EditSpaceModal({
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
             Deleting an IP space moves it to Trash with every block and subnet
-            inside it, restorable together for 30 days. Purging it from Trash
-            deletes them for good. The deletion is gated by a confirm in the
-            next step.
+            inside it. A superadmin can restore them together for 30 days.
+            Purging it from Trash deletes them for good. The deletion is gated
+            by a confirm in the next step.
           </p>
           <button
             onClick={() => setDeleteStep(1)}
@@ -12265,9 +12266,10 @@ export function EditBlockModal({
             <strong className="text-foreground font-mono">
               {block.network}
             </strong>
-            , with every block and subnet inside it, will be moved to Trash. You
-            can restore them together within 30 days from Administration →
-            Trash; after that the nightly purge deletes them for good.
+            , with every block and subnet inside it, will be moved to Trash. A
+            superadmin can restore them together within 30 days from
+            Administration → Trash; after that the nightly purge deletes them
+            for good.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -12435,9 +12437,9 @@ export function EditBlockModal({
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
             Deleting a block moves it to Trash with every block and subnet
-            inside it, restorable together for 30 days. Purging it from Trash
-            deletes them for good. The deletion is gated by a confirm in the
-            next step.
+            inside it. A superadmin can restore them together for 30 days.
+            Purging it from Trash deletes them for good. The deletion is gated
+            by a confirm in the next step.
           </p>
           <button
             onClick={() => setDeleteStep(1)}
@@ -13235,7 +13237,7 @@ function BlockDetailView({
                   : sCount > 0
                     ? `This will move ${sCount} subnet${sCount === 1 ? "" : "s"} to Trash.`
                     : `This will move ${bCount} empty block${bCount === 1 ? "" : "s"} to Trash.`) +
-                " You can restore them from Administration → Trash within 30 days."
+                " A superadmin can restore them from Administration → Trash within 30 days."
               }
               checkLabel={`I understand ${noun} will be moved to Trash.`}
               isPending={blockBulkDeleteMut.isPending}
@@ -14941,7 +14943,7 @@ function SpaceTableView({
           return (
             <ConfirmDestroyModal
               title={`Delete ${summary}`}
-              description={`This will move ${summary} to Trash. You can restore from Admin → Trash within 30 days. Only leaf blocks (no child blocks or subnets) are selectable.`}
+              description={`This will move ${summary} to Trash. A superadmin can restore them from Administration → Trash within 30 days. Only leaf blocks (no child blocks or subnets) are selectable.`}
               checkLabel={`I understand ${summary} will be moved to Trash.`}
               isPending={bulkDeleteMut.isPending}
               error={spaceBulkDeleteError}

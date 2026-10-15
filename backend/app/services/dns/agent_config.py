@@ -1242,14 +1242,14 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
 
     async def _streamed_zone(
         lists: list[Any] | None, rpz_zone_name: str, view_name: str | None
-    ) -> None:
+    ) -> bool:
         # #1662 — the zone exactly as below, with a placeholder for its
         # entries, which ``encode_bundle_body`` streams in. A zone with no
         # entry is left out, as below; an entry deleted between this check and
         # the stream leaves a zone with none, and the delete has marked the
         # bundle, so the next render drops it.
         if not lists or not await has_entries(db, lists):
-            return
+            return False
         mark = _placeholder()
         streamed.append(_StreamedEntries(mark=mark, lists=lists))
         blocklists_payload.append(
@@ -1260,18 +1260,26 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 "view_name": view_name,
             }
         )
+        return True
 
+    # #1706 — a view's own zone already folds in the group's lists, so the
+    # group zone rendered beside it would hold the same entries a second time.
+    # Track which views got a zone of their own; the group zone is only needed
+    # for one that did not.
+    views_with_own_zone = 0
     if views:
         for v in views:
             if stream:
-                await _streamed_zone(
+                if await _streamed_zone(
                     await effective_lists_for_view(db, v.id),
                     f"spatium-blocklist-{v.name}.rpz.",
                     v.name,
-                )
+                ):
+                    views_with_own_zone += 1
                 continue
             eff_v = await build_effective_for_view(db, v.id)
             if eff_v.entries:
+                views_with_own_zone += 1
                 blocklists_payload.append(
                     {
                         "rpz_zone_name": f"spatium-blocklist-{v.name}.rpz.",
@@ -1283,24 +1291,30 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                         "view_name": v.name,
                     }
                 )
-    if stream:
-        await _streamed_zone(
-            await effective_lists_for_group(db, server.group_id), "spatium-blocklist.rpz.", None
-        )
-    else:
-        eff_g = await build_effective_for_group(db, server.group_id)
-        if eff_g.entries:
-            blocklists_payload.append(
-                {
-                    "rpz_zone_name": "spatium-blocklist.rpz.",
-                    "entries": _entries_payload(eff_g.entries),
-                    "exceptions": sorted(eff_g.exceptions),
-                    # Group-level blocklist. With views, it applies to EVERY
-                    # view (rendered into each); with no views it's the single
-                    # global RPZ as before. ``view_name=None`` marks it global.
-                    "view_name": None,
-                }
+    # With views, only a view that got no zone of its own needs the group's
+    # (the agent loads it into that view alone). Without views it is the one
+    # global RPZ, as before.
+    if not views or views_with_own_zone < len(views):
+        if stream:
+            await _streamed_zone(
+                await effective_lists_for_group(db, server.group_id),
+                "spatium-blocklist.rpz.",
+                None,
             )
+        else:
+            eff_g = await build_effective_for_group(db, server.group_id)
+            if eff_g.entries:
+                blocklists_payload.append(
+                    {
+                        "rpz_zone_name": "spatium-blocklist.rpz.",
+                        "entries": _entries_payload(eff_g.entries),
+                        "exceptions": sorted(eff_g.exceptions),
+                        # Group-level blocklist. ``view_name=None`` marks it
+                        # global: the single RPZ with no views, or (#1706)
+                        # the fallback for a view with no zone of its own.
+                        "view_name": None,
+                    }
+                )
 
     # Phase 8f-3 — fleet upgrade intent. Only set when the operator
     # stamped a desired_appliance_version on this server row from the

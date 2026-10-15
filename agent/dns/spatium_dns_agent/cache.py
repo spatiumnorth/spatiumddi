@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import uuid
 from pathlib import Path
 from typing import Any
@@ -91,7 +92,24 @@ def save_config(state_dir: Path, bundle: dict[str, Any], etag: str) -> None:
     cfg_dir.mkdir(parents=True, exist_ok=True)
     current = cfg_dir / "current.json"
     tmp = cfg_dir / "current.json.tmp"
-    tmp.write_text(json.dumps(bundle, indent=2, sort_keys=True))
+    # Stream into the file (#1705): ``json.dumps`` built the whole bundle as
+    # one string and ``write_text`` encoded it again, two extra copies of a
+    # config that is >100 MB with a catalog-sized blocklist. Compact, too — a
+    # cache file nobody reads by eye does not need ``indent=2``. ``sort_keys``
+    # stays so the bytes are stable for a given bundle.
+    # Durable before visible: the rename only happens once every byte is on
+    # disk, so neither a crash mid-dump nor a power cut after the rename can
+    # leave ``current.json`` truncated — and a truncated cache is no cache,
+    # since ``load_config`` reads a JSON error as "nothing cached"
+    # (non-negotiable #5).
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(bundle, fh, sort_keys=True, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     tmp.replace(current)
     (cfg_dir / "current.etag").write_text(etag)
 
@@ -138,7 +156,13 @@ def commit_config(state_dir: Path, etag: str) -> None:
     # Copy the bytes rather than re-serialise the bundle: ``previous.json``
     # has to be exactly what ``current.json`` was, because that is what the
     # agent replays on a revert. Two independent serialisations could drift.
-    tmp.write_text(current.read_text())
+    # ``copyfile`` streams in kernel-sized chunks (#1705); ``read_text`` then
+    # ``write_text`` held the file decoded and re-encoded in memory.
+    shutil.copyfile(current, tmp)
+    # fsync before the rename for the same reason as ``save_config``: this is
+    # the revert fallback, and a truncated one is worse than a stale one.
+    with tmp.open("rb") as fh:
+        os.fsync(fh.fileno())
     tmp.replace(cfg_dir / "previous.json")
     etag_tmp = cfg_dir / "previous.etag.tmp"
     etag_tmp.write_text(etag_path.read_text())
