@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An agent's config long-poll answers 404, not 500, when its server row is
+  deleted under it (#1936).** `DELETE .../servers/{id}` wakes the server's
+  channel and removes the row; the open long-poll woke and refreshed a row that
+  no longer existed, which SQLAlchemy raised as `Could not refresh instance`
+  and the API answered with an unhandled 500. The DNS and DHCP long-polls (and
+  the DNS inline-render refresh) now answer 404 for a vanished row, the same
+  as for a token whose server is unknown at the start of a request, which is
+  what makes the agent discard its JWT and re-register.
+
 - **A paginated list's `total` no longer counts rows in Trash (#1933).** The
   shared `paginate` helper counts through
   `select(count()).select_from(base.subquery())`, and the global soft-delete
