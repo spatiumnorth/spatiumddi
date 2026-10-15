@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **One Esc closes only the topmost dialog, and Shift+Tab no longer leaves
+  one (#1947, #1948).** Every open dialog bound its own Esc listener, so a
+  dialog opened from another (an edit form's confirm, a nested picker) was
+  closed together with the one underneath, taking its unsaved input. Dialogs
+  now share a layer stack: Esc and the Tab trap belong to the topmost one, a
+  menu inside a dialog takes its own Esc, and the copilot drawer yields to an
+  open dialog. The focus trap treated the dialog container (where focus
+  landed on open) as outside its first control, so one Shift+Tab walked onto
+  the page behind; it now wraps, also catches focus that is already outside,
+  and opens on the first control rather than the container. The shared
+  `Modal` is named by its title through `aria-labelledby`. Test-only
+  dev dependency `@testing-library/user-event`.
+
 - **The control plane's DNSSEC keys for a BIND zone follow the keys BIND
   serves (#1934).** When BIND changed a zone's keys without a structural
   reload (a pod replacement that re-keyed the zone, a manual or
