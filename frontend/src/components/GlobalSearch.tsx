@@ -1,4 +1,11 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import {
+  useState,
+  useEffect,
+  useId,
+  useRef,
+  useCallback,
+  useMemo,
+} from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Search,
@@ -166,14 +173,21 @@ function ResultRow({
   result,
   isActive,
   onSelect,
+  optionId,
 }: {
   result: SearchResult;
   isActive: boolean;
   onSelect: (r: SearchResult) => void;
+  optionId: string;
 }) {
   const Icon = TYPE_ICONS[result.type] ?? FileText;
   return (
     <button
+      type="button"
+      id={optionId}
+      role="option"
+      aria-selected={isActive}
+      tabIndex={-1}
       className={cn(
         "flex w-full items-start gap-3 px-4 py-2.5 text-left transition-colors",
         isActive ? "bg-accent" : "hover:bg-accent/50",
@@ -280,6 +294,9 @@ export function GlobalSearch() {
   const [activeIdx, setActiveIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const uid = useId();
   const navigate = useNavigate();
   const { enabled: moduleEnabled } = useFeatureModules();
 
@@ -371,7 +388,6 @@ export function GlobalSearch() {
   // While open, the palette is the topmost layer: a dialog under it leaves
   // its Esc and Tab alone (#1947).
   useOverlayLayer(open);
-  const paletteRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     function handler(e: KeyboardEvent) {
@@ -382,7 +398,7 @@ export function GlobalSearch() {
       if (e.key === "Escape") {
         // Esc in the open palette closes the palette only, not a dialog
         // under it (whose Esc listener sits on window, after this one).
-        if (paletteRef.current) e.stopPropagation();
+        if (cardRef.current) e.stopPropagation();
         setOpen(false);
       }
     }
@@ -392,12 +408,49 @@ export function GlobalSearch() {
 
   useEffect(() => {
     if (open) {
-      setTimeout(() => inputRef.current?.focus(), 50);
-    } else {
-      setQuery("");
-      setScope("all");
+      // Remember the opener so closing hands focus back to it (the palette
+      // is a modal dialog: #1949). The trigger button, or whatever had focus
+      // when Ctrl/Cmd+K was pressed.
+      openerRef.current = document.activeElement as HTMLElement | null;
+      const t = setTimeout(() => inputRef.current?.focus(), 50);
+      return () => clearTimeout(t);
     }
+    setQuery("");
+    setScope("all");
+    const opener = openerRef.current;
+    openerRef.current = null;
+    if (opener && opener.isConnected) opener.focus();
   }, [open]);
+
+  // Keep Tab / Shift+Tab inside the palette. Self-contained on purpose (the
+  // shared modal's trap lives in use-draggable-modal.ts); it also pulls
+  // focus back in if it somehow sits outside the card.
+  function trapTab(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (e.key !== "Tab") return;
+    const card = cardRef.current;
+    if (!card) return;
+    const items = Array.from(
+      card.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]):not([tabindex="-1"]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    if (items.length === 0) {
+      e.preventDefault();
+      return;
+    }
+    const first = items[0];
+    const last = items[items.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey) {
+      if (active === first || !card.contains(active)) {
+        e.preventDefault();
+        last.focus();
+      }
+    } else if (active === last || !card.contains(active)) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
 
   const remember = useCallback(
     (q: string) => {
@@ -494,13 +547,21 @@ export function GlobalSearch() {
     }
   }
 
+  const optionId = (i: number) => `${uid}-opt-${i}`;
+  const activeOptionId =
+    rows.length > 0 && activeIdx < rows.length
+      ? optionId(activeIdx)
+      : undefined;
+
   const firstCommandIdx = rows.findIndex((r) => r.kind === "command");
 
   return (
     <>
       {/* Trigger button */}
       <button
+        type="button"
         onClick={() => setOpen(true)}
+        aria-haspopup="dialog"
         className="flex items-center gap-2 rounded-md border border-border/50 bg-muted/30 px-3 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground w-80"
       >
         <Search className="h-3.5 w-3.5 flex-shrink-0" />
@@ -522,9 +583,13 @@ export function GlobalSearch() {
           <div className="absolute inset-0 bg-black/50" />
 
           <div
-            ref={paletteRef}
+            ref={cardRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Search"
             className="relative z-10 w-full max-w-xl rounded-xl border bg-card shadow-2xl"
             onClick={(e) => e.stopPropagation()}
+            onKeyDown={trapTab}
           >
             {/* Input */}
             <div className="flex items-center gap-3 border-b px-4 py-3">
@@ -534,12 +599,24 @@ export function GlobalSearch() {
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={handleKeyDown}
+                role="combobox"
+                aria-label="Search"
+                aria-autocomplete="list"
+                aria-expanded={rows.length > 0}
+                aria-controls={`${uid}-list`}
+                aria-activedescendant={activeOptionId}
                 placeholder="Search IP, hostname, MAC, subnet, zone, record, page…"
                 className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
               />
               {query && (
                 <button
-                  onClick={() => setQuery("")}
+                  type="button"
+                  onClick={() => {
+                    setQuery("");
+                    inputRef.current?.focus();
+                  }}
+                  aria-label="Clear search"
+                  title="Clear search"
                   className="text-muted-foreground hover:text-foreground"
                 >
                   <X className="h-4 w-4" />
@@ -572,7 +649,13 @@ export function GlobalSearch() {
             )}
 
             {/* Results */}
-            <div ref={listRef} className="max-h-96 overflow-y-auto">
+            <div
+              ref={listRef}
+              id={`${uid}-list`}
+              role="listbox"
+              aria-label="Search results"
+              className="max-h-96 overflow-y-auto"
+            >
               {!query && recents.length === 0 && (
                 <p className="px-4 py-6 text-center text-sm text-muted-foreground">
                   Search IP addresses, subnets, zones, records, scopes, VLANs
@@ -611,6 +694,7 @@ export function GlobalSearch() {
                         result={row.result}
                         isActive={isActive}
                         onSelect={handleSelect}
+                        optionId={optionId(i)}
                       />
                     </div>
                   );
@@ -620,6 +704,10 @@ export function GlobalSearch() {
                     <button
                       key={row.key}
                       type="button"
+                      id={optionId(i)}
+                      role="option"
+                      aria-selected={isActive}
+                      tabIndex={-1}
                       data-active={isActive}
                       onMouseDown={(e) => {
                         e.preventDefault();
@@ -646,6 +734,10 @@ export function GlobalSearch() {
                       )}
                       <button
                         type="button"
+                        id={optionId(i)}
+                        role="option"
+                        aria-selected={isActive}
+                        tabIndex={-1}
                         data-active={isActive}
                         onMouseDown={(e) => {
                           e.preventDefault();
@@ -672,6 +764,10 @@ export function GlobalSearch() {
                   <button
                     key={row.key}
                     type="button"
+                    id={optionId(i)}
+                    role="option"
+                    aria-selected={isActive}
+                    tabIndex={-1}
                     data-active={isActive}
                     onMouseDown={(e) => {
                       e.preventDefault();
