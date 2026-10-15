@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -113,6 +114,9 @@ def detect_cnpg_cluster_name(namespace: str | None = None) -> str:
 # before expiration.
 LEASE_DURATION_S = 600  # 10 min
 _LEASE_RENEW_INTERVAL_S = LEASE_DURATION_S / 3.0
+# An unanswered renewal is retried this often until the Lease could have
+# expired (#1713).
+_LEASE_RENEW_RETRY_S = 15.0
 
 
 # When the per-node primitive succeeds the orchestrator gates the next
@@ -733,25 +737,52 @@ async def _lease_renewal_loop(stop_event: asyncio.Event, holder: str) -> None:
     cluster in an ambiguous state. The next orchestrator that picks
     up the row resumes from the row's progress.
     """
+    # When the Lease was last known renewed (or acquired): it can only have
+    # expired LEASE_DURATION_S after this, however many renewals went unanswered.
+    last_ok = time.monotonic()
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=_LEASE_RENEW_INTERVAL_S)
             return  # stop_event set during the wait
         except TimeoutError:
             pass
-        try:
-            ok, err = mutex.renew(holder=holder, lease_duration_seconds=LEASE_DURATION_S)
-        except Exception as exc:  # noqa: BLE001 — any failure here means "not renewed"
-            # An error the kubeapi helpers do not map (#1704) would end this
-            # task silently, leaving the drive running on a Lease nothing
-            # renews. Treat it as a lost Lease.
-            logger.warning("upgrade_lease_renew_crashed", error=str(exc))
-            stop_event.set()
-            return
+        while True:
+            try:
+                ok, err = mutex.renew(holder=holder, lease_duration_seconds=LEASE_DURATION_S)
+            except mutex.LeaseUnknownError as exc:
+                # #1713 — the kubeapi did not answer (a node rebooting, a host
+                # under load). The Lease is unknown, not lost: retry until it
+                # could genuinely have expired, then give up.
+                remaining = LEASE_DURATION_S - (time.monotonic() - last_ok)
+                if remaining <= 0:
+                    logger.warning("upgrade_lease_renew_failed", error=f"unanswered: {exc}")
+                    stop_event.set()
+                    return
+                logger.warning(
+                    "upgrade_lease_renew_unanswered",
+                    error=str(exc),
+                    lease_remaining_s=round(remaining, 1),
+                )
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(), timeout=min(_LEASE_RENEW_RETRY_S, remaining)
+                    )
+                    return
+                except TimeoutError:
+                    continue
+            except Exception as exc:  # noqa: BLE001 — any failure here means "not renewed"
+                # An error the kubeapi helpers do not map (#1704) would end this
+                # task silently, leaving the drive running on a Lease nothing
+                # renews. Treat it as a lost Lease.
+                logger.warning("upgrade_lease_renew_crashed", error=str(exc))
+                stop_event.set()
+                return
+            break
         if not ok:
             logger.warning("upgrade_lease_renew_failed", error=err)
             stop_event.set()
             return
+        last_ok = time.monotonic()
 
 
 async def drive_upgrade(

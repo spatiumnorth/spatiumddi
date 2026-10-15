@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
+from typing import Any
 
 import structlog
 from celery import shared_task
@@ -196,3 +198,95 @@ def release_lingering_shared_tag_hold() -> dict[str, str] | None:
     by node). Without it the control plane would stay on the old tag until
     a rolling run succeeded."""
     return asyncio.run(_async_release_lingering_hold())
+
+
+# A `running` rolling run whose Lease is free is re-driven only after it has
+# been seen free on two sweeps this far apart or more, and at most once per
+# ``_REDRIVE_COOLDOWN_S`` (#1713): a drive handing itself to another node
+# releases the Lease for the moment before the next drive takes it.
+_ORPHAN_SEEN_TTL_S = 600
+_REDRIVE_COOLDOWN_S = 600
+_ORPHAN_MIN_AGE_S = 45
+
+
+def _sweep_redis() -> Any:
+    from app.core.redis_client import make_sync_redis  # noqa: PLC0415
+
+    return make_sync_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+
+
+async def _running_run_ids() -> list[uuid.UUID]:
+    from app.models.system_upgrade import SystemUpgradeRun  # noqa: PLC0415
+
+    async with task_session() as db:
+        rows = await db.execute(
+            select(SystemUpgradeRun.id).where(
+                SystemUpgradeRun.state == "running", SystemUpgradeRun.kind == "cluster_rolling"
+            )
+        )
+        return list(rows.scalars().all())
+
+
+def resume_orphaned_runs_sync(
+    run_ids: list[uuid.UUID], redis_client: Any, *, now: float | None = None
+) -> list[str]:
+    """For each ``running`` run, re-enqueue its drive when none is driving it.
+
+    A drive that exits while its run is still ``running`` (its Lease lost, its
+    worker killed, a task acked after a clean return) leaves nothing to carry
+    the run on (#1713). "No drive" is read off the Lease, the mutex: free
+    (never held, released, or expired) and still free on a second sweep. An
+    unanswered Lease read is skipped, never taken for "free". The re-driven
+    task still has to ``acquire`` the Lease, so a drive that came back in the
+    meantime wins and this one is refused: the sweep never assumes it.
+    """
+    from app.services.appliance import k8s  # noqa: PLC0415
+    from app.services.upgrades import mutex  # noqa: PLC0415
+
+    if not run_ids or k8s.get_config() is None:
+        return []  # nothing running, or a deployment with no Lease
+    try:
+        state = mutex.read_state_strict()
+    except mutex.LeaseUnknownError as exc:
+        logger.warning("upgrade_orphan_sweep_lease_unknown", error=str(exc))
+        return []
+    if state.held:
+        return []  # a live drive renews it
+    now = time.time() if now is None else now
+    redriven: list[str] = []
+    for rid in run_ids:
+        seen_key = f"spatium:upgrade:orphan-seen:{rid}"
+        first = redis_client.get(seen_key)
+        if first is None:
+            redis_client.set(seen_key, str(now), ex=_ORPHAN_SEEN_TTL_S)
+            continue
+        if now - float(first) < _ORPHAN_MIN_AGE_S:
+            continue
+        # SET NX: of two sweeps (a second beat, a slow first), one re-drives.
+        if not redis_client.set(
+            f"spatium:upgrade:redrive:{rid}", str(now), nx=True, ex=_REDRIVE_COOLDOWN_S
+        ):
+            continue
+        drive_upgrade_run.apply_async(args=[str(rid)])  # type: ignore[attr-defined]
+        logger.warning("upgrade_orphaned_run_redriven", run_id=str(rid))
+        redriven.append(str(rid))
+    return redriven
+
+
+@shared_task(name="app.tasks.upgrade_orchestrator.resume_orphaned_runs")
+def resume_orphaned_runs() -> list[str]:
+    """Beat, every minute (#1713): re-drive a ``running`` rolling run whose
+    drive is gone. Nothing else does: ``drive_upgrade_run`` is enqueued by
+    Start, Resume and the drive's own hand-offs only, and a task is acked when
+    it returns, so a drive that exited cleanly is never redelivered."""
+    run_ids = asyncio.run(_running_run_ids())
+    if not run_ids:
+        return []
+    r = _sweep_redis()
+    try:
+        return resume_orphaned_runs_sync(run_ids, r)
+    finally:
+        try:
+            r.close()
+        except Exception:  # noqa: BLE001 — closing a broken client
+            pass

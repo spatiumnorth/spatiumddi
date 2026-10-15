@@ -69,6 +69,12 @@ class LeaseState:
 _NO_LEASE = LeaseState(held=False, holder=None, renew_time=None, transitions=0, expired=False)
 
 
+class LeaseUnknownError(RuntimeError):
+    """The kubeapi did not answer, so whether a Lease is held is UNKNOWN
+    (#1713). Distinct from "not held": a caller that cannot see the Lease must
+    neither conclude it lost it nor that it is free."""
+
+
 def _identity() -> str:
     """The pod's hostname (k8s sets it to the pod name).
 
@@ -139,7 +145,18 @@ def _read(*, namespace: str | None = None) -> tuple[LeaseState, str | None]:
     (#1512). The version is None whenever there is no lease body to hold."""
     try:
         status, body = k8s.get_lease(LEASE_NAME, namespace=namespace)
-    except k8s.KubeapiUnavailableError:
+    except k8s.KubeapiUnavailableError as exc:
+        if k8s.get_config() is not None:
+            # The kubeapi is configured but did not answer (#1713): the Lease
+            # is UNKNOWN, not absent. Report it held by "<unreachable>" like a
+            # 5xx, so no acquire races in and nothing reads it as free.
+            logger.warning("upgrade_lease_read_unanswered", error=str(exc))
+            return (
+                LeaseState(
+                    held=True, holder="<unreachable>", renew_time=None, transitions=0, expired=False
+                ),
+                None,
+            )
         # On docker-compose deployments the SA isn't mounted; treat as
         # "no lease, no concurrent upgrade" — single-node deployments
         # don't need a cluster-wide lock anyway.
@@ -231,6 +248,21 @@ def acquire(
     return False, err
 
 
+def read_state_strict(*, namespace: str | None = None) -> LeaseState:
+    """The Lease's state, or :class:`LeaseUnknownError` when the kubeapi did
+    not answer it (a timeout, a refused connection, a 5xx / 401 / 403).
+    Unlike :func:`get_state`, an unanswered read is never "not held"."""
+    try:
+        status, body = k8s.get_lease(LEASE_NAME, namespace=namespace)
+    except k8s.KubeapiUnavailableError as exc:
+        raise LeaseUnknownError(f"lease read unanswered: {exc}") from exc
+    if status == 404:
+        return _NO_LEASE
+    if status != 200 or body is None:
+        raise LeaseUnknownError(f"lease read returned {status}")
+    return _parse_lease(body)
+
+
 def renew(
     *,
     holder: str | None = None,
@@ -246,18 +278,40 @@ def renew(
     on the next tick. The write is a compare-and-swap on the version read, so a
     takeover between the read and the write loses this renewal instead. A
     failure means the caller no longer holds the cluster lock and must stop.
+
+    #1713 — a renewal the kubeapi did not answer (the read, or the write) is
+    neither: it raises :class:`LeaseUnknownError`, because the Lease may well
+    still be held. Only a Lease SEEN to name someone else (or nobody), or a
+    write refused with a conflict, returns ``(False, ...)``.
     """
     me = holder or _identity()
-    state, version = _read(namespace=namespace)
+    if k8s.get_config() is None:
+        # docker-compose: no Lease to read; as before, nobody holds it.
+        return False, "lease lost: held by nobody"
+    try:
+        status, body = k8s.get_lease(LEASE_NAME, namespace=namespace)
+    except k8s.KubeapiUnavailableError as exc:
+        raise LeaseUnknownError(f"lease read unanswered: {exc}") from exc
+    if status == 404:
+        return False, "lease lost: held by nobody"
+    if status != 200 or body is None:
+        raise LeaseUnknownError(f"lease read returned {status}")
+    state = _parse_lease(body)
     if state.holder != me:
         return False, f"lease lost: held by {state.holder or 'nobody'}"
-    return k8s.update_lease(
+    version = (body.get("metadata") or {}).get("resourceVersion")
+    ok, err = k8s.update_lease(
         LEASE_NAME,
         me,
         namespace=namespace,
         lease_duration_seconds=lease_duration_seconds,
-        resource_version=version,
+        resource_version=str(version) if version else None,
     )
+    if not ok and not (err or "").startswith("conflict"):
+        # The write was not answered or was refused for a reason that says
+        # nothing about who holds the Lease (a 5xx, a timeout).
+        raise LeaseUnknownError(f"lease renew write failed: {err}")
+    return ok, err
 
 
 def release_if_held(

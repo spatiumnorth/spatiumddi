@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A rolling upgrade no longer drops its Lease on one unanswered
+  kubeapi read, and a `running` run whose drive is gone is resumed
+  (#1713).** A node reboot or a loaded host makes a Lease read time out;
+  that was reported as "held by nobody", the drive concluded it had
+  lost a Lease it still held, and it exited after the node in flight
+  with the run left `running` and nothing to re-drive it (seen twice:
+  one of three nodes upgraded, run idle for 2 h 50 min). An unanswered
+  read is now unknown: the renewal retries every 15 s until the Lease
+  could genuinely have expired (600 s after the last renewal), and
+  only a Lease seen held by another, or a refused write, ends the
+  drive. `get_state` reports an unanswered read as held by
+  `<unreachable>`, never as free. A new beat sweep, every minute,
+  re-enqueues `drive_upgrade_run` for a `running` rolling run once the
+  Lease has been free on two sweeps 45 s or more apart, at most once
+  per 10 min; the re-driven task still has to take the Lease, so a
+  live drive wins.
 - **A BIND9-signed zone on the appliance now gets its DS (#1854).**
   The agent derived the DS by running `dnssec-dsfromkey` only when that
   binary was on `PATH`, and the Alpine dns-bind9 image does not carry
