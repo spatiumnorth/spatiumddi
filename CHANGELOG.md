@@ -106,6 +106,18 @@ the formatter handles the rest.
   error during a scheduled run left the run stuck `in_progress`. Both are
   refused when saved.
 
+- **Delete Zone no longer says the zone is permanently deleted (#1880).**
+  The dialog, its confirm checkbox, the "Confirm Permanent Deletion"
+  title and the bulk zone delete all said the zone and its records would
+  be permanently deleted, while the console sends the soft delete and the
+  zone goes to Trash. They now say the zone and its records move to Trash,
+  and that a superadmin can restore them from Administration → Trash
+  (restoring is superadmin-only, so the dialog does not tell a DNS Editor
+  they can undo it themselves). The same untrue "cannot be undone" is gone
+  from the DNS records grid's single-record delete. "Permanent" stays on
+  the paths that are: group, TSIG key and blocking-list deletes, and
+  Trash's purge. Same class as #1152 / #1398 for IPAM.
+
 - **An imported zone no longer has to stay delegated to the server it was
   migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
   BIND9, PowerDNS and Technitium importers keep the source's apex NS, which the
