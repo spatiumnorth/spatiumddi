@@ -109,6 +109,19 @@ the formatter handles the rest.
   at a cloud provider. Opted out, a subnet gets no reverse zone and its PTRs
   are skipped; the subnet's DNS sync report says why. Reverse zones a cloud
   group already holds are kept.
+
+- **Delete Zone no longer says the zone is permanently deleted (#1880).**
+  The dialog, its confirm checkbox, the "Confirm Permanent Deletion"
+  title and the bulk zone delete all said the zone and its records would
+  be permanently deleted, while the console sends the soft delete and the
+  zone goes to Trash. They now say the zone and its records move to Trash,
+  and that a superadmin can restore them from Administration → Trash
+  (restoring is superadmin-only, so the dialog does not tell a DNS Editor
+  they can undo it themselves). The same untrue "cannot be undone" is gone
+  from the DNS records grid's single-record delete. "Permanent" stays on
+  the paths that are: group, TSIG key and blocking-list deletes, and
+  Trash's purge. Same class as #1152 / #1398 for IPAM.
+
 - **An imported zone no longer has to stay delegated to the server it was
   migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
   BIND9, PowerDNS and Technitium importers keep the source's apex NS, which the
@@ -4577,14 +4590,6 @@ the formatter handles the rest.
 
 ### Migrations
 
-- `c4f19a2e7d53` — #1932, additive + data: nullable
-  `dns_zone.agentless_create_due_at` (an auto-created zone whose provider
-  create is outstanding, and when the sweep may next try) and
-  `dns_server_group.auto_reverse_zones_at_provider` (NOT NULL, default
-  false). Backfill marks the non-imported, auto-generated reverse zones in
-  groups with a `technitium_api` or Windows DNS server with credentials and
-  no cloud server, due now; cloud groups are not marked. Downgrade drops
-  both columns.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column
@@ -4660,6 +4665,14 @@ the formatter handles the rest.
   cannot say where its archive was written, so NULL (unknown) stays.
 - `a1903c5e7b24` — #1903, additive: nullable `appliance.cluster_transition_id`
   and `appliance.cluster_transition_at`. Downgrade drops both.
+- `c4f19a2e7d53` — #1932, additive + data: nullable
+  `dns_zone.agentless_create_due_at` (an auto-created zone whose provider
+  create is outstanding, and when the sweep may next try) and
+  `dns_server_group.auto_reverse_zones_at_provider` (NOT NULL, default
+  false). Backfill marks the non-imported, auto-generated reverse zones in
+  groups with a `technitium_api` or Windows DNS server with credentials and
+  no cloud server, due now; cloud groups are not marked. Downgrade drops
+  both columns.
 
 ## 2026.10.02-1 — 2026-10-02
 
