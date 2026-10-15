@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A reverse zone auto-created in an agentless group now reaches the
+  provider, so its PTRs stop failing "No such zone was found" (#1932).**
+  IPAM auto-sync, DDNS and subnet create wrote the reverse zone row and
+  nothing else; only the zone endpoints pushed it to `technitium_api`,
+  Windows Path B and the cloud drivers, so every PTR op failed and retried.
+  The create is now queued in the same after-commit dispatch as the record
+  ops (#1539), ahead of them, and the Copilot's zone create does the same. A
+  failed create is recovered by the ops' own retry, which creates the zone
+  first (an existing zone is a no-op). Agent-managed groups are unchanged.
 - **An imported zone no longer has to stay delegated to the server it was
   migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
   BIND9, PowerDNS and Technitium importers keep the source's apex NS, which the

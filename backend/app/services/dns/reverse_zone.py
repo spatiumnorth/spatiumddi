@@ -325,6 +325,15 @@ async def _ensure_zone_named(
     )
     db.add(zone)
     await db.flush()
+    # #1932 — an agentless group (technitium_api / Windows Path B / cloud)
+    # only gets the zone when it is pushed; the zone endpoints do that, this
+    # path used to create the row alone, so every PTR op failed with "No such
+    # zone". Queued for after the commit, ahead of the record ops.
+    from app.services.dns.record_ops import (  # noqa: PLC0415
+        provision_zone_at_agentless_servers,
+    )
+
+    await provision_zone_at_agentless_servers(db, zone)
 
     db.add(
         AuditLog(

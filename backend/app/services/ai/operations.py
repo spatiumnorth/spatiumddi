@@ -2621,6 +2621,14 @@ async def _apply_create_dns_zone(
     db.add(zone)
     await db.flush()
 
+    # #1932 — the REST create pushes the zone to agentless servers; the
+    # Copilot's create must too, or its zone exists only in SpatiumDDI.
+    from app.services.dns.record_ops import (  # noqa: PLC0415
+        provision_zone_at_agentless_servers,
+    )
+
+    await provision_zone_at_agentless_servers(db, zone)
+
     # #811: enqueue the sign op the same way the REST create does — the
     # Copilot fronts the REST API and the two must stay in lockstep (#798).
     # BIND9 ignores the op (signs inline from the config bundle); PowerDNS

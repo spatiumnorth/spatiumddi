@@ -434,6 +434,9 @@ class _AgentlessUnit:
     server_id: uuid.UUID
     op_rows: list[DNSRecordOp]
     batched: bool
+    #: Set on a zone-provision unit (#1932): create this zone at the
+    #: provider; ``op_rows`` is empty.
+    zone_id: uuid.UUID | None = None
 
 
 @dataclass
@@ -546,6 +549,14 @@ async def _dispatch_claimed(
 
     errors: dict[uuid.UUID, str | None] = {}
     if pairs:
+        # #1932 — a RETRIED op is one whose provider call already failed,
+        # most plausibly because the zone was never created there (the
+        # after-commit zone push failed, or the zone predates this fix).
+        # Create-if-missing first; the drivers treat "already exists" as a
+        # no-op, so this is harmless when the zone is in fact present.
+        retried = {r.zone_name for r in rows if r.attempts > 0}
+        if retried:
+            await _provision_zones_by_name(bind, server, retried)
         try:
             driver = get_driver(server.driver)
             if batched:
@@ -658,6 +669,92 @@ async def _dispatch_claimed(
     return {r.id: r for r in current}
 
 
+async def _create_zone_at_provider(server: DNSServer, zone: DNSZone) -> None:
+    """Idempotent ``create`` of ``zone`` on one agentless server. Never raises:
+    the caller is past the DB commit, and a failure is recovered by the op
+    retry path, which re-ensures the zone (#1932)."""
+    try:
+        driver = get_driver(server.driver)
+        if not hasattr(driver, "apply_zone_change"):
+            return
+        await driver.apply_zone_change(server, zone, "create")
+    except Exception as exc:  # noqa: BLE001 — post-commit; retried via the op path
+        logger.warning(
+            "dns.zone.provision_agentless_failed",
+            server=str(server.id),
+            zone=zone.name,
+            error=str(exc)[:500],
+        )
+
+
+async def _provision_zone_at_provider(bind: Any, server_id: uuid.UUID, zone_id: uuid.UUID) -> None:
+    async with AsyncSession(bind, expire_on_commit=False) as s:
+        server = await s.get(DNSServer, server_id)
+        zone = await s.get(DNSZone, zone_id)
+    if (
+        server is None
+        or zone is None
+        or not server.is_enabled
+        or not is_agentless(server.driver)
+        or zone.group_id != server.group_id
+    ):
+        return  # rolled back, moved, trashed or paused meanwhile
+    await _create_zone_at_provider(server, zone)
+
+
+async def _provision_zones_by_name(bind: Any, server: DNSServer, names: set[str]) -> None:
+    async with AsyncSession(bind, expire_on_commit=False) as s:
+        zones = (
+            (
+                await s.execute(
+                    select(DNSZone).where(
+                        DNSZone.group_id == server.group_id,
+                        DNSZone.name.in_(sorted(names)),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    for zone in zones:
+        await _create_zone_at_provider(server, zone)
+
+
+async def provision_zone_at_agentless_servers(db: AsyncSession, zone: DNSZone) -> int:
+    """Have a zone this transaction auto-created reach the group's agentless
+    servers (#1932). Returns how many servers it was queued for.
+
+    The zone endpoints push synchronously through the router's
+    ``_push_zone_to_agentless_servers`` and fail the request on a provider
+    error. The auto-create paths (reverse zones from IPAM / DDNS / auto-sync,
+    the Copilot's zone create) run inside a larger transaction that must not
+    fail over a provider, so the create is registered with the same
+    after-commit state as the record ops (#1539) and runs at the root commit
+    — and because the zone row is flushed BEFORE the caller enqueues its
+    record ops, the zone unit sits ahead of them in the queue and is sent
+    first. A failed create is not lost: the ops that follow fail, and their
+    retry re-ensures the zone. Agent-managed servers are untouched (the
+    bundle carries their zones).
+    """
+    servers = (
+        (
+            await db.execute(
+                select(DNSServer).where(
+                    DNSServer.group_id == zone.group_id,
+                    DNSServer.credentials_encrypted.isnot(None),
+                    DNSServer.is_enabled.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    targets = [s for s in servers if is_agentless(s.driver)]
+    for server in targets:
+        _defer_agentless(db, server, [], batched=False, zone_id=zone.id)
+    return len(targets)
+
+
 def _merge_units(units: list[_AgentlessUnit]) -> list[_AgentlessUnit]:
     """Fold adjacent single-op units for one server into one, keeping queue
     order — an IPAM sync of N addresses is N ``enqueue_record_op`` calls and
@@ -667,6 +764,8 @@ def _merge_units(units: list[_AgentlessUnit]) -> list[_AgentlessUnit]:
         last = merged[-1] if merged else None
         if (
             last is not None
+            and unit.zone_id is None
+            and last.zone_id is None
             and not unit.batched
             and not last.batched
             and last.server_id == unit.server_id
@@ -675,7 +774,10 @@ def _merge_units(units: list[_AgentlessUnit]) -> list[_AgentlessUnit]:
         else:
             merged.append(
                 _AgentlessUnit(
-                    server_id=unit.server_id, op_rows=list(unit.op_rows), batched=unit.batched
+                    server_id=unit.server_id,
+                    op_rows=list(unit.op_rows),
+                    batched=unit.batched,
+                    zone_id=unit.zone_id,
                 )
             )
     return merged
@@ -685,6 +787,9 @@ async def _dispatch_agentless_units(bind: Any, units: list[_AgentlessUnit]) -> N
     """Claim and send the agentless op rows a committed transaction queued."""
     targets = {r.id: r for u in units for r in u.op_rows}
     for unit in _merge_units(units):
+        if unit.zone_id is not None:
+            await _provision_zone_at_provider(bind, unit.server_id, unit.zone_id)
+            continue
         claimed_at = datetime.now(UTC)
         async with AsyncSession(bind, expire_on_commit=False) as s:
             server = await s.get(DNSServer, unit.server_id)
@@ -729,7 +834,12 @@ def _on_after_transaction_end(sync_session: Any, transaction: Any) -> None:
 
 
 def _defer_agentless(
-    db: AsyncSession, server: DNSServer, op_rows: list[DNSRecordOp], *, batched: bool
+    db: AsyncSession,
+    server: DNSServer,
+    op_rows: list[DNSRecordOp],
+    *,
+    batched: bool,
+    zone_id: uuid.UUID | None = None,
 ) -> None:
     """Register ``op_rows`` for dispatch once ``db``'s transaction commits."""
     sync = db.sync_session
@@ -741,7 +851,9 @@ def _defer_agentless(
             sync.info[_LISTENING_KEY] = True
             event.listen(sync, "after_commit", _on_after_commit)
             event.listen(sync, "after_transaction_end", _on_after_transaction_end)
-    state.units.append(_AgentlessUnit(server_id=server.id, op_rows=op_rows, batched=batched))
+    state.units.append(
+        _AgentlessUnit(server_id=server.id, op_rows=op_rows, batched=batched, zone_id=zone_id)
+    )
 
 
 async def _apply_agentless(
