@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Starting an MFA enrolment re-checks an external account at its own
+  provider (#1354).** An account with no local password used to pass
+  the enrolment step-up with any session younger than 10 minutes,
+  which is a sign-in time, not a check. An LDAP, RADIUS or TACACS+
+  account now re-verifies its password against its own provider
+  (backup servers included, wrong answers spend the step-up budget),
+  and an OIDC or SAML account is sent back to its IdP, forced to
+  authenticate again (`prompt=login` + `max_age=0`, `ForceAuthn`),
+  with a fresh `auth_time` / `AuthnInstant` required. The callback
+  leaves a single-use proof bound to that user and sign-in, which
+  `enroll/begin` takes. The 10-minute window remains only for an
+  account whose provider is gone or disabled. New
+  `POST /auth/mfa/enroll/reauth`; `GET /auth/mfa/status` gains
+  `enrol_provider_name` and two `enrol_requires` values.
+
 - **A Let's Encrypt certificate issued or renewed on an appliance is now
   deployed to the Web UI without an api restart (#1895).** Issuance runs
   in the Celery worker, whose ServiceAccount deliberately cannot patch
