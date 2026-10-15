@@ -241,6 +241,10 @@ services:
     profiles: ["dns", "dns-bind9"]
     image: ghcr.io/spatiumnorth/dns-bind9:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
+    # #1725 — a memory ceiling. named plus the agent hold a large RPZ
+    # (~580k entries per zone is ~2-3.5 GB), and without a limit one big
+    # blocklist takes the host's RAM. Raise it for bigger lists (docs/features/DNS.md).
+    mem_limit: ${DNS_BIND9_MEM_LIMIT:-2g}
     networks:
       - spatiumddi
     environment:
