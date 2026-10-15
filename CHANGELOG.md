@@ -94,7 +94,10 @@ the formatter handles the rest.
   was (#1877). The IP detail's Reputation **Check now** was gated on editing
   the address, while `POST /dnsbl/check` asks write on `dnsbl`, which no
   built-in role but superadmin holds; it now follows that grant, so an IPAM
-  Editor sees it disabled with the reason instead of a 403.
+  Editor sees it disabled with the reason instead of a 403. The DNS import
+  page let a non-superadmin upload an archive or enter a PowerDNS /
+  Technitium key before refusing it; every `/dns/import` route takes a
+  superadmin, so its Preview import and Test connection buttons now say so.
 
 - **An imported zone no longer has to stay delegated to the server it was
   migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
