@@ -290,7 +290,14 @@ config-driven, not op-driven (unlike PowerDNS's REST sign):
    rumoured` or `omnipresent` get a DS, which is BIND's own CDS rule
    (`syncpublish` in `lib/dns/dnssec.c`); a key with no `.state` file is
    included. The sync loop re-collects every 5 minutes and posts only a
-   change, because those transitions happen hours after the reload. The
+   change, because those transitions happen hours after the reload; while a
+   zone's keys are still settling (right after a reload or pod start, after a
+   change, when `rndc` cannot answer for the zone yet, when the zone has no
+   key yet, or when the control plane refused the report) it re-reads every
+   20 s instead, so keys BIND changes on its own (a re-key after the key
+   directory was lost, a policy rollover) reach the control plane without a
+   structural reload. A zone `rndc` cannot answer for is left out of the
+   report rather than reported as having no keys (#1934). The
    control plane mirrors it into `DNSZone.dnssec_ds_records` + `DNSKey` rows
    (replace-per-zone) for the operator's DS-export + key-status view.
 4. **Manual rollover.** `POST .../dnssec/rollover` enqueues a

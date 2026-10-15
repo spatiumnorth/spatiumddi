@@ -1,0 +1,145 @@
+"""#1934: the control plane's DNSSEC keys follow the keys BIND serves.
+
+BIND changes a zone's keys without a structural reload (a pod replacement
+that re-keys the zone, a dnssec-policy rollover). The agent must report the
+new keys, and soon: not after a quiet-zone interval, and never by wiping the
+control plane's rows because named was not answering yet.
+"""
+
+from __future__ import annotations
+
+import base64
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from spatium_dns_agent.drivers import bind9 as b9
+from spatium_dns_agent.drivers.bind9 import Bind9Driver
+from spatium_dns_agent.sync import DNSSEC_REFRESH_SECONDS, SyncLoop
+
+from tests.test_ds_from_keyfile import _Cfg, _Heartbeat
+
+BUNDLE = {"zones": [{"name": "probe.test.", "dnssec_enabled": True, "type": "primary"}]}
+
+
+def _status(tag: int) -> str:
+    return (
+        "dnssec-policy: default\ncurrent time: Thu Oct 15 13:36:00 2026\n\n"
+        f"key: {tag} (ECDSAP256SHA256), CSK\n"
+        "  published:      yes - since Thu Oct 15 13:35:45 2026\n"
+        "  key signing:    yes - since Thu Oct 15 13:35:45 2026\n"
+        "  zone signing:   yes - since Thu Oct 15 13:35:45 2026\n"
+    )
+
+
+def _keyfile(d: Path, tag: int, fill: int) -> None:
+    pub = base64.b64encode(bytes([fill]) * 64).decode()
+    base = f"Kprobe.test.+013+{tag:05d}"
+    (d / f"{base}.key").write_text(f"probe.test. 3600 IN DNSKEY 257 3 13 {pub}\n")
+    (d / f"{base}.state").write_text("DSState: omnipresent\n")
+
+
+class _Bind:
+    """Stands in for named: what ``rndc dnssec -status`` answers."""
+
+    def __init__(self) -> None:
+        self.rc = 0
+        self.tag = 6244
+
+    def run(self, *a: Any, **kw: Any) -> Any:
+        outer = self
+
+        class R:
+            returncode = outer.rc
+            stdout = _status(outer.tag) if outer.rc == 0 else ""
+            stderr = "rndc: 'dnssec' failed: not found"
+
+        return R()
+
+
+@pytest.fixture
+def rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    bind = _Bind()
+    monkeypatch.setattr(b9, "DNSSEC_KEY_DIR", str(keys), raising=False)
+    # main hardcodes the directory inside the method; point the DS reader at
+    # the test directory either way.
+    real = b9._ds_from_key_dir
+    monkeypatch.setattr(b9, "_ds_from_key_dir", lambda zone, kd: real(zone, str(keys)))
+    monkeypatch.setattr(b9.shutil, "which", lambda n: "/usr/sbin/rndc")
+    monkeypatch.setattr(b9.subprocess, "run", bind.run)
+    drv = Bind9Driver.__new__(Bind9Driver)
+    monkeypatch.setattr(drv, "_rndc_base", lambda: ["rndc"], raising=False)
+    loop = SyncLoop(_Cfg(tmp_path), ["tok"], drv, _Heartbeat())  # type: ignore[arg-type]
+    posted: list[list[dict[str, Any]]] = []
+    loop._report_dnssec_state = lambda s: posted.append(s) or True  # type: ignore[method-assign]
+    loop._dnssec_bundle = BUNDLE
+    return loop, bind, keys, posted
+
+
+def _due_in(loop: SyncLoop) -> float:
+    return loop._dnssec_refresh_at - time.monotonic()
+
+
+def test_new_keys_after_rekey_are_reported_without_a_structural_reload(rig) -> None:
+    loop, bind, keys, posted = rig
+    _keyfile(keys, 6244, 1)
+    loop._refresh_dnssec_state(force=True)
+    assert posted[-1][0]["keys"][0]["key_tag"] == 6244
+
+    # BIND re-keys the zone (pod replaced, #1855): same bundle, new key.
+    for f in keys.iterdir():
+        f.unlink()
+    _keyfile(keys, 26803, 2)
+    bind.tag = 26803
+    loop._refresh_dnssec_state()
+    entry = posted[-1][0]
+    assert [k["key_tag"] for k in entry["keys"]] == [26803]
+    assert len(entry["ds_records"]) == 1
+
+
+def test_named_not_answering_is_not_reported_as_no_keys(rig) -> None:
+    loop, bind, keys, posted = rig
+    bind.rc = 1
+    loop._refresh_dnssec_state()
+    # Wiping the control plane's key rows on a guess is wrong...
+    assert posted == []
+    # ...and so is waiting a quiet-zone interval to ask again.
+    assert _due_in(loop) < DNSSEC_REFRESH_SECONDS / 4
+
+
+def test_recheck_soon_after_a_report_so_a_settling_key_set_is_caught(rig) -> None:
+    loop, bind, keys, posted = rig
+    _keyfile(keys, 6244, 1)
+    loop._refresh_dnssec_state(force=True)
+    assert _due_in(loop) < DNSSEC_REFRESH_SECONDS / 4
+
+
+def test_quiet_zone_backs_off_to_the_slow_interval(rig) -> None:
+    loop, bind, keys, posted = rig
+    _keyfile(keys, 6244, 1)
+    loop._refresh_dnssec_state(force=True)
+    loop._refresh_dnssec_state()  # unchanged
+    assert len(posted) == 1
+    assert _due_in(loop) > DNSSEC_REFRESH_SECONDS / 2
+
+
+def test_refused_report_is_retried_soon(rig) -> None:
+    loop, bind, keys, posted = rig
+    loop._report_dnssec_state = lambda s: False  # type: ignore[method-assign]
+    _keyfile(keys, 6244, 1)
+    loop._refresh_dnssec_state()
+    assert _due_in(loop) < DNSSEC_REFRESH_SECONDS / 4
+
+
+def test_zone_not_keyed_yet_is_retried_soon(rig) -> None:
+    loop, bind, keys, posted = rig
+    bind.tag = 0  # rndc answers but lists no key
+    bind.run = lambda *a, **kw: type(  # type: ignore[method-assign]
+        "R", (), {"returncode": 0, "stdout": "dnssec-policy: default\n", "stderr": ""}
+    )()
+    loop._refresh_dnssec_state()
+    assert _due_in(loop) < DNSSEC_REFRESH_SECONDS / 4

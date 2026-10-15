@@ -63,6 +63,15 @@ def _touch_ready_marker(state_dir: Path) -> None:
 # (an hour and up on the default policy), so minutes are plenty.
 DNSSEC_REFRESH_SECONDS = 300.0
 
+# #1934 — the re-read interval while a signed zone's key set is still
+# settling: right after a structural reload or pod start (BIND generates the
+# keys a few seconds AFTER it loads the zone, and a re-keyed zone — #1855 —
+# serves its new key only then), after the keys changed, when BIND could not
+# be asked yet, or when the control plane did not take the report. The slow
+# cadence above is for a quiet zone; using it here left the control plane
+# showing the old key (and a DS made from it) for a full interval.
+DNSSEC_SETTLE_SECONDS = 20.0
+
 
 def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[str, Any]:
     """One op ack. Echoes the page's ``dispatch`` stamp when it has one
@@ -868,6 +877,8 @@ class SyncLoop:
         unchanged signed zone costs one ``rndc dnssec -status`` per zone
         every ``DNSSEC_REFRESH_SECONDS`` and no control-plane write.
         """
+        # Re-arm for the slow cadence first; every path below that has not
+        # reached a settled, accepted report pulls it back to the short one.
         self._dnssec_refresh_at = time.monotonic() + DNSSEC_REFRESH_SECONDS
         collect = getattr(self.driver, "collect_dnssec_state", None)
         if collect is None or self._dnssec_bundle is None:
@@ -876,11 +887,21 @@ class SyncLoop:
             states = collect(self._dnssec_bundle)
         except Exception:
             log.exception("dnssec_collect_failed")
+            self._dnssec_refresh_at = time.monotonic() + DNSSEC_SETTLE_SECONDS
             return
+        # The driver could not read (or has not yet got) some zone's keys:
+        # named still loading, or the zone not keyed yet. Retry soon.
+        settling = bool(getattr(self.driver, "dnssec_incomplete", False))
         if not states or (not force and states == self._dnssec_reported):
+            if settling:
+                self._dnssec_refresh_at = time.monotonic() + DNSSEC_SETTLE_SECONDS
             return
         if self._report_dnssec_state(states):
             self._dnssec_reported = states
+        # Reported (the keys just moved, or this is the first look after a
+        # reload: BIND may still be mid-change) or refused (retry): either
+        # way look again shortly, not after a quiet-zone interval.
+        self._dnssec_refresh_at = time.monotonic() + DNSSEC_SETTLE_SECONDS
 
     def _report_dnssec_state(self, states: list[dict[str, Any]]) -> bool:
         """POST the DS rrset(s) the driver just produced after a sign /

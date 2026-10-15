@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The control plane's DNSSEC keys for a BIND zone follow the keys BIND
+  serves (#1934).** After BIND changed a zone's keys without a structural
+  reload (a pod replacement that re-keyed the zone, a policy rollover), the
+  agent re-read them on a 5-minute timer that a failed read or refused report
+  also re-armed, and an `rndc` that could not answer yet was reported as "no
+  keys", so the zone page kept the old key and a DS made from it. The agent
+  now re-reads every 20 s while a zone's keys are settling, leaves a zone
+  `rndc` cannot answer for out of the report instead of clearing its keys,
+  and backs off to 5 minutes once a report is accepted and nothing moves.
 - **IPAM delete dialogs no longer promise a non-superadmin a restore
   (#1930).** The subnet, block and IP space deletes (the tree's Delete…,
   Edit's Danger zone and both bulk deletes) said "You can restore them from
