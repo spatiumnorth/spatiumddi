@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A BIND9-signed zone on the appliance now gets its DS (#1854).**
+  The agent derived the DS by running `dnssec-dsfromkey` only when that
+  binary was on `PATH`, and the Alpine dns-bind9 image does not carry
+  it, so every signed zone reported an empty DS with nothing logged and
+  the zone card had no record to paste at the parent. The agent now
+  computes the SHA-256 DS from the KSK `.key` file in-process with
+  dnspython, so no binary can be missing from an image, and a signed
+  zone that still yields no DS logs why (`dnssec_ds_pending` or
+  `dnssec_ds_unavailable`) instead of reporting empty in silence. The DS
+  shown follows BIND's own CDS rule: only a KSK whose `DSState` is
+  rumoured or omnipresent gets one, so a newly signed zone shows its DS
+  once BIND considers the DNSKEY propagated (about two hours on the
+  `default` policy), and a KSK withdrawn after a rollover drops out. The
+  agent now re-reads DNSSEC state every 5 minutes rather than only after a
+  config reload, so those changes reach the card without one, and each
+  key in the per-key table carries its own DS rather than every KSK's.
+
 - **Trashing a subnet now withdraws its own DNS records, instead of
   leaving them answering from a zone that stays (#1906).** When one of
   two subnets sharing a /24 reverse zone went to Trash, the zone was
