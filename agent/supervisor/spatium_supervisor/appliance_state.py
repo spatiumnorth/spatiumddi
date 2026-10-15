@@ -35,6 +35,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -374,6 +375,67 @@ def _write_sidecar_durable(path: Path, text: str) -> None:
         os.fsync(fh.fileno())
 
 
+# #1825 — a trigger that lands while systemd is in a ``daemon-reload`` is
+# never seen: the reload re-creates the path watch, and ``PathChanged=`` does
+# not fire for a file already there when it comes back (systemd.path(5)).
+# When the watcher sees it the runner writes ``.state`` within milliseconds,
+# so a trigger still unclaimed after this long was missed.
+_PICKUP_GRACE_SECONDS = 30
+_last_rearm_at = 0.0
+
+
+def _pending_trigger_since() -> datetime | None:
+    """When the slot-upgrade trigger was written, if the runner has not
+    claimed it: no ``.state``, or one older than the trigger (an earlier
+    run's). The runner's first act makes ``.state`` newer and its last
+    renames the trigger away, so a running or finished apply is never
+    pending."""
+    try:
+        trig = _TRIGGER_FILE.stat().st_mtime_ns
+    except OSError:
+        return None
+    try:
+        state = _HOST_SLOT_STATE.stat().st_mtime_ns
+    except FileNotFoundError:
+        state = None
+    except OSError:
+        return None
+    if state is not None and state >= trig:
+        return None
+    return datetime.fromtimestamp(trig / 1e9, UTC)
+
+
+def _rearm_missed_trigger(since: datetime) -> None:
+    """#1825 — re-fire ``PathChanged=`` for a trigger the watcher missed.
+
+    Open for write and close without writing: IN_CLOSE_WRITE on the watched
+    file, mtime (and so the reaper's clock) unchanged. No O_CREAT, so a
+    trigger consumed since it was read as pending is not re-created empty;
+    O_NOFOLLOW, so a symlink is not opened through. At most once per grace
+    window. A trigger this process cannot open (the api's per-box apply) is
+    logged and left to the reaper; the api re-arms its own.
+    """
+    global _last_rearm_at
+    now = time.time()
+    waited = now - since.timestamp()
+    if waited < _PICKUP_GRACE_SECONDS or now - _last_rearm_at < _PICKUP_GRACE_SECONDS:
+        return
+    _last_rearm_at = now
+    try:
+        fd = os.open(_TRIGGER_FILE, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return  # consumed since it was read as pending
+    except OSError as exc:
+        log.warning(
+            "supervisor.slot_upgrade.trigger_rearm_failed",
+            waited_seconds=int(waited),
+            error=str(exc),
+        )
+        return
+    os.close(fd)
+    log.warning("supervisor.slot_upgrade.trigger_rearmed", waited_seconds=int(waited))
+
+
 def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     """Read ``state stamp`` from the .state sidecar the host-side
     runner maintains. Returns (state, when) or (None, None) when no
@@ -396,7 +458,18 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     work" signal instead of an empty cell that visually looks like
     "agent hasn't reported yet". ``None`` is reserved for genuinely-
     unknown rows (docker / k8s / pre-8f-2).
+
+    #1825 — a trigger the runner has not claimed reads ``in-flight``,
+    stamped with when it was written, so ``_reap_stale_inflight`` ends it
+    if it is never picked up (before, the Fleet chip read the previous
+    run's state and a missed fleet trigger blocked re-fire for good). One
+    still unclaimed after the pickup grace is re-armed.
     """
+    pending = _pending_trigger_since()
+    if pending is not None:
+        if (datetime.now(UTC) - pending).total_seconds() <= _STALE_INFLIGHT_SECONDS:
+            _rearm_missed_trigger(pending)
+        return "in-flight", pending
     if not _HOST_SLOT_STATE.exists():
         return "ready", None
     try:
@@ -765,6 +838,14 @@ _CLUSTER_LEAVE_MAX_ATTEMPTS = 3
 # reports again. Owned by the supervisor, so rewriting is permitted.
 _CLUSTER_JOIN_STATE_CONSUMED = Path(
     "/var/lib/spatiumddi-host/release-state/cluster-join.state.consumed"
+)
+# #1903 — which promote the sidecar's verdict belongs to. ``<id>\t<fire_ns>``,
+# written when a join trigger is armed: the control plane's transition id and
+# the wall clock of the fire. A verdict in the sidecar proves that id only when
+# its mtime is at or after the fire — an older ``ready`` is a previous
+# membership's (a Replace-evicted box that is still up keeps one for ever).
+_CLUSTER_JOIN_TRANSITION = Path(
+    "/var/lib/spatiumddi-host/release-state/cluster-join.transition"
 )
 # ONLY ``failed`` is retired — never ``ready`` / ``left``.
 #
@@ -1880,10 +1961,103 @@ def reset_cluster_join_attempts() -> None:
     _reset_cluster_transition_attempts(_CLUSTER_LEAVE_TRIGGER_FILE)
 
 
+def _read_cluster_join_transition() -> tuple[str, int] | None:
+    """``(transition_id, fire_ns)`` of the last join this node fired, or None."""
+    try:
+        raw = _CLUSTER_JOIN_TRANSITION.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    tid, _, fire = raw.partition("\t")
+    try:
+        return (tid, int(fire)) if tid else None
+    except ValueError:
+        return None
+
+
+def cluster_join_verdict_proves(transition_id: str | None) -> bool:
+    """Whether the sidecar's current verdict was written by the join fired for
+    ``transition_id`` (#1903): that id was recorded at fire time and the sidecar
+    has been written since."""
+    if not transition_id:
+        return False
+    fired = _read_cluster_join_transition()
+    sidecar = _read_cluster_join_sidecar()
+    if fired is None or sidecar is None:
+        return False
+    return fired[0] == transition_id and sidecar[2] >= fired[1]
+
+
+# #1903 — how much older than the promote a same-seed ``ready`` must be before
+# the supervisor treats it as a previous membership's and fires the join over
+# it. The two ages are taken a heartbeat's latency apart, so a margin keeps a
+# ``ready`` written around the promote on the side of "report, don't act".
+_CLUSTER_JOIN_STALE_MARGIN_S = 10.0
+
+
+def cluster_join_state_age_s() -> float | None:
+    """Seconds since the host runner last wrote the join sidecar, on THIS node's
+    clock (#1903). None when there is no sidecar, or when its mtime is in the
+    future (the clock stepped back): an age we cannot trust proves nothing."""
+    if detect_deployment_kind() != "appliance":
+        return None
+    sidecar = _read_cluster_join_sidecar()
+    if sidecar is None:
+        return None
+    age_ns = time.time_ns() - sidecar[2]
+    if age_ns < 0:
+        return None
+    return age_ns / 1e9
+
+
+def _cluster_join_ready_predates_promote(
+    transition_id: str | None, transition_age_s: float | None
+) -> bool:
+    """Whether the sidecar's verdict PROVABLY predates the promote naming
+    ``transition_id`` (#1903) — the only case in which the join may be fired over
+    a ``ready`` for the same seed.
+
+    Proof needs both ages: the control plane's (seconds since the promote) and
+    this node's (seconds since the runner wrote the sidecar), each a duration on
+    its own clock. Anything less is ambiguous and the answer is no: a re-fire
+    over a working membership is what the #590 guard exists to prevent, and a
+    node joined by a supervisor that predates the fire record (upgraded before
+    its ``ready`` was applied) holds no record for the id while its ``ready`` is
+    perfectly fresh."""
+    if not transition_id or transition_age_s is None:
+        return False
+    try:
+        promote_age = float(transition_age_s)
+    except (TypeError, ValueError):
+        return False
+    if cluster_join_verdict_proves(transition_id):
+        return False
+    age = cluster_join_state_age_s()
+    if age is None:
+        return False
+    return age > promote_age + _CLUSTER_JOIN_STALE_MARGIN_S
+
+
+def reported_cluster_transition_id(desired_transition_id: str | None) -> str | None:
+    """The ``cluster_transition_id`` a heartbeat reports with the join state
+    (#1903): the id of the join fired, or ``""`` when the verdict being reported
+    is not that join's. None only off-appliance. Read from the fire record, not
+    from the heartbeat response, because the report is built before the response
+    that carries the new promote's id has been read."""
+    if detect_deployment_kind() != "appliance":
+        return None
+    fired = _read_cluster_join_transition()
+    sidecar = _read_cluster_join_sidecar()
+    if fired is None or sidecar is None or sidecar[2] < fired[1]:
+        return ""
+    return fired[0]
+
+
 def maybe_fire_cluster_join(
     desired_cluster_role: str | None,
     server_url: str | None,
     join_token: str | None,
+    transition_id: str | None = None,
+    transition_age_s: float | None = None,
 ) -> bool:
     """Write the cluster-join trigger when the control plane asks this
     node to join the k3s control-plane cluster as a server.
@@ -1939,10 +2113,17 @@ def maybe_fire_cluster_join(
     if state == "joining":
         # Runner is mid-flight: it renames the trigger BEFORE it finishes.
         return False
-    if state == "ready" and (target or "") == server_url:
+    if (
+        state == "ready"
+        and (target or "") == server_url
+        and not _cluster_join_ready_predates_promote(transition_id, transition_age_s)
+    ):
         # Already a member of this exact seed. The backend clears the
         # desired-state once it sees the ``ready`` heartbeat; until then,
-        # firing again would wipe the identity we just built.
+        # firing again would wipe the identity we just built. (#1903 — unless
+        # the ``ready`` provably predates the promote now asking: a box Replace
+        # evicted that is still up keeps one for ever, and skipping on it left
+        # a re-promote with no join. Ambiguity keeps the skip.)
         return False
     # Failure ceiling. The runner renames a failed trigger out of the way, so
     # trigger-file presence alone can't stop a doomed join from re-wiping this
@@ -1974,6 +2155,13 @@ def maybe_fire_cluster_join(
     # dir) must not block the join — the backend's clear-on-failed is the
     # primary brake; this is the backstop.
     _record_cluster_transition_fire(_CLUSTER_JOIN_TRIGGER_FILE, fingerprint)
+    if transition_id:
+        try:
+            tmp = _CLUSTER_JOIN_TRANSITION.with_name(_CLUSTER_JOIN_TRANSITION.name + ".new")
+            _write_owner_only(tmp, f"{transition_id}\t{time.time_ns()}\n")
+            tmp.replace(_CLUSTER_JOIN_TRANSITION)
+        except OSError:
+            log.warning("supervisor.cluster_join.transition_record_failed")
     return True
 
 
@@ -4413,6 +4601,9 @@ def collect() -> dict[str, object]:
         "k3s_join_token": read_k3s_join_token() if is_appliance else None,
         "cluster_join_state": (read_cluster_join_state()[0] if is_appliance else None),
         "cluster_join_reason": (read_cluster_join_state()[1] if is_appliance else None),
+        # #1903 — which promote that verdict belongs to; see the function.
+        "cluster_transition_id": reported_cluster_transition_id(None),
+        "cluster_join_state_age_s": cluster_join_state_age_s() if is_appliance else None,
         # #272 Phase 7b — the node's real routable InternalIP. The
         # promote endpoint builds the k3s join URL from the seed's
         # node_ip; ``last_seen_ip`` is the supervisor POD IP (10.42.x.x),

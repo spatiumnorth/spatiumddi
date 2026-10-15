@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import ipaddress
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -432,6 +433,7 @@ class BIND9Driver(DNSDriver):
         *,
         tsig: TsigKey | None = None,
         include_apex_ns: bool = False,
+        fallback_hosts: Sequence[str] = (),
     ) -> list[RecordData]:
         """AXFR the zone from the BIND9 host.
 
@@ -461,6 +463,7 @@ class BIND9Driver(DNSDriver):
             server_id=str(getattr(server, "id", "")),
             tsig=tsig,
             include_apex_ns=include_apex_ns,
+            fallback_hosts=fallback_hosts,
         )
 
     # ── Validation / capabilities ─────────────────────────────────────────

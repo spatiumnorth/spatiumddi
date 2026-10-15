@@ -100,6 +100,60 @@ the formatter handles the rest.
   the apex NS (a zone transfer drops it); on agent-managed BIND9 that push
   failed every run for want of a TSIG key.
 
+- **Re-promoting a node that Replace evicted no longer settles it as a
+  member from a stale `ready` (#1903).** A replaced box that is still up
+  keeps `ready\t<seed url>` in its cluster-join sidecar. Promoted again
+  against the same seed, its supervisor skipped the join because the
+  sidecar already said ready for that seed, and the heartbeat applied the
+  reported `ready` (it is the real success signal on a promote), so the
+  row became a member with no join having run. Each promote now stamps a
+  fresh `cluster_transition_id` and its time; the heartbeat answers the id
+  and the promote's age, the supervisor records the id when it fires the
+  join and reports it, with the age of its sidecar verdict, only for a
+  verdict written after that fire. The control plane applies a `ready` /
+  `failed` for a promote only when the ids match or the verdict is younger
+  than the promote, and the supervisor fires the join over a same-seed
+  `ready` only when that `ready` is provably older than the promote.
+  Ages, not timestamps, cross the wire, so no node clock is compared with
+  the control plane's. A supervisor upgraded mid-join (its join fired
+  before the fire record existed) therefore settles from its fresh `ready`
+  instead of re-firing the join. A supervisor that does not send the
+  fields is not judged, so older nodes behave as before. The same check
+  drops a stale `failed` (the gap noted on #1806).
+
+- **A slot-upgrade apply that landed during a systemd reload no longer
+  stays pending for good, and a new apply no longer reads the previous
+  run's `done` (#1825, #1288).** A `daemon-reload` re-creates the path
+  watches, and `PathChanged=` does not fire for a file already there
+  (systemd.path(5)), so a trigger written mid-reload never started the
+  runner. On the per-box path the status read `in-flight` with no stamp,
+  so nothing aged it and apply and rollback answered 409 until someone
+  touched the file on the host. On the fleet path the heartbeat reported
+  the previous run's state while the stranded trigger and the fire-once
+  marker stopped the supervisor writing it again. Both the api and the
+  supervisor now read a trigger with no `.state`, or one older than the
+  trigger, as `in-flight` stamped with the trigger's mtime, so the
+  existing 300 s heal reports it `failed`. After 30 s unclaimed, each
+  re-fires the watcher by opening the trigger for write and closing it:
+  the mtime, and so the heal's clock, does not move; at most once per
+  30 s; a trigger that has gone is not re-created, and one the process
+  cannot open (the other writer's) is left to the heal. The same reading
+  fixes #1288: the api's unlink of the root-owned `.state` always failed
+  with EPERM, so it is dropped. The other `PathChanged=` triggers are
+
+- **Drift and pull-from-server reach an agent-managed BIND9 or Technitium
+  behind the appliance's DNS VIP (#1470).** With `dns_vip` set the DNS
+  pods drop hostNetwork, so the node address a server row carries
+  refuses TCP/53 and every drift report and scheduled pull failed for
+  the whole group. When the node address actively refuses the
+  connection, the transfer is now retried at that server's own pod
+  address (where its agent heartbeats from), with the same TSIG key.
+  The VIP is deliberately not used: it reaches an arbitrary member, so
+  a server whose daemon is down would have read as in sync. A timeout
+  or unreachable host is not retried, and nothing changes when no DNS
+  VIP is set. The other half of #1470, a connection refusal reported as
+  a refused zone transfer, has its own entry below.
+
 - **A rolling-upgrade Plan is no longer refused for disk room the image
   does not need (#1919).** #1885's "the target is already on the mirror"
   exemption was never reached: the mirror asked for its presence with a
@@ -4523,6 +4577,8 @@ the formatter handles the rest.
 - `d9d0f6ddc446` — #1838: nullable `backup_target.last_run_node`, the
   node whose pod wrote `last_run_filename`. No backfill: an existing row
   cannot say where its archive was written, so NULL (unknown) stays.
+- `a1903c5e7b24` — #1903, additive: nullable `appliance.cluster_transition_id`
+  and `appliance.cluster_transition_at`. Downgrade drops both.
 
 ## 2026.10.02-1 — 2026-10-02
 
