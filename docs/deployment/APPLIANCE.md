@@ -2749,6 +2749,24 @@ baseline fstab + a snapshotted `/usr/lib/etc.image/`. Every
 GitHub release attaches the slot image + its SHA-256 sidecar
 at versioned + `/latest/` URLs.
 
+#### Upgrading from a build older than #1621: a short window of 500s (#1661)
+
+Since #1621 `/var/lib/spatiumddi/release-state` is `1770 root:2770` and
+the api pod carries `supplementalGroups: [2770]`. The booted slot applies
+that mode at sysinit, but k3s first restarts the previous release's api,
+which has no gid 2770 and cannot be changed after the fact. Until the new
+control chart replaces it, that api answers `500` on reads of the
+directory: `GET /api/v1/appliance/slot-upgrade`, and the setup-state and
+system-info reads. In testing this lasted about 90 s and overlapped the
+502s the pod rollout causes anyway. The upgrade itself is unaffected;
+retry once the new api serves. It happens once, on the upgrade that
+introduces the tightened directory.
+
+This is documented rather than bridged on purpose. Bridging it means a
+boot-time unit that hands the trigger directory to the api's uid until
+the new api is up, in the directory every root host runner trusts, to
+avoid a one-time status-read error that no UI page depends on.
+
 ### Rolling back: the database stays on `/var` (#1227)
 
 A slot swap replaces the root filesystem. PostgreSQL lives on the

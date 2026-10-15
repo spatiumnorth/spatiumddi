@@ -95,6 +95,42 @@ the formatter handles the rest.
   already did, #1725). A new test fails any `spatium-service` role
   requesting less than 128Mi.
 
+- **An agent's config long-poll answers 404, not 500, when its server row is
+  deleted under it (#1936).** `DELETE .../servers/{id}` wakes the server's
+  channel and removes the row; the open long-poll woke and refreshed a row that
+  no longer existed, which SQLAlchemy raised as `Could not refresh instance`
+  and the API answered with an unhandled 500. The DNS and DHCP long-polls (and
+  the DNS inline-render refresh) now answer 404 for a vanished row, the same
+  as for a token whose server is unknown at the start of a request, which is
+  what makes the agent discard its JWT and re-register.
+
+- **A paginated list's `total` no longer counts rows in Trash (#1933).** The
+  shared `paginate` helper counts through
+  `select(count()).select_from(base.subquery())`, and the global soft-delete
+  filter only looked at the outer statement's FROM, so it saw an anonymous
+  subquery and skipped it: the page query was filtered and the count was not.
+  A zone with four of ten records trashed listed six rows under `total: 10`,
+  so the pager offered pages that came back empty. The filter now looks inside
+  subquery FROMs (and CTEs), with the criterion placed inside the subquery.
+  The lists this changes are the zone and group-wide record lists; the other
+  count-over-subquery sites count models that are not soft-deleted. A
+  statement that opts out with `include_deleted` still counts Trash.
+
+- **The control plane's DNSSEC keys for a BIND zone follow the keys BIND
+  serves (#1934).** When BIND changed a zone's keys without a structural
+  reload (a pod replacement that re-keyed the zone, a manual or
+  policy-driven rollover), the zone page kept the old key and a DS made from
+  it. The reported build predated #1886, whose 5-minute re-read is what
+  first let a key change with no reload reach the control plane at all
+  (nothing was refused: no report was sent). That re-read still had gaps:
+  a read or report that failed waited a full 5 minutes to try again, a
+  manual rollover's report was the pre-rollover key set (BIND generates the
+  successor after `rndc` returns), and an `rndc` that could not answer for
+  the zone yet was reported as "no keys", clearing the key rows. The agent
+  now looks again 20 s after any report, rollover or failed read, doubling
+  up to 5 minutes while a zone stays unreadable, and leaves a zone `rndc`
+  cannot answer for out of the report instead of clearing its keys.
+
 - **The DNS Pools and DNSSEC Policies pages no longer offer writes the API
   refuses (#1879).** Every pool write (create, edit, delete, check now) and
   every DNSSEC-policy write takes a superadmin, but the top-level DNS Pools
@@ -4247,6 +4283,15 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
+  **On the upgrade itself, expect up to two minutes of 500s from
+  appliance host-state reads (#1661).** After the reboot into the new
+  slot, k3s keeps serving the previous release's api until the new
+  control chart rolls it, and that api has no gid 2770, so
+  `GET /api/v1/appliance/slot-upgrade` (and the setup-state and
+  system-info reads) answer `500` until the new api is Ready — about
+  90 s in testing, mixed in with the 502s the rollout already causes.
+  The upgrade completes normally; retry once the new api serves. This
+  happens once, on the upgrade that introduces the tightened directory.
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
