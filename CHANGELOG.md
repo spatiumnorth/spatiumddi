@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Icon-only buttons have accessible names (#1950).** The remove X on
+  a custom option row of the DHCP option editor (used by the scope,
+  option-template and client-class dialogs) was announced by a screen
+  reader as just "button". It is now "Remove option", with a matching
+  tooltip. A sweep found twelve more icon-only buttons with no name (APT
+  source / key / credential remove, Copilot send, aggregation-panel close,
+  AI provider edit / delete, audit-log previous / next page, IPAM template
+  child, firewall rule and IP space delete, the drag-and-drop error
+  dismiss), all named the same way, and a test now fails on any new one.
+  The search palette's clear-query X is named in the #1949 change.
 - **The control plane's DNSSEC keys for a BIND zone follow the keys BIND
   serves (#1934).** When BIND changed a zone's keys without a structural
   reload (a pod replacement that re-keyed the zone, a manual or

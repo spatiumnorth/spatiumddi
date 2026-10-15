@@ -524,7 +524,13 @@ export function GlobalSearch() {
               />
               {query && (
                 <button
-                  onClick={() => setQuery("")}
+                  type="button"
+                  onClick={() => {
+                    setQuery("");
+                    inputRef.current?.focus();
+                  }}
+                  aria-label="Clear search"
+                  title="Clear search"
                   className="text-muted-foreground hover:text-foreground"
                 >
                   <X className="h-4 w-4" />
