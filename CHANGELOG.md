@@ -111,7 +111,16 @@ the formatter handles the rest.
   policy and group TSIG keys BIND9 renders `allow-transfer` from,
   where before it was NOTIFY-ed and then refused. The serial the
   control plane adopts from an agent is bounded, so a wrong report
-  cannot push the zone to where the next bump overflows.
+  cannot push the zone to where the next bump overflows. The agent
+  also reports the served serials after the apply it makes at start
+  (the cached bundle after a slot upgrade), so the upgrade's serials
+  are adopted within a poll or two instead of at the group's next
+  structural change. A record op made before that adoption moves the
+  zone past the served serial and NOTIFYs, rather than publishing the
+  change under a serial the secondaries already hold. A PowerDNS
+  secondary that has transferred reads in sync (its serial is the
+  primary's, never compared with ours), and a new zone's first
+  numbering (0 to 1) writes no `dns.zone.serial_adopted` row.
 
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored

@@ -1532,6 +1532,9 @@ class PowerDNSDriver(DriverBase):
                 soa_rrsets, notify = self._soa_for_op(
                     client, headers, zone, rtype, name, op.get("target_serial")
                 )
+                soa_rrsets, notify = self._unless_already_served(
+                    client, headers, zone, desired, soa_rrsets, notify
+                )
                 resp = client.patch(url, headers=headers, json={"rrsets": [desired, *soa_rrsets]})
                 if resp.status_code < 400 and soa_rrsets and notify:
                     self._send_notify(client, headers, zone)
@@ -1631,6 +1634,9 @@ class PowerDNSDriver(DriverBase):
             soa_rrsets, notify = self._soa_for_op(
                 client, headers, zone, rtype, name, op.get("target_serial")
             )
+            soa_rrsets, notify = self._unless_already_served(
+                client, headers, zone, rrset, soa_rrsets, notify
+            )
             body = {"rrsets": [rrset, *soa_rrsets]}
             resp = client.patch(url, headers=headers, json=body)
             if resp.status_code < 400 and soa_rrsets and notify:
@@ -1675,10 +1681,13 @@ class PowerDNSDriver(DriverBase):
         PowerDNS no longer bumps the serial itself (``SOA-EDIT-API`` is empty,
         #1965), so the op carries the zone to the serial the control plane
         stamped on it (``target_serial``) in the same PATCH. When PowerDNS
-        already serves that serial or a later one, the op's change is already
-        in a published serial and the SOA is left alone; an op from a control
-        plane that sends no ``target_serial`` moves it to the served serial + 1
-        (#1968: a serial is never sent lower than the one served).
+        already serves that serial or a later one (the control plane has not
+        yet adopted the served serial), the zone moves to the served serial + 1
+        instead, and so does an op from a control plane that sends no
+        ``target_serial`` (#1968: a serial is never sent lower than the one
+        served, and a change is never published under a serial already
+        served). A stale-target op whose change PowerDNS already serves is
+        left alone by ``_unless_already_served``.
         """
         problem, doc = self._read_soa(client, headers, zone)
         if problem:
@@ -1708,11 +1717,23 @@ class PowerDNSDriver(DriverBase):
         reached = getattr(self, "_op_reached", None)
         if reached is None:
             reached = self._op_reached = {}
+        stale = getattr(self, "_op_stale", None)
+        if stale is None:
+            stale = self._op_stale = {}
+        stale.pop(key, None)
         if isinstance(target_serial, int) and not isinstance(target_serial, bool):
-            if not _serial_later(target_serial, have):
-                reached[key] = have
-                return [], False
-            new = target_serial
+            if _serial_later(target_serial, have):
+                new = target_serial
+            else:
+                # The control plane is behind what PowerDNS serves (an op made
+                # before it adopted the served serial, #1968). Leaving the SOA
+                # alone would publish the change under a serial the
+                # secondaries already hold, so they would never transfer it:
+                # move forward of the served one instead, unless the change is
+                # already served (a retried op), which
+                # ``_unless_already_served`` decides once it has the rrset.
+                new = (have + 1) % 2**32
+                stale[key] = have
         else:
             new = (have + 1) % 2**32
         reached[key] = new
@@ -1725,6 +1746,67 @@ class PowerDNSDriver(DriverBase):
                 "records": [{"content": _soa_with_serial(served[0], new), "disabled": False}],
             }
         ], notify
+
+    def _unless_already_served(
+        self,
+        client: httpx.Client,
+        headers: dict[str, str],
+        zone: str,
+        rrset: dict[str, Any],
+        soa_rrsets: list[dict[str, Any]],
+        notify: bool,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Drop the SOA move ``_soa_for_op`` planned for a stale-target op when
+        PowerDNS already serves exactly what ``rrset`` asks for.
+
+        That is a retried op (its ack was lost) or one a full reconcile beat:
+        the change is already published, so moving the serial again would only
+        make every secondary transfer the same data. Any doubt (an unreadable
+        rrset, contents spelled differently) keeps the move, which is the safe
+        direction: a redundant transfer, never a change the secondaries miss.
+        """
+        key = zone.rstrip(".").lower()
+        have = getattr(self, "_op_stale", {}).pop(key, None)
+        if have is None or not soa_rrsets:
+            return soa_rrsets, notify
+        name = str(rrset.get("name") or "")
+        rtype = str(rrset.get("type") or "")
+        try:
+            resp = client.get(
+                f"{_PDNS_API_BASE}/zones/{zone}",
+                params={"rrset_name": name, "rrset_type": rtype},
+                headers=headers,
+            )
+            doc = resp.json() if resp.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            return soa_rrsets, notify
+        if not isinstance(doc, dict):
+            return soa_rrsets, notify
+        served = next(
+            (
+                rs
+                for rs in doc.get("rrsets") or []
+                if isinstance(rs, dict)
+                and str(rs.get("name") or "").lower() == name.lower()
+                and rs.get("type") == rtype
+            ),
+            None,
+        )
+        served_records = (served or {}).get("records") or []
+        if rrset.get("changetype") == "DELETE":
+            unchanged = not served_records
+        else:
+            want = sorted(str(r.get("content")) for r in rrset.get("records") or [])
+            unchanged = (
+                served is not None
+                and served.get("ttl") == rrset.get("ttl")
+                and not any(r.get("disabled") for r in served_records)
+                and sorted(str(r.get("content")) for r in served_records) == want
+            )
+        if not unchanged:
+            return soa_rrsets, notify
+        getattr(self, "_op_reached", {})[key] = have
+        return [], False
 
     def _dnssec_sign(self, api_key: str, zone: str) -> list[str]:
         """Generate KSK + ZSK, set PRESIGNED metadata, rectify zone.

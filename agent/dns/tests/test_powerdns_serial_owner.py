@@ -30,6 +30,8 @@ from typing import Any
 import httpx
 import pytest
 
+from spatium_dns_agent import sync as sync_mod
+from spatium_dns_agent.cache import commit_config, ensure_layout, save_config
 from spatium_dns_agent.drivers import powerdns
 from spatium_dns_agent.drivers.powerdns import (
     PowerDNSDriver,
@@ -402,16 +404,83 @@ def test_a_record_op_carries_the_zone_to_the_control_planes_serial_and_notifies(
     assert ("PUT", "/zones/example.com./notify", None) in fake.calls
 
 
-def test_a_record_op_on_a_zone_already_at_or_past_the_target_leaves_the_soa(
+def test_a_record_op_made_before_adoption_moves_the_serial_past_the_served_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control plane is still behind the served serial (the op was made
+    before it adopted it). Leaving the SOA alone would publish the new record
+    under 2026101605, which every secondary already holds: they would never
+    transfer it. The zone moves to served + 1 and a NOTIFY goes out."""
+    fake = FakePdns()
+    _install(monkeypatch, fake)
+    drv = _driver(tmp_path)
+    drv._reconcile_zones("k", [_zone("example.com.", 2026101605)])
+    fake.calls.clear()
+    drv.apply_record_op(_op(2026101601))
+    assert fake.serial("example.com.") == 2026101606, "forward of the served serial"
+    served = fake.zones["example.com."]["rrsets"]
+    assert served[("www.example.com.", "A")] == ["192.0.2.1"]
+    assert drv.reached_serial("example.com.") == 2026101606, "reported as what it is"
+    (patch,) = [c for c in fake.calls if c[0] == "PATCH"]
+    assert [r["type"] for r in patch[2]["rrsets"]] == ["A", "SOA"], "one transaction"
+    assert ("PUT", "/zones/example.com./notify", None) in fake.calls
+
+
+def test_a_retried_op_whose_change_is_already_served_leaves_the_soa(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same op again (its ack was lost): the record is already served, so
+    moving the serial would only make every secondary transfer the same data."""
+    fake = FakePdns()
+    _install(monkeypatch, fake)
+    drv = _driver(tmp_path)
+    drv._reconcile_zones("k", [_zone("example.com.", 2026101600)])
+    drv.apply_record_op(_op(2026101601))
+    assert fake.serial("example.com.") == 2026101601
+    fake.calls.clear()
+    drv.apply_record_op(_op(2026101601))
+    assert fake.serial("example.com.") == 2026101601, "no creep"
+    assert drv.reached_serial("example.com.") == 2026101601
+    assert not [c for c in fake.calls if c[1].endswith("/notify")]
+
+
+def test_a_stale_delete_of_a_record_still_served_moves_the_serial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = FakePdns()
     _install(monkeypatch, fake)
     drv = _driver(tmp_path)
-    drv._reconcile_zones("k", [_zone("example.com.", 2026101605)])
+    drv._reconcile_zones("k", [_zone("example.com.", 2026101600)])
     drv.apply_record_op(_op(2026101601))
-    assert fake.serial("example.com.") == 2026101605, "never lowered"
-    assert drv.reached_serial("example.com.") == 2026101605, "reported as what it is"
+    delete = _op(2026101601)
+    delete["op"] = "delete"
+    delete["record"]["rrset"] = {"ttl": 60, "members": []}
+    fake.calls.clear()
+    drv.apply_record_op(delete)
+    assert ("www.example.com.", "A") not in fake.zones["example.com."]["rrsets"]
+    assert fake.serial("example.com.") == 2026101602
+    assert ("PUT", "/zones/example.com./notify", None) in fake.calls
+    # and once it is gone, the same delete again changes nothing
+    fake.calls.clear()
+    drv.apply_record_op(delete)
+    assert fake.serial("example.com.") == 2026101602
+    assert not [c for c in fake.calls if c[1].endswith("/notify")]
+
+
+def test_a_stale_op_without_an_rrset_payload_moves_the_serial_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The merge path (DNS-pool ops, older control planes) takes the same rule."""
+    fake = FakePdns()
+    _install(monkeypatch, fake)
+    drv = _driver(tmp_path)
+    drv._reconcile_zones("k", [_zone("example.com.", 2026101605)])
+    op = _op(2026101601)
+    del op["record"]["rrset"]
+    fake.calls.clear()
+    drv.apply_record_op(op)
+    assert fake.serial("example.com.") == 2026101606
+    assert ("PUT", "/zones/example.com./notify", None) in fake.calls
 
 
 def test_an_op_without_a_target_serial_moves_the_serial_forward_by_one(
@@ -468,6 +537,121 @@ def test_the_sync_loop_reports_the_serial_the_zone_actually_reached(
     _poll(loop, monkeypatch, bundle)
     assert {"zone_name": "ok.test", "serial": 2026101605} in posted
     assert {"zone_name": "ok.test", "serial": 2026101601} not in posted
+
+
+# ── #1968: the startup apply reports what it left served ─────────────────────
+
+
+class _ServingDriver(_Driver):
+    """A driver that reads back what it serves, like PowerDNS: the startup
+    apply floored the zone above the cached bundle's serial."""
+
+    def __init__(self, state_dir: Path):
+        super().__init__(state_dir)
+        self.served = {"ok.test": 2026101605}
+        self.readable = True
+
+    def served_zone_serials(self, bundle: dict[str, Any]) -> dict[str, int]:
+        return dict(self.served) if self.readable else {}
+
+
+class _NotModified:
+    def __init__(self) -> None:
+        self.status_code = 304
+        self.headers: dict[str, str] = {}
+        self.text = ""
+
+
+class _Client304:
+    def __enter__(self) -> _Client304:  # noqa: PYI034 - a test double
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def get(self, *args: Any, **kwargs: Any) -> _NotModified:
+        return _NotModified()
+
+
+def _cached_loop(
+    tmp_path: Path, driver: _Driver, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, list[dict[str, Any]], list[bool]]:
+    """A loop booted from a cached bundle (the slot upgrade), whose control
+    plane then answers 304: nothing structural is pending."""
+    ensure_layout(tmp_path)
+    bundle = _bundle("e1", structural="s1")
+    bundle["zones"] = [{"name": "ok.test.", "serial": 2026101600}]
+    save_config(tmp_path, bundle, "e1")
+    commit_config(tmp_path, "e1")
+    loop = _loop(tmp_path, driver, monkeypatch)
+    posted: list[dict[str, Any]] = []
+    outcomes: list[bool] = []
+
+    def post(entries: list[dict[str, Any]]) -> bool:
+        ok = outcomes.pop(0) if outcomes else True
+        if ok:
+            posted.extend(entries)
+        return ok
+
+    monkeypatch.setattr(loop, "_post_zone_state", post)
+    monkeypatch.setattr(loop, "_client", lambda: _Client304())
+    return loop, posted, outcomes
+
+
+def test_the_startup_apply_reports_the_served_serials_on_the_first_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 3 of the walk: after the slot upgrade the agent applied its cached
+    bundle and reported nothing, so the control plane did not adopt the served
+    serial until the next structural change."""
+    loop, posted, _ = _cached_loop(tmp_path, _ServingDriver(tmp_path), monkeypatch)
+    loop._poll_once()
+    assert posted == [{"zone_name": "ok.test.", "serial": 2026101605}]
+    loop._poll_once()
+    loop._poll_once()
+    assert len(posted) == 1, "reported once, not on every poll"
+
+
+def test_the_startup_report_is_retried_until_it_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _ServingDriver(tmp_path)
+    driver.readable = False  # PowerDNS still starting
+    loop, posted, outcomes = _cached_loop(tmp_path, driver, monkeypatch)
+    loop._poll_once()
+    assert posted == []
+    driver.readable = True
+    outcomes.append(False)  # control plane not reachable yet
+    loop._poll_once()
+    assert posted == []
+    loop._poll_once()
+    assert posted == [{"zone_name": "ok.test.", "serial": 2026101605}]
+
+
+def test_the_startup_report_gives_up_after_a_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _ServingDriver(tmp_path)
+    driver.readable = False
+    loop, posted, _ = _cached_loop(tmp_path, driver, monkeypatch)
+    calls: list[int] = []
+    real = driver.served_zone_serials
+    monkeypatch.setattr(
+        driver, "served_zone_serials", lambda b: calls.append(1) or real(b)
+    )
+    for _ in range(sync_mod.BOOT_REPORT_MAX_ATTEMPTS + 5):
+        loop._poll_once()
+    assert len(calls) == sync_mod.BOOT_REPORT_MAX_ATTEMPTS
+    assert posted == []
+
+
+def test_a_driver_serving_the_bundles_serials_sends_no_startup_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BIND9 serves the serials it was sent, which the control plane has."""
+    loop, posted, _ = _cached_loop(tmp_path, _Driver(tmp_path), monkeypatch)
+    loop._poll_once()
+    assert posted == []
 
 
 # ── #1967: NOTIFY and transfers ──────────────────────────────────────────────

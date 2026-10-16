@@ -112,6 +112,40 @@ async def test_a_new_zone_at_serial_0_adopts_the_served_date_serial(
     assert await _last_serial(db_session, zone_id) == today + 1
 
 
+async def _adoption_rows(db: AsyncSession, zone_id: uuid.UUID) -> list[AuditLog]:
+    return list(
+        (
+            await db.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "dns.zone.serial_adopted",
+                    AuditLog.resource_id == str(zone_id),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_brand_new_zone_is_numbered_without_an_audit_row(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A zone is created at ``last_serial`` 0 and the agent creates it at its
+    placeholder serial 1. Adopting that is bookkeeping: it moves ours, so the
+    zone reads in sync, but it writes no ``dns.zone.serial_adopted`` row — the
+    walk saw one for every zone created on a PowerDNS group."""
+    _, srv, zone = await _setup(db_session, "powerdns", serial=0)
+    zone_id = zone.id
+    await db_session.commit()
+    await _report(client, db_session, srv, [("lab.example.test.", 1)])
+    assert await _last_serial(db_session, zone_id) == 1
+    assert await _adoption_rows(db_session, zone_id) == []
+    # a real divergence later is still audited
+    await _report(client, db_session, srv, [("lab.example.test.", 7)])
+    assert [r.new_value["serial"] for r in await _adoption_rows(db_session, zone_id)] == [7]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reported", [2**31 - 1, 2**31 - 2, None])
 async def test_an_implausibly_high_reported_serial_is_not_adopted(
@@ -208,3 +242,26 @@ async def test_a_bind9_secondary_reporting_zero_is_left_as_it_was(
 def test_the_control_plane_pdns_conf_mirror_declares_primary_and_secondary() -> None:
     lines = render_pdns_conf(api_key="k").splitlines()
     assert "primary=yes" in lines and "secondary=yes" in lines
+
+
+@pytest.mark.asyncio
+async def test_a_powerdns_secondary_that_has_transferred_is_in_sync(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A secondary's serial is its primary's, never ``last_serial`` (0): a
+    PowerDNS secondary serving a transferred serial is in sync, as a BIND9
+    secondary that holds the zone always read. Before, it compared 2026101600
+    with 0 and read not in sync, the same as one that never transferred."""
+    token = await _token(db_session)
+    grp, srv, zone = await _setup(db_session, "powerdns", zone_type="secondary", serial=0)
+    grp_id, srv_id, zone_id = grp.id, srv.id, zone.id
+    await db_session.commit()
+    h = {"Authorization": f"Bearer {token}"}
+
+    await _report(client, db_session, srv, [("lab.example.test.", 2026101600)])
+    r = await client.get(f"/api/v1/dns/groups/{grp_id}/zones/{zone_id}/server-state", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["in_sync"] is True
+    r = await client.get(f"/api/v1/dns/servers/{srv_id}/zone-state", headers=h)
+    (entry,) = r.json()["zones"]
+    assert entry["in_sync"] is True and entry["current_serial"] == 2026101600

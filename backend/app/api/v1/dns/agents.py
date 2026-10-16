@@ -1162,10 +1162,16 @@ async def agent_zone_state(
                     ceiling=min(ceiling, _SERIAL_ADOPT_MAX),
                 )
                 continue
+            zone_row.last_serial = serial
+            if ours == 0 and serial == 1:
+                # A zone we have never numbered (created at 0) that the agent
+                # created at its own placeholder serial 1. Bookkeeping, not a
+                # divergence: adopted without an audit row, or every new zone
+                # on a PowerDNS group would write one.
+                continue
             adopted.append(
                 {"zone": zone_row.name, "from": ours, "to": serial, "zone_id": str(zone_id)}
             )
-            zone_row.last_serial = serial
         for a in adopted:
             db.add(
                 AuditLog(

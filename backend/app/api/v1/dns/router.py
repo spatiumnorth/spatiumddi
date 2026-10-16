@@ -5003,20 +5003,24 @@ class ServerZoneStateResponse(BaseModel):
     in_sync: bool
 
 
-def _secondary_never_transferred(zone: DNSZone, current: int | None, driver: str) -> bool:
-    """A secondary / stub zone a PowerDNS server reports at serial 0 holds no
-    data yet.
+def _zone_state_in_sync(zone: DNSZone, current: int, target: int, driver: str) -> bool:
+    """Whether a server's reported serial for ``zone`` reads as in sync.
 
-    Its target serial is 0 too (it is not ours to number), so the equality
-    check read it as in sync while the server answered REFUSED for it (#1967).
-    PowerDNS reports the serial it serves, and a zone that has transferred
-    never serves 0. Other drivers report the bundle's serial (0 for a
-    secondary), so for them 0 says nothing."""
-    return (
-        driver == "powerdns"
-        and (zone.zone_type or "primary") in ("secondary", "stub")
-        and not current
-    )
+    A primary zone is in sync when the server serves our serial
+    (``last_serial``). A secondary / stub zone's serial is its primary's, not
+    ours to number, so it is never compared with ``last_serial`` (0 for a
+    secondary): a server that holds the zone is in sync. That is how BIND9
+    secondaries have always read — the BIND9 agent reports the bundle's serial,
+    0, which equals the target 0 — and it is kept for every driver that does
+    not read back what it serves. PowerDNS reports the serial it serves, so a
+    secondary there is in sync once it has transferred (a transferred zone
+    never serves 0) and not before: at 0 it holds no data and answers REFUSED
+    (#1967)."""
+    if (zone.zone_type or "primary") in ("secondary", "stub"):
+        if driver == "powerdns":
+            return current != 0
+        return current == target
+    return current == target
 
 
 @router.get(
@@ -5074,7 +5078,7 @@ async def get_zone_server_state(
             all_in_sync = False
         else:
             any_reported = True
-            if current != target or _secondary_never_transferred(zone, current, srv.driver):
+            if not _zone_state_in_sync(zone, current, target, srv.driver):
                 all_in_sync = False
 
     return ServerZoneStateResponse(
@@ -5248,11 +5252,7 @@ async def get_server_zone_state(
         st = state_by_zone.get(z.id)
         target = int(z.last_serial or 0)
         current = int(st.current_serial) if st else None
-        in_sync = (
-            current is not None
-            and current == target
-            and not _secondary_never_transferred(z, current, server.driver)
-        )
+        in_sync = current is not None and _zone_state_in_sync(z, current, target, server.driver)
         if current is None:
             not_reported_count += 1
         elif in_sync:
