@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A control-plane join no longer comes up as a cluster of its own
+  (#1723).** `spatium-cluster-join` stops k3s and moves the node's
+  identity aside, its k3s token included, before it writes the config for
+  the cluster it is joining. Moving the token triggered the join-token
+  publisher (#1509), whose `Wants=k3s.service` started k3s right then, on
+  the node's standalone config. Usually the runner wrote the join config
+  within a second and the join reached the seed; when the join first
+  pruned an old identity backup, which can take 20 s, the early k3s
+  founded a new etcd cluster with the node as its only member, and the
+  join still logged `JOIN ok`, because it asks the node's own apiserver.
+  The five-minute HelmChart recovery and the weekly image prune carried
+  the same `Wants=k3s.service`, so either could start a k3s that a runner
+  was holding stopped. The three units now only order themselves after
+  k3s and never start it, and a test keeps every appliance unit from
+  pulling `k3s.service` in. The join still judges success by the node's
+  own apiserver.
+
 - **A signed zone keeps its DNSSEC keys when the appliance's BIND pod is
   replaced (#1855).** BIND keeps each signed zone's keys in its
   `key-directory`, `/var/cache/bind/keys`, and the appliance chart left

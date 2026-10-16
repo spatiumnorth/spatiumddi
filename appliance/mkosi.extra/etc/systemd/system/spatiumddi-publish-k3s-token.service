@@ -2,8 +2,16 @@
 Description=Publish the k3s join token to the supervisor release-state sidecar (#272 Phase 7b)
 Documentation=https://github.com/spatiumnorth/spatiumddi/issues/272
 ConditionKernelCommandLine=!boot=live
+# After= only, never Wants=/Requires= k3s.service (#1723). The .path unit
+# starts this service whenever the token file changes, and the cluster
+# join runner's identity wipe moves that file aside while it holds k3s
+# stopped. With Wants= here, that trigger's transaction queued a k3s start
+# mid-wipe: k3s came up on the standalone config with the identity gone,
+# founded a one-node cluster of its own, and the join still logged
+# JOIN ok. At boot k3s.service is enabled in its own right, so this still
+# runs after it; with k3s stopped the script polls for the token and
+# exits 0, and the .path unit re-runs it when k3s writes the token again.
 After=k3s.service
-Wants=k3s.service
 
 [Service]
 Type=oneshot
