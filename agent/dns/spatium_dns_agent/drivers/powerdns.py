@@ -186,9 +186,12 @@ def _dedupe_contents(rtype: str, contents: list[str]) -> list[str]:
 
 # Never deleted by the reconcile's absent-rrset sweep (#1380). The apex SOA
 # and NS are the zone's own skeleton: deleting either leaves not a smaller zone
-# but a broken one. PowerDNS creates a default SOA with the zone; it does NOT
-# create an apex NS unless the create names nameservers, and the agent does not
-# render the zone's own SOA or NS yet (#1522). The DNSSEC types are PowerDNS's
+# but a broken one. PowerDNS creates a default SOA with the zone but no apex
+# NS; the agent renders both for a primary zone (``_soa_content`` #1522,
+# ``_apex_ns_target`` #1985), so on those the bundle's rrset replaces what is
+# held. The kept types still matter for a zone the bundle carries no rrsets for
+# (a secondary's transferred apex) and for a name the bundle does not know: an
+# NS the operator declared is never swept. The DNSSEC types are PowerDNS's
 # to manage, not the bundle's.
 _APEX_KEPT_TYPES = frozenset({"SOA", "NS"})
 _DNSSEC_RRSET_TYPES = frozenset(
@@ -698,6 +701,36 @@ def _soa_content(zone: dict[str, Any], zname: str) -> str:
     return f"{mname} {rname} {serial} {timers[0]} {timers[1]} {timers[2]} {timers[3]}"
 
 
+def _apex_ns_target(zone: dict[str, Any], zname: str) -> str | None:
+    """The apex NS a PowerDNS-served primary zone needs when the operator
+    declared none (#1985), by the rule the BIND9 renderer uses (``_zone_apex``).
+
+    A zone with its own NS records at the apex returns None: those are the
+    whole set and nothing is written beside them. Otherwise the zone's Primary
+    NS, when it can resolve (outside the zone, or inside it with an A/AAAA
+    record), else the ``ns1.<zone>`` placeholder. BIND9 secondaries refuse a
+    transfer of a zone with no apex NS ("has no NS records"). Unlike BIND9's
+    file the placeholder gets no loopback glue: PowerDNS serves the zone
+    without it, and inventing an address is not this renderer's to do.
+    """
+    origin = zname if zname.endswith(".") else zname + "."
+    addressed: set[str] = set()
+    for rec in zone.get("records") or []:
+        rtype = str(rec.get("type") or "").upper()
+        owner = _name_in_zone(rec.get("name") or "@", origin).lower()
+        if rtype == "NS" and owner == origin.lower():
+            return None
+        if rtype in ("A", "AAAA"):
+            addressed.add(owner)
+    primary = _absolute_name(zone.get("primary_ns"))
+    if primary is not None:
+        low = primary.lower()
+        inside = low == origin.lower() or low.endswith("." + origin.lower())
+        if not inside or low in addressed:
+            return primary
+    return f"ns1.{origin}"
+
+
 # ── SOA serial ownership (#1965, #1968) ─────────────────────────────────────
 #
 # The control plane owns a primary zone's serial. PowerDNS must serve exactly
@@ -1053,6 +1086,14 @@ class PowerDNSDriver(DriverBase):
                 rrset_names[soa_key] = zname
                 rrsets[soa_key] = [_soa_content(zone, zname)]
                 rrset_ttls[soa_key] = [default_ttl]
+                # The apex NS (#1985), when the zone declares none. Rendered on
+                # every reconcile, so a zone created before this fix gets it too.
+                ns_target = _apex_ns_target(zone, zname)
+                if ns_target is not None:
+                    ns_key = (zname.lower(), "NS")
+                    rrset_names[ns_key] = zname
+                    rrsets[ns_key] = [ns_target]
+                    rrset_ttls[ns_key] = [default_ttl]
             deduped: dict[tuple[str, str], list[str]] = {}
             duplicates: list[str] = []
             for key, contents in rrsets.items():
