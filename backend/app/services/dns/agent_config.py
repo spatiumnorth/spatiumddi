@@ -81,6 +81,7 @@ from app.services.dns.record_ops import (
     rrset_match_where,
     supersede,
 )
+from app.services.dns.row_locks import ids_in, lock_ops
 from app.services.dns.soa_timers import served_soa_timers
 from app.services.dns.tsig import (
     legacy_group_key,
@@ -1604,7 +1605,9 @@ async def retire_queued_ops(
     covered = _covered_by(up_to, visible_xacts)
     if covered is not None:
         conds.append(covered)
-    stale_ops = (await db.execute(select(DNSRecordOp).where(*conds))).scalars().all()
+    # #1929 — locked in ``row_locks`` order (ascending id) before the write:
+    # a row a group move deletes meanwhile is skipped, not a StaleDataError.
+    stale_ops = await lock_ops(db, *conds)
     for op in stale_ops:
         op.state = "applied"
     if stale_ops:
@@ -1680,12 +1683,37 @@ async def page_pending_ops(
         .limit(batch)
     )
     ops_to_dispatch = list(op_res.scalars().all())
+    if not ops_to_dispatch:
+        return [], 0
     remaining = 0
     if len(ops_to_dispatch) == batch:
         remaining = int((await db.execute(select(func.count()).where(*conds))).scalar_one()) - len(
             ops_to_dispatch
         )
-    await _supersede_backed_off_ops(db, server, ops_to_dispatch, now)
+    waiting = await _backed_off_candidates(db, server, ops_to_dispatch, now)
+    # #1929 — lock every op this page writes, in one ascending statement
+    # (``row_locks``), before writing any. Read unlocked, a row a server move
+    # deleted meanwhile made the flush below match nothing (StaleDataError,
+    # a 500 on the poll); locked here, a deleted row is simply not returned,
+    # and one still pending is re-read as it is now.
+    locked = {
+        op.id
+        for op in await lock_ops(
+            db,
+            ids_in([op.id for op in ops_to_dispatch] + [op.id for op in waiting]),
+            DNSRecordOp.state == "pending",
+        )
+    }
+    ops_to_dispatch = [op for op in ops_to_dispatch if op.id in locked]
+    _supersede_backed_off_ops(
+        ops_to_dispatch,
+        [
+            op
+            for op in waiting
+            if op.id in locked and op.next_attempt_at is not None and op.next_attempt_at > now
+        ],
+        now,
+    )
     page: list[dict[str, Any]] = []
     for op in ops_to_dispatch:
         page.append(
@@ -1709,30 +1737,17 @@ async def page_pending_ops(
     return page, remaining
 
 
-async def _supersede_backed_off_ops(
+async def _backed_off_candidates(
     db: AsyncSession, server: DNSServer, shipping: list[DNSRecordOp], now: datetime
-) -> None:
-    """Retire an op waiting out a backoff once a newer op for its RRset ships.
-
-    Every op carries the whole desired RRset (#773), so the newer op delivers
-    the older one's change; left alone, the older op would retry after it and
-    put the RRset back the way it was. Only ops still backing off are
-    candidates — anything older and ready ships ahead in the same page — and
-    only those for an RRset in this page, matched in SQL: a bulk backlog that
-    failed can leave hundreds of thousands of ops backing off, and loading
-    them on every page is what paging exists to avoid. Strictly older only,
-    by ``queued_after`` (#1489).
-    """
-    newest: dict[tuple[str, str, str], DNSRecordOp] = {}
-    for op in shipping:
-        key = op_rrset_key(op)
-        if key is not None:
-            newest[key] = op  # the page is oldest-first; the last one wins
-    if not newest:
-        return
-    keys = sorted(newest)
+) -> list[DNSRecordOp]:
+    """The ops still backing off for an RRset in this page, matched in SQL: a
+    bulk backlog that failed can leave hundreds of thousands of ops backing
+    off, and loading them on every page is what paging exists to avoid.
+    Unlocked; the page locks them with its own rows (``page_pending_ops``)."""
+    keys = sorted({key for op in shipping if (key := op_rrset_key(op)) is not None})
+    found: list[DNSRecordOp] = []
     for i in range(0, len(keys), RRSET_KEY_CHUNK):
-        waiting = (
+        found.extend(
             (
                 await db.execute(
                     select(DNSRecordOp).where(
@@ -1746,13 +1761,33 @@ async def _supersede_backed_off_ops(
             .scalars()
             .all()
         )
-        for op in waiting:
-            key = op_rrset_key(op)
-            successor = newest.get(key) if key is not None else None
-            if successor is not None and queued_after(
-                successor.created_at, successor.seq, op.created_at, op.seq
-            ):
-                supersede(op, successor.id, now)
+    return found
+
+
+def _supersede_backed_off_ops(
+    shipping: list[DNSRecordOp], waiting: list[DNSRecordOp], now: datetime
+) -> None:
+    """Retire an op waiting out a backoff once a newer op for its RRset ships.
+
+    Every op carries the whole desired RRset (#773), so the newer op delivers
+    the older one's change; left alone, the older op would retry after it and
+    put the RRset back the way it was. Only ops still backing off are
+    candidates (``waiting``, from ``_backed_off_candidates``) — anything older
+    and ready ships ahead in the same page. Strictly older only, by
+    ``queued_after`` (#1489).
+    """
+    newest: dict[tuple[str, str, str], DNSRecordOp] = {}
+    for op in shipping:
+        key = op_rrset_key(op)
+        if key is not None:
+            newest[key] = op  # the page is oldest-first; the last one wins
+    for op in waiting:
+        key = op_rrset_key(op)
+        successor = newest.get(key) if key is not None else None
+        if successor is not None and queued_after(
+            successor.created_at, successor.seq, op.created_at, op.seq
+        ):
+            supersede(op, successor.id, now)
 
 
 def compose_bundle(
