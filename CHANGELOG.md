@@ -106,6 +106,13 @@ the formatter handles the rest.
   error during a scheduled run left the run stuck `in_progress`. Both are
   refused when saved.
 
+- **`GET /conformity/export.pdf` no longer answers 500 on text that
+  looks like markup (#1964).** The `framework` filter, and every stored
+  policy name, description, reference, result detail and diagnostic, went
+  into reportlab's `Paragraph` unescaped, so `framework=<?` (or a policy
+  named `a<b`) raised a parse error. All such text is now escaped; the
+  audit and IPAM PDF exports were checked and already escape theirs.
+
 - **The Trash respects the IPAM / DNS / DHCP hierarchy (#1957, #1958,
   #1959, #1960, #1961, #1962).** Restoring a subnet, block, DHCP scope
   or DNS record whose parent is still in the Trash is now a 409 naming
