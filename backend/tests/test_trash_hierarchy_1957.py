@@ -21,7 +21,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import create_access_token, hash_password
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup
+from app.models.dhcp import (
+    DHCPPool,
+    DHCPScope,
+    DHCPServer,
+    DHCPServerGroup,
+    DHCPStaticAssignment,
+)
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPBlock, IPSpace, Subnet
 
@@ -228,8 +234,10 @@ async def test_the_sweep_skips_a_block_with_a_live_subnet_instead_of_failing(
 
     from app.tasks.trash_purge import _delete_expired  # noqa: PLC0415
 
-    removed = await _delete_expired(db_session, IPBlock, datetime.now(UTC) - timedelta(days=30))
-    assert removed == 0
+    removed, refused = await _delete_expired(
+        db_session, IPBlock, datetime.now(UTC) - timedelta(days=30)
+    )
+    assert (removed, refused) == (0, 0)
     assert (await _get(db_session, Subnet, t.subnet)).deleted_at is None
     assert (await _get(db_session, IPBlock, t.inner)) is not None
 
@@ -331,7 +339,7 @@ async def test_restoring_a_block_that_overlaps_a_live_sibling_is_refused(
 
     resp = await _restore(client, h, "ip_block", bid)
     assert resp.status_code == 409, resp.text
-    assert "overlaps" in resp.json()["detail"]["conflicts"][0]["reason"]
+    assert "10.96.0.0/17" in resp.json()["detail"]["conflicts"][0]["reason"]
     assert (await _get(db_session, IPBlock, bid)).deleted_at is not None
 
 
@@ -494,3 +502,263 @@ async def test_purging_a_subnet_audits_the_trashed_scope_it_takes(
         .all()
     )
     assert [a.resource_id for a in audits] == [str(scid)]
+
+
+# ── validation: data safety of the purge paths ────────────────────────────
+
+
+async def _scope_on(db: AsyncSession, subnet_id: uuid.UUID) -> uuid.UUID:
+    group = DHCPServerGroup(name=f"th-{uuid.uuid4().hex[:6]}")
+    db.add(group)
+    await db.flush()
+    db.add(
+        DHCPServer(
+            name=f"th-{uuid.uuid4().hex[:6]}",
+            driver="kea",
+            host="127.0.0.1",
+            server_group_id=group.id,
+        )
+    )
+    scope = DHCPScope(group_id=group.id, subnet_id=subnet_id, name="sc", address_family="ipv4")
+    db.add(scope)
+    await db.flush()
+    return scope.id
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_never_cascades_through_a_trashed_child_to_a_live_grandchild(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """ip_block.parent_block_id is CASCADE: a one-level "no live child" test lets
+    the expired outer block take a live block two levels down with it."""
+    h = await _admin(db_session)
+    space = IPSpace(name=f"th-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    outer = IPBlock(space_id=space.id, network="10.62.0.0/16", name="outer")
+    db_session.add(outer)
+    await db_session.flush()
+    mid = IPBlock(space_id=space.id, parent_block_id=outer.id, network="10.62.0.0/20", name="m")
+    db_session.add(mid)
+    await db_session.flush()
+    leaf = IPBlock(space_id=space.id, parent_block_id=mid.id, network="10.62.0.0/22", name="l")
+    db_session.add(leaf)
+    await db_session.flush()
+    oid, lid = outer.id, leaf.id
+    await db_session.commit()
+    await _del(client, h, f"/api/v1/ipam/blocks/{oid}")
+    # The legacy state: the grandchild came back live, its parents did not.
+    await db_session.execute(
+        text("UPDATE ip_block SET deleted_at = NULL, deletion_batch_id = NULL WHERE id = :l;"),
+        {"l": lid},
+    )
+    await db_session.execute(
+        text(
+            "UPDATE ip_block SET deleted_at = now() - interval '60 days' WHERE deleted_at IS NOT NULL"
+        )
+    )
+    await db_session.commit()
+
+    from app.tasks.trash_purge import _delete_expired  # noqa: PLC0415
+
+    await _delete_expired(db_session, IPBlock, datetime.now(UTC) - timedelta(days=30))
+    await db_session.commit()
+    leaf_row = await _get(db_session, IPBlock, lid)
+    assert leaf_row is not None and leaf_row.deleted_at is None
+    assert await _get(db_session, IPBlock, oid) is not None
+
+
+@pytest.mark.asyncio
+async def test_the_whole_sweep_purges_the_rest_and_reports_what_it_held_back(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+    from app.tasks.trash_purge import _sweep  # noqa: PLC0415
+
+    h = await _admin(db_session)
+    t = await _tree(db_session)
+    other = IPBlock(space_id=t.space, network="10.99.0.0/16", name="other")
+    db_session.add(other)
+    await db_session.flush()
+    other_id = other.id
+    if (await db_session.execute(select(PlatformSettings).limit(1))).scalar_one_or_none() is None:
+        db_session.add(PlatformSettings())
+    await db_session.commit()
+    await _del(client, h, f"/api/v1/ipam/blocks/{t.inner}")
+    await _del(client, h, f"/api/v1/ipam/blocks/{other_id}")
+    sub = await _get(db_session, Subnet, t.subnet)
+    sub.deleted_at = None
+    sub.deletion_batch_id = None
+    await db_session.execute(
+        text(
+            "UPDATE ip_block SET deleted_at = now() - interval '60 days' WHERE deleted_at IS NOT NULL"
+        )
+    )
+    await db_session.commit()
+
+    result = await _sweep()
+    assert result["per_type"]["ip_block"] == 1, result
+    assert result["held_back_live_children"] == {"ip_block": 1}, result
+    assert await _get(db_session, IPBlock, other_id) is None
+    assert await _get(db_session, IPBlock, t.inner) is not None
+    assert (await _get(db_session, Subnet, t.subnet)).deleted_at is None
+    # Idempotent: a second night changes nothing and does not fail.
+    again = await _sweep()
+    assert again["per_type"]["ip_block"] == 0
+    assert (await _get(db_session, Subnet, t.subnet)).deleted_at is None
+
+
+@pytest.mark.asyncio
+async def test_a_purge_never_takes_a_live_reservation_under_a_trashed_scope(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _admin(db_session)
+    t = await _tree(db_session)
+    scid = await _scope_on(db_session, t.subnet)
+    st = DHCPStaticAssignment(
+        scope_id=scid, ip_address="10.61.1.50", mac_address="aa:bb:cc:00:00:01"
+    )
+    db_session.add(st)
+    await db_session.flush()
+    stid = st.id
+    await db_session.commit()
+    await _del(client, h, f"/api/v1/ipam/subnets/{t.subnet}")
+    row = await _get(db_session, DHCPStaticAssignment, stid)
+    assert row.deleted_at is not None
+    row.deleted_at = None  # the legacy state: restored alone onto a trashed scope
+    row.deletion_batch_id = None
+    await db_session.commit()
+
+    for typ, rid in (("dhcp_scope", scid), ("subnet", t.subnet), ("ip_block", t.outer)):
+        if typ == "ip_block":
+            await _del(client, h, f"/api/v1/ipam/blocks/{t.outer}")
+        resp = await _purge(client, h, typ, rid)
+        assert resp.status_code == 409, (typ, resp.text)
+        assert "reservation" in resp.json()["detail"], resp.text
+    assert (await _get(db_session, DHCPStaticAssignment, stid)).deleted_at is None
+
+
+@pytest.mark.asyncio
+async def test_a_purge_never_takes_a_live_pool_under_a_trashed_scope(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _admin(db_session)
+    t = await _tree(db_session)
+    scid = await _scope_on(db_session, t.subnet)
+    pool = DHCPPool(scope_id=scid, start_ip="10.61.1.100", end_ip="10.61.1.150")
+    db_session.add(pool)
+    await db_session.flush()
+    pid = pool.id
+    await db_session.commit()
+    await _del(client, h, f"/api/v1/dhcp/scopes/{scid}")
+    row = await _get(db_session, DHCPPool, pid)
+    row.deleted_at = None
+    row.deletion_batch_id = None
+    await db_session.commit()
+
+    resp = await _purge(client, h, "dhcp_scope", scid)
+    assert resp.status_code == 409, resp.text
+    assert await _get(db_session, DHCPPool, pid) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_trashed_subnet_under_a_live_block_under_a_trashed_space(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _admin(db_session)
+    t = await _tree(db_session)
+    await db_session.commit()
+    await _del(client, h, f"/api/v1/ipam/subnets/{t.subnet}")
+    await _del(client, h, f"/api/v1/ipam/spaces/{t.space}")
+    # The legacy state: the blocks came back, the space did not.
+    await db_session.execute(
+        text(
+            "UPDATE ip_block SET deleted_at = NULL, deletion_batch_id = NULL " "WHERE space_id = :s"
+        ),
+        {"s": t.space},
+    )
+    await db_session.commit()
+
+    resp = await _restore(client, h, "subnet", t.subnet)
+    assert resp.status_code == 409, resp.text
+    c = resp.json()["detail"]["conflicts"][0]
+    assert c["parent_type"] == "ip_space" and c["parent_id"] == str(t.space)
+
+    purge = await _purge(client, h, "ip_space", t.space)
+    assert purge.status_code == 409, purge.text
+    assert await _get(db_session, IPBlock, t.outer) is not None
+    assert await _get(db_session, Subnet, t.subnet) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_refused_restore_names_the_parent_row_to_restore(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _admin(db_session)
+    t = await _tree(db_session)
+    await db_session.commit()
+    await _del(client, h, f"/api/v1/ipam/subnets/{t.subnet}")
+    await _del(client, h, f"/api/v1/ipam/blocks/{t.inner}")
+    resp = await _restore(client, h, "subnet", t.subnet)
+    c = resp.json()["detail"]["conflicts"][0]
+    assert (c["parent_type"], c["parent_id"]) == ("ip_block", str(t.inner))
+    assert c["parent_display"].startswith("10.61.0.0/20")
+
+
+@pytest.mark.asyncio
+async def test_restoring_a_block_over_a_live_sibling_does_not_reparent_it(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The create path accepts a strict supernet and re-parents what it covers;
+    a restore must refuse instead of doing that silently."""
+    h = await _admin(db_session)
+    space = IPSpace(name=f"th-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    sp = space.id
+    small = IPBlock(space_id=sp, network="10.97.0.0/17", name="small")
+    db_session.add(small)
+    await db_session.flush()
+    smid = small.id
+    await db_session.commit()
+    await _del(client, h, f"/api/v1/ipam/blocks/{smid}")
+    big = IPBlock(space_id=sp, network="10.97.0.0/16", name="big")
+    db_session.add(big)
+    await db_session.commit()
+    bid = big.id
+    await _del(client, h, f"/api/v1/ipam/blocks/{bid}")
+    db_session.add(IPBlock(space_id=sp, network="10.97.0.0/18", name="new"))
+    await db_session.commit()
+
+    resp = await _restore(client, h, "ip_block", bid)
+    assert resp.status_code == 409, resp.text
+    assert "10.97.0.0/18" in resp.json()["detail"]["conflicts"][0]["reason"]
+    new = (
+        await db_session.execute(select(IPBlock).where(IPBlock.network == "10.97.0.0/18"))
+    ).scalar_one()
+    assert new.parent_block_id is None
+
+
+@pytest.mark.asyncio
+async def test_restoring_an_ipv6_subnet_that_overlaps_a_live_one_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = await _admin(db_session)
+    space = IPSpace(name=f"th-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    blk = IPBlock(space_id=space.id, network="2001:db8::/48", name="v6")
+    db_session.add(blk)
+    await db_session.flush()
+    sub = Subnet(space_id=space.id, block_id=blk.id, network="2001:db8:0:1::/64", name="v6")
+    db_session.add(sub)
+    await db_session.flush()
+    sp, bid, sid = space.id, blk.id, sub.id
+    await db_session.commit()
+    await _del(client, h, f"/api/v1/ipam/subnets/{sid}")
+    db_session.add(Subnet(space_id=sp, block_id=bid, network="2001:db8:0:1::/80", name="n"))
+    await db_session.commit()
+
+    resp = await _restore(client, h, "subnet", sid)
+    assert resp.status_code == 409, resp.text
+    assert "2001:db8:0:1::/80" in resp.json()["detail"]["conflicts"][0]["reason"]

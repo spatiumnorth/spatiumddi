@@ -35,7 +35,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select, text, update
+from fastapi import HTTPException
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -434,7 +435,7 @@ async def _record_conflicts(db: AsyncSession, batch_id: uuid.UUID) -> dict[uuid.
 
 async def _record_parent_conflicts(
     db: AsyncSession, batch_id: uuid.UUID
-) -> dict[uuid.UUID, tuple[str, str]]:
+) -> dict[uuid.UUID, tuple[str, str, DNSZone]]:
     """The batch's records whose ZONE is still in the Trash under another batch (#1957).
 
     A record deleted on its own and then its zone deleted sits in a batch of its
@@ -442,11 +443,11 @@ async def _record_parent_conflicts(
     brings back a live record under a zone that answers 404: no zone list shows
     it, no server renders it, and purging the zone later destroys it unannounced.
     A record whose zone is in THIS batch rides the zone's own restore and is not
-    a conflict. Returns ``{record id: (label, reason)}``.
+    a conflict. Returns ``{record id: (label, reason, zone)}``.
     """
     zone = aliased(DNSZone)
     stmt: Any = (
-        select(DNSRecord.id, DNSRecord.fqdn, DNSRecord.record_type, zone.name)
+        select(DNSRecord.id, DNSRecord.fqdn, DNSRecord.record_type, zone)
         .join(zone, zone.id == DNSRecord.zone_id)
         .where(
             DNSRecord.deletion_batch_id == batch_id,
@@ -456,8 +457,8 @@ async def _record_parent_conflicts(
         .execution_options(include_deleted=True)
     )
     return {
-        row_id: (_record_label(fqdn, rtype), _parent_reason("zone", zone_name))
-        for row_id, fqdn, rtype, zone_name in (await db.execute(stmt)).tuples()
+        row_id: (_record_label(fqdn, rtype), _parent_reason("zone", z.name), z)
+        for row_id, fqdn, rtype, z in (await db.execute(stmt)).tuples()
     }
 
 
@@ -489,8 +490,18 @@ async def _trashed_parent(db: AsyncSession, model: type, parent_id: Any, batch_i
     return parent
 
 
-async def _trashed_parent_reason(db: AsyncSession, obj: Any) -> str | None:
-    """The reason ``obj`` cannot be restored because an ancestor is still trashed (#1957)."""
+_PARENT_RESOURCE_TYPE = {
+    IPBlock: "ip_block",
+    IPSpace: "ip_space",
+    Subnet: "subnet",
+    DHCPScope: "dhcp_scope",
+    DNSZone: "dns_zone",
+}
+
+
+async def trashed_parent(db: AsyncSession, obj: Any) -> tuple[str, Any] | None:
+    """``(kind, parent row)`` when ``obj`` cannot be restored because an ancestor
+    is still in the Trash under another batch (#1957), else None."""
     batch_id = obj.deletion_batch_id
     candidates: list[tuple[str, type, Any]] = []
     if isinstance(obj, Subnet):
@@ -504,11 +515,31 @@ async def _trashed_parent_reason(db: AsyncSession, obj: Any) -> str | None:
         candidates = [("subnet", Subnet, obj.subnet_id)]
     elif isinstance(obj, (DHCPPool, DHCPStaticAssignment)):
         candidates = [("DHCP scope", DHCPScope, obj.scope_id)]
+    elif isinstance(obj, DNSRecord):
+        candidates = [("zone", DNSZone, obj.zone_id)]
     for kind, model, parent_id in candidates:
         parent = await _trashed_parent(db, model, parent_id, batch_id)
         if parent is not None:
-            return _parent_reason(kind, _row_display(parent))
+            return kind, parent
     return None
+
+
+def parent_ref(parent: Any) -> dict[str, str]:
+    """The Trash row a refused restore points at, so the page can offer it (#1957)."""
+    return {
+        "parent_type": _PARENT_RESOURCE_TYPE[type(parent)],
+        "parent_id": str(parent.id),
+        "parent_display": _row_display(parent),
+    }
+
+
+async def _trashed_parent_reason(db: AsyncSession, obj: Any) -> str | None:
+    """The reason ``obj`` cannot be restored because an ancestor is still trashed (#1957)."""
+    found = await trashed_parent(db, obj)
+    if found is None:
+        return None
+    kind, parent = found
+    return _parent_reason(kind, _row_display(parent))
 
 
 async def restore_batch(
@@ -550,10 +581,16 @@ async def restore_batch(
             }
             for rid, label in record_conflicts.items()
         )
-        for rid, (label, reason) in (await _record_parent_conflicts(db, batch_id)).items():
+        for rid, (label, reason, pzone) in (await _record_parent_conflicts(db, batch_id)).items():
             record_parent_conflicts[rid] = reason
             result.conflicts.append(
-                {"type": "dns_record", "id": str(rid), "display": label, "reason": reason}
+                {
+                    "type": "dns_record",
+                    "id": str(rid),
+                    "display": label,
+                    "reason": reason,
+                    **parent_ref(pzone),
+                }
             )
 
     # Look up every row across all in-scope models. Each query opts into
@@ -573,14 +610,18 @@ async def restore_batch(
             if conflict_check is not None:
                 reason = await conflict_check(obj)
                 if reason:
-                    result.conflicts.append(
-                        {
-                            "type": resource_type,
-                            "id": str(obj.id),
-                            "display": _row_display(obj),
-                            "reason": reason,
-                        }
-                    )
+                    conflict: dict[str, Any] = {
+                        "type": resource_type,
+                        "id": str(obj.id),
+                        "display": _row_display(obj),
+                        "reason": reason,
+                    }
+                    # Name the trashed parent as a row the caller can restore,
+                    # so the page can offer "restore it first" (#1957).
+                    found = await trashed_parent(db, obj)
+                    if found is not None:
+                        conflict.update(parent_ref(found[1]))
+                    result.conflicts.append(conflict)
                     continue
             result.restored.append(obj)
             if isinstance(obj, DNSZone):
@@ -669,27 +710,28 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
         ).scalar_one_or_none()
         if existing is not None:
             return f"An active block with CIDR {obj.network} already exists in this space"
-        # The create path (``_assert_no_block_overlap``) refuses any overlap with
-        # a sibling at the same level. Its one leniency, a new strict supernet
-        # re-parenting the siblings it covers, is a deliberate act on create; a
-        # restore must not do it silently.
-        sql = (
-            "SELECT network FROM ip_block WHERE space_id = CAST(:space_id AS uuid) "
-            "AND network && CAST(:network AS cidr) AND deleted_at IS NULL AND id != CAST(:id AS uuid)"
-        )
-        params: dict[str, Any] = {
-            "space_id": str(obj.space_id),
-            "network": str(obj.network),
-            "id": str(obj.id),
-        }
-        if obj.parent_block_id is None:
-            sql += " AND parent_block_id IS NULL"
-        else:
-            sql += " AND parent_block_id = CAST(:parent_id AS uuid)"
-            params["parent_id"] = str(obj.parent_block_id)
-        row = (await db.execute(text(sql), params)).first()
-        if row is not None:
-            return f"Block {obj.network} overlaps with existing block {row[0]} at the same level"
+        # The create path's own rule (``_assert_no_block_overlap``), not a copy
+        # of it (#1959): any overlap with a live sibling at the same level. Its
+        # one leniency, a new strict supernet re-parenting the siblings it
+        # covers, is a deliberate act on create; a restore must not do it
+        # silently, so a re-parent candidate is a refusal here.
+        from app.api.v1.ipam.router import _assert_no_block_overlap  # noqa: PLC0415
+
+        try:
+            covered = await _assert_no_block_overlap(
+                db, obj.space_id, str(obj.network), obj.parent_block_id, exclude_id=obj.id
+            )
+        except HTTPException as exc:
+            return str(exc.detail)
+        if covered:
+            inner = (
+                await db.execute(select(IPBlock.network).where(IPBlock.id == covered[0]))
+            ).scalar_one_or_none()
+            return (
+                f"Block {obj.network} would contain existing block {inner} at the same "
+                "level; a restore does not re-parent live blocks. Move or delete that "
+                "block first"
+            )
 
     elif isinstance(obj, Subnet):
         existing = (
@@ -703,20 +745,14 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
         ).scalar_one_or_none()
         if existing is not None:
             return f"An active subnet with CIDR {obj.network} already exists in this space"
-        # Same rule as the create path's ``_assert_no_overlap``: any overlap in
-        # the space, not only an identical CIDR.
-        row = (
-            await db.execute(
-                text(
-                    "SELECT network FROM subnet WHERE space_id = CAST(:space_id AS uuid) "
-                    "AND network && CAST(:network AS cidr) AND deleted_at IS NULL "
-                    "AND id != CAST(:id AS uuid)"
-                ),
-                {"space_id": str(obj.space_id), "network": str(obj.network), "id": str(obj.id)},
-            )
-        ).first()
-        if row is not None:
-            return f"Network {obj.network} overlaps with existing subnet {row[0]}"
+        # The create path's own rule (``_assert_no_overlap``), not a copy of it
+        # (#1959): any overlap with a live subnet in the space.
+        from app.api.v1.ipam.router import _assert_no_overlap  # noqa: PLC0415
+
+        try:
+            await _assert_no_overlap(db, obj.space_id, str(obj.network), exclude_id=obj.id)
+        except HTTPException as exc:
+            return str(exc.detail)
 
     elif isinstance(obj, DNSZone):
         existing = (

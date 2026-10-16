@@ -24,7 +24,7 @@ from app.api.deps import DB, SuperAdmin
 from app.core.agent_wake import dns_group_channel, publish_wake
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.dhcp import DHCPScope
+from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.dhcp.lease_cleanup import delete_leases_for_scope
@@ -80,6 +80,11 @@ class RestoreConflict(BaseModel):
     id: str
     display: str
     reason: str
+    # Set when the clash is a parent still in the Trash (#1957): the Trash row
+    # to restore first, so the page can offer it instead of a dead end.
+    parent_type: str | None = None
+    parent_id: str | None = None
+    parent_display: str | None = None
 
 
 class RestoreResponse(BaseModel):
@@ -239,16 +244,51 @@ async def _trashed_ipam_subtree(db: Any, target: Any) -> tuple[list[Any], list[A
 async def _live_children(
     db: Any, targets: list[Any], blocks: list[Any], subnets: list[Any]
 ) -> list[str]:
-    """Labels of rows a purge of ``targets`` would destroy that are NOT in the Trash."""
+    """Labels of rows a purge of ``targets`` would destroy that are NOT in the Trash.
+
+    Every level the FK CASCADEs reach is looked at: blocks and subnets (handed
+    in by the caller, trashed or not), the DHCP scopes on those subnets, and the
+    pools and reservations on any of those scopes, trashed scopes included — a
+    live reservation restored onto a trashed scope before #1957 is still live.
+    """
     live = [f"block {_row_label(b)}" for b in blocks if b.deleted_at is None]
     live += [f"subnet {_row_label(sub)}" for sub in subnets if sub.deleted_at is None]
     subnet_ids = [sub.id for sub in subnets] + [t.id for t in targets if isinstance(t, Subnet)]
+    scope_ids = [t.id for t in targets if isinstance(t, DHCPScope)]
     if subnet_ids:
-        # The soft-delete filter is on: only a LIVE scope shows up.
         scopes = (
-            await db.execute(select(DHCPScope).where(DHCPScope.subnet_id.in_(subnet_ids)).limit(5))
-        ).scalars()
-        live += [f"DHCP scope {_row_label(sc)}" for sc in scopes]
+            (
+                await db.execute(
+                    select(DHCPScope)
+                    .where(DHCPScope.subnet_id.in_(subnet_ids))
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        live += [f"DHCP scope {_row_label(sc)}" for sc in scopes if sc.deleted_at is None]
+        scope_ids += [sc.id for sc in scopes]
+    if scope_ids:
+        # The soft-delete filter is on: only LIVE pools / reservations show up.
+        pools = (
+            (await db.execute(select(DHCPPool).where(DHCPPool.scope_id.in_(scope_ids)).limit(5)))
+            .scalars()
+            .all()
+        )
+        live += [f"DHCP pool {_row_label(p)}" for p in pools]
+        statics = (
+            (
+                await db.execute(
+                    select(DHCPStaticAssignment)
+                    .where(DHCPStaticAssignment.scope_id.in_(scope_ids))
+                    .limit(5)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        live += [f"DHCP reservation {_row_label(st)}" for st in statics]
     return live
 
 
@@ -636,93 +676,100 @@ async def permanent_delete_from_trash(
     records_retracted = 0
     purged_extra: dict[str, int] = {}
     dns_wake_group_ids: set[uuid.UUID] = set()
-    if isinstance(target, DHCPScope):
-        # Delete the reservation mirror rows (not just free them) so the IPs fold
-        # back into free gaps, and purge any dynamic leases still pointing here —
-        # defense-in-depth for pre-fix strays / convergence-race leftovers (the
-        # first soft-delete normally already cleaned both up).
-        await remove_ipam_for_scope_statics(db, target.id)
-        await delete_leases_for_scope(db, target.id)
-    elif isinstance(target, DNSZone):
-        # #1830 — retract from agentless servers first; raises (row + audit
-        # untouched) when the provider refuses. Same helper as the 30-day sweep.
-        from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
+    try:
+        if isinstance(target, DHCPScope):
+            live = await _live_children(db, [target], [], [])
+            if live:
+                _refuse_live_children(label, live)
+            # Delete the reservation mirror rows (not just free them) so the IPs fold
+            # back into free gaps, and purge any dynamic leases still pointing here —
+            # defense-in-depth for pre-fix strays / convergence-race leftovers (the
+            # first soft-delete normally already cleaned both up).
+            await remove_ipam_for_scope_statics(db, target.id)
+            await delete_leases_for_scope(db, target.id)
+        elif isinstance(target, DNSZone):
+            # #1830 — retract from agentless servers first; raises (row + audit
+            # untouched) when the provider refuses. Same helper as the 30-day sweep.
+            from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
 
-        # Refuses (409) while a LIVE record sits under the trashed zone (#1957).
-        await purge_trashed_zone(db, target)
-        dns_wake_group_ids.add(target.group_id)
-    elif isinstance(target, Subnet):
-        live = await _live_children(db, [target], [], [])
-        if live:
-            _refuse_live_children(label, live)
-        records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(db, [target])
-        await _audit_scopes_under(db, current_user, [target.id])
-    elif isinstance(target, (IPBlock, IPSpace)):
-        # #1958 — a block or space is purged WITH the trashed subnets and
-        # blocks under it, leaf first (the nightly sweep's order): subnet.block_id
-        # / space_id are RESTRICT, and the soft-delete filter hides the trashed
-        # subnets from the ORM, so a bare delete of the parent only ever met the
-        # database's refusal.
-        blocks, subnets = await _trashed_ipam_subtree(db, target)
-        live = await _live_children(db, [target], blocks, subnets)
-        if live:
-            _refuse_live_children(label, live)
-        records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(db, subnets)
-        await _audit_scopes_under(db, current_user, [sub.id for sub in subnets])
-        for sub in subnets:
-            db.add(_purge_audit(current_user, "subnet", sub))
-        for blk in blocks:
-            if blk.id != target.id:
-                db.add(_purge_audit(current_user, "ip_block", blk))
-        subnet_ids = [sub.id for sub in subnets]
-        if subnet_ids:
-            await db.execute(
-                sa_delete(Subnet)
-                .where(Subnet.id.in_(subnet_ids))
-                .execution_options(include_deleted=True, synchronize_session=False)
-            )
-        # Deepest blocks first: a child block is removed before the block it
-        # hangs from, so no delete relies on the parent_block_id CASCADE.
-        for blk in blocks:
-            if blk.id != target.id:
+            # Refuses (409) while a LIVE record sits under the trashed zone (#1957).
+            await purge_trashed_zone(db, target)
+            dns_wake_group_ids.add(target.group_id)
+        elif isinstance(target, Subnet):
+            live = await _live_children(db, [target], [], [])
+            if live:
+                _refuse_live_children(label, live)
+            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(db, [target])
+            await _audit_scopes_under(db, current_user, [target.id])
+        elif isinstance(target, (IPBlock, IPSpace)):
+            # #1958 — a block or space is purged WITH the trashed subnets and
+            # blocks under it, leaf first (the nightly sweep's order): subnet.block_id
+            # / space_id are RESTRICT, and the soft-delete filter hides the trashed
+            # subnets from the ORM, so a bare delete of the parent only ever met the
+            # database's refusal.
+            blocks, subnets = await _trashed_ipam_subtree(db, target)
+            live = await _live_children(db, [target], blocks, subnets)
+            if live:
+                _refuse_live_children(label, live)
+            records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(db, subnets)
+            await _audit_scopes_under(db, current_user, [sub.id for sub in subnets])
+            for sub in subnets:
+                db.add(_purge_audit(current_user, "subnet", sub))
+            for blk in blocks:
+                if blk.id != target.id:
+                    db.add(_purge_audit(current_user, "ip_block", blk))
+            subnet_ids = [sub.id for sub in subnets]
+            if subnet_ids:
                 await db.execute(
-                    sa_delete(IPBlock)
-                    .where(IPBlock.id == blk.id)
+                    sa_delete(Subnet)
+                    .where(Subnet.id.in_(subnet_ids))
                     .execution_options(include_deleted=True, synchronize_session=False)
                 )
-        if subnets or len(blocks) > 1:
-            purged_extra = {"subnets": len(subnets), "blocks": max(len(blocks) - 1, 0)}
-    db.add(
-        AuditLog(
-            user_id=current_user.id,
-            user_display_name=current_user.display_name,
-            auth_source=current_user.auth_source,
-            action="permanent_delete",
-            resource_type=type,
-            resource_id=str(target.id),
-            resource_display=label,
-            result="success",
-            new_value=(
-                {
-                    **({"dns_records_retracted": records_retracted} if records_retracted else {}),
-                    **purged_extra,
-                }
-                or None
-            ),
+            # Deepest blocks first: a child block is removed before the block it
+            # hangs from, so no delete relies on the parent_block_id CASCADE.
+            for blk in blocks:
+                if blk.id != target.id:
+                    await db.execute(
+                        sa_delete(IPBlock)
+                        .where(IPBlock.id == blk.id)
+                        .execution_options(include_deleted=True, synchronize_session=False)
+                    )
+            if subnets or len(blocks) > 1:
+                purged_extra = {"subnets": len(subnets), "blocks": max(len(blocks) - 1, 0)}
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="permanent_delete",
+                resource_type=type,
+                resource_id=str(target.id),
+                resource_display=label,
+                result="success",
+                new_value=(
+                    {
+                        **(
+                            {"dns_records_retracted": records_retracted}
+                            if records_retracted
+                            else {}
+                        ),
+                        **purged_extra,
+                    }
+                    or None
+                ),
+            )
         )
-    )
-    if isinstance(target, (IPBlock, IPSpace)):
-        # Core, not ``db.delete``: the ORM would lazy-load the parent's
-        # relationships inside an async session, and everything under it is
-        # already gone above.
-        await db.execute(
-            sa_delete(model)
-            .where(model.id == target.id)
-            .execution_options(include_deleted=True, synchronize_session=False)
-        )
-    elif not isinstance(target, DNSZone):
-        await db.delete(target)
-    try:
+        if isinstance(target, (IPBlock, IPSpace)):
+            # Core, not ``db.delete``: the ORM would lazy-load the parent's
+            # relationships inside an async session, and everything under it is
+            # already gone above.
+            await db.execute(
+                sa_delete(model)
+                .where(model.id == target.id)
+                .execution_options(include_deleted=True, synchronize_session=False)
+            )
+        elif not isinstance(target, DNSZone):
+            await db.delete(target)
         await db.commit()
     except IntegrityError as exc:
         # Something we did not account for still references the row. Never a 500

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronLeft,
@@ -60,40 +60,89 @@ function ConfirmRestoreModal({
   // deleted zone's batch is a dns_record too, so the clicked row's type cannot
   // tell the two apart: the 409 carries `skip_conflicts_allowed` instead.
   const [canSkipConflicts, setCanSkipConflicts] = useState(false);
+  // Set after a 409 whose clash is a parent still in the Trash (#1957): the
+  // server names that parent's Trash row, so the dialog can restore it and then
+  // this row in one click instead of sending the operator to find it (it may
+  // well be on another page of the list).
+  const [blocker, setBlocker] = useState<{
+    type: TrashEntryType;
+    id: string;
+    display: string;
+  } | null>(null);
+
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ["trash"] });
+    qc.invalidateQueries({ queryKey: ["ipam"] });
+    qc.invalidateQueries({ queryKey: ["dns"] });
+    qc.invalidateQueries({ queryKey: ["dhcp"] });
+  };
+
+  const showError = (err: unknown) => {
+    const detail = (err as { response?: { data?: { detail?: unknown } } })
+      ?.response?.data?.detail;
+    setBlocker(null);
+    setCanSkipConflicts(false);
+    if (detail && typeof detail === "object" && "conflicts" in detail) {
+      const conflicts = (
+        detail as {
+          conflicts: Array<{
+            display: string;
+            reason: string;
+            parent_type?: TrashEntryType | null;
+            parent_id?: string | null;
+            parent_display?: string | null;
+          }>;
+        }
+      ).conflicts;
+      const allowed = (detail as { skip_conflicts_allowed?: boolean })
+        .skip_conflicts_allowed;
+      setError(
+        `Cannot restore: ${conflicts
+          .map((c) => `${c.display} — ${c.reason}`)
+          .join("; ")}`,
+      );
+      setCanSkipConflicts(
+        allowed === true && entry.batch_size > conflicts.length,
+      );
+      const withParent = conflicts.find((c) => c.parent_type && c.parent_id);
+      if (withParent?.parent_type && withParent.parent_id) {
+        setBlocker({
+          type: withParent.parent_type,
+          id: withParent.parent_id,
+          display: withParent.parent_display ?? withParent.parent_id,
+        });
+      }
+    } else if (typeof detail === "string") {
+      setError(detail);
+    } else {
+      setError("Restore failed");
+    }
+  };
+
   const mut = useMutation({
     mutationFn: (skipConflicts: boolean) =>
       trashApi.restore(entry.type, entry.id, { skipConflicts }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["trash"] });
-      qc.invalidateQueries({ queryKey: ["ipam"] });
-      qc.invalidateQueries({ queryKey: ["dns"] });
-      qc.invalidateQueries({ queryKey: ["dhcp"] });
+      invalidate();
       onClose();
     },
-    onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      if (detail && typeof detail === "object" && "conflicts" in detail) {
-        const conflicts = (
-          detail as { conflicts: Array<{ display: string; reason: string }> }
-        ).conflicts;
-        const allowed = (detail as { skip_conflicts_allowed?: boolean })
-          .skip_conflicts_allowed;
-        setError(
-          `Cannot restore: ${conflicts
-            .map((c) => `${c.display} — ${c.reason}`)
-            .join("; ")}`,
-        );
-        setCanSkipConflicts(
-          allowed === true && entry.batch_size > conflicts.length,
-        );
-      } else if (typeof detail === "string") {
-        setError(detail);
-      } else {
-        setError("Restore failed");
-      }
-    },
+    onError: showError,
   });
+
+  // Restore the blocking parent, then retry this row. A parent with a trashed
+  // parent of its own answers 409 the same way, and the dialog offers that one.
+  const parentMut = useMutation({
+    mutationFn: (p: { type: TrashEntryType; id: string }) =>
+      trashApi.restore(p.type, p.id),
+    onSuccess: () => {
+      invalidate();
+      setError(null);
+      setBlocker(null);
+      mut.mutate(false);
+    },
+    onError: showError,
+  });
+  const pending = mut.isPending || parentMut.isPending;
 
   return (
     <Modal title="Restore from trash?" onClose={onClose}>
@@ -119,13 +168,26 @@ function ConfirmRestoreModal({
           >
             Cancel
           </button>
+          {blocker && (
+            <button
+              onClick={() => {
+                setError(null);
+                parentMut.mutate({ type: blocker.type, id: blocker.id });
+              }}
+              disabled={pending}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+              title="Restore the parent from the Trash (with the rows deleted with it), then this row"
+            >
+              Restore {blocker.display} first
+            </button>
+          )}
           {canSkipConflicts && (
             <button
               onClick={() => {
                 setError(null);
                 mut.mutate(true);
               }}
-              disabled={mut.isPending}
+              disabled={pending}
               className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
               title="Restore every row in the batch except the ones that clash with a live row"
             >
@@ -137,10 +199,10 @@ function ConfirmRestoreModal({
               setError(null);
               mut.mutate(false);
             }}
-            disabled={mut.isPending}
+            disabled={pending}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
-            {mut.isPending ? "Restoring…" : "Restore"}
+            {pending ? "Restoring…" : "Restore"}
           </button>
         </div>
       </div>
@@ -247,6 +309,11 @@ export function TrashPage() {
   const items = data?.items ?? [];
   const total = data?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  // A restore or purge that empties the last page would otherwise leave the
+  // operator on a page past the end, told the Trash is empty while it is not.
+  useEffect(() => {
+    if (data && page > 0 && page >= totalPages) setPage(totalPages - 1);
+  }, [data, page, totalPages]);
 
   return (
     <div className="h-full overflow-auto p-6">

@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, delete, exists, or_, select
+from sqlalchemy import and_, delete, exists, func, or_, select, union
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
@@ -84,7 +84,10 @@ async def _release_ipam_mirrors(db: Any, cutoff: datetime) -> int:
                     DHCPStaticAssignment.deleted_at.is_not(None),
                     DHCPStaticAssignment.deleted_at < cutoff,
                 ),
-                and_(DHCPScope.deleted_at.is_not(None), DHCPScope.deleted_at < cutoff),
+                # The same predicate the scope DELETE uses: a scope held back
+                # because a live pool / reservation sits on it (#1957) keeps its
+                # reservations, so their mirrors must stay too.
+                and_(*_expired_where(DHCPScope, cutoff)),
             )
         )
         .execution_options(include_deleted=True)
@@ -242,6 +245,39 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     return purged, skipped
 
 
+def _blocks_with_live_descendants() -> Any:
+    """Ids of every block with a LIVE block or subnet anywhere beneath it.
+
+    Recursive, not one level: ``ip_block.parent_block_id`` is ON DELETE
+    CASCADE, so deleting an expired block whose direct child is trashed would
+    take a live grandchild block through that child. (A live subnet is held by
+    its RESTRICT key, but is covered too so the row is skipped rather than
+    refused.) ``UNION``, not ``UNION ALL``, so the walk terminates.
+    """
+    anchor_src = union(
+        select(IPBlock.id.label("id")).where(IPBlock.deleted_at.is_(None)),  # type: ignore[attr-defined]
+        select(Subnet.block_id.label("id")).where(Subnet.deleted_at.is_(None)),  # type: ignore[attr-defined]
+    ).subquery()
+    live_under = select(anchor_src.c.id).cte("live_under", recursive=True)
+    parent = aliased(IPBlock)
+    live_under = live_under.union(
+        select(parent.parent_block_id).where(
+            parent.id == live_under.c.id, parent.parent_block_id.is_not(None)
+        )
+    )
+    return select(live_under.c.id)
+
+
+def _scopes_with_live_children() -> Any:
+    """Ids of every DHCP scope holding a LIVE pool or reservation (FK CASCADE)."""
+    return union(
+        select(DHCPPool.scope_id).where(DHCPPool.deleted_at.is_(None)),  # type: ignore[attr-defined]
+        select(DHCPStaticAssignment.scope_id).where(
+            DHCPStaticAssignment.deleted_at.is_(None)  # type: ignore[attr-defined]
+        ),
+    )
+
+
 def _expired_where(model: type, cutoff: datetime) -> list[Any]:
     """The rows of ``model`` the sweep may delete: expired, and with nothing LIVE under them.
 
@@ -249,15 +285,12 @@ def _expired_where(model: type, cutoff: datetime) -> list[Any]:
     is destroyed by the parent's FK CASCADE, or refused by its RESTRICT: the
     first loses data unannounced, the second raised out of the single sweep
     transaction and rolled the whole night back, every night. Such a parent is
-    skipped, not deleted, until its child is restored or moved.
+    skipped, not deleted, until its child is restored or moved; ``_sweep``
+    reports how many it skipped.
     """
     where: list[Any] = [model.deleted_at.is_not(None), model.deleted_at < cutoff]  # type: ignore[attr-defined]
     if model is IPBlock:
-        child = aliased(IPBlock)
-        where += [
-            ~exists().where(child.parent_block_id == model.id).where(child.deleted_at.is_(None)),  # type: ignore[attr-defined]
-            ~exists().where(Subnet.block_id == model.id).where(Subnet.deleted_at.is_(None)),  # type: ignore[attr-defined]
-        ]
+        where.append(IPBlock.id.not_in(_blocks_with_live_descendants()))
     elif model is IPSpace:
         where += [
             ~exists().where(IPBlock.space_id == model.id).where(IPBlock.deleted_at.is_(None)),  # type: ignore[attr-defined]
@@ -266,18 +299,45 @@ def _expired_where(model: type, cutoff: datetime) -> list[Any]:
     elif model is Subnet:
         where += [
             ~exists().where(DHCPScope.subnet_id == model.id).where(DHCPScope.deleted_at.is_(None)),  # type: ignore[attr-defined]
+            ~exists()
+            .where(DHCPScope.subnet_id == model.id)  # type: ignore[attr-defined]
+            .where(DHCPScope.id.in_(_scopes_with_live_children())),
         ]
+    elif model is DHCPScope:
+        where.append(DHCPScope.id.not_in(_scopes_with_live_children()))
     return where
 
 
-async def _delete_expired(db: Any, model: type, cutoff: datetime) -> int:
+async def _count_held_back(db: Any, model: type, cutoff: datetime) -> int:
+    """Expired rows of ``model`` the sweep leaves because something live is under them."""
+    expired = func.count().filter(
+        model.deleted_at.is_not(None), model.deleted_at < cutoff  # type: ignore[attr-defined]
+    )
+    total = (
+        await db.execute(select(expired).select_from(model).execution_options(include_deleted=True))
+    ).scalar_one()
+    if not total:
+        return 0
+    eligible = (
+        await db.execute(
+            select(func.count())
+            .select_from(model)
+            .where(*_expired_where(model, cutoff))
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one()
+    return int(total) - int(eligible)
+
+
+async def _delete_expired(db: Any, model: type, cutoff: datetime) -> tuple[int, int]:
     """Bulk-delete the expired rows of ``model``; one refusing row must not sink the sweep.
 
     A block or space can still be refused by a subnet that is in the Trash but
     not yet expired (RESTRICT). That used to raise out of the one sweep
     transaction. The bulk delete now runs in a savepoint and, if the database
     refuses, falls back to one savepoint per row, leaving the refused rows for a
-    later night.
+    later night. Returns ``(removed, refused)``; the refused rows are logged
+    once per table per sweep, not once each.
     """
     where = _expired_where(model, cutoff)
     try:
@@ -285,9 +345,9 @@ async def _delete_expired(db: Any, model: type, cutoff: datetime) -> int:
             res = await db.execute(
                 delete(model).where(*where).execution_options(include_deleted=True)
             )
-        return int(res.rowcount or 0)
+        return int(res.rowcount or 0), 0
     except IntegrityError:
-        logger.warning("trash_purge.bulk_delete_refused", table=model.__tablename__)  # type: ignore[attr-defined]
+        pass  # fall back to per-row below; the refused rows are logged there
     ids = (
         (
             await db.execute(
@@ -298,6 +358,7 @@ async def _delete_expired(db: Any, model: type, cutoff: datetime) -> int:
         .all()
     )
     removed = 0
+    refused: list[str] = []
     for row_id in ids:
         try:
             async with db.begin_nested():
@@ -308,13 +369,16 @@ async def _delete_expired(db: Any, model: type, cutoff: datetime) -> int:
                 )
             removed += int(res.rowcount or 0)
         except IntegrityError:
-            logger.warning(
-                "trash_purge.row_refused",
-                table=model.__tablename__,  # type: ignore[attr-defined]
-                row_id=str(row_id),
-                hint="something still references it; left in the Trash",
-            )
-    return removed
+            refused.append(str(row_id))
+    if refused:
+        logger.warning(
+            "trash_purge.rows_refused",
+            table=model.__tablename__,  # type: ignore[attr-defined]
+            count=len(refused),
+            row_ids=refused[:10],
+            hint="something still references them; left in the Trash for a later sweep",
+        )
+    return removed, len(refused)
 
 
 async def _sweep() -> dict[str, Any]:
@@ -370,7 +434,7 @@ async def _sweep() -> dict[str, Any]:
             (
                 await db.execute(
                     select(Subnet.id)
-                    .where(Subnet.deleted_at.is_not(None), Subnet.deleted_at < cutoff)
+                    .where(*_expired_where(Subnet, cutoff))
                     .execution_options(include_deleted=True)
                 )
             )
@@ -381,10 +445,28 @@ async def _sweep() -> dict[str, Any]:
             db, purged_subnet_ids
         )
 
+        # Counted before the deletes: what is held back because a LIVE row sits
+        # under it (#1957) stays in the Trash until that row is restored or
+        # moved, and says so once per sweep rather than vanishing silently.
+        held_back: dict[str, int] = {}
         for model in _PURGE_MODELS_LEAF_FIRST:
-            removed = await _delete_expired(db, model, cutoff)
+            n = await _count_held_back(db, model, cutoff)
+            if n:
+                held_back[model.__tablename__] = n
+        if held_back:
+            logger.warning(
+                "trash_purge.held_back_live_children",
+                counts=held_back,
+                hint="expired rows with a live row under them are kept; restore or move the live row",
+            )
+
+        refused: dict[str, int] = {}
+        for model in _PURGE_MODELS_LEAF_FIRST:
+            removed, n_refused = await _delete_expired(db, model, cutoff)
             per_type[model.__tablename__] = removed
             total_removed += removed
+            if n_refused:
+                refused[model.__tablename__] = n_refused
 
         # Zones purge per-row AFTER the record DELETE so the provider teardown
         # gates each DB delete and (for excluded in-zone records) the CASCADE has
@@ -410,6 +492,8 @@ async def _sweep() -> dict[str, Any]:
                         "records_retracted_at_provider": records_retracted,
                         "address_records_retracted": address_records_retracted,
                         "zones_retract_skipped": zones_skipped,
+                        "held_back_live_children": held_back,
+                        "refused": refused,
                     },
                     result="success",
                 )
@@ -427,6 +511,8 @@ async def _sweep() -> dict[str, Any]:
             "records_retracted_at_provider": records_retracted,
             "address_records_retracted": address_records_retracted,
             "zones_retract_skipped": zones_skipped,
+            "held_back_live_children": held_back,
+            "refused": refused,
             "purge_days": purge_days,
             "skipped": False,
         }

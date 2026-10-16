@@ -104,6 +104,63 @@ describe("Restore the others (#1960)", () => {
   });
 });
 
+describe("a parent still in the Trash (#1957)", () => {
+  it("offers to restore the parent first, then restores this row", async () => {
+    list.mockResolvedValue({ items: [entry(1)], total: 1 });
+    restore.mockRejectedValueOnce({
+      response: {
+        status: 409,
+        data: {
+          detail: {
+            message: "Restore would clash with active rows",
+            skip_conflicts_allowed: true,
+            conflicts: [
+              {
+                type: "dns_record",
+                id: "r-1",
+                display: "ya.example.test. A",
+                reason: "its zone example.test. is in the Trash",
+                parent_type: "dns_zone",
+                parent_id: "z-9",
+                parent_display: "example.test.",
+              },
+            ],
+          },
+        },
+      },
+    });
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <TrashPage />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByText("Restore"));
+    const buttons = await screen.findAllByRole("button", { name: "Restore" });
+    fireEvent.click(buttons[buttons.length - 1]);
+    const first = await screen.findByText("Restore example.test. first");
+    restore.mockResolvedValue({ batch_id: "b", restored: 1, skipped: [] });
+    fireEvent.click(first);
+    await waitFor(() => expect(restore).toHaveBeenCalledTimes(3));
+    expect(restore.mock.calls[1]).toEqual(["dns_zone", "z-9"]);
+    expect(restore.mock.calls[2]).toEqual([
+      "dns_record",
+      "r-1",
+      { skipConflicts: false },
+    ]);
+  });
+
+  it("is not offered when the clash is not a trashed parent", async () => {
+    await clash(false);
+    expect(
+      screen.queryByRole("button", { name: /^Restore .* first$/ }),
+    ).toBeNull();
+  });
+});
+
 describe("the list (#1961, #1962)", () => {
   function mount() {
     render(
@@ -134,6 +191,37 @@ describe("the list (#1961, #1962)", () => {
         expect.objectContaining({ offset: 100, limit: 100 }),
       ),
     );
+  });
+
+  it("steps back when the page it is on empties", async () => {
+    let total = 105;
+    list.mockImplementation((p: { offset?: number }) =>
+      Promise.resolve({
+        items: (p.offset ?? 0) >= total ? [] : [entry(1)],
+        total,
+        limit: 100,
+        offset: p.offset ?? 0,
+      }),
+    );
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <TrashPage />
+      </QueryClientProvider>,
+    );
+    await screen.findByText(/of 105/);
+    fireEvent.click(screen.getByLabelText("Next page"));
+    await screen.findByText(/101–101 of 105/);
+    total = 100; // the rows on page 2 were restored or purged
+    await qc.invalidateQueries({ queryKey: ["trash"] });
+    await waitFor(() =>
+      expect(list).toHaveBeenLastCalledWith(
+        expect.objectContaining({ offset: 0 }),
+      ),
+    );
+    expect(screen.queryByText("Trash is empty.")).toBeNull();
   });
 
   it("can list the oldest rows first", async () => {
