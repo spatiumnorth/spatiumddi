@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { cloneElement, isValidElement, useId, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -15,12 +15,14 @@ import {
   type AlertChangeScope,
   type AlertClassification,
   type AlertRule,
+  type AlertRuleUpdate,
   type AlertRuleType,
   type AlertServerType,
   type AlertSeverity,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { errMsg } from "@/pages/dhcp/_shared";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 import {
   NEEDS_SUPERADMIN,
@@ -54,6 +56,9 @@ const RULE_TYPE_PARAM_DEFAULTS: Partial<
   node_pressure: { threshold: 50 },
 };
 
+// #1994 — the label names its control: the single child element gets an
+// `id` and the label a matching `htmlFor`, so a screen reader (or a
+// search by label) finds the control.
 function Field({
   label,
   hint,
@@ -61,22 +66,44 @@ function Field({
 }: {
   label: string;
   hint?: string;
-  children: React.ReactNode;
+  children: React.ReactElement<{ id?: string }>;
 }) {
+  const id = useId();
   return (
     <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
+      <label htmlFor={id} className="text-xs font-medium text-muted-foreground">
         {label}
       </label>
-      {children}
+      {isValidElement(children) ? cloneElement(children, { id }) : children}
       {hint && <p className="text-[11px] text-muted-foreground/80">{hint}</p>}
     </div>
   );
 }
 
+// A numeric input's value: a stored null stays empty, never a default.
+const numVal = (n: number | null): number | string => (n === null ? "" : n);
+const parseNum = (v: string): number | null => (v === "" ? null : Number(v));
+
+const THRESHOLD_PERCENT_TYPES: AlertRuleType[] = [
+  "subnet_utilization",
+  "voice_lease_count_below",
+  "stale_ip_count",
+  "dhcp_pool_exhaustion",
+  "node_pressure",
+  "backup_stale",
+];
+const THRESHOLD_DAYS_TYPES: AlertRuleType[] = [
+  "domain_expiring",
+  "circuit_term_expiring",
+  "service_term_expiring",
+  "secret_expiring",
+  "decom_expiring",
+  "stale_ip_count",
+];
+
 // ── Rule editor ────────────────────────────────────────────────────────────
 
-function RuleEditorModal({
+export function RuleEditorModal({
   existing,
   onClose,
 }: {
@@ -90,11 +117,14 @@ function RuleEditorModal({
   const [ruleType, setRuleType] = useState<AlertRuleType>(
     existing?.rule_type ?? "subnet_utilization",
   );
-  const [threshold, setThreshold] = useState<number>(
-    existing?.threshold_percent ?? 90,
+  // #1986 — an edit shows the STORED value; a stored null stays empty
+  // rather than turning into a default the rule never had. Only a new
+  // rule starts from the per-type defaults.
+  const [threshold, setThreshold] = useState<number | null>(
+    existing ? existing.threshold_percent : 90,
   );
-  const [thresholdDays, setThresholdDays] = useState<number>(
-    existing?.threshold_days ?? 30,
+  const [thresholdDays, setThresholdDays] = useState<number | null>(
+    existing ? existing.threshold_days : 30,
   );
   // dhcp_pool_exhaustion: 0 means "no free-address floor" (occupancy % only).
   const [minFree, setMinFree] = useState<number>(
@@ -123,7 +153,8 @@ function RuleEditorModal({
 
   const mut = useMutation({
     mutationFn: async () => {
-      const body = {
+      // Only the fields this rule type shows are ever sent.
+      const full: AlertRuleUpdate = {
         name,
         description,
         enabled,
@@ -131,43 +162,39 @@ function RuleEditorModal({
         notify_syslog: notifySyslog,
         notify_webhook: notifyWebhook,
         notify_smtp: notifySmtp,
-        threshold_percent:
-          ruleType === "subnet_utilization" ||
-          ruleType === "voice_lease_count_below" ||
-          ruleType === "stale_ip_count" ||
-          ruleType === "dhcp_pool_exhaustion" ||
-          ruleType === "node_pressure" ||
-          ruleType === "backup_stale"
-            ? threshold
-            : null,
-        min_free_addresses:
-          ruleType === "dhcp_pool_exhaustion" && minFree > 0 ? minFree : null,
-        threshold_days:
-          ruleType === "domain_expiring" ||
-          ruleType === "circuit_term_expiring" ||
-          ruleType === "service_term_expiring" ||
-          ruleType === "secret_expiring" ||
-          ruleType === "decom_expiring" ||
-          ruleType === "stale_ip_count"
-            ? thresholdDays
-            : null,
-        server_type: ruleType === "server_unreachable" ? serverType : null,
-        classification:
-          ruleType === "compliance_change" ? classification : null,
-        change_scope: ruleType === "compliance_change" ? changeScope : null,
       };
-      if (existing) {
-        return alertsApi.updateRule(existing.id, body);
+      if (THRESHOLD_PERCENT_TYPES.includes(ruleType))
+        full.threshold_percent = threshold;
+      if (ruleType === "dhcp_pool_exhaustion")
+        full.min_free_addresses = minFree > 0 ? minFree : null;
+      if (THRESHOLD_DAYS_TYPES.includes(ruleType))
+        full.threshold_days = thresholdDays;
+      if (ruleType === "server_unreachable") full.server_type = serverType;
+      if (ruleType === "compliance_change") {
+        full.classification = classification;
+        full.change_scope = changeScope;
       }
-      return alertsApi.createRule({ ...body, rule_type: ruleType });
+      if (existing) {
+        // #1986 — send only what the operator changed; an unchanged Save
+        // sends nothing at all.
+        const stored = existing as unknown as Record<string, unknown>;
+        const changed: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(full)) {
+          const was = k === "description" ? (stored[k] ?? "") : stored[k];
+          if (was !== v) changed[k] = v;
+        }
+        if (Object.keys(changed).length === 0) return existing;
+        return alertsApi.updateRule(existing.id, changed as AlertRuleUpdate);
+      }
+      return alertsApi.createRule({ ...full, name, rule_type: ruleType });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["alert-rules"] });
       onClose();
     },
     onError: (e: unknown) => {
-      const err = e as { response?: { data?: { detail?: string } } };
-      setError(err?.response?.data?.detail ?? "Save failed");
+      // #1993 — a 422's `detail` is a list; render it as text.
+      setError(errMsg(e, "Save failed"));
     },
   });
 
@@ -290,8 +317,8 @@ function RuleEditorModal({
               type="number"
               min={0}
               className={inputCls}
-              value={threshold}
-              onChange={(e) => setThreshold(Number(e.target.value))}
+              value={numVal(threshold)}
+              onChange={(e) => setThreshold(parseNum(e.target.value))}
             />
           </Field>
         )}
@@ -305,8 +332,8 @@ function RuleEditorModal({
               min={0}
               max={100}
               className={inputCls}
-              value={threshold}
-              onChange={(e) => setThreshold(Number(e.target.value))}
+              value={numVal(threshold)}
+              onChange={(e) => setThreshold(parseNum(e.target.value))}
             />
           </Field>
         )}
@@ -328,8 +355,8 @@ function RuleEditorModal({
               min={0}
               max={100}
               className={inputCls}
-              value={threshold}
-              onChange={(e) => setThreshold(Number(e.target.value))}
+              value={numVal(threshold)}
+              onChange={(e) => setThreshold(parseNum(e.target.value))}
             />
           </Field>
         )}
@@ -343,8 +370,8 @@ function RuleEditorModal({
               min={1}
               max={100}
               className={inputCls}
-              value={threshold}
-              onChange={(e) => setThreshold(Number(e.target.value))}
+              value={numVal(threshold)}
+              onChange={(e) => setThreshold(parseNum(e.target.value))}
             />
           </Field>
         )}
@@ -359,8 +386,8 @@ function RuleEditorModal({
                 min={0}
                 max={100}
                 className={inputCls}
-                value={threshold}
-                onChange={(e) => setThreshold(Number(e.target.value))}
+                value={numVal(threshold)}
+                onChange={(e) => setThreshold(parseNum(e.target.value))}
               />
             </Field>
             <Field
@@ -387,8 +414,8 @@ function RuleEditorModal({
                 type="number"
                 min={1}
                 className={inputCls}
-                value={threshold}
-                onChange={(e) => setThreshold(Number(e.target.value))}
+                value={numVal(threshold)}
+                onChange={(e) => setThreshold(parseNum(e.target.value))}
               />
             </Field>
             <Field
@@ -400,8 +427,8 @@ function RuleEditorModal({
                 min={1}
                 max={3650}
                 className={inputCls}
-                value={thresholdDays}
-                onChange={(e) => setThresholdDays(Number(e.target.value))}
+                value={numVal(thresholdDays)}
+                onChange={(e) => setThresholdDays(parseNum(e.target.value))}
               />
             </Field>
           </>
@@ -433,8 +460,8 @@ function RuleEditorModal({
               min={1}
               max={3650}
               className={inputCls}
-              value={thresholdDays}
-              onChange={(e) => setThresholdDays(Number(e.target.value))}
+              value={numVal(thresholdDays)}
+              onChange={(e) => setThresholdDays(parseNum(e.target.value))}
             />
           </Field>
         )}

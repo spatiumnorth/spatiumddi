@@ -84,6 +84,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The alert rule editor no longer rewrites a rule's stored thresholds,
+  crashes on a refused save, or leaves its labels unattached (#1986,
+  #1993, #1994).** Edit then Save with nothing changed sent the editor's
+  own defaults (90, 30) and nulls for every field the rule type does not
+  show, so a stored null threshold became 90 and a stored
+  `threshold_days` became null. The editor now shows stored values (a
+  null stays empty), builds the body from only the fields the rule type
+  shows, and on an edit sends only what changed, nothing at all when
+  nothing did. A 422 carrying FastAPI's validation list is rendered as
+  text through the shared `errMsg` and the dialog stays open, instead of
+  React error #31 replacing the page. Each label is tied to its control
+  with `htmlFor` and `id`. The update handler already used
+  `exclude_unset`.
+
 - **Kubernetes Detect CIDRs answered 500 when the token held a non-ASCII
   character (#1913).** The bearer token goes straight into an
   `Authorization` header; httpx encodes header values as ASCII and raises
