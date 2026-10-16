@@ -242,7 +242,7 @@ export function DevicePoliciesTab({ groupId }: { groupId: string }) {
  *  returned on this install — a free-text box would let an operator build a
  *  policy against a class string that never appears, which compiles to an
  *  empty expression and renders nothing at all. */
-function DevicePolicyModal({
+export function DevicePolicyModal({
   groupId,
   policy,
   onClose,
@@ -270,6 +270,7 @@ function DevicePolicyModal({
     policy?.include_ambiguous ?? false,
   );
   const [optionsError, setOptionsError] = useState<string | null>(null);
+  const [leaseError, setLeaseError] = useState<string | null>(null);
 
   const { data: obs } = useQuery({
     queryKey: [OBS_KEY, groupId],
@@ -318,12 +319,27 @@ function DevicePolicyModal({
       }
     }
     setOptionsError(null);
+    // Blank means inherit; anything else must be a whole number of seconds.
+    // Number("10m") is NaN and JSON sends NaN as null, which would store the
+    // typo as "inherit" with no error (#1991).
+    const leaseText = leaseTime.trim();
+    let lease: number | null = null;
+    if (leaseText) {
+      if (!/^\d+$/.test(leaseText)) {
+        setLeaseError(
+          "Lease time must be a whole number of seconds, e.g. 600 (not 10m). Leave blank to inherit.",
+        );
+        return;
+      }
+      lease = Number(leaseText);
+    }
+    setLeaseError(null);
     mut.mutate({
       name,
       description,
       enabled,
       device_classes: selected,
-      lease_time: leaseTime.trim() ? Number(leaseTime) : null,
+      lease_time: lease,
       options: parsedOptions,
       match_override: override.trim() ? override : null,
       include_ambiguous: includeAmbiguous,
@@ -359,7 +375,9 @@ function DevicePolicyModal({
           label="Device classes"
           hint={
             obs && obs.total_devices === 0
-              ? "No fingerprints collected yet — enable passive fingerprinting first, or this policy will match nothing."
+              ? override.trim()
+                ? "No fingerprints collected yet — device classes have nothing to match until passive fingerprinting is enabled. The manual match expression below applies regardless."
+                : "No fingerprints collected yet — enable passive fingerprinting first, or this policy will match nothing."
               : "Classes fingerbank has returned on this network, with device counts."
           }
         >
@@ -418,11 +436,20 @@ function DevicePolicyModal({
           <input
             className={inputCls}
             value={leaseTime}
-            onChange={(e) => setLeaseTime(e.target.value)}
+            onChange={(e) => {
+              setLeaseTime(e.target.value);
+              setLeaseError(null);
+            }}
             placeholder="600"
             inputMode="numeric"
           />
         </Field>
+
+        {leaseError && (
+          <div role="alert" className="text-xs text-destructive">
+            {leaseError}
+          </div>
+        )}
 
         <Field
           label="Options (JSON)"

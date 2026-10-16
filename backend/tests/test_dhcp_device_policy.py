@@ -597,3 +597,32 @@ async def test_confident_classification_is_not_warned(
     assert out.confidence == 89
     assert not any("confidence" in w for w in out.warnings)
     assert out.confidence >= LOW_CONFIDENCE_SCORE
+
+
+@pytest.mark.asyncio
+async def test_manual_match_only_policy_is_not_called_unrendered(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """#1992: no classes + a manual match IS rendered, so neither the compile
+    warnings nor the REST preview may say it matches nothing / is not
+    rendered. With neither classes nor a match the warning still applies."""
+    _, token = await _make_user(db_session)
+    grp, _ = await _make_group_with_server(db_session)
+    manual = _policy(grp.id, device_classes=[], match_override="option[60].hex == 0x74657374")
+    bare = _policy(grp.id, device_classes=[])
+    db_session.add_all([manual, bare])
+    await db_session.commit()
+
+    out = await compile_device_policy(db_session, manual)
+    assert out.expression
+    assert not any("matches nothing" in w for w in out.warnings)
+    r = await client.get(
+        f"/api/v1/dhcp/device-policies/{manual.id}/preview",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    body = r.json()
+    assert body["renders"] is True
+    assert not any("not rendered and" in w or "matches nothing" in w for w in body["warnings"])
+
+    out_bare = await compile_device_policy(db_session, bare)
+    assert any("matches nothing and is not rendered" in w for w in out_bare.warnings)

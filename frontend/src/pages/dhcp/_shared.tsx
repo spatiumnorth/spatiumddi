@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { cloneElement, isValidElement, useId, useState } from "react";
 import { Modal } from "@/components/ui/modal";
 import { v6ScopeNoHaNote } from "@/lib/dhcpHa";
 
@@ -7,6 +7,12 @@ export { Modal };
 export const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
+const CONTROL_TAGS = new Set(["input", "select", "textarea"]);
+
+/** A visible label that names its control (#1994). A lone input / select /
+ *  textarea child gets an id the label points at; any other child (a group of
+ *  checkboxes, a composite widget) is wrapped in a role="group" labelled by
+ *  the label, so a search by label still finds exactly one thing. */
 export function Field({
   label,
   hint,
@@ -16,12 +22,29 @@ export function Field({
   hint?: string;
   children: React.ReactNode;
 }) {
+  const uid = useId();
+  const child = isValidElement<{ id?: string }>(children) ? children : null;
+  const isControl =
+    child !== null &&
+    typeof child.type === "string" &&
+    CONTROL_TAGS.has(child.type);
+  const controlId = isControl ? (child!.props.id ?? uid) : undefined;
   return (
     <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
+      <label
+        id={isControl ? undefined : uid}
+        htmlFor={controlId}
+        className="block text-xs font-medium text-muted-foreground"
+      >
         {label}
       </label>
-      {children}
+      {isControl ? (
+        cloneElement(child!, { id: controlId })
+      ) : (
+        <div role="group" aria-labelledby={uid}>
+          {children}
+        </div>
+      )}
       {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
     </div>
   );
