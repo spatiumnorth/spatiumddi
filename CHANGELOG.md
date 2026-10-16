@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The cutover TTL pre-flight no longer drops all but one value of a
+  round-robin name on an agentless DNS server (#1983).** It sends the
+  first record of a name as an `update` and its siblings as `update` with
+  `rrset_action="add"`, which opts them out of whole-RRset stamping. The
+  driver-side `RecordChange` has no `rrset_action`, so Windows (WinRM and
+  RFC 2136), Route 53, Google Cloud DNS and Azure DNS each saw a
+  single-value replace and kept only the last value written. The agentless
+  record-op path now stamps those siblings with the whole folded RRset, so
+  every op of a name carries the same final set and the write is
+  order-independent. DNS pool ops are untouched (their `add` is a `create`,
+  their removal is `delete_value`), and the agent path is unchanged.
+
 - **Removing one DNS pool member on a Windows DNS server no longer deletes
   the healthy members too (#1980).** A pool member removal is a `delete` op
   with `rrset_action="delete_value"` and no resolved RRset, and the Windows
