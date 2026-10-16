@@ -478,6 +478,8 @@ async def update_pool(
             "hc_healthy_threshold",
         },
     )
+    # Fields the renderer reads: enabled gates every record, ttl stamps them.
+    rrset_changed = any(k in payload and getattr(pool, k) != payload[k] for k in ("enabled", "ttl"))
     for k, v in payload.items():
         setattr(pool, k, v)
     db.add(
@@ -492,6 +494,11 @@ async def update_pool(
             result="success",
         )
     )
+    if rrset_changed:
+        # Don't wait for the next health-check tick (which skips disabled
+        # pools entirely). Record ops collect_wake the group channel.
+        await db.refresh(pool, ["members"])
+        await apply_pool_state(db, pool)
     await db.commit()
     await db.refresh(pool)
     return _pool_to_response(pool)

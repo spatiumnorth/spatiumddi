@@ -84,6 +84,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Disabling a DNS pool now removes its records, and a pool TTL change
+  lands immediately (#1974).** `update_pool` never reconciled and
+  `apply_pool_state` ignored `pool.enabled`, so a disabled pool kept
+  serving its member records (the health-check task skips disabled
+  pools, so nothing ever removed them) and a TTL edit waited for the
+  next health check. A disabled pool now renders nothing, re-enabling
+  restores its healthy members, and both edits reconcile in the request.
+
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored
   policy name, description, reference, result detail and diagnostic, went

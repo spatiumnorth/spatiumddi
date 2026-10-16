@@ -39,6 +39,9 @@ async def apply_pool_state(
     unhealthy or disabled, ensure none exists. Returns a summary dict
     with ``created`` / ``deleted`` counts.
 
+    A disabled pool (``pool.enabled`` false) renders nothing, so the
+    reconcile removes any records it previously rendered.
+
     The pool's TTL is honoured on every emitted record so changes to
     ``pool.ttl`` flow through on the next reconcile pass.
     """
@@ -87,8 +90,12 @@ async def apply_pool_state(
         deleted += 1
 
     for member in pool.members:
-        should_render = bool(member.enabled) and (
-            (member.last_check_state or "unknown") == "healthy"
+        # A disabled pool renders nothing: every record it owns is removed
+        # (#1974), and re-enabling restores the healthy + enabled members.
+        should_render = (
+            bool(pool.enabled)
+            and bool(member.enabled)
+            and ((member.last_check_state or "unknown") == "healthy")
         )
         rec = existing_by_member.get(str(member.id))
 
