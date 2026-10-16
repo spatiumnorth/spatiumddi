@@ -465,6 +465,8 @@ function TemplateEditor({
                         className={inputCls}
                       />
                       <button
+                        aria-label="Remove child"
+                        title="Remove child"
                         type="button"
                         onClick={() => removeChild(idx)}
                         className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:text-destructive"

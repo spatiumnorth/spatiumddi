@@ -2067,6 +2067,8 @@ function ChatComposer({
           </button>
         ) : (
           <button
+            aria-label="Send message"
+            title="Send message"
             type="submit"
             disabled={!text.trim() || disabled}
             className="self-end rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"

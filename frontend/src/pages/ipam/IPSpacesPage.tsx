@@ -46,6 +46,8 @@ export function IPSpacesPage() {
                 <td className="px-4 py-3">{space.is_default ? "Yes" : "—"}</td>
                 <td className="px-4 py-3 text-right">
                   <button
+                    aria-label="Delete IP space"
+                    title="Delete IP space"
                     onClick={() => deleteMutation.mutate(space.id)}
                     disabled={deleteMutation.isPending}
                     className="rounded p-1 text-muted-foreground hover:text-destructive"

@@ -23,6 +23,18 @@ Documentation=https://docs.k3s.io
 # kubeapi /readyz at the end — that's a deadlock.
 After=network-online.target nss-lookup.target spatium-etc-reconcile.service
 Wants=network-online.target nss-lookup.target
+# #1910 — the node's identity lives in the /etc overlay's upper: its
+# hostname (k3s names the Node after it), machine-id, the role and CIDR
+# drop-ins in config.yaml.d (--node-label spatium.io/role-control-plane,
+# --cluster-cidr/--service-cidr/--cluster-dns), .env and role-config. The
+# ordering above only WAITS for etc.mount; when the mount failed after a
+# power-off, k3s started anyway on the slot's bare /etc and registered a
+# brand-new Node, ``localhost``, without its role or CIDRs, and the
+# cluster never recovered. Require the overlay, as the host runners'
+# units already do (spatiumddi-ssh-reload.service and its siblings): no
+# overlay, no k3s.
+Requires=etc.mount
+After=etc.mount
 # Skip on the live ISO — installer environment, no slot partitions,
 # no kubeapi state to bootstrap. firstboot also writes /etc/rancher/
 # /k3s after install; until then k3s would hit a read-only config dir.

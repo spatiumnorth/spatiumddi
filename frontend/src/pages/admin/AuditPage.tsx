@@ -415,6 +415,8 @@ export function AuditPage() {
             </span>
             <div className="flex items-center gap-2">
               <button
+                aria-label="Previous page"
+                title="Previous page"
                 onClick={() => setPage((p) => Math.max(0, p - 1))}
                 disabled={page === 0}
                 className="flex h-8 w-8 items-center justify-center rounded-md border text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-40"
@@ -422,6 +424,8 @@ export function AuditPage() {
                 <ChevronLeft className="h-4 w-4" />
               </button>
               <button
+                aria-label="Next page"
+                title="Next page"
                 onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
                 disabled={page >= totalPages - 1}
                 className="flex h-8 w-8 items-center justify-center rounded-md border text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-40"
