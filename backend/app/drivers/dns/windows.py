@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 from collections.abc import Sequence
 from typing import Any
@@ -1048,6 +1049,48 @@ def _ps_add_record(zone: str, name: str, record: RecordData, ttl: int) -> str:
     return create
 
 
+# Types whose rdata ``Get-DnsServerResourceRecord`` exposes as ONE comparable
+# string, so a per-value delete can target just the matching record (#1980).
+# Anything else (CNAME is single-valued; SRV / CAA / TLSA have no single
+# property) keeps the delete-the-whole-RRset behaviour.
+_PS_VALUE_PROP = {
+    "A": "IPv4Address",
+    "AAAA": "IPv6Address",
+    "NS": "NameServer",
+    "PTR": "PtrDomainName",
+    "MX": "MailExchange",
+    "TXT": "DescriptiveText",
+}
+_PS_HOSTNAME_TYPES = frozenset({"NS", "PTR", "MX"})
+
+
+def _delete_match_value(change: RecordChange, rtype: str) -> str | None:
+    """The value a per-value delete must match, or ``None`` to delete all.
+
+    Only a delete with no resolved RRset (``rrset_action`` callers: DNS pool
+    member removal, #1980) is value-targeted. A resolved RRset already says
+    exactly what survives, so those keep the whole-RRset write.
+    """
+    if change.op != "delete" or change.rrset is not None:
+        return None
+    if rtype not in _PS_VALUE_PROP:
+        return None
+    raw = change.record.value or ""
+    if rtype == "TXT":
+        raw = _strip_txt_quotes(raw)
+    raw = raw.strip() if rtype != "TXT" else raw
+    if not raw:
+        return None
+    if rtype in ("A", "AAAA"):
+        try:
+            return str(ipaddress.ip_address(raw))
+        except ValueError:
+            return None
+    if rtype in _PS_HOSTNAME_TYPES:
+        return raw.rstrip(".")
+    return raw
+
+
 def _ps_apply_record(change: RecordChange) -> str:
     """PowerShell script for ``apply_record_change`` create/update/delete.
 
@@ -1093,11 +1136,21 @@ def _ps_apply_record(change: RecordChange) -> str:
     # zone in SpatiumDDI but the operator never ran Sync with Servers,
     # so deleting an IP tries to delete a PTR from a zone Windows
     # doesn't know about.
+    # #1980 — a per-value delete (no resolved RRset) removes only the record
+    # whose rdata matches the op's value; ``Get-… | Remove-…`` over the whole
+    # (name, type) took every healthy sibling with it.
+    value_filter = ""
+    match_value = _delete_match_value(change, rtype)
+    if match_value is not None:
+        prop = _PS_VALUE_PROP[rtype]
+        mv = _ps_escape_single_quoted(match_value)
+        trim = ".TrimEnd('.')" if rtype in _PS_HOSTNAME_TYPES else ""
+        value_filter = f" | Where-Object {{ \"$($_.RecordData.{prop})\"{trim} -eq '{mv}' }}"
     delete = f"""
 if (-not (Get-DnsServerZone -Name '{zone}' -ErrorAction SilentlyContinue)) {{
     Write-Output "zone '{zone}' not present on server; delete is a no-op"
 }} else {{
-    $rrs = Get-DnsServerResourceRecord -ZoneName '{zone}' -Name '{name}' -RRType {rtype} -ErrorAction SilentlyContinue
+    $rrs = Get-DnsServerResourceRecord -ZoneName '{zone}' -Name '{name}' -RRType {rtype} -ErrorAction SilentlyContinue{value_filter}
     if ($rrs) {{
         $rrs | Remove-DnsServerResourceRecord -ZoneName '{zone}' -Force -ErrorAction Stop
         Write-Output "record '{name}' {rtype} deleted from '{zone}'"
@@ -1197,10 +1250,12 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
         #   adds nothing. Getting this wrong turns a legacy delete into a
         #   remove-then-re-add, i.e. a silent no-op.
         members = _rrset_members_or_self(change)
+        dv: str | None = None
         if members is not None:
             to_add, remove_first = members, True
         elif change.op == "delete":
             to_add, remove_first = [], True
+            dv = _delete_match_value(change, rtype)
         else:
             to_add, remove_first = [change.record], change.op == "update"
         ops.append(
@@ -1217,6 +1272,9 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
                 ),
             }
         )
+        if dv is not None:
+            # #1980 — per-value delete: only the record with this rdata goes.
+            ops[-1]["dv"] = dv
     blob = json.dumps(ops, separators=(",", ":")).encode("utf-8")
     payload_b64 = base64.b64encode(blob).decode("ascii")
 
@@ -1228,6 +1286,19 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
     # (_pack_record_chunks) measures the built script's encoded length
     # and packs each chunk under MAX_ENCODED_COMMAND, so this wrapper's
     # size is accounted for automatically rather than via a fixed count.
+    # #1980 — only ships when some op is a per-value delete, so every other
+    # batch keeps its existing size against the encoded-command budget. The
+    # property is chosen per type; a type with no entry (``$null``) is left
+    # unfiltered, i.e. delete-all, matching the singular path.
+    value_filter = ""
+    if any("dv" in o for o in ops):
+        hmap = ";".join(f"{k}='{v}'" for k, v in _PS_VALUE_PROP.items())
+        value_filter = (
+            "$d=$_.dv;if($null -ne $d -and $x){"
+            f"$pr=@{{{hmap}}}[$t];"
+            'if($pr){$x=@($x|?{$q="$($_.RecordData.$pr)";'
+            "if($t -in 'NS','PTR','MX'){$q=$q.TrimEnd('.')};$q -eq $d})}};"
+        )
     return (
         # #426: was "$E='Continue'" — a no-op (PS vars are case-insensitive,
         # so it aliased the loop's $e and was immediately overwritten). The
@@ -1257,7 +1328,8 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
         '  if($m.Count -gt 0 -and !$ze){throw "Zone $z not found"}\n'
         "  if($ze -and [int]$_.rm -eq 1){$x=Get-DnsServerResourceRecord -ZoneName $z -Name $n"
         " -RRType $t -EA SilentlyContinue;"
-        "if($x){$x|Remove-DnsServerResourceRecord -ZoneName $z -Force -EA Stop}}\n"
+        + value_filter
+        + "if($x){$x|Remove-DnsServerResourceRecord -ZoneName $z -Force -EA Stop}}\n"
         "  foreach($mm in $m){\n"
         "   $v=$mm.v\n"
         "   switch($t){\n"
