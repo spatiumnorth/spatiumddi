@@ -21,6 +21,7 @@ import io
 import json
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import LETTER
@@ -66,6 +67,19 @@ async def _latest_results_per_policy(
         seen.add(key)
         grouped.setdefault(str(r.policy_id), []).append(r)
     return grouped
+
+
+def _esc(value: object) -> str:
+    """Escape DB- or request-sourced text for reportlab's ``Paragraph``.
+
+    ``Paragraph`` parses a mini-XML dialect, so an unescaped ``<?`` in the
+    framework filter (or a stored policy name) raises ``paraparser: syntax
+    error`` and 500s the export; the quieter case, ``<legacy>``, silently
+    vanishes from the document. Every value interpolated into a Paragraph
+    goes through here; the literal ``<b>`` / ``<font>`` markup around it
+    stays ours.
+    """
+    return escape("" if value is None else str(value))
 
 
 def _result_hash(rows: Iterable[ConformityResult]) -> str:
@@ -148,7 +162,7 @@ async def generate_conformity_pdf(
     story: list = []
     now = datetime.now(UTC)
 
-    story.append(Paragraph(title or "SpatiumDDI conformity report", h1))
+    story.append(Paragraph(_esc(title or "SpatiumDDI conformity report"), h1))
     story.append(
         Paragraph(
             f"Generated {now.isoformat()} UTC · "
@@ -157,7 +171,7 @@ async def generate_conformity_pdf(
         )
     )
     if framework:
-        story.append(Paragraph(f"Framework filter: {framework}", small))
+        story.append(Paragraph(f"Framework filter: {_esc(framework)}", small))
     story.append(Spacer(1, 0.2 * inch))
 
     if not policies:
@@ -222,20 +236,20 @@ async def generate_conformity_pdf(
         by_framework.setdefault(p.framework, []).append(p)
     for fw in sorted(by_framework.keys()):
         story.append(PageBreak())
-        story.append(Paragraph(fw, h1))
+        story.append(Paragraph(_esc(fw), h1))
         story.append(Spacer(1, 0.1 * inch))
         for policy in by_framework[fw]:
             ref = f" ({policy.reference})" if policy.reference else ""
-            story.append(Paragraph(f"{policy.name}{ref}", h2))
+            story.append(Paragraph(f"{_esc(policy.name)}{_esc(ref)}", h2))
             story.append(
                 Paragraph(
-                    f"Severity: {policy.severity} · check: {policy.check_kind}"
-                    f" · target: {policy.target_kind}",
+                    f"Severity: {_esc(policy.severity)} · check: {_esc(policy.check_kind)}"
+                    f" · target: {_esc(policy.target_kind)}",
                     small,
                 )
             )
             if policy.description:
-                story.append(Paragraph(policy.description, body))
+                story.append(Paragraph(_esc(policy.description), body))
             story.append(Spacer(1, 0.05 * inch))
 
             results = by_policy.get(str(policy.id), [])
@@ -265,8 +279,8 @@ async def generate_conformity_pdf(
                 for r in failing:
                     story.append(
                         Paragraph(
-                            f"<b>[{r.status.upper()}] {r.resource_display}</b>"
-                            f" · {r.detail or '(no detail)'}",
+                            f"<b>[{_esc(r.status.upper())}] {_esc(r.resource_display)}</b>"
+                            f" · {_esc(r.detail or '(no detail)')}",
                             small,
                         )
                     )
@@ -275,7 +289,7 @@ async def generate_conformity_pdf(
                             blob = json.dumps(r.diagnostic, indent=2, default=str)
                         except (TypeError, ValueError):
                             blob = repr(r.diagnostic)
-                        story.append(Paragraph(blob.replace("\n", "<br/>"), mono))
+                        story.append(Paragraph(_esc(blob).replace("\n", "<br/>"), mono))
             story.append(Spacer(1, 0.15 * inch))
 
     # Trailer.
