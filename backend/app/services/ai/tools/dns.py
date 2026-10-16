@@ -235,7 +235,8 @@ class ListServerGroupsArgs(BaseModel):
     description=(
         "List DNS server groups (logical groupings of authoritative "
         "DNS servers). Each summary includes name, group type, "
-        "default view, and recursive flag."
+        "default view, recursive flag, and whether subnet reverse zones "
+        "are auto-created in it when it runs a cloud DNS driver."
     ),
     args_model=ListServerGroupsArgs,
     category="dns",
@@ -256,6 +257,7 @@ async def list_dns_server_groups(
             "group_type": g.group_type,
             "default_view": g.default_view,
             "is_recursive": g.is_recursive,
+            "auto_reverse_zones_at_provider": g.auto_reverse_zones_at_provider,
         }
         for g in rows
     ]

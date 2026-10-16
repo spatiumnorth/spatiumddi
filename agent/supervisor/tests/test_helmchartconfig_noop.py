@@ -312,3 +312,92 @@ def test_firstboot_values_already_satisfy_the_supervisor_overrides() -> None:
             f"supervisor: { {k: owned[k] for k in differing} }\\n"
             f"firstboot:  { {k: chart_values.get(k) for k in differing} }"
         )
+
+
+# --------------------------------------------------------------------------
+# 3. an upgrade from a release that sized differently: one revision (#1210)
+# --------------------------------------------------------------------------
+def test_an_upgrade_over_an_old_sizing_config_converges_in_one_revision(
+    tmp_path: Path,
+) -> None:
+    """firstboot's reconcile + the supervisor's guard, end to end.
+
+    The Config an older release wrote carries ITS sizing (2026.09.04-1: fractions
+    of MemTotal).  firstboot, while the new HelmChart is still held back, brings
+    those keys to the new HelmChart's numbers; the supervisor's first heartbeat
+    must then find nothing to change.  Before #1210 that heartbeat was a second
+    ``spatium-control`` revision, a second migrate Job and a second rollout.
+    """
+    import os
+    import shutil
+    import textwrap
+
+    mem = 8192
+    new_sizing = k8s_api.control_plane_resources(mem)
+    chart_values = {"image": {"tag": "2026.10.02-1"}, **new_sizing}
+    chart_values.update(_owned(cp_size=1, mem_total_mib=mem))
+    old_config = _owned(cp_size=1, mem_total_mib=mem)
+    old_config["api"]["resources"] = {"limits": {"memory": f"{mem // 2}Mi"}}
+    old_config["worker"]["resources"] = {"limits": {"memory": f"{mem // 4}Mi"}}
+    old_config["worker"].pop("concurrency", None)
+    old_config.pop("postgresql", None)  # 2026.09.04-1 sized no database
+    old_config["image"] = {"tag": "2026.09.04-1"}
+
+    manifest = (
+        "apiVersion: helm.cattle.io/v1\nkind: HelmChart\nmetadata:\n  name: spatium-control\n"
+        "spec:\n  chartContent: QUJD\n  valuesContent: |\n"
+        + textwrap.indent(_yaml(chart_values), "    ")
+    )
+
+    # the supervisor, before the fix: the effective values differ -> a write
+    kube = _Kube(chart=_yaml(chart_values), config=_yaml(old_config))
+    orig = k8s_api._request
+    k8s_api._request = kube  # type: ignore[assignment]
+    try:
+        k8s_api.apply_control_plane_overrides(1, "", web_ui_allowed_cidrs=[], mem_total_mib=mem)
+        assert kube.wrote, "the old sizing should make the first heartbeat write"
+
+        # firstboot's real function, against a stub apiserver
+        src = _firstboot().read_text(encoding="utf-8")
+        fns = [
+            re.search(rf"^{name}\(\) \{{.*?^\}}$", src, re.S | re.MULTILINE)
+            for name in ("control_sizing_patch", "apply_control_sizing_patch")
+        ]
+        assert all(fns), "firstboot no longer defines the #1210 sizing functions"
+        stub = tmp_path / "stub"
+        stub.mkdir()
+        (stub / "config").write_text(_yaml(old_config))
+        (stub / "live").write_text(_yaml(chart_values))  # the released chart, applied
+        k3s = tmp_path / "k3s"
+        k3s.write_text(
+            '#!/bin/sh\nS="$STUB"\n[ "$1" = kubectl ] && shift\nargs="$*"\n'
+            'case "$args" in\n  *"get helmchartconfig"*) cat "$S/config";;\n'
+            '  *"get helmchart "*) cat "$S/live";;\n'
+            '  *"patch helmchartconfig"*) printf "%s" "${args#*-p }" > "$S/patched";;\nesac\n'
+        )
+        k3s.chmod(0o755)
+        (tmp_path / "spatium-control.yaml.deferred").write_text(manifest)
+        script = (
+            f'CONTROL_MANIFEST="{tmp_path}/spatium-control.yaml"\n'
+            + "\n".join(f.group(0) for f in fns if f).replace("/usr/local/bin/k3s", str(k3s))
+            + f'\np=$(control_sizing_patch "{tmp_path}/spatium-control.yaml.deferred")\n'
+            + f'apply_control_sizing_patch "{tmp_path}/spatium-control.yaml.deferred" "$p"\n'
+        )
+        subprocess.run(
+            [shutil.which("dash") or "sh", "-c", script],
+            env={**os.environ, "STUB": str(stub)},
+            check=True,
+            capture_output=True,
+        )
+        patched = json.loads((stub / "patched").read_text())["spec"]["valuesContent"]
+
+        # the supervisor, after the fix: nothing left to change
+        kube2 = _Kube(chart=_yaml(chart_values), config=patched)
+        k8s_api._request = kube2  # type: ignore[assignment]
+        ok, err = k8s_api.apply_control_plane_overrides(
+            1, "", web_ui_allowed_cidrs=[], mem_total_mib=mem
+        )
+    finally:
+        k8s_api._request = orig  # type: ignore[assignment]
+    assert (ok, err) == (False, None)
+    assert not kube2.wrote, "the first heartbeat after the reconcile must not add a revision"

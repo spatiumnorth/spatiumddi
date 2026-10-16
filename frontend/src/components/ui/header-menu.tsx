@@ -146,6 +146,8 @@ export function HeaderMenu({
   const onMenuKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") {
       e.preventDefault();
+      // Esc closes the menu only — not the dialog the menu sits in.
+      e.stopPropagation();
       close(true);
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
