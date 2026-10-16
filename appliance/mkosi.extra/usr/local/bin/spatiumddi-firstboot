@@ -495,6 +495,10 @@ fi
 APPLIANCE_VERSION_VAL=""
 if [ -f /etc/spatiumddi/appliance-release ]; then
     APPLIANCE_VERSION_VAL="$(
+        # The .env reconcile above sources this file into THIS shell too, so
+        # clear any inherited value: a release file without the key must read
+        # as unknown, not as whatever an earlier line left set.
+        unset APPLIANCE_VERSION
         # shellcheck disable=SC1091
         . /etc/spatiumddi/appliance-release 2>/dev/null
         printf '%s' "${APPLIANCE_VERSION:-}"

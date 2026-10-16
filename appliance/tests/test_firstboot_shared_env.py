@@ -96,14 +96,15 @@ def test_appliance_version_is_stamped_from_the_slot_release_file(tmp_path) -> No
     fn = re.search(r"^_render_control_helmchart\(\) \{.*?^\}$", FIRSTBOOT, re.DOTALL | re.MULTILINE)
     assert fn
 
-    def render(release: str | None) -> list[dict]:
+    def render(release: str | None, inherited: str = "") -> dict:
         rel = tmp_path / "appliance-release"
         rel.unlink(missing_ok=True)
         if release is not None:
-            rel.write_text(f"APPLIANCE_VERSION={release}\n")
+            rel.write_text(f"APPLIANCE_VERSION={release}\n" if release else "OTHER=1\n")
         block = blk.group(0).replace("/etc/spatiumddi/appliance-release", str(rel))
         script = f"""
             set -euo pipefail
+            APPLIANCE_VERSION={inherited!r}
             {fn.group(0)}
             {block}
             SPATIUMDDI_VERSION=0.0.0-test
@@ -122,3 +123,6 @@ def test_appliance_version_is_stamped_from_the_slot_release_file(tmp_path) -> No
     assert render("2026.10.16-1")["APPLIANCE_VERSION"] == "2026.10.16-1"
     assert render("1.0.0")["APPLIANCE_VERSION"] == "1.0.0"  # upgrade / rollback
     assert render(None)["APPLIANCE_VERSION"] == ""  # unknown, not a made-up value
+    # A release file without the key reads as unknown even though the .env
+    # reconcile earlier in firstboot left APPLIANCE_VERSION set in the shell.
+    assert render("", inherited="0.1.0")["APPLIANCE_VERSION"] == ""
