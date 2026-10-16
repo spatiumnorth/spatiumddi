@@ -45,9 +45,9 @@ semantics.
 The two callers that set ``rrset_action`` themselves — DNS pools and the
 Windows-cutover TTL pre-flight — are deliberately NOT stamped on the AGENT
 path, and keep the per-RR semantics they already had. On the agentless path
-the pre-flight's ``update`` + ``add`` siblings ARE stamped (#1983), because
-``RecordChange`` has no ``rrset_action`` and an unstamped sibling would reach
-the driver as a single-value replace. See :func:`stamp_rrsets_for_ops` for why a
+an ``update`` + ``add`` op (a pool TTL change; the pre-flight's siblings) IS
+stamped (#1983), because ``RecordChange`` has no ``rrset_action`` and an
+unstamped one would reach the driver as a single-value replace. See :func:`stamp_rrsets_for_ops` for why a
 whole-RRset write is the wrong shape for the pool re-point pair specifically.
 
 Known bound: an op carries the RRset as of the moment it was ENQUEUED. Ops
@@ -285,14 +285,17 @@ async def stamp_rrsets_for_ops(
     after the create would drop the new address.
 
     ``agentless=True`` (#1983) additionally stamps an ``update`` op carrying
-    ``rrset_action="add"`` — the cutover TTL pre-flight's siblings. The
-    agentless drivers have no per-RR ``add`` (``RecordChange`` carries no
-    ``rrset_action``), so an unstamped sibling reaches them as a single-value
-    replace and the last value written wins. Stamping folds the whole batch,
-    so every op of a name carries the same final set and the result is
-    order-independent. The old-agent reason for opting out does not apply to
-    drivers that live in this codebase, and DNS pool ops are untouched: their
-    ``add`` is a ``create`` op and their removal is ``delete_value``.
+    ``rrset_action="add"``. The agentless drivers have no per-RR ``add``
+    (``RecordChange`` carries no ``rrset_action``), so an unstamped one reaches
+    them as a single-value replace and the last value written wins. Two callers
+    emit that shape: a DNS pool TTL change (one ``update`` per member, which on
+    an agentless group left the pool answering with its last member only) and
+    the cutover TTL pre-flight's siblings (which never reach an agentless
+    server: the pre-flight refuses an agentless primary). Stamping folds the
+    whole batch, so every op of a name carries the same final set. The
+    old-agent reason for opting out does not apply to drivers that live in
+    this codebase. A pool's ``create`` (``add``) and ``delete_value`` ops are
+    still left alone, for the order-dependence reason above.
     """
     stampable = [
         o

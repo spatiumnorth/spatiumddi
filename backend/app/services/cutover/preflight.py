@@ -144,12 +144,14 @@ def _ttl_ops(records: list[DNSRecord], zone: DNSZone) -> list[dict[str, Any]]:
     would be rewritten three times and end up serving only the last one.
     Lowering a TTL must not cost the operator two thirds of their addresses.
 
-    That is the agent contract. Agentless drivers never see ``rrset_action``
-    (``RecordChange`` has no such field), so on that path the record-op layer
-    stamps the ``update`` + ``add`` siblings with the whole folded RRset
-    (``stamp_rrsets_for_ops(agentless=True)``, #1983) and each driver writes it
-    as one set. ``_assert_target_is_not_the_source`` still keeps this module off a
-    live Windows source; this covers any agentless server that is reached.
+    That is the agent contract, and the only one these ops meet:
+    ``_assert_target_is_not_the_source`` refuses a group whose primary is
+    agentless, and in a group with an agent primary record ops fan out to the
+    agent servers only, so no agentless driver ever receives them. Agentless
+    drivers never see ``rrset_action`` (``RecordChange`` has no such field); the
+    record-op layer would stamp ``update`` + ``add`` siblings with the whole
+    folded RRset there (``stamp_rrsets_for_ops(agentless=True)``, #1983), so
+    this shape stays safe if that guard is ever relaxed.
 
     So ops are grouped by ``(name, type)``. The first op in a group keeps the
     default ``replace`` — which clears the old RRset — and every sibling carries

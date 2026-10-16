@@ -11,7 +11,11 @@ name kept one address.
 These tests run the REAL path — ``_ttl_ops`` -> ``enqueue_record_ops_batch``
 -> the ``RecordChange`` the dispatcher builds — and then hand each change to
 the real request builder of every agentless driver, asserting on what would
-go on the wire. A 3-value A name must keep all 3 at the new TTL.
+go on the wire. A 3-value A name must keep all 3 at the new TTL. They call
+``enqueue_record_ops_batch`` directly: the pre-flight itself refuses an
+agentless primary, so these pin the mechanism, and the last two tests pin
+reachability (the pre-flight never reaches an agentless server) and the one
+path that did reach one (a pool TTL change).
 """
 
 from __future__ import annotations
@@ -205,3 +209,84 @@ async def test_cloudflare_keeps_all_three(
     puts = [c["json"] for c in fake.calls if c["method"] == "put"]
     assert {p["content"] for p in puts} == VALUES
     assert all(p["ttl"] == NEW_TTL for p in puts)
+
+
+# ── Reachability + the paths the flag does and does not change ──────────────
+
+
+async def test_preflight_never_dispatches_to_an_agentless_secondary(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mixed group (agent primary, agentless secondary) is the only shape the
+    pre-flight accepts that contains an agentless server, and record ops there
+    fan out to the AGENT servers only. So the pre-flight cannot reach an
+    agentless driver at all; and the agent ops keep the unstamped per-RR
+    ``add`` siblings (the agent path is unchanged by #1983)."""
+    import uuid
+
+    from sqlalchemy import select
+
+    from app.models.dns import DNSRecordOp, DNSServer
+
+    grp, agent, zone = await _group_and_zone(db_session, driver="bind9")
+    win = DNSServer(
+        group_id=grp.id,
+        driver="windows_dns",
+        host="10.0.0.9",
+        name=f"win-{uuid.uuid4().hex[:6]}",
+        is_primary=False,
+        is_enabled=True,
+    )
+    db_session.add(win)
+    recs = [
+        await _add_record(db_session, zone, name="rr", value=v, ttl=3600) for v in sorted(VALUES)
+    ]
+    await db_session.commit()
+    recorder = _RecordingDriver()
+    monkeypatch.setattr("app.services.dns.record_ops.get_driver", lambda _name: recorder)
+
+    for rec in recs:
+        rec.ttl = NEW_TTL
+    await enqueue_record_ops_batch(db_session, zone, _ttl_ops(recs, zone))
+    await db_session.commit()
+
+    assert recorder.full_changes == []
+    rows = (await db_session.execute(select(DNSRecordOp))).scalars().all()
+    assert {r.server_id for r in rows} == {agent.id}
+    siblings = [r for r in rows if r.record.get("rrset_action") == "add"]
+    assert len(siblings) == 2
+    assert all("rrset" not in r.record for r in siblings)
+
+
+async def test_pool_ttl_change_keeps_every_member_on_an_agentless_server(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The REACHABLE ``update`` + ``rrset_action="add"`` producer on main: a
+    pool TTL change emits one such op per member through ``enqueue_record_op``.
+    Unstamped, each reached Windows DNS as a single-value replace and the pool
+    kept only its last member. Stamped, the last op carries the whole set at
+    the new TTL. (#1979 reshapes this into one plain stamped update; this pin
+    holds either way.)"""
+    from app.services.dns.pool_apply import apply_pool_state
+    from tests.test_dns_pool_geo_steering import _pool_with_members
+
+    grp, _server, zone = await _group_and_zone(db_session, driver="windows_dns")
+    recorder = _RecordingDriver()
+    monkeypatch.setattr("app.services.dns.record_ops.get_driver", lambda _name: recorder)
+    pool = await _pool_with_members(db_session, grp, zone, [{"address": a} for a in sorted(VALUES)])
+    await db_session.commit()
+    recorder.full_changes.clear()
+
+    await db_session.refresh(pool, ["members"])
+    pool.ttl = NEW_TTL
+    await apply_pool_state(db_session, pool)
+    await db_session.commit()
+
+    updates = [c for c in recorder.full_changes if c.op == "update"]
+    assert updates, "the TTL change sent nothing"
+    last = updates[-1]
+    assert last.rrset is not None, "the pool TTL update reached Windows as a single-value replace"
+    assert {m.value for m in last.rrset.members} == VALUES
+    assert last.rrset.ttl == NEW_TTL
+    for c in updates:
+        assert c.rrset is not None and {m.value for m in c.rrset.members} == VALUES
