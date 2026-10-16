@@ -94,10 +94,10 @@ the formatter handles the rest.
   preview as matching nothing and not rendered, and the Device classes hint
   said the same; the warning now applies only with neither classes nor a
   manual match, in both the REST preview and `preview_dhcp_device_policy`. The
-  shared DHCP `Field` now links its label to its control (`htmlFor`/`id`, or a
-  labelled group for a composite widget). The Alerts rule editor's own
-  `Field` is handled separately.
-
+  shared DHCP `Field` now links its label to its control (`htmlFor`/`id` on
+  the one input, select or textarea among its children, even beside a
+  `<datalist>` or an inline error line; otherwise a labelled group). The
+  Alerts rule editor's own `Field` is handled separately.
 
 - **Kubernetes Detect CIDRs answered 500 when the token held a non-ASCII
   character (#1913).** The bearer token goes straight into an

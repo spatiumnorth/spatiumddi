@@ -18,6 +18,7 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 const createDevicePolicy = vi.fn(() => Promise.resolve({}));
+const updateDevicePolicy = vi.fn(() => Promise.resolve({}));
 
 vi.mock("@/lib/api", () => ({
   authApi: { myPermissions: () => Promise.resolve({}) },
@@ -26,18 +27,20 @@ vi.mock("@/lib/api", () => ({
       Promise.resolve({ total_devices: 0, classes: [] }),
     createDevicePolicy: (...a: unknown[]) =>
       (createDevicePolicy as (...x: unknown[]) => unknown)(...a),
-    updateDevicePolicy: () => Promise.resolve({}),
+    updateDevicePolicy: (...a: unknown[]) =>
+      (updateDevicePolicy as (...x: unknown[]) => unknown)(...a),
   },
 }));
 
 import { DevicePolicyModal } from "./DevicePoliciesTab";
+import type { DHCPDevicePolicy } from "@/lib/api";
 
-function open() {
+function open(policy?: DHCPDevicePolicy) {
   const onClose = vi.fn();
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
-      <DevicePolicyModal groupId="g1" onClose={onClose} />
+      <DevicePolicyModal groupId="g1" policy={policy} onClose={onClose} />
     </QueryClientProvider>,
   );
   return onClose;
@@ -46,6 +49,7 @@ function open() {
 afterEach(() => {
   cleanup();
   createDevicePolicy.mockClear();
+  updateDevicePolicy.mockClear();
 });
 
 describe("DevicePolicyModal", () => {
@@ -63,7 +67,7 @@ describe("DevicePolicyModal", () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
-  it("sends an integer lease, and null for a blank one", async () => {
+  it("sends an integer lease as that number", async () => {
     open();
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "p" } });
     fireEvent.change(screen.getByLabelText("Lease time (seconds)"), {
@@ -76,6 +80,50 @@ describe("DevicePolicyModal", () => {
       { lease_time: number | null },
     ][];
     expect(calls[0][1].lease_time).toBe(600);
+  });
+
+  it("trims whitespace and leading zeros from a lease", async () => {
+    open();
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "p" } });
+    fireEvent.change(screen.getByLabelText("Lease time (seconds)"), {
+      target: { value: " 0600 " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /create/i }));
+    await waitFor(() => expect(createDevicePolicy).toHaveBeenCalledTimes(1));
+    const calls = createDevicePolicy.mock.calls as unknown as [
+      string,
+      { lease_time: number | null },
+    ][];
+    expect(calls[0][1].lease_time).toBe(600);
+  });
+
+  it("saves an existing lease unchanged on edit", async () => {
+    open({
+      id: "p1",
+      group_id: "g1",
+      name: "phones",
+      description: "",
+      enabled: true,
+      class_name: "spatium-dp-phones",
+      device_classes: [],
+      options: {},
+      lease_time: 86400,
+      match_override: null,
+      include_ambiguous: false,
+      priority: 0,
+      created_at: "",
+      modified_at: "",
+    });
+    expect(
+      (screen.getByLabelText("Lease time (seconds)") as HTMLInputElement).value,
+    ).toBe("86400");
+    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    await waitFor(() => expect(updateDevicePolicy).toHaveBeenCalledTimes(1));
+    const calls = updateDevicePolicy.mock.calls as unknown as [
+      string,
+      { lease_time: number | null },
+    ][];
+    expect(calls[0][1].lease_time).toBe(86400);
   });
 
   it("sends null for a genuinely blank lease", async () => {

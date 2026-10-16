@@ -626,3 +626,11 @@ async def test_manual_match_only_policy_is_not_called_unrendered(
 
     out_bare = await compile_device_policy(db_session, bare)
     assert any("matches nothing and is not rendered" in w for w in out_bare.warnings)
+    assert not out_bare.expression
+
+    # A whitespace-only match is no match: the warning and an empty
+    # expression (renders=False) must still agree.
+    blank = _policy(grp.id, device_classes=[], match_override="   ")
+    out_blank = await compile_device_policy(db_session, blank)
+    assert not out_blank.expression
+    assert any("matches nothing and is not rendered" in w for w in out_blank.warnings)
