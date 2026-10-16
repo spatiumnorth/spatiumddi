@@ -187,11 +187,10 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 30
           volumeMounts:
-            # #292 — the agent's state dir (AGENT_STATE_DIR) is the ONLY
-            # thing that needs persisting. named runs with
-            # ``-c /var/lib/spatium-dns-agent/rendered/named.conf`` and
-            # every path it references (rendered zones, tsig + rndc keys,
-            # the cached ConfigBundle under config/) lives here. The old
+            # #292 — the agent's state dir (AGENT_STATE_DIR). named runs with
+            # ``-c /var/lib/spatium-dns-agent/rendered/named.conf`` and the
+            # config it serves (rendered zones, tsig + rndc keys, the cached
+            # ConfigBundle under config/) lives here. The old
             # /var/named/{data,keys} PVC mounts were never written to —
             # confirmed empty on a live install — so they're dropped.
             # MUST be persistent: on a pod restart during a control-plane
@@ -199,6 +198,22 @@ spec:
             # serving from last-known-good config (non-negotiable #5).
             - name: agent-state
               mountPath: /var/lib/spatium-dns-agent
+            # #1855 — named's own working ``directory``, which holds its
+            # DNSSEC ``key-directory`` (/var/cache/bind/keys, rendered by the
+            # agent's bind9 driver): ``dnssec-policy`` keeps every signed
+            # zone's keys and their timing state there. MUST be persistent
+            # too. Unmounted, it was the anonymous volume the image's VOLUME
+            # gives each container, and it went with the container: every
+            # new pod (an upgrade, a reboot, an engine switch, an eviction)
+            # signed each zone with new keys, and a DS published at the
+            # parent stopped matching, so validating resolvers answered
+            # SERVFAIL. The umbrella chart and the Compose files persist this
+            # path already. The entrypoint creates keys/ and chowns the tree
+            # to ``spatium`` (the user named runs as) before it drops
+            # privileges, so the root-owned dir kubelet creates is writable
+            # by named.
+            - name: data
+              mountPath: /var/cache/bind
             {{- if .Values.dnsBind9.controlPlaneUrl }}
             {{- include "spatiumddi-appliance.cpPin.mount" . | nindent 12 }}
             {{- end }}
@@ -216,6 +231,13 @@ spec:
         - name: agent-state
           hostPath:
             path: /var/lib/spatiumddi/agents/dns-bind9/state
+            type: DirectoryOrCreate
+        # #1855 — named's working dir and DNSSEC keys (see the mount above),
+        # beside the state dir on the same persistent /var and per node like
+        # it, as dns-powerdns and dns-technitium keep their engine's data.
+        - name: data
+          hostPath:
+            path: /var/lib/spatiumddi/agents/dns-bind9/data
             type: DirectoryOrCreate
 ---
 apiVersion: v1
