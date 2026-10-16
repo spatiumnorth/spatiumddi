@@ -888,7 +888,7 @@ export function AlertsPage() {
                     </td>
                     <td className="px-4 py-2 text-muted-foreground tabular-nums">
                       {r.rule_type === "subnet_utilization"
-                        ? `≥ ${r.threshold_percent}%`
+                        ? `≥ ${r.threshold_percent ?? 90}%`
                         : r.rule_type === "voice_lease_count_below"
                           ? `< ${r.threshold_percent ?? 1} leases`
                           : r.rule_type === "stale_ip_count"
