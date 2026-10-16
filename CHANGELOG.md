@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Updating an alert rule with a null `enabled` or `severity` answered
+  500, and disabling a rule left its open alerts open for good (#1987,
+  #1988).** Every NOT NULL field of the rule update (`name`,
+  `description`, `enabled`, `severity`, `notify_*`) now answers 422
+  naming the field on an explicit null, through the shared
+  `resolve_update_changes`; the nullable thresholds, `server_type`,
+  `classification` and `change_scope` can still be cleared. Disabling a
+  rule now resolves its open events in the same transaction, since the
+  evaluator only visits enabled rules and nothing else would ever close
+  them; the count is recorded in that update's audit row
+  (`resolved_open_events`). Overview and the "Open only" list stop
+  showing them.
+
 - **Kubernetes Detect CIDRs answered 500 when the token held a non-ASCII
   character (#1913).** The bearer token goes straight into an
   `Authorization` header; httpx encodes header values as ASCII and raises
