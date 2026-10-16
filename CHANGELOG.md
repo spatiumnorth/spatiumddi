@@ -84,6 +84,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A k3s appliance's api, worker and beat never knew their
+  appliance version.** firstboot's `sharedEnv` carried no
+  `APPLIANCE_VERSION`, so `settings.appliance_version` was empty,
+  `/appliance/system/info` said "dev" and `/api/v1/version` said
+  null (#2004). firstboot now stamps it from the running slot's
+  `appliance-release` on every boot, so a slot upgrade stamps the
+  new version and a rollback the old one. `system/info` now
+  reports null for unknown, like `/version`.
 - **`npm test` failed 52 tests on Node 26.** Node 26 defines its own
   global `localStorage`, which is undefined without
   `--localstorage-file` and shadows jsdom's, so every test calling

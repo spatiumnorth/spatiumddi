@@ -485,6 +485,22 @@ if [ -f "$ENV_FILE" ]; then
     : "${APPLIANCE_HOST_IPS_VAL:=$(grep '^APPLIANCE_HOST_IPS=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)}"
 fi
 
+# #2004 — the running slot's version for the control-plane pods' env. Read from
+# the slot's own appliance-release on EVERY boot (never from .env, which sits on
+# the shared /var and holds whatever the last boot wrote), so a slot upgrade
+# stamps the new version and a rollback the old one: this bootstrap manifest is
+# re-rendered each boot and helm-controller rolls the pods when the value moves.
+# Empty (not a made-up "0.1.0") when the file is absent: the api reads "" as
+# unknown.
+APPLIANCE_VERSION_VAL=""
+if [ -f /etc/spatiumddi/appliance-release ]; then
+    APPLIANCE_VERSION_VAL="$(
+        # shellcheck disable=SC1091
+        . /etc/spatiumddi/appliance-release 2>/dev/null
+        printf '%s' "${APPLIANCE_VERSION:-}"
+    )"
+fi
+
 # ── Render the bootstrap HelmChart manifest ──────────────────────────────────
 # k3s's helm-controller watches /var/lib/rancher/k3s/server/manifests/
 # for ``HelmChart`` CRs + reconciles them into Helm releases at
@@ -1084,6 +1100,10 @@ spec:
     sharedEnv:
       - name: APPLIANCE_MODE
         value: "true"
+      # #2004 — the slot's version. Without it settings.appliance_version is ""
+      # in every control-plane pod, so system/info and /version report unknown.
+      - name: APPLIANCE_VERSION
+        value: "${APPLIANCE_VERSION_VAL:-}"
       # #1003 item 2 — the installer's Time source answer. Seeds the
       # INITIAL platform_settings.ntp_pool_servers so the #154 chrony
       # plane pushes what the operator typed instead of the platform
