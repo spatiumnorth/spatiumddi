@@ -75,6 +75,10 @@ async def _trashed_zone(db: AsyncSession, age_days: int = 1) -> DNSZone:
     )
     db.add(zone)
     await db.flush()
+    # The record is trashed WITH its zone, as the zone's delete stamps it: a live
+    # record under a trashed zone makes the purge refuse (#1957).
+    deleted_at = datetime.now(UTC) - timedelta(days=age_days)
+    batch_id = uuid.uuid4()
     db.add(
         DNSRecord(
             zone_id=zone.id,
@@ -83,10 +87,12 @@ async def _trashed_zone(db: AsyncSession, age_days: int = 1) -> DNSZone:
             record_type="A",
             value="203.0.113.1",
             ttl=300,
+            deleted_at=deleted_at,
+            deletion_batch_id=batch_id,
         )
     )
-    zone.deleted_at = datetime.now(UTC) - timedelta(days=age_days)
-    zone.deletion_batch_id = uuid.uuid4()
+    zone.deleted_at = deleted_at
+    zone.deletion_batch_id = batch_id
     await db.commit()
     return zone
 

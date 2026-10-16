@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import String, cast, func, literal, select, union_all
 from sqlalchemy import delete as sa_delete
+from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB, SuperAdmin
 from app.core.agent_wake import dns_group_channel, publish_wake
@@ -70,6 +71,8 @@ class TrashEntry(BaseModel):
 class TrashListResponse(BaseModel):
     items: list[TrashEntry]
     total: int
+    limit: int = 200
+    offset: int = 0
 
 
 class RestoreConflict(BaseModel):
@@ -132,6 +135,178 @@ def _label_expr(model: type) -> Any:
 # ── Endpoints ─────────────────────────────────────────────────────────────
 
 
+# ── Purge helpers (#1957, #1958) ──────────────────────────────────────────
+
+
+def _purge_audit(current_user: Any, resource_type: str, row: Any) -> AuditLog:
+    return AuditLog(
+        user_id=current_user.id,
+        user_display_name=current_user.display_name,
+        auth_source=current_user.auth_source,
+        action="permanent_delete",
+        resource_type=resource_type,
+        resource_id=str(row.id),
+        resource_display=_row_label(row),
+        result="success",
+        new_value={"purged_with": "parent"},
+    )
+
+
+def _refuse_live_children(label: str, live: list[str]) -> None:
+    shown = ", ".join(live[:5]) + (f" and {len(live) - 5} more" if len(live) > 5 else "")
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Cannot permanently delete {label}: it still holds live rows that are not in "
+            f"the Trash ({shown}). Restore {label} from the Trash or move or delete those "
+            "rows first; a permanent delete never takes live rows with it."
+        ),
+    )
+
+
+async def _trashed_ipam_subtree(db: Any, target: Any) -> tuple[list[Any], list[Any]]:
+    """Every block (deepest first, ``target`` included when a block) and every
+    subnet under a trashed block or space, whatever batch each was trashed in.
+
+    Live rows are returned too, so the caller can refuse; the soft-delete filter
+    is off because the point is to see what the database will refuse over.
+    """
+    if isinstance(target, IPSpace):
+        blocks = list(
+            (
+                await db.execute(
+                    select(IPBlock)
+                    .where(IPBlock.space_id == target.id)
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        subnets = list(
+            (
+                await db.execute(
+                    select(Subnet)
+                    .where(Subnet.space_id == target.id)
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    else:
+        blocks = [target]
+        frontier = [target.id]
+        while frontier:
+            kids = list(
+                (
+                    await db.execute(
+                        select(IPBlock)
+                        .where(IPBlock.parent_block_id.in_(frontier))
+                        .execution_options(include_deleted=True)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            blocks.extend(kids)
+            frontier = [k.id for k in kids]
+        subnets = list(
+            (
+                await db.execute(
+                    select(Subnet)
+                    .where(Subnet.block_id.in_([b.id for b in blocks]))
+                    .execution_options(include_deleted=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # Deepest first: a block's depth is the length of its parent chain.
+    by_id = {b.id: b for b in blocks}
+
+    def depth(b: Any) -> int:
+        d = 0
+        while b.parent_block_id in by_id and d < 1000:
+            b = by_id[b.parent_block_id]
+            d += 1
+        return d
+
+    blocks.sort(key=depth, reverse=True)
+    return blocks, subnets
+
+
+async def _live_children(
+    db: Any, targets: list[Any], blocks: list[Any], subnets: list[Any]
+) -> list[str]:
+    """Labels of rows a purge of ``targets`` would destroy that are NOT in the Trash."""
+    live = [f"block {_row_label(b)}" for b in blocks if b.deleted_at is None]
+    live += [f"subnet {_row_label(sub)}" for sub in subnets if sub.deleted_at is None]
+    subnet_ids = [sub.id for sub in subnets] + [t.id for t in targets if isinstance(t, Subnet)]
+    if subnet_ids:
+        # The soft-delete filter is on: only a LIVE scope shows up.
+        scopes = (
+            await db.execute(select(DHCPScope).where(DHCPScope.subnet_id.in_(subnet_ids)).limit(5))
+        ).scalars()
+        live += [f"DHCP scope {_row_label(sc)}" for sc in scopes]
+    return live
+
+
+async def _audit_scopes_under(db: Any, current_user: Any, subnet_ids: list[uuid.UUID]) -> None:
+    """One audit row per trashed DHCP scope a subnet purge takes with it (#1957).
+
+    The scope rows go by FK CASCADE, which runs no Python, so without this the
+    scope and its reservations vanished with no record of it.
+    """
+    if not subnet_ids:
+        return
+    scopes = (
+        (
+            await db.execute(
+                select(DHCPScope)
+                .where(DHCPScope.subnet_id.in_(subnet_ids), DHCPScope.deleted_at.is_not(None))
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for sc in scopes:
+        db.add(_purge_audit(current_user, "dhcp_scope", sc))
+
+
+async def _prepare_subnet_purge(db: Any, subnets: list[Any]) -> tuple[int, set[uuid.UUID]]:
+    """Withdraw what IPAM published for ``subnets`` before they are hard-deleted.
+
+    spatiumddi#1151 — the addresses go with the subnet (FK CASCADE); the
+    auto-generated A / AAAA / PTR / alias records IPAM published for them would
+    survive as ownerless rows the agents keep serving. Withdraw them first,
+    through the record-op queue.
+    spatiumddi#1906 — the records retracted when the subnet was trashed sit in
+    the Trash under its batch, ownerless once the addresses cascade. They are
+    not served; drop them with the subnet instead of leaving a stray Trash
+    entry per record.
+    """
+    if not subnets:
+        return 0, set()
+    subnet_ids = [sub.id for sub in subnets]
+    retracted, groups = await retract_address_records(db, subnet_ids)
+    batch_ids = {sub.deletion_batch_id for sub in subnets if sub.deletion_batch_id is not None}
+    if batch_ids:
+        await db.execute(
+            sa_delete(DNSRecord)
+            .where(
+                DNSRecord.deletion_batch_id.in_(batch_ids),
+                DNSRecord.auto_generated.is_(True),
+                DNSRecord.ip_address_id.in_(
+                    select(IPAddress.id).where(IPAddress.subnet_id.in_(subnet_ids))
+                ),
+            )
+            .execution_options(include_deleted=True, synchronize_session=False)
+        )
+    return retracted, groups
+
+
 @router.get("/trash", response_model=TrashListResponse)
 async def list_trash(
     db: DB,
@@ -142,6 +317,10 @@ async def list_trash(
     q: str | None = Query(None, description="Substring match on name / CIDR / FQDN"),
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    sort: Literal["newest", "oldest"] = Query(
+        "newest",
+        description="``oldest`` lists the rows the retention purge will remove first (#1961)",
+    ),
 ) -> TrashListResponse:
     """Paginated list of soft-deleted rows across every in-scope type."""
 
@@ -186,7 +365,10 @@ async def list_trash(
     page = (
         await db.execute(
             select(listing, func.count().over().label("total"))
-            .order_by(listing.c.deleted_at.desc(), listing.c.id)
+            .order_by(
+                listing.c.deleted_at.asc() if sort == "oldest" else listing.c.deleted_at.desc(),
+                listing.c.id,
+            )
             .limit(limit)
             .offset(offset)
             .execution_options(include_deleted=True)
@@ -245,7 +427,7 @@ async def list_trash(
         )
         for r in page
     ]
-    return TrashListResponse(items=items, total=total)
+    return TrashListResponse(items=items, total=total, limit=limit, offset=offset)
 
 
 # Types a partial restore is safe for (#963 review). ``skip_conflicts`` leaves
@@ -323,9 +505,17 @@ async def restore_row(
     result = await restore_batch(db, batch_id, conflict_check=_check, skip_conflicts=skip_conflicts)
     restored, conflicts = result.restored, result.conflicts
     if conflicts and not skip_conflicts:
+        # Tell the client whether ``skip_conflicts`` would be accepted, so the
+        # page offers "Restore the others" only where the 422 above will not
+        # answer it (#1960). The same test as the guard at the top.
+        cascade_types = await batch_resource_types(db, batch_id) - _PARTIAL_RESTORE_TYPES
         raise HTTPException(
             status_code=409,
-            detail={"message": "Restore would clash with active rows", "conflicts": conflicts},
+            detail={
+                "message": "Restore would clash with active rows",
+                "conflicts": conflicts,
+                "skip_conflicts_allowed": not cascade_types,
+            },
         )
 
     # Soft-delete pushed a remove-scope to every agentless (Windows) member
@@ -444,6 +634,7 @@ async def permanent_delete_from_trash(
 
     label = _row_label(target)
     records_retracted = 0
+    purged_extra: dict[str, int] = {}
     dns_wake_group_ids: set[uuid.UUID] = set()
     if isinstance(target, DHCPScope):
         # Delete the reservation mirror rows (not just free them) so the IPs fold
@@ -457,31 +648,50 @@ async def permanent_delete_from_trash(
         # untouched) when the provider refuses. Same helper as the 30-day sweep.
         from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
 
+        # Refuses (409) while a LIVE record sits under the trashed zone (#1957).
         await purge_trashed_zone(db, target)
         dns_wake_group_ids.add(target.group_id)
     elif isinstance(target, Subnet):
-        # spatiumddi#1151 — the subnet's addresses go with it (FK CASCADE); the
-        # auto-generated A / AAAA / PTR / alias records IPAM published for them
-        # would survive as ownerless rows the agents keep serving. Withdraw
-        # them first, through the record-op queue. (A block or space can't
-        # reach addresses from here: subnet.block_id / space_id are RESTRICT.)
-        records_retracted, dns_wake_group_ids = await retract_address_records(db, [target.id])
-        # spatiumddi#1906 — the records retracted when the subnet was trashed sit
-        # in the Trash under its batch, ownerless once the addresses cascade.
-        # They are not served; drop them with the subnet instead of leaving a
-        # stray Trash entry per record.
-        if target.deletion_batch_id is not None:
+        live = await _live_children(db, [target], [], [])
+        if live:
+            _refuse_live_children(label, live)
+        records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(db, [target])
+        await _audit_scopes_under(db, current_user, [target.id])
+    elif isinstance(target, (IPBlock, IPSpace)):
+        # #1958 — a block or space is purged WITH the trashed subnets and
+        # blocks under it, leaf first (the nightly sweep's order): subnet.block_id
+        # / space_id are RESTRICT, and the soft-delete filter hides the trashed
+        # subnets from the ORM, so a bare delete of the parent only ever met the
+        # database's refusal.
+        blocks, subnets = await _trashed_ipam_subtree(db, target)
+        live = await _live_children(db, [target], blocks, subnets)
+        if live:
+            _refuse_live_children(label, live)
+        records_retracted, dns_wake_group_ids = await _prepare_subnet_purge(db, subnets)
+        await _audit_scopes_under(db, current_user, [sub.id for sub in subnets])
+        for sub in subnets:
+            db.add(_purge_audit(current_user, "subnet", sub))
+        for blk in blocks:
+            if blk.id != target.id:
+                db.add(_purge_audit(current_user, "ip_block", blk))
+        subnet_ids = [sub.id for sub in subnets]
+        if subnet_ids:
             await db.execute(
-                sa_delete(DNSRecord)
-                .where(
-                    DNSRecord.deletion_batch_id == target.deletion_batch_id,
-                    DNSRecord.auto_generated.is_(True),
-                    DNSRecord.ip_address_id.in_(
-                        select(IPAddress.id).where(IPAddress.subnet_id == target.id)
-                    ),
-                )
+                sa_delete(Subnet)
+                .where(Subnet.id.in_(subnet_ids))
                 .execution_options(include_deleted=True, synchronize_session=False)
             )
+        # Deepest blocks first: a child block is removed before the block it
+        # hangs from, so no delete relies on the parent_block_id CASCADE.
+        for blk in blocks:
+            if blk.id != target.id:
+                await db.execute(
+                    sa_delete(IPBlock)
+                    .where(IPBlock.id == blk.id)
+                    .execution_options(include_deleted=True, synchronize_session=False)
+                )
+        if subnets or len(blocks) > 1:
+            purged_extra = {"subnets": len(subnets), "blocks": max(len(blocks) - 1, 0)}
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -492,12 +702,40 @@ async def permanent_delete_from_trash(
             resource_id=str(target.id),
             resource_display=label,
             result="success",
-            new_value=({"dns_records_retracted": records_retracted} if records_retracted else None),
+            new_value=(
+                {
+                    **({"dns_records_retracted": records_retracted} if records_retracted else {}),
+                    **purged_extra,
+                }
+                or None
+            ),
         )
     )
-    if not isinstance(target, DNSZone):
+    if isinstance(target, (IPBlock, IPSpace)):
+        # Core, not ``db.delete``: the ORM would lazy-load the parent's
+        # relationships inside an async session, and everything under it is
+        # already gone above.
+        await db.execute(
+            sa_delete(model)
+            .where(model.id == target.id)
+            .execution_options(include_deleted=True, synchronize_session=False)
+        )
+    elif not isinstance(target, DNSZone):
         await db.delete(target)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        # Something we did not account for still references the row. Never a 500
+        # for a refusal the operator can act on (#922's mapping, kept local: the
+        # key it names may not be the row in the path).
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot permanently delete {label}: another row still references it "
+                "or something under it. Nothing was deleted."
+            ),
+        ) from exc
     # This router carries no wake_publishing dependency, so the enqueue's
     # collect_wake had no collector; tell the agents now the ops are committed
     # instead of leaving them to the safety tick.

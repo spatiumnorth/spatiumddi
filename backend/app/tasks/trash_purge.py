@@ -17,7 +17,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, exists, or_, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from app.celery_app import celery_app
 from app.config import settings
@@ -240,6 +242,81 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     return purged, skipped
 
 
+def _expired_where(model: type, cutoff: datetime) -> list[Any]:
+    """The rows of ``model`` the sweep may delete: expired, and with nothing LIVE under them.
+
+    A live child under a trashed parent (a restore before #1957 could leave one)
+    is destroyed by the parent's FK CASCADE, or refused by its RESTRICT: the
+    first loses data unannounced, the second raised out of the single sweep
+    transaction and rolled the whole night back, every night. Such a parent is
+    skipped, not deleted, until its child is restored or moved.
+    """
+    where: list[Any] = [model.deleted_at.is_not(None), model.deleted_at < cutoff]  # type: ignore[attr-defined]
+    if model is IPBlock:
+        child = aliased(IPBlock)
+        where += [
+            ~exists().where(child.parent_block_id == model.id).where(child.deleted_at.is_(None)),  # type: ignore[attr-defined]
+            ~exists().where(Subnet.block_id == model.id).where(Subnet.deleted_at.is_(None)),  # type: ignore[attr-defined]
+        ]
+    elif model is IPSpace:
+        where += [
+            ~exists().where(IPBlock.space_id == model.id).where(IPBlock.deleted_at.is_(None)),  # type: ignore[attr-defined]
+            ~exists().where(Subnet.space_id == model.id).where(Subnet.deleted_at.is_(None)),  # type: ignore[attr-defined]
+        ]
+    elif model is Subnet:
+        where += [
+            ~exists().where(DHCPScope.subnet_id == model.id).where(DHCPScope.deleted_at.is_(None)),  # type: ignore[attr-defined]
+        ]
+    return where
+
+
+async def _delete_expired(db: Any, model: type, cutoff: datetime) -> int:
+    """Bulk-delete the expired rows of ``model``; one refusing row must not sink the sweep.
+
+    A block or space can still be refused by a subnet that is in the Trash but
+    not yet expired (RESTRICT). That used to raise out of the one sweep
+    transaction. The bulk delete now runs in a savepoint and, if the database
+    refuses, falls back to one savepoint per row, leaving the refused rows for a
+    later night.
+    """
+    where = _expired_where(model, cutoff)
+    try:
+        async with db.begin_nested():
+            res = await db.execute(
+                delete(model).where(*where).execution_options(include_deleted=True)
+            )
+        return int(res.rowcount or 0)
+    except IntegrityError:
+        logger.warning("trash_purge.bulk_delete_refused", table=model.__tablename__)  # type: ignore[attr-defined]
+    ids = (
+        (
+            await db.execute(
+                select(model.id).where(*where).execution_options(include_deleted=True)  # type: ignore[attr-defined]
+            )
+        )
+        .scalars()
+        .all()
+    )
+    removed = 0
+    for row_id in ids:
+        try:
+            async with db.begin_nested():
+                res = await db.execute(
+                    delete(model)
+                    .where(model.id == row_id)  # type: ignore[attr-defined]
+                    .execution_options(include_deleted=True)
+                )
+            removed += int(res.rowcount or 0)
+        except IntegrityError:
+            logger.warning(
+                "trash_purge.row_refused",
+                table=model.__tablename__,  # type: ignore[attr-defined]
+                row_id=str(row_id),
+                hint="something still references it; left in the Trash",
+            )
+    return removed
+
+
 async def _sweep() -> dict[str, Any]:
     async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
         ps_res = await db.execute(select(PlatformSettings).limit(1))
@@ -305,14 +382,7 @@ async def _sweep() -> dict[str, Any]:
         )
 
         for model in _PURGE_MODELS_LEAF_FIRST:
-            stmt = (
-                delete(model)
-                .where(model.deleted_at.is_not(None))
-                .where(model.deleted_at < cutoff)
-                .execution_options(include_deleted=True)
-            )
-            res = await db.execute(stmt)
-            removed = int(res.rowcount or 0)
+            removed = await _delete_expired(db, model, cutoff)
             per_type[model.__tablename__] = removed
             total_removed += removed
 
