@@ -822,13 +822,16 @@ async def agent_config_longpoll(
             if bundle is not None:
                 ops: list[dict[str, Any]] = []
                 remaining_ops = 0
-                if bundle.ships_ops:
-                    ops, remaining_ops = await page_pending_ops(
-                        db,
-                        server,
-                        up_to=bundle.snapshot_at,
-                        visible_xacts=bundle.visible_xacts,
-                    )
+                # Under views the body carries record changes (their ops were
+                # retired by the render) but never a DNSSEC op: page those
+                # regardless (#1946).
+                ops, remaining_ops = await page_pending_ops(
+                    db,
+                    server,
+                    up_to=bundle.snapshot_at,
+                    visible_xacts=bundle.visible_xacts,
+                    non_record_only=not bundle.ships_ops,
+                )
                 # Early return if there are pending ops (fast-path per §3)
                 if not etag_matches(if_none_match, bundle.etag) or ops:
                     # The body before the commit, and never assumed: the

@@ -6601,12 +6601,22 @@ async def rollover_zone_dnssec_key(
     if not zone.dnssec_enabled:
         raise HTTPException(status_code=409, detail="Zone is not DNSSEC-signed")
     await _check_driver_gated_operation("dnssec_rollover", group_id, db)
-    await enqueue_record_op(
+    op = await enqueue_record_op(
         db,
         zone,
         "dnssec_rollover",
         {"name": "@", "type": "DNSSEC_OP", "key_tag": body.key_tag},
     )
+    if op is None:
+        # #1946 — no row was written (no primary, or no enabled agent-based
+        # server): answering ``queued`` would claim a rollover nobody runs.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Nothing to run the rollover: the group has no primary server "
+                "or no enabled agent-based server"
+            ),
+        )
     db.add(
         AuditLog(
             user_id=current_user.id,
