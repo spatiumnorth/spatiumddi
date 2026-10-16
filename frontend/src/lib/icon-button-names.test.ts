@@ -45,11 +45,7 @@ const BUTTONS = new Set(["button", "Button", "HeaderButton"]);
  * must still match at least one offender, so whichever change merges second
  * is told by this test to delete the entry instead of leaving a hole.
  */
-const PENDING: Record<string, string> = {
-  // The search palette's clear-query X: GlobalSearch.tsx is owned by #1949,
-  // which names it "Clear search". Delete this entry once #1949 is on main.
-  "components/GlobalSearch.tsx": "#1949",
-};
+const PENDING: Record<string, string> = {};
 
 function sources(dir: string, out: string[] = []): string[] {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
