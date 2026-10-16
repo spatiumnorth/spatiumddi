@@ -5003,6 +5003,22 @@ class ServerZoneStateResponse(BaseModel):
     in_sync: bool
 
 
+def _secondary_never_transferred(zone: DNSZone, current: int | None, driver: str) -> bool:
+    """A secondary / stub zone a PowerDNS server reports at serial 0 holds no
+    data yet.
+
+    Its target serial is 0 too (it is not ours to number), so the equality
+    check read it as in sync while the server answered REFUSED for it (#1967).
+    PowerDNS reports the serial it serves, and a zone that has transferred
+    never serves 0. Other drivers report the bundle's serial (0 for a
+    secondary), so for them 0 says nothing."""
+    return (
+        driver == "powerdns"
+        and (zone.zone_type or "primary") in ("secondary", "stub")
+        and not current
+    )
+
+
 @router.get(
     "/groups/{group_id}/zones/{zone_id}/server-state",
     response_model=ServerZoneStateResponse,
@@ -5058,7 +5074,7 @@ async def get_zone_server_state(
             all_in_sync = False
         else:
             any_reported = True
-            if current != target:
+            if current != target or _secondary_never_transferred(zone, current, srv.driver):
                 all_in_sync = False
 
     return ServerZoneStateResponse(
@@ -5232,7 +5248,11 @@ async def get_server_zone_state(
         st = state_by_zone.get(z.id)
         target = int(z.last_serial or 0)
         current = int(st.current_serial) if st else None
-        in_sync = current is not None and current == target
+        in_sync = (
+            current is not None
+            and current == target
+            and not _secondary_never_transferred(z, current, server.driver)
+        )
         if current is None:
             not_reported_count += 1
         elif in_sync:

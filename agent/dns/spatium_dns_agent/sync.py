@@ -494,6 +494,14 @@ class SyncLoop:
                     zone=op.get("zone_name"),
                 )
                 _note_reached(reached, op)
+                # A driver that moves a zone to a serial of its own (PowerDNS
+                # never goes backwards from the one it serves, #1968) reports
+                # THAT serial, not the op's target.
+                actual_hook = getattr(self.driver, "reached_serial", None)
+                if callable(actual_hook):
+                    actual = actual_hook(str(op.get("zone_name") or ""))
+                    if isinstance(actual, int) and not isinstance(actual, bool):
+                        reached[_zone_key(op.get("zone_name"))] = actual
                 # PowerDNS DNSSEC ops return the DS rrset so we can ship
                 # it back to the control plane in one batched POST below.
                 if isinstance(result, dict) and "dnssec_state" in result:

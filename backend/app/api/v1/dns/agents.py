@@ -1114,6 +1114,49 @@ async def agent_zone_state(
         else:
             (ambiguous if matches else unknown).append(entry.zone_name)
 
+    # #1968 — a PowerDNS server never serves a serial below the one it already
+    # held (the agent floors it), so after the upgrade to a build that owns the
+    # serial it can serve one AHEAD of ours. Left as it is, our next bump (a
+    # small step from the lower number) is below what the server holds and the
+    # agent floors it again, so the zone never reads in sync and every change
+    # costs a floor. Move ours up to the one it serves: forward only (RFC 1982),
+    # primary zones only, and only for PowerDNS — BIND9 reports the serial it
+    # was sent, which is ours by construction.
+    if server.driver == "powerdns":
+        adopted: list[dict[str, Any]] = []
+        for zone_id, serial in serial_by_zone.items():
+            zone_row = next(
+                (z for zs in zones_by_key.values() for z in zs if z.id == zone_id), None
+            )
+            if zone_row is None or (zone_row.zone_type or "primary") != "primary":
+                continue
+            ours = int(zone_row.last_serial or 0)
+            # ``last_serial`` is a signed 32-bit column: a serial beyond it
+            # (legal on the wire, absent in practice) is left alone, not stored.
+            if serial <= 2**31 - 1 and 0 < (serial - ours) % 2**32 < 2**31:
+                adopted.append(
+                    {"zone": zone_row.name, "from": ours, "to": serial, "zone_id": str(zone_id)}
+                )
+                zone_row.last_serial = serial
+        for a in adopted:
+            db.add(
+                AuditLog(
+                    user_display_name="system:dns-agent",
+                    auth_source="system",
+                    action="dns.zone.serial_adopted",
+                    resource_type="dns_zone",
+                    resource_id=a["zone_id"],
+                    resource_display=a["zone"],
+                    new_value={
+                        "server_id": str(server.id),
+                        "previous_serial": a["from"],
+                        "serial": a["to"],
+                        "reason": "the PowerDNS server serves a later serial than the control plane",
+                    },
+                    result="success",
+                )
+            )
+
     for zone_id, serial in serial_by_zone.items():
         # Upsert: look up existing row, update or insert.
         existing_res = await db.execute(

@@ -84,6 +84,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **PowerDNS serves the control plane's serial, never goes
+  backwards, sends NOTIFY, and transfers a secondary
+  ([#1965](https://github.com/spatiumnorth/spatiumddi/issues/1965),
+  [#1967](https://github.com/spatiumnorth/spatiumddi/issues/1967),
+  [#1968](https://github.com/spatiumnorth/spatiumddi/issues/1968)).**
+  Zones were created with PowerDNS's default `SOA-EDIT-API:
+  DEFAULT`, which rewrote the serial of every change, so a zone
+  never served the serial SpatiumDDI stamped, an SOA-only edit
+  could be served under a serial a secondary already held, and the
+  sync status never matched. Zones are now created with it empty
+  (and cleared on existing ones), and a record op carries the zone
+  to the control plane's serial in the same PATCH. The serial is
+  never sent below the one PowerDNS serves (RFC 1982): the first
+  reconcile after the upgrade used to publish a serial below what
+  PowerDNS had served, and so did any later full reconcile after a
+  record add; it now goes forward by one instead, and the control
+  plane moves `last_serial` up to what a PowerDNS server reports
+  ahead of it. `pdns.conf` now sets `primary=yes` and
+  `secondary=yes`, without which PowerDNS sent no NOTIFY and never
+  transferred a secondary zone, which answered REFUSED while
+  reading in sync; PowerDNS restarts once on upgrade. A PowerDNS
+  secondary at serial 0 no longer reads in sync.
+
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored
   policy name, description, reference, result detail and diagnostic, went

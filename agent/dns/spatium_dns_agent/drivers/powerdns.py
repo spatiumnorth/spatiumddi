@@ -308,6 +308,10 @@ def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
         "name": zname,
         "kind": "Native",
         "serial": serial,
+        # The catalog's serial is the agent's own (a timestamp, bumped by
+        # PowerDNS's SOA-EDIT-API DEFAULT on every change), not the control
+        # plane's: it keeps that rule (#1965).
+        "serial_managed": False,
         "rrsets": rrsets,
     }
 
@@ -610,6 +614,96 @@ def _soa_content(zone: dict[str, Any], zname: str) -> str:
         else:
             timers.append(value)
     return f"{mname} {rname} {serial} {timers[0]} {timers[1]} {timers[2]} {timers[3]}"
+
+
+# ── SOA serial ownership (#1965, #1968) ─────────────────────────────────────
+#
+# The control plane owns a primary zone's serial. PowerDNS must serve exactly
+# the serial the agent sends, so a zone is created with ``soa_edit_api`` empty:
+# left at the API's default (``DEFAULT``) PowerDNS REWRITES the serial of every
+# change made through the API (below ``YYYYMMDD01`` it becomes ``YYYYMMDD01``,
+# else serial + 1), so the zone never served the control plane's number and an
+# SOA-only edit could keep the serial a secondary already held.
+#
+# A serial is never sent LOWER than the one PowerDNS already serves (RFC 1982):
+# before this fix a zone served PowerDNS's own, higher number, so the first
+# reconcile after the upgrade (and any later one) would publish a smaller serial
+# and every secondary that holds the larger one would keep its stale copy.
+
+
+def _serial_later(new: int, old: int) -> bool:
+    """RFC 1982: ``new`` is later than ``old``."""
+    return 0 < (new - old) % 2**32 < 2**31
+
+
+def _soa_parts(content: str) -> list[str] | None:
+    parts = str(content).split()
+    if len(parts) != 7:
+        return None
+    try:
+        int(parts[2])
+    except ValueError:
+        return None
+    return parts
+
+
+def _soa_serial(content: str) -> int | None:
+    parts = _soa_parts(content)
+    return int(parts[2]) if parts else None
+
+
+def _soa_with_serial(content: str, serial: int) -> str:
+    parts = _soa_parts(content)
+    if parts is None:
+        return content
+    parts[2] = str(serial % 2**32)
+    return " ".join(parts)
+
+
+def _soa_same_ignoring_serial(a: str, b: str) -> bool:
+    pa, pb = _soa_parts(a), _soa_parts(b)
+    if pa is None or pb is None:
+        return False
+    norm = lambda p: [x.lower().rstrip(".") for i, x in enumerate(p) if i != 2]  # noqa: E731
+    return norm(pa) == norm(pb)
+
+
+def _floor_soa_content(desired: str, served: str | None) -> str:
+    """The SOA content to REPLACE with: ``desired`` (the control plane's
+    serial), except that it never goes backwards from ``served``.
+
+    * ``desired`` is later than ``served``: sent as it is.
+    * Otherwise, with the same Primary NS / Admin Email / timers: the served
+      content (nothing to publish, and no serial creep per reconcile).
+    * Otherwise (the fields differ, e.g. PowerDNS's default SOA on the
+      upgrade): the served serial + 1, so a secondary sees a change.
+    """
+    want, have = _soa_serial(desired), _soa_serial(served or "")
+    if want is None or have is None or served is None:
+        return desired
+    if _serial_later(want, have):
+        return desired
+    if _soa_same_ignoring_serial(desired, served):
+        return served
+    return _soa_with_serial(desired, have + 1)
+
+
+def _soa_from_zone_doc(doc: Any, zone: str) -> tuple[str, int] | None:
+    """The apex SOA ``(content, ttl)`` out of a ``GET /zones/{z}`` document."""
+    if not isinstance(doc, dict):
+        return None
+    for rs in doc.get("rrsets") or []:
+        if (
+            isinstance(rs, dict)
+            and rs.get("type") == "SOA"
+            and str(rs.get("name") or "").lower().rstrip(".") == zone.lower().rstrip(".")
+        ):
+            for rec in rs.get("records") or []:
+                content = rec.get("content") if isinstance(rec, dict) else None
+                if isinstance(content, str) and not rec.get("disabled"):
+                    ttl = rs.get("ttl")
+                    return content, int(ttl) if isinstance(ttl, int) else 3600
+    return None
 
 
 class PowerDNSDriver(DriverBase):
@@ -1244,6 +1338,7 @@ class PowerDNSDriver(DriverBase):
         zone_raw = op["zone_name"]
         zone = zone_raw.rstrip(".") + "."
         op_kind = op["op"]
+        self._forget_reached(zone)
 
         # DNSSEC operations (Phase 3c) are zone-level, not rrset-
         # shaped. They flow through the same record-op queue but
@@ -1332,8 +1427,14 @@ class PowerDNSDriver(DriverBase):
             else:
                 desired = {"name": name, "type": rtype, "changetype": "DELETE"}
             with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
-                resp = client.patch(url, headers=headers, json={"rrsets": [desired]})
+                soa_rrsets, notify = self._soa_for_op(
+                    client, headers, zone, rtype, name, op.get("target_serial")
+                )
+                resp = client.patch(url, headers=headers, json={"rrsets": [desired, *soa_rrsets]})
+                if resp.status_code < 400 and soa_rrsets and notify:
+                    self._send_notify(client, headers, zone)
             if resp.status_code >= 400:
+                self._forget_reached(zone)
                 raise RuntimeError(
                     f"PowerDNS PATCH {zone}/{name}/{rtype} returned "
                     f"{resp.status_code}: {resp.text[:200]}"
@@ -1425,9 +1526,15 @@ class PowerDNSDriver(DriverBase):
                     "records": merged,
                 }
 
-            body = {"rrsets": [rrset]}
+            soa_rrsets, notify = self._soa_for_op(
+                client, headers, zone, rtype, name, op.get("target_serial")
+            )
+            body = {"rrsets": [rrset, *soa_rrsets]}
             resp = client.patch(url, headers=headers, json=body)
+            if resp.status_code < 400 and soa_rrsets and notify:
+                self._send_notify(client, headers, zone)
             if resp.status_code >= 400:
+                self._forget_reached(zone)
                 raise RuntimeError(
                     f"PowerDNS PATCH {zone}/{name}/{rtype} returned "
                     f"{resp.status_code}: {resp.text[:200]}"
@@ -1450,6 +1557,72 @@ class PowerDNSDriver(DriverBase):
         )
 
     # ── DNSSEC ops (Phase 3c) ──────────────────────────────────────────────
+
+    def _soa_for_op(
+        self,
+        client: httpx.Client,
+        headers: dict[str, str],
+        zone: str,
+        rtype: str,
+        name: str,
+        target_serial: Any,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """The SOA rrset a record op adds to its PATCH, and whether the zone is
+        a primary (a NOTIFY is due after it).
+
+        PowerDNS no longer bumps the serial itself (``SOA-EDIT-API`` is empty,
+        #1965), so the op carries the zone to the serial the control plane
+        stamped on it (``target_serial``) in the same PATCH. When PowerDNS
+        already serves that serial or a later one, the op's change is already
+        in a published serial and the SOA is left alone; an op from a control
+        plane that sends no ``target_serial`` moves it to the served serial + 1
+        (#1968: a serial is never sent lower than the one served).
+        """
+        problem, doc = self._read_soa(client, headers, zone)
+        if problem:
+            raise RuntimeError(f"PowerDNS {zone}: {problem}")
+        kind = _kind_category(doc.get("kind"))
+        if kind == "secondary":
+            return [], False
+        served = _soa_from_zone_doc(doc, zone)
+        if doc.get("soa_edit_api"):
+            # A zone the full reconcile has not reached yet (an op beating it
+            # after the upgrade): clear it here, or PowerDNS rewrites ours.
+            resp = client.put(
+                f"{_PDNS_API_BASE}/zones/{zone}", headers=headers, json={"soa_edit_api": ""}
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"PowerDNS {zone}: clear SOA-EDIT-API returned "
+                    f"{resp.status_code}: {resp.text[:200]}"
+                )
+        notify = kind == "primary"
+        if served is None or (rtype == "SOA" and name.lower() == zone.lower()):
+            return [], notify
+        have = _soa_serial(served[0])
+        if have is None:
+            return [], notify
+        key = zone.rstrip(".").lower()
+        reached = getattr(self, "_op_reached", None)
+        if reached is None:
+            reached = self._op_reached = {}
+        if isinstance(target_serial, int) and not isinstance(target_serial, bool):
+            if not _serial_later(target_serial, have):
+                reached[key] = have
+                return [], False
+            new = target_serial
+        else:
+            new = (have + 1) % 2**32
+        reached[key] = new
+        return [
+            {
+                "name": zone,
+                "type": "SOA",
+                "ttl": served[1],
+                "changetype": "REPLACE",
+                "records": [{"content": _soa_with_serial(served[0], new), "disabled": False}],
+            }
+        ], notify
 
     def _dnssec_sign(self, api_key: str, zone: str) -> list[str]:
         """Generate KSK + ZSK, set PRESIGNED metadata, rectify zone.
@@ -1874,6 +2047,20 @@ class PowerDNSDriver(DriverBase):
                 # ``swap_and_reload`` restarts pdns when this file changes.
                 "dnsupdate=yes",
                 "",
+                # NOTIFY and zone transfers are OFF in PowerDNS until the
+                # server declares its role (#1967). A zone of kind Master
+                # with ALSO-NOTIFY metadata is not enough while ``primary``
+                # is ``no`` (the default): nothing is ever sent. Likewise a
+                # kind Slave zone is never checked or transferred while
+                # ``secondary`` is ``no``. Both are per-zone no-ops for a
+                # zone of the other kind, so they are always on; a changed
+                # file restarts pdns (``swap_and_reload``), once. Verified
+                # against pdns-auth 5.0.7: with ``primary=yes`` a change to
+                # a Master zone is NOTIFY-ed to its ALSO-NOTIFY targets, and
+                # a Slave zone transfers only with ``secondary=yes``.
+                "primary=yes",
+                "secondary=yes",
+                "",
             ]
         )
 
@@ -1951,6 +2138,14 @@ class PowerDNSDriver(DriverBase):
                         create_body["serial"] = 1
                     if zone_payload.get("masters"):
                         create_body["masters"] = zone_payload["masters"]
+                    if _kind_category(create_body["kind"]) != "secondary" and zone_payload.get(
+                        "serial_managed", True
+                    ):
+                        # The API default (``DEFAULT``) rewrites the serial of
+                        # every change made through it, so the zone would
+                        # never serve the control plane's (#1965). Empty means
+                        # PowerDNS serves the serial the agent sends.
+                        create_body["soa_edit_api"] = ""
                     resp = client.post(
                         f"{_PDNS_API_BASE}/zones",
                         headers=headers,
@@ -1960,6 +2155,10 @@ class PowerDNSDriver(DriverBase):
                         self._zone_not_applied(zone_name, "create", resp, refused, failures)
                         continue
                     log.info("powerdns_zone_created", zone=zone_name)
+                    if _kind_category(zone_payload.get("kind")) == "secondary":
+                        # Do not wait for the next refresh cycle (up to a
+                        # minute) for the first transfer (#1967).
+                        self._request_axfr(client, headers, zone_name)
                 else:
                     # Zone type / primaries drift (#1521): a zone
                     # converted primary↔secondary, or whose masters
@@ -1999,6 +2198,20 @@ class PowerDNSDriver(DriverBase):
                     # dropped, then REPLACE every rrset it carries. One PATCH,
                     # which PowerDNS applies as one transaction.
                     desired = zone_payload.get("rrsets") or []
+                    serial_changed = False
+                    if _kind_category(desired_kind) != "secondary" and zone_payload.get(
+                        "serial_managed", True
+                    ):
+                        # Own the serial (#1965) and never send a lower one
+                        # than PowerDNS serves (#1968) — before the PATCH, since
+                        # the replacement SOA is in it.
+                        problem, serial_changed = self._own_soa_serial(
+                            client, headers, zone_name, desired
+                        )
+                        if problem:
+                            log.error("powerdns_soa_serial_failed", zone=zone_name, error=problem)
+                            failures.append(f"{zone_name} soa serial: {problem}")
+                            continue
                     rrsets: list[dict[str, Any]] = []
                     if _kind_category(desired_kind) == "secondary":
                         # A secondary's rrsets are the transfer's (#1521):
@@ -2057,6 +2270,8 @@ class PowerDNSDriver(DriverBase):
                             rrset_count=len(rrsets) - deleted,
                             deleted=deleted,
                         )
+                        if serial_changed and _kind_category(desired_kind) == "primary":
+                            self._send_notify(client, headers, zone_name)
 
                 # Dynamic-update (RFC 2136) ACL metadata (issue #641).
                 failures.extend(
@@ -2097,6 +2312,131 @@ class PowerDNSDriver(DriverBase):
             raise RuntimeError(
                 "PowerDNS did not accept every zone: " + "; ".join(problems[:5]) + more
             )
+
+    def _own_soa_serial(
+        self,
+        client: httpx.Client,
+        headers: dict[str, str],
+        zone_name: str,
+        desired: list[dict[str, Any]],
+    ) -> tuple[str | None, bool]:
+        """Make the zone serve the control plane's serial, and never a lower
+        one than it serves now (#1965, #1968).
+
+        Clears ``SOA-EDIT-API`` on a zone that still carries one (every zone
+        created before this fix has ``DEFAULT``, which would rewrite the serial
+        the PATCH below sends), then floors the SOA rrset in ``desired``
+        against the SOA PowerDNS serves. Returns ``(problem, changed)``:
+        what went wrong, or None, and whether the serial that will be served
+        differs from the one served now (a NOTIFY is due).
+        """
+        problem, doc = self._read_soa(client, headers, zone_name)
+        if problem:
+            return problem, False
+        served = _soa_from_zone_doc(doc, zone_name)
+        # The key is always present on a real zone ("" once cleared); a reader
+        # that does not carry it is not asked to clear anything.
+        edit_api = doc.get("soa_edit_api") if isinstance(doc, dict) else None
+        if edit_api:
+            try:
+                resp = client.put(
+                    f"{_PDNS_API_BASE}/zones/{zone_name}",
+                    headers=headers,
+                    json={"soa_edit_api": ""},
+                )
+            except httpx.HTTPError as exc:
+                return f"clear SOA-EDIT-API: {exc}", False
+            if resp.status_code >= 400:
+                return (
+                    f"clear SOA-EDIT-API: HTTP {resp.status_code} {_pdns_error(resp)}",
+                    False,
+                )
+            log.info("powerdns_soa_edit_api_cleared", zone=zone_name, was=edit_api)
+        soa = next(
+            (
+                rs
+                for rs in desired
+                if rs.get("type") == "SOA"
+                and str(rs.get("name") or "").lower().rstrip(".") == zone_name.lower().rstrip(".")
+            ),
+            None,
+        )
+        if soa is None or served is None:
+            return None, False
+        records = soa.get("records") or []
+        if not records:
+            return None, False
+        want = records[0].get("content", "")
+        sent = _floor_soa_content(want, served[0])
+        if sent != want:
+            log.info(
+                "powerdns_soa_serial_floored",
+                zone=zone_name,
+                control_plane_serial=_soa_serial(want),
+                served_serial=_soa_serial(served[0]),
+                sent_serial=_soa_serial(sent),
+            )
+            records[0]["content"] = sent
+        return None, _soa_serial(sent) != _soa_serial(served[0])
+
+    def _read_soa(
+        self, client: httpx.Client, headers: dict[str, str], zone_name: str
+    ) -> tuple[str | None, Any]:
+        """The zone as PowerDNS holds it, with only its apex SOA rrset."""
+        try:
+            resp = client.get(
+                f"{_PDNS_API_BASE}/zones/{zone_name}?rrset_name={zone_name}&rrset_type=SOA",
+                headers=headers,
+            )
+            doc = resp.json() if resp.status_code == 200 else None
+        except (httpx.HTTPError, ValueError) as exc:
+            return f"read SOA: {exc}", None
+        if not isinstance(doc, dict):
+            return f"read SOA: HTTP {resp.status_code} {_pdns_error(resp)}", None
+        return None, doc
+
+    def _send_notify(self, client: httpx.Client, headers: dict[str, str], zone: str) -> None:
+        """Queue a NOTIFY now (#1967). PowerDNS sends one on its own cycle
+        (``xfr-cycle-interval``, 60 s) once ``primary=yes``; this makes a
+        change reach a secondary in seconds. Best-effort: the cycle is the
+        safety net."""
+        try:
+            resp = client.put(f"{_PDNS_API_BASE}/zones/{zone}/notify", headers=headers)
+            if resp.status_code >= 400:
+                log.info(
+                    "powerdns_notify_not_queued",
+                    zone=zone,
+                    status=resp.status_code,
+                    body=resp.text[:200],
+                )
+        except httpx.HTTPError as exc:
+            log.info("powerdns_notify_failed", zone=zone, error=str(exc))
+
+    def _request_axfr(self, client: httpx.Client, headers: dict[str, str], zone: str) -> None:
+        """Ask a secondary to transfer now rather than at its next refresh
+        cycle (#1967). Best-effort, like ``_send_notify``."""
+        try:
+            resp = client.put(f"{_PDNS_API_BASE}/zones/{zone}/axfr-retrieve", headers=headers)
+            if resp.status_code >= 400:
+                log.info(
+                    "powerdns_axfr_retrieve_not_queued",
+                    zone=zone,
+                    status=resp.status_code,
+                    body=resp.text[:200],
+                )
+        except httpx.HTTPError as exc:
+            log.info("powerdns_axfr_retrieve_failed", zone=zone, error=str(exc))
+
+    def _forget_reached(self, zone: str) -> None:
+        getattr(self, "_op_reached", {}).pop(zone.rstrip(".").lower(), None)
+
+    def reached_serial(self, zone_name: str) -> int | None:
+        """The serial a record op last brought ``zone_name`` to, or None.
+
+        The sync loop reports this instead of the op's ``target_serial``:
+        when PowerDNS already served a higher serial the zone moved on from
+        THAT one (#1968), and the control plane learns it from the report."""
+        return getattr(self, "_op_reached", {}).get(zone_name.rstrip(".").lower())
 
     @staticmethod
     def _zone_not_applied(
