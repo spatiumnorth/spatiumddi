@@ -261,6 +261,18 @@ the formatter handles the rest.
   revision on the new image seconds later rather than minutes later. It
   writes nothing when the two already agree, so a reboot adds no revision.
 
+- **A role change whose apply met an unready kube API is tried again, and
+  the node says why (#1716).** A role change is applied once, on the
+  node's next heartbeat, and the apply first asks the kube API's `/readyz`
+  (2 s). When that probe missed, the apply reported `idle` and the
+  heartbeat recorded the change as applied, so no later heartbeat tried it
+  again, even once the kube API was back, and Fleet showed the node `idle`
+  with no reason until its roles changed again. A `/readyz` miss now
+  reports `failed` with its reason, which the heartbeat does not record as
+  applied (#1640), so the next heartbeat applies the change, and Fleet
+  shows why while it cannot. A slot with no role chart baked still reports
+  `idle`.
+
 - **A member of the control-plane cluster can no longer be revoked in
   place (#1884).** The Fleet tab disables Revoke on control-plane rows
   and the deployment docs say a live cluster member must be demoted first,
