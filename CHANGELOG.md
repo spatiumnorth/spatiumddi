@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Moving a DNS server to another group no longer deadlocks against the
+  worker's bundle render or the agent, and the agent's requests no longer
+  answer 500 when a move deletes what they were updating (#1703, #1929).**
+  The worker's render holds `FOR KEY SHARE` on the server's row (the bundle
+  insert's foreign key) and then needs `FOR NO KEY UPDATE`; the move wrote the
+  row in two steps, the second (`group_id`, a unique-index column) needing
+  `FOR UPDATE`, so each side held half of what the other wanted and Postgres
+  aborted the move (40P01). Separately, the move deletes the server's queued
+  record ops and zone-state rows, and an agent config poll, heartbeat or
+  zone-state report that had read them answered 500 (`StaleDataError`) or, with
+  several ops, shipped ops the move had already discarded. Every one of them
+  now locks a server's rows in one order — zone-state rows, then record ops
+  (each ascending), then the server row — before writing any of them
+  (`app/services/dns/row_locks.py`). The move takes the server row
+  `FOR UPDATE` before its first write to it, in the server PUT and in the
+  Fleet roles PUT; a request that waited for a move skips the rows it deleted,
+  and a zone-state report records nothing for the group the server left.
+
 - **One Esc closes only the topmost dialog, and Shift+Tab no longer leaves
   one (#1947, #1948).** Every open dialog bound its own Esc listener, so a
   dialog opened from another (an edit form's confirm, a nested picker) was

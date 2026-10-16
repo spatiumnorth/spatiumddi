@@ -34,6 +34,7 @@ from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMembe
 from app.models.audit import AuditLog
 from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone
 from app.models.ipam import IPAddress
+from app.services.dns.row_locks import ids_in, lock_op_ids
 from app.services.dns.rrset import rrset_key as record_rrset_key
 from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
@@ -221,7 +222,9 @@ async def fail_attempts(
             op.next_attempt_at = now + retry_delay(op.attempts)
 
 
-async def reset_unacknowledged_ops(db: AsyncSession, server_id: uuid.UUID) -> int:
+async def reset_unacknowledged_ops(
+    db: AsyncSession, server_id: uuid.UUID, *, now: datetime | None = None
+) -> int:
     """Return ops shipped and never acknowledged to the retry path (#1232).
 
     The agent keeps its acks in memory until a heartbeat succeeds, so a
@@ -234,8 +237,11 @@ async def reset_unacknowledged_ops(db: AsyncSession, server_id: uuid.UUID) -> in
     is exactly when re-shipping can help, and the heartbeat always commits.
     (The long-poll does not — a 304 rolls its transaction back — which is why
     this is not done there.)
+
+    ``now`` is the heartbeat's own, so the rows it locked up front
+    (``lock_heartbeat_ops``) are exactly the ones selected here.
     """
-    now = datetime.now(UTC)
+    now = now or datetime.now(UTC)
     stale = (
         (
             await db.execute(
@@ -326,6 +332,10 @@ async def sweep_zone_ops(db: AsyncSession, zone: DNSZone, group_id: uuid.UUID) -
     kept. Name-scoped — see :func:`queued_zone_ops_where` for the
     split-horizon caveat (#964).
     """
+    # Locked ascending first (``row_locks``): a DELETE alone takes its rows in
+    # scan order, which can cross a server move or a poll locking the same
+    # server's ops in id order.
+    await lock_op_ids(db, *queued_zone_ops_where(zone, group_id))
     res = await db.execute(sa_delete(DNSRecordOp).where(*queued_zone_ops_where(zone, group_id)))
     return int(res.rowcount or 0)
 
@@ -1857,6 +1867,35 @@ async def apply_pending_agentless_ops(
     if counts["applied"] or counts["rescheduled"] or counts["recovered"]:
         logger.info("agentless_record_op_retry_sweep", **counts)
     return counts
+
+
+async def lock_heartbeat_ops(
+    db: AsyncSession, server_id: uuid.UUID, acks: Collection[dict[str, Any]], now: datetime
+) -> None:
+    """Lock every op a heartbeat writes — the ones it acks and the ones
+    ``reset_unacknowledged_ops`` returns to the retry path — in one ascending
+    statement, before the heartbeat writes the server row (#1929, the order in
+    ``row_locks``). The server row used to be written first, by the autoflush
+    of the heartbeat's own ``last_seen_at``, which is the reverse of the order
+    a group move and the config poll take; and an op a move deleted between
+    the heartbeat's read and its flush made the flush match nothing."""
+    ids: list[uuid.UUID] = []
+    for ack in acks:
+        try:
+            ids.append(uuid.UUID(str(ack.get("op_id"))))
+        except ValueError:
+            continue
+    await lock_op_ids(
+        db,
+        DNSRecordOp.server_id == server_id,
+        or_(
+            ids_in(ids),
+            and_(
+                DNSRecordOp.state == "in_flight",
+                DNSRecordOp.updated_at < now - IN_FLIGHT_ACK_TIMEOUT,
+            ),
+        ),
+    )
 
 
 async def apply_acks(
