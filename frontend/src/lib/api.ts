@@ -4061,7 +4061,10 @@ export interface InfluxDBTarget {
   push_dhcp_metrics: boolean;
   push_subnet_utilization: boolean;
   push_dhcp_scope_leases: boolean;
+  /** The last attempt; moves on failure. */
   last_push_at: string | null;
+  /** The last push the destination accepted; null = never. */
+  last_success_at: string | null;
   last_push_points: number;
   last_push_error: string | null;
   last_dns_bucket_at: string | null;
@@ -4079,11 +4082,15 @@ export interface InfluxDBTargetWrite {
   timeout_seconds: number;
   database: string;
   username: string;
-  /** ``null`` = keep what is stored, ``""`` = clear, else replace. */
+  /** Absent, ``null`` or ``""`` = keep what is stored; else replace. */
   password?: string | null;
+  /** Explicitly remove the stored password (a blank field never does). */
+  clear_password?: boolean;
   org: string;
   bucket: string;
   token?: string | null;
+  /** Explicitly remove the stored token (a blank field never does). */
+  clear_token?: boolean;
   measurement_prefix: string;
   push_interval_seconds: number;
   push_dns_metrics: boolean;

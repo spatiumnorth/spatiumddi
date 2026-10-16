@@ -556,6 +556,7 @@ backend/alembic/versions/d6e1a4b9f082_add_dns_auto_sync_settings.py:drop_column:
 backend/alembic/versions/d6e1a4b9f082_add_dns_auto_sync_settings.py:drop_column:63
 backend/alembic/versions/d72a36e159c4_ai_prompts.py:drop_table:102
 backend/alembic/versions/d7a2b6e9f134_add_address_family_to_dhcp_scope.py:drop_column:44
+backend/alembic/versions/d7a2e94b1c60_influxdb_target_last_success_at.py:drop_column:47
 backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_column:65
 backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_column:66
 backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_column:67

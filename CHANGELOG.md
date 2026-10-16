@@ -84,6 +84,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **InfluxDB Export: a stored password or token survives an edit that
+  types in its field and clears it again; "Last push" no longer shows a
+  failed attempt as a push; a refused save shows its reason (#1989,
+  #1990, part of #1993).** The form sent `""` for a secret field that
+  had been typed in and cleared, and the server read `""` as "clear": a
+  v1 password was silently wiped, and a v2 token save was refused with
+  "token is required". Now a blank secret always keeps the stored one,
+  on the server as well (API clients can send `""`), and removing a
+  secret takes an explicit `clear_password` / `clear_token` (a "Clear
+  stored password / token" checkbox in the form). `last_push_at` is the
+  last attempt and moves on failure by design, but the table presented
+  it as the last push ("31m ago (0 pts)" for a target that never pushed).
+  A new nullable `last_success_at` (NULL = never) records the last push
+  the destination accepted, the column shows it, and a failure is
+  reported beside it as "last attempt failed Nm ago". A validation
+  refusal showed "[object Object]" because the FastAPI 422 list was
+  stringified; the form now uses the DHCP dialogs' `errMsg` and stays
+  open. The Alerts page half of #1993 is fixed separately.
+
 - **Kubernetes Detect CIDRs answered 500 when the token held a non-ASCII
   character (#1913).** The bearer token goes straight into an
   `Authorization` header; httpx encodes header values as ASCII and raises
@@ -4973,6 +4992,9 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `d7a2e94b1c60` — #1990: `influxdb_target.last_success_at` (nullable
+  `timestamptz`, NULL = never). Backfilled from `last_push_at` for rows
+  with a push time and no recorded error.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column

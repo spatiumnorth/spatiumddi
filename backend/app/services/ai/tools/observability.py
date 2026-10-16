@@ -711,6 +711,7 @@ async def find_influxdb_targets(
                 ],
                 "credential_on_file": bool(t.password_encrypted or t.token_encrypted),
                 "last_push_at": t.last_push_at.isoformat() if t.last_push_at else None,
+                "last_success_at": t.last_success_at.isoformat() if t.last_success_at else None,
                 "last_push_points": t.last_push_points,
                 "last_push_error": t.last_push_error,
             }

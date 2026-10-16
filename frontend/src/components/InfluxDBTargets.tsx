@@ -23,6 +23,7 @@ import { Check, Pencil, Play, Plus, Trash2, X } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { pollUnlessRefused } from "@/lib/refusal";
+import { errMsg } from "@/pages/dhcp/_shared";
 import {
   settingsApi,
   type InfluxDBTarget,
@@ -89,13 +90,9 @@ function targetToBody(t: InfluxDBTarget): InfluxDBTargetWrite {
   };
 }
 
-function errorDetail(e: unknown, fallback: string): string {
-  if (e && typeof e === "object" && "response" in e) {
-    const resp = (e as { response?: { data?: { detail?: unknown } } }).response;
-    if (resp?.data?.detail) return String(resp.data.detail);
-  }
-  return fallback;
-}
+// A FastAPI 422 carries ``detail`` as a list; ``errMsg`` turns it (or a
+// plain string) into text, so a refusal never renders "[object Object]".
+const errorDetail = errMsg;
 
 function relativeTime(iso: string | null): string {
   if (!iso) return "never";
@@ -261,11 +258,19 @@ export function InfluxDBTargets({ isSuperadmin }: { isSuperadmin: boolean }) {
                       {carries || "nothing selected"}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
-                      {relativeTime(t.last_push_at)}
-                      {t.last_push_at && (
+                      {/* The last push the destination ACCEPTED, or "never".
+                          ``last_push_at`` is the last attempt and moves on
+                          failure, so it is not what this column says (#1990). */}
+                      {relativeTime(t.last_success_at)}
+                      {t.last_success_at && (
                         <span className="ml-1 text-[11px]">
                           ({t.last_push_points} pts)
                         </span>
+                      )}
+                      {t.last_push_error && t.last_push_at && (
+                        <div className="text-[11px] text-red-600">
+                          last attempt failed {relativeTime(t.last_push_at)}
+                        </div>
                       )}
                     </td>
                     <td className="px-3 py-2">
@@ -410,15 +415,28 @@ function InfluxTargetModal({
   const qc = useQueryClient();
   const [form, setForm] = useState<InfluxDBTargetWrite>(initial);
   const [error, setError] = useState<string | null>(null);
+  // Removing a stored secret is its own control. A blank field only ever
+  // means "keep" — typing in it and deleting again must not clear (#1989).
+  const [clearPassword, setClearPassword] = useState(false);
+  const [clearToken, setClearToken] = useState(false);
 
   const saveMut = useMutation({
     mutationFn: async () => {
       const body: InfluxDBTargetWrite = { ...form };
-      // ``null`` (the default on edit) means "keep the stored secret";
-      // the server reads an absent key the same way, so drop it rather
-      // than sending a null the operator never chose.
-      if (body.password === null) delete body.password;
-      if (body.token === null) delete body.token;
+      // A blank secret field (never touched, or typed in and cleared) keeps
+      // the stored secret; the server reads an absent key and "" the same
+      // way. Only the explicit checkbox removes one.
+      if (!body.password) delete body.password;
+      if (!body.token) delete body.token;
+      // The checkbox disables its field, so what it shows is what is sent.
+      if (clearPassword) {
+        delete body.password;
+        body.clear_password = true;
+      }
+      if (clearToken) {
+        delete body.token;
+        body.clear_token = true;
+      }
       if (existingId) return settingsApi.updateInfluxTarget(existingId, body);
       return settingsApi.createInfluxTarget(body);
     },
@@ -542,11 +560,22 @@ function InfluxTargetModal({
                 type="password"
                 className={inputCls}
                 value={form.password ?? ""}
+                disabled={clearPassword}
                 onChange={(e) => setForm({ ...form, password: e.target.value })}
                 placeholder={
                   passwordSet ? "(stored — leave blank to keep)" : "Password"
                 }
               />
+              {existingId && passwordSet && (
+                <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={clearPassword}
+                    onChange={(e) => setClearPassword(e.target.checked)}
+                  />
+                  Clear stored password
+                </label>
+              )}
             </label>
           </div>
         ) : (
@@ -583,11 +612,22 @@ function InfluxTargetModal({
                 type="password"
                 className={inputCls}
                 value={form.token ?? ""}
+                disabled={clearToken}
                 onChange={(e) => setForm({ ...form, token: e.target.value })}
                 placeholder={
                   tokenSet ? "(stored — leave blank to keep)" : "API token"
                 }
               />
+              {existingId && tokenSet && (
+                <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={clearToken}
+                    onChange={(e) => setClearToken(e.target.checked)}
+                  />
+                  Clear stored token
+                </label>
+              )}
             </label>
           </div>
         )}

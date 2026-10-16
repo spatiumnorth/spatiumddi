@@ -3541,14 +3541,17 @@ class InfluxDBTargetBody(BaseModel):
     # v1
     database: str = ""
     username: str = ""
-    # ``None`` = leave the stored value alone (the operator is editing
-    # another field), ``""`` = clear, anything else = encrypt + replace.
-    # Same three-way contract as ``AuditTargetBody.smtp_password``.
+    # Secrets are write-only. ``None`` or ``""`` = keep the stored value
+    # (a form whose field was typed in and cleared sends ``""``, and that
+    # must not wipe the credential, #1989); anything else = encrypt +
+    # replace. Removing one takes the explicit ``clear_*`` flag.
     password: str | None = None
+    clear_password: bool = False
     # v2 / v3
     org: str = ""
     bucket: str = ""
     token: str | None = None
+    clear_token: bool = False
     measurement_prefix: str = Field(default=DEFAULT_MEASUREMENT_PREFIX, max_length=64)
     push_interval_seconds: int = Field(
         default=DEFAULT_PUSH_INTERVAL_SECONDS, ge=MIN_PUSH_INTERVAL_SECONDS, le=86400
@@ -3606,7 +3609,11 @@ class InfluxDBTargetResponse(BaseModel):
     push_dhcp_metrics: bool
     push_subnet_utilization: bool
     push_dhcp_scope_leases: bool
+    # The last ATTEMPT (moves on failure so the interval gate holds).
     last_push_at: datetime | None
+    # The last push the destination accepted; NULL = never (#1990).
+    last_success_at: datetime | None
+    # Point count of that successful push.
     last_push_points: int
     last_push_error: str | None
     last_dns_bucket_at: datetime | None
@@ -3637,6 +3644,7 @@ def _influx_to_response(t: InfluxDBTarget) -> InfluxDBTargetResponse:
         push_subnet_utilization=bool(t.push_subnet_utilization),
         push_dhcp_scope_leases=bool(t.push_dhcp_scope_leases),
         last_push_at=t.last_push_at,
+        last_success_at=t.last_success_at,
         last_push_points=int(t.last_push_points or 0),
         last_push_error=t.last_push_error,
         last_dns_bucket_at=t.last_dns_bucket_at,
@@ -3665,10 +3673,16 @@ def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> None:
     t.push_dhcp_metrics = body.push_dhcp_metrics
     t.push_subnet_utilization = body.push_subnet_utilization
     t.push_dhcp_scope_leases = body.push_dhcp_scope_leases
-    if body.password is not None:
-        t.password_encrypted = encrypt_str(body.password) if body.password else None
-    if body.token is not None:
-        t.token_encrypted = encrypt_str(body.token) if body.token else None
+    # Blank never clears; only the explicit flag does. A non-blank value
+    # sent alongside the flag wins over it: the operator typed a new secret.
+    if body.password:
+        t.password_encrypted = encrypt_str(body.password)
+    elif body.clear_password:
+        t.password_encrypted = None
+    if body.token:
+        t.token_encrypted = encrypt_str(body.token)
+    elif body.clear_token:
+        t.token_encrypted = None
 
 
 def _assert_influx_writable(t: InfluxDBTarget) -> None:

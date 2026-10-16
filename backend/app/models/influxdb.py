@@ -108,6 +108,10 @@ class InfluxDBTarget(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         DateTime(timezone=True), nullable=True
     )
     last_push_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The last push the destination ACCEPTED (#1990). ``last_push_at`` is the
+    # last attempt and moves on failure; this one does not. NULL = never.
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Point count of that successful push (only written on success).
     last_push_points: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # NULL means "no failure recorded"; it is cleared on the next success
     # so the UI never shows a stale error next to a healthy target.
