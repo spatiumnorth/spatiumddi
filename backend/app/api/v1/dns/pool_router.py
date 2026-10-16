@@ -32,7 +32,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSPool, DNSPoolMember, DNSZone
 from app.models.ownership import Site
 from app.services.dns import technitium_api_scope
-from app.services.dns.pool_apply import apply_pool_state
+from app.services.dns.pool_apply import apply_pool_state, withdraw_member_records
 
 logger = structlog.get_logger(__name__)
 
@@ -521,14 +521,11 @@ async def delete_pool(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
             result="success",
         )
     )
-    # Members + the rendered DNSRecord rows cascade via FK ON DELETE CASCADE.
-    # The records the pool created don't need explicit RFC 2136 deletes
-    # here — the next health-check pass on a now-empty pool would bump
-    # the zone serial, and AXFR pull would catch the deletion. Cleaner:
-    # explicitly enqueue deletes via apply_pool_state before destroying
-    # the rows.
-    pool.members = []  # detach so apply emits deletes
-    await apply_pool_state(db, pool)
+    # #1966 — withdraw every member's rendered record (row + delete op)
+    # before the pool goes. Members and records would otherwise vanish via
+    # the FK ``ON DELETE CASCADE`` with no op, and the agent would keep
+    # serving every address until something else reconciled the zone.
+    await withdraw_member_records(db, pool, list(pool.members))
     await db.delete(pool)
     await db.commit()
 
@@ -778,11 +775,12 @@ async def delete_member(member_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
             result="success",
         )
     )
-    # Make sure the rendered DNSRecord row goes away before the FK
-    # cascade fires (so we get a proper enqueue_record_op delete).
+    # #1966 — withdraw the member's rendered record (row + delete op) while
+    # the member still exists. Deleting the member first lets the
+    # ``dns_record.pool_member_id`` FK cascade remove the record row without
+    # any op, and the agent keeps serving the address.
     pool = await db.get(DNSPool, member.pool_id)
     if pool is not None:
-        pool.members = [m for m in pool.members if m.id != member.id]
-        await apply_pool_state(db, pool)
+        await withdraw_member_records(db, pool, [member])
     await db.delete(member)
     await db.commit()
