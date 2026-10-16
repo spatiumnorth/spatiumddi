@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Disabling a DNS pool now removes its records, and a pool TTL change
+  lands immediately (#1974).** `update_pool` never reconciled and
+  `apply_pool_state` ignored `pool.enabled`, so a disabled pool kept
+  serving its member records (the health-check task skips disabled
+  pools, so nothing ever removed them) and a TTL edit waited for the
+  next health check. A disabled pool now renders nothing, re-enabling
+  restores its healthy members, and both edits reconcile in the request.
+  A TTL change now goes out as one whole-RRset update instead of one
+  value-only update per member: Windows DNS, Route 53 and Google Cloud
+  DNS read a value-only update as "replace the RRset with this value",
+  so each member's update cleared its siblings and the live pool was left
+  answering with its last member alone.
+
 - **`npm test` failed 52 tests on Node 26.** Node 26 defines its own
   global `localStorage`, which is undefined without
   `--localstorage-file` and shadows jsdom's, so every test calling
