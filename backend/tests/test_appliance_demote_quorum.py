@@ -32,7 +32,7 @@ from app.models.appliance import (
     DESIRED_CLUSTER_ROLE_MEMBER,
     DESIRED_CLUSTER_ROLE_NONE,
 )
-from app.services.appliance import k8s
+from app.services.appliance import k8s, redis_handoff
 from tests.test_appliance_control_plane_promote import _admin, _appliance, _hdr, _seed
 
 DEMOTE = "/api/v1/appliance/fleet/control-plane/demote"
@@ -719,3 +719,89 @@ async def test_off_k3s_a_stale_seed_heartbeat_still_refuses(
 
     assert resp.status_code == 409, resp.text
     assert "'seed'" in resp.json()["detail"]
+
+
+# ── #1860: the Redis master moves off the leaving members first ─────────
+
+
+@pytest.mark.asyncio
+async def test_the_redis_master_is_handed_off_before_the_cordon(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    """The hand-off is asked with the leaving members' Node names, after the
+    quorum gate and before anything about them changes."""
+    token = await _admin(db_session)
+    _, m1, m2 = await _three(db_session)
+    await db_session.commit()
+    fake = _fake_kubeapi(monkeypatch, "m1", "m2")
+    asked: list[tuple[set[str], list]] = []
+
+    def _hand_off(leaving: set[str]) -> redis_handoff.Handoff:
+        asked.append((set(leaving), list(fake.calls)))
+        return redis_handoff.Handoff("moved", "the Redis master moved to the seed")
+
+    monkeypatch.setattr(redis_handoff, "hand_off", _hand_off)
+
+    resp = await client.post(
+        DEMOTE, json={"appliance_ids": [str(m1.id), str(m2.id)]}, headers=_hdr(token)
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(asked) == 1
+    leaving, calls_then = asked[0]
+    assert leaving == {"m1", "m2"}
+    assert [c for c in calls_then if c[0] != "get"] == []  # nothing cordoned yet
+    assert fake.cordoned("m1") and fake.cordoned("m2")
+
+
+@pytest.mark.asyncio
+async def test_a_master_that_cannot_be_moved_refuses_the_demote_and_changes_nothing(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    token = await _admin(db_session)
+    _, m1, m2 = await _three(db_session)
+    await db_session.commit()
+    fake = _fake_kubeapi(monkeypatch, "m1", "m2")
+
+    def _hand_off(_leaving: set[str]) -> redis_handoff.Handoff:
+        raise redis_handoff.RedisHandoffError(
+            "the Redis master (spatium-redis-1 on m1) runs on a node this demote removes, "
+            "and no Sentinel would fail it over to a node that stays (NOGOODSLAVE)"
+        )
+
+    monkeypatch.setattr(redis_handoff, "hand_off", _hand_off)
+
+    resp = await client.post(
+        DEMOTE, json={"appliance_ids": [str(m1.id), str(m2.id)]}, headers=_hdr(token)
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"].startswith("Refusing the demote: the Redis master")
+    assert "NOGOODSLAVE" in resp.json()["detail"]
+    assert [c for c in fake.calls if c[0] != "get"] == []
+    await db_session.refresh(m1)
+    assert m1.desired_cluster_role is None
+
+
+@pytest.mark.asyncio
+async def test_redis_pods_that_cannot_be_listed_are_a_503_not_a_guess(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch
+) -> None:
+    token = await _admin(db_session)
+    _, m1, m2 = await _three(db_session)
+    await db_session.commit()
+    _fake_kubeapi(monkeypatch, "m1", "m2")
+
+    def _hand_off(_leaving: set[str]) -> redis_handoff.Handoff:
+        raise k8s.KubeapiUnavailableError("kubeapi GET /api/v1/namespaces/spatium/pods: timed out")
+
+    monkeypatch.setattr(redis_handoff, "hand_off", _hand_off)
+
+    resp = await client.post(
+        DEMOTE, json={"appliance_ids": [str(m1.id), str(m2.id)]}, headers=_hdr(token)
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert "Redis pods" in resp.json()["detail"]
+    await db_session.refresh(m1)
+    assert m1.desired_cluster_role is None
