@@ -84,6 +84,28 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Kubernetes Detect CIDRs answered 500 when the token held a non-ASCII
+  character (#1913).** The bearer token goes straight into an
+  `Authorization` header; httpx encodes header values as ASCII and raises
+  while building the client, outside the one `except` the probe had, so a
+  token with a pasted smart quote, accent or zero-width space was a 500
+  from `POST /kubernetes/clusters/detect-cidrs`, against the helper's own
+  "never raises" promise. A token that cannot be a header value (non-ASCII,
+  a control character, or whitespace inside it), or an `api_server_url`
+  httpx cannot parse, is now a 422 saying what is wrong, and `_detect_cidrs`
+  returns a message instead of raising. Whitespace around a pasted token,
+  such as its trailing newline, is stripped rather than refused. The check
+  lives in one helper (`app/core/header_credentials.py`) and also guards
+  the Tailscale, NetBird, Meraki, FortiGate, UniFi, PAN-OS and Proxmox
+  credential fields; it runs on input only, so a credential saved before
+  it still reads back, and an omitted or empty credential on an update
+  still keeps the stored one. Two more paths had the same 500: a webhook
+  custom header (the Test button, and the worker's delivery, which now
+  reports the header instead of raising) and a backup HTTPS-PUT
+  target's credential, header name or extra header, where an uncaught
+  error during a scheduled run left the run stuck `in_progress`. Both are
+  refused when saved.
+
 - **A record op that appends one value to a name no longer replaces the
   whole name on an agentless DNS server (#1983).** An `update` carrying
   `rrset_action="add"` opts out of whole-RRset stamping, and the driver-side
