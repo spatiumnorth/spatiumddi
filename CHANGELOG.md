@@ -84,6 +84,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **`npm test` failed 52 tests on Node 26.** Node 26 defines its own
+  global `localStorage`, which is undefined without
+  `--localstorage-file` and shadows jsdom's, so every test calling
+  `localStorage.clear()` threw. The vitest workers now start with
+  `--no-experimental-webstorage` (`frontend/vite.config.ts`), so jsdom's
+  storage is used on Node 22 and 26 alike. No shipped code changes.
+
 - **Kubernetes Detect CIDRs answered 500 when the token held a non-ASCII
   character (#1913).** The bearer token goes straight into an
   `Authorization` header; httpx encodes header values as ASCII and raises
