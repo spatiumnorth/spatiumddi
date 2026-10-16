@@ -1572,6 +1572,15 @@ def _covered_by(up_to: datetime | None, visible_xacts: str | None) -> Any | None
     return or_(and_(comparable, visible), by_time)
 
 
+# The op kinds a views render folds into the zone payload (the record the op
+# carries is in the body, so the render has already delivered the change).
+# Everything else — ``dnssec_rollover`` (a one-shot ``rndc`` call), and
+# ``dnssec_sign`` / ``dnssec_unsign`` (PowerDNS and Technitium act only from
+# the op) — has NO carrier in a bundle, so a views render must neither retire
+# it nor leave it unshipped (#1946).
+RECORD_OP_KINDS: frozenset[str] = frozenset({"create", "update", "delete"})
+
+
 async def retire_queued_ops(
     db: AsyncSession,
     server: DNSServer,
@@ -1601,6 +1610,8 @@ async def retire_queued_ops(
     conds: list[Any] = [
         DNSRecordOp.server_id == server.id,
         DNSRecordOp.state.in_(QUEUED_OP_STATES),
+        # #1946 — only the kinds the render carries; the rest ship (below).
+        DNSRecordOp.op.in_(RECORD_OP_KINDS),
     ]
     covered = _covered_by(up_to, visible_xacts)
     if covered is not None:
@@ -1621,6 +1632,7 @@ async def page_pending_ops(
     *,
     up_to: datetime | None = None,
     visible_xacts: str | None = None,
+    non_record_only: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
     """One PAGE of this server's pending ops, oldest first, marked ``in_flight``.
 
@@ -1660,6 +1672,10 @@ async def page_pending_ops(
     moments before the page, and this is what keeps it once the body is
     rendered asynchronously. An op the snapshot does not cover rides with
     the next render — whose dirty mark its own commit already made.
+
+    ``non_record_only`` (#1946): a split-horizon bundle carries record
+    changes in the zone payload and retires their ops, but a DNSSEC op has
+    no carrier there; the page then holds only those kinds.
     """
     if server.maintenance_mode:
         return [], 0
@@ -1671,6 +1687,8 @@ async def page_pending_ops(
         # #1232 — an op backing off after a failed attempt waits its turn.
         or_(DNSRecordOp.next_attempt_at.is_(None), DNSRecordOp.next_attempt_at <= now),
     ]
+    if non_record_only:
+        conds.append(DNSRecordOp.op.not_in(RECORD_OP_KINDS))
     covered = _covered_by(up_to, visible_xacts)
     if covered is not None:
         conds.append(covered)
@@ -1824,6 +1842,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         pass
     elif rendered.has_views:
         await retire_queued_ops(db, server)
+        ops, remaining = await page_pending_ops(db, server, non_record_only=True)
     else:
         ops, remaining = await page_pending_ops(db, server)
     return compose_bundle(rendered, ops, remaining)

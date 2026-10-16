@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A manual DNSSEC rollover in a group with a view is now delivered
+  to the agent (#1946).** Under split-horizon (or active geo steering) every
+  bundle render retired the server's queued ops as `applied` and the
+  bundle shipped none, whatever their kind. That is right for record ops,
+  which the body carries, but a `dnssec_rollover` has no carrier in it and
+  the BIND9 agent rolls a key only from the op, so the endpoint answered
+  `queued` and no key rolled (PowerDNS / Technitium `dnssec_sign` /
+  `dnssec_unsign` were lost the same way). The views render now retires only
+  `create` / `update` / `delete` ops and still pages every other kind to
+  the agent, which acks it as usual.
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored
   policy name, description, reference, result detail and diagnostic, went
