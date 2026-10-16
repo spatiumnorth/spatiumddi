@@ -293,3 +293,6 @@ async def test_webhook_delivery_with_a_stored_unsendable_header_fails_not_raises
     async with httpx.AsyncClient() as c:
         code, err = await _deliver_one(c, sub, row, "", "dev")
     assert code is None and err
+    # Names the header the operator has to re-save, never the value.
+    assert "'X-Tenant'" in err
+    assert "quipe" not in err and "\u00e9" not in err

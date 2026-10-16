@@ -106,6 +106,23 @@ async def _deliver_one(
     for k, v in custom_headers.items():
         if k.lower().startswith("x-spatiumddi-"):
             continue
+        # A header saved before the subscription schema refused non-ASCII
+        # (#1913) can't be sent. Name the header, never its value (it may be
+        # a credential), so the operator knows which one to re-save.
+        try:
+            k.encode("ascii")
+        except UnicodeEncodeError:
+            return (
+                None,
+                "headers: a stored custom header name is not ASCII; re-save the subscription",
+            )
+        try:
+            v.encode("ascii")
+        except UnicodeEncodeError:
+            return None, (
+                f"headers: stored header {k!r} has a non-ASCII value that cannot be sent; "
+                "re-save the subscription"
+            )
         headers[k] = v
 
     try:
