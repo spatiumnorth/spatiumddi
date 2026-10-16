@@ -84,6 +84,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Trash respects the IPAM / DNS / DHCP hierarchy (#1957, #1958,
+  #1959, #1960, #1961, #1962).** Restoring a subnet, block, DHCP scope
+  or DNS record whose parent is still in the Trash is now a 409 naming
+  the parent, and the dialog offers to restore that parent and then the
+  row in one click; it used to come back live under a
+  parent that answers 404, make the block's purge answer 500 and be
+  destroyed unaudited when the parent was purged. "Delete permanently"
+  on a trashed block or IP space now purges the trashed subnets and
+  blocks under it, leaf first and audited (it answered 409, or 500
+  under a child block), and refuses with a 409 naming any LIVE row a
+  purge would otherwise take (a block, subnet, DHCP scope, pool,
+  reservation or DNS record); the nightly sweep holds such a parent back
+  at any depth (a live block two levels down included), reports how many
+  it held back, and survives a refusing row instead of rolling the whole
+  night back. A restore refuses a subnet or block
+  that overlaps a live one, as the create path does. The 409 now says
+  whether "Restore the others" is accepted (`skip_conflicts_allowed`),
+  so the page no longer offers it on a record of a deleted zone's
+  batch. `GET /admin/trash` gains `sort=oldest` and echoes
+  `limit` / `offset`; the page pages through every row with a count and
+  an oldest-first order, and a search with no matches no longer says
+  "Trash is empty."
+
 - **Icon-only buttons have accessible names (#1950).** The remove X on
   a custom option row of the DHCP option editor (used by the scope,
   option-template and client-class dialogs) was announced by a screen

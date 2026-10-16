@@ -1,6 +1,12 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { RotateCcw, Search, Trash2 } from "lucide-react";
+import {
+  ChevronLeft,
+  ChevronRight,
+  RotateCcw,
+  Search,
+  Trash2,
+} from "lucide-react";
 import { trashApi, type TrashEntry, type TrashEntryType } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
@@ -24,6 +30,8 @@ const TYPE_BADGE: Record<TrashEntryType, string> = {
   dhcp_scope: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
 };
 
+const PAGE_SIZE = 100;
+
 function formatTs(ts: string) {
   try {
     return new Date(ts).toLocaleString();
@@ -44,45 +52,97 @@ function ConfirmRestoreModal({
   // Set after a 409: the batch holds rows that clash with live ones. The
   // operator can then restore the others and leave the clashing rows behind.
   //
-  // Only offered for a dns_record batch — a bulk record delete (#963) stamps
-  // N independent siblings under one id, so leaving one behind is sound. Every
-  // other batch is a cascade (a zone AND its records, a scope AND its pools)
-  // where a partial restore can bring a child back without its parent; the
-  // server refuses those with a 422, and this keeps the button off the screen
-  // rather than showing one that always errors.
+  // Only offered when the SERVER says it will accept it (#1960). A bulk record
+  // delete (#963) stamps N independent siblings under one id, so leaving one
+  // behind is sound; every other batch is a cascade (a zone AND its records,
+  // a scope AND its pools) where a partial restore can bring a child back
+  // without its parent, and the server refuses it with a 422. A record row of a
+  // deleted zone's batch is a dns_record too, so the clicked row's type cannot
+  // tell the two apart: the 409 carries `skip_conflicts_allowed` instead.
   const [canSkipConflicts, setCanSkipConflicts] = useState(false);
+  // Set after a 409 whose clash is a parent still in the Trash (#1957): the
+  // server names that parent's Trash row, so the dialog can restore it and then
+  // this row in one click instead of sending the operator to find it (it may
+  // well be on another page of the list).
+  const [blocker, setBlocker] = useState<{
+    type: TrashEntryType;
+    id: string;
+    display: string;
+  } | null>(null);
+
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ["trash"] });
+    qc.invalidateQueries({ queryKey: ["ipam"] });
+    qc.invalidateQueries({ queryKey: ["dns"] });
+    qc.invalidateQueries({ queryKey: ["dhcp"] });
+  };
+
+  const showError = (err: unknown) => {
+    const detail = (err as { response?: { data?: { detail?: unknown } } })
+      ?.response?.data?.detail;
+    setBlocker(null);
+    setCanSkipConflicts(false);
+    if (detail && typeof detail === "object" && "conflicts" in detail) {
+      const conflicts = (
+        detail as {
+          conflicts: Array<{
+            display: string;
+            reason: string;
+            parent_type?: TrashEntryType | null;
+            parent_id?: string | null;
+            parent_display?: string | null;
+          }>;
+        }
+      ).conflicts;
+      const allowed = (detail as { skip_conflicts_allowed?: boolean })
+        .skip_conflicts_allowed;
+      setError(
+        `Cannot restore: ${conflicts
+          .map((c) => `${c.display} — ${c.reason}`)
+          .join("; ")}`,
+      );
+      setCanSkipConflicts(
+        allowed === true && entry.batch_size > conflicts.length,
+      );
+      const withParent = conflicts.find((c) => c.parent_type && c.parent_id);
+      if (withParent?.parent_type && withParent.parent_id) {
+        setBlocker({
+          type: withParent.parent_type,
+          id: withParent.parent_id,
+          display: withParent.parent_display ?? withParent.parent_id,
+        });
+      }
+    } else if (typeof detail === "string") {
+      setError(detail);
+    } else {
+      setError("Restore failed");
+    }
+  };
+
   const mut = useMutation({
     mutationFn: (skipConflicts: boolean) =>
       trashApi.restore(entry.type, entry.id, { skipConflicts }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["trash"] });
-      qc.invalidateQueries({ queryKey: ["ipam"] });
-      qc.invalidateQueries({ queryKey: ["dns"] });
-      qc.invalidateQueries({ queryKey: ["dhcp"] });
+      invalidate();
       onClose();
     },
-    onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: unknown } } })
-        ?.response?.data?.detail;
-      if (detail && typeof detail === "object" && "conflicts" in detail) {
-        const conflicts = (
-          detail as { conflicts: Array<{ display: string; reason: string }> }
-        ).conflicts;
-        setError(
-          `Cannot restore: ${conflicts
-            .map((c) => `${c.display} — ${c.reason}`)
-            .join("; ")}`,
-        );
-        setCanSkipConflicts(
-          entry.type === "dns_record" && entry.batch_size > conflicts.length,
-        );
-      } else if (typeof detail === "string") {
-        setError(detail);
-      } else {
-        setError("Restore failed");
-      }
-    },
+    onError: showError,
   });
+
+  // Restore the blocking parent, then retry this row. A parent with a trashed
+  // parent of its own answers 409 the same way, and the dialog offers that one.
+  const parentMut = useMutation({
+    mutationFn: (p: { type: TrashEntryType; id: string }) =>
+      trashApi.restore(p.type, p.id),
+    onSuccess: () => {
+      invalidate();
+      setError(null);
+      setBlocker(null);
+      mut.mutate(false);
+    },
+    onError: showError,
+  });
+  const pending = mut.isPending || parentMut.isPending;
 
   return (
     <Modal title="Restore from trash?" onClose={onClose}>
@@ -108,13 +168,26 @@ function ConfirmRestoreModal({
           >
             Cancel
           </button>
+          {blocker && (
+            <button
+              onClick={() => {
+                setError(null);
+                parentMut.mutate({ type: blocker.type, id: blocker.id });
+              }}
+              disabled={pending}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+              title="Restore the parent from the Trash (with the rows deleted with it), then this row"
+            >
+              Restore {blocker.display} first
+            </button>
+          )}
           {canSkipConflicts && (
             <button
               onClick={() => {
                 setError(null);
                 mut.mutate(true);
               }}
-              disabled={mut.isPending}
+              disabled={pending}
               className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
               title="Restore every row in the batch except the ones that clash with a live row"
             >
@@ -126,10 +199,10 @@ function ConfirmRestoreModal({
               setError(null);
               mut.mutate(false);
             }}
-            disabled={mut.isPending}
+            disabled={pending}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
-            {mut.isPending ? "Restoring…" : "Restore"}
+            {pending ? "Restoring…" : "Restore"}
           </button>
         </div>
       </div>
@@ -165,7 +238,11 @@ function ConfirmPermanentDeleteModal({
         <p className="text-sm">
           This permanently removes{" "}
           <span className="font-mono font-medium">{entry.name_or_cidr}</span> (
-          {TYPE_LABELS[entry.type]}). It cannot be restored.
+          {TYPE_LABELS[entry.type]}).
+          {entry.type === "ip_block" || entry.type === "ip_space"
+            ? " The subnets and blocks in the Trash under it are removed with it."
+            : ""}{" "}
+          It cannot be restored.
         </p>
         {error && (
           <p className="rounded bg-red-500/15 p-2 text-xs text-red-700 dark:text-red-300">
@@ -204,15 +281,25 @@ export function TrashPage() {
   );
   const [pendingRestore, setPendingRestore] = useState<TrashEntry | null>(null);
 
+  // Paged (#1961): the API answers a window and the total. "Oldest first" is
+  // the order the retention purge removes rows in, so the rows closest to being
+  // lost are reachable.
+  const [page, setPage] = useState(0);
+  const [sort, setSort] = useState<"newest" | "oldest">("newest");
+
   const params = useMemo(
     () => ({
       type: filterType === "all" ? undefined : filterType,
       since: filterSince ? new Date(filterSince).toISOString() : undefined,
       q: filterQ || undefined,
-      limit: 200,
+      limit: PAGE_SIZE,
+      offset: page * PAGE_SIZE,
+      sort,
     }),
-    [filterType, filterSince, filterQ],
+    [filterType, filterSince, filterQ, page, sort],
   );
+  const filtered =
+    filterType !== "all" || filterSince !== "" || filterQ.trim() !== "";
 
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["trash", params],
@@ -220,6 +307,13 @@ export function TrashPage() {
   });
 
   const items = data?.items ?? [];
+  const total = data?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  // A restore or purge that empties the last page would otherwise leave the
+  // operator on a page past the end, told the Trash is empty while it is not.
+  useEffect(() => {
+    if (data && page > 0 && page >= totalPages) setPage(totalPages - 1);
+  }, [data, page, totalPages]);
 
   return (
     <div className="h-full overflow-auto p-6">
@@ -243,9 +337,10 @@ export function TrashPage() {
             <select
               className="rounded-md border bg-background px-2 py-1 text-sm"
               value={filterType}
-              onChange={(e) =>
-                setFilterType(e.target.value as TrashEntryType | "all")
-              }
+              onChange={(e) => {
+                setFilterType(e.target.value as TrashEntryType | "all");
+                setPage(0);
+              }}
             >
               <option value="all">All</option>
               {(Object.keys(TYPE_LABELS) as TrashEntryType[]).map((t) => (
@@ -260,7 +355,10 @@ export function TrashPage() {
             <input
               type="datetime-local"
               value={filterSince}
-              onChange={(e) => setFilterSince(e.target.value)}
+              onChange={(e) => {
+                setFilterSince(e.target.value);
+                setPage(0);
+              }}
               className="rounded-md border bg-background px-2 py-1 text-sm"
             />
           </div>
@@ -270,10 +368,29 @@ export function TrashPage() {
               type="text"
               placeholder="Search name / CIDR…"
               value={filterQ}
-              onChange={(e) => setFilterQ(e.target.value)}
+              onChange={(e) => {
+                setFilterQ(e.target.value);
+                setPage(0);
+              }}
               className="rounded-md border bg-background px-2 py-1 text-sm"
             />
           </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-muted-foreground">Order</label>
+          <select
+            aria-label="Order"
+            className="rounded-md border bg-background px-2 py-1 text-sm"
+            value={sort}
+            onChange={(e) => {
+              setSort(e.target.value as "newest" | "oldest");
+              setPage(0);
+            }}
+          >
+            <option value="newest">Newest first</option>
+            <option value="oldest">Oldest first (purged first)</option>
+          </select>
         </div>
 
         <div className="overflow-x-auto rounded border">
@@ -303,7 +420,11 @@ export function TrashPage() {
                     {isError ? (
                       <ListReadError error={error} what="the trash" />
                     ) : (
-                      "Trash is empty."
+                      <>
+                        {filtered
+                          ? "No rows match these filters."
+                          : "Trash is empty."}
+                      </>
                     )}
                   </td>
                 </tr>
@@ -351,6 +472,38 @@ export function TrashPage() {
             </tbody>
           </table>
         </div>
+
+        {total > 0 && (
+          <div className="flex items-center justify-between">
+            <span className="text-sm text-muted-foreground">
+              Showing {page * PAGE_SIZE + 1}–{page * PAGE_SIZE + items.length}{" "}
+              of {total}
+              {totalPages > 1 ? ` · page ${page + 1} of ${totalPages}` : ""}
+            </span>
+            {totalPages > 1 && (
+              <div className="flex items-center gap-2">
+                <button
+                  aria-label="Previous page"
+                  onClick={() => setPage((p) => Math.max(0, p - 1))}
+                  disabled={page === 0}
+                  className="flex h-8 w-8 items-center justify-center rounded-md border text-muted-foreground hover:bg-accent disabled:pointer-events-none disabled:opacity-40"
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+                <button
+                  aria-label="Next page"
+                  onClick={() =>
+                    setPage((p) => Math.min(totalPages - 1, p + 1))
+                  }
+                  disabled={page >= totalPages - 1}
+                  className="flex h-8 w-8 items-center justify-center rounded-md border text-muted-foreground hover:bg-accent disabled:pointer-events-none disabled:opacity-40"
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </button>
+              </div>
+            )}
+          </div>
+        )}
 
         {pendingRestore && (
           <ConfirmRestoreModal

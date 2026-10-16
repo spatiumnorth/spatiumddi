@@ -15346,6 +15346,8 @@ export interface TrashEntry {
 export interface TrashListResponse {
   items: TrashEntry[];
   total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface TrashRestoreResponse {
@@ -15363,6 +15365,7 @@ export const trashApi = {
       q?: string;
       limit?: number;
       offset?: number;
+      sort?: "newest" | "oldest";
     } = {},
   ) =>
     api.get<TrashListResponse>("/admin/trash", { params }).then((r) => r.data),
