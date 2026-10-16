@@ -512,6 +512,27 @@ state on its heartbeat:
   whenever merging the supervisor's keys in would leave them exactly as they
   are, whether or not a Config already exists.
 
+  A Config that survives a slot upgrade can still carry the *previous*
+  release's sizing ([#1210](https://github.com/spatiumnorth/spatiumddi/issues/1210)):
+  2026.09.04-1 sized api / worker as fractions of `MemTotal`, #1115 as a
+  whole-node budget, and helm-controller merges the stale Config over the new
+  HelmChart, so the first rollout ran the old limits and the new supervisor's
+  first heartbeat rewrote them, a second `spatium-control` revision, a second
+  migrate Job (which replaces a running one) and a second api / worker
+  rollout. firstboot now brings the sizing keys an existing Config already
+  carries (api / worker memory and concurrency, the Postgres requests /
+  limits and `shared_buffers`) to the values this boot's HelmChart renders.
+  It computes them while that HelmChart is still held back as `.deferred`
+  and writes them as soon as k3s has applied it, so helm-controller's job
+  for the new chart is replaced, before it runs, by one carrying the new
+  sizing too. Patching earlier would re-run the previous release's chart: a
+  rollout on the old image followed by a second one. It only updates keys
+  already present and writes only on a difference (a Config write is itself
+  a helm revision), so a reboot of an up-to-date node changes nothing. The
+  fix lives in the release being upgraded **to**; the release being left
+  cannot be changed, and any future release that retunes the sizing is
+  covered the same way.
+
   Deliberately **not** restricted to the create case. `chart_bump`'s
   `_patch_image_tag` *creates* this CR carrying only `image.tag` to roll the
   control plane to a new version, so from the next heartbeat — at most 30 s

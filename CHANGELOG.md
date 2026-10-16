@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An upgrade no longer rolls the control plane out twice (#1210).** A
+  `spatium-control` HelmChartConfig that survived a slot upgrade still
+  carried the previous release's api / worker sizing, and helm-controller
+  merges it over the new HelmChart, so the first rollout ran the old limits
+  and the new supervisor's first heartbeat then rewrote them: a second
+  revision, a second migrate Job (which replaced a running one twice in the
+  report) and a second api / worker restart. Seen on 5 of 5 upgrades from
+  2026.09.04-1. firstboot now brings the sizing keys an existing Config
+  already carries to the values the new HelmChart renders, and writes them
+  the moment k3s has applied that HelmChart, so helm-controller runs one job
+  carrying the new image and the new sizing. The timing is the fix. Measured
+  against k3s v1.36.4's helm-controller, patching the Config before the
+  release instead re-runs the previous release's chart: a rollout on the old
+  image, then a second one. A patch that loses the race costs a second
+  revision on the new image seconds later rather than minutes later. It
+  writes nothing when the two already agree, so a reboot adds no revision.
+
 - **Saving an SSH setting no longer leaves `ssh.service` failed (#1632).**
   The appliance runs sshd socket-activated: `ssh.socket` holds the port.
   The runner applied a change with `systemctl reload ssh.service`, whose
