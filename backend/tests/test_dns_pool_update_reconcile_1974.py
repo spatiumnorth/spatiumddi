@@ -144,9 +144,47 @@ async def test_ttl_change_applies_immediately(
     r = await client.put(f"/api/v1/dns/pools/{pool_id}", headers=h, json={"ttl": 120})
     assert r.status_code == 200, r.text
     assert {x.ttl for x in await _records(db_session, pool_id)} == {120}
-    updates = [o for o in await _ops(db_session, server_id) if o.op == "update"]
-    assert len(updates) == 2
-    assert {o.record["ttl"] for o in updates} == {120}
+    # ONE op for the whole RRset, carrying every member at the new TTL. A
+    # per-member update with no set is read by the agentless drivers
+    # (Windows DNS, Route 53, Google) as "replace the RRset with this one
+    # value", so each would clear its siblings and leave the last member
+    # alone on the wire.
+    ops = await _ops(db_session, server_id)
+    assert [o.op for o in ops] == ["update"]
+    rec = ops[0].record
+    assert "rrset_action" not in rec
+    assert rec["rrset"]["ttl"] == 120
+    assert sorted(m["value"] for m in rec["rrset"]["members"]) == ["192.0.2.1", "192.0.2.2"]
+
+
+@pytest.mark.asyncio
+async def test_ttl_change_op_keeps_every_member_on_windows_dns(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Feed the queued op through the Windows driver's own translation: its
+    batch script clears (name, type) on an update and re-adds the op's
+    members, so those members must be the whole pool, not one address."""
+    from app.drivers.dns.base import RecordChange, RecordData
+    from app.drivers.dns.windows import _rrset_members_or_self
+    from app.services.dns.record_ops import rrset_from_payload
+
+    h, pool_id, server_id = await _setup(db_session)
+    r = await client.put(f"/api/v1/dns/pools/{pool_id}", headers=h, json={"ttl": 120})
+    assert r.status_code == 200, r.text
+    (op,) = await _ops(db_session, server_id)
+    rec = op.record
+    change = RecordChange(
+        op="update",
+        zone_name="example.com.",
+        record=RecordData(
+            name=rec["name"], record_type=rec["type"], value=rec["value"], ttl=rec["ttl"]
+        ),
+        target_serial=op.target_serial or 0,
+        rrset=rrset_from_payload(rec),
+    )
+    members = _rrset_members_or_self(change)
+    assert members is not None
+    assert sorted(m.value for m in members) == ["192.0.2.1", "192.0.2.2"]
 
 
 @pytest.mark.asyncio

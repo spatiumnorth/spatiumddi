@@ -84,6 +84,7 @@ async def apply_pool_state(
     created = 0
     deleted = 0
     skipped = 0
+    ttl_changed: DNSPoolMember | None = None
 
     for orphan in orphan_records:
         await _delete_pool_record(db, zone, orphan)
@@ -129,17 +130,6 @@ async def apply_pool_state(
                 target_serial=target_serial,
             )
             created += 1
-        elif should_render and rec is not None and rec.ttl != pool.ttl:
-            # Pool TTL changed — push an update (rare, but harmless).
-            rec.ttl = pool.ttl
-            target_serial = bump_zone_serial(zone)
-            await enqueue_record_op(
-                db,
-                zone,
-                "update",
-                _record_payload(pool, member, rec.ttl),
-                target_serial=target_serial,
-            )
         elif (
             should_render
             and rec is not None
@@ -173,8 +163,33 @@ async def apply_pool_state(
                 target_serial=target_serial,
             )
             created += 1  # counts as a re-creation under the new name
+        elif should_render and rec is not None and rec.ttl != pool.ttl:
+            # Pool TTL changed. Collected and shipped as ONE whole-RRset op
+            # after the loop, not one per member (#1974): see below.
+            rec.ttl = pool.ttl
+            ttl_changed = member
         else:
             skipped += 1
+
+    if ttl_changed is not None:
+        # A TTL change is a property of the RRset, not of one member, so it
+        # goes out as a single ``update`` WITHOUT ``rrset_action``:
+        # ``enqueue_record_op`` then stamps it with the complete desired set
+        # (every pool record, already at the new TTL and reflecting every
+        # create / delete above, which have been flushed). The per-member
+        # ``update`` this replaced carried ``rrset_action="add"`` and no set,
+        # which the agentless drivers read as "replace the RRset with this
+        # one value": on Windows DNS, Route 53 and Google Cloud DNS each
+        # member's update cleared its siblings, so a TTL edit left a live pool
+        # answering with only its last member while the database still listed
+        # them all — and nothing reconciled it back, because the rows matched.
+        # A whole-set write is also order-independent: it is emitted last in
+        # the pass, so per-RR ops queued above it cannot be undone by it.
+        await db.flush()
+        target_serial = bump_zone_serial(zone)
+        payload = _record_payload(pool, ttl_changed, pool.ttl)
+        payload.pop("rrset_action")
+        await enqueue_record_op(db, zone, "update", payload, target_serial=target_serial)
 
     if created or deleted:
         logger.info(
