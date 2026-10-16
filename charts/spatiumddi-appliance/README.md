@@ -60,10 +60,11 @@ bursts the data plane exists to serve, so none is set.
 
 | Values key | Default request |
 |---|---|
-| `dhcpKea.resources` | `500m` CPU / `64Mi` |
-| `dnsBind9.resources` / `dnsPowerdns.resources` / `dnsTechnitium.resources` | `250m` CPU / `64Mi` |
+| `dhcpKea.resources` | `500m` CPU / `128Mi` |
+| `dnsBind9.resources` / `dnsTechnitium.resources` | `250m` CPU / `256Mi` (BIND also carries a `2Gi` limit, #1725) |
+| `dnsPowerdns.resources` | `250m` CPU / `128Mi` |
 | `supervisor.resources` | `50m` CPU / `128Mi` |
-| `lookingGlass.resources` | `50m` CPU / `64Mi` |
+| `lookingGlass.resources` | `50m` CPU / `128Mi` |
 | `agentLanding.resources` | `10m` CPU / `16Mi` |
 
 The supervisor's values map does not touch these keys, so the chart

@@ -7331,6 +7331,11 @@ function DnsSyncModal({
                       <span className="italic text-muted-foreground">none</span>
                     )}
                   </div>
+                  {data.reverse_zone_skipped_reason && (
+                    <p className="mt-1 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-amber-700 dark:text-amber-400">
+                      {data.reverse_zone_skipped_reason}
+                    </p>
+                  )}
                 </div>
               )}
 
