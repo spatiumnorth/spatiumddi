@@ -92,7 +92,10 @@ the formatter handles the rest.
   `threshold_days` became null. The editor now shows stored values (a
   null stays empty), builds the body from only the fields the rule type
   shows, and on an edit sends only what changed, nothing at all when
-  nothing did. A 422 carrying FastAPI's validation list is rendered as
+  nothing did. A select that can only display a stored null as its
+  default (a null server type as `any`, a null change scope as
+  `any_change`) counts as unchanged too, which is how the evaluator reads
+  that null anyway. A 422 carrying FastAPI's validation list is rendered as
   text through the shared `errMsg` and the dialog stays open, instead of
   React error #31 replacing the page. Each label is tied to its control
   with `htmlFor` and `id`. The update handler already used

@@ -177,10 +177,22 @@ export function RuleEditorModal({
       if (existing) {
         // #1986 — send only what the operator changed; an unchanged Save
         // sends nothing at all.
+        // A stored null that a control can only display as a value (a
+        // select has no empty option) compares as that value, so leaving
+        // the control alone is not a change. Both evaluators read the null
+        // as exactly that value. `classification` is deliberately absent:
+        // a stored null there is a rule that can never fire (#1580), and
+        // the server refuses any edit that keeps it, so the shown choice
+        // must be sent.
+        const shownForNull: Record<string, unknown> = {
+          description: "",
+          server_type: "any",
+          change_scope: "any_change",
+        };
         const stored = existing as unknown as Record<string, unknown>;
         const changed: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(full)) {
-          const was = k === "description" ? (stored[k] ?? "") : stored[k];
+          const was = stored[k] ?? shownForNull[k] ?? null;
           if (was !== v) changed[k] = v;
         }
         if (Object.keys(changed).length === 0) return existing;

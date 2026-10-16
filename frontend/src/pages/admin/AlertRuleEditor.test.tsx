@@ -89,6 +89,12 @@ describe("unchanged Save (#1986)", () => {
       { classification: "pci_scope", change_scope: "create" },
     ],
     ["server_unreachable", { server_type: "dns" }],
+    // A stored null a select can only show as its default value.
+    ["server_unreachable", {}],
+    [
+      "compliance_change",
+      { classification: "hipaa_scope", change_scope: null },
+    ],
   ] as const)("%s sends nothing", async (rule_type, over) => {
     const onClose = mount(
       rule({ rule_type: rule_type as AlertRule["rule_type"], ...over }),
@@ -115,6 +121,19 @@ describe("unchanged Save (#1986)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(updateRule).toHaveBeenCalled());
     expect(updateRule).toHaveBeenCalledWith("r1", { threshold_days: 45 });
+  });
+});
+
+describe("clearing a value (#1986)", () => {
+  it("sends null when a stored threshold is cleared", async () => {
+    updateRule.mockResolvedValue(rule({}));
+    mount(rule({ rule_type: "subnet_utilization", threshold_percent: 80 }));
+    fireEvent.change(screen.getByLabelText("Threshold (%)"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(updateRule).toHaveBeenCalled());
+    expect(updateRule).toHaveBeenCalledWith("r1", { threshold_percent: null });
   });
 });
 
