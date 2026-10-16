@@ -39,6 +39,7 @@ import { askAI } from "@/components/copilot/askAI";
 import { useAiAvailable } from "@/components/copilot/useAiAvailable";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
+import { useOverlayLayer } from "@/components/ui/use-draggable-modal";
 import {
   ALL_NAV_DESTINATIONS,
   navEntryVisible,
@@ -367,13 +368,23 @@ export function GlobalSearch() {
     el?.scrollIntoView({ block: "nearest" });
   }, [activeIdx]);
 
+  // While open, the palette is the topmost layer: a dialog under it leaves
+  // its Esc and Tab alone (#1947).
+  useOverlayLayer(open);
+  const paletteRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     function handler(e: KeyboardEvent) {
       if (matchesShortcut(e, OPEN_GLOBAL_SEARCH)) {
         e.preventDefault();
         setOpen((v) => !v);
       }
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        // Esc in the open palette closes the palette only, not a dialog
+        // under it (whose Esc listener sits on window, after this one).
+        if (paletteRef.current) e.stopPropagation();
+        setOpen(false);
+      }
     }
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
@@ -476,6 +487,9 @@ export function GlobalSearch() {
       const row = rows[activeIdx];
       if (row) activate(row);
     } else if (e.key === "Escape") {
+      // Stops the native event at the React root, so neither the document
+      // handler above nor a dialog's window listener sees it (#1947).
+      e.stopPropagation();
       setOpen(false);
     }
   }
@@ -508,6 +522,7 @@ export function GlobalSearch() {
           <div className="absolute inset-0 bg-black/50" />
 
           <div
+            ref={paletteRef}
             className="relative z-10 w-full max-w-xl rounded-xl border bg-card shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >

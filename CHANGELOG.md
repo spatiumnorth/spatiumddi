@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **One Esc closes only the topmost dialog, and Shift+Tab no longer leaves
+  one (#1947, #1948).** Every open dialog bound its own Esc listener, so a
+  dialog opened from another (an edit form's confirm, a nested picker) was
+  closed together with the one underneath, taking its unsaved input. Dialogs
+  now share a layer stack: Esc and the Tab trap belong to the topmost one, a
+  menu inside a dialog takes its own Esc, the copilot drawer yields to an
+  open dialog, and Esc in the search palette closes the palette and not the
+  dialog under it. The focus trap treated the dialog container (where focus
+  lands on open) as outside its first control, so one Shift+Tab walked onto
+  the page behind; it now wraps, and also brings back focus that is already
+  outside. Focus still opens on the container, never on a control, so Enter
+  cannot fire a confirm's destructive button. The shared `Modal` is named by
+  its title through `aria-labelledby`. Test-only dev dependency
+  `@testing-library/user-event`.
+
 - **An upgrade no longer rolls the control plane out twice (#1210).** A
   `spatium-control` HelmChartConfig that survived a slot upgrade still
   carried the previous release's api / worker sizing, and helm-controller
