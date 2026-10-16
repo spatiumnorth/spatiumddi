@@ -188,7 +188,7 @@ def _dedupe_contents(rtype: str, contents: list[str]) -> list[str]:
 # and NS are the zone's own skeleton: deleting either leaves not a smaller zone
 # but a broken one. PowerDNS creates a default SOA with the zone but no apex
 # NS; the agent renders both for a primary zone (``_soa_content`` #1522,
-# ``_apex_ns_target`` #1985), so on those the bundle's rrset replaces what is
+# ``_default_apex_ns`` #1985), so on those the bundle's rrset replaces what is
 # held. The kept types still matter for a zone the bundle carries no rrsets for
 # (a secondary's transferred apex) and for a name the bundle does not know: an
 # NS the operator declared is never swept. The DNSSEC types are PowerDNS's
@@ -701,27 +701,22 @@ def _soa_content(zone: dict[str, Any], zname: str) -> str:
     return f"{mname} {rname} {serial} {timers[0]} {timers[1]} {timers[2]} {timers[3]}"
 
 
-def _apex_ns_target(zone: dict[str, Any], zname: str) -> str | None:
-    """The apex NS a PowerDNS-served primary zone needs when the operator
-    declared none (#1985), by the rule the BIND9 renderer uses (``_zone_apex``).
+def _default_apex_ns(zone: dict[str, Any], zname: str, addressed: set[str]) -> str:
+    """The apex NS a PowerDNS-served primary zone gets when the operator
+    declared none (#1985), by the BIND9 renderer's rule (``_zone_apex``): the
+    zone's Primary NS when it can resolve (outside the zone, or inside it with
+    an A/AAAA record; ``addressed`` holds the absolute, lowercased owners that
+    have one), else the ``ns1.<zone>`` placeholder.
 
-    A zone with its own NS records at the apex returns None: those are the
-    whole set and nothing is written beside them. Otherwise the zone's Primary
-    NS, when it can resolve (outside the zone, or inside it with an A/AAAA
-    record), else the ``ns1.<zone>`` placeholder. BIND9 secondaries refuse a
-    transfer of a zone with no apex NS ("has no NS records"). Unlike BIND9's
-    file the placeholder gets no loopback glue: PowerDNS serves the zone
-    without it, and inventing an address is not this renderer's to do.
+    Unlike BIND9's file the placeholder gets no loopback glue. BIND9 needs it
+    only to LOAD a primary zone (``integrity_checks`` is primary-only); a BIND9
+    secondary transferring the zone counts an unaddressed in-zone NS as a
+    warning and accepts it (``zone_get_from_db`` in lib/dns/zone.c, 9.20: the
+    ``errors != 0`` refusal is gated on ``dns_zone_primary``; only
+    ``nscount == 0`` refuses a transfer). Glue to 127.0.0.1 would send every
+    resolver that follows the zone's NS set to its own loopback.
     """
     origin = zname if zname.endswith(".") else zname + "."
-    addressed: set[str] = set()
-    for rec in zone.get("records") or []:
-        rtype = str(rec.get("type") or "").upper()
-        owner = _name_in_zone(rec.get("name") or "@", origin).lower()
-        if rtype == "NS" and owner == origin.lower():
-            return None
-        if rtype in ("A", "AAAA"):
-            addressed.add(owner)
     primary = _absolute_name(zone.get("primary_ns"))
     if primary is not None:
         low = primary.lower()
@@ -1074,6 +1069,7 @@ class PowerDNSDriver(DriverBase):
                 rrset_ttls.setdefault(key, []).append(
                     default_ttl if rec_ttl is None else int(rec_ttl)
                 )
+            default_ns: str | None = None
             if kind != "Slave":
                 # The apex SOA is synthesised from the zone itself (#1522):
                 # Primary NS / Admin Email / timers / serial. Zones used to
@@ -1086,13 +1082,24 @@ class PowerDNSDriver(DriverBase):
                 rrset_names[soa_key] = zname
                 rrsets[soa_key] = [_soa_content(zone, zname)]
                 rrset_ttls[soa_key] = [default_ttl]
-                # The apex NS (#1985), when the zone declares none. Rendered on
-                # every reconcile, so a zone created before this fix gets it too.
-                ns_target = _apex_ns_target(zone, zname)
-                if ns_target is not None:
-                    ns_key = (zname.lower(), "NS")
+                # The apex NS (#1985). The zone's own apex NS records, when
+                # it has any, are the whole set; otherwise the default. Both
+                # are decided from the rrsets this render serves, so "the
+                # operator declared an apex NS" and "this name has an address"
+                # mean what PowerDNS will serve, however a record's name was
+                # spelled. Rendered on every reconcile, so a zone created
+                # before this fix gets it too. The default also rides the
+                # payload: a record op deleting the zone's last apex NS puts it
+                # back in the same PATCH (``apply_record_op``).
+                default_ns = _default_apex_ns(
+                    zone,
+                    zname,
+                    {owner for owner, rtype in rrsets if rtype in ("A", "AAAA")},
+                )
+                ns_key = (zname.lower(), "NS")
+                if ns_key not in rrsets:
                     rrset_names[ns_key] = zname
-                    rrsets[ns_key] = [ns_target]
+                    rrsets[ns_key] = [default_ns]
                     rrset_ttls[ns_key] = [default_ttl]
             deduped: dict[tuple[str, str], list[str]] = {}
             duplicates: list[str] = []
@@ -1144,6 +1151,10 @@ class PowerDNSDriver(DriverBase):
                     "notify_enabled": eff_notify,
                     "also_notify": [str(e) for e in eff_also or []],
                     "serial": zone.get("serial") or 1,
+                    # The apex NS a record op restores when it deletes the
+                    # zone's last one (#1985); None on a secondary.
+                    "default_apex_ns": default_ns,
+                    "default_apex_ns_ttl": default_ttl,
                     "rrsets": [
                         {
                             "name": rrset_names[key],
@@ -1569,6 +1580,7 @@ class PowerDNSDriver(DriverBase):
                 }
             else:
                 desired = {"name": name, "type": rtype, "changetype": "DELETE"}
+            desired = self._keep_apex_ns(zone, desired)
             with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
                 soa_rrsets, notify = self._soa_for_op(
                     client, headers, zone, rtype, name, op.get("target_serial")
@@ -1672,6 +1684,7 @@ class PowerDNSDriver(DriverBase):
                     "records": merged,
                 }
 
+            rrset = self._keep_apex_ns(zone, rrset)
             soa_rrsets, notify = self._soa_for_op(
                 client, headers, zone, rtype, name, op.get("target_serial")
             )
@@ -1706,6 +1719,54 @@ class PowerDNSDriver(DriverBase):
         )
 
     # ── DNSSEC ops (Phase 3c) ──────────────────────────────────────────────
+
+    def _keep_apex_ns(self, zone: str, rrset: dict[str, Any]) -> dict[str, Any]:
+        """``rrset``, unless it deletes the zone's apex NS (#1985): then a
+        REPLACE with the zone's default apex NS, in the same PATCH.
+
+        A record op deleting the zone's last apex NS record ships an empty
+        rrset, i.e. a DELETE. Records are not structural, so no reconcile
+        follows to put the default back, and the zone would serve no NS until
+        some unrelated structural change: every BIND9 secondary's next
+        transfer fails with "has no NS records". BIND9 itself never reaches
+        that state (an UPDATE removing the last apex NS is ignored, RFC 2136
+        3.4.2.4); here the default takes the operator's NS's place directly.
+
+        The default is the one the last APPLIED render computed (the live
+        ``zones.json``), so it follows the zone's Primary NS; with no such
+        render on disk it is the ``ns1.<zone>`` placeholder, and the next
+        reconcile corrects it.
+        """
+        if (
+            rrset.get("type") != "NS"
+            or rrset.get("changetype") != "DELETE"
+            or str(rrset.get("name") or "").lower() != zone.lower()
+        ):
+            return rrset
+        target, ttl = f"ns1.{zone}", 3600
+        try:
+            rendered = json.loads((self.state_dir / "rendered" / "zones.json").read_text())
+        except (OSError, ValueError):
+            rendered = []
+        for entry in rendered if isinstance(rendered, list) else []:
+            if (
+                isinstance(entry, dict)
+                and str(entry.get("name") or "").lower() == zone.lower()
+                and entry.get("default_apex_ns")
+            ):
+                target = str(entry["default_apex_ns"])
+                # Absence, not falsiness: a TTL of 0 is legal.
+                if entry.get("default_apex_ns_ttl") is not None:
+                    ttl = int(entry["default_apex_ns_ttl"])
+                break
+        log.info("powerdns_apex_ns_default_restored", zone=zone, target=target)
+        return {
+            "name": rrset["name"],
+            "type": "NS",
+            "ttl": ttl,
+            "changetype": "REPLACE",
+            "records": [{"content": target, "disabled": False}],
+        }
 
     def _soa_for_op(
         self,

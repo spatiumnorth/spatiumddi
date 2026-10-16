@@ -92,8 +92,12 @@ the formatter handles the rest.
   zone's own apex NS records when it has any (used as they are), else
   its Primary NS when that can resolve, else the `ns1.<zone>`
   placeholder. It is rendered on every reconcile, so existing zones
-  gain it on upgrade, and an NS the operator declared is never swept.
-  The placeholder gets no loopback glue on PowerDNS.
+  gain it on upgrade, and an NS the operator declared is never
+  overwritten. Deleting a zone's last NS record puts the default back
+  in the same change, so the zone is never left without one. The
+  placeholder gets no loopback glue on PowerDNS: BIND needs that glue
+  only to load a zone it is primary for, and a BIND9 secondary accepts
+  a transferred zone whose NS has no address, with a warning.
 - **PowerDNS serves the control plane's serial, never goes
   backwards, sends NOTIFY, and transfers a secondary
   ([#1965](https://github.com/spatiumnorth/spatiumddi/issues/1965),
