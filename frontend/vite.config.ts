@@ -32,6 +32,13 @@ export default defineConfig({
   // existing pure-logic suites have no use for it.
   test: {
     globals: true,
+    // Node 26 ships its own global `localStorage` (Web Storage), which
+    // is undefined unless --localstorage-file is given and shadows
+    // jsdom's, so tests calling localStorage.clear() throw. Turn
+    // Node's off for the test workers so jsdom's is used. Node 22.4+
+    // accepts the flag as a no-op for behaviour (the feature is off
+    // by default there).
+    execArgv: ["--no-experimental-webstorage"],
   },
   resolve: {
     alias: {
