@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Removing one DNS pool member on a Windows DNS server no longer deletes
+  the healthy members too (#1980).** A pool member removal is a `delete` op
+  with `rrset_action="delete_value"` and no resolved RRset, and the Windows
+  driver deleted the whole name and type on both of its paths, so every
+  sibling A / AAAA went with it: over WinRM it piped every
+  `Get-DnsServerResourceRecord` result to `Remove-…`, and over RFC 2136 (a
+  server with no WinRM credentials) it sent a delete-the-RRset update. Over
+  WinRM a value-only delete now keeps only the record whose rdata matches, in
+  both the singular and batched scripts: A and AAAA compared as IP addresses,
+  NS / PTR / MX case-insensitively without the trailing dot, TXT exactly. Over
+  RFC 2136 it deletes that one RR. Both stay a no-op when nothing matches or
+  the zone is absent. CNAME and the types with no single rdata property keep
+  deleting the whole name. The cloud drivers (Route 53, Google, Azure, Cloudflare) were checked
+  and already remove only the matching value.
+
 - **Deleting a DNS pool member, or a whole pool, now withdraws its addresses
   from DNS (#1966).** `delete_member` / `delete_pool` took the members out of
   `pool.members` so `apply_pool_state` could enqueue each record's delete
