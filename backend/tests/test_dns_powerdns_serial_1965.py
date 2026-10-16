@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from httpx import AsyncClient
@@ -95,6 +96,52 @@ async def test_a_lower_or_equal_reported_serial_never_lowers_it(
     assert await _last_serial(db_session, zone_id) == 2026101605
     await _report(client, db_session, srv, [("lab.example.test.", 2026101605)])
     assert await _last_serial(db_session, zone_id) == 2026101605
+
+
+@pytest.mark.asyncio
+async def test_a_new_zone_at_serial_0_adopts_the_served_date_serial(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    # A zone created on the old build was stamped 0 while PowerDNS served its
+    # own YYYYMMDD01: a jump of two billion, and a legitimate one.
+    today = int(datetime.now(UTC).strftime("%Y%m%d")) * 100
+    _, srv, zone = await _setup(db_session, "powerdns", serial=0)
+    zone_id = zone.id
+    await db_session.commit()
+    await _report(client, db_session, srv, [("lab.example.test.", today + 1)])
+    assert await _last_serial(db_session, zone_id) == today + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reported", [2**31 - 1, 2**31 - 2, None])
+async def test_an_implausibly_high_reported_serial_is_not_adopted(
+    client: AsyncClient, db_session: AsyncSession, reported: int | None
+) -> None:
+    # The serial comes from an agent. Adopting the top of the signed 32-bit
+    # column would make the next bump overflow it and every write to the zone
+    # fail; more than a year of YYYYMMDDNN ahead is no served serial either.
+    today = int(datetime.now(UTC).strftime("%Y%m%d")) * 100
+    base = min(today, 2026101600)
+    _, srv, zone = await _setup(db_session, "powerdns", serial=base)
+    zone_id = zone.id
+    await db_session.commit()
+    if reported is None:  # two years of YYYYMMDDNN ahead
+        reported = max(today, base) + 2_000_000
+    await _report(client, db_session, srv, [("lab.example.test.", reported)])
+    assert await _last_serial(db_session, zone_id) == base
+    adopted = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "dns.zone.serial_adopted",
+                    AuditLog.resource_id == str(zone_id),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert adopted == []
 
 
 @pytest.mark.asyncio

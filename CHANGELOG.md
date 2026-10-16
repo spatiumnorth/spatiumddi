@@ -105,7 +105,13 @@ the formatter handles the rest.
   `secondary=yes`, without which PowerDNS sent no NOTIFY and never
   transferred a secondary zone, which answered REFUSED while
   reading in sync; PowerDNS restarts once on upgrade. A PowerDNS
-  secondary at serial 0 no longer reads in sync.
+  secondary at serial 0 no longer reads in sync. A secondary on
+  another host can now transfer from a PowerDNS primary: each zone
+  gets `ALLOW-AXFR-FROM` and `TSIG-ALLOW-AXFR` from the same transfer
+  policy and group TSIG keys BIND9 renders `allow-transfer` from,
+  where before it was NOTIFY-ed and then refused. The serial the
+  control plane adopts from an agent is bounded, so a wrong report
+  cannot push the zone to where the next bump overflows.
 
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored

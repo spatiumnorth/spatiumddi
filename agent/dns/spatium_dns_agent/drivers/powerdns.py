@@ -503,6 +503,13 @@ def _pdns_masters(entries: Any) -> list[str]:
 _NOTIFY_VALUES = frozenset({"yes", "no", "explicit", "master-only", "primary-only"})
 
 
+def _axfr_payload(
+    acl: Any, bundle_keys: dict[str, dict[str, Any]], zone: str
+) -> dict[str, Any]:
+    cidrs, keys = _axfr_grants(acl, bundle_keys, zone)
+    return {"axfr_from": cidrs, "axfr_tsig_keys": keys}
+
+
 def _also_notify_targets(entries: Any) -> list[str]:
     """Bundle also-notify entries → PowerDNS ``ALSO-NOTIFY`` values (#1523).
 
@@ -524,6 +531,81 @@ def _also_notify_targets(entries: Any) -> list[str]:
         host = tokens[0]
         out.extend(_pdns_masters([f"{host}@{port}" if port else host]))
     return out
+
+
+def _axfr_grants(
+    acl: Any, bundle_keys: dict[str, dict[str, Any]], zone: str
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Who may AXFR a zone from this server: ``(ALLOW-AXFR-FROM, keys)``.
+
+    PowerDNS answers an AXFR only to ``allow-axfr-ips`` (default: loopback),
+    a zone's ``ALLOW-AXFR-FROM`` subnets, a TSIG key named in the zone's
+    ``TSIG-ALLOW-AXFR``, or an address it notified seconds earlier. None of
+    the per-zone grants was rendered, so a secondary on another host could be
+    NOTIFY-ed (#1967) and then had its transfer REFUSED at its next refresh.
+
+    The source is the one BIND9 renders ``allow-transfer`` from (#734): the
+    zone's ``allow_transfer`` when set, else the server options', in BIND's
+    vocabulary, plus every TSIG key in the bundle, granted unconditionally —
+    the same keys the BIND9 agent grants, so ``resolve_group_transfer_key``
+    signs with a key this server accepts. PowerDNS's ``ALLOW-AXFR-FROM`` is a
+    list of subnets with no negation and no named ACLs, so:
+
+    * ``any`` → ``0.0.0.0/0`` and ``::/0``; ``none`` grants nothing;
+    * an address or prefix is granted as one;
+    * ``key <name>`` grants that bundle key;
+    * a named ACL cannot be expressed and is dropped, which narrows;
+    * a negated entry (``!10.0.0.5``) cannot be expressed either, and dropping
+      only it would WIDEN what the rest grants, so the whole address list is
+      dropped (keys still apply) — failing closed.
+    """
+    cidrs: list[str] = []
+    keys: dict[str, dict[str, Any]] = {
+        str(name): k for name, k in bundle_keys.items() if name and k.get("secret")
+    }
+    dropped: list[str] = []
+    negated = False
+    for entry in acl or []:
+        token = str(entry).strip().rstrip(";").strip()
+        if not token or token.lower() == "none":
+            continue
+        if token.startswith("!"):
+            negated = True
+            continue
+        if token.lower() == "any":
+            cidrs += ["0.0.0.0/0", "::/0"]
+            continue
+        parts = token.split()
+        if len(parts) == 2 and parts[0].lower() == "key":
+            name = parts[1].strip('"')
+            if name in bundle_keys and bundle_keys[name].get("secret"):
+                keys.setdefault(name, bundle_keys[name])
+            else:
+                dropped.append(token)
+            continue
+        try:
+            cidrs.append(str(ipaddress.ip_network(token, strict=False)))
+        except ValueError:
+            dropped.append(token)
+    if negated:
+        log.warning(
+            "powerdns_allow_transfer_negation_unsupported",
+            zone=zone,
+            hint=(
+                "PowerDNS ALLOW-AXFR-FROM cannot express a negated entry; no "
+                "address is granted transfers for this zone (TSIG keys still "
+                "are). Use keys or plain prefixes on a PowerDNS group."
+            ),
+        )
+        cidrs = []
+    if dropped:
+        log.warning(
+            "powerdns_allow_transfer_entries_dropped",
+            zone=zone,
+            entries=dropped[:5],
+            hint="named ACLs and unknown keys cannot be granted on PowerDNS",
+        )
+    return list(dict.fromkeys(cidrs)), list(keys.values())
 
 
 # Characters a zone-file / SOA name cannot carry unescaped — the same set
@@ -664,7 +746,9 @@ def _soa_same_ignoring_serial(a: str, b: str) -> bool:
     pa, pb = _soa_parts(a), _soa_parts(b)
     if pa is None or pb is None:
         return False
-    norm = lambda p: [x.lower().rstrip(".") for i, x in enumerate(p) if i != 2]  # noqa: E731
+    def norm(p: list[str]) -> list[str]:
+        return [x.lower().rstrip(".") for i, x in enumerate(p) if i != 2]
+
     return norm(pa) == norm(pb)
 
 
@@ -1034,6 +1118,16 @@ class PowerDNSDriver(DriverBase):
                     # metadata by the reconciler. Empty list = disabled.
                     "update_acl": acl,
                     "update_tsig_keys": referenced_keys,
+                    # Zone transfers out (#1967): ALLOW-AXFR-FROM +
+                    # TSIG-ALLOW-AXFR, from the same source BIND9's
+                    # ``allow-transfer`` is rendered from (#734).
+                    **_axfr_payload(
+                        zone.get("allow_transfer")
+                        if zone.get("allow_transfer") is not None
+                        else opts.get("allow_transfer"),
+                        bundle_keys,
+                        zname,
+                    ),
                 }
             )
 
@@ -1045,7 +1139,15 @@ class PowerDNSDriver(DriverBase):
         # we'll add in a follow-up — see the warning branch below).
         catalog = bundle.get("catalog") or None
         if catalog and catalog.get("mode") == "producer":
-            zones_payload.append(_render_catalog_zone_payload(catalog))
+            catalog_payload = _render_catalog_zone_payload(catalog)
+            # Consumers transfer the catalog like any zone, under the
+            # server's transfer policy.
+            catalog_payload.update(
+                _axfr_payload(
+                    opts.get("allow_transfer"), bundle_keys, catalog_payload["name"]
+                )
+            )
+            zones_payload.append(catalog_payload)
         elif catalog and catalog.get("mode") == "consumer":
             log.warning(
                 "powerdns_catalog_consumer_unsupported",
@@ -2281,6 +2383,15 @@ class PowerDNSDriver(DriverBase):
                     )
                 )
 
+                # Zone transfers out (#1967) — ALLOW-AXFR-FROM +
+                # TSIG-ALLOW-AXFR metadata.
+                failures.extend(
+                    f"{zone_name} transfer ACL: {problem}"
+                    for problem in self._apply_transfer_acl(
+                        client, headers, zone_payload, tsig_seen=tsig_seen
+                    )
+                )
+
                 # NOTIFY targets (issue #1523) — ALSO-NOTIFY metadata.
                 notify_problem = self._apply_notify_settings(client, headers, zone_payload)
                 if notify_problem:
@@ -2480,6 +2591,49 @@ class PowerDNSDriver(DriverBase):
             return None
         targets = _also_notify_targets(zone_payload.get("also_notify"))
         return self._put_metadata(client, headers, zone_payload["name"], "ALSO-NOTIFY", targets)
+
+    # ── Zone transfers out (issue #1967) ───────────────────────────────────
+
+    def _apply_transfer_acl(
+        self,
+        client: httpx.Client,
+        headers: dict[str, str],
+        zone_payload: dict[str, Any],
+        *,
+        tsig_seen: set[str] | None = None,
+    ) -> list[str]:
+        """Set (or clear) who may AXFR the zone from this server.
+
+        ``ALLOW-AXFR-FROM`` (subnets) + ``TSIG-ALLOW-AXFR`` (key names, each
+        imported first). A payload without the keys — one rendered before
+        this existed — is left alone. Returns what PowerDNS refused, so a
+        grant that did not land fails the apply instead of looking applied.
+        """
+        if "axfr_from" not in zone_payload:
+            return []
+        zone = zone_payload["name"]
+        problems: list[str] = []
+        key_names: list[str] = []
+        for k in zone_payload.get("axfr_tsig_keys") or []:
+            key_name = (k.get("name") or "").rstrip(".")
+            if not key_name:
+                continue
+            key_names.append(key_name)
+            if tsig_seen is not None:
+                if key_name in tsig_seen:
+                    continue
+                tsig_seen.add(key_name)
+            problem = self._ensure_tsigkey(client, headers, k)
+            if problem:
+                problems.append(problem)
+        for kind, values in (
+            ("ALLOW-AXFR-FROM", list(zone_payload.get("axfr_from") or [])),
+            ("TSIG-ALLOW-AXFR", key_names),
+        ):
+            problem = self._put_metadata(client, headers, zone, kind, values)
+            if problem:
+                problems.append(problem)
+        return problems
 
     # ── Dynamic-update ACLs (issue #641) ───────────────────────────────────
 
