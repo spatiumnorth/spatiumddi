@@ -168,6 +168,37 @@ async def apply_pool_state(
     return {"created": created, "deleted": deleted, "skipped": skipped}
 
 
+async def withdraw_member_records(
+    db: AsyncSession, pool: DNSPool, members: list[DNSPoolMember]
+) -> int:
+    """Withdraw the rendered records of ``members`` BEFORE they are deleted.
+
+    Call while the members are still in ``pool.members`` and nothing about
+    them is pending. Each record is found by ``pool_member_id`` directly,
+    deleted, flushed and its ``delete_value`` op enqueued — so by the time
+    the member rows go, the ``dns_record.pool_member_id`` FK ``ON DELETE
+    CASCADE`` has nothing left to take silently (#1966: it used to take the
+    record row first, and no delete op was ever sent). Returns how many
+    records were withdrawn.
+    """
+    ids = [m.id for m in members]
+    if not ids:
+        return 0
+    zone = await db.get(DNSZone, pool.zone_id)
+    if zone is None:
+        return 0
+    recs = (
+        (await db.execute(select(DNSRecord).where(DNSRecord.pool_member_id.in_(ids))))
+        .scalars()
+        .all()
+    )
+    for rec in recs:
+        await _delete_pool_record(db, zone, rec)
+    if recs:
+        logger.info("dns_pool_members_withdrawn", pool=pool.name, zone=zone.name, deleted=len(recs))
+    return len(recs)
+
+
 async def _read_pool_state(
     db: AsyncSession, pool: DNSPool
 ) -> tuple[DNSZone | None, dict[str, DNSRecord], list[DNSRecord]]:

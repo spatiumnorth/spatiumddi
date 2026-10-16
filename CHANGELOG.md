@@ -92,10 +92,12 @@ the formatter handles the rest.
   removed the record row in the same statement, the orphan sweep found
   nothing, and no delete op was ever sent, so the agent (or provider) kept
   serving the address until an unrelated write reconciled the whole zone.
-  The reconcile now reads without autoflush and removes the orphans' record
-  rows in one targeted flush before enqueuing their deletes, for agent-managed
-  and agentless groups alike (which also ends the `DELETE ... 0 were matched`
-  warning).
+  Both handlers now withdraw the members' records (row and `delete_value`
+  op) while the members still exist, and only then delete them, for
+  agent-managed and agentless groups alike. The reconcile's orphan sweep is
+  kept as a safety net and now reads without autoflush, so it no longer
+  loses the rows the same way (which also ends the `DELETE ... 0 were
+  matched` warning).
 
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored

@@ -162,3 +162,60 @@ async def test_agentless_group_member_delete_reaches_the_provider(
     r = await client.delete(f"/api/v1/dns/pool-members/{by_addr[gone]}", headers=headers)
     assert r.status_code == 204, r.text
     assert ("delete", "www", gone) in _FakeProvider.calls, _FakeProvider.calls
+
+
+@pytest.mark.asyncio
+async def test_apply_pool_state_orphan_sweep_survives_autoflush(
+    db_session: AsyncSession,
+) -> None:
+    """The safety net under the endpoints: a caller that drops a member from
+    ``pool.members`` and reconciles still gets a delete op, though the
+    member is a pending delete-orphan the first read would autoflush."""
+    from app.services.dns.pool_apply import apply_pool_state
+
+    _headers, pool, server, by_addr = await _setup(db_session, "bind9")
+    zone_id, server_id = pool.zone_id, server.id
+    gone = ADDRS[0]
+    pool.members = [m for m in pool.members if m.id != by_addr[gone]]
+    summary = await apply_pool_state(db_session, pool)
+    await db_session.commit()
+    assert summary["deleted"] == 1
+    deletes = await _fresh_ops(db_session, server_id, "delete")
+    assert [o.record["value"] for o in deletes] == [gone]
+    assert await _served_values(db_session, zone_id) == set(ADDRS[1:])
+
+
+@pytest.mark.asyncio
+async def test_disable_unhealthy_and_reenable_still_reconcile(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The non-delete paths that share ``_delete_pool_record``: an operator
+    disable, a health-check flip to unhealthy, and a re-enable."""
+    from app.services.dns.pool_apply import apply_pool_state
+
+    headers, pool, server, by_addr = await _setup(db_session, "bind9")
+    zone_id, server_id, pool_id = pool.zone_id, server.id, pool.id
+
+    r = await client.put(
+        f"/api/v1/dns/pool-members/{by_addr[ADDRS[0]]}", headers=headers, json={"enabled": False}
+    )
+    assert r.status_code == 200, r.text
+    assert await _served_values(db_session, zone_id) == set(ADDRS[1:])
+
+    # Health-check flip, the task's own call.
+    db_session.expire_all()
+    pool = await db_session.get(DNSPool, pool_id)  # type: ignore[assignment]
+    for m in pool.members:
+        if m.address == ADDRS[1]:
+            m.last_check_state = "unhealthy"
+    await apply_pool_state(db_session, pool)
+    await db_session.commit()
+    assert await _served_values(db_session, zone_id) == {ADDRS[2]}
+    deletes = await _fresh_ops(db_session, server_id, "delete")
+    assert sorted(o.record["value"] for o in deletes) == sorted(ADDRS[:2])
+
+    r = await client.put(
+        f"/api/v1/dns/pool-members/{by_addr[ADDRS[0]]}", headers=headers, json={"enabled": True}
+    )
+    assert r.status_code == 200, r.text
+    assert await _served_values(db_session, zone_id) == {ADDRS[0], ADDRS[2]}
