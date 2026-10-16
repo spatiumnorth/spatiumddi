@@ -82,6 +82,7 @@ from app.services.dns.record_ops import (
     supersede,
 )
 from app.services.dns.row_locks import ids_in, lock_ops
+from app.services.dns.rrset import RRSET_OPS
 from app.services.dns.soa_timers import served_soa_timers
 from app.services.dns.tsig import (
     legacy_group_key,
@@ -1578,7 +1579,9 @@ def _covered_by(up_to: datetime | None, visible_xacts: str | None) -> Any | None
 # ``dnssec_sign`` / ``dnssec_unsign`` (PowerDNS and Technitium act only from
 # the op) — has NO carrier in a bundle, so a views render must neither retire
 # it nor leave it unshipped (#1946).
-RECORD_OP_KINDS: frozenset[str] = frozenset({"create", "update", "delete"})
+# The same set as ``rrset.RRSET_OPS`` (the ops that describe an RRset): one
+# definition, so a new record op kind cannot be retired by one and not the other.
+RECORD_OP_KINDS: frozenset[str] = RRSET_OPS
 
 
 async def retire_queued_ops(

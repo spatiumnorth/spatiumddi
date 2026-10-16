@@ -20,6 +20,7 @@ from app.models.dns import DNSRecordOp
 from app.services.dns import agent_bundle_store as store
 from app.services.dns.agent_bundle_render import render_and_store
 from tests.test_dns_agent_bundle_ops_gate import CONFIG_URL, _agent, _op
+from tests.test_dnssec_bind9 import _admin, _group_with_driver, _zone_row
 
 
 def _rollover(server_id: uuid.UUID, zone_name: str) -> DNSRecordOp:
@@ -79,3 +80,53 @@ async def test_views_render_ships_dnssec_ops_and_retires_only_record_ops(
     if again.status_code == 200:
         assert again.json()["pending_record_ops"] == []
     assert server_id
+
+
+@pytest.mark.asyncio
+async def test_rollover_endpoint_under_views_reaches_the_agent(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The issue's own path: POST /dnssec/rollover in a group with a view."""
+    server, zone, headers = await _agent(db_session, views=True)
+    zone.dnssec_enabled = True
+    token = await _admin(db_session)
+    await db_session.commit()
+    r = await client.post(
+        f"/api/v1/dns/groups/{zone.group_id}/zones/{zone.id}/dnssec/rollover",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"key_tag": 11437},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "queued"
+
+    await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    resp = await client.get(CONFIG_URL, headers=headers)
+    assert resp.status_code == 200, resp.text
+    shipped = [o for o in resp.json()["pending_record_ops"] if o["op"] == "dnssec_rollover"]
+    assert len(shipped) == 1 and shipped[0]["record"]["key_tag"] == 11437
+
+
+@pytest.mark.asyncio
+async def test_rollover_endpoint_refuses_when_nothing_was_queued(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """No primary (or no enabled agent-based server): no row is written, so
+    the endpoint must not answer ``queued``."""
+    grp = await _group_with_driver(db_session, "bind9")  # one server, not primary
+    zone = await _zone_row(db_session, grp)
+    zone.dnssec_enabled = True
+    token = await _admin(db_session)
+    await db_session.commit()
+    r = await client.post(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}/dnssec/rollover",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"key_tag": 11437},
+    )
+    assert r.status_code == 409, r.text
+    rows = (
+        (await db_session.execute(select(DNSRecordOp).where(DNSRecordOp.zone_name == zone.name)))
+        .scalars()
+        .all()
+    )
+    assert rows == []

@@ -286,7 +286,10 @@ because only they are carried in the zone payload. A DNSSEC op
 (`dnssec_rollover`, and `dnssec_sign` / `dnssec_unsign`, which PowerDNS and
 Technitium act on only from the op) has no carrier in a bundle, so under
 views the stored bundle still ships those, and nothing else, as the ops page
-(#1946).
+(#1946). Under views BIND loads the zone once per view, so the BIND9 agent
+runs a rollover (and its DNSSEC status read) per view with
+`rndc dnssec … <zone> IN <view>`; a bare zone name fails there with "zone was
+found in multiple views".
 
 Three cases keep the time gate (`created_at <= snapshot_at`):
 - ops and bundles from before these columns;
