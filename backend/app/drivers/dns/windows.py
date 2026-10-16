@@ -303,7 +303,14 @@ class WindowsDNSDriver(DNSDriver):
                     *[_format_rdata(r) for r in change.rrset.as_records(rr)],
                 )
         elif change.op == "delete":
-            update.delete(rel_name, rdtype)
+            # #1980 — a delete with no resolved RRset (a DNS pool member's
+            # removal) names ONE value; RFC 2136 can address exactly that RR,
+            # so the siblings at the name survive. Same type set as the WinRM
+            # path, so the two paths agree on what a delete touches.
+            if _delete_match_value(change, rtype) is not None:
+                update.delete(rel_name, rdtype, _format_rdata(rr))
+            else:
+                update.delete(rel_name, rdtype)
         else:  # create | update
             if change.op == "update":
                 update.delete(rel_name, rdtype)
@@ -1050,7 +1057,7 @@ def _ps_add_record(zone: str, name: str, record: RecordData, ttl: int) -> str:
 
 
 # Types whose rdata ``Get-DnsServerResourceRecord`` exposes as ONE comparable
-# string, so a per-value delete can target just the matching record (#1980).
+# value, so a per-value delete can target just the matching record (#1980).
 # Anything else (CNAME is single-valued; SRV / CAA / TLSA have no single
 # property) keeps the delete-the-whole-RRset behaviour.
 _PS_VALUE_PROP = {
@@ -1078,7 +1085,8 @@ def _delete_match_value(change: RecordChange, rtype: str) -> str | None:
     raw = change.record.value or ""
     if rtype == "TXT":
         raw = _strip_txt_quotes(raw)
-    raw = raw.strip() if rtype != "TXT" else raw
+    else:
+        raw = raw.strip()
     if not raw:
         return None
     if rtype in ("A", "AAAA"):
@@ -1089,6 +1097,32 @@ def _delete_match_value(change: RecordChange, rtype: str) -> str | None:
     if rtype in _PS_HOSTNAME_TYPES:
         return raw.rstrip(".")
     return raw
+
+
+def _ps_value_predicate(rtype: str, rd: str, value: str) -> str:
+    """PowerShell boolean: does record data ``rd`` hold ``value`` (#1980)?
+
+    ``rd`` is an expression for a record's ``RecordData``; ``value`` one for
+    the string ``_delete_match_value`` produced. Shared by the singular and
+    batched scripts so the two cannot match differently.
+
+    * A / AAAA compare as ``[ipaddress]`` (``IPAddress.Equals`` is a byte
+      compare), not as text: ``RecordData.IPv4Address`` / ``IPv6Address`` are
+      ``IPAddress`` objects, and .NET's IPv6 text form need not agree with
+      Python's canonical one.
+    * NS / PTR / MX: Windows returns the FQDN with its trailing dot; the
+      value has it stripped. PowerShell ``-eq`` on strings is
+      case-insensitive, which is right for a DNS name.
+    * TXT: joined exactly as ``_ps_list_records`` reads it, so a value pulled
+      from the server matches itself, and compared case-SENSITIVELY
+      (``-ceq``) — two TXT strings differing only in case are two records.
+    """
+    prop = _PS_VALUE_PROP[rtype]
+    if rtype in ("A", "AAAA"):
+        return f'([ipaddress]"$({rd}.{prop})").Equals([ipaddress]{value})'
+    if rtype == "TXT":
+        return f"((@({rd}.{prop}) -join '') -ceq {value})"
+    return f"(\"$({rd}.{prop})\".TrimEnd('.') -eq {value})"
 
 
 def _ps_apply_record(change: RecordChange) -> str:
@@ -1142,10 +1176,9 @@ def _ps_apply_record(change: RecordChange) -> str:
     value_filter = ""
     match_value = _delete_match_value(change, rtype)
     if match_value is not None:
-        prop = _PS_VALUE_PROP[rtype]
-        mv = _ps_escape_single_quoted(match_value)
-        trim = ".TrimEnd('.')" if rtype in _PS_HOSTNAME_TYPES else ""
-        value_filter = f" | Where-Object {{ \"$($_.RecordData.{prop})\"{trim} -eq '{mv}' }}"
+        mv = "'" + _ps_escape_single_quoted(match_value) + "'"
+        pred = _ps_value_predicate(rtype, "$_.RecordData", mv)
+        value_filter = f" | Where-Object {{ {pred} }}"
     delete = f"""
 if (-not (Get-DnsServerZone -Name '{zone}' -ErrorAction SilentlyContinue)) {{
     Write-Output "zone '{zone}' not present on server; delete is a no-op"
@@ -1288,16 +1321,18 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
     # size is accounted for automatically rather than via a fixed count.
     # #1980 — only ships when some op is a per-value delete, so every other
     # batch keeps its existing size against the encoded-command budget. The
-    # property is chosen per type; a type with no entry (``$null``) is left
-    # unfiltered, i.e. delete-all, matching the singular path.
+    # record data is captured as ``$rd`` before the ``switch``, because a
+    # switch rebinds ``$_`` to its own subject inside each branch. ``dv`` is
+    # only ever set for a type with a branch here; ``default`` keeps the
+    # record (never delete-all on a value the script can't compare).
     value_filter = ""
     if any("dv" in o for o in ops):
-        hmap = ";".join(f"{k}='{v}'" for k, v in _PS_VALUE_PROP.items())
+        branches = "".join(
+            f"'{t}'{{{_ps_value_predicate(t, '$rd', '$d')}}}" for t in _PS_VALUE_PROP
+        )
         value_filter = (
             "$d=$_.dv;if($null -ne $d -and $x){"
-            f"$pr=@{{{hmap}}}[$t];"
-            'if($pr){$x=@($x|?{$q="$($_.RecordData.$pr)";'
-            "if($t -in 'NS','PTR','MX'){$q=$q.TrimEnd('.')};$q -eq $d})}};"
+            f"$x=@($x|?{{$rd=$_.RecordData;switch($t){{{branches}default{{$false}}}}}})}};"
         )
     return (
         # #426: was "$E='Continue'" — a no-op (PS vars are case-insensitive,
