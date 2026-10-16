@@ -261,6 +261,21 @@ the formatter handles the rest.
   revision on the new image seconds later rather than minutes later. It
   writes nothing when the two already agree, so a reboot adds no revision.
 
+- **A member of the control-plane cluster can no longer be revoked in
+  place (#1884).** The Fleet tab disables Revoke on control-plane rows
+  and the deployment docs say a live cluster member must be demoted first,
+  but the API refused only the last control-plane node. A member revoked
+  through the API was fenced out by its peers' firewalls within a minute
+  and stayed an etcd voter with a Ready Node: nothing takes a revoked
+  member out of etcd, its established peer connections kept it in quorum
+  while every new one was dropped, and its own teardown could clear only
+  its role labels, on the heartbeats its kube API answered.
+  `DELETE /appliances/{id}` now answers 409 for a member of a formed
+  cluster and says to demote it first, or to Replace it when the node is
+  dead (Replace evicts it from the seed's side). It refuses the seed too,
+  which can be neither demoted nor replaced, and says to demote the other
+  members first. A node that has left the cluster revokes as before.
+
 - **Saving an SSH setting no longer leaves `ssh.service` failed (#1632).**
   The appliance runs sshd socket-activated: `ssh.socket` holds the port.
   The runner applied a change with `systemctl reload ssh.service`, whose
