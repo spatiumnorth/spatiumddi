@@ -1016,7 +1016,7 @@ async def _apply_agentless(
     """
     if "rrset" not in record:
         record = dict(record)
-        await stamp_rrsets_for_ops(db, zone, [{"op": op, "record": record}])
+        await stamp_rrsets_for_ops(db, zone, [{"op": op, "record": record}], agentless=True)
 
     op_row = DNSRecordOp(
         server_id=server.id,
@@ -1716,7 +1716,7 @@ async def _apply_agentless_batch(
     the operator deleted.
     """
     ops = [{**o, "record": dict(o["record"])} for o in ops]
-    await stamp_rrsets_for_ops(db, zone, ops)
+    await stamp_rrsets_for_ops(db, zone, ops, agentless=True)
 
     op_rows: list[DNSRecordOp] = []
     due = datetime.now(UTC) + AGENTLESS_DISPATCH_GRACE

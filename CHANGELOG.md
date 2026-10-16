@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A record op that appends one value to a name no longer replaces the
+  whole name on an agentless DNS server (#1983).** An `update` carrying
+  `rrset_action="add"` opts out of whole-RRset stamping, and the driver-side
+  `RecordChange` has no `rrset_action`, so Windows (WinRM and RFC 2136),
+  Route 53, Google Cloud DNS and Azure DNS each read it as a single-value
+  replace and kept only the last value written. The one reachable case was a
+  DNS pool TTL change, which sends one such `update` per member: on an
+  agentless group the pool was left answering with its last member while the
+  database still listed them all. The agentless record-op path now stamps
+  those ops with the whole folded RRset. The issue was filed against the
+  cutover TTL pre-flight, which emits the same shape for the siblings of a
+  round-robin name; that path never reaches an agentless server (the
+  pre-flight refuses a group whose primary is agentless, and an agent
+  primary's record ops go to agent servers only), so it is covered
+  defensively. Cloudflare stores one row per value and was not affected. A
+  pool's `create` and `delete_value` ops are unchanged, and so is the agent
+  path.
+
 - **Removing one DNS pool member on a Windows DNS server no longer deletes
   the healthy members too (#1980).** A pool member removal is a `delete` op
   with `rrset_action="delete_value"` and no resolved RRset, and the Windows
