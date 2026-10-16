@@ -100,6 +100,8 @@ backend/alembic/versions/97190c1b0325_dns_server_api_key_encrypted_bytes.py:alte
 backend/alembic/versions/99e91dcae1e2_release_schema_head.py:drop_table:40
 backend/alembic/versions/a07f6c12e5d3_dns_zone_forwarders.py:drop_column:47
 backend/alembic/versions/a07f6c12e5d3_dns_zone_forwarders.py:drop_column:48
+backend/alembic/versions/a1903c5e7b24_appliance_cluster_transition_id.py:drop_column:47
+backend/alembic/versions/a1903c5e7b24_appliance_cluster_transition_id.py:drop_column:48
 backend/alembic/versions/a1b2c3d4e5f6_add_dns_assignment_to_ipam.py:drop_column:41
 backend/alembic/versions/a1b2c3d4e5f6_add_dns_assignment_to_ipam.py:drop_column:42
 backend/alembic/versions/a1b2c3d4e5f6_add_dns_assignment_to_ipam.py:drop_column:43
@@ -379,6 +381,8 @@ backend/alembic/versions/c4e7a2f813b9_network_devices.py:drop_table:306
 backend/alembic/versions/c4e7a2f813b9_network_devices.py:drop_table:310
 backend/alembic/versions/c4e8b71f0d23_ai_provider_enabled_tools.py:drop_column:27
 backend/alembic/versions/c4e8f1a25d93_dns_server_is_enabled.py:drop_column:40
+backend/alembic/versions/c4f19a2e7d53_dns_zone_agentless_create_due_at.py:drop_column:100
+backend/alembic/versions/c4f19a2e7d53_dns_zone_agentless_create_due_at.py:drop_column:99
 backend/alembic/versions/c4f7a1d3e589_feature_module_table.py:drop_table:80
 backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:282
 backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:285

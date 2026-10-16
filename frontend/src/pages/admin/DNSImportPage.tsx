@@ -21,8 +21,10 @@ import {
   dnsApi,
   dnsImportApi,
   type CloudDNSServerOption,
+  type DNSImportApexNsPolicy,
   type DNSImportCommitResult,
   type DNSImportConflictDecision,
+  type DNSImportedZone,
   type DNSImportPreview,
   type DNSImportSource,
   type DNSImportZoneConflict,
@@ -34,6 +36,11 @@ import {
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ZoneScopePill } from "@/components/ZoneScopePill";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 
 // Tab metadata. Every source is live; ``available: false`` remains the
 // hook for rendering a not-yet-shipped source (so the operator sees the
@@ -108,6 +115,14 @@ interface BindUploadState {
   result: DNSImportCommitResult | null;
   phase: Phase;
   error: string | null;
+}
+
+/** Every DNS import route — preview, test and commit — takes a superadmin
+ *  (`dns_import/router.py`), so the controls that start one say so rather
+ *  than letting a DNS Editor upload an archive and be refused (#1879's
+ *  sweep). Commit is reachable only from a successful preview. */
+function useImportGate(): { disabled?: boolean; title?: string } {
+  return permissionGate(usePermissions().isSuperadmin, NEEDS_SUPERADMIN);
 }
 
 function emptyState(): BindUploadState {
@@ -249,13 +264,14 @@ function BindTab() {
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the archive first");
       return dnsImportApi.bind9Commit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
@@ -322,9 +338,9 @@ function BindTab() {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -415,13 +431,14 @@ function WindowsDNSTab() {
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the server first");
       return dnsImportApi.windowsDNSCommit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
@@ -478,9 +495,9 @@ function WindowsDNSTab() {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -511,6 +528,7 @@ function WindowsDNSPullForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canPreview = Boolean(state.serverId && state.groupId) && !previewing;
   const eligible = servers.filter((s) => s.has_credentials);
   const hasIneligible = servers.length > eligible.length;
@@ -623,7 +641,8 @@ function WindowsDNSPullForm({
           icon={previewing ? Loader2 : ServerIcon}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling zones…" : "Preview import"}
         </HeaderButton>
@@ -746,13 +765,14 @@ function CloudDNSTab({ initialServerId }: { initialServerId?: string }) {
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the server first");
       return dnsImportApi.cloudDNSCommit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
@@ -810,9 +830,9 @@ function CloudDNSTab({ initialServerId }: { initialServerId?: string }) {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -845,6 +865,7 @@ function CloudDNSPullForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canPreview = Boolean(state.serverId && state.groupId) && !previewing;
   const eligible = servers.filter((s) => s.has_credentials);
   const hasIneligible = servers.length > eligible.length;
@@ -964,7 +985,8 @@ function CloudDNSPullForm({
           icon={previewing ? Loader2 : Cloud}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling zones…" : "Preview import"}
         </HeaderButton>
@@ -1078,13 +1100,14 @@ function PowerDNSTab() {
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the server first");
       return dnsImportApi.powerDNSCommit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
@@ -1141,9 +1164,9 @@ function PowerDNSTab() {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -1174,6 +1197,7 @@ function PowerDNSPullForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canTest =
     Boolean(state.apiUrl && state.apiKey) && !testing && !previewing;
   const canPreview =
@@ -1252,7 +1276,8 @@ function PowerDNSPullForm({
               icon={testing ? Loader2 : Plug}
               iconClassName={testing ? "animate-spin" : undefined}
               onClick={onTest}
-              disabled={!canTest}
+              disabled={!canTest || !!gate.disabled}
+              title={gate.title}
             >
               {testing ? "Testing…" : "Test connection"}
             </HeaderButton>
@@ -1318,7 +1343,8 @@ function PowerDNSPullForm({
           icon={previewing ? Loader2 : Globe}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling zones…" : "Preview import"}
         </HeaderButton>
@@ -1428,13 +1454,14 @@ function TechnitiumTab() {
   });
 
   const commitMut = useMutation({
-    mutationFn: () => {
+    mutationFn: (apexNsPolicy: DNSImportApexNsPolicy) => {
       if (!state.preview) throw new Error("Preview the server first");
       return dnsImportApi.technitiumCommit({
         target_group_id: state.groupId,
         target_view_id: state.viewId || null,
         plan: state.preview,
         conflict_actions: state.decisions,
+        apex_ns_policy: apexNsPolicy,
       });
     },
     onSuccess: (result) => {
@@ -1491,9 +1518,9 @@ function TechnitiumTab() {
                 setState((s) => ({ ...s, decisions: updater(s.decisions) }))
               }
               conflictByZone={conflictByZone}
-              onCommit={() => {
+              onCommit={(apexNsPolicy) => {
                 setState((s) => ({ ...s, phase: "committing", error: null }));
-                commitMut.mutate();
+                commitMut.mutate(apexNsPolicy);
               }}
               committing={commitMut.isPending}
               onReset={reset}
@@ -1524,6 +1551,7 @@ function TechnitiumPullForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canTest =
     Boolean(state.apiUrl && state.apiToken) && !testing && !previewing;
   const canPreview =
@@ -1584,7 +1612,8 @@ function TechnitiumPullForm({
               icon={testing ? Loader2 : Plug}
               iconClassName={testing ? "animate-spin" : undefined}
               onClick={onTest}
-              disabled={!canTest}
+              disabled={!canTest || !!gate.disabled}
+              title={gate.title}
             >
               {testing ? "Testing…" : "Test connection"}
             </HeaderButton>
@@ -1652,7 +1681,8 @@ function TechnitiumPullForm({
           icon={previewing ? Loader2 : Globe}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling zones…" : "Preview import"}
         </HeaderButton>
@@ -1678,6 +1708,7 @@ function UploadForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canPreview = Boolean(state.file && state.groupId) && !previewing;
   return (
     <div className="rounded-md border bg-muted/20 p-4">
@@ -1764,7 +1795,8 @@ function UploadForm({
           icon={previewing ? Loader2 : Download}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Parsing…" : "Preview import"}
         </HeaderButton>
@@ -1773,7 +1805,59 @@ function UploadForm({
   );
 }
 
-function PreviewPanel({
+/**
+ * #1892 — an imported zone carries the source server's apex NS, and the
+ * group's agents serve those rows as the zone's whole NS set, so without this
+ * the managed zone stays delegated to the host it was migrated off. Off by
+ * default: an apex NS outside the group can be deliberate (a hidden primary
+ * whose public NS are a provider's), so replacing it is the operator's call.
+ */
+function ApexNsPolicyChoice({
+  zones,
+  replace,
+  onChange,
+}: {
+  zones: DNSImportedZone[];
+  replace: boolean;
+  onChange: (replace: boolean) => void;
+}) {
+  const affected = zones.filter((z) => (z.foreign_apex_ns ?? []).length > 0);
+  if (affected.length === 0) return null;
+  return (
+    <div className="mb-3 space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+      <div className="font-medium text-amber-700 dark:text-amber-400">
+        Apex NS outside the target group
+      </div>
+      <div className="text-amber-700/90 dark:text-amber-300/90">
+        These zones name a server that is not in the target group as their NS.
+        Kept, the imported zone stays delegated to that host and goes lame once
+        it is retired.
+      </div>
+      <ul className="space-y-0.5">
+        {affected.map((z) => (
+          <li key={z.name} className="break-all font-mono">
+            {z.name} → {(z.foreign_apex_ns ?? []).join(", ")}
+          </li>
+        ))}
+      </ul>
+      <label className="flex items-start gap-2">
+        <input
+          type="checkbox"
+          checked={replace}
+          onChange={(e) => onChange(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          Replace them with the target group&apos;s servers (only servers whose
+          host is a DNS name; NS records below the apex are kept). Leave
+          unticked if the zone is deliberately served from these hosts.
+        </span>
+      </label>
+    </div>
+  );
+}
+
+export function PreviewPanel({
   preview,
   decisions,
   setDecisions,
@@ -1790,10 +1874,11 @@ function PreviewPanel({
     ) => Record<string, DNSImportConflictDecision>,
   ) => void;
   conflictByZone: Map<string, DNSImportZoneConflict>;
-  onCommit: () => void;
+  onCommit: (apexNsPolicy: DNSImportApexNsPolicy) => void;
   committing: boolean;
   onReset: () => void;
 }) {
+  const [replaceApexNs, setReplaceApexNs] = useState(false);
   return (
     <div className="space-y-4">
       <div className="rounded-md border bg-muted/20 p-4">
@@ -1831,6 +1916,12 @@ function PreviewPanel({
             ))}
           </div>
         )}
+
+        <ApexNsPolicyChoice
+          zones={preview.zones}
+          replace={replaceApexNs}
+          onChange={setReplaceApexNs}
+        />
 
         {Object.keys(preview.record_type_histogram).length > 0 && (
           <div className="mb-3 flex flex-wrap gap-2">
@@ -1973,7 +2064,7 @@ function PreviewPanel({
           variant="primary"
           icon={committing ? Loader2 : Database}
           iconClassName={committing ? "animate-spin" : undefined}
-          onClick={onCommit}
+          onClick={() => onCommit(replaceApexNs ? "replace" : "keep")}
           disabled={committing}
         >
           {committing ? "Committing…" : "Commit import"}

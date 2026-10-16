@@ -1046,6 +1046,10 @@ _DNSSEC_ALGO_NUM: dict[str, int] = {
 }
 
 
+# Where BIND's dnssec-policy keeps its key files (rendered as key-directory).
+DNSSEC_KEY_DIR = "/var/cache/bind/keys"
+
+
 def _parse_dnssec_status(text: str) -> list[dict[str, Any]]:
     """Parse ``rndc dnssec -status <zone>`` into per-key state dicts.
 
@@ -1783,9 +1787,9 @@ class Bind9Driver(DriverBase):
 
         if has_views:
             # Split-horizon (issue #24): every zone + RPZ lives inside its
-            # view block. Group-level blocklists (view_name=None) replicate
-            # into EVERY view; per-view blocklists land only in their own
-            # view. Files are namespaced per view (zones/<view>/...) so
+            # view block. Per-view blocklists land only in their own view;
+            # a group-level one (view_name=None) only in a view that has no
+            # zone of its own (#1706). Files are namespaced per view (zones/<view>/...) so
             # identical zone names across views don't collide. Views are
             # already ordered low→high by the control plane for first-match
             # precedence.
@@ -1796,9 +1800,12 @@ class Bind9Driver(DriverBase):
                     continue
                 match_clients = _render_match_clients(view, view_keys)
                 recursion_v = "yes" if view.get("recursion", True) else "no"
-                view_bls = [
-                    bl for bl in blocklists if bl.get("view_name") == vname
-                ] + global_bls
+                own_bls = [bl for bl in blocklists if bl.get("view_name") == vname]
+                # #1706 — a view's own zone already folds in the group's
+                # lists, so the group zone behind it would load the same
+                # entries a second time. Only a view with no zone of its own
+                # falls back to the group zone.
+                view_bls = own_bls if own_bls else list(global_bls)
                 body = ""
                 if view_bls:
                     zlist = "; ".join(
@@ -3085,6 +3092,10 @@ class Bind9Driver(DriverBase):
         """
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
+        # #1934 — set when some zone's keys could not be read yet (named not
+        # answering, zone not keyed); the sync loop re-reads on a short timer
+        # instead of the quiet-zone interval.
+        self.dnssec_incomplete = False
         for z in bundle.get("zones", []):
             if not z.get("dnssec_enabled"):
                 continue
@@ -3096,9 +3107,14 @@ class Bind9Driver(DriverBase):
                 continue
             seen.add(zname)
             try:
-                out.append(self._zone_dnssec_state(zname))
+                state = self._zone_dnssec_state(zname)
             except Exception as e:  # noqa: BLE001 — never let one zone block the rest
                 log.warning("dnssec_state_collect_failed", zone=zname, error=str(e))
+                self.dnssec_incomplete = True
+                continue
+            if not state["keys"]:
+                self.dnssec_incomplete = True
+            out.append(state)
         return out
 
     def _zone_dnssec_state(self, zone: str) -> dict[str, Any]:
@@ -3111,16 +3127,19 @@ class Bind9Driver(DriverBase):
                 text=True,
                 check=False,
             )
-            if res.returncode == 0:
-                keys = _parse_dnssec_status(res.stdout)
+            if res.returncode != 0:
+                # Not "the zone has no keys": named is not answering for it
+                # (still loading, zone not loaded). Reporting [] would wipe
+                # the control plane's key rows on a guess (#1934).
+                raise RuntimeError(f"rndc dnssec -status failed: {res.stderr.strip()[:200]}")
+            keys = _parse_dnssec_status(res.stdout)
         # DS rrset(s) from the KSK public-key files BIND wrote into the
         # key-directory, computed in-process with dnspython (#1854). This
         # used to shell out to ``dnssec-dsfromkey`` behind a ``shutil.which``
         # guard, and the appliance image has no such binary (Alpine ships it
         # in a separate package), so every signed zone silently reported an
         # empty DS. No binary means nothing to be missing from an image.
-        key_dir = "/var/cache/bind/keys"
-        ds_records = _ds_from_key_dir(zone, key_dir)
+        ds_records = _ds_from_key_dir(zone, DNSSEC_KEY_DIR)
         # Attach each DS to the key it was derived from, so the per-key UI
         # shows a key's own DS (and none for a key that is not submittable).
         by_tag: dict[int, list[str]] = {}

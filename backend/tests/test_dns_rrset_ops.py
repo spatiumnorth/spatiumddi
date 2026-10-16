@@ -673,6 +673,7 @@ async def test_agentless_ops_are_stamped_and_reach_the_driver(
     op = await enqueue_record_op(
         db_session, zone, "create", {"name": "www", "type": "A", "value": "10.0.0.2"}
     )
+    await db_session.commit()  # #1539 — the provider is written by the commit
     assert op is not None
     assert op.state == "applied", "the agentless branch really ran"
     assert recorder.changes == [("create", "www", "A")]
@@ -710,6 +711,7 @@ async def test_agentless_batch_folds_before_stamping(
             {"op": "delete", "record": {"name": "www", "type": "A", "value": "10.0.0.2"}},
         ],
     )
+    await db_session.commit()  # #1539 — the provider is written by the commit
 
     sets = [
         {m.value for m in c.rrset.members} for c in recorder.full_changes if c.rrset is not None

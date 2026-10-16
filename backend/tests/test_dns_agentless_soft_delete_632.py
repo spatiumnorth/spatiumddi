@@ -332,6 +332,7 @@ async def test_purge_retracts_pre_632_agentless_record(
     recorder = _patch_record_driver(monkeypatch)
     cutoff = datetime.now(UTC) - timedelta(days=30)
     retracted = await _retract_records_from_providers(db_session, cutoff, set())
+    await db_session.commit()  # #1539 — the provider is written by the commit
 
     assert retracted == 1
     assert recorder.changes == [("delete", "stale", "A")]

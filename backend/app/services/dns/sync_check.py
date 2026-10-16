@@ -33,7 +33,7 @@ from sqlalchemy import ColumnElement, String, and_, any_, func, literal, or_, se
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dns import DNSRecord, DNSZone
+from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.integration_ownership import dns_record_owned_elsewhere
 
@@ -93,6 +93,10 @@ class DriftReport:
     # (spatiumddi#1840: a /23 spans two, a /17 128). ``reverse_zone_id`` /
     # ``reverse_zone_name`` are the first of them, kept for older clients.
     reverse_zone_names: list[str] = field(default_factory=list)
+    # #1932 — set when the subnet has no reverse zone because its DNS group
+    # runs a cloud driver that has not opted in to auto-created reverse
+    # zones: its PTRs are skipped, and this says why. None otherwise.
+    reverse_zone_skipped_reason: str | None = None
 
 
 # ── Effective DNS resolution (duplicated minimally to avoid a router import) ─
@@ -507,6 +511,31 @@ async def _aggregate(db: AsyncSession, subnet_ids: Sequence[uuid.UUID]) -> Drift
     return agg
 
 
+async def _cloud_reverse_optout_reason(
+    db: AsyncSession, forward_zone: DNSZone | None, group_ids: Sequence[str]
+) -> str | None:
+    """Why a subnet with no reverse zone has none, when the reason is the
+    #1932 cloud opt-out; None otherwise. The group is resolved the way the
+    reverse-zone auto-create resolves it: the forward zone's group, else the
+    first effective DNS group."""
+    from app.services.dns.reverse_zone import (  # noqa: PLC0415
+        cloud_reverse_optout_driver,
+        cloud_reverse_optout_message,
+    )
+
+    group_id: uuid.UUID | None = forward_zone.group_id if forward_zone else None
+    if group_id is None and group_ids:
+        try:
+            group_id = uuid.UUID(str(group_ids[0]))
+        except ValueError:
+            return None
+    group = await db.get(DNSServerGroup, group_id) if group_id else None
+    if group is None:
+        return None
+    driver = await cloud_reverse_optout_driver(db, group)
+    return cloud_reverse_optout_message(group.name, driver) if driver else None
+
+
 async def compute_subnet_dns_drift(
     db: AsyncSession,
     subnet_id: uuid.UUID,
@@ -546,6 +575,10 @@ async def compute_subnet_dns_drift(
         reverse_zone_name=reverse_zone.name if reverse_zone else None,
         reverse_zone_names=[z.name for z in subnet_rev_zones],
     )
+    if not subnet_rev_zones:
+        report.reverse_zone_skipped_reason = await _cloud_reverse_optout_reason(
+            db, forward_zone, rev_group_ids
+        )
 
     # All live IPs in the subnet (batched by the caller, else loaded here).
     if preloaded_ips is not None:

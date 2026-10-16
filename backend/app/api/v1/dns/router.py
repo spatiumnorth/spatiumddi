@@ -337,6 +337,9 @@ class ServerGroupCreate(BaseModel):
     # operator pins a private IP into a zone in this group, forcing a
     # typed-CIDR confirm. Off by default — existing groups unaffected.
     is_public_facing: bool = False
+    # #1932 — auto-create subnet reverse zones in a cloud DNS group. Off by
+    # default: the provider bills per hosted zone. Other drivers ignore it.
+    auto_reverse_zones_at_provider: bool = False
 
     @field_validator("group_type")
     @classmethod
@@ -355,6 +358,7 @@ class ServerGroupUpdate(BaseModel):
     catalog_zones_enabled: bool | None = None
     catalog_zone_name: str | None = None
     is_public_facing: bool | None = None
+    auto_reverse_zones_at_provider: bool | None = None
 
     @field_validator("group_type")
     @classmethod
@@ -374,6 +378,7 @@ class ServerGroupResponse(BaseModel):
     catalog_zones_enabled: bool
     catalog_zone_name: str
     is_public_facing: bool = False
+    auto_reverse_zones_at_provider: bool = False
     # #934 follow-up — the distinct drivers of the servers currently in this
     # group. Empty means an empty group, which is compatible with anything.
     # A group is single-driver, so one entry is the normal case; two or more
@@ -412,6 +417,7 @@ class ServerGroupResponse(BaseModel):
             catalog_zones_enabled=g.catalog_zones_enabled,
             catalog_zone_name=g.catalog_zone_name,
             is_public_facing=g.is_public_facing,
+            auto_reverse_zones_at_provider=g.auto_reverse_zones_at_provider,
             server_drivers=sorted(drivers or []),
             catalog_unsupported_warning=(
                 catalog_unsupported_message(drivers or [])
@@ -1825,6 +1831,7 @@ async def update_group(
             "catalog_zones_enabled",
             "catalog_zone_name",
             "is_public_facing",
+            "auto_reverse_zones_at_provider",
         },
     )
     # #1784 — only turning catalog zones ON is refused: turning an
@@ -7735,6 +7742,9 @@ async def create_record(
     )
     await db.commit()
     await db.refresh(record)
+    # #1539 — an agentless op is dispatched by the commit above, so its
+    # outcome is only known now.
+    provider_warning = provider_warning or _agentless_op_warning(op)
     record.provider_warning = provider_warning  # type: ignore[attr-defined]
     return record
 
@@ -7828,6 +7838,7 @@ async def update_record(
         )
     target_serial = bump_zone_serial(zone) if zone is not None else None
     op = None
+    rename_ops: list[Any] = []
     if zone is not None:
         new_payload = {
             "name": record.name,
@@ -7860,9 +7871,8 @@ async def update_record(
             )
             # Surface a failure of either half: a failed delete leaves the old
             # name live, which is the very bug being fixed.
-            op = next((o for o in ops if o is not None and o.last_error), None) or (
-                ops[-1] if ops else None
-            )
+            rename_ops = [o for o in ops if o is not None]
+            op = next((o for o in rename_ops if o.last_error), None) or (ops[-1] if ops else None)
         else:
             op = await enqueue_record_op(
                 db, zone, "update", new_payload, target_serial=target_serial
@@ -7887,6 +7897,11 @@ async def update_record(
     )
     await db.commit()
     await db.refresh(record)
+    # #1539 — an agentless op is dispatched by the commit above, so its
+    # outcome is only known now (either half of a rename may have failed).
+    provider_warning = provider_warning or _agentless_op_warning(
+        next((o for o in rename_ops if o.last_error), None) or op
+    )
     record.provider_warning = provider_warning  # type: ignore[attr-defined]
     return record
 
@@ -7921,8 +7936,9 @@ async def delete_record(
     rec_snapshot = record_op_payload(record)
 
     async def _push_delete() -> None:
-        # enqueue_record_op dispatches per-driver: agentless applies immediately
-        # (recording a ``failed`` op row, non-fatal, if the provider rejects);
+        # enqueue_record_op dispatches per-driver: agentless is sent once the
+        # commit below lands (#1539) and a provider refusal is retried from
+        # the op row with backoff;
         # agent-based enqueues a delete op the bundle drop also covers
         # (idempotent against an already-absent record). Kept in one closure so
         # the soft and permanent paths retract identically (#632).
@@ -8006,6 +8022,12 @@ class BulkDeleteRecordsResponse(BaseModel):
     # per-record singular route cannot offer that). ``None`` when
     # ``permanent=true`` — there is nothing to restore.
     deletion_batch_id: uuid.UUID | None = None
+    # #1539 — set when an agentless provider did not accept the retraction
+    # on its first attempt. The provider is called after the DB commit, so
+    # the records ARE deleted here and the provider delete is retried from
+    # its op row with backoff; until it lands the provider keeps serving
+    # them. Always None for agent-based groups.
+    provider_warning: str | None = None
 
 
 @router.post(
@@ -8109,6 +8131,13 @@ async def bulk_delete_records(
             detail=f"Bulk delete dispatch failed on zone {zone.name}: {exc}",
         ) from exc
 
+    # #1539 — an agentless provider is called AFTER the commit, so no op is
+    # ``failed`` at this point: the delete commits — exactly as the singular
+    # DELETE route always has — and a provider refusal is retried from the op
+    # row (audited as ``agentless_push_failed``, terminally alerted by
+    # ``dns_op_failed``) and reported on the response as
+    # ``provider_warning``, read after the commit below.
+    #
     # Per-op state determines the DB delete. A wire delete that came back
     # failed must NOT remove the DB row — if we delete blindly the user
     # sees "deleted" in the UI but the record is still published, and
@@ -8161,7 +8190,11 @@ async def bulk_delete_records(
             )
             await db.delete(rec)
         await db.commit()
-        return BulkDeleteRecordsResponse(deleted=len(dispatched), skipped=skipped)
+        return BulkDeleteRecordsResponse(
+            deleted=len(dispatched),
+            skipped=skipped,
+            provider_warning=_agentless_batch_warning([o for o in op_rows if o is not None]),
+        )
 
     # One batch id across the whole selection. ``collect_soft_delete_batch``
     # mints a fresh id per root, so append each record's cascade set to a
@@ -8189,6 +8222,7 @@ async def bulk_delete_records(
         deleted=len(dispatched),
         skipped=skipped,
         deletion_batch_id=batch.batch_id if dispatched else None,
+        provider_warning=_agentless_batch_warning([o for o in op_rows if o is not None]),
     )
 
 
@@ -8664,6 +8698,7 @@ async def import_zone_commit(
     # (#773), read after the flush.
     target_serial: int | None = None
     provider_warning: str | None = None
+    op_rows: list[Any] = []
     if create_rows or update_rows or delete_payloads:
         target_serial = bump_zone_serial(zone)
         await db.flush()
@@ -8725,6 +8760,8 @@ async def import_zone_commit(
 
     collect_wake(dns_group_channel(zone.group_id))
     await db.commit()
+    # #1539 — agentless ops are dispatched by the commit; read the outcome now.
+    provider_warning = provider_warning or _agentless_batch_warning(op_rows)
 
     logger.info(
         "dns_zone_import",

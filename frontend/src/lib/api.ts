@@ -495,6 +495,10 @@ export interface DnsSyncPreview {
    * order — a subnet wider than a /24 spans several (#1840). The two
    * fields above are the first of them. Empty on block/space scope. */
   reverse_zone_names?: string[];
+  /** #1932 — why the subnet has no reverse zone when its DNS group runs a
+   * cloud driver that has not opted in to auto-created reverse zones (its
+   * PTRs are skipped). Null otherwise. */
+  reverse_zone_skipped_reason?: string | null;
   missing: DnsSyncMissing[];
   mismatched: DnsSyncMismatch[];
   stale: DnsSyncStale[];
@@ -5043,6 +5047,10 @@ export interface DNSServerGroup {
   // operator binds a private IP into a zone in this group, forcing a
   // typed-CIDR confirm.
   is_public_facing?: boolean;
+  /** #1932 — auto-create subnet reverse zones in this group when it runs a
+   *  cloud DNS driver. Off by default: the provider bills per hosted zone.
+   *  Groups on other drivers ignore it. */
+  auto_reverse_zones_at_provider?: boolean;
   /** Distinct drivers of the servers currently in this group (#934
    *  follow-up). Empty = an empty group, compatible with anything. A group
    *  is single-driver, so one entry is normal; two or more means the group
@@ -6518,6 +6526,7 @@ export const dnsApi = {
         deleted: number;
         skipped: { record_id: string; reason: string }[];
         deletion_batch_id: string | null;
+        provider_warning?: string | null;
       }>(
         `/dns/groups/${groupId}/zones/${zoneId}/records/bulk-delete`,
         { record_ids: recordIds },
@@ -6821,7 +6830,15 @@ export interface DNSImportedZone {
    * shape is posted back on commit, where it is ignored server-side.
    */
   name_scope?: ZoneNameScope;
+  /**
+   * #1892 — apex NS targets naming no server of the target group. Derived by
+   * the preview; ignored on commit.
+   */
+  foreign_apex_ns?: string[];
 }
+
+/** #1892 — what commit does with an apex NS outside the target group. */
+export type DNSImportApexNsPolicy = "keep" | "replace";
 
 export interface DNSImportZoneConflict {
   zone_name: string;
@@ -6907,6 +6924,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/bind9/commit", body)
@@ -6930,6 +6948,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/windows-dns/commit", body)
@@ -6965,6 +6984,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/powerdns/commit", body)
@@ -6993,6 +7013,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/technitium/commit", body)
@@ -7018,6 +7039,7 @@ export const dnsImportApi = {
     target_view_id?: string | null;
     plan: DNSImportPreview;
     conflict_actions: Record<string, DNSImportConflictDecision>;
+    apex_ns_policy?: DNSImportApexNsPolicy;
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/cloud/commit", body)

@@ -6,6 +6,11 @@ import { dnsApi, type DNSSECPolicy } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 
 const ALGORITHMS = [
@@ -46,6 +51,8 @@ export function DNSSECPoliciesPage() {
   });
 
   const rows = policies.data ?? [];
+  // The policy routes take a superadmin whatever the grants (#1879).
+  const gate = permissionGate(usePermissions().isSuperadmin, NEEDS_SUPERADMIN);
 
   return (
     <div className="flex min-w-0 flex-1 flex-col gap-4 p-4">
@@ -60,7 +67,11 @@ export function DNSSECPoliciesPage() {
             on <code>default</code> for BIND&rsquo;s built-in policy.
           </p>
         </div>
-        <HeaderButton variant="primary" onClick={() => setCreating(true)}>
+        <HeaderButton
+          variant="primary"
+          onClick={() => setCreating(true)}
+          {...gate}
+        >
           <Plus className="h-4 w-4" /> New policy
         </HeaderButton>
       </div>
@@ -120,6 +131,8 @@ export function DNSSECPoliciesPage() {
                           onClick={() => setEditing(p)}
                           className="rounded border p-1 hover:bg-accent"
                           title="Edit"
+                          aria-label="Edit"
+                          {...gate}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
@@ -128,6 +141,8 @@ export function DNSSECPoliciesPage() {
                           onClick={() => setToDelete(p)}
                           className="rounded border border-destructive/40 p-1 text-destructive hover:bg-destructive/10"
                           title="Delete"
+                          aria-label="Delete"
+                          {...gate}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>

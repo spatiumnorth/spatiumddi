@@ -62,6 +62,7 @@ from app.services.agents.ingest_receipt import (
     claim_batch,
     duplicate_response,
 )
+from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.dns import agent_bundle_store as bundle_store
 from app.services.dns import dnssec_signers
@@ -622,7 +623,7 @@ async def _render_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle 
     if outcome.bundle is not None:
         AGENT_BUNDLE_INLINE_RENDERS.labels(family="dns").inc()
         return outcome.bundle
-    await db.refresh(server)
+    await refresh_agent_server(db, server)
     return await bundle_store.newest(db, server)
 
 
@@ -798,7 +799,7 @@ async def agent_config_longpoll(
             # the newest stored bundle; refresh it so a change committed on
             # any replica, or the worker's store, is seen here
             # (expire_on_commit=False, no in-loop commit).
-            await db.refresh(server)
+            await refresh_agent_server(db, server)
             # The newest bundle this release stored, current or not: under a
             # write storm no render is current until the writes stop, and
             # each one that lands is served as it lands (docstring).
@@ -813,7 +814,7 @@ async def agent_config_longpoll(
                     except _InlineRenderFailed:
                         # Once per poll: the worker's renders serve it instead.
                         inline_tried = True
-                        await db.refresh(server)
+                        await refresh_agent_server(db, server)
                         bundle = await bundle_store.newest(db, server)
                 if not enqueued and not bundle_store.is_current(server):
                     await enqueue_renders([server.id])

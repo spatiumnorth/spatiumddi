@@ -57,6 +57,8 @@ import { ZoneTemplateModal } from "./ZoneTemplateModal";
 import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { PoolsView } from "./PoolsView";
+import { ConfirmDestroyModal } from "./ConfirmDestroyModal";
+import { DeleteZoneDialog, BulkDeleteZonesDialog } from "./ZoneDeleteDialogs";
 import { DriftView } from "./DriftView";
 import {
   CertsCompactTable,
@@ -683,113 +685,6 @@ function DeleteDNSGroupModal({
   );
 }
 
-// ── Double-confirm destroy modal (matches IPAM pattern) ──────────────────────
-
-function ConfirmDestroyModal({
-  title,
-  description,
-  checkLabel,
-  onConfirm,
-  onClose,
-  isPending,
-  error,
-  notice,
-}: {
-  title: string;
-  description: React.ReactNode;
-  checkLabel: string;
-  onConfirm: () => void;
-  onClose: () => void;
-  isPending?: boolean;
-  error?: string | null;
-  // Non-error feedback shown in a neutral box — used for the #62
-  // two-person approval queue "Submitted for approval" message, where
-  // the delete returned 202 instead of executing.
-  notice?: string | null;
-}) {
-  const [step, setStep] = useState<1 | 2>(1);
-  const [checked, setChecked] = useState(false);
-
-  if (step === 1) {
-    return (
-      <Modal title={title} onClose={onClose}>
-        <div className="space-y-4">
-          <p className="text-sm text-muted-foreground">{description}</p>
-          {error && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-              {error}
-            </div>
-          )}
-          {notice && (
-            <div className="rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400">
-              {notice}
-            </div>
-          )}
-          <div className="flex justify-end gap-2">
-            <button
-              onClick={onClose}
-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-            >
-              Cancel
-            </button>
-            <button
-              onClick={() => setStep(2)}
-              className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90"
-            >
-              Continue
-            </button>
-          </div>
-        </div>
-      </Modal>
-    );
-  }
-
-  return (
-    <Modal title="Confirm Permanent Deletion" onClose={onClose}>
-      <div className="space-y-4">
-        <p className="text-sm font-medium text-destructive">
-          This action cannot be undone.
-        </p>
-        <p className="text-sm text-muted-foreground">{description}</p>
-        <label className="flex cursor-pointer items-start gap-2 text-sm">
-          <input
-            type="checkbox"
-            className="mt-0.5"
-            checked={checked}
-            onChange={(e) => setChecked(e.target.checked)}
-          />
-          {checkLabel}
-        </label>
-        {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-            {error}
-          </div>
-        )}
-        {notice && (
-          <div className="rounded-md border border-blue-500/40 bg-blue-500/5 px-3 py-2 text-xs text-blue-600 dark:text-blue-400">
-            {notice}
-          </div>
-        )}
-        <div className="flex justify-end gap-2">
-          <button
-            onClick={onClose}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            disabled={!checked || isPending}
-            className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
-          >
-            {isPending ? "Deleting…" : "Delete"}
-          </button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
 /** Single-step destructive confirm (no checkbox). Used for low-stakes deletes
  * like individual DNS records — the two-step modal above stays for group /
  * blocklist deletes where the blast radius is much larger. */
@@ -1143,6 +1038,10 @@ function GroupModal({
   const [isPublicFacing, setIsPublicFacing] = useState(
     group?.is_public_facing ?? false,
   );
+  // #1932 — subnet reverse zones in a cloud DNS group are opt-in.
+  const [autoReverseAtProvider, setAutoReverseAtProvider] = useState(
+    group?.auto_reverse_zones_at_provider ?? false,
+  );
   const [error, setError] = useState("");
   const [confirmRotate, setConfirmRotate] = useState(false);
   const [rotated, setRotated] = useState(false);
@@ -1189,6 +1088,7 @@ function GroupModal({
             catalog_zones_enabled: catalogZonesEnabled,
             catalog_zone_name: catalogZoneName.trim(),
             is_public_facing: isPublicFacing,
+            auto_reverse_zones_at_provider: autoReverseAtProvider,
           });
         }}
         className="space-y-3"
@@ -1250,6 +1150,26 @@ function GroupModal({
               — flag this group as exposed to the public internet. Publishing a
               private IP (RFC 1918 / CGNAT / ULA) into a zone in this group will
               require typed-CIDR confirmation on the IPAM side.
+            </span>
+          </span>
+        </label>
+
+        <label className="flex items-start gap-2 text-xs cursor-pointer select-none rounded border bg-muted/20 px-3 py-2">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4"
+            checked={autoReverseAtProvider}
+            onChange={(e) => setAutoReverseAtProvider(e.target.checked)}
+          />
+          <span>
+            <span className="font-medium">
+              Auto-create reverse zones at the provider
+            </span>
+            <span className="ml-1 text-muted-foreground">
+              — cloud DNS groups only (Route 53, Azure, Google, Cloudflare, …).
+              Each reverse zone is a hosted zone the provider bills for, one per
+              /24 a subnet spans. Off: subnets here get no reverse zone and no
+              PTRs.
             </span>
           </span>
         </label>
@@ -3868,6 +3788,7 @@ function ZoneDetailView({
       let deleted = 0;
       const skipped: { record_id: string; reason: string }[] = [];
       const batches: string[] = [];
+      const providerWarnings: string[] = [];
       for (let i = 0; i < ids.length; i += BULK_DELETE_CHUNK) {
         const res = await dnsApi.bulkDeleteRecords(
           group.id,
@@ -3878,10 +3799,11 @@ function ZoneDetailView({
         deleted += res.deleted;
         skipped.push(...res.skipped);
         if (res.deletion_batch_id) batches.push(res.deletion_batch_id);
+        if (res.provider_warning) providerWarnings.push(res.provider_warning);
       }
-      return { deleted, skipped, batches };
+      return { deleted, skipped, batches, providerWarnings };
     },
-    onSuccess: ({ deleted, skipped, batches }) => {
+    onSuccess: ({ deleted, skipped, batches, providerWarnings }) => {
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
       setSelectedRecords(new Set());
       setConfirmBulkDelete(false);
@@ -3889,14 +3811,21 @@ function ZoneDetailView({
         batches.length > 1
           ? ` across ${batches.length} trash batches, each restored separately`
           : "";
+      // #1539 — the DNS provider is called after the delete commits; a
+      // refusal is retried in the background, and until it lands the
+      // provider keeps serving the records. Say so rather than read clean.
+      const provider =
+        providerWarnings.length > 0
+          ? ` The DNS provider has not removed them yet and will be retried: ${providerWarnings[0]}`
+          : "";
       if (skipped.length > 0) {
         const reasons = Array.from(new Set(skipped.map((s) => s.reason)));
         setBulkDeleteNotice(
-          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}${spread}; ${skipped.length} skipped — ${reasons.join("; ")}`,
+          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}${spread}; ${skipped.length} skipped — ${reasons.join("; ")}.${provider}`,
         );
-      } else if (spread) {
+      } else if (spread || provider) {
         setBulkDeleteNotice(
-          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}${spread}.`,
+          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}${spread}.${provider}`,
         );
       } else {
         setBulkDeleteNotice(null);
@@ -5046,10 +4975,8 @@ function ZoneDetailView({
         />
       )}
       {confirmDelete && (
-        <ConfirmDestroyModal
-          title="Delete DNS Zone"
-          description={`Permanently delete zone "${zone.name}" and all its records from SpatiumDDI?`}
-          checkLabel={`I understand all records in "${zone.name}" will be permanently deleted.`}
+        <DeleteZoneDialog
+          zoneName={zone.name}
           onConfirm={() => deleteZone.mutate()}
           onClose={() => {
             setConfirmDelete(false);
@@ -8732,7 +8659,8 @@ function RecordsTab({
               <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
                 {confirmDelete.record_type}
               </span>
-              ? This cannot be undone.
+              ? The record moves to Trash. A superadmin can restore it from
+              Administration → Trash.
             </p>
             {deleteMut.isError && (
               <p className="text-sm text-destructive">
@@ -9256,17 +9184,8 @@ function ZonesTab({
       )}
 
       {confirmBulkDelete && (
-        <ConfirmDestroyModal
-          title={`Delete ${selected.size} zone${selected.size === 1 ? "" : "s"}`}
-          description={
-            <>
-              Permanently delete the{" "}
-              <span className="font-medium">{selected.size}</span> selected zone
-              {selected.size === 1 ? "" : "s"} and all their records from
-              SpatiumDDI? This cannot be undone.
-            </>
-          }
-          checkLabel={`I understand ${selected.size} zone${selected.size === 1 ? "" : "s"} and all their records will be permanently deleted.`}
+        <BulkDeleteZonesDialog
+          count={selected.size}
           isPending={bulkDeleteZones.isPending}
           error={bulkDeleteError}
           onClose={() => {

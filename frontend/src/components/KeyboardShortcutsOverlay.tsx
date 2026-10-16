@@ -64,11 +64,10 @@ export function KeyboardShortcutsHelp() {
       // "?" is a legitimate thing to put in a description.
       if (isTypingTarget(e.target)) return;
       if (!matchesShortcut(e, SHOW_SHORTCUTS)) return;
-      // Don't stack on top of another dialog. Every modal binds Escape
-      // on `window` (`use-draggable-modal`), so an overlay opened over
-      // an edit form would let a single Escape dismiss BOTH — taking
-      // the operator's unsaved input with it. Closing our own overlay
-      // is still fine, hence the `openRef` check first.
+      // Don't stack on top of another dialog: a reference sheet has no
+      // business covering an edit form (Esc would still close only the
+      // topmost, #1947). Closing our own overlay is still fine, hence the
+      // `openRef` check first.
       if (
         !openRef.current &&
         document.querySelector('[role="dialog"][aria-modal="true"]')

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import stat
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -40,6 +41,10 @@ def appliance_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
         appliance_state,
         "_CLUSTER_JOIN_STATE_CONSUMED",
         tmp_path / "cluster-join.state.consumed",
+    )
+    # #1903 — the join's fire record, likewise kept off the real host.
+    monkeypatch.setattr(
+        appliance_state, "_CLUSTER_JOIN_TRANSITION", tmp_path / "cluster-join.transition"
     )
     return tmp_path
 
@@ -547,3 +552,95 @@ def test_read_cluster_restore_state(restore_paths: Path) -> None:
     assert appliance_state.read_cluster_restore_state() == ("restoring", "snap-A")
     (restore_paths / "cluster-restore.state").write_text("done\t")
     assert appliance_state.read_cluster_restore_state() == ("done", None)
+
+
+# ── #1903 — a stale ``ready`` from a previous membership ─────────────────────
+
+SEED = "https://s:6443"
+
+
+def _age(path: Path, seconds: float) -> None:
+    """Backdate ``path`` so it was last written ``seconds`` ago."""
+    when = time.time_ns() - int(seconds * 1e9)
+    os.utime(path, ns=(when, when))
+
+
+def test_stale_ready_for_same_seed_does_not_block_a_repromote(appliance_paths: Path) -> None:
+    """A Replace-evicted box that is still up keeps ``ready\\t<seed>`` from its
+    old membership — written long before the promote now asking. The join must
+    fire over it, and that stale verdict must not be reported as the promote's."""
+    sidecar = appliance_paths / "cluster-join.state"
+    sidecar.write_text(f"ready\t{SEED}\n")
+    _age(sidecar, 3600)
+
+    # What the heartbeat reports before anything has fired: not this promote's.
+    assert appliance_state.reported_cluster_transition_id(None) == ""
+    assert appliance_state.maybe_fire_cluster_join("member", SEED, "t", "T2", 60.0) is True
+    assert (appliance_paths / "cluster-join.transition").read_text().startswith("T2\t")
+
+    # The runner, once it has run, writes its verdict: now it proves T2 ...
+    (appliance_paths / "cluster-join-pending").unlink()
+    sidecar.write_text(f"ready\t{SEED}\n")
+    later = os.stat(sidecar).st_mtime_ns + 10**9
+    os.utime(sidecar, ns=(later, later))
+    assert appliance_state.reported_cluster_transition_id(None) == "T2"
+    # ... and the idempotence guard (#590) holds again: no wipe of a fresh join.
+    assert appliance_state.maybe_fire_cluster_join("member", SEED, "t", "T2", 120.0) is False
+
+
+def test_supervisor_upgraded_mid_join_does_not_refire_over_its_fresh_ready(
+    appliance_paths: Path,
+) -> None:
+    """A join fired by a supervisor that predates the fire record, then upgraded
+    before the control plane applied its ``ready``: no record names the id, but
+    the ``ready`` is younger than the promote, so it is this promote's. Firing
+    again would re-run the join over a working membership."""
+    sidecar = appliance_paths / "cluster-join.state"
+    sidecar.write_text(f"ready\t{SEED}\n")
+    _age(sidecar, 5)
+    assert not (appliance_paths / "cluster-join.transition").exists()
+
+    assert appliance_state.maybe_fire_cluster_join("member", SEED, "t", "T2", 300.0) is False
+    assert not (appliance_paths / "cluster-join-pending").exists()
+    # The report carries the age the control plane needs to settle it.
+    age = appliance_state.cluster_join_state_age_s()
+    assert age is not None and 0 <= age < 300
+
+
+@pytest.mark.parametrize(
+    ("sidecar_age", "promote_age", "why"),
+    [
+        (3600, None, "a control plane that sent the id without the promote's age"),
+        (305, 300.0, "older than the promote, but within the latency margin"),
+        (-60, 300.0, "a sidecar stamped in the future: the clock stepped back"),
+    ],
+)
+def test_ambiguous_ready_is_reported_not_refired(
+    appliance_paths: Path, sidecar_age: float, promote_age: float | None, why: str
+) -> None:
+    sidecar = appliance_paths / "cluster-join.state"
+    sidecar.write_text(f"ready\t{SEED}\n")
+    _age(sidecar, sidecar_age)
+    assert (
+        appliance_state.maybe_fire_cluster_join("member", SEED, "t", "T2", promote_age) is False
+    ), why
+
+
+def test_ready_from_an_earlier_promotes_join_is_stale(appliance_paths: Path) -> None:
+    """A fire record for a previous promote (T1) proves nothing about T2."""
+    (appliance_paths / "cluster-join.transition").write_text(
+        f"T1\t{time.time_ns() - 7200 * 10**9}\n"
+    )
+    sidecar = appliance_paths / "cluster-join.state"
+    sidecar.write_text(f"ready\t{SEED}\n")
+    _age(sidecar, 3600)
+    assert appliance_state.reported_cluster_transition_id(None) == "T1"
+    assert appliance_state.maybe_fire_cluster_join("member", SEED, "t", "T2", 60.0) is True
+
+
+def test_ready_without_a_transition_id_still_blocks_a_refire(appliance_paths: Path) -> None:
+    """An older control plane names no promote: the #590 guard is unchanged."""
+    sidecar = appliance_paths / "cluster-join.state"
+    sidecar.write_text(f"ready\t{SEED}\n")
+    _age(sidecar, 3600)
+    assert appliance_state.maybe_fire_cluster_join("member", SEED, "t") is False

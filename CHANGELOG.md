@@ -102,6 +102,245 @@ the formatter handles the rest.
   Fleet roles PUT; a request that waited for a move skips the rows it deleted,
   and a zone-state report records nothing for the group the server left.
 
+- **One Esc closes only the topmost dialog, and Shift+Tab no longer leaves
+  one (#1947, #1948).** Every open dialog bound its own Esc listener, so a
+  dialog opened from another (an edit form's confirm, a nested picker) was
+  closed together with the one underneath, taking its unsaved input. Dialogs
+  now share a layer stack: Esc and the Tab trap belong to the topmost one, a
+  menu inside a dialog takes its own Esc, the copilot drawer yields to an
+  open dialog, and Esc in the search palette closes the palette and not the
+  dialog under it. The focus trap treated the dialog container (where focus
+  lands on open) as outside its first control, so one Shift+Tab walked onto
+  the page behind; it now wraps, and also brings back focus that is already
+  outside. Focus still opens on the container, never on a control, so Enter
+  cannot fire a confirm's destructive button. The shared `Modal` is named by
+  its title through `aria-labelledby`. Test-only dev dependency
+  `@testing-library/user-event`.
+
+- **An upgrade no longer rolls the control plane out twice (#1210).** A
+  `spatium-control` HelmChartConfig that survived a slot upgrade still
+  carried the previous release's api / worker sizing, and helm-controller
+  merges it over the new HelmChart, so the first rollout ran the old limits
+  and the new supervisor's first heartbeat then rewrote them: a second
+  revision, a second migrate Job (which replaced a running one twice in the
+  report) and a second api / worker restart. Seen on 5 of 5 upgrades from
+  2026.09.04-1. firstboot now brings the sizing keys an existing Config
+  already carries to the values the new HelmChart renders, and writes them
+  the moment k3s has applied that HelmChart, so helm-controller runs one job
+  carrying the new image and the new sizing. The timing is the fix. Measured
+  against k3s v1.36.4's helm-controller, patching the Config before the
+  release instead re-runs the previous release's chart: a rollout on the old
+  image, then a second one. A patch that loses the race costs a second
+  revision on the new image seconds later rather than minutes later. It
+  writes nothing when the two already agree, so a reboot adds no revision.
+
+- **Saving an SSH setting no longer leaves `ssh.service` failed (#1632).**
+  The appliance runs sshd socket-activated: `ssh.socket` holds the port.
+  The runner applied a change with `systemctl reload ssh.service`, whose
+  `ExecReload` is `sshd -t` plus `kill -HUP`; sshd answers SIGHUP by
+  re-executing itself, cannot bind the port the socket owns and dies, while
+  both reload commands exit 0. The log said "sshd reloaded" over a failed
+  unit, with no sshd running until the next connection. Under socket
+  activation the runner now restarts `ssh.service` (the socket keeps the
+  port, open sessions survive, `KillMode=process`), which also clears a unit
+  an earlier save left failed, and judges success by whether the unit is
+  active afterwards. A failed apply now fails the trigger and leaves the
+  applied-hash sidecar unwritten, so Fleet shows it as not applied instead of
+  green. Also fixed on the way: under socket activation sshd ignores `Port`,
+  so a changed `ssh_port` opened the firewall for a port nothing listened on.
+  The runner now writes an `ssh.socket` `ListenStream` drop-in and re-binds
+  the socket, which needs `ssh.service` stopped first (systemd refuses to
+  start the socket while its service runs). Because the port now really
+  moves, the move is guarded: it happens only after the firewall has loaded
+  the rule for the new port, and if the socket cannot bind the new port the
+  previous listen port and the previous firewall fragment are both put back,
+  so SSH stays reachable where it was.
+
+- **A reverse zone auto-created in an agentless group now reaches the
+  provider, so its PTRs stop failing "No such zone was found" (#1932).**
+  IPAM auto-sync, DDNS and subnet create wrote the reverse zone row and
+  nothing else; only the zone endpoints pushed it to `technitium_api`,
+  Windows Path B and the cloud drivers, so every PTR op failed and retried.
+  The zone is now marked as not yet at the provider and created after the
+  commit, ahead of its record ops. Whichever path sends one of those ops
+  first, the request or the retry sweep, creates a still-marked zone
+  before it, and ops whose zone cannot be created wait with that error.
+  The mark clears once the zone is at the provider, so a zone that got
+  there once is never created again, even if it is later deleted at the
+  provider. One commit creates at most 16 zones inline (a /17 needs 128);
+  the retry sweep creates the rest, 32 a minute. On upgrade, reverse
+  zones SpatiumDDI auto-created in a `technitium_api` or Windows DNS group
+  are marked and created by the sweep; a zone already at the provider is left
+  as it is. The Copilot's zone create now pushes to the provider before
+  its commit, as the REST create does. Agent-managed groups are unchanged.
+  Groups running a cloud DNS driver (Route 53, Azure DNS, Google Cloud DNS,
+  Cloudflare and the others) only get auto-created reverse zones when the
+  new group setting *Auto-create reverse zones at the provider* is on,
+  because the provider bills per hosted zone and a /17 makes 128. It is off
+  by default and for every existing group, so the upgrade creates nothing
+  at a cloud provider. Opted out, a subnet gets no reverse zone and its PTRs
+  are skipped; the subnet's DNS sync report says why. Reverse zones a cloud
+  group already holds are kept.
+
+- **DNS and DHCP pods no longer rank ahead of the control plane for
+  eviction under memory pressure (#1828).** The kubelet ranks a memory
+  eviction by whether a pod's usage is over its memory request before it
+  looks at the PriorityClass, and the serving pods requested 64Mi while
+  Kea (66-72 Mi), BIND and PowerDNS/Technitium used more at idle, so under
+  pressure they went ahead of the database, the cache and the UI whatever
+  `spatium-service` says. The role chart now requests 128Mi for Kea,
+  PowerDNS and the looking-glass collector and 256Mi for Technitium (BIND
+  already did, #1725). A new test fails any `spatium-service` role
+  requesting less than 128Mi.
+
+- **An agent's config long-poll answers 404, not 500, when its server row is
+  deleted under it (#1936).** `DELETE .../servers/{id}` wakes the server's
+  channel and removes the row; the open long-poll woke and refreshed a row that
+  no longer existed, which SQLAlchemy raised as `Could not refresh instance`
+  and the API answered with an unhandled 500. The DNS and DHCP long-polls (and
+  the DNS inline-render refresh) now answer 404 for a vanished row, the same
+  as for a token whose server is unknown at the start of a request, which is
+  what makes the agent discard its JWT and re-register.
+
+- **A paginated list's `total` no longer counts rows in Trash (#1933).** The
+  shared `paginate` helper counts through
+  `select(count()).select_from(base.subquery())`, and the global soft-delete
+  filter only looked at the outer statement's FROM, so it saw an anonymous
+  subquery and skipped it: the page query was filtered and the count was not.
+  A zone with four of ten records trashed listed six rows under `total: 10`,
+  so the pager offered pages that came back empty. The filter now looks inside
+  subquery FROMs (and CTEs), with the criterion placed inside the subquery.
+  The lists this changes are the zone and group-wide record lists; the other
+  count-over-subquery sites count models that are not soft-deleted. A
+  statement that opts out with `include_deleted` still counts Trash.
+
+- **The control plane's DNSSEC keys for a BIND zone follow the keys BIND
+  serves (#1934).** When BIND changed a zone's keys without a structural
+  reload (a pod replacement that re-keyed the zone, a manual or
+  policy-driven rollover), the zone page kept the old key and a DS made from
+  it. The reported build predated #1886, whose 5-minute re-read is what
+  first let a key change with no reload reach the control plane at all
+  (nothing was refused: no report was sent). That re-read still had gaps:
+  a read or report that failed waited a full 5 minutes to try again, a
+  manual rollover's report was the pre-rollover key set (BIND generates the
+  successor after `rndc` returns), and an `rndc` that could not answer for
+  the zone yet was reported as "no keys", clearing the key rows. The agent
+  now looks again 20 s after any report, rollover or failed read, doubling
+  up to 5 minutes while a zone stays unreadable, and leaves a zone `rndc`
+  cannot answer for out of the report instead of clearing its keys.
+
+- **The DNS Pools and DNSSEC Policies pages no longer offer writes the API
+  refuses (#1879).** Every pool write (create, edit, delete, check now) and
+  every DNSSEC-policy write takes a superadmin, but the top-level DNS Pools
+  page and the DNSSEC Policies page rendered New Pool, Check now, Delete,
+  New policy, Edit and Delete enabled for everyone, so a DNS Editor filled in
+  the form and was then refused. They are now disabled with the reason
+  "Requires superadmin" for anyone else, as the zone's own Pools tab already
+  was (#1877). The IP detail's Reputation **Check now** was gated on editing
+  the address, while `POST /dnsbl/check` asks write on `dnsbl`, which no
+  built-in role but superadmin holds; it now follows that grant, so an IPAM
+  Editor sees it disabled with the reason instead of a 403. The DNS import
+  page let a non-superadmin upload an archive or enter a PowerDNS /
+  Technitium key before refusing it; every `/dns/import` route takes a
+  superadmin, so its Preview import and Test connection buttons now say so.
+
+- **Delete Zone no longer says the zone is permanently deleted (#1880).**
+  The dialog, its confirm checkbox, the "Confirm Permanent Deletion"
+  title and the bulk zone delete all said the zone and its records would
+  be permanently deleted, while the console sends the soft delete and the
+  zone goes to Trash. They now say the zone and its records move to Trash,
+  and that a superadmin can restore them from Administration → Trash
+  (restoring is superadmin-only, so the dialog does not tell a DNS Editor
+  they can undo it themselves). The same untrue "cannot be undone" is gone
+  from the DNS records grid's single-record delete. "Permanent" stays on
+  the paths that are: group, TSIG key and blocking-list deletes, and
+  Trash's purge. Same class as #1152 / #1398 for IPAM.
+
+- **An imported zone no longer has to stay delegated to the server it was
+  migrated off, and Sync stops re-pushing its apex NS (#1892, #1893).** The
+  BIND9, PowerDNS and Technitium importers keep the source's apex NS, which the
+  agent then serves as the zone's NS set. Preview now lists, per zone, an apex
+  NS naming a host outside the target group (`foreign_apex_ns`, plus a
+  warning), and the import page offers to replace it with the group's own
+  servers that have a DNS hostname. The box starts unticked, because an outside
+  NS can be deliberate (a hidden primary whose public NS are a provider's). The
+  commit API takes `apex_ns_policy: "replace"`, and so does the Copilot's
+  `commit_dns_import`. Replacing is audited, leaves delegations below the apex
+  alone, moves a SOA primary name that named the old host, and keeps the rows
+  with a warning when the group has no server with a hostname. Sync with
+  Servers no longer pushes a stored apex NS to a server whose read cannot see
+  the apex NS (a zone transfer drops it); on agent-managed BIND9 that push
+  failed every run for want of a TSIG key.
+
+- **An agentless DNS record op no longer reaches the provider before
+  the database commits (#1539).** Windows DNS, the cloud providers and
+  `technitium_api` were called in the middle of the request, so a commit
+  that then failed rolled back the record and its op row while the
+  provider kept the write, with nothing recording it. The op row is now
+  written `pending` inside the transaction and the driver is called from
+  an after-commit hook (one call per batch, so Windows still chunks),
+  which marks it `applied` or reschedules it with backoff; a process
+  that dies in between leaves a committed `pending` row the retry sweep
+  replays. A provider refusal gets its own `agentless_push_failed` audit
+  row, because the request's audit row is written before the provider is
+  called. Every caller is covered (record CRUD, import, IPAM sync, DDNS,
+  trash purge, Celery workers) since the hook sits on the session. The
+  hook waits for the outer commit (a savepoint release does not count),
+  claims the rows before calling the provider so the retry sweep can never
+  send the same op at the same time, and holds no database connection
+  during the provider call. A bulk delete or IPAM purge no longer keeps a
+  row on a first provider failure: the delete commits, as a single delete
+  always has, the op is retried, and the bulk-delete response and its
+  notice say the provider has not removed the records yet.
+
+- **IPAM delete dialogs no longer promise a non-superadmin a restore
+  (#1930).** The subnet, block and IP space deletes (the tree's Delete…,
+  Edit's Danger zone and both bulk deletes) said "You can restore them from
+  Administration → Trash", but Trash's list and restore are superadmin-only,
+  so an IPAM Editor was promised an undo they cannot perform. They now say
+  that a superadmin can restore them from Administration → Trash, the same
+  wording as the DNS zone delete (#1880). What the dialogs send and how they
+  are gated is unchanged.
+
+- **The DNS agent no longer copies its whole config cache through memory
+  on each apply (#1705).** `save_config` built the bundle as one string
+  and encoded it again, and `commit_config` read `current.json` and
+  wrote it back through memory, each adding about twice the config to
+  the agent's peak (about 237 MiB at 124 MB, the Family filter). The
+  cache is now streamed to disk, compact, fsynced before its rename, and
+  promoted to `previous.json` with a file copy. The ingest sweep also stops
+  re-parsing the cache every 180 s when it has not changed.
+
+- **A group blocklist ships once per view, not twice (#1706).** With
+  views, every view's own RPZ zone already carries the group's lists,
+  yet the group zone was rendered into each view as well, so named
+  loaded the same entries twice per view and the bundle carried them
+  twice. The control plane now omits the group zone when every view has
+  its own, and the agent loads it only into a view without one. Changes
+  served config: the second `zone` and its `response-policy` entry are
+  gone from each view; answers are unchanged.
+
+- **Re-promoting a node that Replace evicted no longer settles it as a
+  member from a stale `ready` (#1903).** A replaced box that is still up
+  keeps `ready\t<seed url>` in its cluster-join sidecar. Promoted again
+  against the same seed, its supervisor skipped the join because the
+  sidecar already said ready for that seed, and the heartbeat applied the
+  reported `ready` (it is the real success signal on a promote), so the
+  row became a member with no join having run. Each promote now stamps a
+  fresh `cluster_transition_id` and its time; the heartbeat answers the id
+  and the promote's age, the supervisor records the id when it fires the
+  join and reports it, with the age of its sidecar verdict, only for a
+  verdict written after that fire. The control plane applies a `ready` /
+  `failed` for a promote only when the ids match or the verdict is younger
+  than the promote, and the supervisor fires the join over a same-seed
+  `ready` only when that `ready` is provably older than the promote.
+  Ages, not timestamps, cross the wire, so no node clock is compared with
+  the control plane's. A supervisor upgraded mid-join (its join fired
+  before the fire record existed) therefore settles from its fresh `ready`
+  instead of re-firing the join. A supervisor that does not send the
+  fields is not judged, so older nodes behave as before. The same check
+  drops a stale `failed` (the gap noted on #1806).
+
 - **A slot-upgrade apply that landed during a systemd reload no longer
   stays pending for good, and a new apply no longer reads the previous
   run's `done` (#1825, #1288).** A `daemon-reload` re-creates the path
@@ -4142,6 +4381,15 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
+  **On the upgrade itself, expect up to two minutes of 500s from
+  appliance host-state reads (#1661).** After the reboot into the new
+  slot, k3s keeps serving the previous release's api until the new
+  control chart rolls it, and that api has no gid 2770, so
+  `GET /api/v1/appliance/slot-upgrade` (and the setup-state and
+  system-info reads) answer `500` until the new api is Ready — about
+  90 s in testing, mixed in with the 502s the rollout already causes.
+  The upgrade completes normally; retry once the new api serves. This
+  happens once, on the upgrade that introduces the tightened directory.
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
@@ -4558,6 +4806,16 @@ the formatter handles the rest.
 - `d9d0f6ddc446` — #1838: nullable `backup_target.last_run_node`, the
   node whose pod wrote `last_run_filename`. No backfill: an existing row
   cannot say where its archive was written, so NULL (unknown) stays.
+- `a1903c5e7b24` — #1903, additive: nullable `appliance.cluster_transition_id`
+  and `appliance.cluster_transition_at`. Downgrade drops both.
+- `c4f19a2e7d53` — #1932, additive + data: nullable
+  `dns_zone.agentless_create_due_at` (an auto-created zone whose provider
+  create is outstanding, and when the sweep may next try) and
+  `dns_server_group.auto_reverse_zones_at_provider` (NOT NULL, default
+  false). Backfill marks the non-imported, auto-generated reverse zones in
+  groups with a `technitium_api` or Windows DNS server with credentials and
+  no cloud server, due now; cloud groups are not marked. Downgrade drops
+  both columns.
 
 ## 2026.10.02-1 — 2026-10-02
 
