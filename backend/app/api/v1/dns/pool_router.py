@@ -773,9 +773,14 @@ async def delete_member(member_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     )
     # Make sure the rendered DNSRecord row goes away before the FK
     # cascade fires (so we get a proper enqueue_record_op delete).
+    # ``apply_pool_state`` reads without autoflush (#1966) so the member —
+    # a delete-orphan once it leaves ``pool.members`` — and its record are
+    # still there for the orphan sweep; the member's own DELETE is written by
+    # the flush that follows, so it is not deleted a second time here.
     pool = await db.get(DNSPool, member.pool_id)
     if pool is not None:
         pool.members = [m for m in pool.members if m.id != member.id]
         await apply_pool_state(db, pool)
-    await db.delete(member)
+    else:
+        await db.delete(member)
     await db.commit()

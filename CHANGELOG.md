@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting a DNS pool member, or a whole pool, now withdraws its addresses
+  from DNS (#1966).** `delete_member` / `delete_pool` took the members out of
+  `pool.members` so `apply_pool_state` could enqueue each record's delete
+  first, but the removed member is a delete-orphan and the reconcile's first
+  query autoflushed it: the `dns_record.pool_member_id` `ON DELETE CASCADE`
+  removed the record row in the same statement, the orphan sweep found
+  nothing, and no delete op was ever sent, so the agent (or provider) kept
+  serving the address until an unrelated write reconciled the whole zone.
+  The reconcile now reads without autoflush and removes the orphans' record
+  rows in one targeted flush before enqueuing their deletes, for agent-managed
+  and agentless groups alike (which also ends the `DELETE ... 0 were matched`
+  warning).
+
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored
   policy name, description, reference, result detail and diagnostic, went
