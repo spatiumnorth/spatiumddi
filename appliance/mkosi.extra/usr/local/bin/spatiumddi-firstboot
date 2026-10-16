@@ -1411,6 +1411,18 @@ case "$BOOTSTRAP_ROLE" in
         ;;
 esac
 
+# #1866 — spatium-cluster-join's leave runs this script with
+# SPATIUM_FIRSTBOOT_RENDER_ONLY=1, while k3s is stopped, to render the
+# bootstrap manifests for the build the node runs now, as its next boot
+# would. The copies it set aside when it joined name the build it joined
+# on, and a node slot upgraded since holds only the new build's images.
+# Everything above runs on every boot and is safe there; everything below
+# wants a running k3s, and the node's next boot does it.
+if [ "${SPATIUM_FIRSTBOOT_RENDER_ONLY:-}" = "1" ]; then
+    echo "render-only (#1866): bootstrap manifests rendered for ${SPATIUMDDI_VERSION} (role=${BOOTSTRAP_ROLE}); stopping here"
+    exit 0
+fi
+
 # ── Render agent landing page ───────────────────────────────────────────────
 # Static "this is a SpatiumDDI appliance" page served on :80 by the
 # agent-landing nginx pod (chart template:

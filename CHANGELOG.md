@@ -755,6 +755,34 @@ the formatter handles the rest.
   node still reporting `left` while its row says `joining`) is guarded the
   same way.
 
+- **A member upgraded after it joined comes out of a demote with its
+  supervisor running (#1866).** The leave put back the bootstrap
+  manifests the member set aside when it joined, and those name the
+  build it joined on. After a slot upgrade the node holds only the new
+  build's images, so the supervisor never started (ErrImageNeverPull)
+  and the row never left `leaving`. The leave now renders the bootstrap
+  manifests again for the build the node runs, as its next boot would,
+  before it restarts k3s.
+
+- **A demoted member whose k3s takes a while to come back no longer
+  ends the leave `failed` (#1859).** The leave wipes the node's image
+  store with its cluster identity, so its fresh k3s imports every image
+  again before it reports Ready, and on a slow disk that took longer
+  than the leave's 180 s wait. The node was already wiped, so giving up
+  recovered nothing: the row stayed `failed` while k3s came up anyway.
+  The leave now waits up to 600 s more, as a join that registered with
+  the seed's etcd does.
+
+- **Demoting both members of a three-node cluster no longer takes the
+  api down for good when the Redis master ran on one of them (#1860).**
+  Sentinel fails over only with a majority of the Sentinels it knows,
+  so once both members left, the seed's lone Sentinel could never move
+  a master that had been on a member, and the api answered 502 from
+  then on. The demote now moves the master to a node that stays first,
+  while all three Sentinels are up, and keeps every Redis pod on a
+  leaving member from being promoted. It is refused (409) when the
+  master cannot be moved, and nothing is changed.
+
 - **A Halt or Abort mid-node, and a drive that lost the upgrade Lease,
   no longer get overwritten by the drive (#1702, #1704, #1707).** A
   rolling-upgrade drive kept its own copy of the run for the whole of a
