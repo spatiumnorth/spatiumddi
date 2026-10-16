@@ -84,6 +84,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The global search palette is a named, modal dialog that holds focus
+  (#1949).** Ctrl/Cmd+K opened an overlay with no role, no name and no
+  focus trap: a screen reader was not told a modal had opened, Tab and
+  Shift+Tab walked out to the page behind, and the `?` shortcut's
+  open-dialog guard could not see it, so Keyboard shortcuts opened on top
+  of the palette. The card is now `role="dialog"` with `aria-modal` and
+  the name "Search", Tab and Shift+Tab cycle inside it, Esc closes it and
+  focus returns to whatever opened it. The input is a combobox over a
+  listbox of options (`aria-activedescendant` follows the arrow keys), the
+  "Searching…" / "No results" text is a polite live region outside that
+  listbox, and the clear-query X is named "Clear search" (#1950). Opened
+  over another dialog, the palette alone holds Tab and Esc, and closing it
+  puts focus back inside that dialog.
+
 - **Moving a DNS server to another group no longer deadlocks against the
   worker's bundle render or the agent, and the agent's requests no longer
   answer 500 when a move deletes what they were updating (#1703, #1929).**
