@@ -95,5 +95,17 @@ async def test_agent_zone_state_stores_serial_above_int32(
 
 def test_serial_increment_wraps_mod_2_32() -> None:
     now = datetime(2026, 10, 16, tzinfo=UTC)
-    assert compute_next_serial(4_294_967_295, now=now) == 0
+    # Wraps past 2^32 - 1 to 1, skipping 0 (BIND's increment does the same;
+    # 0 is the "never seeded" sentinel that renderers turn into 1).
+    assert compute_next_serial(4_294_967_295, now=now) == 1
+    assert compute_next_serial(4_294_967_294, now=now) == 4_294_967_295
     assert compute_next_serial(BIG, now=now) == BIG + 1
+    # Every step from just below the top is later than its predecessor under
+    # RFC 1982 serial arithmetic, including the wrap and the jump back to a
+    # date-based serial afterwards.
+    cur = 4_294_967_290
+    for _ in range(10):
+        nxt = compute_next_serial(cur, now=now)
+        assert 0 < nxt < 2**32
+        assert 0 < (nxt - cur) % 2**32 < 2**31, (cur, nxt)
+        cur = nxt
