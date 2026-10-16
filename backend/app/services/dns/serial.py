@@ -15,6 +15,9 @@ if TYPE_CHECKING:
     from app.models.dns import DNSZone
 
 
+SERIAL_MODULUS = 2**32  # SOA serials are unsigned 32-bit, RFC 1982 arithmetic is mod 2^32
+
+
 def compute_next_serial(current: int, *, now: datetime | None = None) -> int:
     """Return the next serial for a zone with ``current`` as the last value.
 
@@ -27,6 +30,10 @@ def compute_next_serial(current: int, *, now: datetime | None = None) -> int:
       * Otherwise (freshly seeded / garbage value) use today's
         ``YYYYMMDD00`` if that is greater than ``current``, else ``current + 1``.
     """
+    return _next_serial(current, now=now) % SERIAL_MODULUS
+
+
+def _next_serial(current: int, *, now: datetime | None) -> int:
     now = now or datetime.now(UTC)
     today_base = int(now.strftime("%Y%m%d")) * 100
 

@@ -1036,7 +1036,8 @@ async def agent_ops_ack(
 
 class ZoneStateEntry(BaseModel):
     zone_name: str
-    serial: int
+    # SOA serial: unsigned 32-bit (RFC 1035 §3.3.13), so 0..2^32-1, not int32.
+    serial: int = Field(ge=0, le=4294967295)
 
 
 class ZoneStateReport(BaseModel):

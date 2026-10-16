@@ -84,6 +84,8 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial raised "integer out of range" and the agent zone-state report answered 500. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment wraps modulo 2^32 as RFC 1982 arithmetic does.
+
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored
   policy name, description, reference, result detail and diagnostic, went
@@ -4887,6 +4889,8 @@ the formatter handles the rest.
   that never expires is what you want.
 
 ### Migrations
+
+- `d2a6e81f3b57` — #1975, widens `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` from `INTEGER` to `BIGINT`. Downgrade narrows them back and fails if a stored serial no longer fits.
 
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
