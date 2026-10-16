@@ -1038,6 +1038,10 @@ function GroupModal({
   const [isPublicFacing, setIsPublicFacing] = useState(
     group?.is_public_facing ?? false,
   );
+  // #1932 — subnet reverse zones in a cloud DNS group are opt-in.
+  const [autoReverseAtProvider, setAutoReverseAtProvider] = useState(
+    group?.auto_reverse_zones_at_provider ?? false,
+  );
   const [error, setError] = useState("");
   const [confirmRotate, setConfirmRotate] = useState(false);
   const [rotated, setRotated] = useState(false);
@@ -1084,6 +1088,7 @@ function GroupModal({
             catalog_zones_enabled: catalogZonesEnabled,
             catalog_zone_name: catalogZoneName.trim(),
             is_public_facing: isPublicFacing,
+            auto_reverse_zones_at_provider: autoReverseAtProvider,
           });
         }}
         className="space-y-3"
@@ -1145,6 +1150,26 @@ function GroupModal({
               — flag this group as exposed to the public internet. Publishing a
               private IP (RFC 1918 / CGNAT / ULA) into a zone in this group will
               require typed-CIDR confirmation on the IPAM side.
+            </span>
+          </span>
+        </label>
+
+        <label className="flex items-start gap-2 text-xs cursor-pointer select-none rounded border bg-muted/20 px-3 py-2">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4"
+            checked={autoReverseAtProvider}
+            onChange={(e) => setAutoReverseAtProvider(e.target.checked)}
+          />
+          <span>
+            <span className="font-medium">
+              Auto-create reverse zones at the provider
+            </span>
+            <span className="ml-1 text-muted-foreground">
+              — cloud DNS groups only (Route 53, Azure, Google, Cloudflare, …).
+              Each reverse zone is a hosted zone the provider bills for, one per
+              /24 a subnet spans. Off: subnets here get no reverse zone and no
+              PTRs.
             </span>
           </span>
         </label>
