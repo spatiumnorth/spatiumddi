@@ -95,7 +95,12 @@ the formatter handles the rest.
   evaluator only visits enabled rules and nothing else would ever close
   them; the count is recorded in that update's audit row
   (`resolved_open_events`). Overview and the "Open only" list stop
-  showing them.
+  showing them. Resolution is silent, as the evaluator's own is. A rule
+  already disabled with events stuck open is cleared by sending the
+  disable again. The `audit-chain-broken` and `schema-behind-head` rules
+  no longer open (or deliver) an event while disabled, matching the
+  ACME, upgrade and conformity rules; otherwise the next pass after a
+  disable would re-open and re-deliver the alert it had just closed.
 
 - **Kubernetes Detect CIDRs answered 500 when the token held a non-ASCII
   character (#1913).** The bearer token goes straight into an

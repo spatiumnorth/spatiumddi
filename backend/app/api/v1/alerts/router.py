@@ -390,8 +390,12 @@ async def update_rule(
     # #1988 — disabling a rule closes what it still has open. The
     # evaluator only visits enabled rules, so nothing would ever resolve
     # these: a dashboard counting an alert whose condition may be long
-    # gone. Recorded in the same audit row as the disable.
-    if changed.get("enabled", {}).get("new") is False:
+    # gone. Recorded in the same audit row as the disable. Keyed on the
+    # request (``enabled: false`` sent), not on the column flipping, so a
+    # rule disabled before this fix — whose events are stuck open — can
+    # be cleared by sending the disable again. Resolution is silent, as
+    # the evaluator's own resolve is: no delivery fires for a close.
+    if changes.get("enabled") is False:
         closed = await db.execute(
             update(AlertEvent)
             .where(AlertEvent.rule_id == rule.id, AlertEvent.resolved_at.is_(None))
