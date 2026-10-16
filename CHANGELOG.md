@@ -261,6 +261,15 @@ the formatter handles the rest.
   revision on the new image seconds later rather than minutes later. It
   writes nothing when the two already agree, so a reboot adds no revision.
 
+- **A revoked node's teardown that could not run now says why (#1884).**
+  Once revoked, the supervisor runs its teardown on every rejected
+  heartbeat. It logged a teardown that stopped something, or one that
+  raised, but not one that returned without stopping anything, so a
+  teardown that could reach no kube API, as on a member its peers had
+  already fenced out, returned in silence. It now logs
+  `supervisor.heartbeat.revoked_teardown_incomplete` with the state and
+  the reason; it still tries again on the next heartbeat.
+
 - **A role change whose apply met an unready kube API is tried again, and
   the node says why (#1716).** A role change is applied once, on the
   node's next heartbeat, and the apply first asks the kube API's `/readyz`
