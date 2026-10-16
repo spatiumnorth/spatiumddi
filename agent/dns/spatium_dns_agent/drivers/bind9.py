@@ -3072,6 +3072,20 @@ class Bind9Driver(DriverBase):
 
     # ── DNSSEC (issue #49) ──────────────────────────────────────────────────
 
+    def _zone_rndc_scopes(self, zone: str) -> list[list[str]]:
+        """The rndc zone arguments that address ``zone``: ``[zone, "IN", view]``
+        for each view the last render placed it in, or ``[zone]`` without views
+        (#1946). Read off the rendered tree, like ``rendered_zone_views``."""
+        want = zone.rstrip(".").lower()
+        views: list[str] = []
+        if getattr(self, "state_dir", None) is not None:
+            views = [
+                v
+                for z, v in self.rendered_zone_views()
+                if v and z.rstrip(".").lower() == want
+            ]
+        return [[zone, "IN", v] for v in views] or [[zone]]
+
     def _rndc_base(self) -> list[str]:
         cmd = ["rndc"]
         agent_conf = self.state_dir / "rndc.conf"
@@ -3122,7 +3136,9 @@ class Bind9Driver(DriverBase):
         ds_records: list[str] = []
         if shutil.which("rndc"):
             res = subprocess.run(
-                [*self._rndc_base(), "dnssec", "-status", zone],
+                # #1946 — one view's copy under split-horizon (the key files
+                # are shared); a bare zone name is ambiguous there.
+                [*self._rndc_base(), "dnssec", "-status", *self._zone_rndc_scopes(zone)[0]],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -3164,10 +3180,18 @@ class Bind9Driver(DriverBase):
         key_tag = rec.get("key_tag")
         if not shutil.which("rndc"):
             raise RuntimeError("rndc not available — cannot roll DNSSEC key")
-        cmd = [*self._rndc_base(), "dnssec", "-rollover", "-key", str(key_tag), zone]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if res.returncode != 0:
-            raise RuntimeError(f"rndc dnssec -rollover failed: {res.stderr.strip()}")
+        # #1946 — under split-horizon the zone is loaded once per view that
+        # holds it, and a bare ``rndc dnssec … <zone>`` then fails with "zone
+        # was found in multiple views". Roll it in every view that holds it
+        # (BIND 9.20: each view's copy rolls; the key files are shared).
+        failures: list[str] = []
+        for scope in self._zone_rndc_scopes(zone):
+            cmd = [*self._rndc_base(), "dnssec", "-rollover", "-key", str(key_tag), *scope]
+            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if res.returncode != 0:
+                failures.append(f"{' '.join(scope)}: {res.stderr.strip()}")
+        if failures:
+            raise RuntimeError(f"rndc dnssec -rollover failed: {'; '.join(failures)}")
         log.info("dnssec_rollover_triggered", zone=zone, key_tag=key_tag)
         try:
             return {"dnssec_state": self._zone_dnssec_state(zone)}

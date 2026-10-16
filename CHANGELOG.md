@@ -106,6 +106,69 @@ the formatter handles the rest.
   error during a scheduled run left the run stuck `in_progress`. Both are
   refused when saved.
 
+- **A record op that appends one value to a name no longer replaces the
+  whole name on an agentless DNS server (#1983).** An `update` carrying
+  `rrset_action="add"` opts out of whole-RRset stamping, and the driver-side
+  `RecordChange` has no `rrset_action`, so Windows (WinRM and RFC 2136),
+  Route 53, Google Cloud DNS and Azure DNS each read it as a single-value
+  replace and kept only the last value written. The one reachable case was a
+  DNS pool TTL change, which sends one such `update` per member: on an
+  agentless group the pool was left answering with its last member while the
+  database still listed them all. The agentless record-op path now stamps
+  those ops with the whole folded RRset. The issue was filed against the
+  cutover TTL pre-flight, which emits the same shape for the siblings of a
+  round-robin name; that path never reaches an agentless server (the
+  pre-flight refuses a group whose primary is agentless, and an agent
+  primary's record ops go to agent servers only), so it is covered
+  defensively. Cloudflare stores one row per value and was not affected. A
+  pool's `create` and `delete_value` ops are unchanged, and so is the agent
+  path.
+
+- **Removing one DNS pool member on a Windows DNS server no longer deletes
+  the healthy members too (#1980).** A pool member removal is a `delete` op
+  with `rrset_action="delete_value"` and no resolved RRset, and the Windows
+  driver deleted the whole name and type on both of its paths, so every
+  sibling A / AAAA went with it: over WinRM it piped every
+  `Get-DnsServerResourceRecord` result to `Remove-…`, and over RFC 2136 (a
+  server with no WinRM credentials) it sent a delete-the-RRset update. Over
+  WinRM a value-only delete now keeps only the record whose rdata matches, in
+  both the singular and batched scripts: A and AAAA compared as IP addresses,
+  NS / PTR / MX case-insensitively without the trailing dot, TXT exactly. Over
+  RFC 2136 it deletes that one RR. Both stay a no-op when nothing matches or
+  the zone is absent. CNAME and the types with no single rdata property keep
+  deleting the whole name. The cloud drivers (Route 53, Google, Azure, Cloudflare) were checked
+  and already remove only the matching value.
+
+- **Deleting a DNS pool member, or a whole pool, now withdraws its addresses
+  from DNS (#1966).** `delete_member` / `delete_pool` took the members out of
+  `pool.members` so `apply_pool_state` could enqueue each record's delete
+  first, but the removed member is a delete-orphan and the reconcile's first
+  query autoflushed it: the `dns_record.pool_member_id` `ON DELETE CASCADE`
+  removed the record row in the same statement, the orphan sweep found
+  nothing, and no delete op was ever sent, so the agent (or provider) kept
+  serving the address until an unrelated write reconciled the whole zone.
+  Both handlers now withdraw the members' records (row and `delete_value`
+  op) while the members still exist, and only then delete them, for
+  agent-managed and agentless groups alike. The reconcile's orphan sweep is
+  kept as a safety net and now reads without autoflush, so it no longer
+  loses the rows the same way (which also ends the `DELETE ... 0 were
+  matched` warning).
+
+- **A manual DNSSEC rollover in a group with a view is now delivered
+  to the agent (#1946).** Under split-horizon (or active geo steering) every
+  bundle render retired the server's queued ops as `applied` and the
+  bundle shipped none, whatever their kind. That is right for record ops,
+  which the body carries, but a `dnssec_rollover` has no carrier in it and
+  the BIND9 agent rolls a key only from the op, so the endpoint answered
+  `queued` and no key rolled (PowerDNS / Technitium `dnssec_sign` /
+  `dnssec_unsign` were lost the same way). The views render now retires only
+  `create` / `update` / `delete` ops and still pages every other kind to
+  the agent, which acks it as usual. The BIND9 agent now also rolls the key
+  in every view that holds the zone: a zone in two views made a bare
+  `rndc dnssec -rollover` fail with "found in multiple views" (verified on
+  BIND 9.20). And the endpoint answers 409 instead of `queued` when it wrote
+  no op at all (no primary, or no enabled agent-based server).
+
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored
   policy name, description, reference, result detail and diagnostic, went
@@ -776,6 +839,34 @@ the formatter handles the rest.
   and `failed` still apply. The mirror race on promote (a once-demoted
   node still reporting `left` while its row says `joining`) is guarded the
   same way.
+
+- **A member upgraded after it joined comes out of a demote with its
+  supervisor running (#1866).** The leave put back the bootstrap
+  manifests the member set aside when it joined, and those name the
+  build it joined on. After a slot upgrade the node holds only the new
+  build's images, so the supervisor never started (ErrImageNeverPull)
+  and the row never left `leaving`. The leave now renders the bootstrap
+  manifests again for the build the node runs, as its next boot would,
+  before it restarts k3s.
+
+- **A demoted member whose k3s takes a while to come back no longer
+  ends the leave `failed` (#1859).** The leave wipes the node's image
+  store with its cluster identity, so its fresh k3s imports every image
+  again before it reports Ready, and on a slow disk that took longer
+  than the leave's 180 s wait. The node was already wiped, so giving up
+  recovered nothing: the row stayed `failed` while k3s came up anyway.
+  The leave now waits up to 600 s more, as a join that registered with
+  the seed's etcd does.
+
+- **Demoting both members of a three-node cluster no longer takes the
+  api down for good when the Redis master ran on one of them (#1860).**
+  Sentinel fails over only with a majority of the Sentinels it knows,
+  so once both members left, the seed's lone Sentinel could never move
+  a master that had been on a member, and the api answered 502 from
+  then on. The demote now moves the master to a node that stays first,
+  while all three Sentinels are up, and keeps every Redis pod on a
+  leaving member from being promoted. It is refused (409) when the
+  master cannot be moved, and nothing is changed.
 
 - **A Halt or Abort mid-node, and a drive that lost the upgrade Lease,
   no longer get overwritten by the drive (#1702, #1704, #1707).** A
