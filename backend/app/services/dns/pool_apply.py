@@ -42,49 +42,36 @@ async def apply_pool_state(
     The pool's TTL is honoured on every emitted record so changes to
     ``pool.ttl`` flow through on the next reconcile pass.
     """
-    zone = await db.get(DNSZone, pool.zone_id)
+    # #1966 — every read below runs without autoflush. A caller that took a
+    # member out of ``pool.members`` (``delete_member`` / ``delete_pool``)
+    # has queued the member row's DELETE as a delete-orphan; the first query
+    # here would autoflush it, and the ``dns_record.pool_member_id`` FK
+    # ``ON DELETE CASCADE`` would take the member's record row with it in
+    # the same statement — before the orphan sweep could read it, so no
+    # delete op was ever enqueued and the agent kept serving the address.
+    with db.no_autoflush:
+        zone, existing_by_member, orphan_records = await _read_pool_state(db, pool)
     if zone is None:
         return {"created": 0, "deleted": 0, "skipped": 0}
-
-    # Existing records for this pool — keyed by member id so we can
-    # diff against desired state below. No name/type filter on this
-    # query because the rename branch downstream needs to find the
-    # record under its OLD name to delete-then-recreate it.
-    existing_res = await db.execute(
-        select(DNSRecord).where(
-            DNSRecord.zone_id == pool.zone_id,
-            DNSRecord.pool_member_id.in_(_member_ids(pool)),
-        )
-    )
-    existing_by_member: dict[str, DNSRecord] = {
-        str(r.pool_member_id): r for r in existing_res.scalars().all()
-    }
-
-    # Orphan sweep — records whose ``pool_member_id`` belongs to a
-    # member of THIS pool that's no longer in ``pool.members`` (eg.
-    # the caller is ``delete_member`` which mutated the in-memory
-    # list before calling here). Without this, the FK
-    # ``ondelete=CASCADE`` on ``DNSRecord.pool_member_id`` strips the
-    # record row at SQL commit but no ``enqueue_record_op('delete')``
-    # ever fires, leaving BIND9 serving the stale answer until the
-    # zone re-renders for some other reason.
-    current_member_ids = {str(m.id) for m in pool.members}
-    orphan_res = await db.execute(
-        select(DNSRecord)
-        .join(DNSPoolMember, DNSRecord.pool_member_id == DNSPoolMember.id)
-        .where(DNSPoolMember.pool_id == pool.id)
-    )
-    orphan_records = [
-        r for r in orphan_res.scalars().all() if str(r.pool_member_id) not in current_member_ids
-    ]
 
     created = 0
     deleted = 0
     skipped = 0
 
-    for orphan in orphan_records:
-        await _delete_pool_record(db, zone, orphan)
-        deleted += 1
+    if orphan_records:
+        # Every orphan's row goes in ONE targeted flush, before any op is
+        # enqueued: ``enqueue_record_op`` autoflushes, which would write the
+        # pending member DELETEs, and the FK cascade would then take the
+        # orphans not yet deleted here (#1966).
+        snapshots = [_delete_snapshot(o) for o in orphan_records]
+        for orphan in orphan_records:
+            await db.delete(orphan)
+        await db.flush(orphan_records)
+        for snapshot in snapshots:
+            await enqueue_record_op(
+                db, zone, "delete", snapshot, target_serial=bump_zone_serial(zone)
+            )
+            deleted += 1
 
     for member in pool.members:
         should_render = bool(member.enabled) and (
@@ -181,6 +168,82 @@ async def apply_pool_state(
     return {"created": created, "deleted": deleted, "skipped": skipped}
 
 
+async def withdraw_member_records(
+    db: AsyncSession, pool: DNSPool, members: list[DNSPoolMember]
+) -> int:
+    """Withdraw the rendered records of ``members`` BEFORE they are deleted.
+
+    Call while the members are still in ``pool.members`` and nothing about
+    them is pending. Each record is found by ``pool_member_id`` directly,
+    deleted, flushed and its ``delete_value`` op enqueued — so by the time
+    the member rows go, the ``dns_record.pool_member_id`` FK ``ON DELETE
+    CASCADE`` has nothing left to take silently (#1966: it used to take the
+    record row first, and no delete op was ever sent). Returns how many
+    records were withdrawn.
+    """
+    ids = [m.id for m in members]
+    if not ids:
+        return 0
+    zone = await db.get(DNSZone, pool.zone_id)
+    if zone is None:
+        return 0
+    recs = (
+        (await db.execute(select(DNSRecord).where(DNSRecord.pool_member_id.in_(ids))))
+        .scalars()
+        .all()
+    )
+    for rec in recs:
+        await _delete_pool_record(db, zone, rec)
+    if recs:
+        logger.info("dns_pool_members_withdrawn", pool=pool.name, zone=zone.name, deleted=len(recs))
+    return len(recs)
+
+
+async def _read_pool_state(
+    db: AsyncSession, pool: DNSPool
+) -> tuple[DNSZone | None, dict[str, DNSRecord], list[DNSRecord]]:
+    """The zone, the pool's rendered records keyed by member id, and the
+    orphans (records of a member of this pool no longer in ``pool.members``).
+    Call under ``db.no_autoflush`` (``apply_pool_state``)."""
+    zone = await db.get(DNSZone, pool.zone_id)
+    if zone is None:
+        return None, {}, []
+
+    # Existing records for this pool — keyed by member id so we can
+    # diff against desired state below. No name/type filter on this
+    # query because the rename branch downstream needs to find the
+    # record under its OLD name to delete-then-recreate it.
+    existing_res = await db.execute(
+        select(DNSRecord).where(
+            DNSRecord.zone_id == pool.zone_id,
+            DNSRecord.pool_member_id.in_(_member_ids(pool)),
+        )
+    )
+    existing_by_member: dict[str, DNSRecord] = {
+        str(r.pool_member_id): r for r in existing_res.scalars().all()
+    }
+
+    # Orphan sweep — records whose ``pool_member_id`` belongs to a
+    # member of THIS pool that's no longer in ``pool.members`` (eg.
+    # the caller is ``delete_member`` which mutated the in-memory
+    # list before calling here). Without this, the FK
+    # ``ondelete=CASCADE`` on ``DNSRecord.pool_member_id`` strips the
+    # record row at SQL commit but no ``enqueue_record_op('delete')``
+    # ever fires, leaving BIND9 serving the stale answer until the
+    # zone re-renders for some other reason.
+    current_member_ids = {str(m.id) for m in pool.members}
+    orphan_res = await db.execute(
+        select(DNSRecord)
+        .join(DNSPoolMember, DNSRecord.pool_member_id == DNSPoolMember.id)
+        .where(DNSPoolMember.pool_id == pool.id)
+    )
+    orphan_records = [
+        r for r in orphan_res.scalars().all() if str(r.pool_member_id) not in current_member_ids
+    ]
+
+    return zone, existing_by_member, orphan_records
+
+
 def _member_ids(pool: DNSPool) -> list[str]:
     if not pool.members:
         return ["00000000-0000-0000-0000-000000000000"]  # safe non-match
@@ -215,7 +278,7 @@ async def _create_pool_record(
     )
 
 
-async def _delete_pool_record(db: AsyncSession, zone: DNSZone, rec: DNSRecord) -> None:
+def _delete_snapshot(rec: DNSRecord) -> dict[str, object]:
     # ``delete_value`` removes only this specific RR — sibling pool
     # members at the same (name, rtype) survive. Without this, removing
     # one unhealthy member would wipe every healthy member's record too.
@@ -225,16 +288,24 @@ async def _delete_pool_record(db: AsyncSession, zone: DNSZone, rec: DNSRecord) -
     # that pair order-dependent (the delete's set is computed before the row is
     # mutated, so applying it after the create would drop the new address).
     # Per-RR semantics are order-independent, which is what this path needs.
-    snapshot = {
+    return {
         "name": rec.name,
         "type": rec.record_type,
         "value": rec.value,
         "ttl": rec.ttl,
         "rrset_action": "delete_value",
     }
+
+
+async def _delete_pool_record(db: AsyncSession, zone: DNSZone, rec: DNSRecord) -> None:
+    snapshot = _delete_snapshot(rec)
     target_serial = bump_zone_serial(zone)
     await db.delete(rec)
-    await db.flush()
+    # Only this row. A bare ``flush()`` would also write a pending delete-orphan
+    # member's DELETE in the same unit of work, in no defined order against
+    # this one: the member first lets the FK cascade take this row, and the
+    # ORM's own DELETE then matches nothing (#1966).
+    await db.flush([rec])
     await enqueue_record_op(db, zone, "delete", snapshot, target_serial=target_serial)
 
 

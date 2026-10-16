@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting a DNS pool member, or a whole pool, now withdraws its addresses
+  from DNS (#1966).** `delete_member` / `delete_pool` took the members out of
+  `pool.members` so `apply_pool_state` could enqueue each record's delete
+  first, but the removed member is a delete-orphan and the reconcile's first
+  query autoflushed it: the `dns_record.pool_member_id` `ON DELETE CASCADE`
+  removed the record row in the same statement, the orphan sweep found
+  nothing, and no delete op was ever sent, so the agent (or provider) kept
+  serving the address until an unrelated write reconciled the whole zone.
+  Both handlers now withdraw the members' records (row and `delete_value`
+  op) while the members still exist, and only then delete them, for
+  agent-managed and agentless groups alike. The reconcile's orphan sweep is
+  kept as a safety net and now reads without autoflush, so it no longer
+  loses the rows the same way (which also ends the `DELETE ... 0 were
+  matched` warning).
+
 - **A manual DNSSEC rollover in a group with a view is now delivered
   to the agent (#1946).** Under split-horizon (or active geo steering) every
   bundle render retired the server's queued ops as `applied` and the
