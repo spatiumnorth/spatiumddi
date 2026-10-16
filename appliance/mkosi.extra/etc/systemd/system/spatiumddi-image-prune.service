@@ -4,8 +4,10 @@ Documentation=https://github.com/spatiumnorth/spatiumddi/issues/441
 # Skip on the live ISO — no k3s there.
 ConditionKernelCommandLine=!boot=live
 # Needs the k3s containerd socket; /var holds the log + image store.
+# After= only, never Wants= k3s.service (#1723): a weekly tick that lands
+# while the cluster join runner holds k3s stopped must not start it. With
+# k3s stopped, crictl lists nothing and the script keeps every image.
 After=k3s.service local-fs.target
-Wants=k3s.service
 
 [Service]
 Type=oneshot

@@ -3482,6 +3482,21 @@ def active_slot_upgrade() -> dict | None:
     return p
 
 
+def _etc_overlay_missing() -> bool:
+    """#1910 — True on an installed slot whose /etc overlay did not mount.
+
+    /etc is an overlay (etc.mount: lower /usr/lib/etc.image, upper
+    /var/persist/etc); without it the slot's bare /etc is all there is,
+    and k3s, which requires the overlay, stays down. The live ISO runs
+    without the overlay by design, so it never counts."""
+    try:
+        if "boot=live" in Path("/proc/cmdline").read_text(encoding="utf-8").split():
+            return False
+    except OSError:
+        pass
+    return Path("/usr/lib/etc.image").is_dir() and not os.path.ismount("/etc")
+
+
 def k3s_status() -> tuple[str, str] | None:
     """Issue #183 Phase 1 — derive a (label, style) tuple for the
     console's 'k3s' row, or ``None`` when k3s isn't baked into this
@@ -3533,6 +3548,14 @@ def k3s_status() -> tuple[str, str] | None:
         unit_state = "unknown"
 
     if unit_state in ("inactive", "unknown"):
+        if _etc_overlay_missing():
+            # #1910 — k3s.service Requires=etc.mount: on a boot whose
+            # overlay failed it never started, and "disabled" would send
+            # the operator to the wrong fix.
+            return (
+                f"{version} · held — /etc overlay not mounted (journalctl -b -u etc.mount)",
+                "bold red",
+            )
         return (f"{version} · disabled (systemctl enable --now k3s)", "yellow")
     if unit_state == "failed":
         return (f"{version} · failed — journalctl -u k3s", "bold red")
@@ -3599,6 +3622,24 @@ def control_plane_reachable(env: dict[str, str], timeout: float = 2.0) -> bool |
         return False
 
 
+def _state_not_mounted() -> bool:
+    """#1910 — True when the STATE partition is present but not mounted.
+
+    The supervisor's identity lives on STATE (/var/persist/spatium-supervisor
+    links into /var/lib/spatium-state). When STATE did not mount,
+    spatium-etc-render stops rather than let the supervisor mint a new
+    identity on the empty mountpoint, so the Identity row says why it is
+    held. The live ISO never counts."""
+    try:
+        if "boot=live" in Path("/proc/cmdline").read_text(encoding="utf-8").split():
+            return False
+    except OSError:
+        pass
+    return Path("/dev/disk/by-label/state").exists() and not os.path.ismount(
+        "/var/lib/spatium-state"
+    )
+
+
 def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple[str, str] | None:
     """#170 — derive a (label, style) tuple for the console's
     'Identity' row, or ``None`` when the role doesn't pair against
@@ -3621,6 +3662,12 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
     """
     if role not in ("appliance", "application"):
         return None
+    if _state_not_mounted():
+        # #1910 — every file below is on STATE; without it they read as
+        # "Bootstrapping…", and the node is not bootstrapping, it is held.
+        # The render writes why to its own log (and the kernel log), not to
+        # its unit's journal, so the row points there.
+        return ("Held — STATE not mounted (see /var/log/spatiumddi/etc-render.log)", "bold red")
     state_dir = Path("/var/persist/spatium-supervisor")
     approval_state_file = state_dir / "approval-state"
     identity_dir = state_dir / "identity"

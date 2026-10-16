@@ -84,6 +84,71 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Icon-only buttons have accessible names (#1950).** The remove X on
+  a custom option row of the DHCP option editor (used by the scope,
+  option-template and client-class dialogs) was announced by a screen
+  reader as just "button". It is now "Remove option", with a matching
+  tooltip. A sweep found thirteen more icon-only buttons with no name
+  (APT source / GPG key / credential remove, Copilot send, the aggregation
+  panel's close, AI provider edit / delete, audit-log previous / next page,
+  IPAM template child remove, firewall rule remove, IP space delete, and
+  the IPAM drag-and-drop error's dismiss), all named the same way, and a
+  test now fails on any new one. The search palette's clear-query X is
+  named by the #1949 change.
+
+- **A node whose STATE partition did not mount at boot no longer comes
+  back with a new identity (#1910).** STATE is mounted `nofail`, so a
+  boot whose STATE check was stopped part-way, as after a hard power-off,
+  went on with `/var/lib/spatium-state` as an empty directory on `/var`.
+  `spatium-etc-render` wrote the node's identity paths into it, the
+  supervisor's identity link resolved into it, and the supervisor minted
+  a new identity its control plane did not know: the appliance stopped
+  heartbeating as itself. The render now starts the STATE mount, and
+  with it the check, itself when the partition is present but not
+  mounted, up to three times. When STATE still does not mount it stops
+  before reading or writing anything there, says so in the journal and
+  on the kernel log, and keeps the hostname the last good boot rendered
+  into `/etc`; the supervisor has no identity to start with and does not
+  make one. k3s, DNS and DHCP keep running. The console's Identity row
+  reads "Held — STATE not mounted" instead of "Bootstrapping…". The
+  render was also only ordered after `local-fs.target`, which a `nofail`
+  mount does not hold back, so a slow STATE check could lose that race
+  on any boot; the render now waits for the mount. What stopped the
+  check is not fixed here: a node whose STATE does not mount no longer
+  runs as someone else.
+
+- **k3s and first-boot no longer start without the `/etc` overlay
+  (#1910).** The node's own `/etc` (its hostname, machine-id, the k3s
+  drop-ins that carry its role label and CIDRs, the appliance `.env` and
+  role-config) is the overlay's upper layer, and `etc.mount` is only
+  wanted by `local-fs.target`, so a boot whose overlay failed to mount
+  went on. `k3s.service` and `spatiumddi-firstboot.service` were only
+  ordered after it: after a power-off k3s started on the slot's bare
+  `/etc` and registered a new Node, `localhost`, without the role or
+  CIDRs, and first-boot generated a fresh `.env` as on a first boot.
+  Both now require the overlay, as the host runners' reload units
+  already do, so on such a boot they stay down, and the console's k3s
+  row reads "held — /etc overlay not mounted" instead of "disabled".
+  Why the overlay failed to mount is not fixed here: a node whose
+  overlay does not mount no longer runs as someone else.
+
+- **A control-plane join no longer comes up as a cluster of its own
+  (#1723).** `spatium-cluster-join` stops k3s and moves the node's
+  identity aside, its k3s token included, before it writes the config for
+  the cluster it is joining. Moving the token triggered the join-token
+  publisher (#1509), whose `Wants=k3s.service` started k3s right then, on
+  the node's standalone config. Usually the runner wrote the join config
+  within a second and the join reached the seed; when the join first
+  pruned an old identity backup, which can take 20 s, the early k3s
+  founded a new etcd cluster with the node as its only member, and the
+  join still logged `JOIN ok`, because it asks the node's own apiserver.
+  The five-minute HelmChart recovery and the weekly image prune carried
+  the same `Wants=k3s.service`, so either could start a k3s that a runner
+  was holding stopped. The three units now only order themselves after
+  k3s and never start it, and a test keeps every appliance unit from
+  pulling `k3s.service` in. The join still judges success by the node's
+  own apiserver.
+
 - **A signed zone keeps its DNSSEC keys when the appliance's BIND pod is
   replaced (#1855).** BIND keeps each signed zone's keys in its
   `key-directory`, `/var/cache/bind/keys`, and the appliance chart left
@@ -260,18 +325,6 @@ the formatter handles the rest.
   now looks again 20 s after any report, rollover or failed read, doubling
   up to 5 minutes while a zone stays unreadable, and leaves a zone `rndc`
   cannot answer for out of the report instead of clearing its keys.
-
-- **Icon-only buttons have accessible names (#1950).** The remove X on
-  a custom option row of the DHCP option editor (used by the scope,
-  option-template and client-class dialogs) was announced by a screen
-  reader as just "button". It is now "Remove option", with a matching
-  tooltip. A sweep found thirteen more icon-only buttons with no name
-  (APT source / GPG key / credential remove, Copilot send, the aggregation
-  panel's close, AI provider edit / delete, audit-log previous / next page,
-  IPAM template child remove, firewall rule remove, IP space delete, and
-  the IPAM drag-and-drop error's dismiss), all named the same way, and a
-  test now fails on any new one. The search palette's clear-query X is
-  named by the #1949 change.
 
 - **The DNS Pools and DNSSEC Policies pages no longer offer writes the API
   refuses (#1879).** Every pool write (create, edit, delete, check now) and

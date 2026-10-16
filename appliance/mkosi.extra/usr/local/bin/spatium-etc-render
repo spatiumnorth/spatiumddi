@@ -15,10 +15,12 @@
 # AND a /var factory reset — the single source of truth, rendered
 # into /etc on every boot before anything reads it.
 #
-# Runs After=etc.mount + the STATE fstab mount, Before=sysinit.target
-# / sshd / k3s. Degrades gracefully: a missing/empty STATE leaves the
+# Runs After=etc.mount, Before=sysinit.target / sshd / k3s, and starts
+# the STATE fstab mount itself when STATE is present but not mounted yet
+# (#1910). Degrades gracefully: a missing/empty STATE leaves the
 # image-baseline /etc untouched (and seeds STATE from the current
-# values so the NEXT boot is authoritative).
+# values so the NEXT boot is authoritative); a STATE that is present
+# but will not mount stops the render before it writes anything.
 
 set -eu
 
@@ -43,6 +45,51 @@ get_cfg() {
 if [ ! -d "$STATE_DIR" ]; then
     echo "STATE dir $STATE_DIR absent — using image-baseline /etc (no render)."
     exit 0
+fi
+
+# ── STATE is mounted before anything reads or writes it (#1910) ──────
+# STATE is mounted ``nofail`` (spatium-install's fstab) so that a box
+# without one still boots, and systemd does not order a nofail mount
+# before local-fs.target, so nothing guarantees it is up when this runs.
+# When STATE is present but its mount did not happen on this boot (its
+# check was stopped or failed, as one was after a power-off, #1910), the
+# boot goes on with $STATE_DIR as the empty mountpoint directory on /var.
+# Everything below would then read an empty config and write this node's
+# identity paths INTO that directory: the supervisor's symlink resolves
+# into it, finds no identity and mints a new one, a stranger to its own
+# control plane that never heartbeats again.
+#
+# So a STATE that exists gets its check and its mount (again) here. One
+# that still does not mount is left alone: nothing is rendered from it or
+# written into the empty directory, /etc keeps what the last boot
+# rendered, the supervisor has no identity directory to start in, and the
+# unit fails loudly. A box with no STATE at all (no ``state`` label)
+# degrades exactly as before.
+STATE_DEV="$(blkid -L state 2>/dev/null || true)"
+if [ -n "$STATE_DEV" ] && ! mountpoint -q "$STATE_DIR"; then
+    STATE_UNIT="$(systemd-escape --path --suffix=mount "$STATE_DIR")"
+    for _try in 1 2 3; do
+        echo "STATE ($STATE_DEV) is not mounted on $STATE_DIR — starting its check and mount (attempt $_try of 3)"
+        if timeout 20 systemctl start "$STATE_UNIT" && mountpoint -q "$STATE_DIR"; then
+            echo "STATE mounted on $STATE_DIR"
+            break
+        fi
+        sleep 2
+    done
+    if ! mountpoint -q "$STATE_DIR"; then
+        _msg="STATE ($STATE_DEV) is present but did not mount on $STATE_DIR: nothing is rendered from it or written into the empty mountpoint, and the supervisor has no identity to start with. See: journalctl -b -u '$STATE_UNIT' -u 'systemd-fsck@*'"
+        echo "ERROR: $_msg"
+        printf '<3>spatium-etc-render: ERROR: %s\n' "$_msg" > /dev/kmsg 2>/dev/null || true
+        # PID1 set the kernel hostname from the slot's own /etc before the
+        # overlay mounted (an upgrade-written slot's is empty: localhost,
+        # which k3s would register as a new Node); the overlay's
+        # /etc/hostname is the one the last good boot rendered.
+        _hn="$(head -n 1 /etc/hostname 2>/dev/null || true)"
+        if [ -n "$_hn" ] && hostname "$_hn" 2>/dev/null; then
+            echo "hostname → $_hn (from /etc/hostname: STATE did not mount)"
+        fi
+        exit 1
+    fi
 fi
 
 # ── Hostname ─────────────────────────────────────────────────────────
