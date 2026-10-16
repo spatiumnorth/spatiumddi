@@ -3654,7 +3654,13 @@ def _influx_to_response(t: InfluxDBTarget) -> InfluxDBTargetResponse:
     )
 
 
-def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> None:
+def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]:
+    """Apply ``body`` to ``t``; return which secrets were set or cleared.
+
+    The return value is for the audit row, which never carries a secret but
+    must say that one was replaced or removed (``password_set`` /
+    ``token_cleared`` …), or a cleared credential leaves no trace.
+    """
     from app.core.crypto import encrypt_str
 
     t.name = body.name
@@ -3675,14 +3681,20 @@ def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> None:
     t.push_dhcp_scope_leases = body.push_dhcp_scope_leases
     # Blank never clears; only the explicit flag does. A non-blank value
     # sent alongside the flag wins over it: the operator typed a new secret.
+    secret_changes: list[str] = []
     if body.password:
         t.password_encrypted = encrypt_str(body.password)
-    elif body.clear_password:
+        secret_changes.append("password_set")
+    elif body.clear_password and t.password_encrypted:
         t.password_encrypted = None
+        secret_changes.append("password_cleared")
     if body.token:
         t.token_encrypted = encrypt_str(body.token)
-    elif body.clear_token:
+        secret_changes.append("token_set")
+    elif body.clear_token and t.token_encrypted:
         t.token_encrypted = None
+        secret_changes.append("token_cleared")
+    return secret_changes
 
 
 def _assert_influx_writable(t: InfluxDBTarget) -> None:
@@ -3714,7 +3726,13 @@ def _assert_influx_writable(t: InfluxDBTarget) -> None:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-def _audit_influx(db: DB, current_user: CurrentUser, action: str, row: InfluxDBTarget) -> None:
+def _audit_influx(
+    db: DB,
+    current_user: CurrentUser,
+    action: str,
+    row: InfluxDBTarget,
+    secret_changes: list[str] | None = None,
+) -> None:
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -3744,6 +3762,11 @@ def _audit_influx(db: DB, current_user: CurrentUser, action: str, row: InfluxDBT
                     "push_dhcp_metrics": row.push_dhcp_metrics,
                     "push_subnet_utilization": row.push_subnet_utilization,
                     "push_dhcp_scope_leases": row.push_dhcp_scope_leases,
+                    # Presence only, and what this request did to it (#1989):
+                    # a cleared credential is a change the audit must show.
+                    "password_set": bool(row.password_encrypted),
+                    "token_set": bool(row.token_encrypted),
+                    "secret_changes": secret_changes or [],
                 }
             ),
         )
@@ -3770,11 +3793,11 @@ async def create_influxdb_target(
     if not is_effective_superadmin(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = InfluxDBTarget()
-    _apply_influx_body(row, body)
+    secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)
     db.add(row)
     await db.flush()
-    _audit_influx(db, current_user, "create", row)
+    _audit_influx(db, current_user, "create", row, secret_changes)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
@@ -3797,9 +3820,9 @@ async def update_influxdb_target(
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
-    _apply_influx_body(row, body)
+    secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)
-    _audit_influx(db, current_user, "update", row)
+    _audit_influx(db, current_user, "update", row, secret_changes)
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001

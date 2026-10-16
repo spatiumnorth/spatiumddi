@@ -23,10 +23,12 @@ from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_str
 from app.core.security import create_access_token, hash_password
+from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import (
     DHCPLease,
@@ -742,6 +744,53 @@ async def test_blank_secret_keeps_it_and_only_the_flag_clears(
     )
     assert r.status_code == 200, r.text
     assert r.json()["password_set"] is False
+
+
+@pytest.mark.asyncio
+async def test_clearing_a_secret_is_audited_without_the_secret(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = {"Authorization": f"Bearer {await _superadmin(db_session)}"}
+    url = "/api/v1/settings/influxdb-targets"
+    v1 = {
+        **_v2_body(),
+        "version": "v1",
+        "database": "ddi",
+        "username": "u",
+        "name": "v1-audit",
+        "password": "pw-very-secret",
+        "token": None,
+    }
+    r = await client.post(url, headers=h, json=v1)
+    assert r.status_code == 201, r.text
+    pid = r.json()["id"]
+    # A blank-keep save changes no secret; the explicit clear does.
+    r = await client.put(f"{url}/{pid}", headers=h, json={**v1, "password": ""})
+    assert r.status_code == 200, r.text
+    r = await client.put(
+        f"{url}/{pid}", headers=h, json={**v1, "password": "", "clear_password": True}
+    )
+    assert r.status_code == 200, r.text
+
+    rows = (
+        (
+            await db_session.execute(
+                select(AuditLog)
+                .where(AuditLog.resource_type == "influxdb_target", AuditLog.resource_id == pid)
+                .order_by(AuditLog.seq)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    changes = [(a.action, a.new_value["secret_changes"]) for a in rows]
+    assert changes == [
+        ("create", ["password_set"]),
+        ("update", []),
+        ("update", ["password_cleared"]),
+    ]
+    assert rows[-1].new_value["password_set"] is False
+    assert all("pw-very-secret" not in repr(a.new_value) for a in rows)
 
 
 # ── #1990: the last SUCCESSFUL push is kept apart from the last attempt ──
