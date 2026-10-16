@@ -838,6 +838,8 @@ export function AIProvidersPage() {
                       <RefreshCw className="h-3 w-3" />
                     </button>
                     <button
+                      aria-label="Edit provider"
+                      title="Edit provider"
                       onClick={() => {
                         setEditorErr("");
                         setTestResult(null);
@@ -852,6 +854,8 @@ export function AIProvidersPage() {
                       <Pencil className="h-3 w-3" />
                     </button>
                     <button
+                      aria-label="Delete provider"
+                      title="Delete provider"
                       onClick={() => {
                         if (confirm(`Delete provider "${p.name}"?`))
                           deleteMut.mutate(p.id);

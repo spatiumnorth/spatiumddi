@@ -1160,6 +1160,8 @@ function RuleRowsEditor({
                 </td>
                 <td className="px-1 py-1 text-right">
                   <button
+                    aria-label="Remove rule"
+                    title="Remove rule"
                     type="button"
                     onClick={() =>
                       setRows((rs) => rs.filter((_, j) => j !== i))

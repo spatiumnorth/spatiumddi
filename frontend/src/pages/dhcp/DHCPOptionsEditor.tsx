@@ -256,6 +256,8 @@ function CustomOptionRow({
           // click would then land on the next row's button.
           onMouseDown={(e) => e.preventDefault()}
           onClick={onRemove}
+          aria-label="Remove option"
+          title="Remove option"
           className="rounded p-1 text-muted-foreground hover:text-destructive"
         >
           <X className="h-4 w-4" />

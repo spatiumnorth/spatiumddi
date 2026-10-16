@@ -117,6 +117,8 @@ export function AggregationCandidatesBadge({ blockId }: { blockId: string }) {
               </span>
             </div>
             <button
+              aria-label="Close"
+              title="Close"
               type="button"
               onClick={() => setOpen(false)}
               className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"

@@ -391,6 +391,8 @@ export function AptSection({
                   Enabled
                 </label>
                 <button
+                  aria-label="Remove source"
+                  title="Remove source"
                   type="button"
                   disabled={ro}
                   onClick={() => {
@@ -462,6 +464,8 @@ export function AptSection({
                   }}
                 />
                 <button
+                  aria-label="Remove GPG key"
+                  title="Remove GPG key"
                   type="button"
                   disabled={ro}
                   onClick={() => {
@@ -598,6 +602,8 @@ export function AptSection({
                 }}
               />
               <button
+                aria-label="Remove credential"
+                title="Remove credential"
                 type="button"
                 disabled={ro}
                 onClick={() => {
