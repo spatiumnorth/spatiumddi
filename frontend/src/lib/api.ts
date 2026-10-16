@@ -495,6 +495,10 @@ export interface DnsSyncPreview {
    * order — a subnet wider than a /24 spans several (#1840). The two
    * fields above are the first of them. Empty on block/space scope. */
   reverse_zone_names?: string[];
+  /** #1932 — why the subnet has no reverse zone when its DNS group runs a
+   * cloud driver that has not opted in to auto-created reverse zones (its
+   * PTRs are skipped). Null otherwise. */
+  reverse_zone_skipped_reason?: string | null;
   missing: DnsSyncMissing[];
   mismatched: DnsSyncMismatch[];
   stale: DnsSyncStale[];
@@ -5043,6 +5047,10 @@ export interface DNSServerGroup {
   // operator binds a private IP into a zone in this group, forcing a
   // typed-CIDR confirm.
   is_public_facing?: boolean;
+  /** #1932 — auto-create subnet reverse zones in this group when it runs a
+   *  cloud DNS driver. Off by default: the provider bills per hosted zone.
+   *  Groups on other drivers ignore it. */
+  auto_reverse_zones_at_provider?: boolean;
   /** Distinct drivers of the servers currently in this group (#934
    *  follow-up). Empty = an empty group, compatible with anything. A group
    *  is single-driver, so one entry is normal; two or more means the group
@@ -15338,6 +15346,8 @@ export interface TrashEntry {
 export interface TrashListResponse {
   items: TrashEntry[];
   total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface TrashRestoreResponse {
@@ -15355,6 +15365,7 @@ export const trashApi = {
       q?: string;
       limit?: number;
       offset?: number;
+      sort?: "newest" | "oldest";
     } = {},
   ) =>
     api.get<TrashListResponse>("/admin/trash", { params }).then((r) => r.data),

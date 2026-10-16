@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { hasOpenModal } from "@/components/ui/use-draggable-modal";
 import { useSessionState } from "@/lib/useSessionState";
 import {
   Archive,
@@ -404,7 +405,8 @@ export function CopilotDrawer({
   // Esc closes the drawer.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
+      // A dialog over the drawer owns this Esc (#1947).
+      if (e.key === "Escape" && !hasOpenModal()) onClose();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -2065,6 +2067,8 @@ function ChatComposer({
           </button>
         ) : (
           <button
+            aria-label="Send message"
+            title="Send message"
             type="submit"
             disabled={!text.trim() || disabled}
             className="self-end rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"

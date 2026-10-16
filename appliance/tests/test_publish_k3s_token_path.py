@@ -52,6 +52,23 @@ def test_path_unit_is_edge_triggered() -> None:
         assert not _directives(text, key), f"{key}= is level-triggered"
 
 
+def test_service_is_ordered_after_k3s_but_never_starts_it() -> None:
+    # #1723: the cluster join runner stops k3s, then moves this token aside
+    # while it wipes the node's identity. A Wants= (or Requires=, BindsTo=,
+    # Upholds=) on k3s here put a k3s start in the .path trigger's
+    # transaction, and the joining node came up mid-wipe as a one-node
+    # cluster of its own. Ordering behind k3s is all the service needs.
+    text = SERVICE.read_text()
+    pulls = [
+        f"{key}={value}"
+        for key in ("Wants", "Requires", "BindsTo", "Upholds")
+        for value in _directives(text, key)
+        if "k3s.service" in value.split()
+    ]
+    assert not pulls, f"{SERVICE.name} starts k3s from its .path trigger: {pulls}"
+    assert any("k3s.service" in value.split() for value in _directives(text, "After"))
+
+
 def test_boot_run_is_kept_and_path_unit_enabled() -> None:
     # A .path unit only sees writes after it starts; a token that already
     # exists at boot still needs the service's own boot run.

@@ -106,6 +106,286 @@ the formatter handles the rest.
   error during a scheduled run left the run stuck `in_progress`. Both are
   refused when saved.
 
+- **The Trash respects the IPAM / DNS / DHCP hierarchy (#1957, #1958,
+  #1959, #1960, #1961, #1962).** Restoring a subnet, block, DHCP scope
+  or DNS record whose parent is still in the Trash is now a 409 naming
+  the parent, and the dialog offers to restore that parent and then the
+  row in one click; it used to come back live under a
+  parent that answers 404, make the block's purge answer 500 and be
+  destroyed unaudited when the parent was purged. "Delete permanently"
+  on a trashed block or IP space now purges the trashed subnets and
+  blocks under it, leaf first and audited (it answered 409, or 500
+  under a child block), and refuses with a 409 naming any LIVE row a
+  purge would otherwise take (a block, subnet, DHCP scope, pool,
+  reservation or DNS record); the nightly sweep holds such a parent back
+  at any depth (a live block two levels down included), reports how many
+  it held back, and survives a refusing row instead of rolling the whole
+  night back. A restore refuses a subnet or block
+  that overlaps a live one, as the create path does. The 409 now says
+  whether "Restore the others" is accepted (`skip_conflicts_allowed`),
+  so the page no longer offers it on a record of a deleted zone's
+  batch. `GET /admin/trash` gains `sort=oldest` and echoes
+  `limit` / `offset`; the page pages through every row with a count and
+  an oldest-first order, and a search with no matches no longer says
+  "Trash is empty."
+
+- **Icon-only buttons have accessible names (#1950).** The remove X on
+  a custom option row of the DHCP option editor (used by the scope,
+  option-template and client-class dialogs) was announced by a screen
+  reader as just "button". It is now "Remove option", with a matching
+  tooltip. A sweep found thirteen more icon-only buttons with no name
+  (APT source / GPG key / credential remove, Copilot send, the aggregation
+  panel's close, AI provider edit / delete, audit-log previous / next page,
+  IPAM template child remove, firewall rule remove, IP space delete, and
+  the IPAM drag-and-drop error's dismiss), all named the same way, and a
+  test now fails on any new one. The search palette's clear-query X is
+  named by the #1949 change.
+
+- **A node whose STATE partition did not mount at boot no longer comes
+  back with a new identity (#1910).** STATE is mounted `nofail`, so a
+  boot whose STATE check was stopped part-way, as after a hard power-off,
+  went on with `/var/lib/spatium-state` as an empty directory on `/var`.
+  `spatium-etc-render` wrote the node's identity paths into it, the
+  supervisor's identity link resolved into it, and the supervisor minted
+  a new identity its control plane did not know: the appliance stopped
+  heartbeating as itself. The render now starts the STATE mount, and
+  with it the check, itself when the partition is present but not
+  mounted, up to three times. When STATE still does not mount it stops
+  before reading or writing anything there, says so in the journal and
+  on the kernel log, and keeps the hostname the last good boot rendered
+  into `/etc`; the supervisor has no identity to start with and does not
+  make one. k3s, DNS and DHCP keep running. The console's Identity row
+  reads "Held — STATE not mounted" instead of "Bootstrapping…". The
+  render was also only ordered after `local-fs.target`, which a `nofail`
+  mount does not hold back, so a slow STATE check could lose that race
+  on any boot; the render now waits for the mount. What stopped the
+  check is not fixed here: a node whose STATE does not mount no longer
+  runs as someone else.
+
+- **k3s and first-boot no longer start without the `/etc` overlay
+  (#1910).** The node's own `/etc` (its hostname, machine-id, the k3s
+  drop-ins that carry its role label and CIDRs, the appliance `.env` and
+  role-config) is the overlay's upper layer, and `etc.mount` is only
+  wanted by `local-fs.target`, so a boot whose overlay failed to mount
+  went on. `k3s.service` and `spatiumddi-firstboot.service` were only
+  ordered after it: after a power-off k3s started on the slot's bare
+  `/etc` and registered a new Node, `localhost`, without the role or
+  CIDRs, and first-boot generated a fresh `.env` as on a first boot.
+  Both now require the overlay, as the host runners' reload units
+  already do, so on such a boot they stay down, and the console's k3s
+  row reads "held — /etc overlay not mounted" instead of "disabled".
+  Why the overlay failed to mount is not fixed here: a node whose
+  overlay does not mount no longer runs as someone else.
+
+- **A control-plane join no longer comes up as a cluster of its own
+  (#1723).** `spatium-cluster-join` stops k3s and moves the node's
+  identity aside, its k3s token included, before it writes the config for
+  the cluster it is joining. Moving the token triggered the join-token
+  publisher (#1509), whose `Wants=k3s.service` started k3s right then, on
+  the node's standalone config. Usually the runner wrote the join config
+  within a second and the join reached the seed; when the join first
+  pruned an old identity backup, which can take 20 s, the early k3s
+  founded a new etcd cluster with the node as its only member, and the
+  join still logged `JOIN ok`, because it asks the node's own apiserver.
+  The five-minute HelmChart recovery and the weekly image prune carried
+  the same `Wants=k3s.service`, so either could start a k3s that a runner
+  was holding stopped. The three units now only order themselves after
+  k3s and never start it, and a test keeps every appliance unit from
+  pulling `k3s.service` in. The join still judges success by the node's
+  own apiserver.
+
+- **A signed zone keeps its DNSSEC keys when the appliance's BIND pod is
+  replaced (#1855).** BIND keeps each signed zone's keys in its
+  `key-directory`, `/var/cache/bind/keys`, and the appliance chart left
+  that directory inside the dns-bind9 container. Every new pod (an
+  upgrade, a reboot, an engine switch, an eviction) signed each zone with
+  new keys, so a DS record published at the parent matched no key and
+  validating resolvers answered SERVFAIL for the zone. The chart now keeps
+  `/var/cache/bind` on the node's persistent `/var`, at
+  `/var/lib/spatiumddi/agents/dns-bind9/data`, beside the agent's state.
+  The upgrade that brings this fix still re-keys each signed zone once
+  more, because the keys in use before it were never kept. If you
+  published a DS for a zone an appliance serves, replace it after the
+  upgrade with one made from the key the appliance now serves for the zone
+  (`dig @<appliance> <zone> DNSKEY`). Until the agent next reads BIND's
+  keys (every 5 minutes, #1854, #1934), the zone page can still show the
+  old key and its DS, so compare it with that answer before you copy a
+  DS from it.
+
+- **The global search palette is a named, modal dialog that holds focus
+  (#1949).** Ctrl/Cmd+K opened an overlay with no role, no name and no
+  focus trap: a screen reader was not told a modal had opened, Tab and
+  Shift+Tab walked out to the page behind, and the `?` shortcut's
+  open-dialog guard could not see it, so Keyboard shortcuts opened on top
+  of the palette. The card is now `role="dialog"` with `aria-modal` and
+  the name "Search", Tab and Shift+Tab cycle inside it, Esc closes it and
+  focus returns to whatever opened it. The input is a combobox over a
+  listbox of options (`aria-activedescendant` follows the arrow keys), the
+  "Searching…" / "No results" text is a polite live region outside that
+  listbox, and the clear-query X is named "Clear search" (#1950). Opened
+  over another dialog, the palette alone holds Tab and Esc, and closing it
+  puts focus back inside that dialog.
+
+- **Moving a DNS server to another group no longer deadlocks against the
+  worker's bundle render or the agent, and the agent's requests no longer
+  answer 500 when a move deletes what they were updating (#1703, #1929).**
+  The worker's render holds `FOR KEY SHARE` on the server's row (the bundle
+  insert's foreign key) and then needs `FOR NO KEY UPDATE`; the move wrote the
+  row in two steps, the second (`group_id`, a unique-index column) needing
+  `FOR UPDATE`, so each side held half of what the other wanted and Postgres
+  aborted the move (40P01). Separately, the move deletes the server's queued
+  record ops and zone-state rows, and an agent config poll, heartbeat or
+  zone-state report that had read them answered 500 (`StaleDataError`) or, with
+  several ops, shipped ops the move had already discarded. Every one of them
+  now locks a server's rows in one order — zone-state rows, then record ops
+  (each ascending), then the server row — before writing any of them
+  (`app/services/dns/row_locks.py`). The move takes the server row
+  `FOR UPDATE` before its first write to it, in the server PUT and in the
+  Fleet roles PUT; a request that waited for a move skips the rows it deleted,
+  and a zone-state report records nothing for the group the server left.
+
+- **One Esc closes only the topmost dialog, and Shift+Tab no longer leaves
+  one (#1947, #1948).** Every open dialog bound its own Esc listener, so a
+  dialog opened from another (an edit form's confirm, a nested picker) was
+  closed together with the one underneath, taking its unsaved input. Dialogs
+  now share a layer stack: Esc and the Tab trap belong to the topmost one, a
+  menu inside a dialog takes its own Esc, the copilot drawer yields to an
+  open dialog, and Esc in the search palette closes the palette and not the
+  dialog under it. The focus trap treated the dialog container (where focus
+  lands on open) as outside its first control, so one Shift+Tab walked onto
+  the page behind; it now wraps, and also brings back focus that is already
+  outside. Focus still opens on the container, never on a control, so Enter
+  cannot fire a confirm's destructive button. The shared `Modal` is named by
+  its title through `aria-labelledby`. Test-only dev dependency
+  `@testing-library/user-event`.
+
+- **An upgrade no longer rolls the control plane out twice (#1210).** A
+  `spatium-control` HelmChartConfig that survived a slot upgrade still
+  carried the previous release's api / worker sizing, and helm-controller
+  merges it over the new HelmChart, so the first rollout ran the old limits
+  and the new supervisor's first heartbeat then rewrote them: a second
+  revision, a second migrate Job (which replaced a running one twice in the
+  report) and a second api / worker restart. Seen on 5 of 5 upgrades from
+  2026.09.04-1. firstboot now brings the sizing keys an existing Config
+  already carries to the values the new HelmChart renders, and writes them
+  the moment k3s has applied that HelmChart, so helm-controller runs one job
+  carrying the new image and the new sizing. The timing is the fix. Measured
+  against k3s v1.36.4's helm-controller, patching the Config before the
+  release instead re-runs the previous release's chart: a rollout on the old
+  image, then a second one. A patch that loses the race costs a second
+  revision on the new image seconds later rather than minutes later. It
+  writes nothing when the two already agree, so a reboot adds no revision.
+
+- **Saving an SSH setting no longer leaves `ssh.service` failed (#1632).**
+  The appliance runs sshd socket-activated: `ssh.socket` holds the port.
+  The runner applied a change with `systemctl reload ssh.service`, whose
+  `ExecReload` is `sshd -t` plus `kill -HUP`; sshd answers SIGHUP by
+  re-executing itself, cannot bind the port the socket owns and dies, while
+  both reload commands exit 0. The log said "sshd reloaded" over a failed
+  unit, with no sshd running until the next connection. Under socket
+  activation the runner now restarts `ssh.service` (the socket keeps the
+  port, open sessions survive, `KillMode=process`), which also clears a unit
+  an earlier save left failed, and judges success by whether the unit is
+  active afterwards. A failed apply now fails the trigger and leaves the
+  applied-hash sidecar unwritten, so Fleet shows it as not applied instead of
+  green. Also fixed on the way: under socket activation sshd ignores `Port`,
+  so a changed `ssh_port` opened the firewall for a port nothing listened on.
+  The runner now writes an `ssh.socket` `ListenStream` drop-in and re-binds
+  the socket, which needs `ssh.service` stopped first (systemd refuses to
+  start the socket while its service runs). Because the port now really
+  moves, the move is guarded: it happens only after the firewall has loaded
+  the rule for the new port, and if the socket cannot bind the new port the
+  previous listen port and the previous firewall fragment are both put back,
+  so SSH stays reachable where it was.
+
+- **A reverse zone auto-created in an agentless group now reaches the
+  provider, so its PTRs stop failing "No such zone was found" (#1932).**
+  IPAM auto-sync, DDNS and subnet create wrote the reverse zone row and
+  nothing else; only the zone endpoints pushed it to `technitium_api`,
+  Windows Path B and the cloud drivers, so every PTR op failed and retried.
+  The zone is now marked as not yet at the provider and created after the
+  commit, ahead of its record ops. Whichever path sends one of those ops
+  first, the request or the retry sweep, creates a still-marked zone
+  before it, and ops whose zone cannot be created wait with that error.
+  The mark clears once the zone is at the provider, so a zone that got
+  there once is never created again, even if it is later deleted at the
+  provider. One commit creates at most 16 zones inline (a /17 needs 128);
+  the retry sweep creates the rest, 32 a minute. On upgrade, reverse
+  zones SpatiumDDI auto-created in a `technitium_api` or Windows DNS group
+  are marked and created by the sweep; a zone already at the provider is left
+  as it is. The Copilot's zone create now pushes to the provider before
+  its commit, as the REST create does. Agent-managed groups are unchanged.
+  Groups running a cloud DNS driver (Route 53, Azure DNS, Google Cloud DNS,
+  Cloudflare and the others) only get auto-created reverse zones when the
+  new group setting *Auto-create reverse zones at the provider* is on,
+  because the provider bills per hosted zone and a /17 makes 128. It is off
+  by default and for every existing group, so the upgrade creates nothing
+  at a cloud provider. Opted out, a subnet gets no reverse zone and its PTRs
+  are skipped; the subnet's DNS sync report says why. Reverse zones a cloud
+  group already holds are kept.
+
+- **DNS and DHCP pods no longer rank ahead of the control plane for
+  eviction under memory pressure (#1828).** The kubelet ranks a memory
+  eviction by whether a pod's usage is over its memory request before it
+  looks at the PriorityClass, and the serving pods requested 64Mi while
+  Kea (66-72 Mi), BIND and PowerDNS/Technitium used more at idle, so under
+  pressure they went ahead of the database, the cache and the UI whatever
+  `spatium-service` says. The role chart now requests 128Mi for Kea,
+  PowerDNS and the looking-glass collector and 256Mi for Technitium (BIND
+  already did, #1725). A new test fails any `spatium-service` role
+  requesting less than 128Mi.
+
+- **An agent's config long-poll answers 404, not 500, when its server row is
+  deleted under it (#1936).** `DELETE .../servers/{id}` wakes the server's
+  channel and removes the row; the open long-poll woke and refreshed a row that
+  no longer existed, which SQLAlchemy raised as `Could not refresh instance`
+  and the API answered with an unhandled 500. The DNS and DHCP long-polls (and
+  the DNS inline-render refresh) now answer 404 for a vanished row, the same
+  as for a token whose server is unknown at the start of a request, which is
+  what makes the agent discard its JWT and re-register.
+
+- **A paginated list's `total` no longer counts rows in Trash (#1933).** The
+  shared `paginate` helper counts through
+  `select(count()).select_from(base.subquery())`, and the global soft-delete
+  filter only looked at the outer statement's FROM, so it saw an anonymous
+  subquery and skipped it: the page query was filtered and the count was not.
+  A zone with four of ten records trashed listed six rows under `total: 10`,
+  so the pager offered pages that came back empty. The filter now looks inside
+  subquery FROMs (and CTEs), with the criterion placed inside the subquery.
+  The lists this changes are the zone and group-wide record lists; the other
+  count-over-subquery sites count models that are not soft-deleted. A
+  statement that opts out with `include_deleted` still counts Trash.
+
+- **The control plane's DNSSEC keys for a BIND zone follow the keys BIND
+  serves (#1934).** When BIND changed a zone's keys without a structural
+  reload (a pod replacement that re-keyed the zone, a manual or
+  policy-driven rollover), the zone page kept the old key and a DS made from
+  it. The reported build predated #1886, whose 5-minute re-read is what
+  first let a key change with no reload reach the control plane at all
+  (nothing was refused: no report was sent). That re-read still had gaps:
+  a read or report that failed waited a full 5 minutes to try again, a
+  manual rollover's report was the pre-rollover key set (BIND generates the
+  successor after `rndc` returns), and an `rndc` that could not answer for
+  the zone yet was reported as "no keys", clearing the key rows. The agent
+  now looks again 20 s after any report, rollover or failed read, doubling
+  up to 5 minutes while a zone stays unreadable, and leaves a zone `rndc`
+  cannot answer for out of the report instead of clearing its keys.
+
+- **The DNS Pools and DNSSEC Policies pages no longer offer writes the API
+  refuses (#1879).** Every pool write (create, edit, delete, check now) and
+  every DNSSEC-policy write takes a superadmin, but the top-level DNS Pools
+  page and the DNSSEC Policies page rendered New Pool, Check now, Delete,
+  New policy, Edit and Delete enabled for everyone, so a DNS Editor filled in
+  the form and was then refused. They are now disabled with the reason
+  "Requires superadmin" for anyone else, as the zone's own Pools tab already
+  was (#1877). The IP detail's Reputation **Check now** was gated on editing
+  the address, while `POST /dnsbl/check` asks write on `dnsbl`, which no
+  built-in role but superadmin holds; it now follows that grant, so an IPAM
+  Editor sees it disabled with the reason instead of a 403. The DNS import
+  page let a non-superadmin upload an archive or enter a PowerDNS /
+  Technitium key before refusing it; every `/dns/import` route takes a
+  superadmin, so its Preview import and Test connection buttons now say so.
+
 - **Delete Zone no longer says the zone is permanently deleted (#1880).**
   The dialog, its confirm checkbox, the "Confirm Permanent Deletion"
   title and the bulk zone delete all said the zone and its records would
@@ -4243,6 +4523,15 @@ the formatter handles the rest.
   2770, so they keep their access. Every runner now checks the trigger's
   owner first and renames a foreign one aside instead of acting on it.
   Existing appliances are repaired on their next boot; no operator action.
+  **On the upgrade itself, expect up to two minutes of 500s from
+  appliance host-state reads (#1661).** After the reboot into the new
+  slot, k3s keeps serving the previous release's api until the new
+  control chart rolls it, and that api has no gid 2770, so
+  `GET /api/v1/appliance/slot-upgrade` (and the setup-state and
+  system-info reads) answer `500` until the new api is Ready — about
+  90 s in testing, mixed in with the 502s the rollout already causes.
+  The upgrade completes normally; retry once the new api serves. This
+  happens once, on the upgrade that introduces the tightened directory.
 - **A resource-scoped API token no longer sees zones, records or addresses
   outside its grant through group record lists or search
   (GHSA-wr8j-6r46-pj7g).** The zone list and per-zone routes already
@@ -4661,6 +4950,14 @@ the formatter handles the rest.
   cannot say where its archive was written, so NULL (unknown) stays.
 - `a1903c5e7b24` — #1903, additive: nullable `appliance.cluster_transition_id`
   and `appliance.cluster_transition_at`. Downgrade drops both.
+- `c4f19a2e7d53` — #1932, additive + data: nullable
+  `dns_zone.agentless_create_due_at` (an auto-created zone whose provider
+  create is outstanding, and when the sweep may next try) and
+  `dns_server_group.auto_reverse_zones_at_provider` (NOT NULL, default
+  false). Backfill marks the non-imported, auto-generated reverse zones in
+  groups with a `technitium_api` or Windows DNS server with credentials and
+  no cloud server, due now; cloud groups are not marked. Downgrade drops
+  both columns.
 
 ## 2026.10.02-1 — 2026-10-02
 

@@ -7331,6 +7331,11 @@ function DnsSyncModal({
                       <span className="italic text-muted-foreground">none</span>
                     )}
                   </div>
+                  {data.reverse_zone_skipped_reason && (
+                    <p className="mt-1 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-amber-700 dark:text-amber-400">
+                      {data.reverse_zone_skipped_reason}
+                    </p>
+                  )}
                 </div>
               )}
 
@@ -15521,6 +15526,8 @@ export function SpaceSection({
         <div className="mx-2 mt-2 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
           <span className="flex-1">{dndError}</span>
           <button
+            aria-label="Dismiss"
+            title="Dismiss"
             onClick={() => setDndError(null)}
             className="text-destructive hover:opacity-70"
           >

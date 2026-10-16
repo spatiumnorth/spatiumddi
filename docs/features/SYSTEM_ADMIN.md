@@ -25,7 +25,17 @@ per-row Restore (with conflict-detail rendering when a live row
 would clash) and Delete-permanently buttons. Soft-deleting a DNS zone
 does not touch agentless servers (Windows DNS, cloud, Technitium API);
 Delete-permanently and the purge sweep do, and a failing provider keeps
-the zone in the Trash. Nightly purge sweep
+the zone in the Trash. A row is only restored under a live parent: a
+subnet whose block is still in the Trash (and likewise a block, scope or
+record) is refused with a 409 naming the parent, which the page offers to
+restore first; a subnet or block that would overlap a live one is refused
+by the create path's own overlap rules. Delete-permanently on a
+block or IP space also purges the trashed subnets and blocks under it, and
+refuses while a live row (block, subnet, DHCP scope, pool or reservation)
+sits under it; the nightly sweep holds such a row back and counts it in its
+`held_back_live_children` summary. The list is paged (100 per page,
+`limit` / `offset` / `total`, `sort=oldest` for the rows the purge removes
+first). Nightly purge sweep
 is operator-configurable via
 `PlatformSettings.soft_delete_purge_days`.
 
