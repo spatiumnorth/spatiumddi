@@ -436,7 +436,8 @@ async def agent_register(
             agent_fingerprint=body.fingerprint,
             pending_approval=require_approval,
             is_primary=not has_primary,
-            notes=f"agent v{body.version}" if body.version else "auto-registered",
+            # ``notes`` is the operator's field; the agent never writes it.
+            agent_version=body.version or None,
         )
         pending_approval = require_approval
         db.add(server)
@@ -460,6 +461,10 @@ async def agent_register(
         server.driver = body.driver
         server.roles = body.roles
         server.status = "active"
+        # Only overwrite when the agent actually sent one: an older agent
+        # omits it and must not blank a version a heartbeat already recorded.
+        if body.version:
+            server.agent_version = body.version
         if server.agent_id is None:
             server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
 
@@ -908,6 +913,9 @@ async def agent_heartbeat(
     # reason.
     if body.daemon_version:
         server.daemon_version = body.daemon_version
+    # #2078 — likewise only when reported (an older agent omits it).
+    if body.agent_version:
+        server.agent_version = body.agent_version
     # #1171 — on every heartbeat, from the header: the same server row is run
     # by an older agent until the upgrade replaces its pod, and by an older one
     # again if a node is rolled back.

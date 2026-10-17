@@ -117,13 +117,18 @@ the formatter handles the rest.
   now started rather than reloaded, since systemd refuses to reload a
   unit that is not running.
 
-- **DNS agent registers with the version it actually runs**
-  (#2078). `bootstrap.register` sent a literal `"2026.04.14.1"`
-  that nothing rewrote, so every new DNS server row was seeded
-  with `notes = "agent v2026.04.14.1"` whatever build it ran.
-  It now sends the image's stamped `SPATIUM_AGENT_VERSION`, as
-  the DHCP agent does. Existing rows keep their seeded note;
-  operator notes are never rewritten on re-register.
+- **The DNS server shows the version its agent actually runs
+  (#2078).** The DNS agent registered with a literal
+  `"2026.04.14.1"` that nothing rewrote, and the control plane
+  seeded the operator's `notes` with it (`agent v2026.04.14.1`)
+  and kept no version anywhere else; the heartbeat's
+  `agent_version` was accepted and dropped. The agent now sends
+  its stamped release, the register and heartbeat handlers store
+  it in a new `dns_server.agent_version`, the server response
+  carries it, and the server detail dialog shows it (unknown
+  when never reported). `notes` is no longer seeded by the
+  agent; existing rows keep whatever note they have. An older
+  agent that sends no version leaves the column as it was.
 
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
@@ -5497,6 +5502,9 @@ the formatter handles the rest.
   that never expires is what you want.
 
 ### Migrations
+
+- `a2078c5e1d90` — #2078, adds nullable `dns_server.agent_version`
+  (String(64)); no backfill, NULL means the agent has not reported one.
 
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`

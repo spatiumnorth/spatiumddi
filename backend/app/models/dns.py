@@ -270,6 +270,11 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # crosses that boundary. NULL = not reported yet (agentless drivers never
     # report one) and must be treated as UNKNOWN, never as "old".
     daemon_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # #2078 — the python AGENT's own version (the image's stamped release, or
+    # ``dev`` for an unstamped build), reported on register and each heartbeat.
+    # Distinct from ``daemon_version`` above. NULL = never reported (an older
+    # agent, or an agentless driver): UNKNOWN, never a made-up value.
+    agent_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # #1171 — this server's agent writes each zone's own SOA timers into its
     # SOA: it sent ``soa-timers`` in ``X-Spatium-Agent-Features`` on its last
     # register or heartbeat. False for an agent of an older release, which
