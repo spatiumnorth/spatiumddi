@@ -84,6 +84,44 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **PowerDNS serves the control plane's serial, never goes
+  backwards, sends NOTIFY, and transfers a secondary
+  ([#1965](https://github.com/spatiumnorth/spatiumddi/issues/1965),
+  [#1967](https://github.com/spatiumnorth/spatiumddi/issues/1967),
+  [#1968](https://github.com/spatiumnorth/spatiumddi/issues/1968)).**
+  Zones were created with PowerDNS's default `SOA-EDIT-API:
+  DEFAULT`, which rewrote the serial of every change, so a zone
+  never served the serial SpatiumDDI stamped, an SOA-only edit
+  could be served under a serial a secondary already held, and the
+  sync status never matched. Zones are now created with it empty
+  (and cleared on existing ones), and a record op carries the zone
+  to the control plane's serial in the same PATCH. The serial is
+  never sent below the one PowerDNS serves (RFC 1982): the first
+  reconcile after the upgrade used to publish a serial below what
+  PowerDNS had served, and so did any later full reconcile after a
+  record add; it now goes forward by one instead, and the control
+  plane moves `last_serial` up to what a PowerDNS server reports
+  ahead of it. `pdns.conf` now sets `primary=yes` and
+  `secondary=yes`, without which PowerDNS sent no NOTIFY and never
+  transferred a secondary zone, which answered REFUSED while
+  reading in sync; PowerDNS restarts once on upgrade. A PowerDNS
+  secondary at serial 0 no longer reads in sync. A secondary on
+  another host can now transfer from a PowerDNS primary: each zone
+  gets `ALLOW-AXFR-FROM` and `TSIG-ALLOW-AXFR` from the same transfer
+  policy and group TSIG keys BIND9 renders `allow-transfer` from,
+  where before it was NOTIFY-ed and then refused. The serial the
+  control plane adopts from an agent is bounded, so a wrong report
+  cannot push the zone to where the next bump overflows. The agent
+  also reports the served serials after the apply it makes at start
+  (the cached bundle after a slot upgrade), so the upgrade's serials
+  are adopted within a poll or two instead of at the group's next
+  structural change. A record op made before that adoption moves the
+  zone past the served serial and NOTIFYs, rather than publishing the
+  change under a serial the secondaries already hold. A PowerDNS
+  secondary that has transferred reads in sync (its serial is the
+  primary's, never compared with ours), and a new zone's first
+  numbering (0 to 1) writes no `dns.zone.serial_adopted` row.
+
 - **Audit details mask presigned-URL signatures and storage connection
   strings on read.** The read-side redaction of `GET /api/v1/audit/{id}`,
   the Audit page and the copilot's audit tool now also masks the signing

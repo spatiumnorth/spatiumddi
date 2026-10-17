@@ -72,6 +72,10 @@ DNSSEC_REFRESH_SECONDS = 300.0
 # showing the old key (and a DS made from it) for a full interval.
 DNSSEC_SETTLE_SECONDS = 20.0
 
+# #1968 — how many polls a startup apply's served-serial report is retried on
+# before it is dropped (see ``SyncLoop._flush_boot_report``).
+BOOT_REPORT_MAX_ATTEMPTS = 10
+
 
 def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[str, Any]:
     """One op ack. Echoes the page's ``dispatch`` stamp when it has one
@@ -172,6 +176,15 @@ class SyncLoop:
         # #1373 — the serial last reported per zone (zone-state), so the late
         # retry of an older op can never report a zone backwards.
         self._reported_serials: dict[str, int] = {}
+        # #1968 — a bundle applied at startup (the cached one, or the
+        # last-known-good) whose served serials have not been reported yet.
+        # A driver that can move a zone to a serial of its own (PowerDNS
+        # floors it above the one it served) changes what is served on that
+        # apply, and the control plane only adopts it from a report; with no
+        # structural change pending, nothing else would send one. Reported at
+        # the top of the next polls until it lands.
+        self._boot_report_bundle: dict[str, Any] | None = None
+        self._boot_report_attempts = 0
         # #882 — last-known-good revert. ``quarantine`` remembers an etag
         # whose apply failed so we stop re-applying it every poll;
         # ``apply_status`` is what the heartbeat reports upward.
@@ -244,6 +257,7 @@ class SyncLoop:
                 # waiting for the next control-plane long-poll round-trip.
                 _touch_ready_marker(self.cfg.state_dir)
                 self._dnssec_bundle = bundle
+                self._arm_boot_report(bundle)
                 log.info("dns_agent_bootstrap_from_cache", etag=etag)
                 # #170 Wave C1 — fleet-upgrade / reboot / SNMP / NTP
                 # trigger-file writes moved to the supervisor's
@@ -323,6 +337,7 @@ class SyncLoop:
             return
         self._current_etag = prev_etag
         self._current_structural_etag = self._applied_fingerprint(prev_bundle)
+        self._arm_boot_report(prev_bundle)
         self.apply_status = ApplyStatus(
             status=STATUS_REVERTED,
             etag=prev_etag,
@@ -340,6 +355,41 @@ class SyncLoop:
     def stop(self) -> None:
         self._stop.set()
 
+    def _arm_boot_report(self, bundle: dict[str, Any]) -> None:
+        """Queue the served-serial report for a bundle applied at startup.
+
+        Only for a driver that reads back what it serves
+        (``served_zone_serials``): its serials can differ from the bundle's.
+        A driver without the hook serves the bundle's serials, which the
+        control plane already has."""
+        if callable(getattr(self.driver, "served_zone_serials", None)):
+            self._boot_report_bundle = bundle
+            self._boot_report_attempts = 0
+
+    def _flush_boot_report(self) -> None:
+        """Report the serials the startup apply left served (#1968).
+
+        Retried at the top of each poll until a report lands: right after the
+        apply the daemon may still be starting (an unreadable API reports
+        nothing) and the control plane may not be reachable yet. Bounded, so a
+        group whose zones the server never reports (forward zones only) does
+        not read the API on every poll forever. Re-sending is harmless: the
+        control plane's adoption only moves forward."""
+        bundle = self._boot_report_bundle
+        if bundle is None:
+            return
+        self._boot_report_attempts += 1
+        done = self._report_zone_state(
+            bundle, skip={h.zone.lower() for h in self.driver.held_back}
+        )
+        if done or self._boot_report_attempts >= BOOT_REPORT_MAX_ATTEMPTS:
+            if not done:
+                log.warning(
+                    "zone_state_boot_report_gave_up",
+                    attempts=self._boot_report_attempts,
+                )
+            self._boot_report_bundle = None
+
     def _client(self) -> httpx.Client:
         verify = self.cfg.httpx_verify()
         # server holds for ~30s, give client a bit more
@@ -351,6 +401,7 @@ class SyncLoop:
         )
 
     def _poll_once(self) -> None:
+        self._flush_boot_report()
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
         # #882 — a quarantined bundle is parked on a 304 by the etag we sent
         # last time, so the only way to give it another attempt is to stop
@@ -457,6 +508,9 @@ class SyncLoop:
             self._report_zone_state(
                 bundle, skip={h.zone.lower() for h in self.driver.held_back}
             )
+            # This bundle replaces the one applied at startup, and its report
+            # covers the same question.
+            self._boot_report_bundle = None
 
             # DNSSEC (issue #49): BIND9 signs inline from the rendered
             # config, so after a structural reload we read each signed
@@ -494,6 +548,14 @@ class SyncLoop:
                     zone=op.get("zone_name"),
                 )
                 _note_reached(reached, op)
+                # A driver that moves a zone to a serial of its own (PowerDNS
+                # never goes backwards from the one it serves, #1968) reports
+                # THAT serial, not the op's target.
+                actual_hook = getattr(self.driver, "reached_serial", None)
+                if callable(actual_hook):
+                    actual = actual_hook(str(op.get("zone_name") or ""))
+                    if isinstance(actual, int) and not isinstance(actual, bool):
+                        reached[_zone_key(op.get("zone_name"))] = actual
                 # PowerDNS DNSSEC ops return the DS rrset so we can ship
                 # it back to the control plane in one batched POST below.
                 if isinstance(result, dict) and "dnssec_state" in result:
@@ -796,12 +858,14 @@ class SyncLoop:
 
     def _report_zone_state(
         self, bundle: dict[str, Any], skip: set[str] | None = None
-    ) -> None:
+    ) -> bool:
         """POST ``{zones: [{zone_name, serial}, ...]}`` after a successful apply.
 
         Best-effort. A dead control plane or transient 5xx never blocks
         the daemon — the next structural reload will try again. ``skip``:
         zone names (lowercase, no trailing dot) the apply held back (#1403).
+        Returns whether the report landed (or there was nothing to report);
+        False when the post failed or the driver could read nothing back.
         """
         entries: list[dict[str, Any]] = []
         # A driver that can read back what it actually serves (PowerDNS,
@@ -818,6 +882,10 @@ class SyncLoop:
             except Exception as e:  # noqa: BLE001 — reporting is best-effort
                 log.warning("served_zone_serials_hook_failed", error=str(e))
                 served = {}
+        if served is not None and not served and bundle.get("zones"):
+            # An unreadable API (the daemon still starting) reads back as an
+            # empty map: nothing was reported, so it is not done.
+            return False
         for z in bundle.get("zones") or []:
             name = z.get("name")
             serial = z.get("serial")
@@ -832,8 +900,8 @@ class SyncLoop:
                 serial = actual
             entries.append({"zone_name": str(name), "serial": int(serial)})
         if not entries:
-            return
-        self._post_zone_state(entries)
+            return True
+        return self._post_zone_state(entries)
 
     def _report_reached_serials(self, reached: dict[str, int]) -> None:
         """POST the serial each zone reached through the record ops this pass
@@ -855,7 +923,7 @@ class SyncLoop:
         if entries:
             self._post_zone_state(entries)
 
-    def _post_zone_state(self, entries: list[dict[str, Any]]) -> None:
+    def _post_zone_state(self, entries: list[dict[str, Any]]) -> bool:
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
         try:
             with self._client() as c:
@@ -870,12 +938,13 @@ class SyncLoop:
                     status=resp.status_code,
                     body=resp.text[:200],
                 )
-                return
+                return False
         except httpx.HTTPError as e:
             log.warning("zone_state_report_failed", error=str(e))
-            return
+            return False
         for entry in entries:
             self._reported_serials[_zone_key(entry["zone_name"])] = int(entry["serial"])
+        return True
 
     def _refresh_dnssec_state(self, force: bool = False) -> None:
         """Re-read the driver's DNSSEC state and POST it when it changed.
