@@ -2604,6 +2604,13 @@ export function ZoneModal({
     staleTime: 60_000,
   });
   const [error, setError] = useState("");
+  // #2075 — a Primary NS that is not a host name is refused, as the API does.
+  // On edit only a changed value is held to it (the API's rule too): a zone
+  // stored before the check re-sends its value on every save, and an edit to
+  // its TTL must still go through. Such a value is flagged, not blocked.
+  const primaryNsErr = technitiumApi ? null : primaryNsError(primaryNs);
+  const primaryNsBlocks =
+    primaryNsErr !== null && (!zone || primaryNs !== (zone.primary_ns ?? ""));
 
   const mut = useMutation({
     mutationFn: (d: Record<string, unknown>) =>
@@ -2620,9 +2627,8 @@ export function ZoneModal({
   function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
-    const nsErr = technitiumApi ? null : primaryNsError(primaryNs);
-    if (nsErr) {
-      setError(nsErr);
+    if (primaryNsBlocks) {
+      setError(primaryNsErr ?? "");
       return;
     }
     const payload: Record<string, unknown> = {
@@ -2821,7 +2827,20 @@ export function ZoneModal({
                 value={primaryNs}
                 onChange={(e) => setPrimaryNs(e.target.value)}
                 placeholder="ns1.example.com."
+                aria-invalid={primaryNsBlocks || undefined}
               />
+              {primaryNsErr &&
+                (primaryNsBlocks ? (
+                  <p className="text-xs text-destructive mt-0.5">
+                    {primaryNsErr}
+                  </p>
+                ) : (
+                  <p className="text-xs text-amber-600 dark:text-amber-400 mt-0.5">
+                    {primaryNsErr}. Stored before this was checked; a BIND9
+                    server serves the zone&apos;s first NS record (or
+                    ns1.&lt;zone&gt;) in its place. Change it to a host name.
+                  </p>
+                ))}
             </Field>
             <Field label="Admin Email">
               <input

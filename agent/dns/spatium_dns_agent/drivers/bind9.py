@@ -838,12 +838,16 @@ _HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
 def _is_host_name(absolute: str) -> bool:
-    """Whether absolute ``absolute`` passes BIND's default ``check-names``
-    for a host (RFC 1123 labels, at most 63 octets each, 253 in all). The SOA
-    MNAME is checked as one: a row stored before #2075 with ``ns_1.…`` made
-    named refuse the zone and the agent revert the whole bundle."""
+    """Whether absolute ``absolute`` is a usable Primary NS: the control
+    plane's ``primary_ns_error`` rule (backend ``app/core/dns_names.py``, kept
+    in step by shared test vectors). RFC 1123 labels, at most 63 octets each
+    and 253 in all, as BIND's default ``check-names`` requires: a row stored
+    before #2075 with ``ns_1.…`` made named refuse the zone and the agent
+    revert the whole bundle. And at least two labels: a single label such as
+    ``ns1`` is read as absolute and would be served as a name at the root,
+    not the ``ns1.<zone>`` the operator meant."""
     body = absolute[:-1] if absolute.endswith(".") else absolute
-    if not body or len(body) > 253:
+    if not body or len(body) > 253 or "." not in body:
         return False
     return all(_HOST_LABEL_RE.match(label) for label in body.split("."))
 

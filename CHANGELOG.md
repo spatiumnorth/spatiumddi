@@ -88,15 +88,19 @@ the formatter handles the rest.
   The zone dialog stored `ns_1.<zone>.` or a 64-character label as typed
   and answered 201; the BIND9 agent then wrote it as the SOA MNAME, named's
   check-names refused the zone, and the server row went `reverted` with the
-  zone never served. Zone create and update (REST), the Copilot's
-  `create_dns_zone` and the zone importers now apply the host-name rule: a
-  422 naming `primary_ns` for an underscore, an over-long or empty label, or
-  a single label such as `ns1`, which would have been served as a name at the
-  root. The importer leaves an unservable source MNAME unset rather than
-  storing it. A row stored before this no longer stops the group: the BIND9
-  agent renders the placeholder apex for it and logs `unusable_field`. The
-  responsible-person name is unchanged, since a mailbox is not a host.
-
+  zone never served. A single label such as `ns1` was stored too, and served
+  as a name at the root rather than under the zone. Zone create (REST and the
+  dialog), the Copilot's `create_dns_zone` and the zone importers now apply
+  the host-name rule: letters, digits and hyphens, at most 63 per label and
+  253 in all, at least two labels, trailing dot optional; empty still means
+  "use the zone's NS". A zone **update** refuses only a changed value, so a
+  zone stored before this stays editable by a save that re-sends it (the
+  dialog shows a warning under the field until it is changed). The importer leaves an
+  unservable source MNAME unset and says so in the commit warnings. On BIND9
+  a stored value of that kind no longer stops the group: the agent serves the
+  zone's first apex NS record, or the `ns1.<zone>` placeholder, as the SOA
+  primary name and logs `unusable_field`. The responsible-person name is
+  unchanged, since a mailbox is not a host.
 
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said

@@ -324,7 +324,8 @@ def primary_ns_error(value: str | None) -> str | None:
     if not body or "." not in body:
         return (
             "must be a fully qualified host name such as ns1.example.com. "
-            "(a name with no dot would be read as a name at the root)"
+            "(a single label such as 'ns1' would be served as a name at the "
+            "root, not under the zone)"
         )
     if len(body) > MAX_NAME_LEN:
         return f"exceeds {MAX_NAME_LEN} characters"

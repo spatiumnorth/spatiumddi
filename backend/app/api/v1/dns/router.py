@@ -1276,11 +1276,14 @@ class ZoneUpdate(BaseModel):
 
     @field_validator("primary_ns", "admin_email")
     @classmethod
-    def validate_soa_fields(cls, v: str | None, info: ValidationInfo) -> str | None:
+    def validate_soa_fields(cls, v: str | None) -> str | None:
         # Optional on update; same injection guard as ZoneCreate (issue #597).
+        # The #2075 host-name rule for primary_ns is applied in update_zone,
+        # to a CHANGED value only: a zone stored before it must stay
+        # editable by a request that re-sends what it holds.
         if v is None:
             return v
-        return _validate_soa_field(v, field=info.field_name)
+        return _validate_soa_field(v)
 
     @field_validator("zone_type")
     @classmethod
@@ -5624,6 +5627,15 @@ async def update_zone(
     # row — so an operator can't flip a zone to secondary without masters,
     # nor empty the masters on an existing secondary.
     _refuse_superadmin_zone_fields(current_user, changes, zone)
+    # #2075 — a Primary NS that is not a host name makes BIND refuse the zone.
+    # Only a changed value is held to it (the #1784 / #1310 rule): the Edit
+    # dialog and a GET-then-PUT client re-send the stored value on every save,
+    # and a row written before this check must not block an edit to its TTL.
+    # The agent renders a fallback for such a row, so keeping it breaks nothing.
+    if "primary_ns" in changes and (changes["primary_ns"] or "") != (zone.primary_ns or ""):
+        ns_err = primary_ns_error(changes["primary_ns"])
+        if ns_err is not None:
+            raise HTTPException(status_code=422, detail=f"Primary NS (primary_ns) {ns_err}")
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)

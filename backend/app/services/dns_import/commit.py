@@ -671,6 +671,15 @@ async def commit_import(
                 # The plan's preview warning said to commit with "replace";
                 # done, so it no longer belongs in the result.
                 warnings = [w for w in warnings if not is_apex_ns_warning(w, parsed.name)]
+        if parsed.soa is not None and parsed.soa.primary_ns:
+            mname = parsed.soa.primary_ns.rstrip(".")
+            if mname and primary_ns_error(mname) is not None:
+                # #2075 — _zone_kwargs_from_parsed leaves it unset; say so.
+                warnings.append(
+                    f"Zone {parsed.name!r}: SOA primary name {parsed.soa.primary_ns!r} "
+                    "is not a fully qualified host name and was not imported; the "
+                    "zone's first apex NS record is served as the SOA primary name instead"
+                )
         if bind9_target and parsed.forwarders:
             kept, dropped = split_zone_forwarders(parsed.forwarders)
             if dropped:
