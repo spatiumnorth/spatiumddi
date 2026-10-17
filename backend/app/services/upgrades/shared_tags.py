@@ -51,6 +51,7 @@ fewer than two nodes, which has no mixed-version window.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -96,12 +97,43 @@ _POLL_INTERVAL_S = 5.0
 @dataclass(frozen=True)
 class StepOutcome:
     """What one hold step did. ``mode`` is ``hold``, ``legacy``,
-    ``released`` or ``skipped`` (no k3s, or a one-node run)."""
+    ``released`` or ``skipped`` (no k3s, or a one-node run).
+
+    ``retryable``: the step failed at the kubeapi in a way a later try can
+    get past, a request unanswered or refused for now (:func:`_transient`).
+    Every step is idempotent, so the drive tries it again rather than end
+    the run on an apiserver that is restarting."""
 
     ok: bool
     mode: str = "skipped"
     error: str | None = None
     detail: dict[str, Any] = field(default_factory=dict)
+    retryable: bool = False
+
+
+# Statuses the kubeapi answers a request it may take on a later try with:
+# timeout, conflict (a write that raced another one), throttling. Every 5xx
+# is one too: k3s answers 503 "apiserver not ready" while it restarts.
+_TRANSIENT_STATUSES = frozenset({408, 409, 429})
+_STATUS_RE = re.compile(r"\bstatus (\d{3})\b")
+
+
+def _transient(error: str | None) -> bool:
+    """Whether a pin step's ``error`` is the kubeapi's not answering or
+    refusing for now (#2028), which the drive tries again, rather than an
+    answer no later try changes: a 403 (RBAC), a 422 (an invalid object), a
+    missing ServiceAccount. Those fail the run at once, as before, so a real
+    fault is never hidden behind five minutes of retries.
+
+    Reads the status the k8s helpers put in their error text; an error with
+    no status is a request that went unanswered."""
+    if not error or "ServiceAccount not mounted" in error:
+        return False
+    match = _STATUS_RE.search(error)
+    if match is None:
+        return True
+    status = int(match.group(1))
+    return status >= 500 or status in _TRANSIENT_STATUSES
 
 
 def _now_iso() -> str:
@@ -294,7 +326,9 @@ async def ensure_hold(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
     before every later one. The caller commits.
 
     A hold that cannot be placed is a failure: the run must stop before a
-    node boots the new slot with the shared tags free to move."""
+    node boots the new slot with the shared tags free to move. A failure the
+    kubeapi may get past on a later try is ``retryable``: the drive pauses
+    and tries the step again before it fails the run on it."""
     record = record_of(run)
     mode = record.get("mode")
     if mode == MODE_LEGACY:
@@ -306,7 +340,7 @@ async def ensure_hold(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
         if not held_tag:
             return StepOutcome(ok=False, mode=MODE_HOLD, error="the hold records no tag")
         ok, err = _apply_pins(held_tag)
-        return StepOutcome(ok=ok, mode=MODE_HOLD, error=err)
+        return StepOutcome(ok=ok, mode=MODE_HOLD, error=err, retryable=not ok and _transient(err))
 
     nodes = [str(n) for n in (run.plan or {}).get("node_order") or []]
     if len(nodes) < 2 or k8s.get_config() is None:
@@ -345,7 +379,13 @@ async def ensure_hold(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
         ok=ok,
         error=err,
     )
-    return StepOutcome(ok=ok, mode=MODE_HOLD, error=err, detail={"from_tag": from_tag})
+    return StepOutcome(
+        ok=ok,
+        mode=MODE_HOLD,
+        error=err,
+        detail={"from_tag": from_tag},
+        retryable=not ok and _transient(err),
+    )
 
 
 # ── The flip ─────────────────────────────────────────────────────────
@@ -459,7 +499,12 @@ async def flip(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
         try:
             current = _list_workloads(RELEASE_NAMESPACE)
         except k8s.KubeapiUnavailableError as exc:
-            return StepOutcome(ok=False, mode=MODE_HOLD, error=f"kubeapi unreachable: {exc}")
+            return StepOutcome(
+                ok=False,
+                mode=MODE_HOLD,
+                error=f"kubeapi unreachable: {exc}",
+                retryable=_transient(str(exc)),
+            )
         workloads = [
             {"kind": kind, "name": name}
             for (kind, name), item in sorted(current.items())
@@ -472,7 +517,12 @@ async def flip(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
 
     ok, err = _apply_pins(None)
     if not ok:
-        return StepOutcome(ok=False, mode=MODE_HOLD, error=f"could not remove a tag pin: {err}")
+        return StepOutcome(
+            ok=False,
+            mode=MODE_HOLD,
+            error=f"could not remove a tag pin: {err}",
+            retryable=_transient(err),
+        )
     now = _now_iso()
     flip_rec.update(state=FLIP_FLIPPED, flipped_at=now)
     record.update(flip=flip_rec, released_at=now, release_reason="flip")
