@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting a DNS or DHCP server row no longer takes its daemon down
+  with it (#2052).** The agent's woken config poll answers 404 once the
+  row is gone, and on a 401 or 404 the DNS, DHCP and looking-glass agents
+  dropped their token and stopped the sync thread. The supervisor's
+  dead-thread watch then exited the container, so named stopped answering
+  for 2-13 s (Kea about 1 s) until the restarted container re-registered,
+  which is the opposite of what non-negotiable #5 and the #1939 note say.
+  The agents now re-register from the PSK in the same thread
+  (`bootstrap.reauthenticate`, serialised so the sync loop and the
+  heartbeat register once) and keep polling; the daemon never stops and
+  serves from its cached config throughout. A control plane that is down
+  or a wrong PSK backs off (jittered, capped at 5 min) instead of
+  spinning or exiting. The re-registered agent appears as a new server
+  row.
+
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create

@@ -36,12 +36,12 @@ import httpx
 import structlog
 
 from . import gobgp
+from .bootstrap import reauthenticate
 from .cache import (
     commit_config,
     load_config,
     load_previous_config,
     save_config,
-    save_token,
 )
 from .config import AgentConfig
 from .config_apply import (
@@ -242,9 +242,9 @@ class SyncLoop:
             return
         if resp.status_code in (401, 404):
             # 401 = token expired/invalid. 404 = the collector row was
-            # deleted on the control plane. Both recover the same way:
-            # drop the cached token and let the supervisor's dead-thread
-            # detection restart the container -> re-bootstrap from PSK.
+            # deleted on the control plane. #2052 — re-register in this
+            # thread and keep polling; stopping it made the supervisor exit
+            # the container and take the BGP daemon down with the agent.
             log.warning(
                 "lg_sync_will_rebootstrap",
                 status=resp.status_code,
@@ -252,8 +252,8 @@ class SyncLoop:
                     "token_invalid" if resp.status_code == 401 else "collector_missing"
                 ),
             )
-            save_token(self.cfg.state_dir, "")
-            self._stop.set()
+            reauthenticate(self.cfg, self.token_ref, headers["Authorization"][7:])
+            self._current_etag = None
             return
         if resp.status_code != 200:
             log.warning("lg_sync_unexpected_status", status=resp.status_code)

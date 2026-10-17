@@ -18,6 +18,7 @@ import structlog
 
 from . import features
 from .admin_pusher import push_rendered_config
+from .bootstrap import reauthenticate
 from .cache import commit_config, load_config, load_previous_config, save_config
 from .config import AgentConfig
 from .config_apply import (
@@ -466,10 +467,12 @@ class SyncLoop:
                 status=resp.status_code,
                 reason="token_invalid" if resp.status_code == 401 else "server_missing",
             )
-            from .cache import save_token
-
-            save_token(self.cfg.state_dir, "")
-            self._stop.set()
+            # #2052 — re-register in this thread; do NOT stop it. Stopping
+            # made the supervisor exit the container and take the daemon down.
+            reauthenticate(self.cfg, self.token_ref, headers["Authorization"][7:])
+            # The new row has seen no bundle: force a fresh 200 (the
+            # structural etag still gates any daemon reload).
+            self._current_etag = None
             return
         if resp.status_code != 200:
             log.warning("sync_unexpected_status", status=resp.status_code)

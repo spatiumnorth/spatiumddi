@@ -11,6 +11,7 @@ import httpx
 import structlog
 
 from . import __version__, kea_ctrl
+from .bootstrap import reauthenticate
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
@@ -111,6 +112,7 @@ class HeartbeatClient:
         # supervisor's heartbeat (one producer instead of three).
         # The DHCP service container drops the host bind mounts in C1
         # so it can no longer read those signals anyway.
+        sent_token = self.token_ref[0]
         try:
             with self._client() as c:
                 resp = c.post(
@@ -135,11 +137,11 @@ class HeartbeatClient:
                     save_token(self.cfg.state_dir, rotated)
                     log.info("dhcp_agent_token_rotated")
             elif resp.status_code in (401, 404):
-                # Token invalidated or server row deleted — clear token and
-                # exit so supervisor restarts the container (→ re-bootstrap).
+                # Token invalidated or server row deleted (#2052): re-register
+                # from the PSK in this thread. Stopping it made the supervisor
+                # exit the container and take Kea down with the agent.
                 log.warning("heartbeat_will_rebootstrap", status=resp.status_code)
-                save_token(self.cfg.state_dir, "")
-                self._stop.set()
+                reauthenticate(self.cfg, self.token_ref, sent_token)
             else:
                 log.warning("heartbeat_failed", status=resp.status_code)
         except httpx.HTTPError as e:

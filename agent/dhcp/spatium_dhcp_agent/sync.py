@@ -30,13 +30,13 @@ from typing import Any
 import httpx
 import structlog
 
+from .bootstrap import reauthenticate
 from .cache import (
     commit_config,
     load_config,
     load_previous_config,
     save_config,
     save_rendered_kea,
-    save_token,
 )
 from .config import AgentConfig
 from .config_apply import (
@@ -751,15 +751,17 @@ class SyncLoop:
             return
         if resp.status_code in (401, 404):
             # 401 = token expired/invalid. 404 = server row was deleted on the
-            # control plane (user removed it in the UI); re-register to create
-            # a fresh row rather than 404-looping forever.
+            # control plane. #2052 — re-register in this thread and keep
+            # polling; stopping it made the supervisor exit the container and
+            # take Kea down with the agent.
             log.warning(
                 "sync_will_rebootstrap",
                 status=resp.status_code,
                 reason="token_invalid" if resp.status_code == 401 else "server_missing",
             )
-            save_token(self.cfg.state_dir, "")
-            self._stop.set()
+            reauthenticate(self.cfg, self.token_ref, headers["Authorization"][7:])
+            # Force a fresh 200 for the new row (the apply is etag-gated).
+            self._current_etag = None
             return
         if resp.status_code != 200:
             self._record_failure(f"status:{resp.status_code}")

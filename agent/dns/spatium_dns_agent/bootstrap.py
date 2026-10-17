@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+import threading
 import time
 
 import httpx
@@ -99,3 +100,33 @@ def ensure_token(cfg: AgentConfig) -> tuple[str, str]:
         return agent_id, token
     agent_id, token, _ = register(cfg)
     return agent_id, token
+
+
+# #2052 — one re-bootstrap at a time. The sync loop and the heartbeat both see
+# the same 401/404 within moments of each other; the second must find the
+# token already replaced rather than register a second row.
+_reauth_lock = threading.Lock()
+
+
+def reauthenticate(cfg: AgentConfig, token_ref: list[str], stale_token: str) -> str:
+    """Replace a rejected token in place, from the PSK. Returns the live token.
+
+    Called from the sync / heartbeat threads on a 401 or 404 (token expired,
+    or the server row was deleted). It drops the cached token and registers
+    again WITHOUT ending the calling thread, so the supervisor's dead-thread
+    watch never fires and the daemon keeps serving from its cached config
+    (non-negotiable #5) — the previous behaviour stopped the thread, which
+    made the supervisor exit the container and took the daemon down with it.
+
+    ``register`` retries with jittered backoff (cap 5 min) until the control
+    plane answers, so an unreachable control plane or a wrong PSK waits and
+    retries instead of spinning or exiting. Another thread may have refreshed
+    the token while this one waited for the lock; then nothing is registered.
+    """
+    with _reauth_lock:
+        if token_ref[0] != stale_token:
+            return token_ref[0]
+        save_token(cfg.state_dir, "")
+        _agent_id, token, _ = register(cfg)
+        token_ref[0] = token
+        return token
