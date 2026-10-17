@@ -1353,6 +1353,7 @@ async def _assert_alias_cname_rules(
     aliases: list[Any],
     *,
     hostname: str | None,
+    address: Any,
     zone_id: uuid.UUID | None,
 ) -> None:
     """Refuse an alias set that would put a CNAME beside other data (#2080).
@@ -1384,10 +1385,21 @@ async def _assert_alias_cname_rules(
     if zone is None or not ipam_authors_zone(zone):
         return
     zone_domain = zone.name.rstrip(".")
-    # name (lower-cased) -> record types the request itself will put there
-    pending: dict[str, list[str]] = {hostname.strip().lower(): ["A"]}
+    try:
+        is_v6 = isinstance(ipaddress.ip_address(str(address)), ipaddress.IPv6Address)
+    except ValueError:
+        is_v6 = False
+    host_rtype = "AAAA" if is_v6 else "A"
+    # name (lower-cased) -> what the request itself will put there, as
+    # (is_cname, label) pairs; the label names it in the refusal.
+    pending: dict[str, list[tuple[bool, str]]] = {
+        hostname.strip().lower(): [(False, f"the address's own {host_rtype} record")]
+    }
     for al in aliases:
         rtype = (getattr(al, "record_type", None) or al.get("record_type") or "CNAME").upper()
+        # The writer turns an A alias on an IPv6 address into an AAAA.
+        if rtype == "A" and is_v6:
+            rtype = "AAAA"
         name = (getattr(al, "name", None) or al.get("name") or "").strip().rstrip(".")
         if not name or rtype not in {"CNAME", "A", "AAAA"}:
             continue
@@ -1401,18 +1413,19 @@ async def _assert_alias_cname_rules(
             raise HTTPException(
                 status.HTTP_409_CONFLICT, describe_cname_conflict(rtype, fqdn, other)
             )
+        is_cname = rtype == "CNAME"
+        what = f"{'an' if rtype.startswith('A') else 'a'} {rtype} alias"
         siblings = pending.setdefault(name.lower(), [])
-        # A is the stand-in for the host record and any A-family alias.
-        kind = "CNAME" if rtype == "CNAME" else "A"
-        if (kind == "CNAME" and siblings) or (kind != "CNAME" and "CNAME" in siblings):
+        clash = next((lbl for c, lbl in siblings if is_cname or c), None)
+        if clash is not None:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"{fqdn} would hold a CNAME and another record ({', '.join(siblings)} / "
-                f"{rtype}) in this request. A CNAME must be the only record at its name "
-                "(RFC 1034 section 3.6.2, RFC 2181 section 10.1); PowerDNS and BIND both "
+                f"{fqdn} would hold both {clash} and {what} from this "
+                "request. A CNAME must be the only record at its name (RFC 1034 "
+                "section 3.6.2, RFC 2181 section 10.1); PowerDNS and BIND both "
                 "refuse a zone that breaks this, and the server stops applying it.",
             )
-        siblings.append(kind)
+        siblings.append((is_cname, what))
 
 
 async def _create_alias_records(
@@ -7995,7 +8008,12 @@ async def create_address(
             raise _collision_http_exc(warnings)
 
     await _assert_alias_cname_rules(
-        db, subnet, body.aliases, hostname=body.hostname, zone_id=explicit_zone
+        db,
+        subnet,
+        body.aliases,
+        hostname=body.hostname,
+        address=body.address,
+        zone_id=explicit_zone,
     )
     ip = IPAddress(
         subnet_id=subnet_id,
@@ -8556,7 +8574,9 @@ async def add_alias(
                 "records into it."
             ),
         )
-    await _assert_alias_cname_rules(db, subnet, [body], hostname=ip.hostname, zone_id=zone_id)
+    await _assert_alias_cname_rules(
+        db, subnet, [body], hostname=ip.hostname, address=ip.address, zone_id=zone_id
+    )
     await _create_alias_records(db, ip, subnet, [body], zone_id=zone_id)
     # Find the just-created record
     res = await db.execute(
@@ -9648,7 +9668,12 @@ async def allocate_next_ip(
             raise _collision_http_exc(public_warnings)
 
     await _assert_alias_cname_rules(
-        db, subnet, body.aliases, hostname=body.hostname, zone_id=explicit_zone
+        db,
+        subnet,
+        body.aliases,
+        hostname=body.hostname,
+        address=chosen,
+        zone_id=explicit_zone,
     )
     ip = IPAddress(
         subnet_id=subnet_id,

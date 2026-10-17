@@ -95,8 +95,13 @@ the formatter handles the rest.
   so the agent stayed on its last good config. The alias path now asks
   the same shared check, before anything is written, in every view:
   409 for a clash, 422 for a CNAME at the apex, with the DNS API's
-  message. An alias stored before this fix still has to be deleted
-  by hand.
+  message. An A alias on an IPv6 address is checked as the AAAA it is
+  written as, and a clash inside one request names both sides (for
+  example the address's own AAAA record). An alias stored before this
+  fix is not removed: BIND holds back only the zone it is in (#1403),
+  the server reports it through the `agent_config_rejected` alert, and
+  deleting the alias (`DELETE /ipam/addresses/{id}/aliases/{record_id}`)
+  releases the zone.
 
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said

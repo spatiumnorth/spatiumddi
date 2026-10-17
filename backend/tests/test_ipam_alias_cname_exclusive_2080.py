@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
-from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSZone
+from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone
 from app.models.ipam import IPBlock, IPSpace
 
 
@@ -37,7 +37,12 @@ async def _headers(db: AsyncSession) -> dict[str, str]:
     return {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
 
 
-async def _setup(client: AsyncClient, db: AsyncSession) -> tuple[dict[str, str], str, DNSZone]:
+async def _setup(
+    client: AsyncClient,
+    db: AsyncSession,
+    block_cidr: str = "10.98.0.0/16",
+    subnet_cidr: str = "10.98.5.0/24",
+) -> tuple[dict[str, str], str, DNSZone]:
     headers = await _headers(db)
     grp = DNSServerGroup(name=f"g2080-{uuid.uuid4().hex[:6]}")
     db.add(grp)
@@ -64,7 +69,7 @@ async def _setup(client: AsyncClient, db: AsyncSession) -> tuple[dict[str, str],
     space = IPSpace(name=f"sp2080-{uuid.uuid4().hex[:8]}", description="")
     db.add(space)
     await db.flush()
-    block = IPBlock(space_id=space.id, network="10.98.0.0/16", name="b")
+    block = IPBlock(space_id=space.id, network=block_cidr, name="b")
     db.add(block)
     await db.flush()
     await db.commit()
@@ -74,7 +79,7 @@ async def _setup(client: AsyncClient, db: AsyncSession) -> tuple[dict[str, str],
         json={
             "space_id": str(space.id),
             "block_id": str(block.id),
-            "network": "10.98.5.0/24",
+            "network": subnet_cidr,
             "dns_group_id": str(grp.id),
             "dns_zone_id": str(zone.id),
             "skip_reverse_zone": True,
@@ -242,3 +247,76 @@ async def test_a_request_cannot_clash_with_itself(
         ("c1", "CNAME"),
         ("h3", "A"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_view_scoped_row_blocks_a_cname_alias(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An alias has no view, so it renders into every view: a row scoped to any
+    one view at the same name is beside it there (split horizon)."""
+    headers, sid, zone = await _setup(client, db_session)
+    view = DNSView(group_id=zone.group_id, name=f"v{uuid.uuid4().hex[:6]}")
+    db_session.add(view)
+    await db_session.flush()
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            view_id=view.id,
+            name="intra",
+            fqdn=f"intra.{zone.name.rstrip('.')}",
+            record_type="TXT",
+            value='"x"',
+        )
+    )
+    await db_session.commit()
+    resp = await _alloc(
+        client,
+        headers,
+        sid,
+        "10.98.5.40",
+        "h40",
+        aliases=[{"name": "intra", "record_type": "CNAME"}],
+    )
+    assert resp.status_code == 409, resp.text
+    assert "TXT" in resp.text
+    assert await _records(db_session, zone.id) == [("intra", "TXT")]
+
+
+@pytest.mark.asyncio
+async def test_ipv6_address_alias_is_checked_as_aaaa(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An A alias on an IPv6 address is written as an AAAA, and the refusal
+    says so; the request's own AAAA host record is named in a self-clash."""
+    headers, sid, zone = await _setup(
+        client, db_session, block_cidr="fd98::/48", subnet_cidr="fd98:0:0:5::/64"
+    )
+    base = await _alloc(
+        client,
+        headers,
+        sid,
+        "fd98:0:0:5::10",
+        "v6host",
+        aliases=[{"name": "svc", "record_type": "CNAME"}],
+    )
+    assert base.status_code == 201, base.text
+    add = await client.post(
+        f"/api/v1/ipam/addresses/{base.json()['id']}/aliases",
+        headers=headers,
+        json={"name": "svc", "record_type": "A"},
+    )
+    assert add.status_code == 409, add.text
+    assert "can hold no AAAA record" in add.text
+
+    self_clash = await _alloc(
+        client,
+        headers,
+        sid,
+        "fd98:0:0:5::11",
+        "loop",
+        aliases=[{"name": "loop", "record_type": "CNAME"}],
+    )
+    assert self_clash.status_code == 409, self_clash.text
+    assert "own AAAA record" in self_clash.text
+    assert await _records(db_session, zone.id) == [("svc", "CNAME"), ("v6host", "AAAA")]
