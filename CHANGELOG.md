@@ -90,7 +90,9 @@ the formatter handles the rest.
   returned nowhere, so the only way to see them was SQL.
   `GET /audit/{id}` returns them, `GET /audit` does too with
   `include_details=true`, the Audit Log page expands a row to show them,
-  and `get_audit_history` carries `old_value` / `new_value`. Values are
+  and `get_audit_history` carries `old_value` / `new_value` when asked
+  with `include_details` (off by default, because the copilot's provider
+  can be off-premises; non-negotiable #13). Values are
   redacted on read (credential-shaped keys and secret-shaped strings,
   a PEM private key whole), because the writers are hundreds of call
   sites and nothing stops one storing a credential. The writers' own

@@ -231,12 +231,28 @@ async def test_details_need_read_audit_log(client: AsyncClient, db_session: Asyn
     assert r.status_code == 403
 
 
-async def test_mcp_tool_redacts_the_same_way(db_session: AsyncSession) -> None:
+async def test_mcp_tool_omits_details_unless_asked(db_session: AsyncSession) -> None:
+    """The copilot's provider can be off-premises, so before/after values
+    leave the box only on request, like the list endpoint's include_details."""
     from app.services.ai.tools.network import GetAuditHistoryArgs, get_audit_history
 
     row = await _entry(db_session)
     out = await get_audit_history(
         db_session, None, GetAuditHistoryArgs(resource_id=row.resource_id)  # type: ignore[arg-type]
+    )
+    assert len(out) == 1
+    assert "old_value" not in out[0] and "new_value" not in out[0]
+    assert out[0]["changed_fields"] == row.changed_fields
+
+
+async def test_mcp_tool_redacts_the_same_way(db_session: AsyncSession) -> None:
+    from app.services.ai.tools.network import GetAuditHistoryArgs, get_audit_history
+
+    row = await _entry(db_session)
+    out = await get_audit_history(
+        db_session,
+        None,  # type: ignore[arg-type]
+        GetAuditHistoryArgs(resource_id=row.resource_id, include_details=True),
     )
     assert len(out) == 1
     assert out[0]["new_value"]["direction"] == "backward"
