@@ -20,7 +20,77 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
-import type { AlertRule } from "@/lib/api";
+import type { AlertParamSpec, AlertRule, AlertRuleTypeSpec } from "@/lib/api";
+
+const int = (
+  name: AlertParamSpec["name"],
+  label: string,
+  over: Partial<AlertParamSpec> = {},
+): AlertParamSpec => ({
+  name,
+  label,
+  kind: "integer",
+  unit: null,
+  min: null,
+  max: null,
+  default: null,
+  initial: null,
+  hint: null,
+  options: [],
+  ...over,
+});
+const sel = (
+  name: AlertParamSpec["name"],
+  label: string,
+  options: string[],
+  over: Partial<AlertParamSpec> = {},
+): AlertParamSpec => ({
+  ...int(name, label, over),
+  kind: "select",
+  options: options.map((o) => ({ value: o, label: o })),
+});
+const t = (
+  rule_type: string,
+  params: AlertParamSpec[],
+  group = "G",
+): AlertRuleTypeSpec => ({
+  rule_type,
+  label: rule_type,
+  group,
+  description: null,
+  params,
+});
+// What the backend serves — a few types, including one the old hand-kept
+// frontend union never knew (ip_free_but_responding, #1997).
+const CATALOGUE: AlertRuleTypeSpec[] = [
+  t("subnet_utilization", [
+    int("threshold_percent", "Threshold (%)", { default: 90, unit: "%" }),
+  ]),
+  t("voice_lease_count_below", [
+    int("threshold_percent", "Minimum active leases", { default: 1 }),
+  ]),
+  t("stale_ip_count", [
+    int("threshold_percent", "Stale IP count threshold", { default: 10 }),
+    int("threshold_days", "Stale window (days)", { default: 90 }),
+  ]),
+  t("ip_free_but_responding", [
+    int("threshold_days", "Recency window (days)", { default: 1 }),
+  ]),
+  t("domain_nameserver_drift", []),
+  t("server_unreachable", [
+    sel("server_type", "Server type", ["any", "dns", "dhcp"], {
+      default: "any",
+    }),
+  ]),
+  t("compliance_change", [
+    sel("classification", "Classification", ["pci_scope", "hipaa_scope"], {
+      initial: "pci_scope",
+    }),
+    sel("change_scope", "Change scope", ["any_change", "create", "delete"], {
+      default: "any_change",
+    }),
+  ]),
+];
 
 const updateRule = vi.fn();
 const createRule = vi.fn();
@@ -31,6 +101,7 @@ vi.mock("@/lib/api", async () => {
     ...actual,
     alertsApi: {
       ...actual.alertsApi,
+      ruleTypes: () => Promise.resolve(CATALOGUE),
       updateRule: (...a: unknown[]) => updateRule(...a),
       createRule: (...a: unknown[]) => createRule(...a),
     },
@@ -99,23 +170,30 @@ describe("unchanged Save (#1986)", () => {
     const onClose = mount(
       rule({ rule_type: rule_type as AlertRule["rule_type"], ...over }),
     );
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const save = screen.getByRole("button", { name: "Save" });
+    await waitFor(() =>
+      expect((save as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(save);
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(updateRule).not.toHaveBeenCalled();
   });
 
-  it("shows a stored null as empty, not as a default", () => {
+  it("shows a stored null as empty, not as a default", async () => {
     mount(rule({ rule_type: "voice_lease_count_below" }));
     expect(
-      (screen.getByLabelText("Minimum active leases") as HTMLInputElement)
-        .value,
+      (
+        (await screen.findByLabelText(
+          "Minimum active leases",
+        )) as HTMLInputElement
+      ).value,
     ).toBe("");
   });
 
   it("sends only the changed field", async () => {
     updateRule.mockResolvedValue(rule({}));
     mount(rule({ rule_type: "stale_ip_count" }));
-    fireEvent.change(screen.getByLabelText("Stale window (days)"), {
+    fireEvent.change(await screen.findByLabelText("Stale window (days)"), {
       target: { value: "45" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -128,7 +206,7 @@ describe("clearing a value (#1986)", () => {
   it("sends null when a stored threshold is cleared", async () => {
     updateRule.mockResolvedValue(rule({}));
     mount(rule({ rule_type: "subnet_utilization", threshold_percent: 80 }));
-    fireEvent.change(screen.getByLabelText("Threshold (%)"), {
+    fireEvent.change(await screen.findByLabelText("Threshold (%)"), {
       target: { value: "" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -157,7 +235,7 @@ describe("refused save (#1993)", () => {
     fireEvent.change(screen.getByLabelText("Name"), {
       target: { value: "x" },
     });
-    fireEvent.change(screen.getByLabelText("Threshold (%)"), {
+    fireEvent.change(await screen.findByLabelText("Threshold (%)"), {
       target: { value: "150" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Create" }));
@@ -171,8 +249,9 @@ describe("refused save (#1993)", () => {
 });
 
 describe("labels name their controls (#1994)", () => {
-  it("finds each control by its visible label", () => {
+  it("finds each control by its visible label", async () => {
     mount(null);
+    await screen.findByLabelText("Threshold (%)");
     for (const l of [
       "Name",
       "Description",
@@ -181,5 +260,64 @@ describe("labels name their controls (#1994)", () => {
       "Severity",
     ])
       expect(screen.getByLabelText(l)).toBeTruthy();
+  });
+});
+
+describe("types the old frontend union did not know (#1997)", () => {
+  it("shows threshold_days for ip_free_but_responding", async () => {
+    mount(rule({ rule_type: "ip_free_but_responding", threshold_days: 5 }));
+    const input = (await screen.findByLabelText(
+      "Recency window (days)",
+    )) as HTMLInputElement;
+    expect(input.value).toBe("5");
+  });
+
+  it("an untouched Save on it sends nothing", async () => {
+    const onClose = mount(
+      rule({ rule_type: "ip_free_but_responding", threshold_days: 5 }),
+    );
+    await screen.findByLabelText("Recency window (days)");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateRule).not.toHaveBeenCalled();
+  });
+
+  it("an untouched Save on a stored null sends nothing and keeps it empty", async () => {
+    const onClose = mount(rule({ rule_type: "ip_free_but_responding" }));
+    const input = (await screen.findByLabelText(
+      "Recency window (days)",
+    )) as HTMLInputElement;
+    expect(input.value).toBe("");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateRule).not.toHaveBeenCalled();
+  });
+
+  it("editing it sends only that field", async () => {
+    updateRule.mockResolvedValue(rule({}));
+    mount(rule({ rule_type: "ip_free_but_responding", threshold_days: 5 }));
+    fireEvent.change(await screen.findByLabelText("Recency window (days)"), {
+      target: { value: "3" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(updateRule).toHaveBeenCalled());
+    expect(updateRule).toHaveBeenCalledWith("r1", { threshold_days: 3 });
+  });
+
+  it("a type with no parameters says so", async () => {
+    mount(rule({ rule_type: "domain_nameserver_drift" }));
+    expect(await screen.findByText("No adjustable parameters.")).toBeTruthy();
+  });
+
+  it("lists catalogue types in the New-rule picker", async () => {
+    mount(null);
+    const select = (await screen.findByLabelText(
+      "Rule type",
+    )) as HTMLSelectElement;
+    await waitFor(() =>
+      expect(Array.from(select.options).map((o) => o.value)).toContain(
+        "ip_free_but_responding",
+      ),
+    );
   });
 });

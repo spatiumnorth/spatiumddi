@@ -12,12 +12,10 @@ import {
 } from "lucide-react";
 import {
   alertsApi,
-  type AlertChangeScope,
-  type AlertClassification,
+  type AlertParamSpec,
   type AlertRule,
+  type AlertRuleTypeSpec,
   type AlertRuleUpdate,
-  type AlertRuleType,
-  type AlertServerType,
   type AlertSeverity,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
@@ -32,29 +30,6 @@ import {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-// Per-rule-type sensible starting values, seeded when the operator picks a
-// type in the New-rule modal. Without this, switching to e.g. stale_ip_count
-// would inherit subnet_utilization's 90 / 30 and create a 90-count / 30-day
-// rule that contradicts the documented 10 / 90 semantics.
-const RULE_TYPE_PARAM_DEFAULTS: Partial<
-  Record<AlertRuleType, { threshold?: number; thresholdDays?: number }>
-> = {
-  subnet_utilization: { threshold: 90 },
-  voice_lease_count_below: { threshold: 10 },
-  stale_ip_count: { threshold: 10, thresholdDays: 90 },
-  dhcp_pool_exhaustion: { threshold: 90 },
-  domain_expiring: { thresholdDays: 30 },
-  circuit_term_expiring: { thresholdDays: 30 },
-  service_term_expiring: { thresholdDays: 30 },
-  secret_expiring: { thresholdDays: 30 },
-  decom_expiring: { thresholdDays: 30 },
-  // #983 Phase 2 — PSI stall %. Conservative on purpose: nobody has watched
-  // PSI on a loaded appliance yet, so it starts where the reading is
-  // unambiguous rather than where it is sensitive. Tune DOWN with field
-  // numbers; starting low pages on day one and teaches people to ignore it.
-  node_pressure: { threshold: 50 },
-};
 
 // #1994 — the label names its control: the single child element gets an
 // `id` and the label a matching `htmlFor`, so a screen reader (or a
@@ -84,22 +59,18 @@ function Field({
 const numVal = (n: number | null): number | string => (n === null ? "" : n);
 const parseNum = (v: string): number | null => (v === "" ? null : Number(v));
 
-const THRESHOLD_PERCENT_TYPES: AlertRuleType[] = [
-  "subnet_utilization",
-  "voice_lease_count_below",
-  "stale_ip_count",
-  "dhcp_pool_exhaustion",
-  "node_pressure",
-  "backup_stale",
-];
-const THRESHOLD_DAYS_TYPES: AlertRuleType[] = [
-  "domain_expiring",
-  "circuit_term_expiring",
-  "service_term_expiring",
-  "secret_expiring",
-  "decom_expiring",
-  "stale_ip_count",
-];
+// A select's empty value ("") means NULL on the wire.
+const norm = (v: unknown): unknown => (v === "" || v === undefined ? null : v);
+
+// What the control shows for a stored value. A stored null stays empty for a
+// number (#1986); a select has no empty option unless the catalogue lists
+// one, so it shows the value the evaluator reads the null as (or, for a
+// required parameter with no such value, the first option).
+function shownFor(p: AlertParamSpec, stored: unknown): number | string | null {
+  if (stored !== null && stored !== undefined) return stored as number | string;
+  if (p.kind === "integer") return null;
+  return p.default ?? p.initial ?? p.options[0]?.value ?? null;
+}
 
 // ── Rule editor ────────────────────────────────────────────────────────────
 
@@ -111,34 +82,28 @@ export function RuleEditorModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  // #1997 — the rule types and each one's editable parameters come from the
+  // backend, so a type added there is editable here with no change.
+  const catalogue = useQuery({
+    queryKey: ["alert-rule-types"],
+    queryFn: alertsApi.ruleTypes,
+    staleTime: 5 * 60_000,
+  });
+  const types = catalogue.data;
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
-  const [ruleType, setRuleType] = useState<AlertRuleType>(
-    existing?.rule_type ?? "subnet_utilization",
-  );
-  // #1986 — an edit shows the STORED value; a stored null stays empty
-  // rather than turning into a default the rule never had. Only a new
-  // rule starts from the per-type defaults.
-  const [threshold, setThreshold] = useState<number | null>(
-    existing ? existing.threshold_percent : 90,
-  );
-  const [thresholdDays, setThresholdDays] = useState<number | null>(
-    existing ? existing.threshold_days : 30,
-  );
-  // dhcp_pool_exhaustion: 0 means "no free-address floor" (occupancy % only).
-  const [minFree, setMinFree] = useState<number>(
-    existing?.min_free_addresses ?? 0,
-  );
-  const [serverType, setServerType] = useState<AlertServerType>(
-    (existing?.server_type as AlertServerType | null) ?? "any",
-  );
-  const [classification, setClassification] = useState<AlertClassification>(
-    (existing?.classification as AlertClassification | null) ?? "pci_scope",
-  );
-  const [changeScope, setChangeScope] = useState<AlertChangeScope>(
-    (existing?.change_scope as AlertChangeScope | null) ?? "any_change",
-  );
+  const [pickedType, setPickedType] = useState<string | null>(null);
+  const ruleType =
+    existing?.rule_type ??
+    pickedType ??
+    types?.find((t) => t.rule_type === "subnet_utilization")?.rule_type ??
+    types?.[0]?.rule_type ??
+    null;
+  const spec = types?.find((t) => t.rule_type === ruleType) ?? null;
+  // Only what the operator has touched; everything else shows (and keeps)
+  // the stored value, or the type's starting value on a new rule.
+  const [touched, setTouched] = useState<Record<string, unknown>>({});
   const [severity, setSeverity] = useState<AlertSeverity>(
     existing?.severity ?? "warning",
   );
@@ -151,10 +116,20 @@ export function RuleEditorModal({
   const [notifySmtp, setNotifySmtp] = useState(existing?.notify_smtp ?? false);
   const [error, setError] = useState<string | null>(null);
 
+  const stored = existing as unknown as Record<string, unknown> | null;
+  const current = (p: AlertParamSpec): number | string | null => {
+    if (p.name in touched) return touched[p.name] as number | string | null;
+    if (stored) return shownFor(p, stored[p.name]);
+    return (
+      p.initial ?? p.default ?? (p.kind === "select" ? shownFor(p, null) : null)
+    );
+  };
+  const setParam = (n: string, v: number | string | null) =>
+    setTouched((t) => ({ ...t, [n]: v }));
+
   const mut = useMutation({
     mutationFn: async () => {
-      // Only the fields this rule type shows are ever sent.
-      const full: AlertRuleUpdate = {
+      const base: AlertRuleUpdate = {
         name,
         description,
         enabled,
@@ -163,42 +138,39 @@ export function RuleEditorModal({
         notify_webhook: notifyWebhook,
         notify_smtp: notifySmtp,
       };
-      if (THRESHOLD_PERCENT_TYPES.includes(ruleType))
-        full.threshold_percent = threshold;
-      if (ruleType === "dhcp_pool_exhaustion")
-        full.min_free_addresses = minFree > 0 ? minFree : null;
-      if (THRESHOLD_DAYS_TYPES.includes(ruleType))
-        full.threshold_days = thresholdDays;
-      if (ruleType === "server_unreachable") full.server_type = serverType;
-      if (ruleType === "compliance_change") {
-        full.classification = classification;
-        full.change_scope = changeScope;
-      }
+      // Only the parameters this rule type has are ever sent.
+      const params: Record<string, unknown> = {};
+      for (const p of spec?.params ?? []) params[p.name] = norm(current(p));
       if (existing) {
         // #1986 — send only what the operator changed; an unchanged Save
-        // sends nothing at all.
-        // A stored null that a control can only display as a value (a
-        // select has no empty option) compares as that value, so leaving
-        // the control alone is not a change. Both evaluators read the null
-        // as exactly that value. `classification` is deliberately absent:
-        // a stored null there is a rule that can never fire (#1580), and
-        // the server refuses any edit that keeps it, so the shown choice
-        // must be sent.
-        const shownForNull: Record<string, unknown> = {
-          description: "",
-          server_type: "any",
-          change_scope: "any_change",
+        // sends nothing at all. A stored null a select can only show as a
+        // value compares as the value the evaluator reads it as, so leaving
+        // the control alone is not a change; a required parameter with no
+        // such value (a compliance rule's classification) is compared to
+        // null, so the shown choice is sent — the server refuses any edit
+        // that keeps it null (#1580).
+        const was = (k: string, p?: AlertParamSpec): unknown => {
+          const v = (stored as Record<string, unknown>)[k];
+          if (v !== null && v !== undefined) return v;
+          return p?.kind === "select" ? norm(p.default) : null;
         };
-        const stored = existing as unknown as Record<string, unknown>;
         const changed: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(full)) {
-          const was = stored[k] ?? shownForNull[k] ?? null;
-          if (was !== v) changed[k] = v;
+        for (const [k, v] of Object.entries(base)) {
+          const w = k === "description" ? (was(k) ?? "") : was(k);
+          if (w !== v) changed[k] = v;
         }
+        for (const p of spec?.params ?? [])
+          if (norm(was(p.name, p)) !== params[p.name])
+            changed[p.name] = params[p.name];
         if (Object.keys(changed).length === 0) return existing;
         return alertsApi.updateRule(existing.id, changed as AlertRuleUpdate);
       }
-      return alertsApi.createRule({ ...full, name, rule_type: ruleType });
+      return alertsApi.createRule({
+        ...base,
+        ...params,
+        name,
+        rule_type: ruleType as string,
+      });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["alert-rules"] });
@@ -209,6 +181,12 @@ export function RuleEditorModal({
       setError(errMsg(e, "Save failed"));
     },
   });
+
+  // The catalogue gates a NEW rule (no type to create without it); an edit
+  // can still change its non-parameter fields if the catalogue is down.
+  const catalogueBlocks = !existing && !spec;
+  const groups: Record<string, AlertRuleTypeSpec[]> = {};
+  for (const t of types ?? []) (groups[t.group] ??= []).push(t);
 
   return (
     <Modal
@@ -238,327 +216,90 @@ export function RuleEditorModal({
           >
             <select
               className={inputCls}
-              value={ruleType}
+              value={ruleType ?? ""}
+              disabled={!types}
               onChange={(e) => {
-                const next = e.target.value as AlertRuleType;
-                setRuleType(next);
-                const d = RULE_TYPE_PARAM_DEFAULTS[next];
-                if (d?.threshold !== undefined) setThreshold(d.threshold);
-                if (d?.thresholdDays !== undefined)
-                  setThresholdDays(d.thresholdDays);
+                setPickedType(e.target.value);
+                setTouched({});
               }}
             >
-              <optgroup label="Infrastructure">
-                <option value="subnet_utilization">Subnet utilization</option>
-                <option value="dhcp_pool_exhaustion">
-                  DHCP pool exhaustion (dynamic pool pressure)
-                </option>
-                <option value="server_unreachable">Server unreachable</option>
-                <option value="stale_ip_count">
-                  Stale IP count (address-space hygiene)
-                </option>
-                <option value="node_pressure">
-                  Node resource pressure (PSI stalling)
-                </option>
-              </optgroup>
-              <optgroup label="Subnet / IPAM">
-                <option value="decom_expiring">
-                  Subnet decommission approaching
-                </option>
-              </optgroup>
-              <optgroup label="Network (ASN / RPKI)">
-                <option value="asn_holder_drift">ASN holder drift</option>
-                <option value="asn_whois_unreachable">
-                  ASN WHOIS unreachable
-                </option>
-                <option value="rpki_roa_expiring">RPKI ROA expiring</option>
-                <option value="rpki_roa_expired">RPKI ROA expired</option>
-              </optgroup>
-              <optgroup label="Domains (registry)">
-                <option value="domain_expiring">Domain expiring</option>
-                <option value="domain_nameserver_drift">
-                  Domain nameserver drift
-                </option>
-                <option value="domain_registrar_changed">
-                  Domain registrar changed (transfer)
-                </option>
-                <option value="domain_dnssec_status_changed">
-                  Domain DNSSEC status changed
-                </option>
-              </optgroup>
-              <optgroup label="Circuits (WAN transport)">
-                <option value="circuit_term_expiring">
-                  Circuit term expiring
-                </option>
-                <option value="circuit_status_changed">
-                  Circuit status changed (suspended / decom)
-                </option>
-              </optgroup>
-              <optgroup label="Service catalog">
-                <option value="service_term_expiring">
-                  Service term expiring
-                </option>
-                <option value="service_resource_orphaned">
-                  Service resource orphaned (target deleted)
-                </option>
-              </optgroup>
-              <optgroup label="Compliance">
-                <option value="compliance_change">
-                  Compliance change (PCI / HIPAA / internet-facing)
-                </option>
-              </optgroup>
-              <optgroup label="VoIP">
-                <option value="voice_lease_count_below">
-                  Voice VLAN lease count below threshold
-                </option>
-              </optgroup>
-              <optgroup label="Security">
-                <option value="secret_expiring">
-                  Secret / certificate expiring
-                </option>
-              </optgroup>
+              {Object.entries(groups).map(([g, ts]) => (
+                <optgroup key={g} label={g}>
+                  {ts.map((t) => (
+                    <option key={t.rule_type} value={t.rule_type}>
+                      {t.label}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
             </select>
           </Field>
         )}
-        {ruleType === "voice_lease_count_below" && (
-          <Field
-            label="Minimum active leases"
-            hint="Fires when any subnet tagged subnet_role='voice' has fewer active DHCP leases than this. Set to roughly 50% of the expected phone fleet so brief reboots don't trigger but a real mass-disconnect does."
-          >
-            <input
-              type="number"
-              min={0}
-              className={inputCls}
-              value={numVal(threshold)}
-              onChange={(e) => setThreshold(parseNum(e.target.value))}
-            />
-          </Field>
+        {catalogue.isLoading && (
+          <p className="text-xs text-muted-foreground">
+            Loading rule parameters…
+          </p>
         )}
-        {ruleType === "subnet_utilization" && (
-          <Field
-            label="Threshold (%)"
-            hint="Fires when subnet utilization ≥ this. PTP / loopback subnets (prefix > utilization_max_prefix_*) are excluded."
-          >
-            <input
-              type="number"
-              min={0}
-              max={100}
-              className={inputCls}
-              value={numVal(threshold)}
-              onChange={(e) => setThreshold(parseNum(e.target.value))}
-            />
-          </Field>
+        {catalogue.isError && (
+          <p className="text-xs text-red-600">
+            Could not load the rule types
+            {existing ? "; its parameters cannot be edited here." : "."}
+          </p>
         )}
-        {ruleType === "node_pressure" && (
+        {spec?.params.map((p) => (
           <Field
-            label="Stall threshold (%)"
+            key={p.name}
+            label={p.label}
             hint={
-              "Warns when CPU or memory 'some' stalling holds at or above this " +
-              "across a 5-minute window — the share of wall time at least one " +
-              "task was blocked waiting for the resource. Separate from the " +
-              "fixed 1% memory 'full' floor, which is always critical: 'some' " +
-              "at 20% is a busy node, 'full' at 20% is a node doing no work. " +
-              "Silent on nodes whose kubelet does not report PSI (below " +
-              "Kubernetes 1.36)."
+              p.hint
+                ? p.default != null &&
+                  p.kind === "integer" &&
+                  p.hint.indexOf("Default") < 0
+                  ? `${p.hint} Empty uses ${p.default}${p.unit === "%" ? "%" : p.unit === "days" ? " d" : ""}.`
+                  : p.hint
+                : undefined
             }
           >
-            <input
-              type="number"
-              min={0}
-              max={100}
-              className={inputCls}
-              value={numVal(threshold)}
-              onChange={(e) => setThreshold(parseNum(e.target.value))}
-            />
-          </Field>
-        )}
-        {ruleType === "backup_stale" && (
-          <Field
-            label="Missed runs"
-            hint="Fires when a scheduled backup target has had no successful run for this many scheduled runs, plus one hour. Default 2."
-          >
-            <input
-              type="number"
-              min={1}
-              max={100}
-              className={inputCls}
-              value={numVal(threshold)}
-              onChange={(e) => setThreshold(parseNum(e.target.value))}
-            />
-          </Field>
-        )}
-        {ruleType === "dhcp_pool_exhaustion" && (
-          <>
-            <Field
-              label="Occupancy threshold (%)"
-              hint="Fires when a dynamic DHCP pool's live occupancy (active leases ÷ pool size) reaches this. Orthogonal to subnet utilization, which counts allocated IPAM rows — a pool can be exhausted while the subnet looks empty."
-            >
-              <input
-                type="number"
-                min={0}
-                max={100}
-                className={inputCls}
-                value={numVal(threshold)}
-                onChange={(e) => setThreshold(parseNum(e.target.value))}
-              />
-            </Field>
-            <Field
-              label="Minimum free addresses (optional)"
-              hint="Also fire when fewer than this many addresses are free in the pool, regardless of percent. Set 0 to use the percent threshold only."
-            >
-              <input
-                type="number"
-                min={0}
-                className={inputCls}
-                value={minFree}
-                onChange={(e) => setMinFree(Number(e.target.value))}
-              />
-            </Field>
-          </>
-        )}
-        {ruleType === "stale_ip_count" && (
-          <>
-            <Field
-              label="Stale IP count threshold"
-              hint="Fires when a subnet holds at least this many allocated IPs that haven't been seen on the wire in the window below. Reads the discovery last-seen signal; never-seen rows are excluded (chase those from the Stale-IP report)."
-            >
-              <input
-                type="number"
-                min={1}
-                className={inputCls}
-                value={numVal(threshold)}
-                onChange={(e) => setThreshold(parseNum(e.target.value))}
-              />
-            </Field>
-            <Field
-              label="Stale window (days)"
-              hint="An allocated IP counts as stale once its last-seen timestamp is older than this. Default 90."
-            >
-              <input
-                type="number"
-                min={1}
-                max={3650}
-                className={inputCls}
-                value={numVal(thresholdDays)}
-                onChange={(e) => setThresholdDays(parseNum(e.target.value))}
-              />
-            </Field>
-          </>
-        )}
-        {ruleType === "server_unreachable" && (
-          <Field label="Server type">
-            <select
-              className={inputCls}
-              value={serverType}
-              onChange={(e) => setServerType(e.target.value as AlertServerType)}
-            >
-              <option value="any">DNS + DHCP</option>
-              <option value="dns">DNS only</option>
-              <option value="dhcp">DHCP only</option>
-            </select>
-          </Field>
-        )}
-        {(ruleType === "domain_expiring" ||
-          ruleType === "circuit_term_expiring" ||
-          ruleType === "service_term_expiring" ||
-          ruleType === "secret_expiring" ||
-          ruleType === "decom_expiring") && (
-          <Field
-            label="Threshold (days)"
-            hint="Soft fire at threshold; severity escalates to warning at threshold/4 and critical at threshold/12 (e.g. 30 → 7.5 → 2.5 d)."
-          >
-            <input
-              type="number"
-              min={1}
-              max={3650}
-              className={inputCls}
-              value={numVal(thresholdDays)}
-              onChange={(e) => setThresholdDays(parseNum(e.target.value))}
-            />
-          </Field>
-        )}
-        {ruleType === "domain_nameserver_drift" && (
-          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
-            Fires for any domain whose operator-pinned{" "}
-            <code>expected_nameservers</code> list differs from the
-            registrar-reported <code>actual_nameservers</code>. Resolves when
-            drift clears.
-          </p>
-        )}
-        {ruleType === "domain_registrar_changed" && (
-          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
-            Fires once per registrar transition (e.g. a transfer). Auto-resolves
-            after 7 days; can be marked resolved manually before then. The first
-            observation per domain is recorded as a baseline without paging.
-          </p>
-        )}
-        {ruleType === "domain_dnssec_status_changed" && (
-          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
-            Fires once when a domain's <code>dnssec_signed</code> flag flips at
-            the parent zone (DS records appearing or disappearing).
-            Auto-resolves after 7 days; can be marked resolved manually.
-          </p>
-        )}
-        {ruleType === "circuit_status_changed" && (
-          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
-            Fires once when a circuit transitions into <code>suspended</code> or{" "}
-            <code>decom</code>. Routine <code>active</code> ↔{" "}
-            <code>pending</code> flips during commissioning are excluded.
-            Auto-resolves after 7 days; can be marked resolved manually.
-          </p>
-        )}
-        {ruleType === "service_resource_orphaned" && (
-          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
-            Fires when a service has a resource link (VRF / subnet / circuit /
-            etc.) whose target row was deleted out from under it. Resolves
-            automatically when the operator detaches the orphan link or
-            re-creates the target.
-          </p>
-        )}
-        {ruleType === "compliance_change" && (
-          <>
-            <Field
-              label="Classification"
-              hint="Subnet flag this rule watches. Mutations against subnets / IPs / DHCP scopes whose subnet has the flag fire one event per audit row."
-            >
+            {p.kind === "select" ? (
               <select
                 className={inputCls}
-                value={classification}
-                onChange={(e) =>
-                  setClassification(e.target.value as AlertClassification)
-                }
+                value={String(current(p) ?? "")}
+                onChange={(e) => setParam(p.name, e.target.value)}
               >
-                <option value="pci_scope">PCI scope</option>
-                <option value="hipaa_scope">HIPAA scope</option>
-                <option value="internet_facing">Internet-facing</option>
+                {p.options.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
               </select>
-            </Field>
-            <Field
-              label="Change scope"
-              hint="Which audit-log actions count. Update + create + delete cover the common cases; pick a narrower scope to reduce noise."
-            >
-              <select
+            ) : (
+              <input
+                type="number"
+                min={p.min ?? undefined}
+                max={p.max ?? undefined}
                 className={inputCls}
-                value={changeScope}
-                onChange={(e) =>
-                  setChangeScope(e.target.value as AlertChangeScope)
-                }
-              >
-                <option value="any_change">
-                  Any change (create + update + delete)
-                </option>
-                <option value="create">Create only</option>
-                <option value="delete">Delete only</option>
-              </select>
-            </Field>
-            <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
-              On first enable, the rule baselines its watermark to "now" — it
-              won't retro-fire on existing audit history. Each matching audit
-              row opens one event that auto-resolves after 24 h. Inheritance
-              from IP block / space is not supported today (classification flags
-              only exist on subnet rows).
-            </p>
-          </>
+                value={numVal(current(p) as number | null)}
+                onChange={(e) => setParam(p.name, parseNum(e.target.value))}
+              />
+            )}
+          </Field>
+        ))}
+        {spec && spec.params.length === 0 && (
+          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
+            No adjustable parameters.
+          </p>
+        )}
+        {spec?.description && (
+          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
+            {spec.description}
+          </p>
+        )}
+        {existing && !spec && types && (
+          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
+            This server does not describe rule type{" "}
+            <code>{existing.rule_type}</code>; stored parameters are kept as
+            they are.
+          </p>
         )}
         <Field label="Severity">
           <select
@@ -624,7 +365,12 @@ export function RuleEditorModal({
           </button>
           <button
             type="button"
-            disabled={!name.trim() || mut.isPending}
+            disabled={
+              !name.trim() ||
+              mut.isPending ||
+              catalogueBlocks ||
+              (!!existing && catalogue.isLoading)
+            }
             onClick={() => mut.mutate()}
             className={cn(
               "rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground",
@@ -636,6 +382,26 @@ export function RuleEditorModal({
         </div>
       </div>
     </Modal>
+  );
+}
+
+// The Parameters cell: each parameter the type has, a stored null shown as
+// the value the evaluator reads it as (#1997).
+function paramSummary(r: AlertRule, spec?: AlertRuleTypeSpec): string {
+  if (!spec || spec.params.length === 0) return "—";
+  const row = r as unknown as Record<string, unknown>;
+  return (
+    spec.params
+      .map((p) => {
+        const v = row[p.name] ?? p.default;
+        if (v === null || v === undefined || v === "") return null;
+        if (p.kind === "select")
+          return `${p.label}: ${p.options.find((o) => o.value === v)?.label ?? v}`;
+        const unit = p.unit === "%" ? "%" : p.unit === "days" ? " d" : "";
+        return `${p.label}: ${v}${unit}`;
+      })
+      .filter(Boolean)
+      .join(" · ") || "—"
   );
 }
 
@@ -657,6 +423,13 @@ export function AlertsPage() {
     queryKey: ["alert-rules"],
     queryFn: alertsApi.listRules,
   });
+
+  const { data: ruleTypes } = useQuery({
+    queryKey: ["alert-rule-types"],
+    queryFn: alertsApi.ruleTypes,
+    staleTime: 5 * 60_000,
+  });
+  const specByType = new Map((ruleTypes ?? []).map((t) => [t.rule_type, t]));
 
   const { data: events = [] } = useQuery({
     queryKey: ["alert-events", { openOnly }],
@@ -887,27 +660,7 @@ export function AlertsPage() {
                       {r.rule_type}
                     </td>
                     <td className="px-4 py-2 text-muted-foreground tabular-nums">
-                      {r.rule_type === "subnet_utilization"
-                        ? `≥ ${r.threshold_percent ?? 90}%`
-                        : r.rule_type === "voice_lease_count_below"
-                          ? `< ${r.threshold_percent ?? 1} leases`
-                          : r.rule_type === "stale_ip_count"
-                            ? `≥ ${r.threshold_percent ?? 10} stale · ${r.threshold_days ?? 90}d`
-                            : r.rule_type === "node_pressure"
-                              ? `≥ ${r.threshold_percent ?? 50}% stalled · full ≥ 1%`
-                              : r.rule_type === "server_unreachable"
-                                ? `type=${r.server_type ?? "any"}`
-                                : r.rule_type === "domain_expiring" ||
-                                    r.rule_type === "circuit_term_expiring" ||
-                                    r.rule_type === "service_term_expiring" ||
-                                    r.rule_type === "secret_expiring" ||
-                                    r.rule_type === "decom_expiring"
-                                  ? `≤ ${r.threshold_days ?? 30} d`
-                                  : r.rule_type === "compliance_change"
-                                    ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`
-                                    : r.rule_type === "backup_stale"
-                                      ? `${r.threshold_percent ?? 2} missed runs`
-                                      : "—"}
+                      {paramSummary(r, specByType.get(r.rule_type))}
                     </td>
                     <td className="px-4 py-2">
                       <SeverityBadge severity={r.severity} />

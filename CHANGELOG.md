@@ -84,6 +84,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The alert rule editor can edit every rule type's thresholds, not
+  just the 23 it was hand-coded for (#1997).** The editor's type list
+  and per-type fields were a frontend union that knew 23 of the
+  backend's 64 rule types, so for the rest (`ip_free_but_responding`,
+  `stale_reservation`, `dns_nxdomain_spike`, `tls_cert_expiring` and so
+  on) `threshold_days`, `threshold_percent` and friends could only be set
+  through the API. The backend now serves the catalogue at
+  `GET /api/v1/alerts/rule-types` (same access as listing rules): label,
+  group and, for each type, the parameters its evaluator reads, with
+  unit, bounds, select options and the value the evaluator uses when the
+  stored one is null. The editor and the rules table's Parameters column
+  render from it, and a type with no parameters says "No adjustable
+  parameters". `tests/test_alert_rule_catalogue.py` fails when a rule
+  type is missing from the catalogue or when a type's declared
+  parameters differ from the `rule.<column>` reads in its evaluator, so
+  the two cannot drift again. The #1986 guarantees hold: stored values
+  are kept, a stored null stays empty, and an unchanged Save sends
+  nothing. No MCP tool: this is editor metadata, and `list_alert_rules`
+  already covers the rules themselves.
 - **The alert rule editor no longer rewrites a rule's stored thresholds,
   crashes on a refused save, or leaves its labels unattached (#1986,
   #1993, #1994).** Edit then Save with nothing changed sent the editor's
