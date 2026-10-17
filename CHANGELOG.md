@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The IPAM bulk-delete dialog kept describing what was submitted after
+  an approval policy took it (#2046).** With a `delete:subnet` approval
+  policy, bulk-deleting two subnets showed "2 of 2 submitted for
+  approval." under a dialog that now read "This will move 0 empty blocks
+  to Trash." and "I understand 0 empty Blocks will be moved to Trash.",
+  because the page clears its selection when the requests are filed and
+  the dialog recounted from it. The space and block views now freeze the
+  selection when the dialog opens. A delete that actually runs still
+  closes the dialog and clears the selection as before.
+
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create

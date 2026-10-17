@@ -12756,6 +12756,9 @@ function BlockDetailView({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
+  // #2046 — what the delete dialog describes, frozen when it opens. A filed
+  // approval request clears `selected` while the dialog stays open.
+  const [bulkDeleteKeys, setBulkDeleteKeys] = useState<string[]>([]);
   const [showDnsSync, setShowDnsSync] = useState(false);
   const [showFindFree, setShowFindFree] = useState(false);
   const [showSplitSubnet, setShowSplitSubnet] = useState(false);
@@ -12964,7 +12967,10 @@ function BlockDetailView({
                 <HeaderButton
                   variant="destructive"
                   icon={Trash2}
-                  onClick={() => setShowBulkDelete(true)}
+                  onClick={() => {
+                    setBulkDeleteKeys([...selected]);
+                    setShowBulkDelete(true);
+                  }}
                 >
                   Delete ({selectedCount})
                 </HeaderButton>
@@ -13225,8 +13231,12 @@ function BlockDetailView({
       )}
       {showBulkDelete &&
         (() => {
-          const sCount = selectedSubnetIds.length;
-          const bCount = selectedBlockKeys.length;
+          const sCount = bulkDeleteKeys.filter((k) =>
+            k.startsWith("subnet:"),
+          ).length;
+          const bCount = bulkDeleteKeys.filter((k) =>
+            k.startsWith("block:"),
+          ).length;
           const noun =
             sCount && bCount
               ? `${sCount} subnet${sCount === 1 ? "" : "s"} + ${bCount} block${bCount === 1 ? "" : "s"}`
@@ -14116,7 +14126,7 @@ function MulticastGroupsPanel({
   );
 }
 
-function SpaceTableView({
+export function SpaceTableView({
   space,
   onSelectSubnet,
   onSelectBlock,
@@ -14157,6 +14167,8 @@ function SpaceTableView({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkOpen, setBulkOpen] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
+  // #2046 — what the delete dialog describes, frozen when it opens.
+  const [bulkDeleteKeys, setBulkDeleteKeys] = useState<string[]>([]);
   const [showEditSpace, setShowEditSpace] = useState(false);
   const [showCreateBlock, setShowCreateBlock] = useState(false);
   const [showCreateSubnet, setShowCreateSubnet] = useState(false);
@@ -14416,7 +14428,10 @@ function SpaceTableView({
                 <HeaderButton
                   variant="destructive"
                   icon={Trash2}
-                  onClick={() => setShowBulkDelete(true)}
+                  onClick={() => {
+                    setBulkDeleteKeys([...selected]);
+                    setShowBulkDelete(true);
+                  }}
                 >
                   Delete ({selectedCount})
                 </HeaderButton>
@@ -14933,10 +14948,10 @@ function SpaceTableView({
         })()}
       {showBulkDelete &&
         (() => {
-          const subnetCount = [...selected].filter((k) =>
+          const subnetCount = bulkDeleteKeys.filter((k) =>
             k.startsWith("subnet:"),
           ).length;
-          const blockCount = [...selected].filter((k) =>
+          const blockCount = bulkDeleteKeys.filter((k) =>
             k.startsWith("block:"),
           ).length;
           const parts: string[] = [];
