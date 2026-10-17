@@ -112,7 +112,13 @@ import {
   type ResolverPreset,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
-import { fqdnError, recordOwnerError, zoneKindForName } from "@/lib/dnsNames";
+import {
+  DNS_TTL_MAX,
+  fqdnError,
+  parseTtlInput,
+  recordOwnerError,
+  zoneKindForName,
+} from "@/lib/dnsNames";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -2619,6 +2625,12 @@ export function ZoneModal({
   function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
+    // #2073 / #2074 — the hidden field (technitium_api) keeps its default.
+    const zoneTtl = parseTtlInput(ttl);
+    if (zoneTtl === null || typeof zoneTtl === "string") {
+      setError(`Default TTL ${zoneTtl ?? "is required"}.`);
+      return;
+    }
     const payload: Record<string, unknown> = {
       name,
       zone_type: zoneType,
@@ -2626,7 +2638,7 @@ export function ZoneModal({
       view_id: viewId || null,
       primary_ns: primaryNs,
       admin_email: adminEmail,
-      ttl: parseInt(ttl, 10),
+      ttl: zoneTtl,
       color,
       domain_id: domainId,
       customer_id: customerId,
@@ -2833,7 +2845,7 @@ export function ZoneModal({
               <input
                 type="number"
                 min={0}
-                max={2147483647}
+                max={DNS_TTL_MAX}
                 step={1}
                 className={inputCls}
                 value={ttl}
@@ -3022,11 +3034,16 @@ function RecordModal({
       setError("SRV records require priority, weight, and port.");
       return;
     }
+    const recordTtl = parseTtlInput(ttl);
+    if (typeof recordTtl === "string") {
+      setError(`TTL ${recordTtl}.`);
+      return;
+    }
     mut.mutate({
       name,
       record_type: type,
       value,
-      ttl: ttl ? parseInt(ttl, 10) : null,
+      ttl: recordTtl,
       // Only send the structured fields the type actually uses, so the API
       // never sees a stray weight/port on a non-SRV record.
       priority: usesPriority && priority !== "" ? parseInt(priority, 10) : null,
@@ -3192,7 +3209,7 @@ function RecordModal({
             <input
               type="number"
               min={0}
-              max={2147483647}
+              max={DNS_TTL_MAX}
               step={1}
               className={inputCls}
               value={ttl}

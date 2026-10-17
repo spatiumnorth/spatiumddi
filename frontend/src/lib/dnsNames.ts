@@ -127,3 +127,21 @@ export function summarizeZoneNames(names: string[], max = 4): string {
   if (names.length <= max) return names.join(", ");
   return `${names.slice(0, max).join(", ")} + ${names.length - max} more`;
 }
+
+/** RFC 2181 §8: the largest TTL, and what the API accepts (#2073). */
+export const DNS_TTL_MAX = 2147483647;
+
+/**
+ * A TTL field's text as seconds (#2073 / #2074): `null` when blank, a reason
+ * string when it is not a whole number in 0..DNS_TTL_MAX. Never `parseInt`:
+ * it reads `"1h"` as 1 and `"1e3"` (a number input accepts it) as 1.
+ */
+export function parseTtlInput(text: string): number | null | string {
+  const t = text.trim();
+  if (t === "") return null;
+  const n = Number(t);
+  if (!Number.isInteger(n) || n < 0 || n > DNS_TTL_MAX) {
+    return `must be a whole number of seconds from 0 to ${DNS_TTL_MAX}`;
+  }
+  return n;
+}

@@ -87,12 +87,23 @@ the formatter handles the rest.
 - **A zone or record TTL outside RFC 2181's range is refused with a
   422 instead of stored (#2073).** Add Zone with Default TTL `-1`
   answered 201 and saved it, and the BIND9 agent then refused the
-  zone for a bad TTL, so it was never served. The zone `ttl` and a
-  record's `ttl` are now bounded to 0..2147483647 on create and
-  update, like the SOA timers already were, and the 422 names the
-  field. The Default TTL and record TTL inputs are numeric with the
-  same min and max. Rows already holding a negative TTL are not
-  rewritten; edit them to a valid value.
+  zone for a bad TTL, so it was never served. The zone `ttl`, a
+  record's `ttl` and the IPAM / IPAM-template `ddns_ttl` (which
+  stamps every DDNS record) are now bounded to 0..2147483647 on
+  create and update, like the SOA timers already were, and the 422
+  names the field. The importers store a servable value rather than
+  what the source said: a record TTL outside the range inherits the
+  zone's, and a zone TTL or SOA timer outside it takes the default
+  (a TTL past 2147483647 would not fit the column and failed the
+  commit). A TTL stored
+  negative before this fix is not rewritten, but no longer reaches a
+  server: the agent bundle ships the zone with a `$TTL` of 3600 and
+  the record inheriting it, and record updates send it as inherit.
+  Edit the row to clear it. The Add/Edit Zone and record dialogs
+  take a number and refuse anything that is not a whole number in
+  range with a reason; they used to send `parseInt` of the text, so
+  `1h` went out as 1 (#2074), and `1e3`, which a number field
+  accepts, would have too.
 
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said

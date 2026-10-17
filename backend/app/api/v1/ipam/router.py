@@ -35,7 +35,7 @@ from app.core.permissions import (
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
-from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
+from app.models.dns import DNS_TTL_MAX, DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import (
     IP_ROLES,
     IP_ROLES_SHARED,
@@ -2348,7 +2348,7 @@ class IPSpaceCreate(BaseModel):
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     # Fragile-device probe suppression (#722). Set at any level of the
     # space → block → subnet chain; ORs downward and cannot be
     # overridden from below.
@@ -2398,7 +2398,7 @@ class IPSpaceUpdate(BaseModel):
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     do_not_probe: bool | None = None
     do_not_probe_reason: str | None = None
     vrf_id: uuid.UUID | None = None
@@ -2478,7 +2478,7 @@ class IPBlockCreate(BaseModel):
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     ddns_inherit_settings: bool = True
     # Fragile-device probe suppression (#722) — see IPSpaceCreate.
     do_not_probe: bool = False
@@ -2529,7 +2529,7 @@ class IPBlockUpdate(BaseModel):
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     ddns_inherit_settings: bool | None = None
     do_not_probe: bool | None = None
     do_not_probe_reason: str | None = None
@@ -2641,7 +2641,7 @@ class SubnetCreate(BaseModel):
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     ddns_inherit_settings: bool = True
     # Device profiling — see Subnet model. Default off because nmap is loud.
     auto_profile_on_dhcp_lease: bool = False
@@ -2805,7 +2805,7 @@ class SubnetUpdate(BaseModel):
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     ddns_inherit_settings: bool | None = None
     auto_profile_on_dhcp_lease: bool | None = None
     auto_profile_preset: str | None = None

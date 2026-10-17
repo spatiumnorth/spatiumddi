@@ -70,11 +70,13 @@ from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.dns import (
     DEFAULT_ALLOW_RECURSION,
+    DNS_TTL_MAX,
     DNSSEC_ALGORITHMS,
     ZONE_DEFAULT_EXPIRE,
     ZONE_DEFAULT_MINIMUM,
     ZONE_DEFAULT_REFRESH,
     ZONE_DEFAULT_RETRY,
+    ZONE_DEFAULT_TTL,
     DNSAcl,
     DNSAclEntry,
     DNSKey,
@@ -1127,8 +1129,9 @@ def _validate_masters_format(v: list[str] | None) -> list[str]:
 # serves, so it moves the serial (update_zone).
 _ZONE_FILE_TIMER_FIELDS = ("ttl", "refresh", "retry", "expire", "minimum")
 # RFC 2181 section 8 bounds a TTL at 2^31 - 1; it is also the column's (int4).
-# BIND refuses a zone whose SOA carries a negative timer, so one never reaches it.
-_SOA_TIMER_MAX = 2**31 - 1
+# BIND refuses a zone whose SOA carries a negative timer, or a negative $TTL or
+# record TTL (#2073), so one never reaches it.
+_SOA_TIMER_MAX = DNS_TTL_MAX
 
 
 class ZoneCreate(BaseModel):
@@ -1138,7 +1141,7 @@ class ZoneCreate(BaseModel):
     # #1310 — omitted ⇒ ``resolved_zone_kind``: a primary zone's is taken
     # from its name.
     kind: str | None = None
-    ttl: int = Field(3600, ge=0, le=_SOA_TIMER_MAX)
+    ttl: int = Field(ZONE_DEFAULT_TTL, ge=0, le=_SOA_TIMER_MAX)
     refresh: int = Field(ZONE_DEFAULT_REFRESH, ge=0, le=_SOA_TIMER_MAX)
     retry: int = Field(ZONE_DEFAULT_RETRY, ge=0, le=_SOA_TIMER_MAX)
     expire: int = Field(ZONE_DEFAULT_EXPIRE, ge=0, le=_SOA_TIMER_MAX)
@@ -1447,6 +1450,7 @@ class RecordCreate(BaseModel):
     name: str
     record_type: str
     value: str
+    # #2073 — null inherits the zone's $TTL.
     ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     priority: int | None = None
     weight: int | None = None
@@ -1475,6 +1479,7 @@ class RecordCreate(BaseModel):
 class RecordUpdate(BaseModel):
     name: str | None = None
     value: str | None = None
+    # #2073 — null inherits the zone's $TTL.
     ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     priority: int | None = None
     weight: int | None = None

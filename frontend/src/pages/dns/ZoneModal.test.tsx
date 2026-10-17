@@ -203,14 +203,38 @@ describe("Add Zone on an experimental technitium_api group (#1784)", () => {
   });
 });
 
-describe("Default TTL field (#2073)", () => {
+describe("Default TTL field (#2073 / #2074)", () => {
+  const ttlInput = () =>
+    screen.getByPlaceholderText("3600") as HTMLInputElement;
+
   it("is a bounded numeric input", () => {
     groups = [{ id: "grp-1", server_drivers: ["bind9"] }];
     open();
-    const ttl = screen.getByPlaceholderText("3600") as HTMLInputElement;
-    expect(ttl.type).toBe("number");
-    expect(ttl.min).toBe("0");
-    expect(ttl.max).toBe("2147483647");
+    expect(ttlInput().type).toBe("number");
+    expect(ttlInput().min).toBe("0");
+    expect(ttlInput().max).toBe("2147483647");
+  });
+
+  // A number input never holds "1h": the browser drops it, leaving the field
+  // empty, which is refused rather than sent as 1 (or NaN → null).
+  it.each([["-1"], ["1.5"], [""], ["1h"]])(
+    "refuses %j with a reason and sends nothing",
+    async (typed) => {
+      open();
+      typeName("ttl.example.com");
+      fireEvent.change(ttlInput(), { target: { value: typed } });
+      fireEvent.submit(control("Kind").form!);
+      await screen.findByText(/^Default TTL (must be|is required)/);
+      expect(createZone).not.toHaveBeenCalled();
+    },
+  );
+
+  it("sends 1e3 as 1000, not 1", async () => {
+    open();
+    typeName("ttl.example.com");
+    fireEvent.change(ttlInput(), { target: { value: "1e3" } });
+    await save();
+    expect(createZone.mock.calls[0][1]).toMatchObject({ ttl: 1000 });
   });
 });
 
