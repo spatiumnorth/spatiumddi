@@ -527,6 +527,18 @@ the formatter handles the rest.
 
 - **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial could not be written ("value out of int32 range") and the agent zone-state report was refused with a 422, leaving the Zone Sync pill unable to show convergence. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment past 4294967295 wraps to 1 (RFC 1982; it skips 0 the way BIND's own `increment` does, because 0 is the "never seeded" value that every renderer serves as 1). It used to produce 4294967296, which is not a valid SOA serial.
 
+- **A node's hard loss no longer leaves a surviving node's heartbeat stale
+  past the demote guard (#1805).** Every heartbeat reached the api through
+  its Service, and so does every DNS and DHCP agent and the frontend's
+  `/api` proxy. The Service spread their connections over every api pod. A
+  lost node's api pod stays listed until the node reads NotReady, about
+  40 s, so a heartbeat that landed on it waited out its whole 40 s timeout.
+  Two in a row left a healthy node 97 s without a heartbeat. The api
+  Service now sets `trafficDistribution: PreferSameNode`: each node's
+  callers use the api pod on their own node while it is ready, and every
+  api pod only while it is not. It is rendered on Kubernetes 1.34 and
+  later; `api.service.trafficDistribution: ""` turns it off.
+
 - **A node's return no longer rolls CoreDNS out twice (#1753).** k3s
   force re-applies its bundled `coredns.yaml` at every server start. That
   put the CoreDNS pod template's tolerations back to k3s's own two entries.
@@ -563,8 +575,6 @@ the formatter handles the rest.
   call a voter unhealthy. The supervisor now sends such a heartbeat again
   after 5 s, doubling the wait while failures continue, up to the
   interval. A heartbeat the control plane answered is paced as before.
-  This does not close #1805: a heartbeat that lands on the lost node's api
-  pod still waits out its 40 s timeout.
 
 - **Disabling a DNS pool now removes its records, and a pool TTL change
   lands immediately (#1974).** `update_pool` never reconciled and
