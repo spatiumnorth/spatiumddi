@@ -8,6 +8,8 @@ Layout under /var/lib/spatium-dns-agent/:
     config/previous.json           # last bundle that APPLIED cleanly (#882)
     config/previous.etag
     config/quarantine.json         # etag of a bundle that failed to apply (#882)
+    config/fetch.json.part         # a 200's body while it downloads (#2029);
+                                   # never read as a cache, removed on start
     rendered/                      # managed by driver
     ops/{inflight,failed}/
 """
@@ -27,10 +29,21 @@ import structlog
 log = structlog.get_logger(__name__)
 
 
+# Where a config reply's body is spooled while it downloads (#2029). Only
+# ``fetch.get_config`` writes it and only its parse reads it; nothing treats it
+# as ``current`` or ``previous``.
+FETCH_SPOOL = "config/fetch.json.part"
+
+
 def ensure_layout(state_dir: Path) -> None:
     for sub in ("config", "rendered", "tsig", "ops/inflight", "ops/failed"):
         (state_dir / sub).mkdir(parents=True, exist_ok=True)
     os.chmod(state_dir, 0o700)
+    # A spool left by a process killed mid-download or mid-parse (an OOM kill
+    # is the case #2029 is about) is up to a whole bundle of dead disk. The
+    # next fetch would truncate it anyway; dropping it at start means a
+    # crash-looping agent does not sit on it in the meantime.
+    (state_dir / FETCH_SPOOL).unlink(missing_ok=True)
 
 
 def load_or_create_agent_id(state_dir: Path) -> str:
@@ -101,7 +114,11 @@ def load_config(state_dir: Path) -> tuple[dict[str, Any] | None, str | None]:
         return None, None
     try:
         cfg = parse_bundle_file(cfg_path)
-    except json.JSONDecodeError:
+    except ValueError:
+        # JSONDecodeError, and UnicodeDecodeError: the encoding is sniffed
+        # from the first bytes (#2029), so a torn, NUL-filled file reads as
+        # UTF-32 and fails to DECODE rather than to parse. Either way it is
+        # no cache, never a crash at boot (non-negotiable #5).
         return None, None
     etag = etag_path.read_text().strip() if etag_path.exists() else None
     return cfg, etag
@@ -225,7 +242,11 @@ def load_previous_config(state_dir: Path) -> tuple[dict[str, Any] | None, str | 
         return None, None
     try:
         cfg = parse_bundle_file(cfg_path)
-    except json.JSONDecodeError:
+    except ValueError:
+        # JSONDecodeError, and UnicodeDecodeError: the encoding is sniffed
+        # from the first bytes (#2029), so a torn, NUL-filled file reads as
+        # UTF-32 and fails to DECODE rather than to parse. Either way it is
+        # no cache, never a crash at boot (non-negotiable #5).
         return None, None
     etag_path = cfg_dir / "previous.etag"
     etag = etag_path.read_text().strip() if etag_path.exists() else None

@@ -226,3 +226,113 @@ def test_a_parse_reads_utf16_like_json_loads(tmp_path: Path) -> None:
     path = tmp_path / "b.json"
     path.write_bytes(json.dumps(doc, ensure_ascii=False).encode("utf-16"))
     assert parse_bundle_file(path) == json.loads(path.read_bytes()) == doc
+
+
+def test_a_stale_spool_is_removed_at_start_and_the_cache_is_untouched(tmp_path: Path) -> None:
+    """An agent killed mid-download leaves the spool; start drops it (#2029)."""
+    state = tmp_path / "state"
+    ensure_layout(state)
+    save_config(state, _bundle("old", 3), "old")
+    commit_config(state, "old")
+    before = {p.name: p.read_bytes() for p in (state / "config").iterdir()}
+    (state / "config" / "fetch.json.part").write_bytes(b'{"etag": "new", "zones": [')
+
+    ensure_layout(state)
+
+    assert not (state / "config" / "fetch.json.part").exists()
+    assert {p.name: p.read_bytes() for p in (state / "config").iterdir()} == before
+    assert load_config(state)[1] == "old"
+
+
+def test_a_torn_cache_file_reads_as_no_cache_not_a_crash(tmp_path: Path) -> None:
+    """Sniffing the encoding makes a NUL-filled file a DECODE error (UTF-32);
+    it must still read as "nothing cached", as the JSON error did (#5)."""
+    state = tmp_path / "state"
+    ensure_layout(state)
+    for name in ("current.json", "previous.json"):
+        (state / "config" / name).write_bytes(b"\x00" * 4097)
+    from spatium_dns_agent.cache import load_previous_config
+
+    assert load_config(state) == (None, None)
+    assert load_previous_config(state) == (None, None)
+
+
+def test_a_full_disk_while_spooling_fails_the_fetch_and_keeps_the_cache(
+    rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, body, _ = rig
+    cached = (state / "config" / "current.json").read_bytes()
+    loop = SyncLoop(_Cfg(state), ["tok"], _Driver(state_dir=state), _Heartbeat())  # type: ignore[arg-type]
+    monkeypatch.setattr(loop, "_client", lambda *a, **k: _client(_serve(body)))
+    monkeypatch.setattr(sync_mod.time, "sleep", lambda s: None)
+
+    real_open = Path.open
+
+    class _Full:
+        def __init__(self, fh: Any) -> None:
+            self._fh = fh
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._fh.close()
+
+        def write(self, chunk: bytes) -> int:
+            self._fh.write(chunk[:10])
+            raise OSError(28, "No space left on device")
+
+    def fake_open(self: Path, mode: str = "r", *a: Any, **k: Any) -> Any:
+        fh = real_open(self, mode, *a, **k)
+        return _Full(fh) if self.name == "fetch.json.part" else fh
+
+    monkeypatch.setattr(Path, "open", fake_open)
+    loop._poll_once()  # must not raise: an exception here ends the sync thread
+
+    assert loop._current_etag == "old"
+    assert (state / "config" / "current.json").read_bytes() == cached
+    assert not (state / "config" / "fetch.json.part").exists()
+
+
+def test_the_dnssec_copy_drops_only_records_and_collects_the_same(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The slim ``_dnssec_bundle`` (#2029) must give the BIND9 collector the
+    same answer the whole bundle did: it reads name / type / dnssec_enabled."""
+    state = tmp_path / "state"
+    ensure_layout(state)
+    zones = [
+        {
+            "name": "signed.test.",
+            "type": "primary",
+            "dnssec_enabled": True,
+            "view_name": "internal",
+            "records": [{"name": "www", "type": "A", "value": "192.0.2.1"}],
+        },
+        {"name": "signed.test.", "type": "primary", "dnssec_enabled": True, "view_name": "guest"},
+        {"name": "plain.test.", "type": "primary", "dnssec_enabled": False, "records": []},
+        {"name": "sec.test.", "type": "secondary", "dnssec_enabled": True},
+        {"name": "Master.test", "type": "master", "dnssec_enabled": True},
+    ]
+    full = {**_bundle("x", 5), "zones": zones}
+    loop = SyncLoop(_Cfg(state), ["tok"], _Driver(state_dir=state), _Heartbeat())  # type: ignore[arg-type]
+    loop._dnssec_bundle = full
+
+    slim = loop._dnssec_bundle
+    assert slim is not None and set(slim) == {"zones"}
+    assert slim["zones"] == [{k: v for k, v in z.items() if k != "records"} for z in zones]
+
+    drv = _Driver(state_dir=state)
+    monkeypatch.setattr(
+        drv,
+        "_zone_dnssec_state",
+        lambda zone: {"zone_name": zone + ".", "ds_records": [], "keys": [{"key_tag": 1}]},
+    )
+    assert drv.collect_dnssec_state(slim) == drv.collect_dnssec_state(full)
+    assert [s["zone_name"] for s in drv.collect_dnssec_state(slim)] == [
+        "signed.test.",
+        "Master.test.",
+    ]
+
+    loop._dnssec_bundle = None
+    assert loop._dnssec_bundle is None

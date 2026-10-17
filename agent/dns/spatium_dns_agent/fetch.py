@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from .cache import parse_bundle_file
+from .cache import FETCH_SPOOL, parse_bundle_file
 
 CONFIG_PATH = "/api/v1/dns/agents/config"
 
@@ -54,7 +54,7 @@ def get_config(client: Any, headers: dict[str, str], state_dir: Path) -> Any:
     with stream("GET", CONFIG_PATH, headers=headers) as resp:
         if resp.status_code != 200:
             return _SpooledConfig(resp.status_code, resp.headers, None)
-        spool = state_dir / "config" / "fetch.json.part"
+        spool = state_dir / FETCH_SPOOL
         spool.parent.mkdir(parents=True, exist_ok=True)
         try:
             with spool.open("wb") as fh:
@@ -62,7 +62,8 @@ def get_config(client: Any, headers: dict[str, str], state_dir: Path) -> Any:
                     fh.write(chunk)
         except BaseException:
             # A body cut off mid-stream raises here (an httpx error the poll
-            # already handles); leave no partial spool behind.
+            # already handles), as does a full disk (OSError, which the poll
+            # treats as a failed fetch); leave no partial spool behind.
             spool.unlink(missing_ok=True)
             raise
         return _SpooledConfig(resp.status_code, resp.headers, spool)

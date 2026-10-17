@@ -398,6 +398,13 @@ class SyncLoop:
             log.warning("sync_http_error", error=str(e))
             time.sleep(5.0)
             return
+        except OSError as e:
+            # #2029 — the body is spooled to the state dir; a full disk there
+            # fails this fetch (the partial spool is already removed) and
+            # leaves the cache as it was, rather than killing the sync thread.
+            log.warning("sync_spool_failed", error=str(e))
+            time.sleep(5.0)
+            return
 
         if resp.status_code == 304:
             return
