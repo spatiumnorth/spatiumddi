@@ -354,7 +354,10 @@ class PreviewZoneMoveArgs(BaseModel):
 
 @register_tool(
     name="preview_dns_zone_move",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    # Matches the REST preview (POST …/zones/{id}/move/preview), which is
+    # superadmin-only: the answer describes the TARGET group too (its views,
+    # drivers, zone names, ACL and key names), not just the caller's zone.
+    permission="superadmin",
     description=(
         "Report what moving a DNS zone to another server group would do, "
         "WITHOUT doing it. Answers 'can this zone move to that group, and "

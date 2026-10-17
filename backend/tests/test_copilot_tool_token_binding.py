@@ -351,14 +351,16 @@ async def test_session_caller_is_unaffected_by_token_binding_rule(
     assert not _refused(resp), resp
     assert e.server_b.name in json.dumps(resp)
 
+    # The zone-move preview describes the target group too, so like its
+    # REST endpoint it is superadmin-only, for sessions as well as tokens.
     resp = await _mcp_call(
         db_session,
         user,
         "preview_dns_zone_move",
         {"zone_id": str(e.zone_a.id), "target_group_id": str(e.group_b.id)},
     )
-    assert not _refused(resp), resp
-    assert e.group_b.name in json.dumps(resp)
+    assert _refused(resp), resp
+    assert e.group_b.name not in json.dumps(resp)
 
     # Name resolution is unchanged for a caller with no token binding.
     space = await db_session.get(IPSpace, e.subnet_b.space_id)
