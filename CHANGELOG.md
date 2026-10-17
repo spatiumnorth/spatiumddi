@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DHCP scope dialog pickers and New PXE profile match rows now have
+  accessible names (#2016).** The scope dialog's PXE profile select and its
+  "Apply template…" select had no name (now "PXE profile" and "Apply
+  template", the select's own visible text). In New PXE profile, the two
+  starter match rows repeated every label, so each name belonged to two
+  controls; each control is now named with its row ("Match 2: Priority"), each
+  row is a group "Match rule N", and "Arch codes (option 93)" is a group
+  naming its checkbox set instead of a `<label>` wrapped around the
+  checkboxes' own labels, which had named only the first one. The PXE page's
+  own `Field` links a lone control or labels a group.
+
 - **The audit API and page now show what an entry recorded (#2009).**
   An entry's `old_value` / `new_value` / `changed_fields` (for example a
   per-box upgrade's `direction` and `schema_check`) were stored and
