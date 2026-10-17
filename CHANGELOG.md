@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Fleet no longer reports `ssh: retrying` forever after managed SSH is
+  turned off (#2053).** The supervisor's fire-state reader stripped the
+  leading tab of an empty-hash line (`\t1\t<iso>`, written when a plane
+  is turned off), so the fields shifted left, attempts read as the hash
+  and never matched the runner's empty applied sidecar. It now strips
+  only the line ending and parses the empty hash faithfully; the same
+  reader serves every host-config plane (SNMP, NTP, APT, LLDP, syslog,
+  resolver, firewall, timezone, console mode, removable). The appliance
+  console's own copy of the reader had the same bug and reported the
+  plane `retrying` on the dashboard and the health screen; it is fixed
+  too, and its plane list, which had fallen behind by three planes (APT,
+  console mode, removable), now matches the supervisor's, pinned by a
+  test. Two related cases also no longer stick at `retrying`: a config
+  that failed to apply and was then reverted to what the host already
+  runs, and a failed timezone change followed by clearing the timezone.
+  And an "off" that fails to apply now backs off like any other failed
+  apply, instead of re-firing on every heartbeat.
+
 - **IPAM no longer adopts a PTR whose target lacks the trailing dot
   where that target is served relative to the zone (#2045).** Since
   #1890 an allocation adopts an operator's identical record instead of

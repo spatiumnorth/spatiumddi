@@ -396,8 +396,8 @@ def effective_role_label(role: str) -> str:
 # existing ``upgrade_status`` / ``cluster_join_state`` readers use).
 _RELEASE_STATE_DIR = Path("/var/lib/spatiumddi/release-state")
 
-# (plane-name, applied-hash-sidecar-basename) for the 8 host-config
-# planes. The console compares each plane's last-FIRED hash (the
+# (plane-name, trigger-basename, applied-hash-sidecar-basename) for the
+# host-config planes. The console compares each plane's last-FIRED hash (the
 # ``<trigger>.fire-state`` sidecar) against its APPLIED hash; a mismatch
 # means the host runner hasn't converged. Mirrors
 # ``appliance_state._HOST_CONFIG_PLANES`` — keep in sync.
@@ -410,6 +410,9 @@ _HOST_CONFIG_PLANES_DASH: tuple[tuple[str, str, str], ...] = (
     ("resolver", "resolver-config-pending", "resolver-config-hash"),
     ("firewall", "firewall-pending", "firewall-applied-hash"),
     ("timezone", "tz-pending", "tz-hash"),
+    ("apt", "apt-config-pending", "apt-config-hash"),
+    ("console_mode", "verbose-boot-pending", "verbose-boot-applied"),
+    ("removable", "removable-config-pending", "removable-config-hash"),
 )
 # At/above this many fires of the SAME hash → "failing" (apply keeps
 # missing); below → "retrying" (still backing off). Mirrors
@@ -426,20 +429,28 @@ def _read_state_line(name: str) -> str:
         return ""
 
 
-def _read_fire_state_dash(trigger_basename: str) -> tuple[str, int]:
+def _read_fire_state_dash(trigger_basename: str) -> tuple[str, int, bool]:
     """Read ``<hash>\\t<attempts>\\t<iso>`` from a ``<trigger>.fire-state``
-    sidecar → (hash, attempts). Missing / malformed → ("", 0)."""
-    text = _read_state_line(trigger_basename + ".fire-state")
-    if not text:
-        return "", 0
-    parts = text.split("\t")
-    if not parts or not parts[0]:
-        return "", 0
+    sidecar → (hash, attempts, fired). Missing / malformed → ("", 0, False).
+
+    The hash is EMPTY when a plane was turned off (``\\t1\\t<iso>``), so
+    ``fired`` — not the hash — says whether the plane was ever fired, and
+    only the line ending may be stripped: a whole-line strip eats the
+    leading tab and shifts every field left (#2053). Mirrors
+    ``appliance_state._read_fire_state``."""
+    try:
+        text = (_RELEASE_STATE_DIR / (trigger_basename + ".fire-state")).read_text(
+            encoding="utf-8"
+        ).rstrip("\r\n")
+    except OSError:
+        return "", 0, False
+    parts = [p.strip() for p in text.split("\t")]
     try:
         attempts = int(parts[1]) if len(parts) > 1 else 0
     except ValueError:
         attempts = 0
-    return parts[0], attempts
+    fired = bool(parts[0]) or attempts > 0 or (len(parts) > 2 and bool(parts[2]))
+    return parts[0], attempts, fired
 
 
 def _metric_num(token: str, default: float = 0.0) -> float:
@@ -658,8 +669,8 @@ def host_health_rollup() -> dict[str, object]:
     retrying: list[str] = []
     if _RELEASE_STATE_DIR.is_dir():
         for name, trigger_basename, applied_basename in _HOST_CONFIG_PLANES_DASH:
-            fhash, attempts = _read_fire_state_dash(trigger_basename)
-            if not fhash:
+            fhash, attempts, fired = _read_fire_state_dash(trigger_basename)
+            if not fired:
                 continue  # never fired → nothing to report
             applied = _read_state_line(applied_basename)
             if applied == fhash:
@@ -5640,8 +5651,8 @@ def _render_health_screen(
         planes_tbl.add_column()
     planes_tbl.add_row(*(Text(h, style="bold dim") for h in ("PLANE", "STATE", "ATTEMPTS")))
     for name, trig, applied_base in _HOST_CONFIG_PLANES_DASH:
-        fhash, attempts = _read_fire_state_dash(trig)
-        if not fhash:
+        fhash, attempts, fired = _read_fire_state_dash(trig)
+        if not fired:
             label, lstyle = "idle", "dim"
         elif _read_state_line(applied_base) == fhash:
             label, lstyle = "applied", "green"
@@ -5651,7 +5662,7 @@ def _render_health_screen(
             label, lstyle = "retrying", "yellow"
         planes_tbl.add_row(
             Text(name), Text(label, style=lstyle),
-            Text(str(attempts) if fhash else "—", style="dim"),
+            Text(str(attempts) if fired else "—", style="dim"),
         )
     console.print(Panel(
         planes_tbl, box=SQUARE, border_style="cyan",
