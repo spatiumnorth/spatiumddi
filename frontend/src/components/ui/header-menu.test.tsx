@@ -52,6 +52,40 @@ describe("open / close", () => {
     expect(document.activeElement).toBe(trigger);
   });
 
+  it("closes on Escape after a mouse open, focus still on the trigger (#2047)", () => {
+    render(<HeaderMenu label="Zone" items={[item()]} />);
+    const trigger = screen.getByRole("button", { name: /Zone/ });
+    trigger.focus();
+    openMenu();
+    // Mouse open: focus never moved into the panel.
+    expect(document.activeElement).toBe(trigger);
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("closes on Escape pressed on <body> and does not reach a window handler", () => {
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    render(<HeaderMenu label="Zone" items={[item()]} />);
+    openMenu();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    window.removeEventListener("keydown", onWindow);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(onWindow).not.toHaveBeenCalled();
+  });
+
+  it("does not swallow Escape while the menu is closed", () => {
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    render(<HeaderMenu label="Zone" items={[item()]} />);
+    const trigger = screen.getByRole("button", { name: /Zone/ });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    window.removeEventListener("keydown", onWindow);
+    expect(onWindow).toHaveBeenCalledOnce();
+  });
+
   it("closes on an outside mousedown", () => {
     render(<HeaderMenu label="Zone" items={[item()]} />);
     openMenu();

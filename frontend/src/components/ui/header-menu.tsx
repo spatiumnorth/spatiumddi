@@ -103,9 +103,26 @@ export function HeaderMenu({
         setOpen(false);
       }
     };
+    // Esc closes the menu wherever focus is. A mouse open leaves focus
+    // on the trigger (or on <body> in Safari, which does not focus a
+    // button on click), and a handler on the panel never sees a key
+    // pressed there (#2047). Capture phase on the document so it runs
+    // before the modal hook's window listener; stopPropagation only
+    // because the menu was open and handled it, so a closed menu never
+    // swallows the Esc a parent dialog is waiting for.
+    const onDocKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      close(true);
+    };
     document.addEventListener("mousedown", onDocMouseDown);
-    return () => document.removeEventListener("mousedown", onDocMouseDown);
-  }, [open]);
+    document.addEventListener("keydown", onDocKeyDown, true);
+    return () => {
+      document.removeEventListener("mousedown", onDocMouseDown);
+      document.removeEventListener("keydown", onDocKeyDown, true);
+    };
+  }, [open, close]);
 
   // Flip to the left edge when the panel would overflow the viewport. A
   // header menu near the right edge is the common case, so `right-0` is
@@ -144,12 +161,9 @@ export function HeaderMenu({
   };
 
   const onMenuKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      // Esc closes the menu only — not the dialog the menu sits in.
-      e.stopPropagation();
-      close(true);
-    } else if (e.key === "ArrowDown") {
+    // Escape is handled by the document listener above, which also
+    // covers focus on the trigger.
+    if (e.key === "ArrowDown") {
       e.preventDefault();
       focusItem(1);
     } else if (e.key === "ArrowUp") {

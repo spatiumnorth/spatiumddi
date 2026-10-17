@@ -84,6 +84,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A header menu opened with the mouse now closes on Esc (#2047).**
+  After a click open, focus stays on the menu's trigger and the Esc
+  handler lived only on the panel, so the key reached nothing. The
+  shared `HeaderMenu` now listens for Esc on the document while open,
+  closes, returns focus to the trigger and stops the event so a parent
+  dialog does not also close; a closed menu leaves Esc alone.
+
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create
