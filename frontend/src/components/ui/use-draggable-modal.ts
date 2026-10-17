@@ -176,10 +176,22 @@ const FOCUSABLE_SELECTOR =
 export function useFocusTrap<T extends HTMLElement>() {
   const ref = useRef<T>(null);
   const seq = useLayerSeq();
+  // The opener is read during the FIRST RENDER, not in the effect: React
+  // applies a child's `autoFocus` at commit, before any effect runs, so by
+  // then `document.activeElement` is the dialog's own field and "focus
+  // return" would restore to a node that is unmounted with the dialog (#2050).
+  // Render is the last point focus is still where the operator left it.
+  const openerRef = useRef<HTMLElement | null | undefined>(undefined);
+  if (openerRef.current === undefined) {
+    openerRef.current =
+      typeof document === "undefined"
+        ? null
+        : (document.activeElement as HTMLElement | null);
+  }
   useEffect(() => {
     const node = ref.current;
     if (!node) return;
-    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const previouslyFocused = openerRef.current;
     const { token, remove } = trapStack.push(seq);
 
     const focusables = () =>
@@ -231,8 +243,15 @@ export function useFocusTrap<T extends HTMLElement>() {
     return () => {
       document.removeEventListener("keydown", onKeyDown);
       remove();
-      // Return focus to where it was before the modal opened (if still in DOM).
-      previouslyFocused?.focus?.();
+      // Return focus to where it was before the modal opened. An opener
+      // that left the DOM (or is the body) is skipped rather than focused.
+      if (
+        previouslyFocused &&
+        previouslyFocused !== document.body &&
+        previouslyFocused.isConnected
+      ) {
+        previouslyFocused.focus?.();
+      }
     };
   }, [seq]);
   return ref;

@@ -84,6 +84,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Closing a dialog with an autofocused field returns focus to its
+  opener again (#2050).** The shared focus trap read the opener in
+  an effect, after React had already applied the field's `autoFocus`,
+  so it remembered the dialog's own input and focus fell to the page
+  body on close (New IP Space opened from its button, closed with
+  Esc). The opener is now captured during the first render, and an
+  opener that has left the DOM is skipped instead of focused.
+
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create
