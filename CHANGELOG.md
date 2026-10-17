@@ -619,6 +619,16 @@ the formatter handles the rest.
 
 - **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial could not be written ("value out of int32 range") and the agent zone-state report was refused with a 422, leaving the Zone Sync pill unable to show convergence. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment past 4294967295 wraps to 1 (RFC 1982; it skips 0 the way BIND's own `increment` does, because 0 is the "never seeded" value that every renderer serves as 1). It used to produce 4294967296, which is not a valid SOA serial.
 
+- **A rolling upgrade's drain that timed out said "0 pod(s) still present"
+  while every pod was still on the node (#1804).** The count was the
+  evictions refused in the drain's last cycle, not the pods left on the
+  node. A node whose kubelet is down accepts every eviction and removes
+  nothing, so it timed out reporting none. The error now counts the pods
+  the last poll still found, says how many evictions were refused and how
+  many were accepted but never removed, and the step detail lists them
+  (`remaining`, `not_removed`). The drain-stuck hint says to check the
+  node's Ready condition as well as PodDisruptionBudgets.
+
 - **Disabling a DNS pool now removes its records, and a pool TTL change
   lands immediately (#1974).** `update_pool` never reconciled and
   `apply_pool_state` ignored `pool.enabled`, so a disabled pool kept
