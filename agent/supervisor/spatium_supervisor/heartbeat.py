@@ -954,6 +954,18 @@ def heartbeat_once(
                             reason=lifecycle.reason,
                             transition=(prior_state != "revoked"),
                         )
+                    else:
+                        # #1884 — a teardown that took nothing down says why. It
+                        # returned in silence while the kubeapi was out of reach
+                        # (a revoked member its peers had already fenced out),
+                        # on every revoked heartbeat. It is tried again on the
+                        # next one.
+                        log.warning(
+                            "supervisor.heartbeat.revoked_teardown_incomplete",
+                            state=lifecycle.state,
+                            reason=lifecycle.reason,
+                            transition=(prior_state != "revoked"),
+                        )
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
                         "supervisor.heartbeat.revoked_teardown_failed",
