@@ -207,3 +207,58 @@ def test_prune_all_sweeps_every_family(
     appliance_state.prune_all_trigger_sidecars(keep=3)
     assert len(list(tmp_path.glob("ntp-config-pending.failed.*"))) == 3
     assert len(list(tmp_path.glob("slot-set-next-boot-pending.done.*"))) == 3
+
+
+# ── #2053: an EMPTY config hash (a plane turned off) ──────────────────
+
+
+def test_empty_hash_fire_state_round_trips(tmp_path: Path) -> None:
+    fs = tmp_path / "fs"
+    t0 = datetime(2026, 10, 1, tzinfo=UTC)
+    appliance_state._write_fire_state(fs, "", 1, t0)
+    # The leading tab must survive: fields must not shift left.
+    assert appliance_state._read_fire_state(fs) == ("", 1, t0)
+
+
+def _one_plane(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+    trigger = tmp_path / "ssh-config-pending"
+    applied = tmp_path / "ssh-config-hash"
+    monkeypatch.setattr(
+        appliance_state, "_HOST_CONFIG_PLANES", [("ssh", trigger, applied)]
+    )
+    return trigger, applied
+
+
+def test_managed_then_off_reads_applied_not_retrying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trigger, applied = _one_plane(monkeypatch, tmp_path)
+    appliance_state._write_fire_state(
+        appliance_state._fire_state_path(trigger),
+        "",
+        1,
+        datetime.now(UTC),
+    )
+    applied.write_text("\n")  # the runner applied 'off': empty hash sidecar
+    assert appliance_state.read_host_config_health() == {}
+
+
+def test_empty_hash_unapplied_is_still_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trigger, applied = _one_plane(monkeypatch, tmp_path)
+    appliance_state._write_fire_state(
+        appliance_state._fire_state_path(trigger), "", 2, datetime.now(UTC)
+    )
+    applied.write_text("oldhash\n")
+    health = appliance_state.read_host_config_health()
+    assert health["ssh"]["state"] == "retrying"
+    assert health["ssh"]["attempts"] == 2
+
+
+def test_never_fired_plane_is_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _trigger, applied = _one_plane(monkeypatch, tmp_path)
+    applied.write_text("oldhash\n")
+    assert appliance_state.read_host_config_health() == {}

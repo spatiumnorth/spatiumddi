@@ -1225,12 +1225,15 @@ def _read_fire_state(fire_state_file: Path) -> tuple[str, int, datetime | None]:
     """Read ``<hash>\\t<attempts>\\t<iso>`` → (hash, attempts, when).
     Missing / malformed → ``("", 0, None)``."""
     try:
-        text = fire_state_file.read_text(encoding="utf-8").strip()
+        # Strip only the line ending: a full ``.strip()`` also eats the
+        # leading tab of an EMPTY-hash line (``\t1\t<iso>``), shifting every
+        # field left so attempts parsed as the hash (#2053).
+        text = fire_state_file.read_text(encoding="utf-8").rstrip("\r\n")
     except OSError:
         return "", 0, None
-    parts = text.split("\t")
-    if not parts or not parts[0]:
+    if not text:
         return "", 0, None
+    parts = text.split("\t")
     try:
         attempts = int(parts[1]) if len(parts) > 1 else 0
     except ValueError:
@@ -1387,8 +1390,9 @@ def read_host_config_health() -> dict[str, dict[str, object]]:
     out: dict[str, dict[str, object]] = {}
     for name, trigger, applied_sidecar in _HOST_CONFIG_PLANES:
         fhash, attempts, when = _read_fire_state(_fire_state_path(trigger))
-        if not fhash:
-            continue  # never fired → nothing to report
+        if not fhash and when is None and attempts == 0:
+            continue  # never fired → nothing to report (an empty hash that
+            # WAS fired, i.e. a plane turned off, carries attempts/when)
         applied = _read_release_state_line(applied_sidecar) or ""
         if applied == fhash:
             continue  # last-fired config is applied → healthy, omit

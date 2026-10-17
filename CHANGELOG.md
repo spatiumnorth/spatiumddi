@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Fleet no longer reports `ssh: retrying` forever after managed SSH is
+  turned off (#2053).** The supervisor's fire-state reader stripped the
+  leading tab of an empty-hash line (`\t1\t<iso>`, written when a plane
+  is turned off), so the fields shifted left, attempts read as the hash
+  and never matched the runner's empty applied sidecar. It now strips
+  only the line ending and parses the empty hash faithfully; the same
+  reader serves every host-config plane (SNMP, NTP, APT, LLDP, syslog,
+  resolver, firewall, timezone, console mode, removable).
+
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create
