@@ -508,6 +508,7 @@ class PingHostArgs(BaseModel):
 
 @register_tool(
     name="ping_host",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     description=(
         "Send ICMP echo requests to a host and return liveness + RTT "
