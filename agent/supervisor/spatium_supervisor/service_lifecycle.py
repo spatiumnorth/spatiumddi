@@ -167,6 +167,9 @@ class K3sEnvironment:
 
     available: bool
     reason: str | None = None
+    # #1716 — the kube API did not answer ``/readyz`` this tick: a miss to try
+    # again, not a slot that has no k3s path at all.
+    kubeapi_unready: bool = False
 
 
 def k3s_available() -> K3sEnvironment:
@@ -182,7 +185,9 @@ def k3s_available() -> K3sEnvironment:
     if not _BAKED_CHART_TARBALL.exists():
         return K3sEnvironment(available=False, reason="chart tarball not baked")
     if not k8s_api.check_kubeapi_ready():
-        return K3sEnvironment(available=False, reason="kubeapi /readyz not ok")
+        return K3sEnvironment(
+            available=False, reason="kubeapi /readyz not ok", kubeapi_unready=True
+        )
     return K3sEnvironment(available=True)
 
 
@@ -735,13 +740,21 @@ def apply_role_assignment(
     appliance's local kubeapi. k3s's helm-controller reconciles
     the CR into a Helm release on its next loop (typically <5s).
 
-    Returns ``ready`` on PATCH success, ``idle`` when k3s isn't
-    available (no chart baked / kubeapi unreachable — caller's
-    fallback to the compose path), ``failed`` on a kubeapi or
-    serialisation error. #1750 — ``idle`` with ``deferred`` set when this node
+    Returns ``ready`` on PATCH success, ``idle`` when the slot has no
+    chart baked (k3s isn't the runtime here), ``failed`` when the kubeapi
+    did not answer ``/readyz`` (#1716) or on a kubeapi or serialisation
+    error. #1750 — ``idle`` with ``deferred`` set when this node
     may not write the chart its cluster shares (:func:`shared_chart_write_refusal`).
     """
     env = k3s_available()
+    if env.kubeapi_unready:
+        # #1716 — a kubeapi that missed its 2 s ``/readyz`` on this tick is a
+        # miss, not a settled outcome. Reported ``idle``, the heartbeat stamped
+        # the apply as done and never tried it again, and the Fleet row read
+        # ``idle`` with no reason after the kubeapi was back. ``failed`` is not
+        # stamped, so the next tick tries again (as #1640's failures are), and
+        # the row carries the reason.
+        return LifecycleResult(state="failed", reason=env.reason)
     if not env.available:
         # ``idle`` instead of ``failed`` mirrors the compose path's
         # "compose not available" shape: the supervisor isn't broken,

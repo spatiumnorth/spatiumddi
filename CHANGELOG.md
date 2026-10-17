@@ -84,6 +84,42 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A revoked node's teardown that could not run now says why (#1884).**
+  Once revoked, the supervisor runs its teardown on every rejected
+  heartbeat. It logged a teardown that stopped something, or one that
+  raised, but not one that returned without stopping anything, so a
+  teardown that could reach no kube API, as on a member its peers had
+  already fenced out, returned in silence. It now logs
+  `supervisor.heartbeat.revoked_teardown_incomplete` with the state and
+  the reason; it still tries again on the next heartbeat.
+
+- **A role change whose apply met an unready kube API is tried again, and
+  the node says why (#1716).** A role change is applied once, on the
+  node's next heartbeat, and the apply first asks the kube API's `/readyz`
+  (2 s). When that probe missed, the apply reported `idle` and the
+  heartbeat recorded the change as applied, so no later heartbeat tried it
+  again, even once the kube API was back, and Fleet showed the node `idle`
+  with no reason until its roles changed again. A `/readyz` miss now
+  reports `failed` with its reason, which the heartbeat does not record as
+  applied (#1640), so the next heartbeat applies the change, and Fleet
+  shows why while it cannot. A slot with no role chart baked still reports
+  `idle`.
+
+- **A member of the control-plane cluster can no longer be revoked in
+  place (#1884).** The Fleet tab disables Revoke on control-plane rows
+  and the deployment docs say a live cluster member must be demoted first,
+  but the API refused only the last control-plane node. A member revoked
+  through the API was fenced out by its peers' firewalls within a minute
+  and stayed an etcd voter with a Ready Node: nothing takes a revoked
+  member out of etcd, its established peer connections kept it in quorum
+  while every new one was dropped, and its own teardown could clear only
+  its role labels, on the heartbeats its kube API answered.
+  `DELETE /appliances/{id}` now answers 409 for a member of a formed
+  cluster and says to demote it first, or to Replace it when the node is
+  dead (Replace evicts it from the seed's side). It refuses the seed too,
+  which can be neither demoted nor replaced, and says to demote the other
+  members first. A node that has left the cluster revokes as before.
+
 - **The alert rule editor no longer rewrites a rule's stored thresholds,
   crashes on a refused save, or leaves its labels unattached (#1986,
   #1993, #1994).** Edit then Save with nothing changed sent the editor's
