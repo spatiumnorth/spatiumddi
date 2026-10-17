@@ -6,7 +6,7 @@ the next ``flush`` / ``commit`` / ``refresh`` therefore yields ``None`` --
 ``str(None)`` is the literal ``"None"`` in the audit row's ``resource_id``.
 
 Static check over ``backend/app``: inside one function, flag any read of
-``X.id`` that comes after ``<db>.add(X)`` with no flush/commit/refresh/
+``X.id`` that comes after ``<db>.add(X)`` / ``<db>.add_all([X, ...])`` with no flush/commit/refresh/
 ``begin_nested`` call (and no explicit ``id=`` / ``X.id = ...``) in between.
 """
 
@@ -48,6 +48,11 @@ def _scan(fn: ast.AST, path: Path) -> list[str]:
             if node.func.attr == "add" and len(node.args) == 1:
                 if isinstance(node.args[0], ast.Name):
                     events.append((node.lineno, node.col_offset, "add", node.args[0].id))
+            elif node.func.attr == "add_all" and len(node.args) == 1:
+                if isinstance(node.args[0], (ast.List, ast.Tuple)):
+                    for elt in node.args[0].elts:
+                        if isinstance(elt, ast.Name):
+                            events.append((node.lineno, node.col_offset, "add", elt.id))
             elif node.func.attr in _BARRIERS:
                 events.append((node.lineno, node.col_offset, "barrier", ""))
         if (
@@ -90,6 +95,23 @@ def test_no_id_read_between_add_and_flush() -> None:
     )
 
 
+def _scan_src(src: str) -> list[str]:
+    fn = ast.parse(src).body[0]
+    return _scan(fn, APP / "synthetic.py")
+
+
+def test_guard_flags_read_before_flush_and_accepts_the_fix() -> None:
+    """The guard must actually fire, or a green run proves nothing."""
+    bad = "async def f(db):\n    r = R()\n    db.add(r)\n    log(r.id)\n"
+    bad_all = "async def f(db):\n    r = R()\n    db.add_all([r])\n    log(r.id)\n"
+    good = "async def f(db):\n    r = R()\n    db.add(r)\n    await db.flush()\n    log(r.id)\n"
+    explicit = "async def f(db):\n    r = R(id=uuid4())\n    db.add(r)\n    log(r.id)\n"
+    assert _scan_src(bad) == ["app/synthetic.py:4: r.id read before flush"]
+    assert _scan_src(bad_all) == ["app/synthetic.py:4: r.id read before flush"]
+    assert _scan_src(good) == []
+    assert _scan_src(explicit) == []
+
+
 # ── API-level: the audit row names the created resource ──────────────
 
 
@@ -111,7 +133,7 @@ async def _headers(db):  # type: ignore[no-untyped-def]
     return {"Authorization": f"Bearer {create_access_token(str(u.id))}"}
 
 
-async def _create_audit_resource_id(db, resource_type: str, rid: str) -> list[str]:  # type: ignore[no-untyped-def]
+async def _create_audit_resource_ids(db, resource_type: str) -> list[str]:  # type: ignore[no-untyped-def]
     from sqlalchemy import select
 
     from app.models.audit import AuditLog
@@ -142,7 +164,7 @@ async def test_alert_rule_create_audit_names_the_rule(client, db_session) -> Non
         json={"name": "audit-id", "rule_type": "subnet_utilization"},
     )
     assert r.status_code == 201, r.text
-    assert await _create_audit_resource_id(db_session, "alert_rule", "") == [r.json()["id"]]
+    assert await _create_audit_resource_ids(db_session, "alert_rule") == [r.json()["id"]]
 
 
 @pytest.mark.asyncio
@@ -150,4 +172,4 @@ async def test_dns_group_create_audit_names_the_row(client, db_session) -> None:
     h = await _headers(db_session)
     g = await client.post("/api/v1/dns/groups", headers=h, json={"name": "audit-g"})
     assert g.status_code == 201, g.text
-    assert await _create_audit_resource_id(db_session, "dns_server_group", "") == [g.json()["id"]]
+    assert await _create_audit_resource_ids(db_session, "dns_server_group") == [g.json()["id"]]
