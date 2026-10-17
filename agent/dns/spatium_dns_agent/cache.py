@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -57,13 +58,49 @@ def save_token(state_dir: Path, token: str) -> None:
     tmp.replace(path)
 
 
+# Value strings at most this long are interned while a bundle is parsed (#2029).
+# A blocklist entry carries ``"action": "block"`` and ``"block_mode":
+# "nxdomain"`` and ``json`` builds a fresh str for every occurrence — 1.4M
+# entries spend ~135 MB of a ~520 MB parse on copies of a handful of words.
+# Keys are already shared by the decoder's own memo. Domain names are left
+# alone: they are long, nearly all distinct, and interning them would only
+# grow the intern table.
+_INTERN_MAX_LEN = 16
+
+
+def _share_short_values(obj: dict[str, Any]) -> dict[str, Any]:
+    """``object_hook`` that swaps short str values for one shared copy.
+
+    Equal strings are interchangeable, so the parsed bundle is ``==`` to the
+    one ``json.loads`` alone would give — only its size changes.
+    """
+    for key, value in obj.items():
+        if value.__class__ is str and len(value) <= _INTERN_MAX_LEN:
+            obj[key] = sys.intern(value)
+    return obj
+
+
+def parse_bundle_file(path: Path) -> Any:
+    """Parse a bundle from disk without holding its bytes during the parse.
+
+    The decoder needs the whole document as one str, so the file is read and
+    decoded first and the raw bytes dropped before ``json`` starts building
+    objects: a bundle is then in memory once as text and once as objects,
+    never also as bytes.
+    """
+    data = path.read_bytes()
+    text = data.decode(json.detect_encoding(data), "surrogatepass")
+    del data
+    return json.loads(text, object_hook=_share_short_values)
+
+
 def load_config(state_dir: Path) -> tuple[dict[str, Any] | None, str | None]:
     cfg_path = state_dir / "config" / "current.json"
     etag_path = state_dir / "config" / "current.etag"
     if not cfg_path.exists():
         return None, None
     try:
-        cfg = json.loads(cfg_path.read_text())
+        cfg = parse_bundle_file(cfg_path)
     except json.JSONDecodeError:
         return None, None
     etag = etag_path.read_text().strip() if etag_path.exists() else None
@@ -187,7 +224,7 @@ def load_previous_config(state_dir: Path) -> tuple[dict[str, Any] | None, str | 
     if not cfg_path.exists():
         return None, None
     try:
-        cfg = json.loads(cfg_path.read_text())
+        cfg = parse_bundle_file(cfg_path)
     except json.JSONDecodeError:
         return None, None
     etag_path = cfg_dir / "previous.etag"

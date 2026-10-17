@@ -33,6 +33,7 @@ from .config_apply import (
     truncate_error,
 )
 from .drivers.base import DriverBase, HeldZone
+from .fetch import get_config
 from .oom_watch import OomWatch, is_oom_status
 
 log = structlog.get_logger(__name__)
@@ -337,6 +338,30 @@ class SyncLoop:
             booted_etag=prev_etag,
         )
 
+    # #2029 — ``_dnssec_bundle`` keeps only what a DNSSEC re-read needs. It
+    # used to hold the whole applied bundle until the next structural apply
+    # replaced it, so every fetch parsed the new bundle while the old one —
+    # blocklist entries and all, ~500 MB for 1.4M RPZ entries — was still
+    # alive: the agent briefly held two bundles. The collectors read each
+    # zone's name, type and DNSSEC flag; zone records and the blocklists are
+    # dropped here, so the previous bundle is freed as soon as the poll that
+    # applied it returns.
+    @property
+    def _dnssec_bundle(self) -> dict[str, Any] | None:
+        return self._dnssec_zones
+
+    @_dnssec_bundle.setter
+    def _dnssec_bundle(self, bundle: dict[str, Any] | None) -> None:
+        if bundle is None:
+            self._dnssec_zones: dict[str, Any] | None = None
+            return
+        self._dnssec_zones = {
+            "zones": [
+                {k: v for k, v in zone.items() if k != "records"}
+                for zone in bundle.get("zones") or []
+            ]
+        }
+
     def stop(self) -> None:
         self._stop.set()
 
@@ -368,7 +393,7 @@ class SyncLoop:
             headers["If-None-Match"] = self._current_etag
         try:
             with self._client() as c:
-                resp = c.get("/api/v1/dns/agents/config", headers=headers)
+                resp = get_config(c, headers, self.cfg.state_dir)
         except httpx.HTTPError as e:
             log.warning("sync_http_error", error=str(e))
             time.sleep(5.0)

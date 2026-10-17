@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS agent no longer holds a large bundle several times over while it
+  takes it (#2029).** Fetching a 147 MB bundle (five blocklists on two views,
+  about 708k RPZ entries per view) took the agent to 1.70 - 1.74 GB, and since
+  it shares named's 2Gi container, the container could be OOM-killed before
+  named started. The response body, its decoded text, the parsed bundle and
+  the previous bundle (still referenced for the DNSSEC re-read) were all alive
+  at once. The body is now streamed to a spool file in the state directory and
+  parsed from there, short repeated values are shared instead of copied per
+  entry, and the agent keeps only the previous bundle's zone list. On a
+  synthetic bundle of that shape the agent's peak RSS fell from 1,474 MB to
+  598 MB, and nothing bundle-sized stays resident after the apply. The cache,
+  the rendered zone files and their validation are unchanged.
 - **DHCP scope dialog pickers and New PXE profile match rows now have
   accessible names (#2016).** The scope dialog's PXE profile select and its
   "Apply template…" select had no name (now "PXE profile" and "Apply
