@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A dialog opened from a right-click menu now keeps focus (#2051).**
+  Choosing Delete…, Edit… or any item that opens a dialog from the IPAM
+  tree's context menu (and the DNS, DHCP and VLAN trees, which share the
+  menu) left focus on the row behind the dialog, because Radix returned
+  focus to the row after the dialog had taken it, so Enter or typing went
+  to the page. The menu now skips that restore when a dialog opened, and
+  puts focus back on the row when the dialog closes. Only a dialog that
+  appeared after the menu opened counts, so a menu inside an open dialog
+  still returns focus to its row.
+
 - **Closing a dialog with an autofocused field returns focus to its
   opener again (#2050).** The shared focus trap read the opener in
   an effect, after React had already applied the field's `autoFocus`,
