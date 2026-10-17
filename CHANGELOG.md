@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Creating an alert rule, firewall policy or alias, conformity policy,
+  backup target, API token, DNS group, server, zone, TSIG key, view,
+  blocklist entry or exception, or an upgrade run no longer writes an
+  audit row whose resource id is the string "None" (#2006).** The id is a
+  column default SQLAlchemy only applies at flush, and each handler built
+  its audit row from the id straight after `db.add`, so the audit trail
+  could not say which row a create made. Each now flushes first (the DNS
+  options row and the API token's `"?"` / `"new"` placeholders are gone
+  too). A new AST guard fails any function that reads `obj.id` between
+  `db.add(obj)` and the next flush.
 - **DHCP Device Policy dialog: a lease of "10m" is refused, a manual-match
   policy is no longer called "not rendered", and every DHCP form label names
   its control (#1991, #1992, part of #1994).** A lease time that was not a

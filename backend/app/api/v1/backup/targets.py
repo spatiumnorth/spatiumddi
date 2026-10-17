@@ -420,6 +420,7 @@ async def create_target(
         next_run_at=next_run,
     )
     db.add(row)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             action="create",

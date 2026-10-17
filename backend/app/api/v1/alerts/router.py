@@ -323,6 +323,7 @@ async def create_rule(body: AlertRuleCreate, db: DB, current_user: CurrentUser) 
     _require_superadmin(current_user)
     rule = AlertRule(**body.model_dump())
     db.add(rule)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             action="create",
