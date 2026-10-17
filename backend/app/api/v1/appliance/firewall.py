@@ -379,6 +379,7 @@ async def create_policy(body: PolicyCreate, db: DB, current_user: CurrentUser) -
         )
     p = FirewallPolicy(**body.model_dump(), is_builtin=False, updated_by_id=current_user.id)
     db.add(p)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             action="create",
@@ -611,6 +612,7 @@ async def create_alias(body: AliasCreate, db: DB, current_user: CurrentUser) -> 
     _require_admin(current_user)
     a = FirewallAlias(**body.model_dump(), is_builtin=False)
     db.add(a)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             action="create",
