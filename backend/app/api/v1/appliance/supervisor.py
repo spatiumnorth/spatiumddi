@@ -105,6 +105,7 @@ from app.models.appliance import (
 from app.models.audit import AuditLog
 from app.models.firewall import FirewallApplyState
 from app.models.settings import PlatformSettings
+from app.services.agents.container_oom import apply_container_oom
 from app.services.appliance.apt import apt_bundle
 from app.services.appliance.ca import (
     ensure_ca,
@@ -1954,6 +1955,30 @@ _REBOOT_GIVE_UP_SECONDS = 900.0
 _HEARTBEAT_HOLD_CAP_S = 28.0
 
 
+async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
+    """Stamp a current ``OOMKilled`` from ``appliance.role_health`` onto the
+    DNS server rows this appliance owns (#2018). See
+    ``app.services.agents.container_oom``."""
+    from app.models.dns import DNSServer  # noqa: PLC0415
+
+    health = appliance.role_health or {}
+    if not any(
+        isinstance(v, dict) and isinstance(v.get("container"), dict) for v in health.values()
+    ):
+        return
+    servers = (
+        (
+            await db.execute(
+                select(DNSServer).where(await _own_server_condition(db, appliance, DNSServer))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for server in servers:
+        apply_container_oom(server, health)
+
+
 @router.post(
     "/supervisor/heartbeat",
     response_model=SupervisorHeartbeatResponse,
@@ -2182,6 +2207,10 @@ async def supervisor_heartbeat(
         # supervisor's ``since`` timestamp is the canonical "first
         # observed in this status" anchor across heartbeats.
         row.role_health = dict(body.role_health)
+        # #2018 — the kubelet's OOMKilled for a DNS role container, onto the
+        # server row. The agent died in the same group kill and cannot say
+        # it; while the container crash-loops this is the only report.
+        await _apply_role_container_oom(db, row)
     if body.host_config_health is not None:
         # #387 — supervisor's per-plane host-config apply health.
         # Overwrite verbatim every tick: empty dict clears stale stuck-
