@@ -299,7 +299,7 @@ def queued_zone_ops_where(zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
     attribution matters: the pending-ops list narrowed to a token's zones),
     but rows queued before that column existed have it NULL, so keying this
     predicate on it would need this name-scoped fallback anyway, to guard a
-    path that is already bypassed.
+    path the incremental op flow never takes under split-horizon.
 
     Every zone-scoped sweep and count goes through here so the decision lives
     in one place; ``tests/test_dns_record_ops_sweep.py`` pins both the
