@@ -38,6 +38,7 @@ from sqlalchemy import desc, select
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_str, encrypt_dict, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.header_credentials import header_credential_problem, header_value_problem
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services import event_delivery
 from app.services.event_publisher import (
@@ -79,6 +80,28 @@ class WebhookSubscriptionWrite(BaseModel):
         if not (v.startswith("http://") or v.startswith("https://")):
             raise ValueError("url must start with http:// or https://")
         return v
+
+    @field_validator("headers")
+    @classmethod
+    def _v_headers(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        """httpx encodes header names and values as ASCII and raises
+        UnicodeEncodeError, which no delivery path expected: the Test
+        button answered 500 and the worker's outbox drain raised (#1913).
+        Surrounding whitespace is dropped, as a pasted value carries it."""
+        if not v:
+            return v
+        out: dict[str, str] = {}
+        for raw_name, raw_value in v.items():
+            name = raw_name.strip()
+            problem = header_credential_problem(name, "header name") if name else None
+            if not name:
+                problem = "A header name is blank."
+            value = raw_value.strip()
+            problem = problem or header_value_problem(value, f"value of header {name!r}")
+            if problem:
+                raise ValueError(problem)
+            out[name] = value
+        return out
 
 
 class WebhookSubscriptionResponse(BaseModel):

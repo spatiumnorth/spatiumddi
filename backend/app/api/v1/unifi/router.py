@@ -29,6 +29,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1._common import StatusResponse
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
 from app.models.audit import AuditLog
@@ -126,6 +127,8 @@ class ControllerCreate(_ControllerBase):
             v = v.split("://", 1)[1]
         return v.rstrip("/")
 
+    _check_api_key = field_validator("api_key")(header_secret)
+
 
 class ControllerUpdate(BaseModel):
     name: str | None = None
@@ -153,6 +156,8 @@ class ControllerUpdate(BaseModel):
     include_wireless: bool | None = None
     include_vpn: bool | None = None
     sync_interval_seconds: int | None = None
+
+    _check_api_key = field_validator("api_key")(header_secret)
 
 
 class ControllerResponse(BaseModel):
@@ -204,6 +209,8 @@ class TestConnectionRequest(BaseModel):
     api_key: str | None = None
     username: str | None = None
     password: str | None = None
+
+    _check_api_key = field_validator("api_key")(header_secret)
 
 
 class TestConnectionResponse(BaseModel):

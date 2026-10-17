@@ -60,6 +60,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from app.core.header_credentials import header_credential_problem
 from app.core.ssrf import SSRFBlockedError, assert_safe_target
 from app.services.backup.targets.base import (
     ArchiveListing,
@@ -162,6 +163,17 @@ def _parse_extra_headers(config: dict[str, Any]) -> dict[str, str]:
         # reaching this with one would mean a bug above.
         if any(c in value for c in "\r\n"):
             raise DestinationConfigError(f"'extra_headers' value for {name!r} contains a newline")
+        # httpx encodes header names and values as ASCII and raises
+        # UnicodeEncodeError (not an httpx error) on anything else, which
+        # escaped the probe as a 500 and a scheduled run with the row left
+        # ``in_progress`` (#1913).
+        name_problem = header_credential_problem(name, "header name")
+        if name_problem:
+            raise DestinationConfigError(f"'extra_headers': {name_problem}")
+        if not all(c.isascii() and c.isprintable() for c in value):
+            raise DestinationConfigError(
+                f"'extra_headers' value for {name!r} must be printable ASCII"
+            )
         out[name] = value
     return out
 
@@ -291,6 +303,18 @@ class HttpsPutDestination(BackupDestination):
             raise DestinationConfigError("'username' is required when auth is 'basic'")
         if mode == "header" and not config.get("header_name"):
             raise DestinationConfigError("'header_name' is required when auth is 'header'")
+        if mode in ("bearer", "header"):
+            # Sent as a header value: printable ASCII, no inner whitespace
+            # (#1913). Surrounding whitespace is dropped when it is sent.
+            problem = header_credential_problem(str(config.get("credential")).strip(), "credential")
+            if problem:
+                raise DestinationConfigError(problem)
+        if mode == "header":
+            problem = header_credential_problem(
+                str(config.get("header_name")).strip(), "header name"
+            )
+            if problem:
+                raise DestinationConfigError(problem)
 
     async def validate_config_network(self, config: dict[str, Any]) -> None:
         """Resolve the URL and refuse an SSRF pivot.
@@ -334,7 +358,7 @@ class HttpsPutDestination(BackupDestination):
     def _headers(self, config: dict[str, Any], *, content_type: str) -> dict[str, str]:
         headers = {"Content-Type": content_type}
         mode = _auth_mode(config)
-        credential = config.get("credential") or ""
+        credential = (config.get("credential") or "").strip()
         if mode == "bearer":
             headers["Authorization"] = f"Bearer {credential}"
         elif mode == "header":
