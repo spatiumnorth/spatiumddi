@@ -14,7 +14,7 @@ from typing import Any, Self
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
@@ -41,6 +41,7 @@ from app.core.dns_names import (
     bind_check_names_error,
     contains_control_chars,
     contains_zonefile_unsafe,
+    primary_ns_error,
     validate_fqdn,
     validate_record_owner,
 )
@@ -1223,8 +1224,8 @@ class ZoneCreate(BaseModel):
 
     @field_validator("primary_ns", "admin_email")
     @classmethod
-    def validate_soa_fields(cls, v: str) -> str:
-        return _validate_soa_field(v)
+    def validate_soa_fields(cls, v: str, info: ValidationInfo) -> str:
+        return _validate_soa_field(v, field=info.field_name)
 
 
 class ZoneUpdate(BaseModel):
@@ -1275,11 +1276,11 @@ class ZoneUpdate(BaseModel):
 
     @field_validator("primary_ns", "admin_email")
     @classmethod
-    def validate_soa_fields(cls, v: str | None) -> str | None:
+    def validate_soa_fields(cls, v: str | None, info: ValidationInfo) -> str | None:
         # Optional on update; same injection guard as ZoneCreate (issue #597).
         if v is None:
             return v
-        return _validate_soa_field(v)
+        return _validate_soa_field(v, field=info.field_name)
 
     @field_validator("zone_type")
     @classmethod
@@ -1625,7 +1626,7 @@ def _normalize_record_struct_fields(
     return None, None, None
 
 
-def _validate_soa_field(v: str | None) -> str:
+def _validate_soa_field(v: str | None, field: str | None = None) -> str:
     """Reject a zone SOA ``primary_ns`` / ``admin_email`` that could inject.
 
     Both are interpolated raw into the BIND9 SOA line (issue #597 review), so
@@ -1642,6 +1643,12 @@ def _validate_soa_field(v: str | None) -> str:
             "must be a bare domain name — no whitespace, control characters, "
             "or zone-file syntax (e.g. ';' '$' '@')"
         )
+    if field == "primary_ns":
+        # #2075 — a Primary NS BIND's check-names refuses stops the zone
+        # being served at all, so it is a host name or it is not stored.
+        err = primary_ns_error(v)
+        if err is not None:
+            raise ValueError(f"Primary NS (primary_ns) {err}")
     return v
 
 

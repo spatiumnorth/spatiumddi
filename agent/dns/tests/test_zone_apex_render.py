@@ -446,3 +446,15 @@ def test_the_apex_is_a_pure_function_of_the_zone() -> None:
     (``_changed_zones``) is what keeps an unchanged zone from reloading."""
     zone = _zone("corp.example.test.", [_rec("@", "NS", "a.ns.example.net.")])
     assert _zone_apex(zone) == _zone_apex(dict(zone))
+
+
+@pytest.mark.parametrize("bad", ["ns_1.corp.example.test.", "a" * 64 + ".example.net."])
+def test_a_primary_ns_that_is_not_a_host_name_is_healed_to_the_placeholder(bad: str) -> None:
+    """#2075 — rows stored before the API refused them must not make named
+    reject the zone (check-names) and stop the group applying."""
+    zone = _zone("corp.example.test.")
+    zone["primary_ns"] = bad
+    apex = _zone_apex(zone)
+    assert apex.soa_mname == "ns1.corp.example.test."
+    assert apex.ns == ("ns1.corp.example.test.",)
+    assert ("unusable_field", f"primary_ns={bad!r}") in apex.notes

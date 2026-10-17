@@ -25,7 +25,7 @@ import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import contains_control_chars
+from app.core.dns_names import contains_control_chars, primary_ns_error
 from app.drivers.dns import is_agentless
 from app.models.audit import AuditLog
 from app.models.auth import User
@@ -233,6 +233,12 @@ def _zone_kwargs_from_parsed(
     """
 
     soa = parsed.soa
+    primary_ns = soa.primary_ns.rstrip(".") if soa and soa.primary_ns else ""
+    if primary_ns_error(primary_ns) is not None:
+        # #2075 — the source server served this MNAME but BIND's check-names
+        # would refuse it here and stop the whole group applying. Leave it
+        # unset: the renderer then uses the zone's own NS records.
+        primary_ns = ""
     return dict(
         group_id=target_group_id,
         view_id=target_view_id,
@@ -244,7 +250,7 @@ def _zone_kwargs_from_parsed(
         retry=soa.retry if soa else 7200,
         expire=soa.expire if soa else 3600000,
         minimum=soa.minimum if soa else 3600,
-        primary_ns=soa.primary_ns.rstrip(".") if soa and soa.primary_ns else "",
+        primary_ns=primary_ns,
         admin_email=soa.admin_email.rstrip(".") if soa and soa.admin_email else "",
         last_serial=soa.serial if soa else 0,
         forwarders=parsed.forwarders or [],

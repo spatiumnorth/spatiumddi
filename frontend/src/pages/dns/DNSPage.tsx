@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { primaryNsError } from "@/lib/primary-ns";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
@@ -2619,6 +2620,11 @@ export function ZoneModal({
   function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
+    const nsErr = technitiumApi ? null : primaryNsError(primaryNs);
+    if (nsErr) {
+      setError(nsErr);
+      return;
+    }
     const payload: Record<string, unknown> = {
       name,
       zone_type: zoneType,

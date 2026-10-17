@@ -2354,6 +2354,24 @@ class CreateDNSZoneArgs(BaseModel):
         default="",
         description="Primary nameserver FQDN (e.g. ``ns1.example.com.``). Recommended.",
     )
+
+    @field_validator("primary_ns")
+    @classmethod
+    def _primary_ns_is_host_name(cls, v: str) -> str:
+        # #2075 — same rule as the REST zone create: BIND refuses a zone
+        # whose SOA primary name is not a host name.
+        from app.core.dns_names import (  # noqa: PLC0415
+            contains_zonefile_unsafe,
+            primary_ns_error,
+        )
+
+        err = primary_ns_error(v)
+        if err is None and contains_zonefile_unsafe(v):
+            err = "must be a bare domain name, with no whitespace or zone-file syntax"
+        if err is not None:
+            raise ValueError(f"Primary NS (primary_ns) {err}")
+        return v
+
     admin_email: str = Field(
         default="",
         description="Zone admin email rendered into SOA RNAME (e.g. ``hostmaster@example.com``).",

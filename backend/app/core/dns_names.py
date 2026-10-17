@@ -308,6 +308,40 @@ def _first_non_host_label(name: str, *, wildcard: bool) -> str | None:
     return None
 
 
+def primary_ns_error(value: str | None) -> str | None:
+    """Why *value* cannot be a zone's Primary NS (the SOA MNAME), or None.
+
+    The MNAME is a host name BIND checks (``check-names``): an underscore or a
+    label over 63 characters makes it refuse the whole zone, so the group never
+    serves it (#2075). It is stored in absolute form, with or without the
+    trailing dot (the agent reads both as absolute), so a single label such as
+    ``ns1`` would be served as a name at the root, not under the zone; that is
+    refused rather than guessed at. Empty means "not set" and is allowed.
+    """
+    if value is None or value == "":
+        return None
+    body = value[:-1] if value.endswith(".") else value
+    if not body or "." not in body:
+        return (
+            "must be a fully qualified host name such as ns1.example.com. "
+            "(a name with no dot would be read as a name at the root)"
+        )
+    if len(body) > MAX_NAME_LEN:
+        return f"exceeds {MAX_NAME_LEN} characters"
+    for label in body.split("."):
+        if not label:
+            return "contains an empty label"
+        if len(label) > MAX_LABEL_LEN:
+            return f"label '{label[:20]}…' exceeds {MAX_LABEL_LEN} characters"
+        if not label.isascii() or not _HOST_LABEL_RE.match(label):
+            return (
+                f"label '{label}' is not a host name label: letters, digits and "
+                "hyphens only, with no leading or trailing hyphen (RFC 1123). "
+                "BIND refuses a zone whose SOA primary name is not a host name"
+            )
+    return None
+
+
 def _zone_absolute(name: str, origin: str) -> str:
     """*name* the way a zone file whose ``$ORIGIN`` is *origin* reads it.
 

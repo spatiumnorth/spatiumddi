@@ -84,6 +84,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A zone's Primary NS must be a host name, or it is refused (#2075).**
+  The zone dialog stored `ns_1.<zone>.` or a 64-character label as typed
+  and answered 201; the BIND9 agent then wrote it as the SOA MNAME, named's
+  check-names refused the zone, and the server row went `reverted` with the
+  zone never served. Zone create and update (REST), the Copilot's
+  `create_dns_zone` and the zone importers now apply the host-name rule: a
+  422 naming `primary_ns` for an underscore, an over-long or empty label, or
+  a single label such as `ns1`, which would have been served as a name at the
+  root. The importer leaves an unservable source MNAME unset rather than
+  storing it. A row stored before this no longer stops the group: the BIND9
+  agent renders the placeholder apex for it and logs `unusable_field`. The
+  responsible-person name is unchanged, since a mailbox is not a host.
+
+
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
   the inactive slot would be re-written with the same release and the
