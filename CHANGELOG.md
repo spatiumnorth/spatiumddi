@@ -84,6 +84,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The bulk zone delete's Trash warning agrees in number (#2048).**
+  Deleting two zones opened "Move 2 Zones to Trash" with the
+  single-zone sentence "The zone and its records move to Trash"
+  while the rest of the dialog was plural. The warning is now built
+  from the selection count: "The 2 zones and all their records move
+  to Trash", and the single-zone wording is unchanged for one zone.
+
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create
