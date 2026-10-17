@@ -84,6 +84,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS and DHCP server detail modals offered Pause and Resume to
+  a user the API refuses (#2076).** Both routes take a superadmin, and
+  the server rows already showed the buttons disabled with "Requires
+  superadmin"; the detail modal opened from the same row did not, so a
+  DNS or DHCP Editor clicked Pause, typed a reason, and only then got
+  a 403. The modals now use the same gate as the rows.
+
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
   the inactive slot would be re-written with the same release and the
