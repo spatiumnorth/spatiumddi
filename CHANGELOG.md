@@ -84,6 +84,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An operator's override in the `spatiumddi-appliance` HelmChartConfig
+  is no longer reverted by the next heartbeat (#2024).** The documented
+  way to raise named's memory limit (`dnsBind9.resources` in that CR,
+  `APPLIANCE.md`) was undone within a minute: the supervisor rewrote the
+  CR's whole `valuesContent` to its three data-plane VIP keys on every
+  beat, so the DaemonSet went back to 2Gi. The supervisor now merges its
+  own keys into the live document and writes only when that changes
+  something, so every other key survives; the PATCH is conditional on the
+  resourceVersion it read, so an edit landing in between is retried
+  rather than overwritten. `spatium-metallb` had the same replace-the-
+  document write and goes through the same path; `spatium-control`
+  already merged (#792) and now shares it, keeping #1005's guard against
+  a helm revision that changes nothing. YAML comments in these CRs are
+  dropped when the supervisor next has to change one of its keys; the
+  recipe now says to edit the CR in place rather than `kubectl apply`
+  over it, and `APPLIANCE.md` lists which keys in each of the three CRs
+  belong to the supervisor. That list corrects one earlier claim: the api
+  and worker memory limits in `spatium-control` are sized by the
+  supervisor and put back on every heartbeat, so an override there never
+  held. A CR whose `valuesContent` is only comments now counts as empty
+  instead of unreadable, so commenting an override out no longer freezes
+  the supervisor's own keys in it.
+
 - **PowerDNS serves the control plane's serial, never goes
   backwards, sends NOTIFY, and transfers a secondary
   ([#1965](https://github.com/spatiumnorth/spatiumddi/issues/1965),
