@@ -206,16 +206,27 @@ async def test_a_slow_render_still_never_rolls_the_mirror_back(
     """The store's writes to the server row are one statement now; the mirror
     columns must still only move forward while the render counters always do."""
     _, server_id = await _agent_server(db_session, "g2031m")
+    # The newer render's mirror, with the store's 'behind' clock running (a
+    # mark landed after it): none of it may move for the older render.
     await db_session.execute(
         text(
             "UPDATE dns_server SET bundle_watermark = 5, bundle_etag = 'sha256:newer', "
-            "bundle_dirty_seq = 5 WHERE id = :i"
+            "bundle_built_at = '2026-01-01T00:00:00Z', bundle_rendered_by = 'api', "
+            "bundle_app_version = 'newer', bundle_renderer_revision = 999, "
+            "bundle_dirty_at = '2026-01-02T00:00:00Z', bundle_dirty_seq = 6 WHERE id = :i"
         ),
         {"i": server_id},
     )
     await db_session.commit()
     server = await db_session.get(DNSServer, server_id, populate_existing=True)
     assert server is not None
+    mirror_before = (
+        server.bundle_built_at,
+        server.bundle_rendered_by,
+        server.bundle_app_version,
+        server.bundle_renderer_revision,
+        server.bundle_dirty_at,
+    )
     row = await bundle_store.store(
         db_session,
         server,
@@ -234,5 +245,13 @@ async def test_a_slow_render_still_never_rolls_the_mirror_back(
     assert row is not None
     assert server.bundle_watermark == 5
     assert server.bundle_etag == "sha256:newer"
+    assert (
+        server.bundle_built_at,
+        server.bundle_rendered_by,
+        server.bundle_app_version,
+        server.bundle_renderer_revision,
+        server.bundle_dirty_at,
+    ) == mirror_before
+    assert server.bundle_dirty_seq == 6
     assert server.bundle_render_count == 1
     assert server.bundle_render_status == bundle_store.RENDER_STATUS_OK
