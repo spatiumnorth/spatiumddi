@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Updating an alert rule with a null `enabled` or `severity` answered
+  500, and disabling a rule left its open alerts open for good (#1987,
+  #1988).** Every NOT NULL field of the rule update (`name`,
+  `description`, `enabled`, `severity`, `notify_*`) now answers 422
+  naming the field on an explicit null, through the shared
+  `resolve_update_changes`; the nullable thresholds, `server_type`,
+  `classification` and `change_scope` can still be cleared. Disabling a
+  rule now resolves its open events in the same transaction, since the
+  evaluator only visits enabled rules and nothing else would ever close
+  them; the count is recorded in that update's audit row
+  (`resolved_open_events`). Overview and the "Open only" list stop
+  showing them. Resolution is silent, as the evaluator's own is. A rule
+  already disabled with events stuck open is cleared by sending the
+  disable again. The `audit-chain-broken` and `schema-behind-head` rules
+  no longer open (or deliver) an event while disabled, matching the
+  ACME, upgrade and conformity rules; otherwise the next pass after a
+  disable would re-open and re-deliver the alert it had just closed.
+
 - **In BGP mode every node of a multi-node appliance gets its BGP
   configuration (#1827).** MetalLB's BGP mode delegates to frr-k8s, whose
   validating webhook for `FRRConfiguration` objects is served by the
