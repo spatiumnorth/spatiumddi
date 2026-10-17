@@ -527,6 +527,19 @@ the formatter handles the rest.
 
 - **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial could not be written ("value out of int32 range") and the agent zone-state report was refused with a 422, leaving the Zone Sync pill unable to show convergence. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment past 4294967295 wraps to 1 (RFC 1982; it skips 0 the way BIND's own `increment` does, because 0 is the "never seeded" value that every renderer serves as 1). It used to produce 4294967296, which is not a valid SOA serial.
 
+- **A node's return no longer rolls CoreDNS out twice (#1753).** k3s
+  force re-applies its bundled `coredns.yaml` at every server start. That
+  put the CoreDNS pod template's tolerations back to k3s's own two entries.
+  The supervisor's HA shape had added a 20 s fast-evict pair to them, so the
+  template changed (rollout one), and the seed's next heartbeat patched the
+  pair back in (rollout two). Each rollout replaced every CoreDNS pod.
+  Lookups in flight to the replaced pods stalled, enough to put Redis
+  Sentinel into TILT once more at each return. With one CoreDNS replica on
+  every node (#1718), a fast eviction has nowhere to put the evicted pod.
+  The HA shape now keeps k3s's own tolerations, so k3s's re-apply changes
+  nothing and a node's return replaces no CoreDNS pod. An existing cluster
+  drops the fast-evict pair in one rollout when it upgrades.
+
 - **After a node's hard loss, Redis fails over in seconds again, not
   80–100 s (#1718).** Until a lost node reads NotReady (about 40 s), its
   CoreDNS pod stays a ready endpoint of the cluster DNS Service. About half

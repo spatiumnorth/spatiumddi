@@ -14,7 +14,8 @@ a rollout stuck forever, blocking every later coredns change.
 
 These tests pin both halves: stock stays stock on one node (no patch at
 all), an already-deadlocked appliance is reverted to stock, a real cluster
-still gets the full HA shape with one replica per node (#1718), a rollout
+still gets the HA shape with one replica per node (#1718) and k3s's own
+tolerations, so k3s's re-apply at a server start changes nothing (#1753), a rollout
 that could not land is deferred rather than authored, and kubeapi errors
 surface.
 """
@@ -218,18 +219,14 @@ def test_two_nodes_stock_manifest_gets_the_ha_shape(monkeypatch) -> None:
     assert (changed, err) == (True, None)
     spec = rec.patch_body["spec"]
     assert spec["replicas"] == 2
-    # Stock tolerations ride along — the merge-patch REPLACES the list.
-    assert spec["template"]["spec"]["tolerations"] == (
-        _STOCK_TOLERATIONS + _FAST_TOLERATIONS)
+    # #1753 — k3s's own tolerations, and nothing else: the merge-patch
+    # REPLACES the list, and k3s's re-apply then finds nothing to change.
+    assert spec["template"]["spec"]["tolerations"] == _STOCK_TOLERATIONS
     assert spec["template"]["spec"]["affinity"] == _REQUIRED_SPREAD
 
 
 def test_idempotent_when_converged(monkeypatch) -> None:
-    rec = _Recorder(
-        200,
-        _deploy(2, _STOCK_TOLERATIONS + _FAST_TOLERATIONS, _REQUIRED_SPREAD),
-        nodes=2,
-    )
+    rec = _Recorder(200, _deploy(2, _STOCK_TOLERATIONS, _REQUIRED_SPREAD), nodes=2)
     monkeypatch.setattr(k8s_api, "_request", rec)
 
     changed, err = k8s_api.ensure_coredns_ha()
@@ -257,21 +254,34 @@ def test_preferred_spread_from_earlier_build_is_upgraded(monkeypatch) -> None:
     assert rec.patch_body["spec"]["template"]["spec"]["affinity"] == _REQUIRED_SPREAD
 
 
-def test_half_applied_fast_evict_is_repaired_on_a_real_cluster(monkeypatch) -> None:
-    """``unreachable`` alone is not the #590 shape — ``not-ready`` carries the
-    other 300 s default. A template missing one must not read as converged."""
-    rec = _Recorder(
-        200,
-        _deploy(2, _STOCK_TOLERATIONS + _FAST_TOLERATIONS[:1], _REQUIRED_SPREAD),
-        nodes=2,
-    )
+@pytest.mark.parametrize("fast", [_FAST_TOLERATIONS, _FAST_TOLERATIONS[:1]])
+def test_fast_evict_from_an_earlier_build_is_removed_on_a_real_cluster(
+        monkeypatch, fast) -> None:
+    """#1753 — the pre-fix HA template (both fast-evict tolerations, or a
+    half-applied one) is put back to k3s's own tolerations, once."""
+    rec = _Recorder(200, _deploy(2, _STOCK_TOLERATIONS + fast, _REQUIRED_SPREAD), nodes=2)
     monkeypatch.setattr(k8s_api, "_request", rec)
 
     changed, err = k8s_api.ensure_coredns_ha()
 
     assert (changed, err) == (True, None)
-    assert rec.patch_body["spec"]["template"]["spec"]["tolerations"] == (
-        _STOCK_TOLERATIONS + _FAST_TOLERATIONS)
+    assert rec.patch_body["spec"]["template"]["spec"]["tolerations"] == _STOCK_TOLERATIONS
+
+
+@pytest.mark.parametrize("nodes", [2, 3])
+def test_k3s_reapply_leaves_the_ha_template_converged(monkeypatch, nodes) -> None:
+    """#1753 — k3s force re-applies its bundled coredns.yaml at every server
+    start. It sets the tolerations to its own two entries and does not set
+    replicas or affinity. A converged HA deployment after that re-apply must
+    still read as converged, so no node's return rolls CoreDNS out at all.
+    It used to roll out twice: once for the re-apply, which dropped the
+    fast-evict pair, and once for the patch that put it back."""
+    after_k3s_reapply = _deploy(nodes, _STOCK_TOLERATIONS, _REQUIRED_SPREAD)
+    rec = _Recorder(200, after_k3s_reapply, nodes=nodes)
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    assert k8s_api.ensure_coredns_ha() == (False, None)
+    assert not rec.patched
 
 
 @pytest.mark.parametrize("nodes", [3, 5, 7])
@@ -321,7 +331,7 @@ def test_scale_up_with_correct_template_is_not_deferred(monkeypatch) -> None:
     the extra pod just sits Pending until the peer is back."""
     rec = _Recorder(
         200,
-        _deploy(1, _STOCK_TOLERATIONS + _FAST_TOLERATIONS, _REQUIRED_SPREAD),
+        _deploy(1, _STOCK_TOLERATIONS, _REQUIRED_SPREAD),
         nodes=2,
         schedulable=1,
     )
@@ -400,7 +410,7 @@ def test_one_patch_reaches_a_fixed_point(monkeypatch, nodes, deployment) -> None
 
 
 def test_hand_edited_eviction_delay_is_normalised(monkeypatch) -> None:
-    """A 25 s fast-evict toleration is not the shape we ship.
+    """A 25 s fast-evict toleration is not the shape we ship (#1753: none is).
 
     Convergence is "the template equals what we would send", not "it looks
     close enough" — and the loose version of that check was what let a
@@ -419,8 +429,7 @@ def test_hand_edited_eviction_delay_is_normalised(monkeypatch) -> None:
     changed, err = k8s_api.ensure_coredns_ha()
 
     assert (changed, err) == (True, None)
-    assert rec.patch_body["spec"]["template"]["spec"]["tolerations"] == (
-        _STOCK_TOLERATIONS + _FAST_TOLERATIONS)
+    assert rec.patch_body["spec"]["template"]["spec"]["tolerations"] == _STOCK_TOLERATIONS
 
 
 # ── Error paths ─────────────────────────────────────────────────────────────

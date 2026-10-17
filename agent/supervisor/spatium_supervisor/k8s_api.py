@@ -1244,11 +1244,11 @@ def _merge_owned_overrides(
 
 
 # Fast-evict tolerations for the CONTROL-PLANE workloads (api / frontend /
-# worker). Deliberately a separate constant from ``_FAST_EVICT_TOLERATIONS``,
-# which coredns uses: the two are the same 20 s today but answer different
-# questions (how fast must a control-plane replica leave a dead node, vs how
-# fast must cluster DNS), and collapsing them would make a future retune of
-# one silently retune the other.
+# worker). CoreDNS carried its own copy until #1753: with one CoreDNS replica
+# per node an evicted DNS pod has nowhere to go, and the copy was the one
+# template field k3s's manifest re-apply fought over. This one answers a
+# different question (how fast must a control-plane replica leave a dead
+# node) and is unchanged.
 _CONTROL_PLANE_FAST_EVICT = [
     {
         "key": "node.kubernetes.io/unreachable",
@@ -2046,21 +2046,9 @@ _KUBE_DNS_PATH = "/api/v1/namespaces/kube-system/services/kube-dns"
 #: #1718 — the kube-dns Service's ``trafficDistribution`` on a real cluster:
 #: a node's lookups go to the CoreDNS pod on that node while it is ready.
 _NODE_LOCAL_DNS = "PreferSameNode"
+#: The fast-evict tolerations earlier builds added (20 s on both keys). The
+#: reconciler now removes them wherever it finds them (#1753, below).
 _FAST_EVICT_KEYS = ("node.kubernetes.io/unreachable", "node.kubernetes.io/not-ready")
-_FAST_EVICT_TOLERATIONS = [
-    {
-        "key": "node.kubernetes.io/unreachable",
-        "operator": "Exists",
-        "effect": "NoExecute",
-        "tolerationSeconds": 20,
-    },
-    {
-        "key": "node.kubernetes.io/not-ready",
-        "operator": "Exists",
-        "effect": "NoExecute",
-        "tolerationSeconds": 20,
-    },
-]
 _COREDNS_SPREAD = {
     "podAntiAffinity": {
         "requiredDuringSchedulingIgnoredDuringExecution": [
@@ -2127,7 +2115,7 @@ def ensure_coredns_ha() -> tuple[bool, str | None]:
       hostname domain — worse, a 20 s unreachable toleration means a kubelet
       blip evicts the only DNS pod with nowhere to put it.
     * **≥2 registered nodes → HA.** One replica per registered node +
-      fast-evict + required spread, so every node runs its own CoreDNS.
+      required spread, so every node runs its own CoreDNS.
       This used to be capped at 2, on the reasoning that two survive a node
       loss and a third buys no failure tolerance. #1718 showed what the
       third buys. Until a lost node reads NotReady (about 40 s), its CoreDNS
@@ -2139,6 +2127,20 @@ def ensure_coredns_ha() -> tuple[bool, str | None]:
       on every node and the kube-dns Service set to ``PreferSameNode``
       (``ensure_kube_dns_node_local``), a pod's lookups stay on its own
       node. A lost node then takes only its own pods' DNS with it.
+
+    #1753 — the HA shape no longer carries the fast-evict tolerations (20 s
+    on ``unreachable``/``not-ready``) that #590 added. ``tolerations`` is the
+    one pod-template field both this reconciler and k3s's bundled manifest
+    set. k3s force re-applies that manifest at every server start, which put
+    the list back to its own two entries: rollout one. The next seed
+    heartbeat patched the fast-evict pair back in: rollout two. So every
+    node's return replaced every CoreDNS pod twice, and lookups in flight to
+    the replaced pods stalled and put Redis Sentinel into TILT again. With one
+    replica per node, the eviction those tolerations hasten has nowhere to
+    go: the required spread leaves no node free for the evicted pod's
+    replacement. So the template now keeps k3s's own tolerations, and its
+    re-apply is a no-op. Any fast-evict entry found is removed, in both
+    shapes.
 
     The count is *registered* Node objects, deliberately, and deliberately
     NOT the ``control_plane_size`` that sizes every other appliance workload
@@ -2227,7 +2229,7 @@ def ensure_coredns_ha() -> tuple[bool, str | None]:
         # above. Nulling the whole ``affinity`` here would take the operator's
         # other scheduling constraints with it.
         affinity_patch = {"podAntiAffinity": None}
-    want_tolerations = (keep + _FAST_EVICT_TOLERATIONS) if want_ha else keep
+    want_tolerations = keep
 
     # Whether the PATCH would actually rewrite the pod template, computed from
     # the body we are about to send rather than from ``template_ok``. The two

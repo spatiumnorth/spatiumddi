@@ -205,8 +205,8 @@ rules:
     verbs: ["get", "list", "watch"]
     # #590 / #750 — ensure_coredns_ha: the seed's heartbeat matches the
     # k3s-bundled CoreDNS to the cluster's node count. Two or more nodes get
-    # one replica per node (#1718; it was 2) + fast-evict tolerations +
-    # required anti-affinity (k3s resets it to a single 300s-toleration
+    # one replica per node (#1718; it was 2) + required anti-affinity, with
+    # k3s's own tolerations (#1753; k3s resets it to a single 300s-toleration
     # replica on every restart; a single replica deterministically sits on
     # the seed, so a hard seed kill silences
     # all Service/pod-FQDN resolution — api readiness's Postgres + Redis
