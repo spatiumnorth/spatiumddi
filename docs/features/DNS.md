@@ -1038,6 +1038,16 @@ records the kill depends on how the container is killed (#2018):
   was in flight when named died, the apply's own failure
   (`agent_config_rejected`) names the OOM kill instead.
 
+**Undoing the change ends the loop (#2019).** A restarted agent whose named
+died while (or within 5 minutes of) applying a bundle does not re-apply that
+cached bundle at startup: it asks the control plane first, so removing the
+blocklists or the extra view in the UI reaches the server on its next start.
+After two deaths the agent itself watched (named exiting while the agent
+lived) the bundle is quarantined and only retried on a backoff; on the
+appliance today the OOM kill takes the agent with named (#2018), so there the
+agent stops at syncing first and the kubelet backs off the crash loop. See `docs/deployment/DNS_AGENT.md` (last-known-good revert) for what
+serves meanwhile.
+
 **Resolver cache.** BIND's `max-cache-size` sizes one cache, every view with
 recursion has its own, and the default is 90 % of physical memory for each:
 named reads the host's RAM, not the container's limit. The agent therefore

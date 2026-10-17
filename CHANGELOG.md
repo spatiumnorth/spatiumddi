@@ -565,6 +565,24 @@ the formatter handles the rest.
   BIND 9.20). And the endpoint answers 409 instead of `queued` when it wrote
   no op at all (no primary, or no enabled agent-based server).
 
+- **A DNS server crash-looping on a bundle too big for its memory
+  limit takes the fixed bundle once the cause is removed
+  ([#2019](https://github.com/spatiumnorth/spatiumddi/issues/2019)).**
+  The agent re-applied its cached bundle at every start, before it
+  synced, so named was OOM-killed on the same config each time and
+  never saw the bundle the operator had fixed. The agent now marks
+  every apply in its state directory and counts a death when the
+  process dies within 5 minutes of one. After one, startup asks the
+  control plane first and falls back to the cache only when it cannot
+  be reached, or when its own bundle fails to apply. Only deaths the
+  agent watched (named exited while the agent lived) can quarantine a
+  bundle: after two, the last-known-good serves if it is a different
+  bundle, and otherwise the cache is retried on the quarantine's
+  backoff. A death the agent did not see (a power cut, a node reboot,
+  or the whole-container OOM kill of #2018) never leaves the server
+  dark while the control plane is unreachable. A revert never goes back
+  to a bundle named was seen dying on. The server row says why it is
+  not on the cached bundle.
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored
   policy name, description, reference, result detail and diagnostic, went
