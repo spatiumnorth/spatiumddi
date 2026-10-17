@@ -103,6 +103,10 @@ def _policy(group_id, **kw) -> DHCPDevicePolicy:
     return DHCPDevicePolicy(**base)
 
 
+_NO_DEVICES_WARNING = "No devices have been seen in the selected classes yet"
+_UNMATCHABLE_WARNING = "in a form that can be matched"
+
+
 # ── Encoding primitives ───────────────────────────────────────────
 
 
@@ -265,6 +269,7 @@ async def test_ambiguous_signature_included_on_explicit_opt_in(
 
     out = await compile_device_policy(db_session, policy)
     assert Signature("1,3,6", None) in out.signatures
+    assert not any(_NO_DEVICES_WARNING in w for w in out.warnings)
 
 
 @pytest.mark.asyncio
@@ -308,6 +313,7 @@ async def test_truncation_is_reported_never_silent(db_session: AsyncSession) -> 
     assert len(out.signatures) == MAX_SIGNATURE_TERMS
     assert out.truncated == 5
     assert any("cap" in w for w in out.warnings)
+    assert not any(_NO_DEVICES_WARNING in w for w in out.warnings)
 
 
 @pytest.mark.asyncio
@@ -599,9 +605,6 @@ async def test_confident_classification_is_not_warned(
     assert out.confidence >= LOW_CONFIDENCE_SCORE
 
 
-_NO_DEVICES_WARNING = "No devices have been seen in the selected classes yet"
-
-
 @pytest.mark.asyncio
 async def test_classes_with_no_observed_devices_warn_why_not_rendered(
     db_session: AsyncSession,
@@ -654,3 +657,46 @@ async def test_all_ambiguous_keeps_its_own_warning_not_the_no_devices_one(
     assert not out.expression
     assert any("excluded" in w for w in out.warnings)
     assert not any(_NO_DEVICES_WARNING in w for w in out.warnings)
+
+
+@pytest.mark.asyncio
+async def test_in_class_devices_with_unmatchable_signatures_are_not_called_unseen(
+    db_session: AsyncSession,
+) -> None:
+    """#2000 boundary: a device in the selected class that sent neither option
+    55 nor 60 is skipped by _term, so the result is empty — but devices WERE
+    seen, and "no devices have been seen" would be false."""
+    grp, _ = await _make_group_with_server(db_session)
+    db_session.add(_fp("aa:bb:cc:00:00:01", None, None, "Printer"))
+    policy = _policy(grp.id, device_classes=["Printer"])
+    db_session.add(policy)
+    await db_session.flush()
+
+    out = await compile_device_policy(db_session, policy)
+    assert not out.expression
+    assert not any(_NO_DEVICES_WARNING in w for w in out.warnings)
+    assert any(_UNMATCHABLE_WARNING in w and w.startswith("1 device") for w in out.warnings)
+
+
+@pytest.mark.asyncio
+async def test_no_devices_warning_boundaries(db_session: AsyncSession) -> None:
+    """#2000 boundaries: an unclassified device sharing nothing with the class
+    does not count as seen in it; a disabled policy still gets the (true)
+    warning; and no classes selected gets only its own warning, never both."""
+    grp, _ = await _make_group_with_server(db_session)
+    db_session.add(_fp("aa:bb:cc:00:00:01", "1,3,6", None, None))
+    disabled = _policy(grp.id, device_classes=["Printer"], enabled=False)
+    no_classes = _policy(grp.id, device_classes=[])
+    db_session.add_all([disabled, no_classes])
+    await db_session.flush()
+
+    out = await compile_device_policy(db_session, disabled)
+    assert not out.expression
+    assert out.unclassified_matches == 0
+    assert any(_NO_DEVICES_WARNING in w for w in out.warnings)
+    assert not any("renders once" in w for w in out.warnings)
+
+    out_none = await compile_device_policy(db_session, no_classes)
+    assert not any(_NO_DEVICES_WARNING in w for w in out_none.warnings)
+    assert not any(_UNMATCHABLE_WARNING in w for w in out_none.warnings)
+    assert any("No device classes selected" in w for w in out_none.warnings)

@@ -447,14 +447,27 @@ async def compile_device_policy(
     else:
         result.expression = ""
         result.source = "empty"
-        # Classes selected but nothing observed in them yet: say why it is not
-        # rendered. Not the ambiguous case, which has its own warning above
-        # (signatures exist but were excluded) (#2000).
+        # Classes selected but nothing to match: say why it is not rendered.
+        # Not the ambiguous case, which has its own warning above (signatures
+        # exist but were excluded). With no ambiguous signature, an empty
+        # result means either nothing was seen in the selected classes, or
+        # every in-class device sent options 55/60 that _term cannot encode;
+        # "no devices seen" would be false for the second (#2000). Worded
+        # without "renders once", which a disabled policy never does.
         if selected and not ambiguous:
-            result.warnings.append(
-                "No devices have been seen in the selected classes yet, so this "
-                "policy renders once one is fingerprinted."
-            )
+            if inside:
+                seen = sum(len(macs) for macs in inside.values())
+                result.warnings.append(
+                    f"{seen} device(s) in the selected classes were seen, but none "
+                    "sent DHCP options 55 or 60 in a form that can be matched, so "
+                    "this policy matches nothing and is not rendered."
+                )
+            else:
+                result.warnings.append(
+                    "No devices have been seen in the selected classes yet, so this "
+                    "policy matches nothing and is not rendered. It compiles once a "
+                    "device in one of them is fingerprinted."
+                )
 
     return result
 
