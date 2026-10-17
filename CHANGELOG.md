@@ -84,6 +84,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **On the appliance, a DNS server whose named is OOM-killed now reads not
+  serving and raises Agent daemon not serving (#2018).** The kubelet sets
+  `memory.oom.group` on every container, so when named reaches the dns-bind9
+  container's memory limit the kernel kills named and the DNS agent together.
+  The agent's own OOM record (#1725 / #1898) is written after it sees named
+  gone, so it never was, and the restarted agent (a new cgroup) could not see
+  the kill either: the server row read `ok` through every kill and the alert
+  never opened. The supervisor's service watchdog now reports each role
+  container's last termination (`OOMKilled`), restart count and start time
+  for this node's pod, and the control plane turns a current `OOMKilled` into
+  the `oom_killed:` daemon state on the server row, from the supervisor
+  heartbeat (a container stuck in CrashLoopBackOff) and over the restarted
+  agent's `ok`, timed from the kill and cleared once the container has stayed
+  up for 10 minutes. Only the engine's live row is stamped, and only while
+  the supervisor is still heartbeating, so a stale row or a supervisor that
+  stopped reporting cannot hold a server down for good. The watchdog also now picks this node's pod of a
+  DaemonSet rather than whichever node's was listed last. No new RBAC: the
+  supervisor already lists pods in its namespace. Docker Compose, where the
+  kernel kills named alone, keeps the agent's own record.
+
 - **A k3s appliance's api, worker and beat never knew their
   appliance version.** firstboot's `sharedEnv` carried no
   `APPLIANCE_VERSION`, so `settings.appliance_version` was empty,

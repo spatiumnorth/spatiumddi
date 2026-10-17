@@ -55,6 +55,7 @@ from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.container_oom import effective_daemon_report, fresh_role_health
 from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.agents.ingest_receipt import (
     BatchId,
@@ -64,6 +65,7 @@ from app.services.agents.ingest_receipt import (
 )
 from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
+from app.services.appliance.ownership import owning_appliance_for_dns_server
 from app.services.dns import agent_bundle_store as bundle_store
 from app.services.dns import dnssec_signers
 from app.services.dns.agent_bundle_render import render_and_store
@@ -963,7 +965,25 @@ async def agent_heartbeat(
     # since it was written and read by nothing: an agent whose ``named`` never
     # started (no bundle yet — #1061 says ``degraded`` on every heartbeat) was
     # indistinguishable from a healthy one.
-    apply_reported_daemon_state(server, body.daemon, agent_kind="dns", server_id=str(server.id))
+    # #2018 — on the appliance the kubelet kills the whole container when
+    # named hits its memory limit, the agent with it, so the agent never
+    # records the kill and its restarted self reports ``ok``. The supervisor
+    # carries the kubelet's ``OOMKilled`` on its heartbeat; while that kill
+    # is current it is the daemon state, whatever the agent says.
+    appliance = await owning_appliance_for_dns_server(db, server)
+    daemon_report, daemon_stamp = effective_daemon_report(
+        body.daemon,
+        fresh_role_health(appliance, now),
+        server.driver,
+        now,
+    )
+    apply_reported_daemon_state(
+        server,
+        daemon_report,
+        agent_kind="dns",
+        server_id=str(server.id),
+        now=min(daemon_stamp, now),
+    )
 
     # Process op ACKs — batched, and scoped to this agent's own ops (#1232).
     await apply_acks(db, server.id, body.ops_ack)

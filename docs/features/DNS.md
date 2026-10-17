@@ -985,18 +985,44 @@ Where to change it:
 - Docker Compose: `DNS_BIND9_MEM_LIMIT` in `.env` (default `2g`).
 - Raw manifests: edit `k8s/dns/bind9-statefulset.yaml`.
 
-**When the limit is hit.** The kernel kills named inside the pod, the agent
-exits, and the orchestrator restarts the container into the same config, so
-a list that does not fit is a crash loop on that server. The agent reads the
-container's OOM-kill counter, records the kill in its state directory, and
-from the restart on reports the daemon as not serving with the reason
-(`oom_killed: named was killed for exceeding the container's 2 GiB memory
-limit …`). That is the red chip on the server row and, after its 5-minute
-grace, the default-on **Agent daemon not serving** alert. The record clears
-once named has stayed up for 10 minutes. If a structural apply was in flight
-when named died, the apply's own failure (`agent_config_rejected`) names the
-OOM kill instead. If the kernel picks the agent rather than named, nothing
-can be written first: the pod's last state (`OOMKilled`) is the record.
+**When the limit is hit.** named is killed inside the pod and the
+orchestrator restarts the container into the same config, so a list that
+does not fit is a crash loop on that server. From the restart on, the server
+reports the daemon as not serving with the reason (`oom_killed: …`): the red
+chip on the server row and, after its 5-minute grace, the default-on **Agent
+daemon not serving** alert. The state clears once the daemon has stayed up
+for 10 minutes, longer than Kubernetes' 5-minute crash-loop back-off. Who
+records the kill depends on how the container is killed (#2018):
+
+- **Appliance (and any Kubernetes install).** The kubelet sets
+  `memory.oom.group` on every container (cgroup v2, Kubernetes 1.28+), so
+  the kernel kills the whole container at once: named, the DNS agent beside
+  it, and anything else in it. The agent cannot record a kill it died in,
+  and its restarted self is a new cgroup that cannot see it. The kubelet
+  can: it records `OOMKilled` as the container's last state. The appliance
+  supervisor reports that on its heartbeat (its service watchdog, every 5
+  minutes, for this node's pod only), and the control plane turns it into
+  the `oom_killed:` state on the server row that container serves (the
+  engine's live row: one a past registration left behind is not touched),
+  whatever the restarted agent says, timed from the kill rather than from
+  the report. A container stuck in CrashLoopBackOff, with no agent heartbeat
+  at all, reads not serving the same way. The report counts only while the
+  supervisor is still heartbeating (15 minutes): one that stopped leaves
+  its last word in place, and that must not hold a recovered server down.
+  The times compared are the kubelet's and the control plane's, so a node
+  clock far off moves the 10-minute recovery by the same amount. The DHCP
+  (Kea) container is group-killed the same way and is not covered yet. A plain Helm install (umbrella
+  chart) has no supervisor, so there the pod's last state
+  (`kubectl get pod … -o jsonpath='{.status.containerStatuses[0].lastState}'`)
+  is the only record; setting the kubelet's `singleProcessOOMKill: true`
+  (Kubernetes 1.32+) restores the single-process kill and with it the
+  agent's own record, for every container on that node.
+- **Docker Compose.** Docker does not group-kill: the kernel kills the
+  largest process, named, and the agent survives. It reads the container's
+  OOM-kill counter, records the kill in its state directory, exits so the
+  container restarts, and reports it from then on. If a structural apply
+  was in flight when named died, the apply's own failure
+  (`agent_config_rejected`) names the OOM kill instead.
 
 **Resolver cache.** BIND's `max-cache-size` sizes one cache, every view with
 recursion has its own, and the default is 90 % of physical memory for each:
