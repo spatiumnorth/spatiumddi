@@ -1501,24 +1501,24 @@ async def _operator_record_twin(
     """
     from app.services.dns.record_identity import find_identical_record  # noqa: PLC0415
 
-    # A PTR target is written with or without its trailing dot by hand.
-    values = {value}
-    if rtype == "PTR":
-        values.add(value.rstrip(".") if value.endswith(".") else value + ".")
-    for candidate in values:
-        found = await find_identical_record(
-            db,
-            zone_id,
-            view_id=None,
-            name=name,
-            record_type=rtype,
-            value=candidate,
-            priority=None,
-            weight=None,
-            port=None,
-        )
-        if found is not None and not found.auto_generated:
-            return found
+    # A PTR target must match exactly, trailing dot included (#2045). The
+    # record API stores a value as typed and BIND9 serves a dot-less target
+    # RELATIVE to the reverse zone origin, so ``db1.example.com`` answers
+    # ``db1.example.com.<reverse zone>.``: a different record, not a spelling
+    # of ours.
+    found = await find_identical_record(
+        db,
+        zone_id,
+        view_id=None,
+        name=name,
+        record_type=rtype,
+        value=value,
+        priority=None,
+        weight=None,
+        port=None,
+    )
+    if found is not None and not found.auto_generated:
+        return found
     return None
 
 

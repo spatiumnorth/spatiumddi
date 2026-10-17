@@ -920,11 +920,10 @@ async def compute_subnet_dns_drift(
 
 def _rr_identity(zone_id: uuid.UUID, name: str, rtype: str, value: str) -> tuple[str, ...]:
     """The #1230 identity of a record, as ``_operator_record_twin`` in the
-    IPAM router matches it: owner name case-insensitive, value trimmed, and a
-    PTR target with or without its trailing dot."""
+    IPAM router matches it: owner name case-insensitive, value trimmed. A PTR
+    target keeps its trailing dot: without it the server serves the target
+    relative to the reverse zone, which is a different record (#2045)."""
     v = value.strip()
-    if rtype.upper() == "PTR":
-        v = v.rstrip(".")
     return (str(zone_id), name.lower(), rtype.upper(), v)
 
 

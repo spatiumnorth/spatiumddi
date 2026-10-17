@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **IPAM no longer adopts a PTR whose target lacks the trailing dot
+  (#2045).** Since #1890 an allocation adopts an operator's identical
+  record instead of writing its own, and for a PTR it also matched the
+  target with the trailing dot removed. The record API stores a value as
+  typed and BIND9 serves a dot-less target relative to the reverse zone,
+  so `db1.example.com` answered `db1.example.com.<reverse zone>.`: IPAM
+  adopted the wrong record, wrote no PTR, and Sync DNS reported nothing
+  missing. The adoption match and the Sync DNS check now both require the
+  exact target, trailing dot included. An operator PTR written with the
+  dot is still adopted. A/AAAA adoption is unchanged; CNAME, MX and NS
+  are not adopted by this code.
+
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create

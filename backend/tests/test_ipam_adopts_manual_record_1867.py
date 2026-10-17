@@ -357,8 +357,7 @@ async def test_sync_dns_does_not_report_an_adopted_record_missing(
     db_session.add_all(
         [
             _manual(r.fwd_id, r.fwd_name, "db1", "A", "10.97.5.10"),
-            # Written without the trailing dot: still the same PTR.
-            _manual(r.rev_id, PTR_ZONE, "10", "PTR", f"db1.{r.fwd_name}".rstrip(".")),
+            _manual(r.rev_id, PTR_ZONE, "10", "PTR", f"db1.{r.fwd_name}"),
         ]
     )
     await db_session.commit()
@@ -458,3 +457,39 @@ async def test_a_generated_record_renamed_onto_the_operators_is_retracted(
         ("10", "PTR", f"db1.{r.fwd_name}", False)
     ]
     assert (await _ip(db_session, ip_id)).dns_record_id == a_id
+
+
+@pytest.mark.asyncio
+async def test_a_dotless_ptr_target_is_not_adopted_and_sync_reports_it(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#2045: a PTR target without its trailing dot is served relative to the
+    reverse zone, so it is another record. IPAM writes its own PTR, and the
+    drift check reports the address missing while only the relative one exists."""
+    headers = await _headers(db_session)
+    r = await _rig(db_session)
+    absolute = f"db1.{r.fwd_name}".rstrip(".") + "."
+    dotless = absolute.rstrip(".")
+    db_session.add(_manual(r.rev_id, PTR_ZONE, "10", "PTR", dotless))
+    await db_session.commit()
+    sid = await _subnet(client, headers, r)
+    ip_id = await _allocate(client, headers, sid, "10.97.5.10", "db1")
+
+    ptrs = [x for x in await _rows(db_session, r.rev_id) if x[0] == "10"]
+    assert ("10", "PTR", absolute, True) in ptrs, ptrs
+    assert ("10", "PTR", dotless, False) in ptrs, ptrs
+
+    # Drop IPAM's own PTR: only the relative one is left, and it must not
+    # satisfy the check.
+    for rec in (
+        await db_session.execute(
+            select(DNSRecord).where(
+                DNSRecord.ip_address_id == uuid.UUID(ip_id), DNSRecord.record_type == "PTR"
+            )
+        )
+    ).scalars():
+        await db_session.delete(rec)
+    await db_session.commit()
+    resp = await client.get(f"/api/v1/ipam/subnets/{sid}/dns-sync/summary", headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["missing"] >= 1, resp.json()
