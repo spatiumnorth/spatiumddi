@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Fleet upgrade dialog no longer promises a re-write and a
+  reboot for a node already on the chosen release (#2068).** It said
+  the inactive slot would be re-written with the same release and the
+  node rebooted into it. Neither happens: the supervisor fires no
+  slot-upgrade trigger when the installed version equals the goal, the
+  next heartbeat drops the goal, and the runner only stages. The note
+  now says nothing will be written and the node will not reboot, and
+  the Schedule button is disabled for that case.
+
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create

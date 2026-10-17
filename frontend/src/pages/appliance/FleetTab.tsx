@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
+import { UpgradeDirectionNotice } from "./UpgradeDirectionNotice";
 import { Link } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -6044,30 +6045,18 @@ function ApplianceOsUpgradeSection({
               />
             </div>
           )}
-          {(direction === "backward" || direction === "same") && (
-            <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-2 py-1 text-[11px] text-amber-800 dark:text-amber-300">
-              {direction === "backward" ? (
-                <>
-                  <strong>{tag.trim()}</strong> is older than the installed{" "}
-                  <strong>{row.installed_appliance_version}</strong>: this is a
-                  rollback, not an upgrade. The older release boots against a
-                  database the newer one may already have migrated.
-                </>
-              ) : (
-                <>
-                  This node already runs <strong>{tag.trim()}</strong>. It will
-                  re-write the inactive slot with the same release and reboot
-                  into it.
-                </>
-              )}
-            </p>
-          )}
+          <UpgradeDirectionNotice
+            direction={direction}
+            tag={tag}
+            installed={row.installed_appliance_version}
+          />
           <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={() => scheduleUpgrade.mutate(false)}
               disabled={
                 !tag.trim() ||
+                direction === "same" ||
                 scheduleUpgrade.isPending ||
                 (sourceKind === "url" && !imageUrl.trim()) ||
                 (sourceKind === "uploaded" && !slotImageId)
