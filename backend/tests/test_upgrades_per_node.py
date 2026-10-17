@@ -436,6 +436,7 @@ async def test_step_health_gate_fails_on_supervisor_failed(
     class _Appliance:
         installed_appliance_version = "2026.05.22-2"  # still old
         last_upgrade_state = "failed"
+        last_upgrade_progress = None
 
     db = MagicMock()
     db.refresh = AsyncMock()

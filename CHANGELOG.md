@@ -84,6 +84,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A per-box upgrade stayed `reboot-pending` after it had rebooted and
+  committed (#2007), and its help text said it reboots (#2008).** The
+  host runner ends a staged apply at state `done` / progress
+  `reboot-pending` and is not running when the node comes back, so after
+  the reboot the supervisor kept re-publishing "upgrade staged" to Fleet,
+  the API and MCP. The runner now records the kernel boot id it staged
+  under and the slot it armed, and the supervisor settles the state once
+  the boot id has changed and the boot is committed (not a trial). A node
+  back on the staged slot reads `ready`. A node back on the OTHER slot
+  (GRUB fell back, or the trial was never committed) reads `failed`, with
+  a "rolled back" progress line, instead of being cleared as if the
+  upgrade had taken; the rolling-upgrade health gate reports it as an
+  auto-revert, and now also accepts the settled `ready`. An upgrade still
+  awaiting its reboot, and a trial boot awaiting its commit, are
+  untouched. No clock is involved, so a wall-clock step between staging
+  and reboot cannot clear a reboot the operator still owes. The per-box
+  form, the API docstring and the Upgrades docs no longer claim the host
+  reboots into the new slot; only Rolling Upgrade reboots for you.
+
 - **DHCP scope dialog pickers and New PXE profile match rows now have
   accessible names (#2016).** The scope dialog's PXE profile select and its
   "Apply template…" select had no name (now "PXE profile" and "Apply

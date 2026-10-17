@@ -80,6 +80,56 @@ def test_clean_apply_writes_done_and_renames_trigger(tmp_path: Path) -> None:
     assert len(list(tmp_path.glob("slot-upgrade-pending.done.*"))) == 1
 
 
+def test_reboot_pending_records_the_staged_boot_and_slot(tmp_path: Path) -> None:
+    """#2007 — the supervisor settles reboot-pending off these two fields:
+    a different boot_id later is the reboot, a different slot a rollback."""
+    import json
+
+    stub = _write_stub(tmp_path, "exit 0")
+    _seed_trigger(tmp_path)
+    grubenv = tmp_path / "grubenv"
+    grubenv.write_text(
+        "# GRUB Environment Block\nsaved_entry=slot_a\nnext_entry=slot_b\n" + "#" * 64,
+        encoding="utf-8",
+    )
+    boot_id = tmp_path / "boot_id"
+    boot_id.write_text("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\n", encoding="utf-8")
+    subprocess.run(
+        ["bash", str(RUNNER)],
+        env=_env(
+            tmp_path, stub, SPATIUM_GRUBENV=str(grubenv), SPATIUM_BOOT_ID_FILE=str(boot_id)
+        ),
+        capture_output=True,
+        timeout=30,
+    )
+    prog = json.loads((tmp_path / "slot-upgrade.progress").read_text(encoding="utf-8"))
+    assert prog["step"] == "reboot-pending"
+    assert prog["staged_slot"] == "slot_b"
+    assert prog["staged_boot_id"] == "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+
+def test_reboot_pending_omits_an_unreadable_identity(tmp_path: Path) -> None:
+    import json
+
+    stub = _write_stub(tmp_path, "exit 0")
+    _seed_trigger(tmp_path)
+    subprocess.run(
+        ["bash", str(RUNNER)],
+        env=_env(
+            tmp_path,
+            stub,
+            SPATIUM_GRUBENV=str(tmp_path / "absent"),
+            SPATIUM_BOOT_ID_FILE=str(tmp_path / "absent-too"),
+        ),
+        capture_output=True,
+        timeout=30,
+    )
+    assert _state(tmp_path).startswith("done ")
+    prog = json.loads((tmp_path / "slot-upgrade.progress").read_text(encoding="utf-8"))
+    assert prog["step"] == "reboot-pending"
+    assert "staged_slot" not in prog and "staged_boot_id" not in prog
+
+
 def test_apply_failure_writes_failed(tmp_path: Path) -> None:
     stub = _write_stub(tmp_path, "exit 1")
     trigger = _seed_trigger(tmp_path)

@@ -6464,8 +6464,9 @@ async def schedule_appliance_upgrade(
     """Stamps ``desired_appliance_version`` + ``desired_slot_image_url``
     on the appliance row. The supervisor's next heartbeat picks them up
     and fires the slot-upgrade trigger; the host runner downloads + dd's
-    the raw.xz to the inactive slot + reboots into it. Per-row reboot is
-    optional — operators who want to defer can clear desired_* via
+    the raw.xz to the inactive slot and stops; it does NOT reboot. The
+    operator reboots (Fleet "Reboot to boot new slot") to boot it. Operators
+    who want to cancel can clear desired_* via
     ``/clear-upgrade`` before the supervisor's next heartbeat.
 
     For air-gapped fleets, pass ``slot_image_id`` (an
