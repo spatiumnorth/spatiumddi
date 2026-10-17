@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An API token bound to specific DNS zones or subnets only reaches
+  the Operator Copilot / MCP tools that narrow their answers to those
+  zones or subnets.** The tools' permission check looks at the resource
+  type, so a token bound to one zone cleared it for every DNS tool, and
+  the tools that list server groups, servers, views or query rates, or
+  count IPAM resources estate-wide, answered as though the token were
+  unbound. The tool registry now refuses an instance-bound token any
+  tool that does not declare `honours_token_binding`, for `tools/list`,
+  MCP `tools/call` and in-app chat alike, the same structural floor the
+  REST routers have. The tools that do declare it (zone and record
+  lists, per-zone DNSSEC / drift / update-ACL reads, the IPAM space /
+  block / subnet / address reads, tag lookup and global search) already
+  filter or gate on the bound instances, and a test pins the list and
+  checks each one against a second zone and subnet. Sessions and
+  unbound tokens are unaffected.
+
 - **On the appliance, a DNS server whose named is OOM-killed now reads not
   serving and raises Agent daemon not serving (#2018).** The kubelet sets
   `memory.oom.group` on every container, so when named reaches the dns-bind9

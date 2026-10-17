@@ -430,6 +430,7 @@ class GlobalSearchArgs(BaseModel):
 
 @register_tool(
     name="global_search",
+    honours_token_binding=True,
     permission="authenticated",
     description=(
         "Cross-resource search across IPAM (IPs / subnets / blocks / "
