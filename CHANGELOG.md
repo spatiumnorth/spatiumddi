@@ -527,6 +527,18 @@ the formatter handles the rest.
 
 - **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial could not be written ("value out of int32 range") and the agent zone-state report was refused with a 422, leaving the Zone Sync pill unable to show convergence. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment past 4294967295 wraps to 1 (RFC 1982; it skips 0 the way BIND's own `increment` does, because 0 is the "never seeded" value that every renderer serves as 1). It used to produce 4294967296, which is not a valid SOA serial.
 
+- **A heartbeat that never reached the control plane is sent again after
+  5 s, not after the whole 30 s interval (part of #1805).** Such a
+  heartbeat is one whose lookup or connection went to a lost node, or that
+  met an empty api Service while the api waited for Redis. On a node loss,
+  two failures in a row left a healthy node's heartbeat about 100 s old.
+  That is past the 90 s after which the demote guard and the Fleet tab
+  call a voter unhealthy. The supervisor now sends such a heartbeat again
+  after 5 s, doubling the wait while failures continue, up to the
+  interval. A heartbeat the control plane answered is paced as before.
+  This does not close #1805: a heartbeat that lands on the lost node's api
+  pod still waits out its 40 s timeout.
+
 - **Disabling a DNS pool now removes its records, and a pool TTL change
   lands immediately (#1974).** `update_pool` never reconciled and
   `apply_pool_state` ignored `pool.enabled`, so a disabled pool kept
