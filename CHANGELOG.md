@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Audit details mask presigned-URL signatures and storage connection
+  strings on read.** The read-side redaction of `GET /api/v1/audit/{id}`,
+  the Audit page and the copilot's audit tool now also masks the signing
+  parameters of a presigned S3 / GCS URL (`X-Amz-Signature`,
+  `X-Amz-Credential`, `X-Amz-Security-Token`, `X-Goog-Signature`,
+  `X-Goog-Credential`), the `AccountKey` of an Azure storage connection
+  string, and any value under a `connection_string` key. Backup-target
+  entries recorded by earlier releases could carry these, in an edited
+  target's `config` or a failed `https_put` / WebDAV run's error text.
+  Stored entries are left exactly as written, since each is part of the
+  audit hash chain; only what is returned changes. The support bundle's
+  scrubber uses the same patterns.
+
 - **On the appliance, a DNS server whose named is OOM-killed now reads not
   serving and raises Agent daemon not serving (#2018).** The kubelet sets
   `memory.oom.group` on every container, so when named reaches the dns-bind9
