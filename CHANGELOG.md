@@ -117,6 +117,14 @@ the formatter handles the rest.
   now started rather than reloaded, since systemd refuses to reload a
   unit that is not running.
 
+- **DNS agent registers with the version it actually runs**
+  (#2078). `bootstrap.register` sent a literal `"2026.04.14.1"`
+  that nothing rewrote, so every new DNS server row was seeded
+  with `notes = "agent v2026.04.14.1"` whatever build it ran.
+  It now sends the image's stamped `SPATIUM_AGENT_VERSION`, as
+  the DHCP agent does. Existing rows keep their seeded note;
+  operator notes are never rewritten on re-register.
+
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
   the inactive slot would be re-written with the same release and the
