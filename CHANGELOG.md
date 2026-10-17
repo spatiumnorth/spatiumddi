@@ -92,7 +92,9 @@ the formatter handles the rest.
   that would have fixed it was never reached, so only a reboot
   recovered. The runner now creates the directory (root:root 0755,
   as the unit does) before validating; an invalid config is still
-  refused.
+  refused. And when ssh.socket is not active, a down ssh.service is
+  now started rather than reloaded, since systemd refuses to reload a
+  unit that is not running.
 
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
