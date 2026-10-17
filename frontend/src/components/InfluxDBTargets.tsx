@@ -552,20 +552,27 @@ function InfluxTargetModal({
                 placeholder="(blank if unauthenticated)"
               />
             </label>
-            <label className="block">
-              <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                Password
-              </div>
-              <input
-                type="password"
-                className={inputCls}
-                value={form.password ?? ""}
-                disabled={clearPassword}
-                onChange={(e) => setForm({ ...form, password: e.target.value })}
-                placeholder={
-                  passwordSet ? "(stored — leave blank to keep)" : "Password"
-                }
-              />
+            {/* The clear checkbox's label is a sibling of the field's label,
+                not inside it: a label may not contain another, and nesting
+                renamed the field "Password Clear stored password". */}
+            <div className="block">
+              <label className="block">
+                <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Password
+                </div>
+                <input
+                  type="password"
+                  className={inputCls}
+                  value={form.password ?? ""}
+                  disabled={clearPassword}
+                  onChange={(e) =>
+                    setForm({ ...form, password: e.target.value })
+                  }
+                  placeholder={
+                    passwordSet ? "(stored — leave blank to keep)" : "Password"
+                  }
+                />
+              </label>
               {existingId && passwordSet && (
                 <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
                   <input
@@ -576,7 +583,7 @@ function InfluxTargetModal({
                   Clear stored password
                 </label>
               )}
-            </label>
+            </div>
           </div>
         ) : (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -604,20 +611,22 @@ function InfluxTargetModal({
                 placeholder="spatiumddi"
               />
             </label>
-            <label className="block">
-              <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                Token
-              </div>
-              <input
-                type="password"
-                className={inputCls}
-                value={form.token ?? ""}
-                disabled={clearToken}
-                onChange={(e) => setForm({ ...form, token: e.target.value })}
-                placeholder={
-                  tokenSet ? "(stored — leave blank to keep)" : "API token"
-                }
-              />
+            <div className="block">
+              <label className="block">
+                <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Token
+                </div>
+                <input
+                  type="password"
+                  className={inputCls}
+                  value={form.token ?? ""}
+                  disabled={clearToken}
+                  onChange={(e) => setForm({ ...form, token: e.target.value })}
+                  placeholder={
+                    tokenSet ? "(stored — leave blank to keep)" : "API token"
+                  }
+                />
+              </label>
               {existingId && tokenSet && (
                 <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
                   <input
@@ -628,7 +637,7 @@ function InfluxTargetModal({
                   Clear stored token
                 </label>
               )}
-            </label>
+            </div>
           </div>
         )}
 

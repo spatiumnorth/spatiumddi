@@ -127,6 +127,20 @@ describe("stored secrets", () => {
     expect("password" in body).toBe(false);
   });
 
+  // The clear checkbox's label must not sit inside the field's label: that
+  // renamed the field "Password Clear stored password" (ddi-pg walk of #2001).
+  it("keeps the secret fields named exactly Password and Token", async () => {
+    await openEdit(BASE);
+    const pw = screen.getByLabelText("Password", { exact: true });
+    expect(pw.getAttribute("type")).toBe("password");
+    expect(screen.getByLabelText("Clear stored password")).toBeTruthy();
+    cleanup();
+    await openEdit({ ...BASE, version: "v2" as const, bucket: "b", org: "o" });
+    const tok = screen.getByLabelText("Token", { exact: true });
+    expect(tok.getAttribute("type")).toBe("password");
+    expect(screen.getByLabelText("Clear stored token")).toBeTruthy();
+  });
+
   it("sends a newly typed password", async () => {
     await openEdit(BASE);
     fireEvent.change(
