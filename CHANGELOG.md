@@ -84,6 +84,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A rolling upgrade no longer fails on one kubeapi request its
+  shared-tag hold could not land (#2028).** The hold (#1710) pins the
+  shared charts' image tag before each node and removes the pins at the
+  end, a few kubeapi requests each time, and any one of them refused or
+  unanswered (a k3s server answers 503 `apiserver not ready` while it
+  restarts) failed the whole run: before the first node, with the
+  cluster on two versions at a re-assert, or with every node already on
+  the target at the flip. Such a step is now tried again every 15 s,
+  with Halt, Abort and the Lease read between tries, as #1713 does for
+  the Lease. No node starts and no tag moves until it lands, and the
+  run fails on it, with the same error, only after 300 s of failures.
+  Only an answer a later try can change is retried (no answer, a 5xx,
+  408, 409 or 429); a 403 or 422 still fails the run at once.
+
 - **A demoted member promoted again rejoins instead of sitting
   `joining` on a full disk (#2049).** Every join and leave set the
   node's k3s identity aside, and with it containerd's whole image
