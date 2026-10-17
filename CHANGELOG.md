@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An IPAM alias named `under_score` (type A) is refused, not written
+  into a zone BIND will not load (#2070).** Allocate IP, the IP edit
+  and the Add alias endpoint stored the name and wrote the record; the
+  BIND9 agent then refused the whole zone under check-names and held
+  every later change in it. An alias now passes the DNS record API's own
+  owner-name checks (`validate_record_owner` and BIND's check-names rule
+  for its type), so an A or AAAA alias must be a host name and the
+  request answers 422 naming the alias. A CNAME alias keeps the
+  underscore, as in the DNS API.
+
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
   the inactive slot would be re-written with the same release and the

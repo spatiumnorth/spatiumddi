@@ -24,7 +24,12 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
-from app.core.dns_names import validate_fqdn, validate_hostname, validate_record_owner
+from app.core.dns_names import (
+    bind_check_names_error,
+    validate_fqdn,
+    validate_hostname,
+    validate_record_owner,
+)
 from app.core.permissions import (
     is_effective_superadmin,
     require_any_resource_or_scoped,
@@ -3084,6 +3089,24 @@ class AliasInput(BaseModel):
         if not v:
             raise ValueError("alias name is required")
         return v
+
+    @model_validator(mode="after")
+    def _owner_rule(self) -> "AliasInput":
+        """Apply the DNS record API's owner-name rules to the alias (#2070).
+
+        The same two checks ``POST /dns/.../records`` runs: the RFC 2181
+        owner syntax, then BIND's check-names rule for the record type (an
+        A/AAAA owner must be a host name, so ``under_score`` is refused as
+        an A alias; a CNAME owner may keep an underscore).
+        """
+        try:
+            owner = validate_record_owner(self.name, field=f"alias '{self.name}'")
+        except ValueError as exc:
+            raise ValueError(f"alias '{self.name}': {exc}") from exc
+        err = bind_check_names_error(self.record_type, owner, None, origin="")
+        if err is not None:
+            raise ValueError(f"alias '{self.name}': {err}")
+        return self
 
 
 def _validate_role(v: Any) -> Any:
