@@ -1020,6 +1020,7 @@ async def _apply_agentless(
 
     op_row = DNSRecordOp(
         server_id=server.id,
+        zone_id=zone.id,
         zone_name=zone.name,
         op=op,
         record=record,
@@ -1314,6 +1315,7 @@ async def enqueue_record_op(
     for srv in agent_servers:
         row = DNSRecordOp(
             server_id=srv.id,
+            zone_id=zone.id,
             zone_name=zone.name,
             op=op,
             record=record,
@@ -1457,6 +1459,7 @@ async def _fanout_agent_ops(
         for o in ops:
             row = DNSRecordOp(
                 server_id=srv.id,
+                zone_id=zone.id,
                 zone_name=zone.name,
                 op=o["op"],
                 record=o["record"],
@@ -1723,6 +1726,7 @@ async def _apply_agentless_batch(
     for o in ops:
         row = DNSRecordOp(
             server_id=server.id,
+            zone_id=zone.id,
             zone_name=zone.name,
             op=o["op"],
             record=o["record"],

@@ -21,8 +21,11 @@ matchers, so a tuning change to a detection reaches all three surfaces at once.
 
 from __future__ import annotations
 
+import uuid
+from collections.abc import Collection
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 #: Defaults chosen to match the alert rules' own (``_FREE_RESPONDING_RECENCY_DAYS``
@@ -40,6 +43,7 @@ async def build_hygiene_report(
     stale_reservation_days: int = DEFAULT_STALE_RESERVATION_DAYS,
     squat_days: int = DEFAULT_SQUAT_DAYS,
     limit: int = 100,
+    subnet_ids: Collection[uuid.UUID] | None = None,
 ) -> dict[str, Any]:
     """Three buckets of address-space hygiene findings, computed live.
 
@@ -58,6 +62,9 @@ async def build_hygiene_report(
     ``limit``. Reporting only the truncated length would understate an estate
     with thousands of findings, which is exactly the estate that needs the
     number.
+
+    ``subnet_ids`` limits every bucket, and its count, to addresses in those
+    subnets (a caller bound to specific subnets); ``None`` applies no limit.
     """
     # Imported here rather than at module scope: ``services.alerts`` imports
     # most of the model tree, and a top-level import would drag that into every
@@ -87,6 +94,27 @@ async def build_hygiene_report(
     squat = await _matching_unknown_mac_in_static_range_subjects(
         db, _rule(RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE, squat_days)
     )
+
+    if subnet_ids is not None:
+        from app.models.ipam import IPAddress  # noqa: PLC0415
+
+        found = {sid for rows in (free, stale, squat) for sid, _, _ in rows}
+        keep: set[str] = set()
+        if found and subnet_ids:
+            keep = {
+                str(i)
+                for i in (
+                    await db.execute(
+                        select(IPAddress.id).where(
+                            IPAddress.id.in_([uuid.UUID(f) for f in found]),
+                            IPAddress.subnet_id.in_(list(subnet_ids)),
+                        )
+                    )
+                ).scalars()
+            }
+        free = [r for r in free if r[0] in keep]
+        stale = [r for r in stale if r[0] in keep]
+        squat = [r for r in squat if r[0] in keep]
 
     def _fmt(rows: list[tuple[str, str, str]]) -> list[dict[str, str]]:
         return [{"ip_id": sid, "address": disp, "detail": msg} for sid, disp, msg in rows[:limit]]

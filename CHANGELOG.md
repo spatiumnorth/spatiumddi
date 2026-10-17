@@ -123,6 +123,27 @@ the formatter handles the rest.
   supervisor already lists pods in its namespace. Docker Compose, where the
   kernel kills named alone, keeps the agent's own record.
 
+- **Block, space and report reads honour an API token's resource
+  binding.** The per-request check added for tokens bound to specific
+  subnets or DNS zones read only path parameters named `subnet_id`,
+  `address_id` and `zone_id`. It now reads the same names in the query
+  string, and also checks `block_id` / `space_id`: a bound token reaches a
+  block or space only when it contains one of the token's subnets. Inside
+  one, the routes that answer about several subnets narrow to the token's
+  own: the block and space DNS-sync previews, the block's aggregation
+  suggestions, and the stale-IP, hygiene and vendor reports. The stale-IP
+  bulk deprecate skips rows outside the binding. Free-space answers for a
+  block or space (`free-space`, `available-subnets`, `plan-allocation`,
+  `find-free`) describe every subnet in it and cannot be narrowed, so they
+  are refused to a token bound to subnets. DNS `delegation-preview` and
+  `delegate-from-parent` also require the token to be bound to the parent
+  zone they read and write. A DNS record op now records the id of its
+  zone, and the per-server pending-ops list narrows by that id, so a
+  same-named zone in another view no longer matches. Block and space
+  create / update check a named `dns_zone_id` against the token's zone
+  grants, as subnet and address writes already did. Sessions and unbound
+  tokens are unaffected.
+
 - **A k3s appliance's api, worker and beat never knew their
   appliance version.** firstboot's `sharedEnv` carried no
   `APPLIANCE_VERSION`, so `settings.appliance_version` was empty,
@@ -5351,6 +5372,10 @@ the formatter handles the rest.
 - `d7a2e94b1c60` — #1990: `influxdb_target.last_success_at` (nullable
   `timestamptz`, NULL = never). Backfilled from `last_push_at` for rows
   with a push time and no recorded error.
+- `c7d2e9a41f63` — additive: nullable `dns_record_op.zone_id`, a foreign
+  key to `dns_zone` (`ON DELETE SET NULL`) with an index. Set on every op
+  queued from now on. No backfill: an older op cannot say which view's
+  zone it belonged to, so NULL stays. Downgrade drops the column.
 
 ## 2026.10.02-1 — 2026-10-02
 
