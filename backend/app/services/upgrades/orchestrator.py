@@ -303,6 +303,7 @@ async def plan_upgrade(
         started_by_user_id=started_by_user_id,
     )
     db.add(run)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     if audit_actor_display or started_by_user_id:
         db.add(
             AuditLog(
