@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { summarizeZoneNames } from "./dnsNames";
+import { parseTtlInput, summarizeZoneNames } from "./dnsNames";
 
 describe("summarizeZoneNames (#1840)", () => {
   it("joins a short list whole", () => {
@@ -23,4 +23,26 @@ describe("summarizeZoneNames (#1840)", () => {
   it("is empty for no zones", () => {
     expect(summarizeZoneNames([])).toBe("");
   });
+});
+
+describe("parseTtlInput (#2073 / #2074)", () => {
+  it.each([
+    ["3600", 3600],
+    [" 0 ", 0],
+    ["2147483647", 2147483647],
+    ["1e3", 1000],
+  ])("reads %j as %d", (text, n) => {
+    expect(parseTtlInput(text)).toBe(n);
+  });
+
+  it("reads blank as null (inherit)", () => {
+    expect(parseTtlInput("  ")).toBeNull();
+  });
+
+  it.each([["1h"], ["-1"], ["1.5"], ["2147483648"], ["abc"]])(
+    "refuses %j with a reason",
+    (text) => {
+      expect(typeof parseTtlInput(text)).toBe("string");
+    },
+  );
 });
