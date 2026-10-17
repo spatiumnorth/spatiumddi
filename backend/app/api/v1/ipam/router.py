@@ -24,7 +24,12 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
-from app.core.dns_names import validate_fqdn, validate_hostname, validate_record_owner
+from app.core.dns_names import (
+    name_in_zone_error,
+    validate_fqdn,
+    validate_hostname,
+    validate_record_owner,
+)
 from app.core.permissions import (
     is_effective_superadmin,
     require_any_resource_or_scoped,
@@ -1543,6 +1548,26 @@ async def _operator_record_twin(
     return None
 
 
+def _name_too_long_for_zone(ip: IPAddress, zone_domain: str, strict: bool) -> bool:
+    """True when ``<hostname>.<zone>`` is not a legal DNS name (#2072).
+
+    ``strict`` raises the 422 instead (the request paths); otherwise the
+    caller skips the zone, and this logs why.
+    """
+    err = name_in_zone_error(ip.hostname or "", zone_domain, field="hostname")
+    if err is None:
+        return False
+    if strict:
+        raise HTTPException(status_code=422, detail=err)
+    logger.warning(
+        "ipam_dns_name_too_long",
+        ip=str(ip.address),
+        zone=zone_domain,
+        hostname_length=len(ip.hostname or ""),
+    )
+    return True
+
+
 async def _sync_dns_record(
     db: AsyncSession,
     ip: IPAddress,
@@ -1552,6 +1577,7 @@ async def _sync_dns_record(
     ttl: int | None = None,
     *,
     backfill_reverse_zone: bool = True,
+    strict: bool = False,
 ) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
@@ -1572,6 +1598,12 @@ async def _sync_dns_record(
     ran (or, with ``skip_reverse_zone``, deliberately did not run) the
     reverse-zone step, and the gateway placeholder's sync must not undo the
     opt-out (spatiumddi#1150).
+
+    ``strict=True`` (the request paths) answers a 422 naming ``hostname`` when
+    ``<hostname>.<zone>`` passes the 253-character DNS name limit (#2072);
+    otherwise (DDNS, importers, DHCP statics) the over-long name is skipped
+    and logged, because those paths must not fail a lease or a batch over one
+    row, and the name must not reach a zone BIND would then refuse whole.
 
     Returns whether the sync had anything to do: False when the row carries
     no hostname, when there is no primary zone and no extra zone to publish
@@ -1651,6 +1683,10 @@ async def _sync_dns_record(
             pass
 
     zone_domain = zone.name.rstrip(".") if zone else ""
+    if zone_domain and _name_too_long_for_zone(ip, zone_domain, strict):
+        # #2072 — not published, and the PTR (whose target is this name) is
+        # skipped with it.
+        return False
     fqdn = f"{ip.hostname}.{zone_domain}" if zone_domain else None
     if fqdn:
         ip.fqdn = fqdn
@@ -1706,6 +1742,10 @@ async def _sync_dns_record(
             zone if desired_zone_id == effective_zone_id else await db.get(DNSZone, desired_zone_id)
         )
         if target is not None and ipam_authors_zone(target):
+            if desired_zone_id != effective_zone_id and _name_too_long_for_zone(
+                ip, target.name.rstrip("."), strict
+            ):
+                continue  # #2072 — an extra zone the name does not fit in
             authored_zone_ids.append(desired_zone_id)
     desired_zone_ids = authored_zone_ids
 
@@ -7940,7 +7980,7 @@ async def create_address(
         await _record_mac_history(db, ip.id, body.mac_address)
 
     # Sync DNS A record
-    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
+    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
     # User-specified alias records (CNAME / A) tied to this IP
     if body.aliases:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
@@ -8381,9 +8421,11 @@ async def update_address(
         # zone_cleared is handled above, so an explicit zone here is a real
         # UUID; otherwise preserve the IP's current forward zone (#493).
         zone_id = uuid.UUID(body.dns_zone_id) if dns_zone_explicit else ip.forward_zone_id
-        await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update")
+        await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update", strict=True)
     elif subnet and restoring:
-        await _sync_dns_record(db, ip, subnet, zone_id=ip.forward_zone_id, action="create")
+        await _sync_dns_record(
+            db, ip, subnet, zone_id=ip.forward_zone_id, action="create", strict=True
+        )
 
     # #1628 — keep the DHCP reservation in step with the row: a MAC /
     # hostname change lands on the linked DHCPStaticAssignment, flipping
@@ -9312,7 +9354,9 @@ async def bulk_allocate_commit(
             await db.flush()
 
             if body.create_dns_records:
-                await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
+                await _sync_dns_record(
+                    db, ip, subnet, zone_id=explicit_zone, action="create", strict=True
+                )
 
             db.add(
                 _audit(
@@ -9597,7 +9641,7 @@ async def allocate_next_ip(
         await _record_mac_history(db, ip.id, body.mac_address)
 
     # Sync DNS A record
-    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
+    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
     # User-specified alias records (CNAME / A) tied to this IP
     if body.aliases:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
@@ -10512,7 +10556,9 @@ async def bulk_edit_addresses(
                         subnet_cache[ip.subnet_id] = subnet
                 if subnet is not None:
                     old["forward_zone_id"] = str(ip.forward_zone_id) if ip.forward_zone_id else None
-                    await _sync_dns_record(db, ip, subnet, zone_id=new_zone_id, action="update")
+                    await _sync_dns_record(
+                        db, ip, subnet, zone_id=new_zone_id, action="update", strict=True
+                    )
 
             db.add(
                 _audit(

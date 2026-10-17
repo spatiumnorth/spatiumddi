@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Allocate IP no longer stores a hostname whose name in its zone
+  passes 253 characters (#2072).** A 243-character hostname is valid
+  alone, but IPAM publishes `<hostname>.<zone>`, and the length cap
+  only looked at the hostname. The allocate answered 201, the A record
+  was queued, and BIND refused both the forward zone and the reverse
+  zone holding the PTR ("ran out of space"), so every later change to
+  either waited behind it. The limit is now applied to the whole name
+  (253 characters of dotted form, 255 octets on the wire, each label
+  63 at most) by one shared helper in `core/dns_names.py`. Allocate IP,
+  edit IP, bulk allocate and bulk edit DNS zone answer 422 naming
+  `hostname` and the length it would reach, storing nothing. The DNS
+  record API and the copilot apply it to a record's owner and to a
+  CNAME / MX / NS / SRV / PTR / DNAME target too. DDNS, importers and
+  DHCP static reservations never fail a lease or a batch: they skip
+  the over-long name (and its PTR) with an `ipam_dns_name_too_long`
+  log line. The Allocate IP dialog shows the same reason as you type.
+  Nothing is ever truncated.
+
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
   the inactive slot would be re-written with the same release and the

@@ -251,6 +251,61 @@ def validate_fqdn(name: str, *, field: str = "domain", allow_underscore: bool = 
     return normalized
 
 
+# ── Full-name length (issue #2072) ───────────────────────────────────────
+# The per-field validators above cap a name on its own. A host name is
+# published as ``<hostname>.<zone>``, and the limit that matters is on that
+# whole name: RFC 1035 section 3.1 / 2.3.4 caps a name at 255 octets on the
+# wire, each label costing its length plus one length octet, plus the one
+# octet of the root label. For a dotted presentation name with no trailing dot
+# that is ``len(name) + 2 <= 255``, i.e. 253 characters, and every label
+# <= 63. A 243-character hostname is valid alone; inside a 33-character zone it
+# is 277, which BIND refuses ("ran out of space") together with the zone that
+# holds the record and the reverse zone that holds the PTR naming it.
+
+
+def name_length_error(name: str, *, field: str = "name") -> str | None:
+    """Why *name* cannot be a DNS name on the wire, or None.
+
+    *name* is a dotted presentation name; one trailing root dot is ignored.
+    Checks the whole name (<= ``MAX_NAME_LEN`` characters, i.e. 255 wire
+    octets) and each label (<= ``MAX_LABEL_LEN``). Length only: character
+    rules stay with the per-context validators. Never truncates.
+    """
+    body = name.strip().rstrip(".")
+    if len(body) > MAX_NAME_LEN:
+        return (
+            f"{field} '{body}' is {len(body)} characters, over the "
+            f"{MAX_NAME_LEN}-character limit of a DNS name (255 octets on the wire)"
+        )
+    for label in body.split("."):
+        if len(label) > MAX_LABEL_LEN:
+            return f"{field} label '{label}' exceeds {MAX_LABEL_LEN} characters"
+    return None
+
+
+def name_in_zone_error(hostname: str, zone_name: str, *, field: str = "hostname") -> str | None:
+    """Why ``<hostname>.<zone_name>`` cannot be published, or None.
+
+    The message names *field* and the length the name would reach, so the
+    operator knows to shorten the hostname or pick another zone.
+    """
+    zone = zone_name.strip().rstrip(".")
+    host = hostname.strip().rstrip(".")
+    if not host or not zone:
+        return None
+    full = f"{host}.{zone}"
+    err = name_length_error(full, field=field)
+    if err is None:
+        return None
+    if len(full) > MAX_NAME_LEN:
+        return (
+            f"{field}: '{host}' in zone '{zone}' makes a {len(full)}-character name; a "
+            f"DNS name holds at most {MAX_NAME_LEN} characters, and BIND refuses a "
+            "zone that holds one longer. Shorten the hostname or choose another zone."
+        )
+    return err
+
+
 # ── What BIND's check-names refuses (issue #1378) ────────────────────────
 # BIND loads a primary zone under ``check-names primary fail`` unless told
 # otherwise, and the agent renders no check-names option, so named-checkzone
@@ -286,6 +341,8 @@ _REVERSE_MAPPING_SUFFIXES = ("in-addr.arpa", "ip6.arpa", "ip6.int")
 _DNSSD_BROWSE_PREFIXES = frozenset(
     (first, "_dns-sd", "_udp") for first in ("b", "db", "lb", "r", "dr")
 )
+# Types whose rdata ends in a domain name (the length check, #2072).
+_TARGET_LENGTH_TYPES = frozenset({"MX", "NS", "SRV", "CNAME", "PTR", "DNAME"})
 _AD_GC_PREFIX = ("gc", "_msdcs")
 _SPF_EXISTS_LABELS = frozenset({"_spf", "_spf_verify", "_spf_rate"})
 
@@ -370,6 +427,19 @@ def bind_check_names_error(
     through. The message is operator-facing.
     """
     rtype = record_type.strip().upper()
+    if check_owner:
+        # #2072 — the whole owner name, zone included, must fit a DNS name.
+        too_long = name_length_error(_zone_absolute(owner, origin), field=f"{rtype} record name")
+        if too_long is not None:
+            return too_long + "; BIND refuses a zone that holds it."
+    if check_target and value is not None and rtype in _TARGET_LENGTH_TYPES:
+        tokens_ = value.split()
+        if tokens_:
+            too_long = name_length_error(
+                _zone_absolute(tokens_[-1], origin), field=f"{rtype} record target"
+            )
+            if too_long is not None:
+                return too_long + "; BIND refuses a zone that holds it."
     if check_owner and rtype in BIND_HOST_OWNER_TYPES:
         owner_abs = _zone_absolute(owner, origin)
         bad = _first_non_host_label(owner_abs, wildcard=True)
