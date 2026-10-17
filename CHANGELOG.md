@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS group's Health line reports what the servers say
+  (#2077).** DNS, a server group, Servers read "all servers assumed
+  consistent (per-server serials arrive in Wave 3)" whatever the
+  servers reported, even while one had refused a zone. It now comes
+  from each server's own zone-state rollup: in sync on N servers, or
+  how many servers are behind, refused zones, or have not reported
+  every zone yet. A server that has not reported is never counted as
+  in sync.
+
 - **A rolling upgrade no longer fails on one kubeapi request its
   shared-tag hold could not land (#2028).** The hold (#1710) pins the
   shared charts' image tag before each node and removes the pins at the
