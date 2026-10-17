@@ -91,8 +91,12 @@ the formatter handles the rest.
   to Trash." and "I understand 0 empty Blocks will be moved to Trash.",
   because the page clears its selection when the requests are filed and
   the dialog recounted from it. The space and block views now freeze the
-  selection when the dialog opens. A delete that actually runs still
-  closes the dialog and clears the selection as before.
+  selection when the dialog opens, and the delete sends that same frozen
+  list, so the confirm describes exactly what goes out. A delete that
+  actually runs still closes the dialog and clears the selection as
+  before. A retry after a partial failure now resends only the items that
+  failed; it used to resend the ones already in Trash too, which came back
+  as fresh failures.
 
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
