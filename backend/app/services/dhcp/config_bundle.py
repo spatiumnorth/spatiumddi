@@ -53,6 +53,7 @@ from app.services.dhcp.device_policy import (
     compile_device_policy,
     load_fingerprint_snapshot,
 )
+from app.services.dhcp.ha_peer_auth import group_credential, peer_auth_ready
 from app.services.dhcp.option_validation import (
     options_for_family,
     phone_options_loadable,
@@ -130,7 +131,17 @@ async def _resolve_failover(
                 "auto-failover": group.auto_failover,
             }
         )
+    # The peer credential, only once every Kea member's agent renders it:
+    # Kea's listener cannot accept TLS and plaintext at once, so switching one
+    # peer before its partner's agent understands the fields would stop the
+    # pair talking for the length of the upgrade (ha_peer_auth module doc).
+    tls: dict[str, str] | None = None
+    if peer_auth_ready(group, kea_peers):
+        tls = group_credential(group)
     return FailoverConfig(
+        tls_ca_pem=tls["ca_pem"] if tls else None,
+        tls_cert_pem=tls["cert_pem"] if tls else None,
+        tls_key_pem=tls["key_pem"] if tls else None,
         channel_id=str(group.id),
         channel_name=group.name,
         mode=group.mode,

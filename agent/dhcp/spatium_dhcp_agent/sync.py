@@ -52,6 +52,7 @@ from .config_apply import (
     Quarantine,
     truncate_error,
 )
+from .ha_tls import materialise as materialise_ha_tls
 from .kea_ctrl import (
     KeaCheckUnavailable,
     KeaConfigRejected,
@@ -589,7 +590,11 @@ class SyncLoop:
         # names only addresses the host holds now. A stale one would not
         # just miss a socket: kea-dhcp6 refuses the whole config.
         v6_unicast = global_ipv6_addresses()
+        ha_tls_dir = self.cfg.state_dir / "ha-tls"
         try:
+            # The HA peer credential goes to disk first: the config written
+            # below points Kea at these files, and Kea reads them at load.
+            materialise_ha_tls(inner.get("failover"), ha_tls_dir)
             rendered = render_kea(
                 inner,
                 control_socket=str(self.cfg.kea_control_socket),
@@ -597,6 +602,7 @@ class SyncLoop:
                 control_socket_v6=str(self.cfg.kea_control_socket_v6),
                 lease_file_v6=lease_file_v6,
                 v6_unicast=v6_unicast,
+                ha_tls_dir=str(ha_tls_dir),
             )
         except Exception as e:
             # #882 — tag the phase. A render failure never reached Kea, so

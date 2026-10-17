@@ -14,6 +14,7 @@ from . import __version__, kea_ctrl
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
+from .ha_tls import AGENT_CAPABILITIES
 from .spool import SpoolManager
 
 log = structlog.get_logger(__name__)
@@ -49,6 +50,10 @@ class HeartbeatClient:
         # model is ``extra="forbid"`` and predates #1077. Dropping the field
         # keeps the agent's liveness signal alive across the version skew.
         self._spool_field_unsupported = False
+        # Same skew handling for ``capabilities``. It is what opens the HA
+        # peer-credential gate, so only an older control plane — which has no
+        # gate — ever sees it dropped.
+        self._capabilities_field_unsupported = False
 
     def stop(self) -> None:
         self._stop.set()
@@ -101,6 +106,8 @@ class HeartbeatClient:
             # treat that as "unknown", never as "old".
             "kea_version": self._kea_version(),
         }
+        if not self._capabilities_field_unsupported:
+            body["capabilities"] = list(AGENT_CAPABILITIES)
         if self.spool_manager is not None and not self._spool_field_unsupported:
             try:
                 body["spool"] = self.spool_manager.status()
@@ -118,6 +125,19 @@ class HeartbeatClient:
                     json=body,
                     headers={"Authorization": f"Bearer {self.token_ref[0]}"},
                 )
+                if (
+                    resp.status_code == 422
+                    and "capabilities" in body
+                    and "capabilities" in resp.text
+                ):
+                    log.warning("heartbeat_capabilities_field_unsupported")
+                    self._capabilities_field_unsupported = True
+                    body.pop("capabilities")
+                    resp = c.post(
+                        "/api/v1/dhcp/agents/heartbeat",
+                        json=body,
+                        headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                    )
                 if resp.status_code == 422 and "spool" in body and "spool" in resp.text:
                     log.warning("heartbeat_spool_field_unsupported")
                     self._spool_field_unsupported = True
