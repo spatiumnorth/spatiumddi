@@ -96,6 +96,76 @@ the formatter handles the rest.
   now started rather than reloaded, since systemd refuses to reload a
   unit that is not running.
 
+- **The Fleet upgrade dialog no longer promises a re-write and a
+  reboot for a node already on the chosen release (#2068).** It said
+  the inactive slot would be re-written with the same release and the
+  node rebooted into it. Neither happens: the supervisor fires no
+  slot-upgrade trigger when the installed version equals the goal, the
+  next heartbeat drops the goal, and the runner only stages. The note
+  now says nothing will be written and the node will not reboot, and
+  the Schedule button is disabled for that case.
+
+- **A dialog opened from a right-click menu now keeps focus (#2051).**
+  Choosing Delete…, Edit… or any item that opens a dialog from the IPAM
+  tree's context menu (and the DNS, DHCP and VLAN trees, which share the
+  menu) left focus on the row behind the dialog, because Radix returned
+  focus to the row after the dialog had taken it, so Enter or typing went
+  to the page. The menu now skips that restore when a dialog opened, and
+  puts focus back on the row when the dialog closes. Only a dialog that
+  appeared after the menu opened counts, so a menu inside an open dialog
+  still returns focus to its row.
+
+- **Closing a dialog with an autofocused field returns focus to its
+  opener again (#2050).** The shared focus trap read the opener in
+  an effect, after React had already applied the field's `autoFocus`,
+  so it remembered the dialog's own input and focus fell to the page
+  body on close (New IP Space opened from its button, closed with
+  Esc). The opener is now captured during the first render, and an
+  opener that has left the DOM is skipped instead of focused. A dialog
+  opened from a header-menu item (the item is gone with its menu by
+  the time the dialog closes) returns to the menu's button instead of
+  the body. Under the dev server's StrictMode, the trap no longer
+  takes focus off an autofocused field when React re-runs its effect.
+
+- **A header menu opened with the mouse now closes on Esc (#2047).**
+  After a click open, focus stays on the menu's trigger and the Esc
+  handler lived only on the panel, so the key reached nothing. The
+  shared `HeaderMenu` now listens for Esc on the document while open,
+  closes, returns focus to the trigger and stops the event so a parent
+  dialog does not also close; a closed menu leaves Esc alone. It also
+  closes when focus moves to another control, so two menus can no longer
+  be open at once, and it leaves an Esc alone when focus is in a layer
+  opened over it (the Cmd+K palette, the `?` overlay) or when the key
+  ends an IME composition.
+
+- **The bulk zone delete's Trash warning agrees in number (#2048).**
+  Deleting two zones opened "Move 2 Zones to Trash" with the
+  single-zone sentence "The zone and its records move to Trash"
+  while the rest of the dialog was plural. The warning is now built
+  from the selection count: "The 2 zones and all their records move
+  to Trash", and the single-zone wording is unchanged for one zone.
+
+- **Block, space and report reads honour an API token's resource
+  binding.** The per-request check added for tokens bound to specific
+  subnets or DNS zones read only path parameters named `subnet_id`,
+  `address_id` and `zone_id`. It now reads the same names in the query
+  string, and also checks `block_id` / `space_id`: a bound token reaches a
+  block or space only when it contains one of the token's subnets. Inside
+  one, the routes that answer about several subnets narrow to the token's
+  own: the block and space DNS-sync previews, the block's aggregation
+  suggestions, and the stale-IP, hygiene and vendor reports. The stale-IP
+  bulk deprecate skips rows outside the binding. Free-space answers for a
+  block or space (`free-space`, `available-subnets`, `plan-allocation`,
+  `find-free`) describe every subnet in it and cannot be narrowed, so they
+  are refused to a token bound to subnets. DNS `delegation-preview` and
+  `delegate-from-parent` also require the token to be bound to the parent
+  zone they read and write. A DNS record op now records the id of its
+  zone, and the per-server pending-ops list narrows by that id, so a
+  same-named zone in another view no longer matches. Block and space
+  create / update check a named `dns_zone_id` against the token's zone
+  grants, as subnet and address writes already did. Sessions and unbound
+  tokens are unaffected.
+
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create
@@ -577,6 +647,24 @@ the formatter handles the rest.
   BIND 9.20). And the endpoint answers 409 instead of `queued` when it wrote
   no op at all (no primary, or no enabled agent-based server).
 
+- **A DNS server crash-looping on a bundle too big for its memory
+  limit takes the fixed bundle once the cause is removed
+  ([#2019](https://github.com/spatiumnorth/spatiumddi/issues/2019)).**
+  The agent re-applied its cached bundle at every start, before it
+  synced, so named was OOM-killed on the same config each time and
+  never saw the bundle the operator had fixed. The agent now marks
+  every apply in its state directory and counts a death when the
+  process dies within 5 minutes of one. After one, startup asks the
+  control plane first and falls back to the cache only when it cannot
+  be reached, or when its own bundle fails to apply. Only deaths the
+  agent watched (named exited while the agent lived) can quarantine a
+  bundle: after two, the last-known-good serves if it is a different
+  bundle, and otherwise the cache is retried on the quarantine's
+  backoff. A death the agent did not see (a power cut, a node reboot,
+  or the whole-container OOM kill of #2018) never leaves the server
+  dark while the control plane is unreachable. A revert never goes back
+  to a bundle named was seen dying on. The server row says why it is
+  not on the cached bundle.
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored
   policy name, description, reference, result detail and diagnostic, went
@@ -5468,6 +5556,10 @@ the formatter handles the rest.
 - `d7a2e94b1c60` — #1990: `influxdb_target.last_success_at` (nullable
   `timestamptz`, NULL = never). Backfilled from `last_push_at` for rows
   with a push time and no recorded error.
+- `c7d2e9a41f63` — additive: nullable `dns_record_op.zone_id`, a foreign
+  key to `dns_zone` (`ON DELETE SET NULL`) with an index. Set on every op
+  queued from now on. No backfill: an older op cannot say which view's
+  zone it belonged to, so NULL stays. Downgrade drops the column.
 
 ## 2026.10.02-1 — 2026-10-02
 
