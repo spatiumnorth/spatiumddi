@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A header menu opened with the mouse now closes on Esc (#2047).**
+  After a click open, focus stays on the menu's trigger and the Esc
+  handler lived only on the panel, so the key reached nothing. The
+  shared `HeaderMenu` now listens for Esc on the document while open,
+  closes, returns focus to the trigger and stops the event so a parent
+  dialog does not also close; a closed menu leaves Esc alone. It also
+  closes when focus moves to another control, so two menus can no longer
+  be open at once, and it leaves an Esc alone when focus is in a layer
+  opened over it (the Cmd+K palette, the `?` overlay) or when the key
+  ends an IME composition.
+
 - **The bulk zone delete's Trash warning agrees in number (#2048).**
   Deleting two zones opened "Move 2 Zones to Trash" with the
   single-zone sentence "The zone and its records move to Trash"
