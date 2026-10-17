@@ -1501,11 +1501,8 @@ async def _operator_record_twin(
     """
     from app.services.dns.record_identity import find_identical_record  # noqa: PLC0415
 
-    # A PTR target must match exactly, trailing dot included (#2045). The
-    # record API stores a value as typed and BIND9 serves a dot-less target
-    # RELATIVE to the reverse zone origin, so ``db1.example.com`` answers
-    # ``db1.example.com.<reverse zone>.``: a different record, not a spelling
-    # of ours.
+    if rtype.upper() == "PTR":
+        return await _operator_ptr_twin(db, zone_id, name=name, value=value)
     found = await find_identical_record(
         db,
         zone_id,
@@ -1519,6 +1516,72 @@ async def _operator_record_twin(
     )
     if found is not None and not found.auto_generated:
         return found
+    return None
+
+
+async def _operator_ptr_twin(
+    db: AsyncSession, zone_id: uuid.UUID, *, name: str, value: str
+) -> DNSRecord | None:
+    """The operator-written PTR IPAM's own would duplicate, or None (#2045).
+
+    A PTR is the same record when the servers SERVE the same target: compared
+    case-insensitively, and with a target written without its trailing dot
+    read the way the zone's servers read it. On BIND9, Technitium and Windows
+    Path A ``db1.example.com`` is relative to the reverse zone, so it names
+    ``db1.example.com.<zone>.`` and is not ours: IPAM writes its own PTR
+    beside it, and the operator's wrong one is logged so it can be found. On
+    the cloud providers and Windows Path B the same spelling is the absolute
+    name, and adopting it is what stops a duplicate the provider refuses.
+    """
+    from app.services.dns.record_identity import (  # noqa: PLC0415
+        ptr_target_key,
+        zone_target_readings,
+    )
+
+    readings = await zone_target_readings(db, [zone_id])
+    if zone_id not in readings:
+        return None
+    zone_name, relative = readings[zone_id]
+    want = ptr_target_key(value, zone_name, relative=relative)
+    rows = (
+        (
+            await db.execute(
+                select(DNSRecord).where(
+                    DNSRecord.zone_id == zone_id,
+                    DNSRecord.view_id.is_(None),
+                    func.lower(DNSRecord.name) == name.lower(),
+                    func.upper(DNSRecord.record_type) == "PTR",
+                    DNSRecord.auto_generated.is_(False),
+                    DNSRecord.priority.is_(None),
+                    DNSRecord.weight.is_(None),
+                    DNSRecord.port.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        if ptr_target_key(row.value, zone_name, relative=relative) == want:
+            return row
+    for row in rows:
+        if relative and ptr_target_key(row.value, zone_name, relative=False) == want:
+            # The operator meant our target and left off the trailing dot, so
+            # the servers answer a name under the reverse zone. Not adopted;
+            # IPAM's PTR now stands beside it and the reverse lookup answers
+            # both until the operator fixes or deletes theirs.
+            logger.warning(
+                "ipam_ptr_relative_operator_record",
+                zone=zone_name,
+                name=name,
+                operator_record_id=str(row.id),
+                operator_value=row.value,
+                detail=(
+                    f"PTR {row.value!r} has no trailing dot, so it is served as "
+                    f"{ptr_target_key(row.value, zone_name, relative=True)}; "
+                    f"IPAM wrote {value} beside it"
+                ),
+            )
     return None
 
 

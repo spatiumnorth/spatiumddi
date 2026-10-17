@@ -492,4 +492,91 @@ async def test_a_dotless_ptr_target_is_not_adopted_and_sync_reports_it(
     await db_session.commit()
     resp = await client.get(f"/api/v1/ipam/subnets/{sid}/dns-sync/summary", headers=headers)
     assert resp.status_code == 200, resp.text
-    assert resp.json()["missing"] >= 1, resp.json()
+    # Exactly the PTR: IPAM's A still stands.
+    assert resp.json()["missing"] == 1, resp.json()
+
+
+@pytest.mark.asyncio
+async def test_a_ptr_differing_only_in_case_is_adopted(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#2045: DNS names compare case-insensitively, so an operator PTR naming
+    the same host in other letter case is the same served record. Adopted,
+    no twin, and Sync DNS reports nothing missing."""
+    headers = await _headers(db_session)
+    r = await _rig(db_session)
+    upper = f"DB1.{r.fwd_name}".upper()
+    db_session.add(_manual(r.rev_id, PTR_ZONE, "10", "PTR", upper))
+    await db_session.commit()
+    sid = await _subnet(client, headers, r)
+    await _allocate(client, headers, sid, "10.97.5.10", "db1")
+
+    assert [x for x in await _rows(db_session, r.rev_id) if x[0] == "10"] == [
+        ("10", "PTR", upper, False)
+    ]
+    resp = await client.get(f"/api/v1/ipam/subnets/{sid}/dns-sync/summary", headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["missing"] == 0, resp.json()
+
+
+async def _ptr_group(db: AsyncSession, servers: list[tuple[str, bytes | None]]) -> DNSZone:
+    grp = DNSServerGroup(name=f"g2045-{uuid.uuid4().hex[:6]}")
+    db.add(grp)
+    await db.flush()
+    for driver, creds in servers:
+        db.add(
+            DNSServer(
+                group_id=grp.id,
+                driver=driver,
+                host="10.9.9.9",
+                name=f"ns-{uuid.uuid4().hex[:6]}",
+                is_enabled=True,
+                credentials_encrypted=creds,
+            )
+        )
+    rev = DNSZone(
+        group_id=grp.id,
+        name=PTR_ZONE,
+        zone_type="primary",
+        kind="reverse",
+        primary_ns="ns1.example.test.",
+        admin_email="admin.example.test.",
+    )
+    db.add(rev)
+    await db.flush()
+    db.add(_manual(rev.id, PTR_ZONE, "10", "PTR", "db1.example.test"))
+    await db.flush()
+    return rev
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("servers", "adopted"),
+    [
+        # Zone-file readers: the dot-less target is db1.example.test.<zone>.
+        ([("bind9", None)], False),
+        ([("technitium", None)], False),
+        ([("windows_dns", None)], False),  # Path A, RFC 2136 against the origin
+        ([], False),  # no server yet: read as the default driver, BIND9
+        # PowerDNS refuses the dot-less spelling, so it is never served.
+        ([("powerdns", None)], False),
+        # Drivers that take the name as given: the same absolute name.
+        ([("route53", None)], True),
+        ([("cloudflare", None)], True),
+        ([("windows_dns", b"x")], True),  # Path B, -PtrDomainName
+        # One relative reader serves the wrong name: not adopted.
+        ([("route53", None), ("bind9", None)], False),
+    ],
+)
+async def test_a_dotless_ptr_is_adopted_only_where_it_is_served_absolute(
+    db_session: AsyncSession, servers: list[tuple[str, bytes | None]], adopted: bool
+) -> None:
+    """#2045: whether ``db1.example.test`` is the same record as IPAM's
+    ``db1.example.test.`` depends on how the zone's servers read it."""
+    from app.api.v1.ipam.router import _operator_record_twin
+
+    rev = await _ptr_group(db_session, servers)
+    twin = await _operator_record_twin(
+        db_session, rev.id, name="10", rtype="PTR", value="db1.example.test."
+    )
+    assert (twin is not None) is adopted
