@@ -304,3 +304,63 @@ def test_the_listener_moves_only_after_the_firewall_loaded() -> None:
     nft_gate = enabled.index("if ! nft_reload; then")
     assert nft_gate < enabled.index('install -o root -g root -m 0644 "$SSHD_TMP" "$SSHD_DROPIN"')
     assert nft_gate < enabled.index('sync_socket_listen "$PORT"')
+
+
+# --- #2054: validation must work while ssh.service is down -----------------
+
+SSHD_STUB = r"""#!/bin/bash
+# Models sshd -t: needs the privsep dir, then rejects a config with BadDirective.
+[ -d "$SSHD_PRIVSEP_DIR" ] || { echo "Missing privilege separation directory: $SSHD_PRIVSEP_DIR" >&2; exit 255; }
+if grep -q BadDirective "$3"; then echo "bad config" >&2; exit 255; fi
+exit 0
+"""
+
+
+def _validate(tmp_path: Path, body: str) -> tuple[subprocess.CompletedProcess[str], Path]:
+    bindir = tmp_path / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    sshd = bindir / "sshd"
+    sshd.write_text(SSHD_STUB, encoding="utf-8")
+    sshd.chmod(0o755)
+    conf = tmp_path / "test.conf"
+    conf.write_text(body, encoding="utf-8")
+    privsep = tmp_path / "run-sshd"  # absent: ssh.service is failed
+    text = SCRIPT.read_text(encoding="utf-8")
+    m = re.search(r"^validate_sshd_config\(\) \{\n.*?^\}\n", text, re.S | re.M)
+    assert m, "validate_sshd_config not found in the shipped script"
+    proc = subprocess.run(
+        [
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            f'{m.group(0)}\nif validate_sshd_config "{conf}" "{tmp_path}/v.log"; '
+            "then echo VALID; else echo INVALID; fi",
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": f"{bindir}:/usr/bin:/bin",
+            "SSHD_PRIVSEP_DIR": str(privsep),
+        },
+        check=False,
+    )
+    return proc, privsep
+
+
+def test_validation_works_while_the_privsep_dir_is_absent(tmp_path: Path) -> None:
+    proc, privsep = _validate(tmp_path, "Port 22\n")
+    assert "VALID" in proc.stdout.split(), proc.stdout + proc.stderr
+    assert privsep.is_dir()
+    assert oct(privsep.stat().st_mode & 0o777) == "0o755"
+
+
+def test_invalid_config_is_still_refused_without_the_privsep_dir(tmp_path: Path) -> None:
+    proc, _ = _validate(tmp_path, "BadDirective yes\n")
+    assert proc.stdout.split() == ["INVALID"], proc.stdout + proc.stderr
+
+
+def test_the_runner_validates_through_the_helper() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert 'validate_sshd_config "$TEST_CONF"' in text
+    assert len(re.findall(r"^\s*(?:if ! )?sshd -t", text, re.M)) == 1  # the helper's own

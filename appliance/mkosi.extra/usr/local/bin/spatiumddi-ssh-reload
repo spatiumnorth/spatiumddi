@@ -308,6 +308,23 @@ echo "  ssh_port:   ${SSH_PORT:-22}"
 echo "  pw_auth:    ${PW_AUTH:-1}"
 echo "  ak_len:     ${AK_LEN:-0}"
 
+# sshd -t needs the privilege-separation directory. On Debian that is
+# /run/sshd, which ssh.service creates as its RuntimeDirectory (root:root
+# 0755, RuntimeDirectoryPreserve=no) and removes when the unit stops or
+# fails -- so while ssh.service is down, `sshd -t` fails on the missing
+# directory and the restart that would repair the unit is never reached
+# (#2054). Create it the way the unit would. systemd adopts an existing
+# directory and re-applies its mode when it next starts the unit, so this
+# does not fight RuntimeDirectory management.
+validate_sshd_config() {
+    local conf="$1" log="$2"
+    local privsep="${SSHD_PRIVSEP_DIR:-/run/sshd}"
+    if [ ! -d "$privsep" ]; then
+        mkdir -p "$privsep" && chmod 0755 "$privsep" || true
+    fi
+    sshd -t -f "$conf" >"$log" 2>&1
+}
+
 fail() {
     echo "  ✗ $1"
     echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
@@ -368,7 +385,7 @@ PYEOF
         trap 'rm -f "$BODY_TMP" "$AK_TMP" "$SSHD_TMP" "$TEST_CONF"; rm -rf "$STAGE_DIR"' EXIT
         grep -iE '^[[:space:]]*HostKey' /etc/ssh/sshd_config > "$TEST_CONF" 2>/dev/null || true
         cat "$STAGE_DIR/spatiumddi.conf" >> "$TEST_CONF"
-        if ! sshd -t -f "$TEST_CONF" >/tmp/spatium-sshd-validate.log 2>&1; then
+        if ! validate_sshd_config "$TEST_CONF" /tmp/spatium-sshd-validate.log; then
             echo "  ✗ sshd -t failed for staged config:"
             sed 's/^/      /' /tmp/spatium-sshd-validate.log
             fail "sshd config validation failed"

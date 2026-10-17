@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Saving SSH settings now repairs a failed or stopped ssh.service
+  (#2054).** The runner validated the staged config with `sshd -t`
+  before restarting, but `sshd -t` needs `/run/sshd`, which is
+  ssh.service's own runtime directory and is removed when the unit
+  stops or fails. With the unit down the check failed and the restart
+  that would have fixed it was never reached, so only a reboot
+  recovered. The runner now creates the directory (root:root 0755,
+  as the unit does) before validating; an invalid config is still
+  refused.
+
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create
