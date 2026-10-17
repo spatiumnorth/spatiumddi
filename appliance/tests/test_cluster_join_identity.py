@@ -255,3 +255,133 @@ def test_identity_entries_list_matches_this_test(tmp_path: Path) -> None:
     proc = _run(_env(tmp_path, t), 'printf "%s\\n" $K3S_IDENTITY_ENTRIES')
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.split() == list(IDENTITY_ENTRIES)
+
+
+# #NNNN — a backup keeps the image store it took only while the join or leave
+# that set it aside can still roll back onto it. Each store is a full copy of
+# every baked image (about 4 GiB), and the newest three backups used to keep
+# one each: a member that formed, left and was promoted again then carried
+# four stores on /var while its join imported the fourth, and on the
+# recommended 40 GiB disk that crossed the kubelet's DiskPressure floor.
+
+
+def _fresh_start(t: dict[str, Path], tag: str) -> None:
+    """What the k3s started after a wipe writes: a store of its own, an
+    import cache describing it, and an identity of its own."""
+    (t["agent"] / "containerd" / "io.containerd.content.v1.content").mkdir(parents=True)
+    (t["agent"] / "images" / ".cache.json").write_text(IMPORT_CACHE)
+    (t["agent"] / "client-kubelet.crt").write_text(f"kubelet-{tag}")
+    for entry in ("db", "tls", "cred"):
+        (t["server"] / entry).mkdir()
+    (t["server"] / "db" / "state.db").write_text(f"etcd-{tag}")
+    for entry in ("token", "agent-token", "node-token"):
+        (t["server"] / entry).write_text(f"K10{tag}::{entry}")
+    t["node_pw"].write_text(f"nodepw-{tag}")
+    t["kubeconfig"].write_text(f"kubeconfig-{tag}")
+
+
+def _wipe(env: dict[str, str], suffix: str) -> Path:
+    proc = _run(env, f'backup_and_wipe_identity {suffix} > "$SPATIUM_RELEASE_STATE/bak_path"')
+    assert proc.returncode == 0, proc.stderr
+    return Path((Path(env["SPATIUM_RELEASE_STATE"]) / "bak_path").read_text().strip())
+
+
+def test_only_the_newest_backup_keeps_its_image_store(tmp_path: Path) -> None:
+    """A join, then a leave: the join's backup gives its store up when the
+    leave sets the next one aside, and keeps every identity entry."""
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    first = _wipe(env, "pre-join")
+    _fresh_start(t, "member")
+    second = _wipe(env, "pre-leave")
+
+    assert not (first / "agent" / "containerd").exists(), (
+        "an older backup still holds a whole image store no rollback will ask for"
+    )
+    assert not (first / "agent-images-cache.json").exists(), (
+        "the import cache must go with the store it describes"
+    )
+    for entry in IDENTITY_ENTRIES:
+        assert (first / f"server-{entry}").exists(), f"{entry} left the older backup"
+    assert (first / "server-token").read_text() == "K10self::server:ownsecret"
+    assert (first / "agent" / "client-kubelet.crt").read_text() == "kubelet"
+    assert (first / "node-password").read_text() == "nodepw"
+    assert (first / "k3s.yaml").read_text() == "kubeconfig"
+
+    assert (second / "agent" / "containerd" / "io.containerd.content.v1.content").is_dir()
+    assert (second / "agent-images-cache.json").read_text() == IMPORT_CACHE
+
+
+def test_the_pruned_set_holds_one_image_store_at_most(tmp_path: Path) -> None:
+    """Four wipes: the newest three backups are kept (#555) and only the
+    newest of them still holds a store."""
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    baks = []
+    for i, suffix in enumerate(("a", "b", "c", "d")):
+        if i:
+            _fresh_start(t, suffix)
+        baks.append(_wipe(env, suffix))
+
+    kept = sorted(Path(env["SPATIUM_RELEASE_STATE"]).glob("k3s-identity.*.*"))
+    assert set(kept) == set(baks[1:]), "the newest three backups are kept"
+    with_store = [b for b in kept if (b / "agent" / "containerd").exists()]
+    assert with_store == [baks[-1]]
+
+
+def test_a_settled_join_or_leave_drops_every_image_store(tmp_path: Path) -> None:
+    """Once the operation ended well no rollback is left, so its own backup
+    gives the store up too; the identity stays for manual recovery."""
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    bak = _wipe(env, "pre-join")
+    proc = _run(env, "_drop_backup_image_stores")
+    assert proc.returncode == 0, proc.stderr
+
+    assert not (bak / "agent" / "containerd").exists()
+    assert not (bak / "agent-images-cache.json").exists()
+    for entry in IDENTITY_ENTRIES:
+        assert (bak / f"server-{entry}").exists(), f"{entry} left the backup"
+    assert "dropped the image store from identity backup" in proc.stderr
+
+
+def test_restore_of_a_backup_without_its_store_reimports(tmp_path: Path) -> None:
+    """A backup restored after its store went keeps the live store and leaves
+    no import cache, so the next start re-imports the baked tarballs."""
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    proc = _run(
+        env,
+        'bak="$(backup_and_wipe_identity pre-join)"\n'
+        'mkdir -p "$SPATIUM_K3S_AGENT_DIR/containerd/live"\n'
+        'printf \'%s\' \'{"airgap.tar": {"size": 5}}\' '
+        '> "$SPATIUM_K3S_AGENT_DIR/images/.cache.json"\n'
+        "_drop_backup_image_stores\n"
+        'restore_identity "$bak"',
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    assert (t["agent"] / "containerd" / "live").is_dir(), "the live store was taken"
+    assert not (t["agent"] / "images" / ".cache.json").exists()
+    assert (t["server"] / "token").read_text() == "K10self::server:ownsecret"
+
+
+def _function(name: str) -> str:
+    text = SCRIPT.read_text()
+    start = text.index(f"\n{name}() {{")
+    return text[start : text.index("\n}\n", start)]
+
+
+def test_every_settled_exit_drops_the_image_stores() -> None:
+    """Each `ready` of do_join and the `left` of do_leave drops the stores
+    before it exits; no failure path does (a rollback may still want one)."""
+    for name, settled, count in (
+        ("do_join", 'write_state ready "$server_url"', 3),
+        ("do_leave", 'write_state left ""', 1),
+    ):
+        body = _function(name)
+        assert body.count(settled) == count, name
+        for tail in body.split(settled)[1:]:
+            assert "_drop_backup_image_stores" in tail.split("exit 0")[0], name
+        for tail in body.split("write_state failed")[1:]:
+            assert "_drop_backup_image_stores" not in tail.split("exit 1")[0], name
