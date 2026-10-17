@@ -2831,6 +2831,10 @@ export function ZoneModal({
           {!technitiumApi && (
             <Field label="Default TTL (seconds)">
               <input
+                type="number"
+                min={0}
+                max={2147483647}
+                step={1}
                 className={inputCls}
                 value={ttl}
                 onChange={(e) => setTtl(e.target.value)}
@@ -3186,6 +3190,10 @@ function RecordModal({
         <div className="grid grid-cols-2 gap-3">
           <Field label="TTL (leave blank for zone default)">
             <input
+              type="number"
+              min={0}
+              max={2147483647}
+              step={1}
               className={inputCls}
               value={ttl}
               onChange={(e) => setTtl(e.target.value)}

@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A zone or record TTL outside RFC 2181's range is refused with a
+  422 instead of stored (#2073).** Add Zone with Default TTL `-1`
+  answered 201 and saved it, and the BIND9 agent then refused the
+  zone for a bad TTL, so it was never served. The zone `ttl` and a
+  record's `ttl` are now bounded to 0..2147483647 on create and
+  update, like the SOA timers already were, and the 422 names the
+  field. The Default TTL and record TTL inputs are numeric with the
+  same min and max. Rows already holding a negative TTL are not
+  rewritten; edit them to a valid value.
+
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
   the inactive slot would be re-written with the same release and the

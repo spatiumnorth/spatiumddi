@@ -1138,7 +1138,7 @@ class ZoneCreate(BaseModel):
     # #1310 — omitted ⇒ ``resolved_zone_kind``: a primary zone's is taken
     # from its name.
     kind: str | None = None
-    ttl: int = 3600
+    ttl: int = Field(3600, ge=0, le=_SOA_TIMER_MAX)
     refresh: int = Field(ZONE_DEFAULT_REFRESH, ge=0, le=_SOA_TIMER_MAX)
     retry: int = Field(ZONE_DEFAULT_RETRY, ge=0, le=_SOA_TIMER_MAX)
     expire: int = Field(ZONE_DEFAULT_EXPIRE, ge=0, le=_SOA_TIMER_MAX)
@@ -1232,7 +1232,7 @@ class ZoneUpdate(BaseModel):
     view_id: uuid.UUID | None = None
     zone_type: str | None = None
     kind: str | None = None
-    ttl: int | None = None
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     refresh: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     retry: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     expire: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
@@ -1447,7 +1447,7 @@ class RecordCreate(BaseModel):
     name: str
     record_type: str
     value: str
-    ttl: int | None = None
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     priority: int | None = None
     weight: int | None = None
     port: int | None = None
@@ -1475,7 +1475,7 @@ class RecordCreate(BaseModel):
 class RecordUpdate(BaseModel):
     name: str | None = None
     value: str | None = None
-    ttl: int | None = None
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     priority: int | None = None
     weight: int | None = None
     port: int | None = None

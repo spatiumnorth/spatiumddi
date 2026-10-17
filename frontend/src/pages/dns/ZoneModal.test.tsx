@@ -203,6 +203,17 @@ describe("Add Zone on an experimental technitium_api group (#1784)", () => {
   });
 });
 
+describe("Default TTL field (#2073)", () => {
+  it("is a bounded numeric input", () => {
+    groups = [{ id: "grp-1", server_drivers: ["bind9"] }];
+    open();
+    const ttl = screen.getByPlaceholderText("3600") as HTMLInputElement;
+    expect(ttl.type).toBe("number");
+    expect(ttl.min).toBe("0");
+    expect(ttl.max).toBe("2147483647");
+  });
+});
+
 describe("zoneKindForName", () => {
   it.each([
     ["81.98.10.in-addr.arpa", "reverse"],
