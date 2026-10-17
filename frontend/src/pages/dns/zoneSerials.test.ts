@@ -42,11 +42,54 @@ describe("readZoneSerials", () => {
     expect(r.text).toBe("6 zones · 1 server behind · 1 server refused zones");
   });
 
+  it("says no servers for a group with zones and none", () => {
+    expect(
+      readZoneSerials({ zoneCount: 2, servers: [], summaries: {} }),
+    ).toEqual({ text: "2 zones · no servers", tone: "muted" });
+  });
+
+  it("does not call a loading rollup unreadable or in sync", () => {
+    const r = readZoneSerials({
+      zoneCount: 2,
+      servers: [srv("a"), srv("b")],
+      summaries: { a: sum() },
+      failed: new Set(),
+    });
+    expect(r).toEqual({
+      text: "2 zones · per-server serials not loaded",
+      tone: "muted",
+    });
+  });
+
+  it("calls only a failed rollup unreadable", () => {
+    const r = readZoneSerials({
+      zoneCount: 2,
+      servers: [srv("a"), srv("b")],
+      summaries: { a: sum() },
+      failed: new Set(["b"]),
+    });
+    expect(r).toEqual({
+      text: "2 zones · 1 server unreadable",
+      tone: "warn",
+    });
+  });
+
+  it("shows a known problem while another server is still loading", () => {
+    const r = readZoneSerials({
+      zoneCount: 6,
+      servers: [srv("a"), srv("b")],
+      summaries: { a: sum(1) },
+      failed: new Set(),
+    });
+    expect(r).toEqual({ text: "6 zones · 1 server behind", tone: "warn" });
+  });
+
   it("says plainly when servers have not reported", () => {
     const r = readZoneSerials({
       zoneCount: 1,
       servers: [srv("a"), srv("b")],
       summaries: { a: sum(0, 1, 1) },
+      failed: new Set(["b"]),
     });
     expect(r.tone).toBe("warn");
     expect(r.text).toBe(

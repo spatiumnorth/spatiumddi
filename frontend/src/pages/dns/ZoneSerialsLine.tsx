@@ -25,10 +25,12 @@ export function ZoneSerialsLine({
     })),
   });
   const summaries: Record<string, Summary | undefined> = {};
+  const failed = new Set<string>();
   servers.forEach((s, i) => {
     summaries[s.id] = results[i]?.data?.summary;
+    if (results[i]?.isError) failed.add(s.id);
   });
-  const reading = readZoneSerials({ zoneCount, servers, summaries });
+  const reading = readZoneSerials({ zoneCount, servers, summaries, failed });
   return (
     <span className={`ml-auto ${toneCls[reading.tone]}`}>
       Zone serials: {reading.text}
