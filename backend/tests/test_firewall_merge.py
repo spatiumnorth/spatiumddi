@@ -250,9 +250,16 @@ def test_builtin_set_shape() -> None:
     }
     assert ps.roles["observer"].enabled is False
     cp = ps.roles["control-plane"]
-    assert [r.seq for r in cp.rules] == [10, 20, 25, 30, 40]
-    # The memberlist pair is the only guarded builtin (multi-node + VIP).
+    assert [r.seq for r in cp.rules] == [10, 20, 25, 30, 40, 50]
+    # The memberlist pair and the frr-k8s webhook are the guarded builtins
+    # (multi-node + VIP).
     assert cp.rules[3].render_guard == _BUILTIN_GUARD
+    assert [r.seq for r in cp.rules if r.render_guard] == [30, 40, 50]
+    # #1827 — frr-k8s's webhook, peers only, never LAN-wide.
+    webhook = next(r for r in cp.rules if r.seq == 50)
+    assert (webhook.protocol, webhook.ports) == ("tcp", (19443,))
+    assert webhook.source_kind == "cluster_peers"
+    assert webhook.render_guard == _BUILTIN_GUARD
     # #993 — the kubelet rule. Indexed by seq rather than position so a
     # future insert renumbers the assertion instead of silently re-pointing
     # it at a different rule.
@@ -285,6 +292,7 @@ _SEED_MIGRATION_FILES = [
     "d4a9e37b2c15_kubelet_firewall_rule_seed.py",
     "e6b2f07a3c91_dhcpv6_firewall_rule_seed.py",
     "b8e2d5c07a14_looking_glass_firewall_seed.py",
+    "a9c3e5f71b28_frr_k8s_webhook_firewall_rule_seed.py",
 ]
 
 

@@ -1776,6 +1776,7 @@ async def create_group(
 
     group = DNSServerGroup(**body.model_dump())
     db.add(group)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
 
     # Auto-create default options
     options = DNSServerOptions(group=group)
@@ -2149,6 +2150,7 @@ async def create_server(
         server.credentials_encrypted = encrypt_dict(body.cloud_credentials)
 
     db.add(server)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -2950,6 +2952,7 @@ async def _sync_single_server(
                 dnssec_enabled=False,
             )
             db.add(zone)
+            await db.flush()  # column-default id must exist before the audit row reads it (#2006)
             zones_imported.append(name)
             db.add(
                 AuditLog(
@@ -3792,6 +3795,7 @@ async def update_options(
     if not opts:
         opts = DNSServerOptions(group_id=group_id)
         db.add(opts)
+        await db.flush()  # column-default id must exist before the audit row reads it (#2006)
 
     changes = body.model_dump(exclude_none=True)
     # #1817: a blank allow_recursion means "the default", not "nobody". An
@@ -3878,7 +3882,7 @@ async def update_options(
             auth_source=current_user.auth_source,
             action="update",
             resource_type="dns_server_options",
-            resource_id=str(opts.id) if opts.id else "new",
+            resource_id=str(opts.id),
             resource_display=f"options for group {group_id}",
             changed_fields=list(changes.keys()),
             result="success",
@@ -4458,6 +4462,7 @@ async def create_tsig_key(
         notes=body.notes,
     )
     db.add(key)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4687,6 +4692,7 @@ async def create_view(
 
     view = DNSView(group_id=group_id, **payload)
     db.add(view)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4889,6 +4895,7 @@ async def create_zone(
     payload.update(await _validated_zone_named_conf_fields(group_id, payload, None, db))
     zone = DNSZone(group_id=group_id, **payload)
     db.add(zone)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
 
     # Write-through: push the create to any windows_dns-with-creds server
     # in this group *before* we commit. If the Windows push fails we don't
@@ -6621,12 +6628,22 @@ async def rollover_zone_dnssec_key(
     if not zone.dnssec_enabled:
         raise HTTPException(status_code=409, detail="Zone is not DNSSEC-signed")
     await _check_driver_gated_operation("dnssec_rollover", group_id, db)
-    await enqueue_record_op(
+    op = await enqueue_record_op(
         db,
         zone,
         "dnssec_rollover",
         {"name": "@", "type": "DNSSEC_OP", "key_tag": body.key_tag},
     )
+    if op is None:
+        # #1946 — no row was written (no primary, or no enabled agent-based
+        # server): answering ``queued`` would claim a rollover nobody runs.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Nothing to run the rollover: the group has no primary server "
+                "or no enabled agent-based server"
+            ),
+        )
     db.add(
         AuditLog(
             user_id=current_user.id,

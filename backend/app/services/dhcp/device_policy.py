@@ -361,7 +361,11 @@ async def compile_device_policy(
     selected = {c for c in (policy.device_classes or []) if isinstance(c, str) and c}
     result = CompiledPolicy(class_name=policy.class_name, expression="", source="empty")
 
-    if not selected:
+    # A manual match expression is rendered whether or not any class is
+    # selected (config_bundle renders every enabled policy with a non-empty
+    # expression), so "matches nothing and is not rendered" is only true with
+    # neither (#1992).
+    if not selected and not (policy.match_override or "").strip():
         result.warnings.append(
             "No device classes selected — this policy matches nothing and is not rendered."
         )

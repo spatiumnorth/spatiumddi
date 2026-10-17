@@ -3971,6 +3971,34 @@ async def delete_appliance(
                 "or factory-reset / reinstall this box to decommission it.",
             )
 
+    # #1884 — nor any other node of a formed control-plane cluster. A revoked
+    # row drops out of its peers' firewall sets (approved rows only) within a
+    # minute, but nothing takes the node out of etcd: its established peer
+    # connections keep it voting while every new one is dropped, and its own
+    # teardown, on a node that shares the cluster, clears only its role labels,
+    # on the heartbeats its kube API still answers. It stays an etcd voter with
+    # a Ready Node that its peers no longer admit. A member leaves etcd by the
+    # demote while it is alive, or by Replace (the seed evicts it) when it is
+    # dead; both clear cluster_role, and it revokes after that. The seed can be
+    # neither demoted nor replaced. The Fleet tab already disables Revoke on
+    # control-plane rows, and the deployment docs say to demote first.
+    if row.cluster_role == CLUSTER_ROLE_PRIMARY:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Refusing to revoke {row.hostname} — it is the etcd seed of the "
+            "control-plane cluster, which can be neither demoted nor replaced. "
+            "Demote the other members first; once it is the only control-plane "
+            "node, factory-reset or reinstall it to decommission it.",
+        )
+    if row.cluster_role == CLUSTER_ROLE_MEMBER:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Refusing to revoke {row.hostname} — it is a member of the "
+            "control-plane cluster and votes in its etcd. Demote it from the "
+            "cluster first (Manage control plane cluster…), or use Replace… on "
+            "its row if the node is dead, then revoke it.",
+        )
+
     # Ownership is judged on the state the appliance is deleted FROM (#1810):
     # only an approved appliance may claim a row by hostname.
     dependents = await _find_appliance_dependents(db, row)
@@ -5176,6 +5204,45 @@ async def _refuse_demote_without_quorum(db: DB, targets: list[Appliance]) -> Non
         raise HTTPException(status.HTTP_409_CONFLICT, f"Refusing the demote: {refusal}")
 
 
+async def _hand_off_redis_master(targets: list[Appliance]) -> None:
+    """#1860 — move the Redis master off the nodes a demote removes, before
+    anything else about them changes; 409 when it runs there and cannot be
+    moved, 503 when the Redis pods cannot be listed.
+
+    Three members run three Sentinels, and Sentinel fails over only with a
+    majority of all the Sentinels it knows. The demote three members allow
+    takes two of them, so a master on either leaving member stayed there with
+    the seed's lone Sentinel unable to move it, and the api answered 502 for
+    good (:mod:`app.services.appliance.redis_handoff` has the whole story)."""
+    from app.services.appliance import k8s, redis_handoff  # noqa: PLC0415
+
+    leaving = {_k8s_node_name(t.hostname) for t in targets if t.hostname}
+    try:
+        result = await asyncio.to_thread(redis_handoff.hand_off, leaving)
+    except k8s.KubeapiUnavailableError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Cannot list the Redis pods to see which node holds the master before a demote "
+            f"({exc}); refusing rather than guessing. Retry once kubeapi answers.",
+        ) from exc
+    except redis_handoff.RedisHandoffError as exc:
+        logger.warning(
+            "control_plane_demote_refused_redis",
+            targets=[t.hostname for t in targets],
+            reason=str(exc),
+        )
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Refusing the demote: {exc}. Nothing was changed; retry once Redis is healthy.",
+        ) from exc
+    logger.info(
+        "control_plane_demote_redis_master",
+        outcome=result.outcome,
+        detail=result.detail,
+        deprioritised=result.deprioritised,
+    )
+
+
 #: #1750 — set on a Node when a demote cordons it, and only then. An uncordon
 #: acts only on a Node carrying it, so a node the operator had already
 #: cordoned before the demote (the rule #1610 applies to upgrades) is never
@@ -5307,7 +5374,11 @@ async def demote_control_plane(
     itself being demoted and the survivors keep a live majority throughout
     (:func:`_demote_quorum_refusal` has the arithmetic). The leaver's own
     etcd guards its removal with a follower's view of the peers, which can
-    still count a powered-off peer as active."""
+    still count a powered-off peer as active.
+
+    #1860 — when the Redis master runs on a leaving member it is moved to a
+    node that stays first (:func:`_hand_off_redis_master`), and the demote is
+    refused (409) when that cannot be done."""
     _require_superadmin(current_user)
     # #1543 — reshapes the cluster or re-stamps a node: never mid-upgrade.
     await assert_no_upgrade_in_flight(db, operation_hint="a control-plane demote")
@@ -5349,6 +5420,11 @@ async def demote_control_plane(
     # down: the leaver's own etcd may not know, and its removal then costs the
     # survivors their quorum.
     await _refuse_demote_without_quorum(db, targets)
+
+    # #1860 — the Redis master moves to a node that stays while every
+    # Sentinel is still up to agree on it; once the members leave, the seed's
+    # Sentinel alone can never move it.
+    await _hand_off_redis_master(targets)
 
     # #1750 — stop the scheduler placing new pods (a replaced helm install
     # Job, say) on a node about to stop k3s. Cordon only, no drain: the

@@ -20,6 +20,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1._common import StatusResponse
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
@@ -86,6 +87,8 @@ class TenantCreate(TenantBase):
             raise ValueError("api_key is required")
         return v
 
+    _check_api_key = field_validator("api_key")(header_secret)
+
 
 class TenantUpdate(BaseModel):
     name: str | None = None
@@ -100,6 +103,8 @@ class TenantUpdate(BaseModel):
     ipv6_cidr: str | None = None
     skip_expired: bool | None = None
     sync_interval_seconds: int | None = None
+
+    _check_api_key = field_validator("api_key")(header_secret)
 
 
 class TenantResponse(BaseModel):
@@ -127,6 +132,8 @@ class TestConnectionRequest(BaseModel):
     tenant_id: uuid.UUID | None = None
     tailnet: str | None = None
     api_key: str | None = None
+
+    _check_api_key = field_validator("api_key")(header_secret)
 
 
 class TestConnectionResponse(BaseModel):
