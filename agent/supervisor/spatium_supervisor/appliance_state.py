@@ -1026,6 +1026,25 @@ def clear_fleet_upgrade_marker() -> None:
         pass
 
 
+def _runner_owns_progress() -> bool:
+    """#2021 — is the progress sidecar a running or staged apply's?
+
+    True while the runner is applying (``.state`` in-flight and the trigger,
+    if any, claimed) or has staged the slot (``.state`` done with a
+    ``reboot-pending`` progress carrying the #2007 staged identity). False
+    on any doubt, which keeps the #786 reset."""
+    try:
+        word = _read_slot_state_word() if _HOST_SLOT_STATE.exists() else None
+    except OSError:
+        return False
+    if word == "in-flight":
+        return _pending_trigger_since() is None
+    if word == "done":
+        progress = _read_slot_upgrade_progress() or {}
+        return progress.get("step") == "reboot-pending" and bool(progress.get("staged_boot_id"))
+    return False
+
+
 def apply_clear_upgrade_command() -> bool:
     """#786 — the operator pressed "Clear failed upgrade"; make the host forget.
 
@@ -1050,6 +1069,17 @@ def apply_clear_upgrade_command() -> bool:
     """
     if detect_deployment_kind() != "appliance":
         return False
+
+    # #2021 — decided BEFORE the trigger goes, because "claimed" is read off
+    # the trigger's mtime: a runner that has claimed it (``.state`` in-flight
+    # and newer than the trigger) is applying, and one that has staged the
+    # slot has armed next-boot. Neither is undone by this command, so their
+    # progress is not this command's to reset: wiping it blanked the Fleet
+    # stepper for the rest of a running apply (the runner only rewrites it
+    # at its next step, which during a long ``dd`` is minutes away), and
+    # wiping a staged ``reboot-pending`` breadcrumb strands the #2007
+    # settle, which keys on it, at ``done`` forever.
+    keep_progress = _runner_owns_progress()
 
     reset = False
     for path in (_TRIGGER_FILE, _FIRED_URL_MARKER):
@@ -1085,7 +1115,7 @@ def apply_clear_upgrade_command() -> bool:
     # which this process carries, so an in-place write succeeds. An empty object reads as "no progress" to every
     # consumer, which is what a cleared upgrade should show.
     try:
-        if _SLOT_UPGRADE_PROGRESS.exists():
+        if _SLOT_UPGRADE_PROGRESS.exists() and not keep_progress:
             _write_sidecar_durable(_SLOT_UPGRADE_PROGRESS, "{}\n")
             reset = True
     except OSError as exc:
