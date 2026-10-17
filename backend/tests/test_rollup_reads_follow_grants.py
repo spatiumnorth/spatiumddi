@@ -1,7 +1,7 @@
 """Dashboard rollups and metric series read with the caller's own grants.
 
-The DNS / DHCP traffic series and the Network / Integrations dashboard tabs
-summarise rows that each have their own router and their own ``read`` grant.
+The DNS / DHCP traffic series, the Network / Integrations dashboard tabs and
+the tag autocomplete summarise rows that each have their own router and their own ``read`` grant.
 These routes now ask for the same grants: a caller who could not read the
 underlying rows through their own routes gets 403 (or an empty panel), and
 the built-in Viewer, which holds ``read *``, still sees everything.
@@ -21,6 +21,7 @@ from app.main import _BUILTIN_ROLES
 from app.models.asn import ASN
 from app.models.audit import AuditLog
 from app.models.auth import Group, Role, User
+from app.models.ipam import IPSpace
 
 pytestmark = pytest.mark.asyncio
 
@@ -179,3 +180,34 @@ async def test_integrations_summary_only_shows_readable_integrations(
     body = resp.json()
     assert len(body["panels"]) == 11
     assert "docker-reconcile-target" in [e["target_display"] for e in body["recent_errors"]]
+
+
+# ── Tag autocomplete ───────────────────────────────────────────────────────
+
+
+async def test_tag_autocomplete_offers_only_tags_on_readable_tables(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    key = f"k{uuid.uuid4().hex[:8]}"
+    db_session.add(
+        IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}", description="", tags={key: "space-value"})
+    )
+    await db_session.flush()
+
+    dhcp_reader = await _headers(db_session, permissions=_grant("read", "dhcp_server"))
+    resp = await client.get("/api/v1/tags/keys", params={"prefix": key}, headers=dhcp_reader)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["keys"] == []
+    resp = await client.get("/api/v1/tags/values", params={"key": key}, headers=dhcp_reader)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["values"] == []
+
+    # Any IPAM read opens the IPAM router, so it opens the IPAM tags too.
+    for headers in (
+        await _headers(db_session, permissions=_grant("read", "subnet")),
+        await _headers(db_session, role="Viewer"),
+    ):
+        resp = await client.get("/api/v1/tags/keys", params={"prefix": key}, headers=headers)
+        assert resp.json()["keys"] == [key]
+        resp = await client.get("/api/v1/tags/values", params={"key": key}, headers=headers)
+        assert resp.json()["values"] == ["space-value"]

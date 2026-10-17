@@ -103,8 +103,6 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/groups/{group_id}": "as /groups",
     "/api/v1/roles": "role picker on the groups page; writes need admin on role",
     "/api/v1/roles/{role_id}": "as /roles",
-    "/api/v1/tags/keys": "tag-chip autocomplete (see the tags router docstring)",
-    "/api/v1/tags/values": "tag-chip autocomplete (see the tags router docstring)",
     "/api/v1/bgp/asn/{asn}/announced-prefixes": "public RIPEstat / PeeringDB data, no install data",
     "/api/v1/bgp/asn/{asn}/ixps": "public RIPEstat / PeeringDB data, no install data",
     "/api/v1/bgp/asn/{asn}/network": "public RIPEstat / PeeringDB data, no install data",
@@ -112,6 +110,8 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/bgp/prefix/origin": "public RIPEstat / PeeringDB data, no install data",
     "/api/v1/bgp/prefix/routing-history": "public RIPEstat / PeeringDB data, no install data",
     # ── checked in the handler ──────────────────────────────────────────
+    "/api/v1/tags/keys": "unions only the tagged tables the caller may read (_readable_tables)",
+    "/api/v1/tags/values": "unions only the tagged tables the caller may read (_readable_tables)",
     "/api/v1/search": "the search engine filters every result type by the caller's read grant",
     "/api/v1/dashboards/security/summary": "per-panel user_has_permission in the handler",
     "/api/v1/sessions": "superadmin sees all, others their own (checked in the handler)",

@@ -40,10 +40,11 @@ options always match what the filter can actually act on.
 
 ## Authorization
 
-Only requires authentication. Tag *names* themselves are not
-sensitive metadata — every operator who can list any tagged
-resource already sees the tag values inline on each row, so
-exposing the union of keys / values doesn't leak anything new.
+Each table contributes only for a caller who may read its rows through
+that table's own router (``_TABLE_READ_TYPES``), so the autocomplete never
+offers a tag the caller could not already see on a row. A caller who can
+read none of them gets an empty list rather than a 403, so the chip simply
+offers nothing.
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from app.api.deps import DB, CurrentUser
+from app.core.permissions import user_has_permission
 
 router = APIRouter()
 
@@ -79,18 +81,52 @@ _TAGGED_TABLES: tuple[str, ...] = (
 )
 
 
-# Build the UNION-ALL fragments at import time — they're constant.
-# ``tags`` is JSONB-typed and non-nullable on every model
-# (default=dict on the column), but `jsonb_object_keys(NULL)`
-# raises, so the IS NOT NULL guard costs nothing and keeps the
-# query safe if a future migration ever loosens the column.
-_KEYS_UNION_SQL = " UNION ALL ".join(
-    f"SELECT jsonb_object_keys(tags) AS key FROM {t} WHERE tags IS NOT NULL" for t in _TAGGED_TABLES
-)
+# The resource types whose ``read`` opens each table's own router; any one
+# of them is enough, as it is there. The IPAM router admits a reader of any
+# of its four types, and the DNS router any of its three.
+_IPAM = ("ip_space", "ip_block", "subnet", "ip_address")
+_DNS = ("dns_group", "dns_zone", "dns_record")
+_TABLE_READ_TYPES: dict[str, tuple[str, ...]] = {
+    "asn": ("manage_asns",),
+    "circuit": ("circuit",),
+    "dhcp_scope": ("dhcp_scope",),
+    "dhcp_static_assignment": ("dhcp_static",),
+    "dns_record": _DNS,
+    "dns_zone": _DNS,
+    "domain": ("manage_domains",),
+    "ip_address": _IPAM,
+    "ip_block": _IPAM,
+    "ip_space": _IPAM,
+    "network_device": ("manage_network_devices",),
+    "network_service": ("network_service",),
+    "overlay_network": ("overlay_network",),
+    "subnet": _IPAM,
+    "vrf": ("vrf",),
+}
 
-_VALUES_UNION_SQL = " UNION ALL ".join(
-    f"SELECT tags ->> :key AS value FROM {t} WHERE tags ? :key" for t in _TAGGED_TABLES
-)
+
+def _readable_tables(user: object) -> list[str]:
+    return [
+        t
+        for t in _TAGGED_TABLES
+        if any(user_has_permission(user, "read", rt) for rt in _TABLE_READ_TYPES[t])  # type: ignore[arg-type]
+    ]
+
+
+# ``tags`` is JSONB-typed and non-nullable on every model (default=dict on
+# the column), but `jsonb_object_keys(NULL)` raises, so the IS NOT NULL
+# guard costs nothing and keeps the query safe if a future migration ever
+# loosens the column. Table names come from ``_TAGGED_TABLES`` only.
+def _keys_union_sql(tables: list[str]) -> str:
+    return " UNION ALL ".join(
+        f"SELECT jsonb_object_keys(tags) AS key FROM {t} WHERE tags IS NOT NULL" for t in tables
+    )
+
+
+def _values_union_sql(tables: list[str]) -> str:
+    return " UNION ALL ".join(
+        f"SELECT tags ->> :key AS value FROM {t} WHERE tags ? :key" for t in tables
+    )
 
 
 class TagKeysResponse(BaseModel):
@@ -105,7 +141,7 @@ class TagValuesResponse(BaseModel):
 @router.get("/keys", response_model=TagKeysResponse)
 async def list_tag_keys(
     db: DB,
-    _: CurrentUser,
+    current_user: CurrentUser,
     prefix: str | None = Query(
         None,
         description=(
@@ -117,7 +153,10 @@ async def list_tag_keys(
     ),
     limit: int = Query(200, ge=1, le=1000),
 ) -> TagKeysResponse:
-    sql = f"SELECT DISTINCT key FROM ({_KEYS_UNION_SQL}) AS sub"
+    tables = _readable_tables(current_user)
+    if not tables:
+        return TagKeysResponse(keys=[])
+    sql = f"SELECT DISTINCT key FROM ({_keys_union_sql(tables)}) AS sub"
     params: dict[str, object] = {"limit": limit}
     if prefix:
         sql += " WHERE key ILIKE :prefix"
@@ -130,7 +169,7 @@ async def list_tag_keys(
 @router.get("/values", response_model=TagValuesResponse)
 async def list_tag_values(
     db: DB,
-    _: CurrentUser,
+    current_user: CurrentUser,
     key: str = Query(
         ...,
         min_length=1,
@@ -149,7 +188,13 @@ async def list_tag_values(
     # explicitly stored as JSON null — the frontend chip can't
     # represent "match the JSON null" anyway, so excluding them
     # keeps the autocomplete tidy.
-    sql = f"SELECT DISTINCT value FROM ({_VALUES_UNION_SQL}) AS sub WHERE value IS NOT NULL"
+    tables = _readable_tables(current_user)
+    if not tables:
+        return TagValuesResponse(key=key, values=[])
+    sql = (
+        f"SELECT DISTINCT value FROM ({_values_union_sql(tables)}) AS sub "
+        "WHERE value IS NOT NULL"
+    )
     params: dict[str, object] = {"key": key, "limit": limit}
     if prefix:
         sql += " AND value ILIKE :prefix"

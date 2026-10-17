@@ -250,7 +250,10 @@ that has since gained a dependency.
 A rollup over several resource types (the Network and Integrations dashboard
 tabs, the DNS / DHCP traffic series) needs `read` on at least one of the types
 it summarises, and fills only the panels whose type the caller can read, so it
-never shows more than the resources' own routes would.
+never shows more than the resources' own routes would. The tag autocomplete
+(`GET /tags/keys`, `/tags/values`) follows the same rule per table: it offers
+tags only from the tables whose rows the caller can read, and an empty list
+when there are none.
 
 ## The console mirrors the server, it does not enforce
 

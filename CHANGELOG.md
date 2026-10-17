@@ -92,7 +92,10 @@ the formatter handles the rest.
   dashboard tabs need `read` on at least one of the types they summarise and
   fill only the panels the caller can read — an integration's panel and its
   recent reconciler errors appear only with `read` on that integration — and
-  say so instead of loading forever when the role covers none of them. The
+  say so instead of loading forever when the role covers none of them; the
+  DNS query-rate and DHCP traffic cards likewise say the data is unavailable
+  rather than "No data yet". The tag autocomplete (`GET /tags/keys`,
+  `/tags/values`) offers only tags from tables the caller can read. The
   built-in Viewer (`read *`) sees everything it saw before. A new guard test
   walks the route table and fails for any `GET` route with no permission
   dependency unless it is listed with the reason (pre-sign-in, agent or token
