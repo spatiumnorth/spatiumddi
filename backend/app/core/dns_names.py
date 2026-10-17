@@ -380,6 +380,21 @@ def _zone_absolute(name: str, origin: str) -> str:
     return f"{name}.{origin}" if origin != "." else f"{name}."
 
 
+def _owner_absolute(owner: str, origin: str) -> str:
+    """*owner* (a full owner name, zone included) as an absolute name.
+
+    Unlike :func:`_zone_absolute`, a dotless owner that already ends in the
+    zone is taken as it stands, so the length check (#2072) measures the name
+    once whether or not the zone row carries its root dot.
+    """
+    name = owner.strip()
+    zone = origin.strip().rstrip(".").lower()
+    body = name.rstrip(".").lower()
+    if zone and (body == zone or body.endswith("." + zone)):
+        return name.rstrip(".") + "."
+    return _zone_absolute(name, origin)
+
+
 def _bind_owner_exempt(record_type: str, owner: str) -> bool:
     """BIND's own exceptions to the owner rule (``checkowner_in_a`` /
     ``checkowner_in_aaaa``): Active Directory's global-catalog name
@@ -429,7 +444,10 @@ def bind_check_names_error(
     rtype = record_type.strip().upper()
     if check_owner:
         # #2072 — the whole owner name, zone included, must fit a DNS name.
-        too_long = name_length_error(_zone_absolute(owner, origin), field=f"{rtype} record name")
+        # *owner* already carries the zone; a zone stored without its root
+        # dot (synthesised and imported zones) would make _zone_absolute
+        # append it a second time and refuse a name that fits.
+        too_long = name_length_error(_owner_absolute(owner, origin), field=f"{rtype} record name")
         if too_long is not None:
             return too_long + "; BIND refuses a zone that holds it."
     if check_target and value is not None and rtype in _TARGET_LENGTH_TYPES:

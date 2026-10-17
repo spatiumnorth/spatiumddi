@@ -96,11 +96,15 @@ the formatter handles the rest.
   edit IP, bulk allocate and bulk edit DNS zone answer 422 naming
   `hostname` and the length it would reach, storing nothing. The DNS
   record API and the copilot apply it to a record's owner and to a
-  CNAME / MX / NS / SRV / PTR / DNAME target too. DDNS, importers and
-  DHCP static reservations never fail a lease or a batch: they skip
-  the over-long name (and its PTR) with an `ipam_dns_name_too_long`
-  log line. The Allocate IP dialog shows the same reason as you type.
-  Nothing is ever truncated.
+  CNAME / MX / NS / SRV / PTR / DNAME target too. A subnet's Sync DNS
+  lists the address under its errors instead of counting it as synced.
+  DDNS, importers and DHCP static reservations never fail a lease or a
+  batch: they publish nothing for the over-long name, retract the A and
+  PTR an earlier name had published, and log `ipam_dns_name_too_long`.
+  The Allocate IP dialog shows the same reason as you type. Nothing is
+  ever truncated. A record already stored too long holds back only its
+  own zones on the agent, as before; shorten the hostname or delete the
+  record to release them.
 
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said

@@ -65,8 +65,8 @@ export function hostnameError(name: string): string | null {
  * `app/core/dns_names.py`.
  */
 export function nameInZoneError(host: string, zone: string): string | null {
-  const h = host.trim().replace(/\.$/, "");
-  const z = zone.trim().replace(/\.$/, "");
+  const h = host.trim().replace(/\.+$/, "");
+  const z = zone.trim().replace(/\.+$/, "");
   if (!h || !z) return null;
   const full = `${h}.${z}`;
   if (full.length > MAX_NAME_LEN)

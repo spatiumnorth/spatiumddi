@@ -40,4 +40,15 @@ describe("nameInZoneError (#2072)", () => {
       nameInZoneError("x".repeat(40), "y".repeat(63) + ".test"),
     ).toBeNull();
   });
+
+  // Same boundary vectors as test_name_in_zone_length_2072.py.
+  it("puts the boundary at 253 characters, root dot ignored", () => {
+    const zone = "z".repeat(60) + ".test"; // 65
+    const fits = "h".repeat(63) + "." + "i".repeat(63) + "." + "j".repeat(59); // 187
+    expect(`${fits}.${zone}`.length).toBe(253);
+    expect(nameInZoneError(fits, zone)).toBeNull();
+    expect(nameInZoneError(fits, zone + ".")).toBeNull();
+    expect(nameInZoneError(fits + ".", zone + "..")).toBeNull();
+    expect(nameInZoneError(fits + "j", zone)).toContain("254");
+  });
 });

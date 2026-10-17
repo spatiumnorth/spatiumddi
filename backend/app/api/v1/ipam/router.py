@@ -1683,13 +1683,18 @@ async def _sync_dns_record(
             pass
 
     zone_domain = zone.name.rstrip(".") if zone else ""
-    if zone_domain and _name_too_long_for_zone(ip, zone_domain, strict):
-        # #2072 — not published, and the PTR (whose target is this name) is
-        # skipped with it.
-        return False
-    fqdn = f"{ip.hostname}.{zone_domain}" if zone_domain else None
+    # #2072 — ``<hostname>.<zone>`` past 253 characters is no DNS name, and
+    # BIND refuses the zone holding it and the reverse zone whose PTR names
+    # it. Strict paths 422 here, before anything is written. Otherwise the
+    # primary zone drops out of the desired set below, so a record an earlier
+    # name published there is retracted (as is its PTR, ``fqdn`` being None)
+    # rather than left naming a host the row no longer carries.
+    primary_too_long = bool(zone_domain) and _name_too_long_for_zone(ip, zone_domain, strict)
+    fqdn = f"{ip.hostname}.{zone_domain}" if zone_domain and not primary_too_long else None
     if fqdn:
         ip.fqdn = fqdn
+    elif primary_too_long:
+        ip.fqdn = None
 
     # Forward record type depends on the address family: AAAA for IPv6, A for IPv4.
     try:
@@ -1742,9 +1747,10 @@ async def _sync_dns_record(
             zone if desired_zone_id == effective_zone_id else await db.get(DNSZone, desired_zone_id)
         )
         if target is not None and ipam_authors_zone(target):
-            if desired_zone_id != effective_zone_id and _name_too_long_for_zone(
-                ip, target.name.rstrip("."), strict
-            ):
+            if desired_zone_id == effective_zone_id:
+                if primary_too_long:
+                    continue  # #2072 — logged above
+            elif _name_too_long_for_zone(ip, target.name.rstrip("."), strict):
                 continue  # #2072 — an extra zone the name does not fit in
             authored_zone_ids.append(desired_zone_id)
     desired_zone_ids = authored_zone_ids
@@ -2095,6 +2101,11 @@ async def _sync_dns_record(
             # Read by the DDNS path so it reports the CNAME clash, not "no
             # forward zone" (not a mapped column; lives for this request).
             ip._dns_skipped_cname = True  # type: ignore[attr-defined]
+            return False
+        if primary_too_long and not forward_published:
+            # #2072 — read by the DDNS path the same way, so it reports the
+            # over-long name, not "no forward zone".
+            ip._dns_skipped_too_long = True  # type: ignore[attr-defined]
             return False
         return True
     try:
@@ -7157,11 +7168,16 @@ async def _apply_dns_sync(
                     errors.append(f"{ip.address}: parent subnet missing")
                     continue
                 try:
-                    await _sync_dns_record(db, ip, sn, action="create")
+                    # #2072 — strict, so a name too long for its zone is
+                    # reported in ``errors`` instead of counted as synced. The
+                    # refusal comes before anything is written for this IP.
+                    await _sync_dns_record(db, ip, sn, action="create", strict=True)
                     if ip.id in body.create_for_ip_ids:
                         created += 1
                     else:
                         updated += 1
+                except HTTPException as exc:
+                    errors.append(f"{ip.address}: {exc.detail}")
                 except Exception as exc:
                     errors.append(f"{ip.address}: {exc}")
         # #1536 — a batched agentless op that came back ``failed`` was
