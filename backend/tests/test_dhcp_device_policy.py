@@ -597,3 +597,60 @@ async def test_confident_classification_is_not_warned(
     assert out.confidence == 89
     assert not any("confidence" in w for w in out.warnings)
     assert out.confidence >= LOW_CONFIDENCE_SCORE
+
+
+_NO_DEVICES_WARNING = "No devices have been seen in the selected classes yet"
+
+
+@pytest.mark.asyncio
+async def test_classes_with_no_observed_devices_warn_why_not_rendered(
+    db_session: AsyncSession,
+) -> None:
+    """#2000: classes selected, nothing fingerprinted in them yet -> empty
+    expression, not rendered. The warning says why, and it is absent when
+    signatures exist, when a manual match is set, and when the empty result is
+    the ambiguous exclusion (which has its own message)."""
+    grp, _ = await _make_group_with_server(db_session)
+
+    # Only a device in another class: nothing in "Printer".
+    db_session.add(_fp("aa:bb:cc:00:00:09", "9,9", None, "Windows"))
+    empty = _policy(grp.id, device_classes=["Printer"])
+    manual = _policy(grp.id, device_classes=["Printer"], match_override="option[60].hex == 0x74")
+    db_session.add_all([empty, manual])
+    await db_session.flush()
+
+    out = await compile_device_policy(db_session, empty)
+    assert not out.expression
+    assert any(_NO_DEVICES_WARNING in w for w in out.warnings)
+
+    out_manual = await compile_device_policy(db_session, manual)
+    assert out_manual.expression
+    assert not any(_NO_DEVICES_WARNING in w for w in out_manual.warnings)
+
+    # Signatures exist -> compiles, no warning.
+    db_session.add(_fp("aa:bb:cc:00:00:01", "1,3,6", None, "Printer"))
+    await db_session.flush()
+    out_seen = await compile_device_policy(db_session, empty)
+    assert out_seen.expression
+    assert not any(_NO_DEVICES_WARNING in w for w in out_seen.warnings)
+
+
+@pytest.mark.asyncio
+async def test_all_ambiguous_keeps_its_own_warning_not_the_no_devices_one(
+    db_session: AsyncSession,
+) -> None:
+    grp, _ = await _make_group_with_server(db_session)
+    db_session.add_all(
+        [
+            _fp("aa:bb:cc:00:00:01", "1,3,6", None, "Printer"),
+            _fp("aa:bb:cc:00:00:02", "1,3,6", None, "Windows"),
+        ]
+    )
+    policy = _policy(grp.id, device_classes=["Printer"])
+    db_session.add(policy)
+    await db_session.flush()
+
+    out = await compile_device_policy(db_session, policy)
+    assert not out.expression
+    assert any("excluded" in w for w in out.warnings)
+    assert not any(_NO_DEVICES_WARNING in w for w in out.warnings)

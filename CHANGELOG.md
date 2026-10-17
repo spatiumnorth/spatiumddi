@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A device policy whose classes have no fingerprinted devices yet now says
+  why it is not rendered (#2000).** With classes selected and nothing seen in
+  them, the policy compiles to an empty expression and is correctly left out of
+  the Kea config, but the preview said only "Renders: no". `compile_device_policy`
+  now warns that no devices have been seen in the selected classes yet and the
+  policy renders once one is fingerprinted, in the REST preview, the dialog and
+  `preview_dhcp_device_policy`. It does not fire when signatures exist, when a
+  manual match is set, or when every signature was excluded as ambiguous (that
+  case keeps its own warning).
+
 - **The alert rule editor no longer rewrites a rule's stored thresholds,
   crashes on a refused save, or leaves its labels unattached (#1986,
   #1993, #1994).** Edit then Save with nothing changed sent the editor's

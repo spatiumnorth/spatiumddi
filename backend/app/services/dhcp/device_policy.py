@@ -447,6 +447,14 @@ async def compile_device_policy(
     else:
         result.expression = ""
         result.source = "empty"
+        # Classes selected but nothing observed in them yet: say why it is not
+        # rendered. Not the ambiguous case, which has its own warning above
+        # (signatures exist but were excluded) (#2000).
+        if selected and not ambiguous:
+            result.warnings.append(
+                "No devices have been seen in the selected classes yet, so this "
+                "policy renders once one is fingerprinted."
+            )
 
     return result
 
