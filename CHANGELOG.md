@@ -619,6 +619,17 @@ the formatter handles the rest.
 
 - **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial could not be written ("value out of int32 range") and the agent zone-state report was refused with a 422, leaving the Zone Sync pill unable to show convergence. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment past 4294967295 wraps to 1 (RFC 1982; it skips 0 the way BIND's own `increment` does, because 0 is the "never seeded" value that every renderer serves as 1). It used to produce 4294967296, which is not a valid SOA serial.
 
+- **A node staging an upgrade could stall its own etcd until k3s restarted
+  (#1804).** The node keeps serving while it writes the new slot, and the
+  write was buffered: hundreds of MB of the 8 GiB image piled up in the page
+  cache and flushed ahead of etcd's WAL fdatasync, which then waited for
+  seconds. On the node holding the cluster's leases the controller-manager
+  missed its renewal and k3s exited in the middle of the write, taking the
+  node's kubelet down until it came back (and longer when the restart landed
+  after the stage had refreshed the image tarballs, which k3s re-imports
+  before it starts the kubelet). The slot write now bypasses the page cache
+  (`dd oflag=direct iflag=fullblock`), so etcd waits behind one 4 MiB block
+  at most.
 - **A rolling upgrade's drain that timed out said "0 pod(s) still present"
   while every pod was still on the node (#1804).** The count was the
   evictions refused in the drain's last cycle, not the pods left on the

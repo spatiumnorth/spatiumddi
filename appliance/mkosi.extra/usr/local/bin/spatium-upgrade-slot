@@ -633,12 +633,22 @@ def cmd_apply(args) -> int:
     # Decompress + dd directly into the inactive partition. xz can
     # stream-decompress so we don't need disk space for an intermediate
     # uncompressed file.
+    #
+    # #1804 — the write bypasses the page cache. The node is still serving
+    # while it stages (#1743), and a buffered dd queued hundreds of MB of
+    # the 8 GiB image ahead of every other write on the disk: etcd's WAL
+    # fdatasync waited behind it for seconds, and on the node holding the
+    # cluster's leases the controller-manager missed its renewal and k3s
+    # exited mid-write. With O_DIRECT dd writes one 4 MiB block at a time,
+    # so etcd waits behind one block at most. iflag=fullblock is what keeps
+    # it direct: the input is xz's pipe, whose reads come back short, and dd
+    # turns O_DIRECT off at the first write shorter than bs.
     _write_progress("writing", None, f"writing image to {inactive['partlabel']}")
     print(f"  writing → {target_dev}")
     xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
                           stdout=subprocess.PIPE)
-    subprocess.run(["dd", f"of={target_dev}", "bs=4M", "conv=fsync",
-                     "status=progress"],
+    subprocess.run(["dd", f"of={target_dev}", "bs=4M", "iflag=fullblock",
+                     "oflag=direct", "conv=fsync", "status=progress"],
                     stdin=xz.stdout, check=True)
     xz.wait()
     if xz.returncode != 0:
