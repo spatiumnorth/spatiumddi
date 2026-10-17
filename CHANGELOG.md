@@ -84,6 +84,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Fleet upgrade dialog no longer promises a re-write and a
+  reboot for a node already on the chosen release (#2068).** It said
+  the inactive slot would be re-written with the same release and the
+  node rebooted into it. Neither happens: the supervisor fires no
+  slot-upgrade trigger when the installed version equals the goal, the
+  next heartbeat drops the goal, and the runner only stages. The note
+  now says nothing will be written and the node will not reboot, and
+  the Schedule button is disabled for that case.
+
 - **A dialog opened from a right-click menu now keeps focus (#2051).**
   Choosing Delete…, Edit… or any item that opens a dialog from the IPAM
   tree's context menu (and the DNS, DHCP and VLAN trees, which share the
