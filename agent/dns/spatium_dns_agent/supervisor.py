@@ -309,6 +309,10 @@ def run(cfg: AgentConfig) -> int:
                     driver.daemon_restarting() or driver.daemon_running()
                 ):
                     log.error("dns_daemon_exited", driver=cfg.driver)
+                    # #2019 — the agent outlived the daemon: a watched death,
+                    # the evidence a bundle needs before it is quarantined
+                    # (an unexplained end of the whole process is not).
+                    syncer.note_daemon_death()
                     if oom.fired():
                         # Persisted before the exit, so the restarted agent
                         # reports it (#1725).

@@ -255,6 +255,7 @@ class _Idle:
         self.pending_acks: list[Any] = []
         self.daemon_status: dict[str, Any] = {}
         self.orderly_exits = 0
+        self.daemon_deaths = 0
 
     def run(self) -> None:
         self._stop.wait()
@@ -262,6 +263,10 @@ class _Idle:
     def note_orderly_exit(self) -> None:
         # SyncLoop's (#2019): the exit was the agent's choice, not a death.
         self.orderly_exits += 1
+
+    def note_daemon_death(self) -> None:
+        # SyncLoop's (#2019): the agent watched the daemon die.
+        self.daemon_deaths += 1
 
     def stop(self) -> None:
         self._stop.set()

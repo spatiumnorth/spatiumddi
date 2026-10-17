@@ -1028,8 +1028,10 @@ records the kill depends on how the container is killed (#2018):
 died while (or within 5 minutes of) applying a bundle does not re-apply that
 cached bundle at startup: it asks the control plane first, so removing the
 blocklists or the extra view in the UI reaches the server on its next start.
-After two such deaths the bundle is quarantined and only retried on a
-backoff. See `docs/deployment/DNS_AGENT.md` (last-known-good revert) for what
+After two deaths the agent itself watched (named exiting while the agent
+lived) the bundle is quarantined and only retried on a backoff; on the
+appliance today the OOM kill takes the agent with named (#2018), so there the
+agent stops at syncing first and the kubelet backs off the crash loop. See `docs/deployment/DNS_AGENT.md` (last-known-good revert) for what
 serves meanwhile.
 
 **Resolver cache.** BIND's `max-cache-size` sizes one cache, every view with

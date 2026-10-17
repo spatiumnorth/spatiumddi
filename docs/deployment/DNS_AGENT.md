@@ -374,7 +374,7 @@ config/
   previous.json                  # last bundle that APPLIED cleanly — the revert target
   previous.etag
   quarantine.json                # etag of a bundle that failed to apply, + its backoff
-  apply_guard.json               # bundle being applied or settling, + deaths per bundle (#2019)
+  apply_guard.json               # bundle being applied or settling, + deaths (and watched deaths) per bundle (#2019)
 rendered/
   zones/
     example.com.db
@@ -480,22 +480,32 @@ that bundle. A SIGTERM or a re-bootstrap disarms it first and is not counted.
   rendered tree is set aside (`rendered.held`) so named does not start on it
   either. The agent asks the control plane first and applies whatever it
   serves, the fixed bundle included. Only if the control plane cannot be
-  reached does it apply the cache after all: one death can be a power cut,
-  and a healthy server must not stay dark over it (non-negotiable #5).
-- **Two deaths:** the bundle is also quarantined. Offline, or while the
-  control plane still serves it, the agent serves the last-known-good bundle
-  if that is a different one the daemon has not died on. `previous.json` is
-  committed as soon as an apply returns, so after a kill it is often the
-  killing bundle itself, and is then not used. With nothing safe to serve,
-  named stays down and the cached bundle is retried on the quarantine's
-  backoff (1 min, 5 min, then every 15 min): one crash per interval instead
-  of a crash loop, and never no config forever.
+  reached, or its own bundle fails to apply, does it apply the cache after
+  all: one death can be a power cut, and a healthy server must not stay dark
+  over it (non-negotiable #5).
+- **Two watched deaths:** the bundle is also quarantined. A death is
+  *watched* when named exited while the agent stayed alive to see it (the
+  agent's `dns_daemon_exited`). A marker left armed by a process that simply
+  ended (a power cut, a node reboot or eviction that SIGKILLed the
+  container, or the whole-container OOM kill of #2018) is not evidence
+  against the bundle, however many times it happens: it only ever buys
+  "ask the control plane first, then serve the cache". Once condemned,
+  offline or while the control plane still serves it, the agent serves the
+  last-known-good bundle if that is a different one the daemon was not seen
+  dying on. `previous.json` is committed as soon as an apply returns, so
+  after a kill it is often the killing bundle itself, and is then not used.
+  With nothing safe to serve, named stays down and the cached bundle is
+  retried on the quarantine's backoff (1 min, 5 min, then every 15 min):
+  one crash per interval instead of a crash loop, and never no config
+  forever. A retried bundle that then stays up for 5 minutes leaves the
+  quarantine.
 
 While the bundle is held the server row reads `no_previous` (or `reverted`
 when the last-known-good is serving) with an error that says named died on
 the bundle, how many times, and, when the OOM record is present, that the
-memory limit killed it. A revert never goes back to a bundle the daemon died
-on. Technitium keeps its own configuration under `/etc/dns`, so for it the
+memory limit killed it. A revert never goes back to a bundle the daemon was
+seen dying on, and at startup, before the control plane has been asked, not to
+one it died on at all. Technitium keeps its own configuration under `/etc/dns`, so for it the
 guard can only change the order (sync first); it cannot keep the daemon off
 a configuration it has already stored.
 
