@@ -18,7 +18,7 @@ import structlog
 
 from . import features
 from .admin_pusher import push_rendered_config
-from .bootstrap import reauthenticate
+from .bootstrap import reauth_generation, reauthenticate
 from .cache import commit_config, load_config, load_previous_config, save_config
 from .config import AgentConfig
 from .config_apply import (
@@ -212,6 +212,8 @@ class SyncLoop:
         # #1725 — the supervisor's; ``None`` in tests that build a loop
         # directly. Only read on a failed apply, to name an OOM kill.
         self.oom_watch = oom_watch
+        # #2052 — the re-registration this loop last caught up with.
+        self._reauth_gen = reauth_generation()
 
         # Preload cached bundle (offline-operation guarantee)
         bundle, etag = load_config(self.cfg.state_dir)
@@ -426,7 +428,46 @@ class SyncLoop:
             headers=features.headers(),
         )
 
+    def _on_reregistered(self) -> None:
+        """Resend what a fresh process sends at startup, to the new row (#2052).
+
+        Re-registering after a 404 lands on a NEW server row. A container
+        restart used to give it the cache apply's zone-state report, a DNSSEC
+        state report and the rendered-config push; in process, none of them
+        would be sent until the next structural change — the structural etag
+        carries no server id, so the new row's bundle re-renders nothing, and
+        its zone-state, Config tab and DS state would read empty until then.
+        The serials already reported are forgotten: they were the old row's
+        (a reset control plane may number its zones lower), and the report
+        re-arms them. Nothing here touches the daemon.
+        """
+        self._current_etag = None
+        if self._dnssec_bundle is not None:
+            zones = []
+            for zone in self._dnssec_bundle.get("zones") or []:
+                served = self._reported_serials.get(_zone_key(zone.get("name")))
+                serial = zone.get("serial")
+                if served is not None and (serial is None or _serial_later(served, int(serial))):
+                    # Record ops moved it past the structural apply's serial.
+                    zone = {**zone, "serial": served}
+                zones.append(zone)
+            self._boot_report_bundle = {"zones": zones}
+            self._boot_report_attempts = 0
+        self._reported_serials = {}
+        self._dnssec_reported = None
+        self._dnssec_settle_streak = 0
+        self._dnssec_refresh_at = 0.0
+        try:
+            push_rendered_config(self.cfg, self.token_ref[0])
+        except Exception:
+            log.exception("rendered_config_reregister_push_failed")
+
     def _poll_once(self) -> None:
+        gen = reauth_generation()
+        if gen != self._reauth_gen:
+            self._reauth_gen = gen
+            log.info("sync_reregistered_resending_reports")
+            self._on_reregistered()
         self._flush_boot_report()
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
         # #882 — a quarantined bundle is parked on a 304 by the etag we sent
@@ -470,8 +511,9 @@ class SyncLoop:
             # #2052 — re-register in this thread; do NOT stop it. Stopping
             # made the supervisor exit the container and take the daemon down.
             reauthenticate(self.cfg, self.token_ref, headers["Authorization"][7:])
-            # The new row has seen no bundle: force a fresh 200 (the
-            # structural etag still gates any daemon reload).
+            # Force a fresh 200. The next poll also sees the generation move
+            # and resends the startup reports to the new row
+            # (``_on_reregistered``), whichever thread registered.
             self._current_etag = None
             return
         if resp.status_code != 200:

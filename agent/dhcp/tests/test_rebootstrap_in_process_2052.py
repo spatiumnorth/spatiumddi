@@ -159,3 +159,60 @@ def test_failing_register_backs_off_instead_of_spinning(
     with pytest.raises(_Stop):
         bootstrap_mod.reauthenticate(agent_cfg, ["old"], "old")
     assert sleeps[0] >= 2.0 and sleeps[2] > sleeps[0]
+
+
+class _Snap:
+    def __init__(self) -> None:
+        self.reasons: list[str] = []
+
+    def request(self, reason: str) -> None:
+        self.reasons.append(reason)
+
+    def step(self) -> None:
+        return None
+
+
+def test_reregistration_snapshots_the_lease_table_to_the_new_row(
+    agent_cfg: AgentConfig, registered: list[int]
+) -> None:
+    """The new row's lease table is empty — the old row's leases went with
+    it. A restart covered that with the ``agent_start`` snapshot; in process
+    the lease watcher asks for one when it sees the re-registration."""
+    from spatium_dhcp_agent.leases import LeaseWatcher
+
+    ensure_layout(agent_cfg.state_dir)
+    token_ref = ["old-token"]
+    s4, s6 = _Snap(), _Snap()
+    w = LeaseWatcher(agent_cfg, token_ref, _Heartbeat(), snapshot=s4, snapshot_v6=s6)
+    s4.reasons.clear()
+    s6.reasons.clear()
+    w.tick()
+    assert s4.reasons == []
+
+    bootstrap_mod.reauthenticate(agent_cfg, token_ref, "old-token")
+    w.tick()
+    assert s4.reasons == ["agent_reregistered"]
+    assert s6.reasons == ["agent_reregistered"]
+    w.tick()
+    assert s4.reasons == ["agent_reregistered"]
+
+
+def test_sync_drops_its_etag_when_another_thread_re_registered(
+    agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch, registered: list[int]
+) -> None:
+    ensure_layout(agent_cfg.state_dir)
+    token_ref = ["old-token"]
+    loop = SyncLoop(agent_cfg, token_ref, heartbeat=_Heartbeat())
+    loop._current_etag = "e-old-row"
+    sent: list[dict[str, str]] = []
+
+    class _Capture(_Client):
+        def get(self, *a: Any, **k: Any) -> _Resp:
+            sent.append(dict(k.get("headers") or {}))
+            return _Resp(304)
+
+    monkeypatch.setattr(loop, "_client", lambda: _Capture(304))
+    bootstrap_mod.reauthenticate(agent_cfg, token_ref, "old-token")  # the heartbeat
+    loop._poll_once()
+    assert "If-None-Match" not in sent[0]
+    assert sent[0]["Authorization"] == "Bearer new-token"

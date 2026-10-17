@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,13 @@ class _Client:
 
     def post(self, *a: Any, **k: Any) -> _Resp:
         return _Resp()
+
+
+@pytest.fixture(autouse=True)
+def _reset_reauth_state() -> Iterator[None]:
+    bootstrap_mod._reset_reauth_state()
+    yield
+    bootstrap_mod._reset_reauth_state()
 
 
 def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AgentConfig:
@@ -65,3 +73,18 @@ def test_heartbeat_404_re_registers_without_stopping(
     # a second thread holding the same stale token does not register again
     bootstrap_mod.reauthenticate(cfg, token_ref, "old-token")
     assert calls == [1]
+
+
+def test_repeated_reauthentication_is_paced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _cfg(tmp_path, monkeypatch)
+    minted = iter(f"token-{i}" for i in range(10))
+    monkeypatch.setattr(bootstrap_mod, "register", lambda c: ("a", next(minted), {}))
+    sleeps: list[float] = []
+    monkeypatch.setattr(bootstrap_mod.time, "sleep", sleeps.append)
+    token_ref = ["old"]
+    bootstrap_mod.reauthenticate(cfg, token_ref, "old")
+    bootstrap_mod.reauthenticate(cfg, token_ref, token_ref[0])
+    assert len(sleeps) == 1 and sleeps[0] >= 5.0
+    assert bootstrap_mod.reauth_generation() == 2

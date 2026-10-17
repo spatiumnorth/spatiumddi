@@ -30,7 +30,7 @@ from typing import Any
 import httpx
 import structlog
 
-from .bootstrap import reauthenticate
+from .bootstrap import reauth_generation, reauthenticate
 from .cache import (
     commit_config,
     load_config,
@@ -161,6 +161,8 @@ class SyncLoop:
         # when the agent is already degraded.
         self._live: tuple[dict[str, Any], str] | None = None
         self._current_etag: str | None = None
+        # #2052 — the re-registration this loop last caught up with.
+        self._reauth_gen = reauth_generation()
         self._consecutive_failures = 0
         self._offline = False
         # #882 — last-known-good revert. ``quarantine`` remembers an etag
@@ -722,6 +724,12 @@ class SyncLoop:
         self._consecutive_failures = 0
 
     def _poll_once(self) -> None:
+        gen = reauth_generation()
+        if gen != self._reauth_gen:
+            # #2052 — another thread re-registered: the row may be new, so
+            # ask it for the whole bundle rather than a 304 on the old etag.
+            self._reauth_gen = gen
+            self._current_etag = None
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
         # #882 — a quarantined bundle is parked on a 304 by the etag we sent
         # last time, so the only way to give it another attempt is to stop

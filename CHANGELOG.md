@@ -96,8 +96,18 @@ the formatter handles the rest.
   heartbeat register once) and keep polling; the daemon never stops and
   serves from its cached config throughout. A control plane that is down
   or a wrong PSK backs off (jittered, capped at 5 min) instead of
-  spinning or exiting. The re-registered agent appears as a new server
-  row.
+  spinning or exiting, and a token refused again straight after it was
+  minted (two agents sharing one agent id off a cloned state dir) waits
+  5 s, doubling to 5 min, before each further re-registration — the pacing
+  the orchestrator's restart back-off used to supply. The re-registered
+  agent appears as a new server row, and gets what a restart used to send
+  it at startup: the DNS agent re-reports its zone serials (the highest it
+  has served, not the last structural render's), its DNSSEC state and its
+  rendered config, and the DHCP agent snapshots Kea's lease table to it —
+  without which the new row's leases would stay empty until each client
+  renewed. This happens whichever thread re-registered, since the
+  structural etag carries no server id and the new row's bundle
+  re-renders nothing.
 
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
