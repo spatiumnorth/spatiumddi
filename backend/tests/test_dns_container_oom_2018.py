@@ -88,6 +88,7 @@ async def _appliance(db: AsyncSession, hostname: str) -> tuple[Appliance, str]:
         deployment_kind="appliance",
         session_token_hash=token_hash,
         assigned_roles=["dns-bind9"],
+        last_seen_at=datetime.now(UTC),
     )
     db.add(row)
     await db.flush()
@@ -95,7 +96,10 @@ async def _appliance(db: AsyncSession, hostname: str) -> tuple[Appliance, str]:
 
 
 async def _agent_server(
-    db: AsyncSession, host: str, appliance_id: uuid.UUID | None = None
+    db: AsyncSession,
+    host: str,
+    appliance_id: uuid.UUID | None = None,
+    last_seen_at: datetime | None = None,
 ) -> tuple[DNSServer, dict[str, str]]:
     """A registered BIND9 agent row, as an appliance's agent registers it:
     ``host`` is the node's name, ``appliance_id`` is normally unset."""
@@ -113,6 +117,7 @@ async def _agent_server(
         appliance_id=appliance_id,
         daemon_status=STATUS_OK,
         daemon_status_since=datetime.now(UTC) - timedelta(hours=2),
+        last_seen_at=last_seen_at or datetime.now(UTC),
     )
     db.add(server)
     await db.flush()
@@ -261,3 +266,64 @@ async def test_the_agents_own_oom_record_is_kept(
     await _agent_hb(client, headers, own)
     row = await _reload(db_session, server.id)
     assert row.daemon_reason == own["reason"]
+
+
+async def test_a_supervisor_that_stopped_reporting_does_not_pin_the_row(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The supervisor's last report stays in ``role_health`` when it stops
+    heartbeating. A frozen "not running, OOMKilled" must not override the
+    agent's ``ok`` for ever: once the supervisor is past its freshness
+    window, the agent's word stands."""
+    appliance, _token = await _appliance(db_session, "ddi-oom-6")
+    server, headers = await _agent_server(db_session, host="ddi-oom-6", appliance_id=appliance.id)
+    killed_at = datetime.now(UTC) - timedelta(hours=3)
+    appliance.role_health = _role_health(killed_at=killed_at, running_since=None)
+    appliance.last_seen_at = datetime.now(UTC) - timedelta(hours=2)
+    await db_session.commit()
+
+    await _agent_hb(client, headers, {"status": "ok"})
+    row = await _reload(db_session, server.id)
+    assert row.daemon_status == STATUS_OK
+    assert row.daemon_reason is None
+
+
+async def test_a_row_an_earlier_registration_left_is_not_stamped(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Two BIND9 rows carry this appliance's hostname: the live one and one
+    an earlier registration left behind in another group. Only the live one
+    is stamped; nothing heartbeats on the other, so a verdict there would
+    never clear and its alert would never resolve."""
+    appliance, token = await _appliance(db_session, "ddi-oom-7")
+    stale, _h1 = await _agent_server(
+        db_session, host="ddi-oom-7", last_seen_at=datetime.now(UTC) - timedelta(days=4)
+    )
+    live, _h2 = await _agent_server(db_session, host="ddi-oom-7")
+    await db_session.commit()
+
+    killed_at = datetime.now(UTC) - timedelta(minutes=7)
+    await _supervisor_hb(
+        client, appliance, token, _role_health(killed_at=killed_at, running_since=None)
+    )
+    assert (await _reload(db_session, live.id)).daemon_status == STATUS_DEGRADED
+    stale_row = await _reload(db_session, stale.id)
+    assert stale_row.daemon_status == STATUS_OK
+    assert stale_row.daemon_reason is None
+
+
+async def test_a_kea_oom_does_not_mark_the_dns_row(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The verdict is per container: an OOM-killed dhcp-kea on the same
+    appliance says nothing about named."""
+    appliance, token = await _appliance(db_session, "ddi-oom-8")
+    server, _headers = await _agent_server(db_session, host="ddi-oom-8")
+    await db_session.commit()
+
+    killed_at = datetime.now(UTC) - timedelta(minutes=7)
+    rh = _role_health(killed_at=killed_at, running_since=None)
+    rh = {"dhcp-kea": {**rh["dns-bind9"], "role": "dhcp", "container_id": "dhcp-kea-x"}}
+    await _supervisor_hb(client, appliance, token, rh)
+    row = await _reload(db_session, server.id)
+    assert row.daemon_status == STATUS_OK

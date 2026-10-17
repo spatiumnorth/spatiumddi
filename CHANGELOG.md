@@ -97,7 +97,9 @@ the formatter handles the rest.
   the `oom_killed:` daemon state on the server row, from the supervisor
   heartbeat (a container stuck in CrashLoopBackOff) and over the restarted
   agent's `ok`, timed from the kill and cleared once the container has stayed
-  up for 10 minutes. The watchdog also now picks this node's pod of a
+  up for 10 minutes. Only the engine's live row is stamped, and only while
+  the supervisor is still heartbeating, so a stale row or a supervisor that
+  stopped reporting cannot hold a server down for good. The watchdog also now picks this node's pod of a
   DaemonSet rather than whichever node's was listed last. No new RBAC: the
   supervisor already lists pods in its namespace. Docker Compose, where the
   kernel kills named alone, keeps the agent's own record.

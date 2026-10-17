@@ -1002,10 +1002,16 @@ records the kill depends on how the container is killed (#2018):
   can: it records `OOMKilled` as the container's last state. The appliance
   supervisor reports that on its heartbeat (its service watchdog, every 5
   minutes, for this node's pod only), and the control plane turns it into
-  the `oom_killed:` state on every server row the appliance owns, whatever
-  the restarted agent says, timed from the kill rather than from the
-  report. A container stuck in CrashLoopBackOff, with no agent heartbeat at
-  all, reads not serving the same way. A plain Helm install (umbrella
+  the `oom_killed:` state on the server row that container serves (the
+  engine's live row: one a past registration left behind is not touched),
+  whatever the restarted agent says, timed from the kill rather than from
+  the report. A container stuck in CrashLoopBackOff, with no agent heartbeat
+  at all, reads not serving the same way. The report counts only while the
+  supervisor is still heartbeating (15 minutes): one that stopped leaves
+  its last word in place, and that must not hold a recovered server down.
+  The times compared are the kubelet's and the control plane's, so a node
+  clock far off moves the 10-minute recovery by the same amount. The DHCP
+  (Kea) container is group-killed the same way and is not covered yet. A plain Helm install (umbrella
   chart) has no supervisor, so there the pod's last state
   (`kubectl get pod … -o jsonpath='{.status.containerStatuses[0].lastState}'`)
   is the only record; setting the kubelet's `singleProcessOOMKill: true`

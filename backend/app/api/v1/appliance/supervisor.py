@@ -105,7 +105,11 @@ from app.models.appliance import (
 from app.models.audit import AuditLog
 from app.models.firewall import FirewallApplyState
 from app.models.settings import PlatformSettings
-from app.services.agents.container_oom import apply_container_oom
+from app.services.agents.container_oom import (
+    apply_container_oom,
+    container_oom_report,
+    is_oom_reason,
+)
 from app.services.appliance.apt import apt_bundle
 from app.services.appliance.ca import (
     ensure_ca,
@@ -1957,8 +1961,20 @@ _HEARTBEAT_HOLD_CAP_S = 28.0
 
 async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
     """Stamp a current ``OOMKilled`` from ``appliance.role_health`` onto the
-    DNS server rows this appliance owns (#2018). See
-    ``app.services.agents.container_oom``."""
+    DNS server row this appliance's container serves (#2018). See
+    ``app.services.agents.container_oom``.
+
+    One row per engine: the most recently seen of the rows this appliance
+    owns with that driver. A row an earlier registration left behind (a
+    group change, a wiped agent state dir) has no agent heartbeating on it,
+    so nothing would ever clear a verdict stamped there and its alert would
+    stay open for good.
+
+    The rows are taken ``FOR UPDATE SKIP LOCKED``. This handler already
+    holds the appliance row, and a DNS server move locks the server row and
+    then the appliance; waiting here would be the other half of that cycle.
+    A row someone else holds is skipped: its own agent heartbeat applies the
+    same verdict, and the next supervisor heartbeat retries."""
     from app.models.dns import DNSServer  # noqa: PLC0415
 
     health = appliance.role_health or {}
@@ -1966,7 +1982,8 @@ async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
         isinstance(v, dict) and isinstance(v.get("container"), dict) for v in health.values()
     ):
         return
-    servers = (
+    now = datetime.now(UTC)
+    owned = (
         (
             await db.execute(
                 select(DNSServer).where(await _own_server_condition(db, appliance, DNSServer))
@@ -1975,8 +1992,34 @@ async def _apply_role_container_oom(db: DB, appliance: Appliance) -> None:
         .scalars()
         .all()
     )
-    for server in servers:
-        apply_container_oom(server, health)
+    live: dict[str, Any] = {}
+    floor = datetime.min.replace(tzinfo=UTC)
+    for server in owned:
+        best = live.get(server.driver)
+        if best is None or (server.last_seen_at or floor) > (best.last_seen_at or floor):
+            live[server.driver] = server
+    ids = [
+        s.id
+        for s in live.values()
+        if container_oom_report(health, s.driver, now) is not None
+        and not is_oom_reason(s.daemon_reason)
+    ]
+    if not ids:
+        return
+    locked = (
+        (
+            await db.execute(
+                select(DNSServer)
+                .where(DNSServer.id.in_(ids))
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for server in locked:
+        apply_container_oom(server, health, now=now)
 
 
 @router.post(

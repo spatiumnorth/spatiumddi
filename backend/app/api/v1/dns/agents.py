@@ -55,7 +55,7 @@ from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.services.agents.config_apply import apply_reported_status
-from app.services.agents.container_oom import effective_daemon_report
+from app.services.agents.container_oom import effective_daemon_report, fresh_role_health
 from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.agents.ingest_receipt import (
     BatchId,
@@ -973,7 +973,7 @@ async def agent_heartbeat(
     appliance = await owning_appliance_for_dns_server(db, server)
     daemon_report, daemon_stamp = effective_daemon_report(
         body.daemon,
-        appliance.role_health if appliance is not None else None,
+        fresh_role_health(appliance, now),
         server.driver,
         now,
     )

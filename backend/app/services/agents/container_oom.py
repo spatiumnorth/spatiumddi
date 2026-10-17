@@ -76,6 +76,15 @@ _DAEMON_NAME = {
 #: The kubelet's word for a container its cgroup's OOM killer ended.
 _OOM_REASON = "OOMKilled"
 
+#: How old the appliance's last supervisor heartbeat may be before its
+#: ``role_health`` stops counting on the DNS agent heartbeat. The watchdog
+#: snapshot is refreshed every 300 s and rides every ~30 s heartbeat, so three
+#: watchdog passes is generous. Past it the snapshot is not evidence of
+#: anything: a supervisor that stopped heartbeating leaves its last report in
+#: the column, and a "not running, OOMKilled" frozen there would otherwise
+#: override the agent's ``ok`` for ever.
+ROLE_HEALTH_FRESH_SECONDS = 900.0
+
 
 def is_oom_reason(reason: str | None) -> bool:
     return str(reason or "").strip().startswith(REASON_PREFIX)
@@ -144,6 +153,19 @@ def container_oom_report(
     return {"status": STATUS_DEGRADED, "reason": reason}, killed_at
 
 
+def fresh_role_health(appliance: Any, now: datetime) -> dict[str, Any] | None:
+    """``appliance.role_health`` while the supervisor that reported it is
+    still heartbeating (:data:`ROLE_HEALTH_FRESH_SECONDS`); None otherwise,
+    and for no appliance."""
+    if appliance is None:
+        return None
+    seen = getattr(appliance, "last_seen_at", None)
+    if seen is None or (now - seen).total_seconds() > ROLE_HEALTH_FRESH_SECONDS:
+        return None
+    health = getattr(appliance, "role_health", None)
+    return health if isinstance(health, dict) else None
+
+
 def effective_daemon_report(
     reported: dict[str, Any] | None,
     role_health: dict[str, Any] | None,
@@ -196,10 +218,12 @@ def apply_container_oom(
 
 __all__ = [
     "DNS_DRIVER_SERVICE",
+    "ROLE_HEALTH_FRESH_SECONDS",
     "REASON_PREFIX",
     "STABLE_SECONDS",
     "apply_container_oom",
     "container_oom_report",
     "effective_daemon_report",
+    "fresh_role_health",
     "is_oom_reason",
 ]
