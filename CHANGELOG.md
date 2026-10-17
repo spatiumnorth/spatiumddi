@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A device policy whose classes have no fingerprinted devices yet now says
+  why it is not rendered (#2000).** With classes selected and nothing seen in
+  them, the policy compiles to an empty expression and is correctly left out of
+  the Kea config, but the preview said only "Renders: no". `compile_device_policy`
+  now warns that no devices have been seen in the selected classes yet, so the
+  policy matches nothing and is not rendered, in the REST preview, the dialog
+  and `preview_dhcp_device_policy`. When devices in those classes were seen but
+  none sent DHCP options 55 or 60 in a form that can be matched, it says that
+  instead, with the count. Neither fires when signatures exist, when a manual
+  match is set, or when every signature was excluded as ambiguous (that case
+  keeps its own warning).
+
 - **The alert rule editor can edit every rule type's thresholds, not
   just the 23 it was hand-coded for (#1997).** The editor's type list
   and per-type fields were a frontend union that knew 23 of the
