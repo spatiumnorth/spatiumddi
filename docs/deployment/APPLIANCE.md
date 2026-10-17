@@ -3272,6 +3272,13 @@ the cluster runs until every node reports the target:
 - When every node is done, the run removes the pins and ends the hold in
   one step. Each node's DNS and DHCP pods restart once at that moment.
 
+A pin, or the removal of the pins, that the kubeapi does not take (a
+request refused or unanswered, as while a k3s server restarts) does
+not end the run. The drive tries it again every 15 s, reading Halt,
+Abort and the Lease between tries, and starts no node and moves no tag
+until it lands. Only once it has kept failing for 5 minutes does the
+run fail on it, with the kubeapi's answer as its error (#2028).
+
 A run that fails or is aborted keeps its hold, because nodes on two
 versions are exactly what it protects. A new run's Start takes it over,
 and a beat task ends it once every cluster member reports one installed

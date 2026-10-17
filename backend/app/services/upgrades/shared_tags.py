@@ -96,12 +96,17 @@ _POLL_INTERVAL_S = 5.0
 @dataclass(frozen=True)
 class StepOutcome:
     """What one hold step did. ``mode`` is ``hold``, ``legacy``,
-    ``released`` or ``skipped`` (no k3s, or a one-node run)."""
+    ``released`` or ``skipped`` (no k3s, or a one-node run).
+
+    ``retryable``: the step failed at the kubeapi, a request unanswered or
+    refused. Every step is idempotent, so the drive tries it again rather
+    than end the run on an apiserver that is restarting."""
 
     ok: bool
     mode: str = "skipped"
     error: str | None = None
     detail: dict[str, Any] = field(default_factory=dict)
+    retryable: bool = False
 
 
 def _now_iso() -> str:
@@ -294,7 +299,9 @@ async def ensure_hold(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
     before every later one. The caller commits.
 
     A hold that cannot be placed is a failure: the run must stop before a
-    node boots the new slot with the shared tags free to move."""
+    node boots the new slot with the shared tags free to move. A failure at
+    the kubeapi is ``retryable``: the drive pauses and tries the step again
+    before it fails the run on it."""
     record = record_of(run)
     mode = record.get("mode")
     if mode == MODE_LEGACY:
@@ -306,7 +313,7 @@ async def ensure_hold(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
         if not held_tag:
             return StepOutcome(ok=False, mode=MODE_HOLD, error="the hold records no tag")
         ok, err = _apply_pins(held_tag)
-        return StepOutcome(ok=ok, mode=MODE_HOLD, error=err)
+        return StepOutcome(ok=ok, mode=MODE_HOLD, error=err, retryable=not ok)
 
     nodes = [str(n) for n in (run.plan or {}).get("node_order") or []]
     if len(nodes) < 2 or k8s.get_config() is None:
@@ -345,7 +352,9 @@ async def ensure_hold(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
         ok=ok,
         error=err,
     )
-    return StepOutcome(ok=ok, mode=MODE_HOLD, error=err, detail={"from_tag": from_tag})
+    return StepOutcome(
+        ok=ok, mode=MODE_HOLD, error=err, detail={"from_tag": from_tag}, retryable=not ok
+    )
 
 
 # ── The flip ─────────────────────────────────────────────────────────
@@ -459,7 +468,9 @@ async def flip(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
         try:
             current = _list_workloads(RELEASE_NAMESPACE)
         except k8s.KubeapiUnavailableError as exc:
-            return StepOutcome(ok=False, mode=MODE_HOLD, error=f"kubeapi unreachable: {exc}")
+            return StepOutcome(
+                ok=False, mode=MODE_HOLD, error=f"kubeapi unreachable: {exc}", retryable=True
+            )
         workloads = [
             {"kind": kind, "name": name}
             for (kind, name), item in sorted(current.items())
@@ -472,7 +483,9 @@ async def flip(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
 
     ok, err = _apply_pins(None)
     if not ok:
-        return StepOutcome(ok=False, mode=MODE_HOLD, error=f"could not remove a tag pin: {err}")
+        return StepOutcome(
+            ok=False, mode=MODE_HOLD, error=f"could not remove a tag pin: {err}", retryable=True
+        )
     now = _now_iso()
     flip_rec.update(state=FLIP_FLIPPED, flipped_at=now)
     record.update(flip=flip_rec, released_at=now, release_reason="flip")

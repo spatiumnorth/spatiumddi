@@ -456,6 +456,17 @@ the formatter handles the rest.
   `exclude_unset`.
 
 - **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial could not be written ("value out of int32 range") and the agent zone-state report was refused with a 422, leaving the Zone Sync pill unable to show convergence. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment past 4294967295 wraps to 1 (RFC 1982; it skips 0 the way BIND's own `increment` does, because 0 is the "never seeded" value that every renderer serves as 1). It used to produce 4294967296, which is not a valid SOA serial.
+- **A rolling upgrade no longer fails on one kubeapi request its
+  shared-tag hold could not land (#2028).** The hold (#1710) pins the
+  shared charts' image tag before each node and removes the pins at the
+  end, a few kubeapi requests each time, and any one of them refused or
+  unanswered (a k3s server answers 503 `apiserver not ready` while it
+  restarts) failed the whole run: before the first node, with the
+  cluster on two versions at a re-assert, or with every node already on
+  the target at the flip. Such a step is now tried again every 15 s,
+  with Halt, Abort and the Lease read between tries, as #1713 does for
+  the Lease. No node starts and no tag moves until it lands, and the
+  run fails on it, with the same error, only after 300 s of failures.
 
 - **Disabling a DNS pool now removes its records, and a pool TTL change
   lands immediately (#1974).** `update_pool` never reconciled and
