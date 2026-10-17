@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Saving SSH settings now repairs a failed or stopped ssh.service
+  (#2054).** The runner validated the staged config with `sshd -t`
+  before restarting, but `sshd -t` needs `/run/sshd`, which is
+  ssh.service's own runtime directory and is removed when the unit
+  stops or fails. With the unit down the check failed and the restart
+  that would have fixed it was never reached, so only a reboot
+  recovered. The runner now creates the directory (root:root 0755,
+  as the unit does) before validating; an invalid config is still
+  refused. And when ssh.socket is not active, a down ssh.service is
+  now started rather than reloaded, since systemd refuses to reload a
+  unit that is not running.
+
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
   the inactive slot would be re-written with the same release and the
