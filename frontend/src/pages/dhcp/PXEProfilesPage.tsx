@@ -11,7 +11,14 @@
  * client-classes.
  */
 
-import { useEffect, useState } from "react";
+import {
+  Children,
+  cloneElement,
+  isValidElement,
+  useEffect,
+  useId,
+  useState,
+} from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Pencil, Plus, Trash2, X, Loader2 } from "lucide-react";
@@ -269,7 +276,7 @@ function ProfileCard({
   );
 }
 
-function ProfileEditor({
+export function ProfileEditor({
   mode,
   groupId,
   existing,
@@ -458,6 +465,7 @@ function ProfileEditor({
             <ArchMatchRow
               key={idx}
               row={m}
+              index={idx}
               onChange={(p) => patchMatch(idx, p)}
               onRemove={() => removeMatch(idx)}
             />
@@ -492,17 +500,24 @@ function ProfileEditor({
 
 function ArchMatchRow({
   row,
+  index,
   onChange,
   onRemove,
 }: {
   row: PXEArchMatchInput;
+  index: number;
   onChange: (p: Partial<PXEArchMatchInput>) => void;
   onRemove: () => void;
 }) {
+  const n = `Match ${index + 1}`;
   return (
-    <div className="space-y-2 rounded border bg-muted/20 p-2 text-xs">
+    <div
+      role="group"
+      aria-label={`Match rule ${index + 1}`}
+      className="space-y-2 rounded border bg-muted/20 p-2 text-xs"
+    >
       <div className="grid gap-2 sm:grid-cols-[6rem_8rem_1fr_auto]">
-        <Field label="Priority">
+        <Field label="Priority" accessibleName={`${n}: Priority`}>
           <input
             type="number"
             value={row.priority ?? 100}
@@ -512,7 +527,7 @@ function ArchMatchRow({
             className={inputCls}
           />
         </Field>
-        <Field label="Match kind">
+        <Field label="Match kind" accessibleName={`${n}: Match kind`}>
           <select
             value={row.match_kind ?? "first_stage"}
             onChange={(e) =>
@@ -524,7 +539,10 @@ function ArchMatchRow({
             <option value="ipxe_chain">ipxe_chain</option>
           </select>
         </Field>
-        <Field label="Vendor class (option 60 substring)">
+        <Field
+          label="Vendor class (option 60 substring)"
+          accessibleName={`${n}: Vendor class (option 60 substring)`}
+        >
           <input
             value={row.vendor_class_match ?? ""}
             onChange={(e) => onChange({ vendor_class_match: e.target.value })}
@@ -537,11 +555,15 @@ function ArchMatchRow({
           onClick={onRemove}
           className="self-end rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
           title="Remove match"
+          aria-label={`${n}: remove`}
         >
           <X className="h-4 w-4" />
         </button>
       </div>
-      <Field label="Arch codes (option 93)">
+      <Field
+        label="Arch codes (option 93)"
+        accessibleName={`${n}: Arch codes (option 93)`}
+      >
         <div className="flex flex-wrap gap-1">
           {Object.entries(DHCP_PXE_ARCH_LABELS).map(([codeStr, label]) => {
             const code = parseInt(codeStr, 10);
@@ -558,6 +580,7 @@ function ArchMatchRow({
                 <input
                   type="checkbox"
                   className="h-3 w-3"
+                  aria-label={`${n}: arch ${code} · ${label}`}
                   checked={checked}
                   onChange={(e) => {
                     const cur = row.arch_codes ?? [];
@@ -579,7 +602,10 @@ function ArchMatchRow({
           Empty = match any arch (combine with vendor-class to filter).
         </span>
       </Field>
-      <Field label="Boot filename / URL">
+      <Field
+        label="Boot filename / URL"
+        accessibleName={`${n}: Boot filename / URL`}
+      >
         <input
           value={row.boot_filename}
           onChange={(e) => onChange({ boot_filename: e.target.value })}
@@ -596,17 +622,65 @@ function ArchMatchRow({
   );
 }
 
+const CONTROL_TAGS = new Set(["input", "select", "textarea"]);
+
+type ControlElement = React.ReactElement<{ id?: string }>;
+
+function isControlElement(node: React.ReactNode): node is ControlElement {
+  return (
+    isValidElement(node) &&
+    typeof node.type === "string" &&
+    CONTROL_TAGS.has(node.type)
+  );
+}
+
+/** A visible label that names its control (#2016). A lone input / select /
+ *  textarea child is linked by htmlFor/id; anything else is wrapped in a
+ *  role="group" labelled by the label, so "Arch codes" names the SET of
+ *  checkboxes rather than being a <label> around their own labels.
+ *  `accessibleName` (the row-qualified name, e.g. "Match 2: Priority") is
+ *  set as aria-label so the same label in two rows names two controls. */
 function Field({
   label,
+  accessibleName,
   children,
 }: {
   label: string;
+  accessibleName?: string;
   children: React.ReactNode;
 }) {
+  const uid = useId();
+  const controls = Children.toArray(children).filter(isControlElement);
+  const control = controls.length === 1 ? controls[0] : null;
+  const controlId = control ? (control.props.id ?? uid) : undefined;
   return (
-    <label className="block space-y-1 text-[11px]">
-      <span className="font-medium text-muted-foreground">{label}</span>
-      {children}
-    </label>
+    <div className="block space-y-1 text-[11px]">
+      <label
+        id={control ? undefined : uid}
+        htmlFor={controlId}
+        className="block font-medium text-muted-foreground"
+      >
+        {label}
+      </label>
+      {control ? (
+        Children.map(children, (c) =>
+          isControlElement(c)
+            ? cloneElement(c, {
+                id: controlId,
+                ...(accessibleName ? { "aria-label": accessibleName } : {}),
+              } as Partial<ControlElement["props"]>)
+            : c,
+        )
+      ) : (
+        <div
+          role="group"
+          aria-labelledby={accessibleName ? undefined : uid}
+          aria-label={accessibleName}
+          className="space-y-1"
+        >
+          {children}
+        </div>
+      )}
+    </div>
   );
 }
