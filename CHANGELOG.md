@@ -84,6 +84,27 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **IPAM no longer adopts a PTR whose target lacks the trailing dot
+  where that target is served relative to the zone (#2045).** Since
+  #1890 an allocation adopts an operator's identical record instead of
+  writing its own, and for a PTR it also matched the target with the
+  trailing dot removed. The record API stores a value as typed, and
+  BIND9, both Technitium drivers and Windows over RFC 2136 serve a
+  dot-less target relative to the reverse zone, so `db1.example.com`
+  answered `db1.example.com.<reverse zone>.`: IPAM adopted the wrong
+  record, wrote no PTR, and Sync DNS reported nothing missing. The
+  adoption match and the Sync DNS check now compare a PTR target the way
+  the zone's servers serve it. A dot-less target is still adopted where
+  every server in the group takes it as the absolute name (the cloud
+  providers, Windows over WinRM), because writing a second copy there is
+  a duplicate the provider can refuse. The comparison is now also
+  case-insensitive, so `DB1.Example.com.` is adopted rather than
+  duplicated. When IPAM declines a dot-less operator PTR it logs
+  `ipam_ptr_relative_operator_record`; the operator's record stays, and
+  the reverse lookup answers both names until it is fixed or deleted.
+  A/AAAA adoption is unchanged; CNAME, MX and NS are not adopted by this
+  code.
+
 - **Saving SSH settings now repairs a failed or stopped ssh.service
   (#2054).** The runner validated the staged config with `sshd -t`
   before restarting, but `sshd -t` needs `/run/sshd`, which is
