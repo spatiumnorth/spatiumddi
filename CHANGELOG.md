@@ -89,11 +89,19 @@ the formatter handles the rest.
   slot apply usually starts within a second, and the host deliberately
   never stops a running apply; the cancel still answered 200 and
   emptied the row. `clear-upgrade` now answers 409
-  (`upgrade_already_started`) once the host reports the apply
-  in-flight, audits the refusal, and leaves the row untouched; a stale
-  in-flight stamp (dead runner) can still be cleared. The Fleet panel
-  hides Cancel and says why. A cancel that lands before the host
-  reports in still works.
+  (`upgrade_already_started`) once the host reports the runner applying
+  or the new slot staged (a clear does not disarm next-boot either),
+  audits the refusal, and leaves the row untouched. A cancel sent before
+  the host has reported is still accepted, but provisionally: the row
+  carries `clear_upgrade_requested` and Fleet shows "waiting for the host
+  to confirm" until the next heartbeat. If that heartbeat shows the
+  apply already running, the log records `appliance.upgrade_cancel_lost`
+  and Fleet shows the running (then staged) upgrade with a note, never a
+  cancelled row. The supervisor's clear also stops wiping the progress
+  of an apply it cannot stop, which blanked the Fleet stepper for the
+  rest of the apply and stranded a staged slot at `done`. A dead
+  runner's stale stamp and a trigger the runner has not claimed can
+  still be cleared.
 
 - **A per-box upgrade stayed `reboot-pending` after it had rebooted and
   committed (#2007), and its help text said it reboots (#2008).** The

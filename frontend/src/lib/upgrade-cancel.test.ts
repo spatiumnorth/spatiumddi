@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  hostUpgradeActivity,
   upgradeAlreadyStartedRefusal,
   upgradeStartedOnHost,
 } from "./upgrade-cancel";
@@ -13,16 +14,31 @@ describe("upgradeStartedOnHost (#2021)", () => {
     );
     expect(upgradeStartedOnHost({ last_upgrade_state: null }, now)).toBe(false);
   });
-  it("is not cancellable once in-flight", () => {
+  it("is not cancellable once the runner has claimed the trigger", () => {
     expect(
-      upgradeStartedOnHost(
+      hostUpgradeActivity(
         {
           last_upgrade_state: "in-flight",
           last_upgrade_state_at: "2026-10-17T03:59:50Z",
+          last_upgrade_progress: { step: "queued" },
         },
         now,
       ),
-    ).toBe(true);
+    ).toBe("applying");
+  });
+  it("lets an unclaimed trigger be cancelled (the host command removes it)", () => {
+    for (const step of [undefined, "", "reboot-pending", "failed"]) {
+      expect(
+        upgradeStartedOnHost(
+          {
+            last_upgrade_state: "in-flight",
+            last_upgrade_state_at: "2026-10-17T03:59:50Z",
+            last_upgrade_progress: step === undefined ? {} : { step },
+          },
+          now,
+        ),
+      ).toBe(false);
+    }
   });
   it("lets a dead in-flight stamp be cancelled", () => {
     expect(
@@ -30,6 +46,46 @@ describe("upgradeStartedOnHost (#2021)", () => {
         {
           last_upgrade_state: "in-flight",
           last_upgrade_state_at: "2026-10-17T03:40:00Z",
+          last_upgrade_progress: { step: "writing" },
+        },
+        now,
+      ),
+    ).toBe(false);
+  });
+  it("is not cancellable once staged (clearing does not disarm next-boot)", () => {
+    expect(
+      hostUpgradeActivity(
+        {
+          last_upgrade_state: "done",
+          last_upgrade_progress: {
+            step: "reboot-pending",
+            staged_boot_id: "b00t",
+          },
+        },
+        now,
+      ),
+    ).toBe("staged");
+    // Booted into it (a trial boot awaiting commit): not pending any more.
+    expect(
+      hostUpgradeActivity(
+        {
+          current_slot: "slot_b",
+          last_upgrade_state: "done",
+          last_upgrade_progress: {
+            step: "reboot-pending",
+            staged_slot: "slot_b",
+            staged_boot_id: "b00t",
+          },
+        },
+        now,
+      ),
+    ).toBeNull();
+    // An older runner's done can outlive its reboot; not counted.
+    expect(
+      upgradeStartedOnHost(
+        {
+          last_upgrade_state: "done",
+          last_upgrade_progress: { step: "reboot-pending" },
         },
         now,
       ),
