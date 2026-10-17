@@ -4070,7 +4070,10 @@ export interface InfluxDBTarget {
   push_dhcp_metrics: boolean;
   push_subnet_utilization: boolean;
   push_dhcp_scope_leases: boolean;
+  /** The last attempt; moves on failure. */
   last_push_at: string | null;
+  /** The last push the destination accepted; null = never. */
+  last_success_at: string | null;
   last_push_points: number;
   last_push_error: string | null;
   last_dns_bucket_at: string | null;
@@ -4088,11 +4091,15 @@ export interface InfluxDBTargetWrite {
   timeout_seconds: number;
   database: string;
   username: string;
-  /** ``null`` = keep what is stored, ``""`` = clear, else replace. */
+  /** Absent, ``null`` or ``""`` = keep what is stored; else replace. */
   password?: string | null;
+  /** Explicitly remove the stored password (a blank field never does). */
+  clear_password?: boolean;
   org: string;
   bucket: string;
   token?: string | null;
+  /** Explicitly remove the stored token (a blank field never does). */
+  clear_token?: boolean;
   measurement_prefix: string;
   push_interval_seconds: number;
   push_dns_metrics: boolean;
@@ -12641,6 +12648,10 @@ export interface ApplianceUpgradeProgress {
   detail: string;
   /** ISO-8601 timestamp the step was entered. */
   at: string;
+  /** #2007 — on ``reboot-pending``: the slot armed and the boot it was
+   *  staged under, which the supervisor settles against after the reboot. */
+  staged_slot?: string;
+  staged_boot_id?: string;
 }
 
 export interface ApplianceRow {
@@ -12728,6 +12739,9 @@ export interface ApplianceRow {
   desired_default_slot: string | null;
   reboot_requested: boolean;
   reboot_requested_at: string | null;
+  // #2021 — a clear the host has not answered yet. A Cancel's 200 is
+  // provisional until then: the host may already have started the apply.
+  clear_upgrade_requested?: boolean;
   // #170 Wave C2 — role assignment + free-form tags.
   assigned_roles: string[];
   assigned_dns_group_id: string | null;
@@ -13745,7 +13759,7 @@ export interface ApplianceSystemInfo {
   maintenance_mode: boolean;
   reboot_pending_from_host: boolean;
   reboot_scheduled: boolean;
-  appliance_version: string;
+  appliance_version: string | null;
   appliance_mode: boolean;
 }
 

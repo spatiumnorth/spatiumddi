@@ -108,7 +108,11 @@ export function SetupWizardPage() {
             sys.data
               ? `${sys.data.hostname} · ${
                   sys.data.host_ips.join(", ") || "no public IPs"
-                } · v${sys.data.appliance_version}`
+                }${
+                  sys.data.appliance_version
+                    ? ` · v${sys.data.appliance_version}`
+                    : ""
+                }`
               : "Loading…"
           }
           icon={ShieldCheck}

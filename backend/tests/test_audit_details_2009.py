@@ -259,3 +259,57 @@ async def test_mcp_tool_redacts_the_same_way(db_session: AsyncSession) -> None:
     assert out[0]["new_value"]["registry_password"] == "[redacted]"
     assert out[0]["old_value"]["api_key"] == "[redacted]"
     assert "s3cret" not in str(out) and _JWT not in str(out)
+
+
+def test_backup_target_rows_written_by_older_builds_read_redacted() -> None:
+    """Older builds recorded a backup target's edited ``config`` and a failed
+    https_put run's full receiver URL as-is. Those rows stay stored as they
+    were (the chain hashes them), so the read path must cover their shapes:
+    storage connection strings, presigned S3 / GCS query strings, and the
+    URL embedded in a run's error text."""
+    from app.services.audit_redact import REDACTED, redact_audit_value
+
+    stored_patch = {
+        "config": {
+            "connection_string": (
+                "DefaultEndpointsProtocol=https;AccountName=acct;"
+                "AccountKey=QUNDT1VOVEtFWUJBU0U2NA==;EndpointSuffix=core.windows.net"
+            ),
+            "url": (
+                "https://bucket.s3.amazonaws.com/b.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+                "&X-Amz-Credential=AKIAEXAMPLE%2F20260101%2Fus-east-1%2Fs3%2Faws4_request"
+                "&X-Amz-Expires=3600&X-Amz-Signature=deadbeefcafef00d0123456789abcdef"
+            ),
+            "secret_access_key": "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+            "bucket": "bucket",
+        },
+        "name": "offsite",
+    }
+    out = redact_audit_value(stored_patch)
+    cfg = out["config"]
+    assert cfg["connection_string"] == REDACTED
+    assert "deadbeefcafef00d" not in cfg["url"]
+    assert "AKIAEXAMPLE" not in cfg["url"]
+    # Host, path and non-credential parameters stay readable.
+    assert cfg["url"].startswith("https://bucket.s3.amazonaws.com/b.zip?")
+    assert "X-Amz-Expires=3600" in cfg["url"]
+    assert cfg["secret_access_key"] == REDACTED
+    assert cfg["bucket"] == "bucket" and out["name"] == "offsite"
+
+    error_detail = (
+        "PUT to https://storage.googleapis.com/b/a.zip?X-Goog-Algorithm=GOOG4-RSA-SHA256"
+        "&X-Goog-Credential=svc%40proj.iam.gserviceaccount.com%2F20260101"
+        "&X-Goog-Signature=0a1b2c3d4e5f60718293a4b5c6d7e8f9 returned 403: denied"
+    )
+    redacted = redact_audit_value(error_detail)
+    assert "0a1b2c3d4e5f6071" not in redacted
+    assert "gserviceaccount" not in redacted
+    assert redacted.endswith("returned 403: denied")
+    # Idempotent: redacting the redacted text changes nothing.
+    assert redact_audit_value(redacted) == redacted
+
+    # A bare connection string under an innocent key is caught by value.
+    assert (
+        "QUNDT1VOVEtFWUJBU0U2NA"
+        not in redact_audit_value({"note": stored_patch["config"]["connection_string"]})["note"]
+    )

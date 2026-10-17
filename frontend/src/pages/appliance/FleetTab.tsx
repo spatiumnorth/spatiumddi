@@ -48,6 +48,10 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { schemaRollbackRefusal } from "@/lib/schema-rollback";
+import {
+  hostUpgradeActivity,
+  upgradeAlreadyStartedRefusal,
+} from "@/lib/upgrade-cancel";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -5480,6 +5484,37 @@ function UpgradeStatusPanel({
   }
 
   const rebootPending = progress?.step === "reboot-pending" || state === "done";
+  // #2021 — the host does not stop a running apply and a clear does not
+  // disarm a staged slot, so once the runner has claimed the trigger there
+  // is nothing for Cancel to do; offering it reported a cancel that never
+  // happened.
+  const activity = hostUpgradeActivity(row);
+  const started = activity !== null;
+  // A Cancel's 200 is provisional: scheduling wakes the host, which has
+  // usually fired the trigger before the cancel lands. Until the host
+  // answers, say that rather than show the upgrade as gone.
+  if (!target && row.clear_upgrade_requested && !started) {
+    return (
+      <div className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+        <div className="flex items-center gap-2">
+          <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-600 dark:text-amber-400" />
+          <span className="font-medium">
+            Waiting for the host to confirm the clear
+          </span>
+        </div>
+        <p className="mt-1 text-muted-foreground">
+          The host&rsquo;s next heartbeat (a few seconds) confirms it. A cancel
+          takes effect only if it reached the host before the slot apply
+          started; if the host had already started, the running upgrade shows
+          here instead of a cancelled one.
+        </p>
+      </div>
+    );
+  }
+  // Running or staged with nothing scheduled: a cancel that lost the race
+  // (recorded as appliance.upgrade_cancel_lost), or an apply started on the
+  // host itself. Shown, never hidden, because the node is still upgrading.
+  const unscheduled = !target && (started || state === "in-flight");
   // Where are we? -1 = desired set but no progress reported yet (the
   // supervisor hasn't fired the trigger). Otherwise the index of the
   // current phase in UPGRADE_STEPS.
@@ -5528,6 +5563,21 @@ function UpgradeStatusPanel({
           </code>
         )}
       </div>
+
+      {unscheduled && (
+        <p className="mt-2 flex items-start gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-800 dark:text-amber-200">
+          <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+          <span>
+            No upgrade is scheduled for this node, but the host reports one{" "}
+            {rebootPending ? "staged" : "in progress"}: most likely a cancel
+            that reached the host after it had started the apply, which the host
+            never stops.{" "}
+            {rebootPending
+              ? "The new slot is armed and boots on the next reboot."
+              : "It will finish (or fail) on its own, and a successful apply arms the new slot for the next reboot."}
+          </span>
+        </p>
+      )}
 
       {stepIndex === -1 &&
         (predatesProgress ? (
@@ -5629,7 +5679,14 @@ function UpgradeStatusPanel({
             <Power className="h-3 w-3" /> Reboot to boot new slot
           </button>
         )}
-        {target && (
+        {target && started && (
+          <p className="text-[11px] text-muted-foreground">
+            {activity === "staged"
+              ? "The new slot is already written and armed for the next boot, so this upgrade can no longer be cancelled — clearing it would not disarm the slot."
+              : "The host has already started this upgrade, so it can no longer be cancelled — the host never stops a running slot apply. It will finish (or fail) on its own."}
+          </p>
+        )}
+        {target && !started && (
           <button
             type="button"
             onClick={onCancel}
@@ -5676,10 +5733,15 @@ function ApplianceOsUpgradeSection({
   // #386 Part C — show the full status panel whenever there's upgrade
   // activity: a pending/in-flight desired version, or a terminal
   // in-flight/failed state the supervisor is still reporting.
+  // #2021 — also while a cancel awaits the host's answer, and whenever the
+  // host reports a staged slot: a cancel that lost the race leaves one with
+  // nothing scheduled, and hiding it would read as cancelled.
   const showUpgradeStatus =
     upgradeInFlight ||
     row.last_upgrade_state === "in-flight" ||
-    row.last_upgrade_state === "failed";
+    row.last_upgrade_state === "failed" ||
+    !!row.clear_upgrade_requested ||
+    hostUpgradeActivity(row) !== null;
 
   // Staged upgrade images — fetched only when the operator picks the
   // ``uploaded`` source, so non-air-gapped flows skip the round trip.
@@ -5751,8 +5813,13 @@ function ApplianceOsUpgradeSection({
   const direction = upgradeDirection(row.installed_appliance_version, tag);
   const clearUpgrade = useMutation({
     mutationFn: () => applianceApprovalApi.clearUpgrade(row.id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
+    // #2021 — a 409 means the host started first: refetch so the panel
+    // shows the real state instead of a cancel that did not happen.
+    onSettled: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
+  const clearRefusal = clearUpgrade.error
+    ? upgradeAlreadyStartedRefusal(clearUpgrade.error)
+    : null;
   type SlotVars = { slot: "slot_a" | "slot_b"; acknowledge: boolean };
   const setNextBoot = useMutation({
     mutationFn: ({ slot, acknowledge }: SlotVars) =>
@@ -5857,6 +5924,11 @@ function ApplianceOsUpgradeSection({
             />
           ))}
         </div>
+      )}
+      {clearRefusal && (
+        <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+          {clearRefusal}
+        </p>
       )}
       {slotError && (
         <p className="mt-1 text-xs text-rose-700 dark:text-rose-300">
@@ -6022,8 +6094,10 @@ function ApplianceOsUpgradeSection({
             Stamps <code>desired_appliance_version</code> on the appliance row.
             The supervisor reads it on its next heartbeat + writes the
             slot-upgrade trigger; the host runner dd&apos;s the image to the
-            inactive slot + reboots into it (auto-revert if{" "}
-            <code>/health/live</code> fails).
+            inactive slot and stops there. It does not reboot: use{" "}
+            <strong>Reboot to boot new slot</strong> when you are ready. The new
+            slot boots on trial and is kept only once it comes up healthy;
+            otherwise the next reboot returns to the old one.
           </p>
         </div>
       )}
