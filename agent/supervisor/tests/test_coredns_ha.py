@@ -14,8 +14,8 @@ a rollout stuck forever, blocking every later coredns change.
 
 These tests pin both halves: stock stays stock on one node (no patch at
 all), an already-deadlocked appliance is reverted to stock, a real cluster
-still gets the full HA shape, the count is capped at 2, a rollout that
-could not land is deferred rather than authored, and kubeapi errors
+still gets the full HA shape with one replica per node (#1718), a rollout
+that could not land is deferred rather than authored, and kubeapi errors
 surface.
 """
 
@@ -274,16 +274,31 @@ def test_half_applied_fast_evict_is_repaired_on_a_real_cluster(monkeypatch) -> N
         _STOCK_TOLERATIONS + _FAST_TOLERATIONS)
 
 
-def test_replicas_capped_at_two_on_a_larger_cluster(monkeypatch) -> None:
-    """Required anti-affinity puts at most one pod per node; a third replica
-    on a 3-node cluster costs memory for no extra failure tolerance."""
-    rec = _Recorder(200, _deploy(1, _STOCK_TOLERATIONS), nodes=3)
+@pytest.mark.parametrize("nodes", [3, 5, 7])
+def test_one_replica_per_node_on_a_larger_cluster(monkeypatch, nodes) -> None:
+    """#1718 — every node runs its own CoreDNS, so the kube-dns Service can keep
+    each node's lookups local (ensure_kube_dns_node_local). Capped at 2, the node
+    without a replica sent half its lookups to a lost node's pod until that node
+    read NotReady, and the stalls held the Redis failover to 77 s."""
+    rec = _Recorder(200, _deploy(2, _STOCK_TOLERATIONS + _FAST_TOLERATIONS,
+                                 _REQUIRED_SPREAD), nodes=nodes)
     monkeypatch.setattr(k8s_api, "_request", rec)
 
     changed, err = k8s_api.ensure_coredns_ha()
 
     assert (changed, err) == (True, None)
-    assert rec.patch_body["spec"]["replicas"] == 2
+    assert rec.patch_body["spec"]["replicas"] == nodes
+
+
+def test_two_replicas_on_three_nodes_is_not_converged(monkeypatch) -> None:
+    """The pre-#1718 shape on a three-node cluster is scaled, not left alone."""
+    rec = _Recorder(
+        200, _deploy(2, _STOCK_TOLERATIONS + _FAST_TOLERATIONS, _REQUIRED_SPREAD), nodes=3
+    )
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    assert k8s_api.ensure_coredns_ha() == (True, None)
+    assert rec.patch_body["spec"]["replicas"] == 3
 
 
 # ── Feasibility gate ────────────────────────────────────────────────────────

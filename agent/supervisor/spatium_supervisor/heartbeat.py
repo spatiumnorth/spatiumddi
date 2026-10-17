@@ -1559,6 +1559,14 @@ def heartbeat_once(
         _dns_changed, dns_err = k8s_api.ensure_coredns_ha()
         if dns_err:
             log.warning("supervisor.heartbeat.coredns_ha_failed", error=dns_err)
+        # #1718 — with a CoreDNS replica on every node, keep each node's
+        # lookups on its own: a lost node's CoreDNS pod, still a ready
+        # endpoint until the node reads NotReady, otherwise stalls half of
+        # every other node's lookups (Redis Sentinel into TILT, the
+        # supervisor's own heartbeat into EAI_AGAIN).
+        _local_changed, local_err = k8s_api.ensure_kube_dns_node_local()
+        if local_err:
+            log.warning("supervisor.heartbeat.kube_dns_node_local_failed", error=local_err)
 
     # #170 Wave C2 — render the role-driven compose env. C3 will
     # consume this via ``docker compose --env-file`` to actually

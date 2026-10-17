@@ -372,11 +372,21 @@ that is a function of the **registered node count**:
 | Nodes | Target |
 |---|---|
 | 1 | Stock: 1 replica, no fast-evict toleration, no anti-affinity — both buy nothing with one node, and a 20 s toleration would evict the only DNS pod with nowhere to put it |
-| ≥2 | `min(nodes, 2)` replicas, fast-evict tolerations, and **required** (not preferred) pod anti-affinity |
+| ≥2 | One replica per node, fast-evict tolerations, and **required** (not preferred) pod anti-affinity; the kube-dns Service gets `trafficDistribution: PreferSameNode` |
 
 Required anti-affinity is deliberate and #633 has the evidence: *preferred*
 parked both replicas on the seed, and Kubernetes never rebalances running
 pods, so the "HA" DNS died with the seed anyway.
+
+One replica per node, with node-local routing, is #1718. Until a lost node
+reads NotReady (about 40 s), its CoreDNS pod stays a ready kube-dns endpoint.
+With replicas load-balanced across nodes, about half of every other node's
+lookups went to that pod and stalled for the resolver's whole timeout. Redis
+Sentinel resolves its peers inside its event loop, so the stalls put the
+surviving sentinels into TILT, and the Redis failover took 77 s instead of
+seconds. Each node now resolves through its own replica, falling back to the
+others only while its own is not ready. A lost node takes only its own pods'
+DNS with it.
 
 **What the Cluster DNS card means** (Cluster → Overview, #985). Until now the
 appliance acted on cluster DNS and showed nothing about it, so a CoreDNS that

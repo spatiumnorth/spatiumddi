@@ -527,6 +527,20 @@ the formatter handles the rest.
 
 - **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial could not be written ("value out of int32 range") and the agent zone-state report was refused with a 422, leaving the Zone Sync pill unable to show convergence. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment past 4294967295 wraps to 1 (RFC 1982; it skips 0 the way BIND's own `increment` does, because 0 is the "never seeded" value that every renderer serves as 1). It used to produce 4294967296, which is not a valid SOA serial.
 
+- **After a node's hard loss, Redis fails over in seconds again, not
+  80–100 s (#1718).** Until a lost node reads NotReady (about 40 s), its
+  CoreDNS pod stays a ready endpoint of the cluster DNS Service. About half
+  of every other node's lookups went to it and stalled for the resolver's
+  whole timeout. Redis Sentinel resolves its peers' names inside its event
+  loop, so each stall put the surviving sentinels into TILT, where they act
+  on nothing until 30 s after the last stall. The failover waited for the
+  dead endpoint to leave, plus the TILT period: 77 s in our drill, 78–102 s
+  in the issue. The supervisor now runs one CoreDNS replica on every node
+  (it was capped at two). It also sets `trafficDistribution:
+  PreferSameNode` on the kube-dns Service, so each node resolves through
+  its own replica and a lost node takes only its own pods' DNS with it. A
+  single-node appliance keeps the stock shape.
+
 - **A heartbeat that never reached the control plane is sent again after
   5 s, not after the whole 30 s interval (part of #1805).** Such a
   heartbeat is one whose lookup or connection went to a lost node, or that
