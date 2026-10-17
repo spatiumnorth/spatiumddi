@@ -505,6 +505,18 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
         index=True,
     )
     zone_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    # The zone the op was queued for. ``zone_name`` alone is ambiguous where
+    # two views of one group serve the same name, so the pending-ops list
+    # narrowed to a token's zones keys on this. The queued-op sweeps stay
+    # name-scoped on purpose (see ``record_ops.queued_zone_ops_where``). NULL
+    # on ops queued before the column existed, and after the zone row itself
+    # is purged.
+    zone_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_zone.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     op: Mapped[str] = mapped_column(String(20), nullable=False)  # create | update | delete
     record: Mapped[dict] = mapped_column(JSONB, nullable=False)
     target_serial: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

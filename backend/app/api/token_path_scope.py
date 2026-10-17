@@ -14,10 +14,22 @@ handler runs:
 
 * ``subnet_id``: the token must be bound to that subnet;
 * ``address_id``: the token must be bound to the address's subnet;
-* ``zone_id``: the token must be bound to that zone.
+* ``zone_id``: the token must be bound to that zone;
+* ``block_id`` / ``space_id``: the block or space must contain a subnet the
+  token is bound to (a block is checked through its parent chain), or be
+  named by a grant of its own.
+
+The same names are checked as **query** parameters too (``?subnet_id=…`` on
+a report filters just as a path id selects), every occurrence of a repeated
+parameter included. A block or space that contains one of the token's
+subnets is admitted, not narrowed: handlers keyed on one that return data
+about more than one subnet narrow their own rows with
+``_token_subnet_scope_uuids`` (or refuse, where the answer is a fact about the
+whole block and cannot be narrowed).
 
 Sessions and tokens without resource grants are untouched (one attribute
-read, no query). A path id that does not parse, or an address that does not
+read, no query). A token with a wildcard ``subnet`` grant is not checked on
+blocks and spaces. An id that does not parse, or an address that does not
 exist, is left to the handler, which answers 422 / 404 as before. The
 per-handler checks stay; this is the floor beneath them, and it covers routes
 added later without anyone having to remember.
@@ -28,10 +40,16 @@ from __future__ import annotations
 import uuid
 
 from fastapi import HTTPException, Request, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
-from app.core.permissions import _token_grants_for, token_scope_allows
-from app.models.ipam import IPAddress
+from app.core.permissions import (
+    _token_grants_for,
+    token_scope_allows,
+    token_scoped_resource_ids,
+)
+from app.models.ipam import IPAddress, IPBlock, Subnet
 
 __all__ = ["enforce_path_token_scope"]
 
@@ -50,23 +68,91 @@ def _deny(what: str) -> HTTPException:
     )
 
 
+def _ids(request: Request, name: str) -> list[uuid.UUID]:
+    """Every id the request names under ``name``: the path parameter plus each
+    occurrence of the query parameter. Values that do not parse are skipped
+    (the handler's own validation answers for them)."""
+    raw: list[object] = []
+    if name in request.path_params:
+        raw.append(request.path_params[name])
+    raw.extend(request.query_params.getlist(name))
+    out = []
+    for value in raw:
+        parsed = _uuid(value)
+        if parsed is not None:
+            out.append(parsed)
+    return out
+
+
+async def _granted_containers(
+    db: AsyncSession, subnet_ids: set[uuid.UUID]
+) -> tuple[set[uuid.UUID], set[uuid.UUID]]:
+    """The spaces and blocks (with every ancestor block) that contain one of
+    ``subnet_ids``."""
+    if not subnet_ids:
+        return set(), set()
+    rows = (
+        await db.execute(select(Subnet.space_id, Subnet.block_id).where(Subnet.id.in_(subnet_ids)))
+    ).all()
+    spaces = {r.space_id for r in rows if r.space_id is not None}
+    blocks: set[uuid.UUID] = set()
+    frontier = {r.block_id for r in rows if r.block_id is not None}
+    while frontier:
+        blocks |= frontier
+        parents = (
+            await db.execute(
+                select(IPBlock.parent_block_id).where(
+                    IPBlock.id.in_(frontier), IPBlock.parent_block_id.is_not(None)
+                )
+            )
+        ).scalars()
+        frontier = {p for p in parents if p is not None} - blocks
+    return spaces, blocks
+
+
+def _token_subnet_uuids(user: object) -> set[uuid.UUID] | None:
+    scoped = token_scoped_resource_ids(user, "subnet")  # type: ignore[arg-type]
+    if scoped is None:
+        return None
+    return {u for u in (_uuid(r) for r in scoped) if u is not None}
+
+
 async def enforce_path_token_scope(request: Request, current_user: CurrentUser, db: DB) -> None:
     if not _token_grants_for(current_user):
         return  # session / unscoped token: nothing to narrow
-    params = request.path_params
 
-    subnet_id = _uuid(params.get("subnet_id"))
-    if subnet_id is not None and not token_scope_allows(current_user, "subnet", subnet_id):
-        raise _deny("subnet")
+    for subnet_id in _ids(request, "subnet_id"):
+        if not token_scope_allows(current_user, "subnet", subnet_id):
+            raise _deny("subnet")
 
-    address_id = _uuid(params.get("address_id"))
-    if address_id is not None:
+    for address_id in _ids(request, "address_id"):
         address = await db.get(IPAddress, address_id)
         if address is not None and not token_scope_allows(
             current_user, "subnet", address.subnet_id
         ):
             raise _deny("subnet")
 
-    zone_id = _uuid(params.get("zone_id"))
-    if zone_id is not None and not token_scope_allows(current_user, "dns_zone", zone_id):
-        raise _deny("DNS zone")
+    for zone_id in _ids(request, "zone_id"):
+        if not token_scope_allows(current_user, "dns_zone", zone_id):
+            raise _deny("DNS zone")
+
+    block_ids = _ids(request, "block_id")
+    space_ids = _ids(request, "space_id")
+    if block_ids or space_ids:
+        granted = _token_subnet_uuids(current_user)
+        if granted is None:
+            return  # wildcard subnet grant: every block and space is in scope
+        spaces, blocks = await _granted_containers(db, granted)
+        # A grant naming the block or space itself also admits it, so this
+        # floor stays in step with the per-handler checks if those types
+        # ever become grantable.
+        for block_id in block_ids:
+            if block_id not in blocks and not token_scope_allows(
+                current_user, "ip_block", block_id
+            ):
+                raise _deny("IP block")
+        for space_id in space_ids:
+            if space_id not in spaces and not token_scope_allows(
+                current_user, "ip_space", space_id
+            ):
+                raise _deny("IP space")
