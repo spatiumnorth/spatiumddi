@@ -466,7 +466,13 @@ def test_a_dynamic_update_zone_is_not_swept(tmp_path: Path, monkeypatch) -> None
 
 def test_a_zone_that_cannot_be_read_back_fails_the_apply(tmp_path: Path, monkeypatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and request.url.path.endswith("/old.test."):
+        # The whole-zone read-back of the absent-rrset sweep, not the
+        # SOA-only read that precedes it (#1965).
+        if (
+            request.method == "GET"
+            and request.url.path.endswith("/old.test.")
+            and "rrset_type" not in request.url.query.decode()
+        ):
             return httpx.Response(500, json={"error": "backend error"})
         return _ok(request)
 

@@ -84,6 +84,132 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Block, space and report reads honour an API token's resource
+  binding.** The per-request check added for tokens bound to specific
+  subnets or DNS zones read only path parameters named `subnet_id`,
+  `address_id` and `zone_id`. It now reads the same names in the query
+  string, and also checks `block_id` / `space_id`: a bound token reaches a
+  block or space only when it contains one of the token's subnets. Inside
+  one, the routes that answer about several subnets narrow to the token's
+  own: the block and space DNS-sync previews, the block's aggregation
+  suggestions, and the stale-IP, hygiene and vendor reports. The stale-IP
+  bulk deprecate skips rows outside the binding. Free-space answers for a
+  block or space (`free-space`, `available-subnets`, `plan-allocation`,
+  `find-free`) describe every subnet in it and cannot be narrowed, so they
+  are refused to a token bound to subnets. DNS `delegation-preview` and
+  `delegate-from-parent` also require the token to be bound to the parent
+  zone they read and write. A DNS record op now records the id of its
+  zone, and the per-server pending-ops list narrows by that id, so a
+  same-named zone in another view no longer matches. Block and space
+  create / update check a named `dns_zone_id` against the token's zone
+  grants, as subnet and address writes already did. Sessions and unbound
+  tokens are unaffected.
+
+- **A PowerDNS primary zone now serves an apex NS, so a BIND9
+  secondary on another host can transfer it (#1985).** The agent
+  rendered the apex SOA but never an NS, and PowerDNS does not create
+  one, so a BIND9 secondary refused every transfer with "has no NS
+  records". The apex NS now follows the BIND9 renderer's rule: the
+  zone's own apex NS records when it has any (used as they are), else
+  its Primary NS when that can resolve, else the `ns1.<zone>`
+  placeholder. It is rendered on every reconcile, so existing zones
+  gain it on upgrade, and an NS the operator declared is never
+  overwritten. Deleting a zone's last NS record puts the default back
+  in the same change, so the zone is never left without one. The
+  placeholder gets no loopback glue on PowerDNS: BIND needs that glue
+  only to load a zone it is primary for, and a BIND9 secondary accepts
+  a transferred zone whose NS has no address, with a warning.
+
+- **The DNS agent no longer holds a large bundle several times over while it
+  takes it (#2029).** Fetching a 147 MB bundle (five blocklists on two views,
+  about 708k RPZ entries per view) took the agent to 1.70 - 1.74 GB, and since
+  it shares named's 2Gi container, the container could be OOM-killed before
+  named started. The response body, its decoded text, the parsed bundle and
+  the previous bundle (still referenced for the DNSSEC re-read) were all alive
+  at once. The body is now streamed to a spool file in the state directory and
+  parsed from there, short repeated values are shared instead of copied per
+  entry, and the agent keeps only the previous bundle's zone list. On a
+  synthetic bundle of that shape the agent's peak RSS fell from 1,474 MB to
+  598 MB, and nothing bundle-sized stays resident after the apply. The cache,
+  the rendered zone files and their validation are unchanged. A spool left by
+  an agent killed mid-download is removed at start, a full state disk fails the
+  fetch rather than stopping the sync loop, and a torn cache file still reads
+  as "nothing cached" instead of crashing the agent at boot.
+
+- **An operator's override in the `spatiumddi-appliance` HelmChartConfig
+  is no longer reverted by the next heartbeat (#2024).** The documented
+  way to raise named's memory limit (`dnsBind9.resources` in that CR,
+  `APPLIANCE.md`) was undone within a minute: the supervisor rewrote the
+  CR's whole `valuesContent` to its three data-plane VIP keys on every
+  beat, so the DaemonSet went back to 2Gi. The supervisor now merges its
+  own keys into the live document and writes only when that changes
+  something, so every other key survives; the PATCH is conditional on the
+  resourceVersion it read, so an edit landing in between is retried
+  rather than overwritten. `spatium-metallb` had the same replace-the-
+  document write and goes through the same path; `spatium-control`
+  already merged (#792) and now shares it, keeping #1005's guard against
+  a helm revision that changes nothing. YAML comments in these CRs are
+  dropped when the supervisor next has to change one of its keys; the
+  recipe now says to edit the CR in place rather than `kubectl apply`
+  over it, and `APPLIANCE.md` lists which keys in each of the three CRs
+  belong to the supervisor. That list corrects one earlier claim: the api
+  and worker memory limits in `spatium-control` are sized by the
+  supervisor and put back on every heartbeat, so an override there never
+  held. A CR whose `valuesContent` is only comments now counts as empty
+  instead of unreadable, so commenting an override out no longer freezes
+  the supervisor's own keys in it.
+
+- **PowerDNS serves the control plane's serial, never goes
+  backwards, sends NOTIFY, and transfers a secondary
+  ([#1965](https://github.com/spatiumnorth/spatiumddi/issues/1965),
+  [#1967](https://github.com/spatiumnorth/spatiumddi/issues/1967),
+  [#1968](https://github.com/spatiumnorth/spatiumddi/issues/1968)).**
+  Zones were created with PowerDNS's default `SOA-EDIT-API:
+  DEFAULT`, which rewrote the serial of every change, so a zone
+  never served the serial SpatiumDDI stamped, an SOA-only edit
+  could be served under a serial a secondary already held, and the
+  sync status never matched. Zones are now created with it empty
+  (and cleared on existing ones), and a record op carries the zone
+  to the control plane's serial in the same PATCH. The serial is
+  never sent below the one PowerDNS serves (RFC 1982): the first
+  reconcile after the upgrade used to publish a serial below what
+  PowerDNS had served, and so did any later full reconcile after a
+  record add; it now goes forward by one instead, and the control
+  plane moves `last_serial` up to what a PowerDNS server reports
+  ahead of it. `pdns.conf` now sets `primary=yes` and
+  `secondary=yes`, without which PowerDNS sent no NOTIFY and never
+  transferred a secondary zone, which answered REFUSED while
+  reading in sync; PowerDNS restarts once on upgrade. A PowerDNS
+  secondary at serial 0 no longer reads in sync. A secondary on
+  another host can now transfer from a PowerDNS primary: each zone
+  gets `ALLOW-AXFR-FROM` and `TSIG-ALLOW-AXFR` from the same transfer
+  policy and group TSIG keys BIND9 renders `allow-transfer` from,
+  where before it was NOTIFY-ed and then refused. The serial the
+  control plane adopts from an agent is bounded, so a wrong report
+  cannot push the zone to where the next bump overflows. The agent
+  also reports the served serials after the apply it makes at start
+  (the cached bundle after a slot upgrade), so the upgrade's serials
+  are adopted within a poll or two instead of at the group's next
+  structural change. A record op made before that adoption moves the
+  zone past the served serial and NOTIFYs, rather than publishing the
+  change under a serial the secondaries already hold. A PowerDNS
+  secondary that has transferred reads in sync (its serial is the
+  primary's, never compared with ours), and a new zone's first
+  numbering (0 to 1) writes no `dns.zone.serial_adopted` row.
+
+- **Audit details mask presigned-URL signatures and storage connection
+  strings on read.** The read-side redaction of `GET /api/v1/audit/{id}`,
+  the Audit page and the copilot's audit tool now also masks the signing
+  parameters of a presigned S3 / GCS URL (`X-Amz-Signature`,
+  `X-Amz-Credential`, `X-Amz-Security-Token`, `X-Goog-Signature`,
+  `X-Goog-Credential`), the `AccountKey` of an Azure storage connection
+  string, and any value under a `connection_string` key. Backup-target
+  entries recorded by earlier releases could carry these, in an edited
+  target's `config` or a failed `https_put` / WebDAV run's error text.
+  Stored entries are left exactly as written, since each is part of the
+  audit hash chain; only what is returned changes. The support bundle's
+  scrubber uses the same patterns.
+
 - **InfluxDB Export: a stored password or token survives an edit that
   types in its field and clears it again; "Last push" no longer shows a
   failed attempt as a push; a refused save shows its reason (#1989,
@@ -122,27 +248,6 @@ the formatter handles the rest.
   DaemonSet rather than whichever node's was listed last. No new RBAC: the
   supervisor already lists pods in its namespace. Docker Compose, where the
   kernel kills named alone, keeps the agent's own record.
-
-- **Block, space and report reads honour an API token's resource
-  binding.** The per-request check added for tokens bound to specific
-  subnets or DNS zones read only path parameters named `subnet_id`,
-  `address_id` and `zone_id`. It now reads the same names in the query
-  string, and also checks `block_id` / `space_id`: a bound token reaches a
-  block or space only when it contains one of the token's subnets. Inside
-  one, the routes that answer about several subnets narrow to the token's
-  own: the block and space DNS-sync previews, the block's aggregation
-  suggestions, and the stale-IP, hygiene and vendor reports. The stale-IP
-  bulk deprecate skips rows outside the binding. Free-space answers for a
-  block or space (`free-space`, `available-subnets`, `plan-allocation`,
-  `find-free`) describe every subnet in it and cannot be narrowed, so they
-  are refused to a token bound to subnets. DNS `delegation-preview` and
-  `delegate-from-parent` also require the token to be bound to the parent
-  zone they read and write. A DNS record op now records the id of its
-  zone, and the per-server pending-ops list narrows by that id, so a
-  same-named zone in another view no longer matches. Block and space
-  create / update check a named `dns_zone_id` against the token's zone
-  grants, as subnet and address writes already did. Sessions and unbound
-  tokens are unaffected.
 
 - **A k3s appliance's api, worker and beat never knew their
   appliance version.** firstboot's `sharedEnv` carried no
@@ -481,6 +586,24 @@ the formatter handles the rest.
   BIND 9.20). And the endpoint answers 409 instead of `queued` when it wrote
   no op at all (no primary, or no enabled agent-based server).
 
+- **A DNS server crash-looping on a bundle too big for its memory
+  limit takes the fixed bundle once the cause is removed
+  ([#2019](https://github.com/spatiumnorth/spatiumddi/issues/2019)).**
+  The agent re-applied its cached bundle at every start, before it
+  synced, so named was OOM-killed on the same config each time and
+  never saw the bundle the operator had fixed. The agent now marks
+  every apply in its state directory and counts a death when the
+  process dies within 5 minutes of one. After one, startup asks the
+  control plane first and falls back to the cache only when it cannot
+  be reached, or when its own bundle fails to apply. Only deaths the
+  agent watched (named exited while the agent lived) can quarantine a
+  bundle: after two, the last-known-good serves if it is a different
+  bundle, and otherwise the cache is retried on the quarantine's
+  backoff. A death the agent did not see (a power cut, a node reboot,
+  or the whole-container OOM kill of #2018) never leaves the server
+  dark while the control plane is unreachable. A revert never goes back
+  to a bundle named was seen dying on. The server row says why it is
+  not on the cached bundle.
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored
   policy name, description, reference, result detail and diagnostic, went
