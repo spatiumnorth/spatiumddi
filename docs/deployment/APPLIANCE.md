@@ -1388,7 +1388,7 @@ The fix:
 - Identity (hostname, full cert fingerprint, paired-at + paired-from-ip, last-seen).
 - **Role assignment** — pick a subset of `dns-bind9` / `dns-powerdns` / `dns-technitium` / `dhcp` / `observer`. DNS engines are mutually exclusive; chips for capabilities the supervisor doesn't advertise dim with a tooltip. DNS / DHCP group dropdowns appear conditionally on the selection.
 - **Firewall preview + operator override** — live preview of the role-driven profile (idle / dns-only / dhcp-only / dns-and-dhcp), always-open + per-role port summary, raw-nft textarea for operator overrides.
-- **OS & lifecycle** — installed appliance version, running + durable-default slots (with trial-boot chip), last upgrade state, Schedule OS upgrade form, Cancel pending upgrade, Reboot host (with a double-confirm modal requiring an "I understand this will go offline" checkbox).
+- **OS & lifecycle** — installed appliance version, running + durable-default slots (with trial-boot chip), last upgrade state, Schedule OS upgrade form, Cancel pending upgrade (only until the host starts the apply: once the host reports it applying or staged it is refused with a 409, and a cancel sent before the host reported is confirmed by its next heartbeat, which records `appliance.upgrade_cancel_lost` and shows the running upgrade if the host had already started, #2021), Reboot host (with a double-confirm modal requiring an "I understand this will go offline" checkbox).
 - **Certificate** — serial, issued/expires timestamps. Re-key + Delete actions on the modal footer.
 
 ### Operator Copilot tools (#170 Wave D2)

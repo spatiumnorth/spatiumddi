@@ -2610,6 +2610,12 @@ export interface AuditLogEntry {
   resource_display: string;
   result: string;
   source_ip: string | null;
+  /** Recorded details (#2009): null on the list, filled by `auditApi.get`.
+   *  Credential-shaped values arrive already redacted. */
+  old_value?: Record<string, unknown> | null;
+  new_value?: Record<string, unknown> | null;
+  changed_fields?: string[] | null;
+  error_detail?: string | null;
 }
 
 export interface AuditLogPage {
@@ -2797,6 +2803,9 @@ export const auditApi = {
     result?: string;
     source_ip?: string;
   }) => api.get<AuditLogPage>("/audit", { params }).then((r) => r.data),
+  /** One entry with its old / new values and changed fields (#2009). */
+  get: (id: string) =>
+    api.get<AuditLogEntry>(`/audit/${id}`).then((r) => r.data),
   /** Walk the chain and report any tampering (issue #73). The
    *  ``max_rows`` cap is for huge tables — leave unset for a full
    *  sweep. */
@@ -10406,30 +10415,40 @@ export const apiTokensApi = {
 
 // ── Alerts ─────────────────────────────────────────────────────────────────────
 
-export type AlertRuleType =
-  | "subnet_utilization"
-  | "server_unreachable"
-  | "asn_holder_drift"
-  | "asn_whois_unreachable"
-  | "rpki_roa_expiring"
-  | "rpki_roa_expired"
-  | "domain_expiring"
-  | "domain_nameserver_drift"
-  | "domain_registrar_changed"
-  | "domain_dnssec_status_changed"
-  | "circuit_term_expiring"
-  | "circuit_status_changed"
-  | "service_term_expiring"
-  | "service_resource_orphaned"
-  | "compliance_change"
-  | "voice_lease_count_below"
-  | "stale_ip_count"
-  | "dhcp_pool_exhaustion"
-  | "secret_expiring"
-  | "decom_expiring"
-  | "node_pressure"
-  | "backup_failed"
-  | "backup_stale";
+// The rule-type list is the backend's (``GET /alerts/rule-types``), not a
+// union kept here: a hand-kept union knew 23 of ~64 types (#1997).
+export type AlertRuleType = string;
+export interface AlertParamOption {
+  value: string;
+  label: string;
+}
+export interface AlertParamSpec {
+  name:
+    | "threshold_percent"
+    | "threshold_days"
+    | "min_free_addresses"
+    | "server_type"
+    | "classification"
+    | "change_scope";
+  label: string;
+  kind: "integer" | "select";
+  unit: string | null;
+  min: number | null;
+  max: number | null;
+  /** What the evaluator uses when the stored value is null. */
+  default: number | string | null;
+  /** Starting value for a new rule's form. */
+  initial: number | string | null;
+  hint: string | null;
+  options: AlertParamOption[];
+}
+export interface AlertRuleTypeSpec {
+  rule_type: string;
+  label: string;
+  group: string;
+  description: string | null;
+  params: AlertParamSpec[];
+}
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with
@@ -10521,6 +10540,8 @@ export interface AlertEvaluateResult {
 
 export const alertsApi = {
   listRules: () => api.get<AlertRule[]>("/alerts/rules").then((r) => r.data),
+  ruleTypes: () =>
+    api.get<AlertRuleTypeSpec[]>("/alerts/rule-types").then((r) => r.data),
   createRule: (body: AlertRuleCreate) =>
     api.post<AlertRule>("/alerts/rules", body).then((r) => r.data),
   updateRule: (id: string, body: AlertRuleUpdate) =>
@@ -12620,6 +12641,10 @@ export interface ApplianceUpgradeProgress {
   detail: string;
   /** ISO-8601 timestamp the step was entered. */
   at: string;
+  /** #2007 — on ``reboot-pending``: the slot armed and the boot it was
+   *  staged under, which the supervisor settles against after the reboot. */
+  staged_slot?: string;
+  staged_boot_id?: string;
 }
 
 export interface ApplianceRow {
@@ -12707,6 +12732,9 @@ export interface ApplianceRow {
   desired_default_slot: string | null;
   reboot_requested: boolean;
   reboot_requested_at: string | null;
+  // #2021 — a clear the host has not answered yet. A Cancel's 200 is
+  // provisional until then: the host may already have started the apply.
+  clear_upgrade_requested?: boolean;
   // #170 Wave C2 — role assignment + free-form tags.
   assigned_roles: string[];
   assigned_dns_group_id: string | null;

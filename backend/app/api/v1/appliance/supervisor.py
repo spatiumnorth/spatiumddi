@@ -2109,6 +2109,9 @@ async def supervisor_heartbeat(
         row.slot_b_version = body.slot_b_version
     if body.is_trial_boot is not None:
         row.is_trial_boot = body.is_trial_boot
+    # #2021 — what the host reported before this heartbeat, so a host that
+    # STARTS applying an upgrade nobody has scheduled is noticed once.
+    activity_before = host_upgrade_activity(row)
     # #786 — while a clear is outstanding, drop ONLY a report that still
     # carries the dismissed failure. The supervisor collected it before it
     # saw the command, so ingesting it would re-stamp the row we cleared
@@ -2132,6 +2135,63 @@ async def supervisor_heartbeat(
             row.last_upgrade_log_tail = body.last_upgrade_log_tail or None
         if body.last_upgrade_progress is not None:
             row.last_upgrade_progress = body.last_upgrade_progress or None
+    # #2021 — a cancel that lost the race. Scheduling wakes this heartbeat,
+    # so the response that delivered the upgrade has usually fired the
+    # trigger before an operator's clear lands; the clear then answers 200
+    # (nothing reported yet) and the host, which never stops a running
+    # apply, carries on. This report is the first word on it. The row
+    # already shows it — the host's state was just ingested and the clear
+    # only nulled ``desired_*`` — so what is left is to say so in the audit
+    # log rather than leave ``appliance.upgrade_cleared`` as the last word.
+    # Logged once, on the transition. Never re-stamps ``desired_*``: the
+    # clear also removed the fire-once marker, so the supervisor would fire
+    # a SECOND apply of the same image.
+    activity_after = host_upgrade_activity(row)
+    if (
+        row.desired_appliance_version is None
+        and activity_after is not None
+        and activity_before is None
+    ):
+        cancel_outstanding = row.clear_upgrade_requested
+        logger.warning(
+            (
+                "appliance_upgrade_cancel_lost"
+                if cancel_outstanding
+                else "appliance_upgrade_unscheduled_apply"
+            ),
+            appliance_id=str(row.id),
+            hostname=row.hostname,
+            host_activity=activity_after,
+        )
+        progress_now = row.last_upgrade_progress or {}
+        db.add(
+            AuditLog(
+                user_id=None,
+                user_display_name=row.hostname,
+                auth_source="supervisor",
+                action=(
+                    "appliance.upgrade_cancel_lost"
+                    if cancel_outstanding
+                    else "appliance.upgrade_unscheduled_apply"
+                ),
+                resource_type="appliance",
+                resource_id=str(row.id),
+                resource_display=row.hostname,
+                result="failed" if cancel_outstanding else "success",
+                new_value={
+                    "host_activity": activity_after,
+                    "last_upgrade_state": row.last_upgrade_state,
+                    "step": (progress_now.get("step") if isinstance(progress_now, dict) else None),
+                    "detail": (
+                        "the host had already started the upgrade when the cancel "
+                        "reached it; it does not stop a running apply"
+                        if cancel_outstanding
+                        else "the host is applying an upgrade the control plane "
+                        "does not have scheduled"
+                    ),
+                },
+            )
+        )
     if body.snmpd_running is not None:
         row.snmpd_running = body.snmpd_running
     if body.lldpd_running is not None:
@@ -3306,6 +3366,10 @@ class ApplianceRow(BaseModel):
     desired_default_slot: str | None
     reboot_requested: bool
     reboot_requested_at: datetime | None
+    # #2021 — a clear (#786 dismissal, or a Cancel) the host has not yet
+    # answered. A Cancel's 200 is provisional until then: the host may have
+    # started the apply already, which the next heartbeat reports.
+    clear_upgrade_requested: bool = False
     # #170 Wave C2 — role assignment + free-form tags.
     assigned_roles: list[str]
     assigned_dns_group_id: uuid.UUID | None
@@ -3539,6 +3603,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         desired_default_slot=row.desired_default_slot,
         reboot_requested=row.reboot_requested,
         reboot_requested_at=row.reboot_requested_at,
+        clear_upgrade_requested=bool(row.clear_upgrade_requested),
         assigned_roles=list(row.assigned_roles or []),
         assigned_dns_group_id=row.assigned_dns_group_id,
         assigned_dhcp_group_id=row.assigned_dhcp_group_id,
@@ -6464,9 +6529,16 @@ async def schedule_appliance_upgrade(
     """Stamps ``desired_appliance_version`` + ``desired_slot_image_url``
     on the appliance row. The supervisor's next heartbeat picks them up
     and fires the slot-upgrade trigger; the host runner downloads + dd's
-    the raw.xz to the inactive slot + reboots into it. Per-row reboot is
-    optional — operators who want to defer can clear desired_* via
-    ``/clear-upgrade`` before the supervisor's next heartbeat.
+    the raw.xz to the inactive slot and stops; it does NOT reboot. The
+    operator reboots (Fleet "Reboot to boot new slot") to boot it.
+
+    Scheduling wakes the supervisor's heartbeat (#358), so the host
+    normally starts the apply within about a second, and a cancel rarely
+    wins. ``/clear-upgrade`` answers 409 once the host reports the runner
+    applying or the slot staged; before that its 200 is provisional and
+    the next heartbeat settles it (``appliance.upgrade_cancel_lost`` when
+    the host had already started). The host deliberately does not stop a
+    running apply (#2021).
 
     For air-gapped fleets, pass ``slot_image_id`` (an
     ``appliance_slot_image`` row from the upload endpoint) instead of
@@ -6588,6 +6660,61 @@ async def schedule_appliance_upgrade(
     return _row_to_schema(row)
 
 
+# #2021 — mirrors the supervisor's _STALE_INFLIGHT_SECONDS: a live runner
+# re-stamps its in-flight marker every ~60 s, so one older than this is a
+# dead apply the supervisor is about to reap, not a running one. Without the
+# allowance the 409 below would lock an operator out of the "cancel and
+# re-apply" recovery the Fleet panel offers for a stuck apply.
+_UPGRADE_INFLIGHT_STALE_SECONDS = 300
+
+# Progress steps that are NOT the runner working on the current apply. The
+# runner writes ``queued`` the instant it claims the trigger, so an in-flight
+# state with one of these (or none) is a trigger it has not claimed yet:
+# ``reboot-pending`` / ``failed`` are a previous run's leftovers, ``{}`` a
+# reset. A deny-list, so a step added later still counts as live.
+_NOT_LIVE_UPGRADE_STEPS = frozenset({"", "failed", "reboot-pending"})
+
+
+def host_upgrade_activity(
+    row: Appliance, now: datetime | None = None
+) -> Literal["applying", "staged"] | None:
+    """What the host reports its slot-upgrade runner has done (#2021).
+
+    * ``applying`` — the runner has claimed the trigger and is downloading /
+      writing: ``in-flight`` with a live progress step, stamp fresh.
+    * ``staged`` — the runner finished and armed next-boot, and the node has
+      not booted it yet: ``done`` with progress ``reboot-pending`` carrying
+      the #2007 staged identity (only a runner the supervisor can settle
+      writes it; an older runner's ``done`` can outlive its reboot, so it is
+      not counted), on a node not already running the staged slot (a trial
+      boot of it is still ``done`` until firstboot commits).
+
+    Neither can be undone by ``/clear-upgrade``: the host never stops a
+    running apply, and clearing does not disarm next-boot. An in-flight
+    report WITHOUT a live step is a trigger the runner has not claimed, which
+    the clear's host command does remove, so it is not counted either.
+    """
+    state = row.last_upgrade_state
+    progress = row.last_upgrade_progress if isinstance(row.last_upgrade_progress, dict) else {}
+    step = progress.get("step")
+    step = step if isinstance(step, str) else ""
+    if state == "in-flight":
+        if step in _NOT_LIVE_UPGRADE_STEPS:
+            return None
+        at = row.last_upgrade_state_at
+        if at is None:
+            return "applying"
+        at = at if at.tzinfo is not None else at.replace(tzinfo=UTC)
+        age = ((now or datetime.now(UTC)) - at).total_seconds()
+        return "applying" if age <= _UPGRADE_INFLIGHT_STALE_SECONDS else None
+    if state == "done" and step == "reboot-pending" and progress.get("staged_boot_id"):
+        staged_slot = progress.get("staged_slot")
+        if staged_slot and row.current_slot == staged_slot:
+            return None
+        return "staged"
+    return None
+
+
 @router.post(
     "/appliances/{appliance_id}/clear-upgrade",
     response_model=ApplianceRow,
@@ -6608,6 +6735,20 @@ async def clear_appliance_upgrade(
     columns verbatim on every heartbeat, so without the command the next
     heartbeat restores the failure — and rebooting does not help, because
     those sidecars live on the persistent /var (#786).
+
+    Refuses with 409 (``detail.code == "upgrade_already_started"``) once
+    the host reports the runner has claimed the trigger or staged the slot
+    (``host_upgrade_activity``): the host does not stop a running apply and
+    a clear does not disarm next-boot, so answering 200 would show a cancel
+    that never happened (#2021). The refusal is audited and changes nothing.
+
+    A 200 is provisional when the upgrade was scheduled moments ago: the
+    heartbeat that delivered it may already have fired the trigger, and the
+    host reports that only on its next heartbeat. ``clear_upgrade_requested``
+    stays set on the row until the host answers; if that answer shows the
+    runner applying or staged, the heartbeat records
+    ``appliance.upgrade_cancel_lost`` and the row shows the running upgrade,
+    never a cancelled one.
     """
     _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
@@ -6617,6 +6758,45 @@ async def clear_appliance_upgrade(
     # the flag set — which permanently suppresses that appliance's heartbeat
     # long-poll. Same gate the other host-command mutators apply.
     _check_appliance_slot_action_allowed(row)
+    activity = host_upgrade_activity(row)
+    if activity is not None:
+        progress = row.last_upgrade_progress or {}
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="appliance.upgrade_clear_refused",
+                resource_type="appliance",
+                resource_id=str(row.id),
+                resource_display=row.hostname,
+                result="failed",
+                new_value={
+                    "reason": "upgrade_already_started",
+                    "host_activity": activity,
+                    "desired_appliance_version": row.desired_appliance_version,
+                    "last_upgrade_state": row.last_upgrade_state,
+                    "step": progress.get("step") if isinstance(progress, dict) else None,
+                },
+            )
+        )
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "upgrade_already_started",
+                "host_activity": activity,
+                "message": (
+                    "The host has already started this upgrade and does not stop a "
+                    "running slot apply, so it cannot be cancelled. It will stage the "
+                    "new slot (or fail) on its own."
+                    if activity == "applying"
+                    else "The new slot is already written and armed for the next boot, "
+                    "and clearing the upgrade does not disarm it: the node boots the "
+                    "new slot on its next reboot."
+                ),
+            },
+        )
     row.desired_appliance_version = None
     row.desired_slot_image_url = None
     row.desired_slot_image_sha256 = None
