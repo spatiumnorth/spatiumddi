@@ -394,15 +394,12 @@ class SyncLoop:
         try:
             with self._client() as c:
                 resp = get_config(c, headers, self.cfg.state_dir)
-        except httpx.HTTPError as e:
+        # #2029 — OSError: the body is spooled to the state dir, and a full
+        # disk there fails this fetch exactly as an unreachable control plane
+        # does (the partial spool is already removed, the cache untouched)
+        # rather than ending the sync thread.
+        except (httpx.HTTPError, OSError) as e:
             log.warning("sync_http_error", error=str(e))
-            time.sleep(5.0)
-            return
-        except OSError as e:
-            # #2029 — the body is spooled to the state dir; a full disk there
-            # fails this fetch (the partial spool is already removed) and
-            # leaves the cache as it was, rather than killing the sync thread.
-            log.warning("sync_spool_failed", error=str(e))
             time.sleep(5.0)
             return
 

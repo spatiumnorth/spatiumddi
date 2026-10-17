@@ -8,10 +8,11 @@ Layout under /var/lib/spatium-dns-agent/:
     config/previous.json           # last bundle that APPLIED cleanly (#882)
     config/previous.etag
     config/quarantine.json         # etag of a bundle that failed to apply (#882)
-    config/fetch.json.part         # a 200's body while it downloads (#2029);
-                                   # never read as a cache, removed on start
     rendered/                      # managed by driver
     ops/{inflight,failed}/
+
+A 200's body is spooled to ``config/fetch.json.part`` while it downloads
+(#2029). It is never read as a cache and is removed on start.
 """
 
 from __future__ import annotations
