@@ -95,6 +95,61 @@ the formatter handles the rest.
   checkboxes' own labels, which had named only the first one. The PXE page's
   own `Field` links a lone control or labels a group.
 
+- **The audit API and page now show what an entry recorded (#2009).**
+  An entry's `old_value` / `new_value` / `changed_fields` (for example a
+  per-box upgrade's `direction` and `schema_check`) were stored and
+  returned nowhere, so the only way to see them was SQL.
+  `GET /audit/{id}` returns them, `GET /audit` does too with
+  `include_details=true`, the Audit Log page expands a row to show them,
+  and `get_audit_history` carries `old_value` / `new_value` when asked
+  with `include_details` (off by default, because the copilot's provider
+  can be off-premises; non-negotiable #13). Values are
+  redacted on read (credential-shaped keys and secret-shaped strings,
+  a PEM private key whole), because the writers are hundreds of call
+  sites and nothing stops one storing a credential. The writers' own
+  `<field>_set: true` flags are kept, since whether a secret was set is
+  the detail worth reading. Reading details takes the same `read` on
+  `audit_log` as the list. Audit forwarding to syslog / webhook targets
+  still sends the stored values unredacted.
+
+- **A device policy whose classes have no fingerprinted devices yet now says
+  why it is not rendered (#2000).** With classes selected and nothing seen in
+  them, the policy compiles to an empty expression and is correctly left out of
+  the Kea config, but the preview said only "Renders: no". `compile_device_policy`
+  now warns that no devices have been seen in the selected classes yet, so the
+  policy matches nothing and is not rendered, in the REST preview, the dialog
+  and `preview_dhcp_device_policy`. When devices in those classes were seen but
+  none sent DHCP options 55 or 60 in a form that can be matched, it says that
+  instead, with the count. Neither fires when signatures exist, when a manual
+  match is set, or when every signature was excluded as ambiguous (that case
+  keeps its own warning).
+
+- **The alert rule editor can edit every rule type's thresholds, not
+  just the 23 it was hand-coded for (#1997).** The editor's type list
+  and per-type fields were a frontend union that knew 23 of the
+  backend's 64 rule types, so for the rest (`ip_free_but_responding`,
+  `stale_reservation`, `dns_nxdomain_spike`, `tls_cert_expiring` and so
+  on) `threshold_days`, `threshold_percent` and friends could only be set
+  through the API. The backend now serves the catalogue at
+  `GET /api/v1/alerts/rule-types` (same access as listing rules): label,
+  group and, for each type, the parameters its evaluator reads, with
+  unit, bounds, select options and the value the evaluator uses when the
+  stored one is null. The editor and the rules table's Parameters column
+  render from it, and a type with no parameters says "No adjustable
+  parameters". `tests/test_alert_rule_catalogue.py` fails when a rule
+  type is missing from the catalogue or when a type's declared
+  parameters differ from the `rule.<column>` reads in its evaluator
+  (followed into helpers, `getattr` included), and every type without a
+  dispatch branch must be named as externally driven, so the two cannot
+  drift again. A new rule starts from the evaluator's default, or empty
+  where the API would refuse that default (the query-rate spike's 200%
+  is above the field's 0..100); a DHCP pool rule's 90% is shown only as
+  a starting value, because the evaluator applies it only while the
+  free-address floor is also empty. The #1986 guarantees hold: stored values
+  are kept, a stored null stays empty, and an unchanged Save sends
+  nothing. No MCP tool: this is editor metadata, and `list_alert_rules`
+  already covers the rules themselves.
+
 - **Creating an alert rule, firewall policy or alias, conformity policy,
   backup target, API token, DNS group, server, zone, TSIG key, view,
   blocklist entry or exception, or an upgrade run no longer writes an

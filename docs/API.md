@@ -566,6 +566,19 @@ with `{"detail": "An IP space named 'Corporate' already exists"}`.
 Every mutation is written to the append-only `audit_log` before the
 response returns (non-negotiable #4).
 
+Read an entry's recorded details with `GET /api/v1/audit/{id}`, which
+returns `old_value`, `new_value`, `changed_fields` and `error_detail`
+(for example a scheduled upgrade's `direction` and `schema_check`).
+`GET /api/v1/audit` leaves them `null` unless called with
+`include_details=true`, since a page can be 500 rows. Values are
+redacted on read: a key that looks like a credential (password, token,
+secret, `*_key`, `*_encrypted`, ...) comes back as `[redacted]`, and
+secret-shaped strings (JWTs, Fernet tokens, bearer values, chat-webhook
+URLs) are masked wherever they appear; a string carrying a PEM private
+key is replaced whole. A boolean or integer under a credential-shaped
+key is kept, so a writer's `smtp_password_set: true` still says whether
+the secret was set. Both endpoints need `read` on `audit_log`.
+
 ### 7.2 Read the running version (public)
 
 `GET /api/v1/version` is unauthenticated (the login page calls it for
