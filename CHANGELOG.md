@@ -89,7 +89,11 @@ the formatter handles the rest.
   handler lived only on the panel, so the key reached nothing. The
   shared `HeaderMenu` now listens for Esc on the document while open,
   closes, returns focus to the trigger and stops the event so a parent
-  dialog does not also close; a closed menu leaves Esc alone.
+  dialog does not also close; a closed menu leaves Esc alone. It also
+  closes when focus moves to another control, so two menus can no longer
+  be open at once, and it leaves an Esc alone when focus is in a layer
+  opened over it (the Cmd+K palette, the `?` overlay) or when the key
+  ends an IME composition.
 
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent

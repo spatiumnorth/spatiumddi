@@ -110,8 +110,24 @@ export function HeaderMenu({
     // before the modal hook's window listener; stopPropagation only
     // because the menu was open and handled it, so a closed menu never
     // swallows the Esc a parent dialog is waiting for.
+    //
+    // Two guards. An Esc that ends an IME composition belongs to the
+    // input method, not to us. And the Esc is ours only while focus is
+    // in the menu (trigger or panel) or nowhere (<body>): if a layer
+    // opened over the menu without a pointer press — Cmd+K's palette,
+    // the `?` overlay, a modal from a page shortcut — focus is in that
+    // layer and so is the Esc. The focusout handler on the container
+    // normally closes the menu before that can happen; this is the
+    // backstop, so a missed focusout cannot yank focus back behind the
+    // layer the operator is in.
     const onDocKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
+      if (e.key !== "Escape" || e.isComposing) return;
+      const active = document.activeElement;
+      const inMenu =
+        !active ||
+        active === document.body ||
+        (ref.current?.contains(active) ?? false);
+      if (!inMenu) return;
       e.preventDefault();
       e.stopPropagation();
       close(true);
@@ -186,7 +202,19 @@ export function HeaderMenu({
   if (items.length === 0) return null;
 
   return (
-    <div ref={ref} className={cn("relative", className)}>
+    <div
+      ref={ref}
+      className={cn("relative", className)}
+      // Focus leaving the menu for somewhere else closes it, so an open
+      // menu never sits under whatever took focus (a Tab off a mouse-opened
+      // trigger, or a layer that focused itself). A null relatedTarget is
+      // focus going nowhere — a click on the page, the window losing focus
+      // — which the outside-mousedown handler already decides.
+      onBlur={(e) => {
+        const next = e.relatedTarget as Node | null;
+        if (open && next && !e.currentTarget.contains(next)) setOpen(false);
+      }}
+    >
       <HeaderButton
         ref={triggerRef}
         icon={Icon}
