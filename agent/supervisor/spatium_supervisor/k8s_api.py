@@ -91,6 +91,12 @@ class PodStatus:
     status: str  # Pending / Running / Succeeded / Failed / Unknown
     container_statuses: list[dict[str, Any]] = field(default_factory=list)
     labels: dict[str, str] = field(default_factory=dict)
+    # #2018 — ``spec.nodeName``, so the watchdog can tell this node's pod of
+    # a DaemonSet from another node's, and each container's
+    # ``resources.limits.memory`` (``"2Gi"``), so an ``OOMKilled`` report can
+    # name the limit that was hit.
+    node_name: str = ""
+    memory_limits: dict[str, str] = field(default_factory=dict)
 
 
 def _resolve_config() -> KubeConfig | None:
@@ -339,7 +345,13 @@ def list_pods(
     out: list[PodStatus] = []
     for item in data.get("items") or []:
         meta = item.get("metadata") or {}
+        spec = item.get("spec") or {}
         status_block = item.get("status") or {}
+        limits: dict[str, str] = {}
+        for c in spec.get("containers") or []:
+            mem = ((c.get("resources") or {}).get("limits") or {}).get("memory")
+            if c.get("name") and mem:
+                limits[str(c["name"])] = str(mem)
         out.append(
             PodStatus(
                 name=meta.get("name") or "",
@@ -347,6 +359,8 @@ def list_pods(
                 status=status_block.get("phase") or "Unknown",
                 container_statuses=status_block.get("containerStatuses") or [],
                 labels=meta.get("labels") or {},
+                node_name=spec.get("nodeName") or "",
+                memory_limits=limits,
             )
         )
     return out

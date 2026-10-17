@@ -19,10 +19,18 @@ daemon has stayed up for :data:`STABLE_SECONDS`, longer than Kubernetes'
 5 min crash-loop back-off, so a container that only survives between
 back-offs never reads as recovered.
 
-Limit: the kernel kills the largest process in the cgroup, which with a big
-RPZ is ``named``. If it picks the agent instead, the container dies before
-anything can be written, and only the orchestrator (``OOMKilled`` as the
-container's last state) records it.
+Limit: this only works where the kernel kills ``named`` alone, which is
+Docker's behaviour (Compose): the OOM killer picks the largest process in the
+cgroup and the agent survives to write the record. The kubelet (cgroup v2,
+Kubernetes 1.28+) sets ``memory.oom.group`` on every container instead, so
+on the appliance and on any Kubernetes install the whole container dies at
+once, the agent with ``named``, and nothing here runs: no record is written,
+and the restarted container is a new cgroup whose counter starts at zero, so
+the baseline below cannot see the kill either (#2018). There the kubelet's
+``OOMKilled`` (the container's last state) is the record: the appliance
+supervisor reports it on its heartbeat and the control plane turns it into
+the same ``oom_killed:`` state
+(``backend/app/services/agents/container_oom.py``).
 """
 
 from __future__ import annotations

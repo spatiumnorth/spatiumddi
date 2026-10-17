@@ -198,6 +198,12 @@ def render_pdns_conf(
             # actual acceptance, so this is a no-op for zones without an ACL.
             "dnsupdate=yes",
             "",
+            # Declare the server's roles: PowerDNS sends no NOTIFY while
+            # ``primary`` is ``no`` and never transfers a secondary zone while
+            # ``secondary`` is ``no`` (#1967). Mirrors the agent's renderer.
+            "primary=yes",
+            "secondary=yes",
+            "",
         ]
     )
 

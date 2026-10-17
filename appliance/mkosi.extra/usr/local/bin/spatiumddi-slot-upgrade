@@ -111,12 +111,32 @@ echo "[$(date -Iseconds)] === spatiumddi-slot-upgrade fired ==="
 
 # Structured progress for the Fleet UI. Best-effort — never abort the
 # upgrade on a progress-write hiccup.
-write_progress() {  # $1 = step, $2 = human detail
-    local detail
+write_progress() {  # $1 = step, $2 = human detail, $3 = extra JSON members
+    local detail extra=""
     detail=$(printf '%s' "${2:-}" | tr -d '"\\\r\n')
-    atomic_write "$PROGRESS" "$(printf '{"step":"%s","pct":null,"detail":"%s","at":"%s"}' \
-        "$1" "$detail" "$(date -Iseconds)")" 2>/dev/null || true
+    [ -n "${3:-}" ] && extra=",$3"
+    atomic_write "$PROGRESS" "$(printf '{"step":"%s","pct":null,"detail":"%s","at":"%s"%s}' \
+        "$1" "$detail" "$(date -Iseconds)" "$extra")" 2>/dev/null || true
     publish_sidecar "$PROGRESS"
+}
+
+# #2007 — what the supervisor needs to settle reboot-pending once the node
+# comes back: the boot this was staged under (a different boot_id later is
+# a reboot, with no clock involved) and the slot set-next-boot armed (so a
+# boot that lands anywhere else reads as a rollback, not a success). Both
+# are omitted when unreadable; the supervisor then leaves the state alone.
+GRUBENV_FILE="${SPATIUM_GRUBENV:-/boot/efi/grub/grubenv}"
+BOOT_ID_FILE="${SPATIUM_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+staged_identity_json() {
+    local slot boot out=""
+    slot=$(sed -n 's/^next_entry=//p' "$GRUBENV_FILE" 2>/dev/null | head -n 1 || true)
+    case "$slot" in slot_a|slot_b) out="\"staged_slot\":\"$slot\"" ;; esac
+    boot=$(tr -cd '0-9a-f-' 2>/dev/null < "$BOOT_ID_FILE" || true)
+    if [ -n "$boot" ]; then
+        [ -n "$out" ] && out="$out,"
+        out="$out\"staged_boot_id\":\"$boot\""
+    fi
+    printf '%s' "$out"
 }
 
 # #421 — keep the coarse in-flight stamp fresh while we work. Best-effort:
@@ -305,7 +325,8 @@ if [ "$apply_rc" -eq 0 ]; then
         stop_inflight_ticker  # before the terminal write so it can't be reverted
         atomic_write "${TRIGGER}.state" "done $(date -Iseconds)"
         publish_sidecar "${TRIGGER}.state"
-        write_progress "reboot-pending" "upgrade staged — reboot to boot the new slot"
+        write_progress "reboot-pending" "upgrade staged — reboot to boot the new slot" \
+            "$(staged_identity_json)"
         # Parity with every other terminal mv: never let a rename race
         # (e.g. supervisor already reaped the trigger) abort under set -e
         # after the correct terminal state is already on disk (#421).
