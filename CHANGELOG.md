@@ -84,6 +84,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The bulk zone delete's Trash warning agrees in number (#2048).**
+  Deleting two zones opened "Move 2 Zones to Trash" with the
+  single-zone sentence "The zone and its records move to Trash"
+  while the rest of the dialog was plural. The warning is now built
+  from the selection count: "The 2 zones and all their records move
+  to Trash", and the single-zone wording is unchanged for one zone.
+
 - **Block, space and report reads honour an API token's resource
   binding.** The per-request check added for tokens bound to specific
   subnets or DNS zones read only path parameters named `subnet_id`,
