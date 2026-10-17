@@ -98,8 +98,14 @@ the formatter handles the rest.
   render from it, and a type with no parameters says "No adjustable
   parameters". `tests/test_alert_rule_catalogue.py` fails when a rule
   type is missing from the catalogue or when a type's declared
-  parameters differ from the `rule.<column>` reads in its evaluator, so
-  the two cannot drift again. The #1986 guarantees hold: stored values
+  parameters differ from the `rule.<column>` reads in its evaluator
+  (followed into helpers, `getattr` included), and every type without a
+  dispatch branch must be named as externally driven, so the two cannot
+  drift again. A new rule starts from the evaluator's default, or empty
+  where the API would refuse that default (the query-rate spike's 200%
+  is above the field's 0..100); a DHCP pool rule's 90% is shown only as
+  a starting value, because the evaluator applies it only while the
+  free-address floor is also empty. The #1986 guarantees hold: stored values
   are kept, a stored null stays empty, and an unchanged Save sends
   nothing. No MCP tool: this is editor metadata, and `list_alert_rules`
   already covers the rules themselves.

@@ -72,6 +72,18 @@ function shownFor(p: AlertParamSpec, stored: unknown): number | string | null {
   return p.default ?? p.initial ?? p.options[0]?.value ?? null;
 }
 
+// A new rule's starting value when the catalogue names no ``initial``: the
+// evaluator's default, unless the API would refuse it (dns_query_rate_spike's
+// 200% is above threshold_percent's 0..100) — then empty, which the evaluator
+// reads as that same default.
+function newRuleDefault(p: AlertParamSpec): number | string | null {
+  if (p.kind === "select") return shownFor(p, null);
+  const d = p.default;
+  if (typeof d !== "number") return null;
+  if ((p.min != null && d < p.min) || (p.max != null && d > p.max)) return null;
+  return d;
+}
+
 // ── Rule editor ────────────────────────────────────────────────────────────
 
 export function RuleEditorModal({
@@ -120,9 +132,7 @@ export function RuleEditorModal({
   const current = (p: AlertParamSpec): number | string | null => {
     if (p.name in touched) return touched[p.name] as number | string | null;
     if (stored) return shownFor(p, stored[p.name]);
-    return (
-      p.initial ?? p.default ?? (p.kind === "select" ? shownFor(p, null) : null)
-    );
+    return p.initial ?? newRuleDefault(p);
   };
   const setParam = (n: string, v: number | string | null) =>
     setTouched((t) => ({ ...t, [n]: v }));

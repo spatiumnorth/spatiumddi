@@ -26,6 +26,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 from app.services import alerts as a
+from app.services.backup.health import STALE_AFTER_RUNS_DEFAULT
 from app.services.dns_threat import aggregate as threat
 
 # Columns an operator can set on a rule.
@@ -183,7 +184,6 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
                 "discovery last-seen signal; never-seen rows are excluded (chase "
                 "those from the Stale-IP report).",
                 min_=1,
-                max_=None,
             ),
             _days(
                 "Stale window (days)",
@@ -257,13 +257,19 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
         "DHCP pool exhaustion (dynamic pool pressure)",
         "DHCP",
         [
+            # No ``default``: the evaluator falls back to 90% only when BOTH
+            # this and the free-address floor are empty, so a null here does
+            # not mean 90% once a floor is set.
             _pct(
                 "Occupancy threshold (%)",
-                90,
+                None,
                 "Fires when a dynamic DHCP pool's live occupancy (active leases ÷ "
                 "pool size) reaches this. Orthogonal to subnet utilization, which "
                 "counts allocated IPAM rows — a pool can be exhausted while the "
-                "subnet looks empty.",
+                "subnet looks empty. Empty uses 90% only while the free-address "
+                "floor below is also empty; with a floor set, empty means no "
+                "percent check.",
+                initial=90,
             ),
             ParamSpec(
                 name="min_free_addresses",
@@ -445,7 +451,7 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
         [
             _count(
                 "Missed runs",
-                2,
+                STALE_AFTER_RUNS_DEFAULT,
                 "Fires when a scheduled backup target has had no successful run "
                 "for this many scheduled runs, plus one hour. Default 2.",
                 min_=1,
@@ -586,7 +592,6 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
                 "active DHCP leases than this. Set to roughly 50% of the "
                 "expected phone fleet so brief reboots don't trigger but a real "
                 "mass-disconnect does.",
-                max_=None,
                 initial=10,
             )
         ],

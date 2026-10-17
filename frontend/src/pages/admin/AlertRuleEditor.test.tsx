@@ -67,7 +67,10 @@ const CATALOGUE: AlertRuleTypeSpec[] = [
     int("threshold_percent", "Threshold (%)", { default: 90, unit: "%" }),
   ]),
   t("voice_lease_count_below", [
-    int("threshold_percent", "Minimum active leases", { default: 1 }),
+    int("threshold_percent", "Minimum active leases", {
+      default: 1,
+      initial: 10,
+    }),
   ]),
   t("stale_ip_count", [
     int("threshold_percent", "Stale IP count threshold", { default: 10 }),
@@ -77,6 +80,15 @@ const CATALOGUE: AlertRuleTypeSpec[] = [
     int("threshold_days", "Recency window (days)", { default: 1 }),
   ]),
   t("domain_nameserver_drift", []),
+  // Its evaluator default (200) is above what the API accepts (0..100).
+  t("dns_query_rate_spike", [
+    int("threshold_percent", "Increase over prior window (%)", {
+      default: 200,
+      min: 0,
+      max: 100,
+    }),
+    int("min_free_addresses", "Minimum queries", { default: 1000, min: 1 }),
+  ]),
   t("server_unreachable", [
     sel("server_type", "Server type", ["any", "dns", "dhcp"], {
       default: "any",
@@ -319,5 +331,118 @@ describe("types the old frontend union did not know (#1997)", () => {
         "ip_free_but_responding",
       ),
     );
+  });
+});
+
+describe("a new rule starts from the catalogue (#1997)", () => {
+  async function create(ruleType: string) {
+    createRule.mockResolvedValue(rule({}));
+    mount(null);
+    const select = (await screen.findByLabelText(
+      "Rule type",
+    )) as HTMLSelectElement;
+    await waitFor(() =>
+      expect(Array.from(select.options).map((o) => o.value)).toContain(
+        ruleType,
+      ),
+    );
+    fireEvent.change(select, { target: { value: ruleType } });
+    fireEvent.change(screen.getByLabelText("Name"), {
+      target: { value: "x" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(createRule).toHaveBeenCalled());
+    return createRule.mock.calls[0][0] as Record<string, unknown>;
+  }
+
+  it("uses the evaluator default when there is no initial", async () => {
+    const body = await create("ip_free_but_responding");
+    expect(body.rule_type).toBe("ip_free_but_responding");
+    expect(body.threshold_days).toBe(1);
+  });
+
+  it("uses initial over the default", async () => {
+    expect((await create("voice_lease_count_below")).threshold_percent).toBe(
+      10,
+    );
+  });
+
+  it("leaves a default the API would refuse empty", async () => {
+    const body = await create("dns_query_rate_spike");
+    expect(body.threshold_percent).toBeNull();
+    expect(body.min_free_addresses).toBe(1000);
+  });
+
+  it("sends a compliance rule's classification and scope", async () => {
+    const body = await create("compliance_change");
+    expect(body.classification).toBe("pci_scope");
+    expect(body.change_scope).toBe("any_change");
+  });
+
+  it("sends only this type's parameters", async () => {
+    const body = await create("domain_nameserver_drift");
+    for (const k of [
+      "threshold_percent",
+      "threshold_days",
+      "min_free_addresses",
+      "server_type",
+      "classification",
+      "change_scope",
+    ])
+      expect(k in body).toBe(false);
+  });
+});
+
+describe("editing a catalogue-only type (#1997)", () => {
+  it("clearing its value sends null", async () => {
+    updateRule.mockResolvedValue(rule({}));
+    mount(rule({ rule_type: "ip_free_but_responding", threshold_days: 5 }));
+    fireEvent.change(await screen.findByLabelText("Recency window (days)"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(updateRule).toHaveBeenCalled());
+    expect(updateRule).toHaveBeenCalledWith("r1", { threshold_days: null });
+  });
+
+  it("an unchanged Save keeps a stored value above the API bound", async () => {
+    // The seeded query-rate rule stores 200, which the editor cannot send.
+    const onClose = mount(
+      rule({ rule_type: "dns_query_rate_spike", threshold_percent: 200 }),
+    );
+    await screen.findByLabelText("Increase over prior window (%)");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(updateRule).not.toHaveBeenCalled();
+  });
+
+  it("changing a compliance rule's classification sends just that", async () => {
+    updateRule.mockResolvedValue(rule({}));
+    mount(
+      rule({
+        rule_type: "compliance_change",
+        classification: "pci_scope",
+        change_scope: null,
+      }),
+    );
+    fireEvent.change(await screen.findByLabelText("Classification"), {
+      target: { value: "hipaa_scope" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(updateRule).toHaveBeenCalled());
+    expect(updateRule).toHaveBeenCalledWith("r1", {
+      classification: "hipaa_scope",
+    });
+  });
+
+  it("a compliance rule with a null classification sends the shown one", async () => {
+    updateRule.mockResolvedValue(rule({}));
+    mount(rule({ rule_type: "compliance_change" }));
+    await screen.findByLabelText("Classification");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(updateRule).toHaveBeenCalled());
+    expect(updateRule).toHaveBeenCalledWith("r1", {
+      classification: "pci_scope",
+    });
   });
 });

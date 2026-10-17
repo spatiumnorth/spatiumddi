@@ -28,8 +28,57 @@ def test_catalogue_covers_every_rule_type_and_nothing_else() -> None:
     assert rule_type_names() == set(alerts.RULE_TYPES)
 
 
+# Rule types no ``evaluate_all`` branch dispatches: a task or another
+# subsystem opens their events directly. Listed rather than inferred, so a
+# dispatch the scan stops recognising fails loudly instead of being skipped.
+_EXTERNALLY_DRIVEN = {
+    alerts.RULE_TYPE_AUDIT_CHAIN_BROKEN,
+    alerts.RULE_TYPE_SCHEMA_BEHIND_HEAD,
+    alerts.RULE_TYPE_ACME_MANUAL_RENEWAL,
+}
+
+
+def _rule_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """The names an AlertRule goes by in ``fn``: ``rule``, plus any argument
+    annotated ``AlertRule``."""
+    names = {"rule"}
+    for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
+        if arg.annotation is not None and "AlertRule" in ast.unparse(arg.annotation):
+            names.add(arg.arg)
+    return names
+
+
+def _direct_reads(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    names = _rule_names(fn)
+    out: set[str] = set()
+    for n in ast.walk(fn):
+        # rule.<column>
+        if (
+            isinstance(n, ast.Attribute)
+            and n.attr in PARAM_COLUMNS
+            and isinstance(n.value, ast.Name)
+            and n.value.id in names
+        ):
+            out.add(n.attr)
+        # getattr(rule, "<column>"[, default])
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "getattr"
+            and len(n.args) >= 2
+            and isinstance(n.args[0], ast.Name)
+            and n.args[0].id in names
+            and isinstance(n.args[1], ast.Constant)
+            and n.args[1].value in PARAM_COLUMNS
+        ):
+            out.add(n.args[1].value)
+    return out
+
+
 def _evaluator_reads() -> dict[str, set[str]]:
-    """rule_type -> the parameter columns its dispatch branch's evaluators read."""
+    """rule_type -> the parameter columns its dispatch branch reads, following
+    calls into helpers in the same module (so a read moved into a helper is
+    still seen)."""
     tree = ast.parse(inspect.getsource(alerts))
     consts = {
         n.targets[0].id: n.value.value
@@ -39,17 +88,26 @@ def _evaluator_reads() -> dict[str, set[str]]:
         and n.targets[0].id.startswith("RULE_TYPE_")
         and isinstance(n.value, ast.Constant)
     }
-    reads: dict[str, set[str]] = {}
+    direct: dict[str, set[str]] = {}
+    callees: dict[str, set[str]] = {}
     for fn in ast.walk(tree):
         if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            reads[fn.name] = {
-                a.attr
-                for a in ast.walk(fn)
-                if isinstance(a, ast.Attribute)
-                and a.attr in PARAM_COLUMNS
-                and isinstance(a.value, ast.Name)
-                and a.value.id == "rule"
-            }
+            direct.setdefault(fn.name, set()).update(_direct_reads(fn))
+            callees.setdefault(fn.name, set()).update(
+                c.func.id
+                for c in ast.walk(fn)
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            )
+
+    def closure(name: str, seen: set[str]) -> set[str]:
+        if name in seen or name not in direct:
+            return set()
+        seen.add(name)
+        out = set(direct[name])
+        for c in callees[name]:
+            out |= closure(c, seen)
+        return out
+
     evaluate_all = next(
         n
         for n in ast.walk(tree)
@@ -69,12 +127,23 @@ def _evaluator_reads() -> dict[str, set[str]]:
         used: set[str] = set()
         for stmt in node.body:
             for c in ast.walk(stmt):
-                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in reads:
-                    used |= reads[c.func.id]
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name):
+                    used |= closure(c.func.id, set())
         for nm in names:
             if nm in consts:
                 out.setdefault(consts[nm], set()).update(used)
     return out
+
+
+def test_every_rule_type_is_dispatched_or_declared_external() -> None:
+    reads = _evaluator_reads()
+    assert set(alerts.RULE_TYPES) - set(reads) == _EXTERNALLY_DRIVEN
+
+
+def test_externally_driven_types_declare_no_params() -> None:
+    by_type = {s.rule_type: s for s in build_catalogue()}
+    for rt in _EXTERNALLY_DRIVEN:
+        assert by_type[rt].params == [], rt
 
 
 def test_declared_params_match_what_each_evaluator_reads() -> None:
@@ -84,8 +153,8 @@ def test_declared_params_match_what_each_evaluator_reads() -> None:
     for spec in build_catalogue():
         declared = {p.name for p in spec.params}
         assert declared <= set(PARAM_COLUMNS), spec.rule_type
-        if spec.rule_type not in reads:
-            continue  # externally driven: no dispatch branch, no params
+        if spec.rule_type in _EXTERNALLY_DRIVEN:
+            continue  # no dispatch branch; covered by the test above
         if declared != reads[spec.rule_type]:
             problems.append(
                 f"{spec.rule_type}: declared {sorted(declared)}, "
