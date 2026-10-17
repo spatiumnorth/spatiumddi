@@ -1204,18 +1204,22 @@ InfluxDBTarget                    -- backend/app/models/influxdb.py
   -- v1 fields:
   database: str
   username: str
-  password_encrypted: bytes       -- Fernet at rest; API returns password_set only
+  password_encrypted: bytes       -- Fernet at rest; API returns password_set only;
+                                  -- blank on save keeps it, clear_password removes it (#1989)
   -- v2 / v3 fields:
   org: str                        -- required on v2; optional on v3
   bucket: str                     -- on v3 this is the database name
-  token_encrypted: bytes          -- Fernet at rest; API returns token_set only
+  token_encrypted: bytes          -- Fernet at rest; API returns token_set only;
+                                  -- blank on save keeps it, clear_token removes it (#1989)
   measurement_prefix: str (default "spatiumddi_")
   push_interval_seconds: int (default 60, min 30)
   push_dns_metrics / push_dhcp_metrics /
   push_subnet_utilization / push_dhcp_scope_leases: bool (all default true)
   -- push state (written by the task, read-only to the operator):
   last_dns_bucket_at, last_dhcp_bucket_at    -- per-source high-water marks
-  last_push_at, last_push_points, last_push_error
+  last_push_at                    -- last ATTEMPT (moves on failure)
+  last_success_at                 -- last push accepted; NULL = never (#1990)
+  last_push_points, last_push_error
 ```
 
 #### "All versions" — v1, v2 and v3
@@ -1312,7 +1316,10 @@ means a delayed export, never a hole — the samples stay in Postgres until
 
 `last_push_at` moves on failure as well as success — otherwise a
 fast-failing target would be retried on every 30 s beat tick instead of
-on its own interval. A failure is always recorded against the target
+on its own interval. So `last_push_at` is the last *attempt*; the
+`last_success_at` column is the last push the destination accepted
+(NULL = never), and the table's **Last push** column shows that one,
+with a "last attempt failed" line beside it. A failure is always recorded against the target
 that caused it: the push is wrapped in a broad per-target boundary,
 because the beat task pushes every due target in one transaction and an
 escaping exception would discard the state updates of the ones that

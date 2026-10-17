@@ -122,6 +122,172 @@ the formatter handles the rest.
   primary's, never compared with ours), and a new zone's first
   numbering (0 to 1) writes no `dns.zone.serial_adopted` row.
 
+- **Audit details mask presigned-URL signatures and storage connection
+  strings on read.** The read-side redaction of `GET /api/v1/audit/{id}`,
+  the Audit page and the copilot's audit tool now also masks the signing
+  parameters of a presigned S3 / GCS URL (`X-Amz-Signature`,
+  `X-Amz-Credential`, `X-Amz-Security-Token`, `X-Goog-Signature`,
+  `X-Goog-Credential`), the `AccountKey` of an Azure storage connection
+  string, and any value under a `connection_string` key. Backup-target
+  entries recorded by earlier releases could carry these, in an edited
+  target's `config` or a failed `https_put` / WebDAV run's error text.
+  Stored entries are left exactly as written, since each is part of the
+  audit hash chain; only what is returned changes. The support bundle's
+  scrubber uses the same patterns.
+
+- **InfluxDB Export: a stored password or token survives an edit that
+  types in its field and clears it again; "Last push" no longer shows a
+  failed attempt as a push; a refused save shows its reason (#1989,
+  #1990, part of #1993).** The form sent `""` for a secret field that
+  had been typed in and cleared, and the server read `""` as "clear": a
+  v1 password was silently wiped, and a v2 token save was refused with
+  "token is required". Now a blank secret always keeps the stored one,
+  on the server as well (API clients can send `""`), and removing a
+  secret takes an explicit `clear_password` / `clear_token` (a "Clear
+  stored password / token" checkbox in the form). `last_push_at` is the
+  last attempt and moves on failure by design, but the table presented
+  it as the last push ("31m ago (0 pts)" for a target that never pushed).
+  A new nullable `last_success_at` (NULL = never) records the last push
+  the destination accepted, the column shows it, and a failure is
+  reported beside it as "last attempt failed Nm ago". A validation
+  refusal showed "[object Object]" because the FastAPI 422 list was
+  stringified; the form now uses the DHCP dialogs' `errMsg` and stays
+  open. The Alerts page half of #1993 is fixed separately.
+
+- **On the appliance, a DNS server whose named is OOM-killed now reads not
+  serving and raises Agent daemon not serving (#2018).** The kubelet sets
+  `memory.oom.group` on every container, so when named reaches the dns-bind9
+  container's memory limit the kernel kills named and the DNS agent together.
+  The agent's own OOM record (#1725 / #1898) is written after it sees named
+  gone, so it never was, and the restarted agent (a new cgroup) could not see
+  the kill either: the server row read `ok` through every kill and the alert
+  never opened. The supervisor's service watchdog now reports each role
+  container's last termination (`OOMKilled`), restart count and start time
+  for this node's pod, and the control plane turns a current `OOMKilled` into
+  the `oom_killed:` daemon state on the server row, from the supervisor
+  heartbeat (a container stuck in CrashLoopBackOff) and over the restarted
+  agent's `ok`, timed from the kill and cleared once the container has stayed
+  up for 10 minutes. Only the engine's live row is stamped, and only while
+  the supervisor is still heartbeating, so a stale row or a supervisor that
+  stopped reporting cannot hold a server down for good. The watchdog also now picks this node's pod of a
+  DaemonSet rather than whichever node's was listed last. No new RBAC: the
+  supervisor already lists pods in its namespace. Docker Compose, where the
+  kernel kills named alone, keeps the agent's own record.
+
+- **A k3s appliance's api, worker and beat never knew their
+  appliance version.** firstboot's `sharedEnv` carried no
+  `APPLIANCE_VERSION`, so `settings.appliance_version` was empty,
+  `/appliance/system/info` said "dev" and `/api/v1/version` said
+  null (#2004). firstboot now stamps it from the running slot's
+  `appliance-release` on every boot, so a slot upgrade stamps the
+  new version and a rollback the old one. `system/info` now
+  reports null for unknown, like `/version`, and the Network &
+  Host tab says "unknown" rather than "dev".
+
+- **Fleet's "Cancel pending upgrade" no longer reports a cancel that
+  did not happen (#2021).** Scheduling wakes the host at once, so the
+  slot apply usually starts within a second, and the host deliberately
+  never stops a running apply; the cancel still answered 200 and
+  emptied the row. `clear-upgrade` now answers 409
+  (`upgrade_already_started`) once the host reports the runner applying
+  or the new slot staged (a clear does not disarm next-boot either),
+  audits the refusal, and leaves the row untouched. A cancel sent before
+  the host has reported is still accepted, but provisionally: the row
+  carries `clear_upgrade_requested` and Fleet shows "waiting for the host
+  to confirm" until the next heartbeat. If that heartbeat shows the
+  apply already running, the log records `appliance.upgrade_cancel_lost`
+  and Fleet shows the running (then staged) upgrade with a note, never a
+  cancelled row. The supervisor's clear also stops wiping the progress
+  of an apply it cannot stop, which blanked the Fleet stepper for the
+  rest of the apply and stranded a staged slot at `done`. A dead
+  runner's stale stamp and a trigger the runner has not claimed can
+  still be cleared.
+
+- **A per-box upgrade stayed `reboot-pending` after it had rebooted and
+  committed (#2007), and its help text said it reboots (#2008).** The
+  host runner ends a staged apply at state `done` / progress
+  `reboot-pending` and is not running when the node comes back, so after
+  the reboot the supervisor kept re-publishing "upgrade staged" to Fleet,
+  the API and MCP. The runner now records the kernel boot id it staged
+  under and the slot it armed, and the supervisor settles the state once
+  the boot id has changed and the boot is committed (not a trial). A node
+  back on the staged slot reads `ready`. A node back on the OTHER slot
+  (GRUB fell back, or the trial was never committed) reads `failed`, with
+  a "rolled back" progress line, instead of being cleared as if the
+  upgrade had taken; the rolling-upgrade health gate reports it as an
+  auto-revert, and now also accepts the settled `ready`. An upgrade still
+  awaiting its reboot, and a trial boot awaiting its commit, are
+  untouched. No clock is involved, so a wall-clock step between staging
+  and reboot cannot clear a reboot the operator still owes. The per-box
+  form, the API docstring and the Upgrades docs no longer claim the host
+  reboots into the new slot; only Rolling Upgrade reboots for you.
+
+- **DHCP scope dialog pickers and New PXE profile match rows now have
+  accessible names (#2016).** The scope dialog's PXE profile select and its
+  "Apply template…" select had no name (now "PXE profile" and "Apply
+  template", the select's own visible text). In New PXE profile, the two
+  starter match rows repeated every label, so each name belonged to two
+  controls; each control is now named with its row ("Match 2: Priority"), each
+  row is a group "Match rule N", and "Arch codes (option 93)" is a group
+  naming its checkbox set instead of a `<label>` wrapped around the
+  checkboxes' own labels, which had named only the first one. The PXE page's
+  own `Field` links a lone control or labels a group.
+
+- **The audit API and page now show what an entry recorded (#2009).**
+  An entry's `old_value` / `new_value` / `changed_fields` (for example a
+  per-box upgrade's `direction` and `schema_check`) were stored and
+  returned nowhere, so the only way to see them was SQL.
+  `GET /audit/{id}` returns them, `GET /audit` does too with
+  `include_details=true`, the Audit Log page expands a row to show them,
+  and `get_audit_history` carries `old_value` / `new_value` when asked
+  with `include_details` (off by default, because the copilot's provider
+  can be off-premises; non-negotiable #13). Values are
+  redacted on read (credential-shaped keys and secret-shaped strings,
+  a PEM private key whole), because the writers are hundreds of call
+  sites and nothing stops one storing a credential. The writers' own
+  `<field>_set: true` flags are kept, since whether a secret was set is
+  the detail worth reading. Reading details takes the same `read` on
+  `audit_log` as the list. Audit forwarding to syslog / webhook targets
+  still sends the stored values unredacted.
+
+- **A device policy whose classes have no fingerprinted devices yet now says
+  why it is not rendered (#2000).** With classes selected and nothing seen in
+  them, the policy compiles to an empty expression and is correctly left out of
+  the Kea config, but the preview said only "Renders: no". `compile_device_policy`
+  now warns that no devices have been seen in the selected classes yet, so the
+  policy matches nothing and is not rendered, in the REST preview, the dialog
+  and `preview_dhcp_device_policy`. When devices in those classes were seen but
+  none sent DHCP options 55 or 60 in a form that can be matched, it says that
+  instead, with the count. Neither fires when signatures exist, when a manual
+  match is set, or when every signature was excluded as ambiguous (that case
+  keeps its own warning).
+
+- **The alert rule editor can edit every rule type's thresholds, not
+  just the 23 it was hand-coded for (#1997).** The editor's type list
+  and per-type fields were a frontend union that knew 23 of the
+  backend's 64 rule types, so for the rest (`ip_free_but_responding`,
+  `stale_reservation`, `dns_nxdomain_spike`, `tls_cert_expiring` and so
+  on) `threshold_days`, `threshold_percent` and friends could only be set
+  through the API. The backend now serves the catalogue at
+  `GET /api/v1/alerts/rule-types` (same access as listing rules): label,
+  group and, for each type, the parameters its evaluator reads, with
+  unit, bounds, select options and the value the evaluator uses when the
+  stored one is null. The editor and the rules table's Parameters column
+  render from it, and a type with no parameters says "No adjustable
+  parameters". `tests/test_alert_rule_catalogue.py` fails when a rule
+  type is missing from the catalogue or when a type's declared
+  parameters differ from the `rule.<column>` reads in its evaluator
+  (followed into helpers, `getattr` included), and every type without a
+  dispatch branch must be named as externally driven, so the two cannot
+  drift again. A new rule starts from the evaluator's default, or empty
+  where the API would refuse that default (the query-rate spike's 200%
+  is above the field's 0..100); a DHCP pool rule's 90% is shown only as
+  a starting value, because the evaluator applies it only while the
+  free-address floor is also empty. The #1986 guarantees hold: stored values
+  are kept, a stored null stays empty, and an unchanged Save sends
+  nothing. No MCP tool: this is editor metadata, and `list_alert_rules`
+  already covers the rules themselves.
+
 - **Creating an alert rule, firewall policy or alias, conformity policy,
   backup target, API token, DNS group, server, zone, TSIG key, view,
   blocklist entry or exception, or an upgrade run no longer writes an
@@ -5233,6 +5399,9 @@ the formatter handles the rest.
   no cloud server, due now; cloud groups are not marked. Downgrade drops
   both columns.
 - `d2a6e81f3b57` — #1975, widens `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` from `INTEGER` to `BIGINT`. Downgrade narrows them back and fails if a stored serial no longer fits.
+- `d7a2e94b1c60` — #1990: `influxdb_target.last_success_at` (nullable
+  `timestamptz`, NULL = never). Backfilled from `last_push_at` for rows
+  with a push time and no recorded error.
 
 ## 2026.10.02-1 — 2026-10-02
 

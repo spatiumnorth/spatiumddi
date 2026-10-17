@@ -24,6 +24,7 @@ from app.models.network import (
     NetworkInterface,
 )
 from app.services.ai.tools.base import register_tool
+from app.services.audit_redact import redact_audit_value
 from app.services.oui import is_voip_phone_vendor, lookup_vendor
 
 # ── network devices ───────────────────────────────────────────────────
@@ -211,6 +212,15 @@ class GetAuditHistoryArgs(BaseModel):
         description="Filter by action — create / update / delete / login / logout / etc.",
     )
     limit: int = Field(default=50, ge=1, le=500)
+    include_details: bool = Field(
+        default=False,
+        description=(
+            "Also return each entry's recorded before/after values "
+            "(old_value / new_value, credentials redacted). Off by default: "
+            "ask for it only when the question needs what a change set a "
+            "field to, not just who changed what."
+        ),
+    )
 
 
 @register_tool(
@@ -219,7 +229,8 @@ class GetAuditHistoryArgs(BaseModel):
     description=(
         "Query the append-only audit log. Filters: user, resource "
         "type, resource id, action. Returns chronological audit "
-        "entries with old / new values when set. Useful for 'who "
+        "entries with the fields each change touched; pass "
+        "include_details for the before/after values. Useful for 'who "
         "changed X?' and 'show me recent activity by user Y'."
     ),
     args_model=GetAuditHistoryArgs,
@@ -239,8 +250,9 @@ async def get_audit_history(
         stmt = stmt.where(AuditLog.action == args.action)
     stmt = stmt.order_by(AuditLog.timestamp.desc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
-    return [
-        {
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        entry: dict[str, Any] = {
             "id": str(r.id),
             "timestamp": r.timestamp.isoformat() if r.timestamp else None,
             "user_id": str(r.user_id) if r.user_id else None,
@@ -253,8 +265,15 @@ async def get_audit_history(
             "result": r.result,
             "changed_fields": r.changed_fields,
         }
-        for r in rows
-    ]
+        # #2009: the recorded state, redacted the same way the REST endpoint
+        # does it, and only on request. A copilot's provider can be
+        # off-premises, so the values leave the box only when the question
+        # needs them (non-negotiable #13), mirroring ?include_details=true.
+        if args.include_details:
+            entry["old_value"] = redact_audit_value(r.old_value)
+            entry["new_value"] = redact_audit_value(r.new_value)
+        out.append(entry)
+    return out
 
 
 # ── find_switchport ───────────────────────────────────────────────────

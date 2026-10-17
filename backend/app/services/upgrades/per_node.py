@@ -1085,7 +1085,8 @@ async def _step_health_gate(
 ) -> StepResult:
     """Wait for the appliance's heartbeat to report
     ``installed_appliance_version == target_version`` AND
-    ``last_upgrade_state == 'done'``.
+    ``last_upgrade_state`` of ``done`` or ``ready`` (the supervisor settles
+    the former to the latter once the new slot is committed, #2007).
 
     Failure paths we surface:
       * ``last_upgrade_state == 'failed'`` — the apply itself failed. A
@@ -1093,9 +1094,10 @@ async def _step_health_gate(
         attempt's and is waited past, not reported: the reboot step's early
         exits hand over without having seen a fresh state (#1449).
       * Health-gate auto-revert (#138 Phase 8c): the host reboots back
-        into the OLD slot, so installed_version never matches +
-        ``last_upgrade_state`` may be 'done' on the OLD slot. We
-        catch this via the version comparison.
+        into the OLD slot. A supervisor with #2007 reports that as
+        ``failed`` with ``reverted`` in the progress, surfaced here as
+        ``auto_reverted``; an older one leaves ``done`` on the OLD slot,
+        and installed_version never matching ends in the timeout.
       * Timeout — the host is taking too long; halt + alert.
     """
     step = StepResult(
@@ -1122,14 +1124,28 @@ async def _step_health_gate(
         await db.refresh(appliance)
         last_installed = appliance.installed_appliance_version
         if appliance.last_upgrade_state == "failed" and not _stale_failure(appliance, stamped_at):
+            # #2007 — the supervisor reports a node that came back on the
+            # slot it did NOT stage as failed + ``reverted``. Named apart so
+            # the alert classifier calls it the auto-revert it is, rather
+            # than an apply that failed.
+            if (appliance.last_upgrade_progress or {}).get("reverted") is True:
+                return step.finish(
+                    False,
+                    error="auto_reverted: the node booted its previous slot",
+                    installed_version=last_installed,
+                )
             return step.finish(
                 False,
                 error="supervisor reported upgrade failed",
                 installed_version=last_installed,
             )
+        # ``ready`` as well as ``done`` (#2007): once the node is back on the
+        # committed new slot the supervisor settles the host's stale
+        # ``done``/``reboot-pending`` to ``ready``, and that can land before
+        # the first heartbeat this step sees.
         if (
             appliance.installed_appliance_version == target_version
-            and appliance.last_upgrade_state in (None, "done")
+            and appliance.last_upgrade_state in (None, "done", "ready")
         ):
             return step.finish(
                 True,

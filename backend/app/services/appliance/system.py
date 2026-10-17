@@ -48,7 +48,9 @@ class SystemInfo:
     maintenance_mode: bool
     reboot_pending_from_host: bool
     reboot_scheduled: bool
-    appliance_version: str
+    # None = unknown (the pods were not given APPLIANCE_VERSION); same
+    # representation as /api/v1/version.
+    appliance_version: str | None
     appliance_mode: bool
 
 
@@ -60,7 +62,7 @@ def get_system_info() -> SystemInfo:
         maintenance_mode=is_maintenance_mode(),
         reboot_pending_from_host=_HOST_REBOOT_REQUIRED.exists(),
         reboot_scheduled=_REBOOT_TRIGGER.exists(),
-        appliance_version=settings.appliance_version or "dev",
+        appliance_version=settings.appliance_version or None,
         appliance_mode=settings.appliance_mode,
     )
 
