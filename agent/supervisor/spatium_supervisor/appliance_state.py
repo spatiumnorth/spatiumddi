@@ -37,7 +37,7 @@ import re
 import subprocess
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
@@ -1459,66 +1459,127 @@ def prune_all_trigger_sidecars(keep: int = 5) -> None:
         _prune_host_config_sidecars(trigger, keep)
 
 
-def _boot_started_at() -> datetime | None:
-    """Wall-clock time this boot began (now minus uptime), or None."""
+def _next_entry_from_grubenv() -> str | None:
+    """``next_entry`` from grubenv: the slot ``grub-reboot`` armed for the
+    next boot, ``""`` once GRUB has consumed it (the rendered grub.cfg
+    clears it and ``save_env``s on every boot that honours it), or None
+    when grubenv cannot be read."""
     try:
-        up = float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
-    except (OSError, ValueError, IndexError):
+        text = _HOST_GRUBENV.read_text(encoding="utf-8", errors="replace")
+    except OSError:
         return None
-    return datetime.now(UTC) - timedelta(seconds=up)
+    for line in text.splitlines():
+        line = line.rstrip("\x00").strip()
+        if line.startswith("next_entry="):
+            return line.split("=", 1)[1].strip()
+    return ""
 
 
 def _settle_staged_upgrade(
     state: str | None,
     state_at: datetime | None,
+    current_slot: str | None,
     is_trial_boot: bool | None,
-    *,
-    boot_started: datetime | None = None,
 ) -> tuple[str | None, datetime | None]:
-    """#2007 — retire a staged upgrade the node has already rebooted past.
+    """#2007 — settle a staged upgrade the node has already rebooted past.
 
     The host runner ends a successful apply at state ``done`` with progress
-    ``reboot-pending`` and nothing ever moves them: the wrapper is not
-    running when the node comes back, so after the reboot into the new slot
-    (or an auto-revert to the old one) the heartbeat kept re-publishing
+    ``reboot-pending`` and nothing ever moved them: the runner is not
+    running when the node comes back, so the heartbeat kept re-publishing
     "upgrade staged — reboot to boot the new slot" for a reboot that had
-    happened. Fleet, the API and MCP all read that field.
+    already happened. Fleet, the API and MCP all read that.
 
-    Settles to ``ready`` only when BOTH hold:
+    "Has the node rebooted since staging" is answered without clocks: the
+    runner records the kernel ``boot_id`` it staged under, and a different
+    one now is a reboot. Comparing uptime against the wall-clock stamp
+    would be wrong whenever the clock was stepped between the two (a node
+    that staged before chrony synced), and a wrong answer here hides a
+    reboot the operator still has to do. A progress file from a runner
+    older than #2007 carries no ``boot_id``; for that one transition
+    upgrade the consumed ``next_entry`` in grubenv stands in.
 
-    * this boot began AFTER the ``reboot-pending`` stamp, so the node has
-      rebooted since staging. An upgrade staged and still awaiting its
-      reboot has a stamp newer than the boot and is never touched;
-    * the boot is not a trial (running slot == durable default), i.e. the
-      new slot committed, or a failed trial rolled back to the old one.
-      A trial boot awaiting its commit is left alone, and so is an
-      unknown trial state.
+    Once rebooted, and only on a committed boot (not a trial, which is
+    still waiting on firstboot's commit, and not an unknown one):
 
-    Persisted to the .state sidecar so the answer survives a restart and
-    the next heartbeat ships an empty progress.
+    * running the slot the runner staged → ``ready``: the upgrade took;
+    * running any other slot → ``failed``, with a progress line saying so.
+      GRUB fell back, or the trial was never committed and the next boot
+      reverted. Clearing that to ``ready`` would report an upgrade that
+      did not take effect as finished.
+
+    Without a recorded slot (the pre-#2007 runner) the second case cannot
+    be told apart and settles ``ready``; that runner only ever stages the
+    upgrade INTO this code, and a node that reverts from it is running the
+    old supervisor, which has no settle at all.
+
+    Persisted to the sidecars (group-writable since #786, the same in-place
+    write the #421 reaper uses) so the answer survives a supervisor restart.
     """
-    if state != "done" or is_trial_boot is not False:
+    if state != "done":
         return state, state_at
     progress = _read_slot_upgrade_progress() or {}
     if progress.get("step") != "reboot-pending":
         return state, state_at
-    try:
-        staged_at = datetime.fromisoformat(str(progress.get("at")))
-    except ValueError:
+    staged_boot = progress.get("staged_boot_id")
+    if isinstance(staged_boot, str) and staged_boot:
+        now_boot = read_boot_id()
+        if now_boot is None or now_boot == staged_boot:
+            return state, state_at
+    else:
+        armed = _next_entry_from_grubenv()
+        if armed is None or armed:
+            return state, state_at
+    if is_trial_boot is not False:
         return state, state_at
-    if staged_at.tzinfo is None:
-        staged_at = staged_at.replace(tzinfo=UTC)
-    started = boot_started if boot_started is not None else _boot_started_at()
-    if started is None or started <= staged_at:
+    staged_slot = progress.get("staged_slot")
+    if staged_slot not in ("slot_a", "slot_b"):
+        staged_slot = None
+    if staged_slot is not None and current_slot is None:
+        return state, state_at
+    if _TRIGGER_FILE.exists():
+        # A new apply was fired since the state was read; it owns the
+        # sidecars from here.
         return state, state_at
     now = datetime.now(UTC)
+    reverted = staged_slot is not None and current_slot != staged_slot
+    new_state = "failed" if reverted else "ready"
+    log.info(
+        "supervisor.slot_upgrade.staged_upgrade_settled",
+        result=new_state,
+        staged_slot=staged_slot,
+        current_slot=current_slot,
+    )
     try:
-        _write_sidecar_durable(_HOST_SLOT_STATE, f"ready {now.isoformat()}\n")
+        _write_sidecar_durable(_HOST_SLOT_STATE, f"{new_state} {now.isoformat()}\n")
     except OSError:
-        # Best-effort: the in-memory answer below still corrects this
-        # heartbeat; the next one retries the write.
+        # Best-effort: the in-memory answer still corrects this heartbeat;
+        # the next one re-derives the same condition and retries the write.
         pass
-    return "ready", now
+    if reverted:
+        detail = (
+            f"rolled back: staged {staged_slot} but the node booted {current_slot}. "
+            "The new slot did not come up (GRUB fell back, or its trial boot was "
+            "not committed), so this node is still on the previous version."
+        )
+        try:
+            _write_sidecar_durable(
+                _SLOT_UPGRADE_PROGRESS,
+                json.dumps(
+                    {
+                        "step": "failed",
+                        "pct": None,
+                        "detail": detail,
+                        "at": now.isoformat(),
+                        "reverted": True,
+                        "staged_slot": staged_slot,
+                    }
+                ),
+            )
+        except OSError:
+            # The durable "failed" state above is what every reader keys
+            # off; a missed breadcrumb only loses the explanation.
+            pass
+    return new_state, now
 
 
 def _read_slot_upgrade_log_tail(lines: int = 40, max_chars: int = 8000) -> str:
@@ -4496,7 +4557,7 @@ def collect() -> dict[str, object]:
     # off-appliance so the backend leaves the columns alone.
     if is_appliance:
         last_state, last_state_at = _settle_staged_upgrade(
-            last_state, last_state_at, is_trial_boot
+            last_state, last_state_at, current_slot, is_trial_boot
         )
     _show_progress = is_appliance and last_state in ("in-flight", "failed", "done")
     if not is_appliance:

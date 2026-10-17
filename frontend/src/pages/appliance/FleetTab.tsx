@@ -6023,9 +6023,9 @@ function ApplianceOsUpgradeSection({
             The supervisor reads it on its next heartbeat + writes the
             slot-upgrade trigger; the host runner dd&apos;s the image to the
             inactive slot and stops there. It does not reboot: use{" "}
-            <strong>Reboot to boot new slot</strong> when you are ready, and
-            the node reverts to the old slot if <code>/health/live</code>{" "}
-            fails on the new one.
+            <strong>Reboot to boot new slot</strong> when you are ready. The new
+            slot boots on trial and is kept only once it comes up healthy;
+            otherwise the next reboot returns to the old one.
           </p>
         </div>
       )}
