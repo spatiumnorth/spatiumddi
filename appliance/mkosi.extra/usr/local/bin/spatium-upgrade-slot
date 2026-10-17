@@ -574,6 +574,39 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+# #1804 — the slot write is paced as well as direct. O_DIRECT keeps the
+# image out of this node's page cache, but dd still wrote as fast as the
+# disk would take it. Where a cluster's members share a disk (VMs on one
+# host or one datastore) that was up to 166 MB/s, every member's etcd slowed
+# at once, and the cluster's leases were lost on the staged node and on each
+# node that took them over. At _WRITE_RATE_BYTES_PER_SECOND the 8 GiB write
+# takes about 4.5 minutes, with the node serving throughout, and the rest of
+# the disk stays free for everything else on it.
+_WRITE_CHUNK_BYTES = 4 * 1024 * 1024  # dd's bs
+_WRITE_RATE_BYTES_PER_SECOND = 32 * 1024 * 1024
+
+
+def _paced_copy(src, dst, *, clock=None, sleep=None) -> int:
+    """Copy ``src`` to ``dst`` in ``_WRITE_CHUNK_BYTES`` reads, never getting
+    ahead of ``_WRITE_RATE_BYTES_PER_SECOND`` since the copy began (#1804).
+    A destination slower than that is not slowed further. Returns the bytes
+    copied; a ``BrokenPipeError`` from ``dst`` (dd has exited) propagates."""
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    rate = _WRITE_RATE_BYTES_PER_SECOND
+    start = clock()
+    copied = 0
+    while True:
+        buf = src.read(_WRITE_CHUNK_BYTES)
+        if not buf:
+            return copied
+        dst.write(buf)
+        copied += len(buf)
+        ahead = copied / rate - (clock() - start)
+        if ahead > 0:
+            sleep(ahead)
+
+
 def cmd_apply(args) -> int:
     if os.geteuid() != 0:
         print("ERROR: must run as root (writes to a block device)", file=sys.stderr)
@@ -655,14 +688,30 @@ def cmd_apply(args) -> int:
     # exited mid-write. With O_DIRECT dd writes one 4 MiB block at a time,
     # so etcd waits behind one block at most. iflag=fullblock is what keeps
     # it direct: the input is xz's pipe, whose reads come back short, and dd
-    # turns O_DIRECT off at the first write shorter than bs.
+    # turns O_DIRECT off at the first write shorter than bs. The runner feeds
+    # dd itself, through _paced_copy, so the write also keeps to
+    # _WRITE_RATE_BYTES_PER_SECOND.
     _write_progress("writing", None, f"writing image to {inactive['partlabel']}")
-    print(f"  writing → {target_dev}")
+    print(f"  writing → {target_dev} (paced to "
+          f"{_WRITE_RATE_BYTES_PER_SECOND // (1024 * 1024)} MiB/s)")
     xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
                           stdout=subprocess.PIPE)
-    subprocess.run(["dd", f"of={target_dev}", "bs=4M", "iflag=fullblock",
-                     "oflag=direct", "conv=fsync", "status=progress"],
-                    stdin=xz.stdout, check=True)
+    dd = subprocess.Popen(["dd", f"of={target_dev}", "bs=4M", "iflag=fullblock",
+                           "oflag=direct", "conv=fsync", "status=progress"],
+                          stdin=subprocess.PIPE)
+    try:
+        _paced_copy(xz.stdout, dd.stdin)
+    except BrokenPipeError:
+        pass  # dd stopped reading; its exit status below says why
+    finally:
+        try:
+            dd.stdin.close()
+        except BrokenPipeError:
+            pass
+    if dd.wait() != 0:
+        xz.kill()
+        xz.wait()
+        raise subprocess.CalledProcessError(dd.returncode, "dd")
     xz.wait()
     if xz.returncode != 0:
         print("ERROR: xz exited non-zero", file=sys.stderr)

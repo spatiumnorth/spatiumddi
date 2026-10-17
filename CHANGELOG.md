@@ -631,7 +631,12 @@ the formatter handles the rest.
   (`dd oflag=direct iflag=fullblock`), so etcd waits behind one 4 MiB block
   at most, and the image download, which lands on the same filesystem as
   etcd's WAL, is flushed to disk every 16 MiB as it arrives instead of
-  piling up 300-400 MB to flush when the write begins.
+  piling up 300-400 MB to flush when the write begins. The write is also
+  paced to 32 MiB/s: where a cluster's members share a disk (VMs on one host
+  or one datastore), a direct write at the disk's full speed slowed every
+  member's etcd at once and the cluster's leases were lost on each node that
+  held them. Paced, the 8 GiB write takes about 4.5 minutes, with the node
+  serving throughout.
 - **A rolling upgrade's drain that timed out said "0 pod(s) still present"
   while every pod was still on the node (#1804).** The count was the
   evictions refused in the drain's last cycle, not the pods left on the
