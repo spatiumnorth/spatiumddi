@@ -555,7 +555,7 @@ function ArchMatchRow({
           onClick={onRemove}
           className="self-end rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
           title="Remove match"
-          aria-label={`${n}: remove`}
+          aria-label={`Remove match ${index + 1}`}
         >
           <X className="h-4 w-4" />
         </button>

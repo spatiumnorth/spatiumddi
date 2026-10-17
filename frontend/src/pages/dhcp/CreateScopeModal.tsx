@@ -1274,7 +1274,7 @@ export function ApplyTemplateControl({
         </span>
       )}
       <select
-        aria-label="Apply option template"
+        aria-label="Apply template"
         key={pickerKey}
         defaultValue=""
         onChange={(e) => handleSelect(e.target.value)}

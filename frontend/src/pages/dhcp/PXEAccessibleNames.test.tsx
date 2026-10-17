@@ -53,7 +53,7 @@ describe("scope dialog pickers", () => {
       />,
     );
     expect(
-      await screen.findAllByRole("combobox", { name: "Apply option template" }),
+      await screen.findAllByRole("combobox", { name: "Apply template" }),
     ).toHaveLength(1);
   });
 });
@@ -87,6 +87,9 @@ describe("New PXE profile match rows", () => {
         screen.getAllByRole("checkbox", {
           name: new RegExp(`^Match ${n}: arch 0 `),
         }),
+      ).toHaveLength(1);
+      expect(
+        screen.getAllByRole("button", { name: `Remove match ${n}` }),
       ).toHaveLength(1);
     }
   });
