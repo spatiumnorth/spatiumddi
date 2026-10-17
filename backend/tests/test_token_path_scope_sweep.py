@@ -576,6 +576,66 @@ async def test_free_space_queries_refuse_a_subnet_bound_token_inside_its_own_blo
 
 
 @pytest.mark.asyncio
+async def test_a_subnet_bound_token_still_reaches_its_own_block_space_and_subnet(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The other side of the refusals above: a block or space holding the
+    token's subnet is admitted, and so is every block above it (the subnet
+    sits in a nested block here, so the parent chain is walked), and the
+    token's own subnet named in the query string is not refused."""
+    tag = uuid.uuid4().hex[:6]
+    space = IPSpace(name=f"own-{tag}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    top = IPBlock(space_id=space.id, network="10.91.0.0/16", name=f"top-{tag}")
+    db_session.add(top)
+    await db_session.flush()
+    mid = IPBlock(
+        space_id=space.id, parent_block_id=top.id, network="10.91.0.0/20", name=f"mid-{tag}"
+    )
+    db_session.add(mid)
+    await db_session.flush()
+    leaf = IPBlock(
+        space_id=space.id, parent_block_id=mid.id, network="10.91.1.0/24", name=f"leaf-{tag}"
+    )
+    db_session.add(leaf)
+    await db_session.flush()
+    sub = Subnet(space_id=space.id, block_id=leaf.id, network="10.91.1.0/25", name="own")
+    db_session.add(sub)
+    await db_session.flush()
+    owner = await _owner(db_session)
+    tok = await _token(
+        db_session,
+        owner,
+        [{"action": "*", "resource_type": "subnet", "resource_id": str(sub.id)}],
+    )
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {tok}"}
+
+    calls = [
+        (f"/api/v1/ipam/spaces/{space.id}/dns-sync/preview", None),
+        (f"/api/v1/ipam/spaces/{space.id}/effective-dns", None),
+        ("/api/v1/ipam/blocks", {"space_id": str(space.id)}),
+        ("/api/v1/ipam/subnets", {"space_id": str(space.id)}),
+        ("/api/v1/ipam/reports/stale-ips", {"subnet_id": str(sub.id)}),
+        ("/api/v1/ipam/addresses/search", {"subnet_id": str(sub.id), "q": "10.91"}),
+    ]
+    for b in (top, mid, leaf):
+        calls += [
+            # (``GET /blocks/{id}`` itself checks an ``ip_block`` grant, which
+            # no token can hold today, so it is not in this list.)
+            (f"/api/v1/ipam/blocks/{b.id}/dns-sync/preview", None),
+            (f"/api/v1/ipam/blocks/{b.id}/aggregation-suggestions", None),
+            (f"/api/v1/ipam/blocks/{b.id}/effective-dns", None),
+            ("/api/v1/ipam/subnets", {"block_id": str(b.id)}),
+            ("/api/v1/ipam/reports/stale-ips", {"block_id": str(b.id)}),
+        ]
+    for url, params in calls:
+        r = await client.get(url, params=params, headers=hdr)
+        assert r.status_code == 200, f"GET {url} {params} -> {r.status_code} {r.text}"
+
+
+@pytest.mark.asyncio
 async def test_stale_ip_deprecate_skips_rows_outside_the_tokens_subnets(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:

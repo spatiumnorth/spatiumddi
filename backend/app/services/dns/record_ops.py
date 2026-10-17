@@ -294,10 +294,12 @@ def queued_zone_ops_where(zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
     ``applied`` on each bundle build instead. A sibling view's op the sweep
     discards was therefore never going to reach ``nsupdate``: the over-sweep
     costs nothing. In a flat group the same name cannot exist twice (the
-    create route 409s it), so the predicate is exact there. A ``zone_id``
-    column would need a migration plus a name-scoped fallback for every
-    pre-upgrade row, i.e. this predicate again, to guard a path that is
-    already bypassed.
+    create route 409s it), so the predicate is exact there. Ops now carry
+    ``zone_id`` too (set on every enqueue path, used where per-view
+    attribution matters: the pending-ops list narrowed to a token's zones),
+    but rows queued before that column existed have it NULL, so keying this
+    predicate on it would need this name-scoped fallback anyway, to guard a
+    path that is already bypassed.
 
     Every zone-scoped sweep and count goes through here so the decision lives
     in one place; ``tests/test_dns_record_ops_sweep.py`` pins both the

@@ -98,17 +98,16 @@ async def build_hygiene_report(
     if subnet_ids is not None:
         from app.models.ipam import IPAddress  # noqa: PLC0415
 
-        found = {sid for rows in (free, stale, squat) for sid, _, _ in rows}
+        # Bound by the caller's own subnets, not by the estate-wide findings:
+        # an IN list of every finding could pass the driver's bind-parameter
+        # limit on a large estate, while a token names a handful of subnets.
         keep: set[str] = set()
-        if found and subnet_ids:
+        if subnet_ids and any((free, stale, squat)):
             keep = {
                 str(i)
                 for i in (
                     await db.execute(
-                        select(IPAddress.id).where(
-                            IPAddress.id.in_([uuid.UUID(f) for f in found]),
-                            IPAddress.subnet_id.in_(list(subnet_ids)),
-                        )
+                        select(IPAddress.id).where(IPAddress.subnet_id.in_(list(subnet_ids)))
                     )
                 ).scalars()
             }
