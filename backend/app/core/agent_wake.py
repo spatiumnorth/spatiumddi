@@ -313,7 +313,7 @@ async def wake_subscription(channels: Iterable[str]) -> AsyncIterator[WakeSubscr
     subscription whose ``wait`` sleeps — so the long-poll loop is
     identical to write either way. Always tears the pub/sub connection
     down in ``finally``: a poll that ends early (an exception, a
-    cancellation) must not leak it, or a flapping fleet would exhaust
+    cancellation) must not leave it open, or a flapping fleet would exhaust
     Redis connections. An agent disconnecting mid-poll does NOT cancel the
     handler, which runs on to its deadline (#2042); that is why the DNS
     long-poll checks ``request.is_disconnected()`` before committing a page

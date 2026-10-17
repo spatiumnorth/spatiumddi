@@ -34,7 +34,7 @@ from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.dns import DNSRecordOp, DNSServer, DNSServerGroup, DNSServerZoneState, DNSZone
 from app.services.dns.agent_token import mint_agent_token
-from app.services.dns.record_ops import apply_acks
+from app.services.dns.record_ops import apply_acks, return_ops_dispatched_elsewhere
 
 CONFIG_URL = "/api/v1/dns/agents/config"
 INSTANCE = "X-Spatium-Agent-Instance"
@@ -115,6 +115,7 @@ async def _shipped_to_old_agent(
     shipped = await _reload(db, op.id)
     assert shipped.state == "in_flight"
     assert shipped.dispatched_to == "old-agent"
+    assert shipped.dispatched_poll_at is not None
     return server, zone, headers, op, old.headers["etag"]
 
 
@@ -159,6 +160,41 @@ async def test_an_op_in_flight_to_this_instance_is_not_shipped_again(
     assert again.status_code == 304
     row = await _reload(db_session, op.id)
     assert (row.state, row.dispatched_to, row.attempts) == ("in_flight", "old-agent", 0)
+
+
+@pytest.mark.asyncio
+async def test_the_departed_agents_older_poll_does_not_take_an_op_from_its_replacement(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Both polls are held at once: the leftover one for the agent that went
+    away (started first) and the replacement's. An op the replacement's poll
+    shipped, received and not yet acked must stay with it — taken back by the
+    older poll, it would go to nobody and then reach the replacement twice."""
+    server, zone, _headers = await _agent(db_session)
+    leftover_started = datetime.now(UTC) - timedelta(seconds=20)
+    op = _op(server, zone)
+    op.state = "in_flight"
+    op.dispatched_to = "new-agent"
+    op.dispatched_poll_at = datetime.now(UTC) - timedelta(seconds=2)
+    db_session.add(op)
+    await db_session.commit()
+
+    taken = await return_ops_dispatched_elsewhere(
+        db_session, server.id, "old-agent", poll_started_at=leftover_started
+    )
+    await db_session.commit()
+    assert taken == 0
+    row = await _reload(db_session, op.id)
+    assert (row.state, row.dispatched_to, row.attempts) == ("in_flight", "new-agent", 0)
+
+    # A poll from another instance that started AFTER the shipping one does
+    # take it back: the ranking, not the instance alone, decides.
+    assert (
+        await return_ops_dispatched_elsewhere(
+            db_session, server.id, "next-agent", poll_started_at=datetime.now(UTC)
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -258,3 +294,12 @@ async def test_server_state_is_not_in_sync_while_the_server_has_an_unacked_op(
     per_server = (await client.get(server_url, headers=user)).json()
     assert per_server["zones"][0]["in_sync"] is True
     assert per_server["summary"]["in_sync"] == 1
+
+    # An op given up on (``failed``) is terminal, not queued: it does not hold
+    # the zone out of sync forever. Its failure surfaces on the op itself.
+    op_row = await _reload(db_session, op.id)
+    op_row.state = "failed"
+    await db_session.commit()
+    body = (await client.get(zone_url, headers=user)).json()
+    assert body["servers"][0]["pending_ops"] == 0
+    assert body["in_sync"] is True

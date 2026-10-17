@@ -1637,6 +1637,7 @@ async def page_pending_ops(
     visible_xacts: str | None = None,
     non_record_only: bool = False,
     dispatched_to: str | None = None,
+    poll_started_at: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """One PAGE of this server's pending ops, oldest first, marked ``in_flight``.
 
@@ -1684,7 +1685,9 @@ async def page_pending_ops(
     ``dispatched_to`` (#2042): the instance id of the agent process the page
     is for, stamped on each op so a replacement agent's poll can tell an op
     shipped to a predecessor from one shipped to itself
-    (``record_ops.return_ops_dispatched_elsewhere``).
+    (``record_ops.return_ops_dispatched_elsewhere``). ``poll_started_at`` is
+    when the poll began, stamped with it: it decides which of two concurrent
+    polls may take an op back from the other.
     """
     if server.maintenance_mode:
         return [], 0
@@ -1760,6 +1763,7 @@ async def page_pending_ops(
         # The dispatch time: the stale-``in_flight`` reset measures from it.
         op.updated_at = now
         op.dispatched_to = dispatched_to
+        op.dispatched_poll_at = poll_started_at if dispatched_to is not None else None
     if ops_to_dispatch:
         await db.flush()
     return page, remaining

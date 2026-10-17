@@ -805,14 +805,18 @@ async def agent_config_longpoll(
     in the next seconds was paged into a response nobody read and sat
     ``in_flight`` until the 5-minute unacknowledged reset. Two guards. The
     agent names its process on every poll (``X-Spatium-Agent-Instance``),
-    each shipped op records it, and every pass first returns the ops
-    ``in_flight`` to a different instance to ``pending`` so this poll ships
+    each shipped op records it and when its poll started, and every pass
+    first returns the ops ``in_flight`` to a different instance, shipped by a
+    poll that started before this one, to ``pending`` so this poll ships
     them. And a handler whose client has disconnected rolls its page back
     instead of committing it; that check is advisory (TCP may not have
     noticed yet), the instance id is what makes the recovery certain.
     """
     server, _payload = auth
     instance = _agent_instance(agent_instance)
+    # #2042 — ranks this poll against any other the API holds for the server;
+    # see ``return_ops_dispatched_elsewhere``.
+    poll_started_at = datetime.now(UTC)
     if server.pending_approval:
         response.headers["X-Spatium-Pending-Approval"] = "1"
         return {"pending_approval": True, "etag": None}
@@ -853,7 +857,7 @@ async def agent_config_longpoll(
                     enqueued = True
             if bundle is not None:
                 if instance is not None and await return_ops_dispatched_elsewhere(
-                    db, server.id, instance
+                    db, server.id, instance, poll_started_at=poll_started_at
                 ):
                     # Committed on its own: this pass may ship nothing (a
                     # paused server) and then waits, and a wait must not hold
@@ -871,6 +875,7 @@ async def agent_config_longpoll(
                     visible_xacts=bundle.visible_xacts,
                     non_record_only=not bundle.ships_ops,
                     dispatched_to=instance,
+                    poll_started_at=poll_started_at,
                 )
                 if ops and await request.is_disconnected():
                     # #2042 — the agent this poll was for is gone; marking

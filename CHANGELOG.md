@@ -93,9 +93,12 @@ the formatter handles the rest.
   connection nobody read, so the new agent never got it and the record
   was not served until the 5-minute unacknowledged-op reset sent it
   again. The agent now names its process on every config poll, each
-  shipped op records which process it went to, and a poll from a
-  different process returns any op still in flight to its predecessor
-  to the queue and ships it on that poll. A long-poll whose client has
+  shipped op records which process it went to and when its poll
+  started, and a poll from a different process returns any op still in
+  flight to its predecessor to the queue and ships it on that poll. Only
+  a poll that started after the one that shipped the op may take it
+  back, so the departed agent's leftover poll never takes an op from
+  its replacement. A long-poll whose client has
   disconnected also rolls its page back instead of committing it. An
   agent that predates this change still recovers through the 5-minute
   reset. Separately, a zone's server state no longer reads in sync
@@ -5299,9 +5302,10 @@ the formatter handles the rest.
 ### Migrations
 
 - `e3b7c19f5a42` — #2042: `dns_record_op.dispatched_to`, a nullable
-  string naming the agent process an op was last shipped to. No
-  backfill: NULL means not recorded and is never read as "another
-  agent". Downgrade drops the column.
+  string naming the agent process an op was last shipped to, and
+  `dns_record_op.dispatched_poll_at`, when the long-poll that shipped it
+  started. No backfill: NULL means not recorded and is never read as
+  "another agent". Downgrade drops both columns.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column

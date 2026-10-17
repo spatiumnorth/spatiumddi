@@ -558,6 +558,13 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
     # unacknowledged reset. NULL = shipped to an agent too old to say, or
     # never shipped; NULL is never treated as "another instance".
     dispatched_to: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # #2042 — when the long-poll that shipped the op STARTED. Ranks two polls
+    # the API holds at once for one server: only a poll that started after the
+    # one that shipped an op may take it back, so a replaced agent's leftover
+    # poll (the older one) never takes an op from its replacement's poll.
+    dispatched_poll_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):

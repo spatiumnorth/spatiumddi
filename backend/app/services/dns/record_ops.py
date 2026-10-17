@@ -271,7 +271,12 @@ async def reset_unacknowledged_ops(
 
 
 async def return_ops_dispatched_elsewhere(
-    db: AsyncSession, server_id: uuid.UUID, instance: str, *, now: datetime | None = None
+    db: AsyncSession,
+    server_id: uuid.UUID,
+    instance: str,
+    *,
+    poll_started_at: datetime,
+    now: datetime | None = None,
 ) -> int:
     """Return this server's ops shipped to another agent process to ``pending``
     (#2042). Returns the count; flushes, the caller commits.
@@ -293,6 +298,16 @@ async def return_ops_dispatched_elsewhere(
     whole-RRset replaces (#773), so re-applying one the old agent did apply is
     a no-op, and its late ``ok`` ack still marks the op applied.
 
+    Only an op shipped by a poll that STARTED BEFORE this one
+    (``dispatched_poll_at < poll_started_at``). The departed agent's leftover
+    poll runs at the same time as its replacement's and also passes through
+    here; without the ranking it would take back ops the replacement has
+    received and not yet acked (acks ride the ~30 s heartbeat), re-send them to
+    nobody, and the replacement would get them a second time — one more
+    attempt each, and a second ``rndc dnssec -rollover`` for a rollover op. The
+    leftover poll always started first, so it never qualifies; the
+    replacement's polls always started after it, so they always do.
+
     An op with no ``dispatched_to`` (shipped by an older control plane, or to
     an agent too old to send an instance id) is left to the 5-minute reset.
     """
@@ -303,6 +318,7 @@ async def return_ops_dispatched_elsewhere(
         DNSRecordOp.state == "in_flight",
         DNSRecordOp.dispatched_to.is_not(None),
         DNSRecordOp.dispatched_to != instance,
+        DNSRecordOp.dispatched_poll_at < poll_started_at,
     )
     if not stale:
         return 0
