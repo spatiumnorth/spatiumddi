@@ -242,6 +242,7 @@ dhcpAgents:
 | `api.replicas` | `2` |  |
 | `api.service.type` | `ClusterIP` |  |
 | `api.service.port` | `8000` |  |
+| `api.service.trafficDistribution` | `PreferSameNode` | #1805 — each node's in-cluster callers (the supervisor, the DNS/DHCP agents, the frontend's `/api` proxy) use the api pod on their own node while it is ready, so a lost node's api pod cannot hold their requests. Rendered on Kubernetes 1.34+; `""` renders no field |
 | `api.autoscaling.enabled` | `true` | HPA on CPU + memory |
 | `api.autoscaling.minReplicas` / `maxReplicas` | `2` / `10` |  |
 | `api.probes.liveness.{initialDelaySeconds,periodSeconds,timeoutSeconds,failureThreshold}` | `10` / `30` / `30` / `4` | #1051 — `/health/live` budgets, sized for a busy single-worker loop: four 30 s misses restart a process that has said nothing for two minutes |

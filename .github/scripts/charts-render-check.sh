@@ -165,6 +165,9 @@ render() { # name chart [helm --set args...]
     # wedges once replicas == nodes.
     python3 "$ROOT/.github/scripts/chart-rollout-strategy.py" "$file" \
         || failures=$((failures + 1))
+    # #1805 — the api Service keeps each node's callers on its own api pod.
+    python3 "$ROOT/.github/scripts/chart-api-node-local.py" "$file" \
+        || failures=$((failures + 1))
 }
 
 coverage() { # chart [every --set arg from every render of that chart...]
@@ -260,6 +263,38 @@ for n in 1 3; do
         --retire-first api --retire-first worker --retire-first frontend \
         "$OUT/umbrella-appliance-cp-$n.yaml" || failures=$((failures + 1))
 done
+
+# #1805 — the default render must carry PreferSameNode on the api Service
+# (--require, so the template cannot silently stop rendering it). A render
+# below Kubernetes 1.34 must omit the field, because the API server refuses
+# the value there. An empty value turns it off, and the gate must notice.
+echo "── api Service keeps callers on their own node (umbrella, #1805)"
+python3 "$ROOT/.github/scripts/chart-api-node-local.py" --require \
+    "$OUT/umbrella-defaults.yaml" || failures=$((failures + 1))
+if helm template umbrella-k8s-133 "$UMBRELLA" --kube-version 1.33.0 \
+        > "$OUT/umbrella-k8s-133.yaml"; then
+    python3 "$ROOT/.github/scripts/chart-api-node-local.py" --require --absent \
+        "$OUT/umbrella-k8s-133.yaml" || failures=$((failures + 1))
+else
+    echo "   FAIL: umbrella chart did not render at Kubernetes 1.33" >&2
+    failures=$((failures + 1))
+fi
+echo "── negative control: an api Service without PreferSameNode must fail"
+if helm template neg-api-td "$UMBRELLA" --kube-version "$K8S_VERSION" \
+        --set api.service.trafficDistribution= > "$OUT/neg-api-td.yaml"; then
+    neg_out="$(python3 "$ROOT/.github/scripts/chart-api-node-local.py" \
+        "$OUT/neg-api-td.yaml" 2>&1)" && neg_rc=0 || neg_rc=$?
+    if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "#1805"; then
+        echo "   ok: api Service without trafficDistribution refused by the #1805 guard"
+    else
+        echo "   FAIL: expected the #1805 guard to refuse an api Service without PreferSameNode (rc=$neg_rc)" >&2
+        printf '%s\n' "$neg_out" | tail -5 >&2
+        failures=$((failures + 1))
+    fi
+else
+    echo "   FAIL: umbrella chart did not render with api.service.trafficDistribution empty" >&2
+    failures=$((failures + 1))
+fi
 # #1826 — the appliance's shared env, as firstboot writes it. Rendered with
 # the mirror on so its URL / secret are in the set too.
 render umbrella-shared-env "$UMBRELLA" \

@@ -32,7 +32,7 @@ import dataclasses
 from . import appliance_state, approval_state, cp_tls
 from .cert_auth import clear_cert
 from .config import SupervisorConfig
-from .heartbeat import _effective_control_plane_url, heartbeat_once
+from .heartbeat import _effective_control_plane_url, heartbeat_once, next_heartbeat_delay
 from .k8s_proxy import start_proxy_thread
 from .identity import (
     clear_appliance_id,
@@ -404,6 +404,9 @@ def main() -> int:
     # (~heartbeat_interval server-side); this only bounds the re-post rate
     # if a server ever returns held=True fast in a loop.
     held_rearm_floor_s = 2.0
+    # #1805 — heartbeats in a row that never reached the control plane; the
+    # next one goes sooner than the interval (``next_heartbeat_delay``).
+    failures = 0
 
     while not stop:
         try:
@@ -428,8 +431,9 @@ def main() -> int:
         # agent only proceeds when its configured URL is present.
         effective_url = _effective_control_plane_url(cfg)
         # #358 Phase 1b — True when the control plane long-poll-held this
-        # heartbeat (and thus already paced us ~heartbeat_interval).
-        held = False
+        # heartbeat (and thus already paced us ~heartbeat_interval); None when
+        # it never reached the control plane (#1805).
+        held: bool | None = False
         if appliance_id is not None and effective_url:
             session_token = load_session_token(cfg.state_dir)
             identity, _ = load_or_generate(cfg.state_dir)
@@ -468,9 +472,17 @@ def main() -> int:
         # heartbeat it already blocked ~heartbeat_interval server-side, so
         # re-arm the hold after a short floor instead of sleeping the full
         # interval again (which would roughly halve hold coverage). Old
-        # control planes / errors (held=False) keep the full interval.
-        sleep_budget = (
-            held_rearm_floor_s if held else float(cfg.heartbeat_interval_seconds)
+        # control planes and crashes (held=False) keep the full interval.
+        # #1805 — a heartbeat that never reached the control plane (None) is
+        # re-sent after 5 s, doubling while they keep failing, up to the
+        # interval: a node loss's few seconds of unreachable api no longer cost
+        # a whole interval each.
+        failures = failures + 1 if held is None else 0
+        sleep_budget = next_heartbeat_delay(
+            held,
+            failures,
+            float(cfg.heartbeat_interval_seconds),
+            held_rearm_floor_s,
         )
         waited = 0.0
         while waited < sleep_budget:
