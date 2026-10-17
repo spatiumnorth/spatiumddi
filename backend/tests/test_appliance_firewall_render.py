@@ -84,6 +84,16 @@ _MATRIX: list[dict] = [
         "pod_cidrs": ["10.42.0.0/16", "2001:cafe:42::/56"],
         "cp_member_count": 2,
     },
+    # #1827 — dual-stack multi-node CP + VIP: the guarded peer rules
+    # (memberlist and frr-k8s's webhook) in both families.
+    {
+        "role_assignment": {"roles": []},
+        "cluster_peer_cidrs": ["192.168.0.10", "2001:db8::10"],
+        "pod_cidrs": ["10.42.0.0/16", "2001:cafe:42::/56"],
+        "service_cidrs": ["10.43.0.0/16"],
+        "cp_member_count": 3,
+        "vip_configured": True,
+    },
     # operator firewall_extra
     {"role_assignment": {"roles": ["dhcp"], "firewall_extra": 'udp dport 161 accept comment "x"'}},
     # Trap 1: junk pod CIDR — is_cp via RAW non-empty, but no valid union.

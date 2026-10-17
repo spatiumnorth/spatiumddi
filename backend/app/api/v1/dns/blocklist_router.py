@@ -1228,6 +1228,7 @@ async def add_entry(
         reason=body.reason,
     )
     db.add(entry)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     bl.entry_count = bl.entry_count + 1
     db.add(
         _audit(
@@ -1459,6 +1460,7 @@ async def add_exception(
         created_by_user_id=current_user.id,
     )
     db.add(ex)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         _audit(
             current_user,

@@ -3971,6 +3971,34 @@ async def delete_appliance(
                 "or factory-reset / reinstall this box to decommission it.",
             )
 
+    # #1884 — nor any other node of a formed control-plane cluster. A revoked
+    # row drops out of its peers' firewall sets (approved rows only) within a
+    # minute, but nothing takes the node out of etcd: its established peer
+    # connections keep it voting while every new one is dropped, and its own
+    # teardown, on a node that shares the cluster, clears only its role labels,
+    # on the heartbeats its kube API still answers. It stays an etcd voter with
+    # a Ready Node that its peers no longer admit. A member leaves etcd by the
+    # demote while it is alive, or by Replace (the seed evicts it) when it is
+    # dead; both clear cluster_role, and it revokes after that. The seed can be
+    # neither demoted nor replaced. The Fleet tab already disables Revoke on
+    # control-plane rows, and the deployment docs say to demote first.
+    if row.cluster_role == CLUSTER_ROLE_PRIMARY:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Refusing to revoke {row.hostname} — it is the etcd seed of the "
+            "control-plane cluster, which can be neither demoted nor replaced. "
+            "Demote the other members first; once it is the only control-plane "
+            "node, factory-reset or reinstall it to decommission it.",
+        )
+    if row.cluster_role == CLUSTER_ROLE_MEMBER:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Refusing to revoke {row.hostname} — it is a member of the "
+            "control-plane cluster and votes in its etcd. Demote it from the "
+            "cluster first (Manage control plane cluster…), or use Replace… on "
+            "its row if the node is dead, then revoke it.",
+        )
+
     # Ownership is judged on the state the appliance is deleted FROM (#1810):
     # only an approved appliance may claim a row by hostname.
     dependents = await _find_appliance_dependents(db, row)

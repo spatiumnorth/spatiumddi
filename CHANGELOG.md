@@ -102,6 +102,122 @@ the formatter handles the rest.
   and reboot cannot clear a reboot the operator still owes. The per-box
   form, the API docstring and the Upgrades docs no longer claim the host
   reboots into the new slot; only Rolling Upgrade reboots for you.
+
+- **Creating an alert rule, firewall policy or alias, conformity policy,
+  backup target, API token, DNS group, server, zone, TSIG key, view,
+  blocklist entry or exception, or an upgrade run no longer writes an
+  audit row whose resource id is the string "None" (#2006).** The id is a
+  column default SQLAlchemy only applies at flush, and each handler built
+  its audit row from the id straight after `db.add`, so the audit trail
+  could not say which row a create made. Each now flushes first (the DNS
+  options row and the API token's `"?"` / `"new"` placeholders are gone
+  too). A new AST guard fails any function that reads `obj.id` between
+  `db.add(obj)` and the next flush.
+- **DHCP Device Policy dialog: a lease of "10m" is refused, a manual-match
+  policy is no longer called "not rendered", and every DHCP form label names
+  its control (#1991, #1992, part of #1994).** A lease time that was not a
+  whole number of seconds went through `Number()` to NaN, which JSON sends as
+  null, so the typo was stored as "inherit" with no error; it is now refused
+  inline and only a blank field means inherit. A policy with a manual match
+  expression and no device classes (which does reach Kea) was described in the
+  preview as matching nothing and not rendered, and the Device classes hint
+  said the same; the warning now applies only with neither classes nor a
+  manual match, in both the REST preview and `preview_dhcp_device_policy`. The
+  shared DHCP `Field` now links its label to its control (`htmlFor`/`id` on
+  the one input, select or textarea among its children, even beside a
+  `<datalist>` or an inline error line; otherwise a labelled group). The
+  Alerts rule editor's own `Field` is handled separately.
+
+- **Updating an alert rule with a null `enabled` or `severity` answered
+  500, and disabling a rule left its open alerts open for good (#1987,
+  #1988).** Every NOT NULL field of the rule update (`name`,
+  `description`, `enabled`, `severity`, `notify_*`) now answers 422
+  naming the field on an explicit null, through the shared
+  `resolve_update_changes`; the nullable thresholds, `server_type`,
+  `classification` and `change_scope` can still be cleared. Disabling a
+  rule now resolves its open events in the same transaction, since the
+  evaluator only visits enabled rules and nothing else would ever close
+  them; the count is recorded in that update's audit row
+  (`resolved_open_events`). Overview and the "Open only" list stop
+  showing them. Resolution is silent, as the evaluator's own is. A rule
+  already disabled with events stuck open is cleared by sending the
+  disable again. The `audit-chain-broken` and `schema-behind-head` rules
+  no longer open (or deliver) an event while disabled, matching the
+  ACME, upgrade and conformity rules; otherwise the next pass after a
+  disable would re-open and re-deliver the alert it had just closed.
+
+- **In BGP mode every node of a multi-node appliance gets its BGP
+  configuration (#1827).** MetalLB's BGP mode delegates to frr-k8s, whose
+  validating webhook for `FRRConfiguration` objects is served by the
+  `frr-k8s-statuscleaner` pod on one node's host network, at port 19443. The
+  apiserver on every other node calls it at that node's address, and the node
+  firewall accepted nothing on 19443 from peers, so those calls timed out
+  and the webhook, which fails closed, refused the write. Each speaker's write
+  of its node's `FRRConfiguration` lands on whichever apiserver the kubernetes
+  Service picks, so only the writes that happened to reach the webhook's own
+  node passed: on a three-node cluster zero to two nodes peered, while the
+  MetalLB settings reported every speaker ready. Control-plane nodes now accept
+  TCP 19443 from their cluster peers, scoped and gated like the MetalLB
+  memberlist rule (multi-node with a control-plane VIP), in all three firewall
+  renderers, and a seed migration adds the rule to the built-in
+  `control-plane` policy of an existing install so fleet enforcement opens it
+  too.
+
+- **A revoked node's teardown that could not run now says why (#1884).**
+  Once revoked, the supervisor runs its teardown on every rejected
+  heartbeat. It logged a teardown that stopped something, or one that
+  raised, but not one that returned without stopping anything, so a
+  teardown that could reach no kube API, as on a member its peers had
+  already fenced out, returned in silence. It now logs
+  `supervisor.heartbeat.revoked_teardown_incomplete` with the state and
+  the reason; it still tries again on the next heartbeat.
+
+- **A role change whose apply met an unready kube API is tried again, and
+  the node says why (#1716).** A role change is applied once, on the
+  node's next heartbeat, and the apply first asks the kube API's `/readyz`
+  (2 s). When that probe missed, the apply reported `idle` and the
+  heartbeat recorded the change as applied, so no later heartbeat tried it
+  again, even once the kube API was back, and Fleet showed the node `idle`
+  with no reason until its roles changed again. A `/readyz` miss now
+  reports `failed` with its reason, which the heartbeat does not record as
+  applied (#1640), so the next heartbeat applies the change, and Fleet
+  shows why while it cannot. A slot with no role chart baked still reports
+  `idle`.
+
+- **A member of the control-plane cluster can no longer be revoked in
+  place (#1884).** The Fleet tab disables Revoke on control-plane rows
+  and the deployment docs say a live cluster member must be demoted first,
+  but the API refused only the last control-plane node. A member revoked
+  through the API was fenced out by its peers' firewalls within a minute
+  and stayed an etcd voter with a Ready Node: nothing takes a revoked
+  member out of etcd, its established peer connections kept it in quorum
+  while every new one was dropped, and its own teardown could clear only
+  its role labels, on the heartbeats its kube API answered.
+  `DELETE /appliances/{id}` now answers 409 for a member of a formed
+  cluster and says to demote it first, or to Replace it when the node is
+  dead (Replace evicts it from the seed's side). It refuses the seed too,
+  which can be neither demoted nor replaced, and says to demote the other
+  members first. A node that has left the cluster revokes as before.
+
+- **The alert rule editor no longer rewrites a rule's stored thresholds,
+  crashes on a refused save, or leaves its labels unattached (#1986,
+  #1993, #1994).** Edit then Save with nothing changed sent the editor's
+  own defaults (90, 30) and nulls for every field the rule type does not
+  show, so a stored null threshold became 90 and a stored
+  `threshold_days` became null. The editor now shows stored values (a
+  null stays empty), builds the body from only the fields the rule type
+  shows, and on an edit sends only what changed, nothing at all when
+  nothing did. A select that can only display a stored null as its
+  default (a null server type as `any`, a null change scope as
+  `any_change`) counts as unchanged too, which is how the evaluator reads
+  that null anyway. A 422 carrying FastAPI's validation list is rendered as
+  text through the shared `errMsg` and the dialog stays open, instead of
+  React error #31 replacing the page. Each label is tied to its control
+  with `htmlFor` and `id`. The update handler already used
+  `exclude_unset`.
+
+- **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial could not be written ("value out of int32 range") and the agent zone-state report was refused with a 422, leaving the Zone Sync pill unable to show convergence. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment past 4294967295 wraps to 1 (RFC 1982; it skips 0 the way BIND's own `increment` does, because 0 is the "never seeded" value that every renderer serves as 1). It used to produce 4294967296, which is not a valid SOA serial.
+
 - **Disabling a DNS pool now removes its records, and a pool TTL change
   lands immediately (#1974).** `update_pool` never reconciled and
   `apply_pool_state` ignored `pool.enabled`, so a disabled pool kept
@@ -120,7 +236,10 @@ the formatter handles the rest.
   `--localstorage-file` and shadows jsdom's, so every test calling
   `localStorage.clear()` threw. The vitest workers now start with
   `--no-experimental-webstorage` (`frontend/vite.config.ts`), so jsdom's
-  storage is used on Node 22 and 26 alike. No shipped code changes.
+  storage is used on Node 22 and 26 alike. The flag is passed only where
+  the running Node accepts it: Node 20, still a supported dev version,
+  refuses to start a worker given an unknown option, so the first cut of
+  this fix made every test fail there. No shipped code changes.
 
 - **Kubernetes Detect CIDRs answered 500 when the token held a non-ASCII
   character (#1913).** The bearer token goes straight into an
@@ -5094,6 +5213,7 @@ the formatter handles the rest.
   groups with a `technitium_api` or Windows DNS server with credentials and
   no cloud server, due now; cloud groups are not marked. Downgrade drops
   both columns.
+- `d2a6e81f3b57` — #1975, widens `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` from `INTEGER` to `BIGINT`. Downgrade narrows them back and fails if a stored serial no longer fits.
 
 ## 2026.10.02-1 — 2026-10-02
 

@@ -190,6 +190,46 @@ def test_memberlist_only_when_multinode_and_vip() -> None:
     assert 7946 in p.expected_tcp_ports and 7946 in p.expected_udp_ports
 
 
+# ── frr-k8s webhook between peers (#1827) ────────────────────────────
+
+
+def test_frr_k8s_webhook_peer_scoped_under_the_memberlist_gate() -> None:
+    # In BGP mode frr-k8s serves its fail-closed FRRConfiguration webhook on
+    # ONE node's host network (:19443); every other node's apiserver calls it
+    # there, through this chain. Dropped, only the speaker writes that land on
+    # the webhook's own apiserver pass and the other nodes never peer (#1827).
+    # Single member or no VIP → not emitted (MetalLB runs only with a VIP, and
+    # a single node calls its own webhook over loopback).
+    for count, vip in ((1, True), (3, False)):
+        p = render_drop_in({"roles": []}, _PEERS_V4, cp_member_count=count, vip_configured=vip)
+        assert "19443" not in p.body
+        assert 19443 not in p.expected_tcp_ports
+    # Multi-node + VIP → peer-scoped, never LAN-wide, after memberlist.
+    p = render_drop_in({"roles": []}, _PEERS_V4, cp_member_count=3, vip_configured=True)
+    rule = (
+        "ip saddr { 192.168.0.125/32, 192.168.0.133/32 } tcp dport 19443 accept "
+        'comment "frr-k8s-webhook-v4"'
+    )
+    assert rule in p.body.splitlines()
+    assert [ln for ln in p.body.splitlines() if "19443" in ln] == [rule]
+    lines = p.body.splitlines()
+    assert lines.index(rule) > next(
+        i for i, ln in enumerate(lines) if "metallb-memberlist-udp" in ln
+    )
+    assert 19443 in p.expected_tcp_ports
+    # A v6 peer is scoped by its /128 in the ip6 set.
+    p6 = render_drop_in(
+        {"roles": []},
+        ["192.168.0.10", "2001:db8::10"],
+        cp_member_count=3,
+        vip_configured=True,
+    )
+    assert (
+        'ip6 saddr { 2001:db8::10/128 } tcp dport 19443 accept comment "frr-k8s-webhook-v6"'
+        in p6.body
+    )
+
+
 # ── Injection safety + operator override ─────────────────────────────
 
 
