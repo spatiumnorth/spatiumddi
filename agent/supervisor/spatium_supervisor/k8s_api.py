@@ -1142,7 +1142,13 @@ def _merge_owned_overrides(
     if current_doc is None:
         # Unknown current state — writing would merge onto {} and delete
         # every key we do not own.
-        return False, f"could not read the current {name} values"
+        # The read logged why. A CR an operator left unparseable stays
+        # frozen — the supervisor's own keys included — until it is fixed or
+        # deleted, so say so on every beat rather than once.
+        return False, (
+            f"could not read the current {name} values; nothing written "
+            f"(if this persists, fix or delete the HelmChartConfig {name})"
+        )
     owned_keys = owned(current_doc) if callable(owned) else owned
     merged = _deep_merge(current_doc, owned_keys)
     if exists and merged == current_doc:
@@ -1302,6 +1308,12 @@ def _values_content_read(
     except yaml.YAMLError as exc:
         log.warning(f"supervisor.{kind}.unparseable_values", chart=name, error=str(exc))
         return None, True, rv
+    if doc is None:
+        # A document of only comments (or ``---`` / ``null``) is a YAML
+        # empty document: helm reads it as no values, so there is nothing to
+        # preserve. Refusing it would freeze every supervisor key in this CR
+        # for good on an operator who commented their override out.
+        return {}, True, rv
     if not isinstance(doc, dict):
         # A list or scalar at the top level is not something we can merge
         # into. Refusing beats replacing it with our own keys and calling
@@ -1342,7 +1354,8 @@ def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict |
     """Current ``spec.valuesContent`` of the HelmChartConfig, parsed.
 
     Returns ``{}`` only when there is genuinely nothing to preserve: the CR
-    does not exist (404), or it exists with an empty ``valuesContent``.
+    does not exist (404), or it exists with an empty ``valuesContent`` (an
+    all-comments document is empty too — YAML parses it to null).
 
     Returns ``None`` for every other non-answer — kubeapi unreachable, an
     unexpected status, a body we cannot parse, or a document that is not a

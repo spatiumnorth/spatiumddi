@@ -1201,7 +1201,7 @@ def heartbeat_once(
         # when k3s re-applies the on-disk firstboot manifest on restart;
         # a HelmChartConfig is a separate CR helm-controller merges on top
         # + the deploy controller never reverts. cp-size + the VIP go on
-        # spatium-control; the MetalLB pool on spatium-bootstrap.
+        # spatium-control; the MetalLB pool on spatium-metallb.
         # Each write MERGES the supervisor's own keys into the live
         # document (operator keys survive, #2024) and only writes when that
         # changes the effective values.

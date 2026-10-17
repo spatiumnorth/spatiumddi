@@ -99,7 +99,13 @@ the formatter handles the rest.
   a helm revision that changes nothing. YAML comments in these CRs are
   dropped when the supervisor next has to change one of its keys; the
   recipe now says to edit the CR in place rather than `kubectl apply`
-  over it.
+  over it, and `APPLIANCE.md` lists which keys in each of the three CRs
+  belong to the supervisor. That list corrects one earlier claim: the api
+  and worker memory limits in `spatium-control` are sized by the
+  supervisor and put back on every heartbeat, so an override there never
+  held. A CR whose `valuesContent` is only comments now counts as empty
+  instead of unreadable, so commenting an override out no longer freezes
+  the supervisor's own keys in it.
 - **Creating an alert rule, firewall policy or alias, conformity policy,
   backup target, API token, DNS group, server, zone, TSIG key, view,
   blocklist entry or exception, or an upgrade run no longer writes an

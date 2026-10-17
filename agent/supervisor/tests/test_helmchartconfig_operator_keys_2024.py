@@ -265,3 +265,48 @@ def test_control_plane_operator_keys_survive(monkeypatch) -> None:
     assert doc["image"] == {"tag": "t"}
     assert doc["api"]["replicas"] == 3
     assert len(kube.writes) == 1
+
+
+# --------------------------------------------------------------------------
+# absent / empty documents — "cannot read" must never mean "not there"
+# --------------------------------------------------------------------------
+def test_an_absent_cr_is_created(monkeypatch) -> None:
+    """A 404 is "no document", not "unknown": the supervisor must still
+    CREATE the CR (a fresh appliance, or an operator who deleted it)."""
+    kube = _Kube()
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    assert _beat("192.0.2.53") == (True, None)
+    assert [m for m, _, _ in kube.writes] == ["POST"]
+    assert kube.doc("spatiumddi-appliance")["dns"] == {
+        "useMetalLBVIP": True,
+        "vip": "192.0.2.53",
+    }
+
+    # Deleted out from under us: the next beat re-creates it.
+    del kube.config["spatiumddi-appliance"]
+    assert _beat("192.0.2.53") == (True, None)
+    assert [m for m, _, _ in kube.writes] == ["POST", "POST"]
+
+
+def test_a_comments_only_document_is_empty_not_unreadable(monkeypatch) -> None:
+    """An operator who comments their override out leaves a YAML empty
+    document (it parses to null). That is nothing to preserve, not an
+    unknown state — refusing it would freeze the VIP keys in this CR for
+    good."""
+    raw = "# dnsBind9:\n#   resources:\n#     limits:\n#       memory: 4Gi\n"
+    kube = _Kube(config={"spatiumddi-appliance": raw})
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    assert _beat("192.0.2.53") == (True, None)
+    assert kube.doc("spatiumddi-appliance")["dns"]["vip"] == "192.0.2.53"
+
+
+def test_an_unparseable_document_says_how_to_recover(monkeypatch) -> None:
+    kube = _Kube(config={"spatiumddi-appliance": "dns: [unclosed\n"})
+    monkeypatch.setattr(k8s_api, "_request", kube)
+    for _ in range(2):  # every beat, not once
+        ok, err = _beat("192.0.2.53")
+        assert ok is False
+        assert err and "fix or delete the HelmChartConfig spatiumddi-appliance" in err
+    assert not kube.writes
