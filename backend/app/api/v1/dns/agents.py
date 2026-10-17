@@ -83,6 +83,7 @@ from app.services.dns.record_ops import (
     apply_acks,
     lock_heartbeat_ops,
     reset_unacknowledged_ops,
+    return_ops_dispatched_elsewhere,
 )
 from app.services.dns.row_locks import (
     lock_op_ids,
@@ -721,11 +722,28 @@ async def _bounded_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle
                 pass
 
 
+#: #2042 — the per-process id a DNS agent sends on every config poll. A new
+#: value for a server means a new agent process; see ``agent_config_longpoll``.
+AGENT_INSTANCE_HEADER = "X-Spatium-Agent-Instance"
+_AGENT_INSTANCE_MAX = 64  # dns_record_op.dispatched_to
+
+
+def _agent_instance(raw: str | None) -> str | None:
+    """The agent's instance id, or None when it sent none or an unusable one
+    (an older agent; its ops are left to the 5-minute reset)."""
+    value = (raw or "").strip()
+    if not value or len(value) > _AGENT_INSTANCE_MAX or not value.isprintable():
+        return None
+    return value
+
+
 @router.get("/config")
 async def agent_config_longpoll(
+    request: Request,
     db: DB,
     response: Response,
     if_none_match: str | None = Header(default=None, alias="If-None-Match"),
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
     auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> Any:
     """Long-poll for config changes.
@@ -781,8 +799,20 @@ async def agent_config_longpoll(
     has never had one. One attempt per server at a time, none during a
     failed attempt's backoff, and a failed attempt leaves the poll on the
     worker's renders like the fallback being off.
+
+    #2042 — an agent that is replaced leaves this handler running: nothing
+    cancels a long-poll when its client goes, so a record change committed
+    in the next seconds was paged into a response nobody read and sat
+    ``in_flight`` until the 5-minute unacknowledged reset. Two guards. The
+    agent names its process on every poll (``X-Spatium-Agent-Instance``),
+    each shipped op records it, and every pass first returns the ops
+    ``in_flight`` to a different instance to ``pending`` so this poll ships
+    them. And a handler whose client has disconnected rolls its page back
+    instead of committing it; that check is advisory (TCP may not have
+    noticed yet), the instance id is what makes the recovery certain.
     """
     server, _payload = auth
+    instance = _agent_instance(agent_instance)
     if server.pending_approval:
         response.headers["X-Spatium-Pending-Approval"] = "1"
         return {"pending_approval": True, "etag": None}
@@ -822,6 +852,13 @@ async def agent_config_longpoll(
                     await enqueue_renders([server.id])
                     enqueued = True
             if bundle is not None:
+                if instance is not None and await return_ops_dispatched_elsewhere(
+                    db, server.id, instance
+                ):
+                    # Committed on its own: this pass may ship nothing (a
+                    # paused server) and then waits, and a wait must not hold
+                    # op row locks the heartbeat needs.
+                    await db.commit()
                 ops: list[dict[str, Any]] = []
                 remaining_ops = 0
                 # Under views the body carries record changes (their ops were
@@ -833,7 +870,14 @@ async def agent_config_longpoll(
                     up_to=bundle.snapshot_at,
                     visible_xacts=bundle.visible_xacts,
                     non_record_only=not bundle.ships_ops,
+                    dispatched_to=instance,
                 )
+                if ops and await request.is_disconnected():
+                    # #2042 — the agent this poll was for is gone; marking
+                    # the page in_flight would ship it to nobody.
+                    await db.rollback()
+                    AGENT_BUNDLE_SERVED.labels(family="dns", outcome="client_gone").inc()
+                    return Response(status_code=304)
                 # Early return if there are pending ops (fast-path per §3)
                 if not etag_matches(if_none_match, bundle.etag) or ops:
                     # The body before the commit, and never assumed: the

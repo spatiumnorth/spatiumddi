@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,17 @@ from .drivers.base import DriverBase, HeldZone
 from .oom_watch import OomWatch, is_oom_status
 
 log = structlog.get_logger(__name__)
+
+# #2042 — names this agent PROCESS on every config poll. The control plane
+# stamps it on each op it ships, so when a replacement process polls, an op
+# still in flight to the previous one (paged into a long-poll the API held for
+# an agent that is gone) is recognised as undelivered and shipped again at
+# once, instead of after the 5-minute unacknowledged reset. Per process, not
+# per ``Sync``: a re-bootstrap keeps the heartbeat and its unsent acks, so the
+# ops this process received are still its own. A header, so an older control
+# plane ignores it.
+AGENT_INSTANCE_HEADER = "X-Spatium-Agent-Instance"
+AGENT_INSTANCE = uuid.uuid4().hex
 
 
 def _touch_ready_marker(state_dir: Path) -> None:
@@ -351,7 +363,10 @@ class SyncLoop:
         )
 
     def _poll_once(self) -> None:
-        headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
+        headers = {
+            "Authorization": f"Bearer {self.token_ref[0]}",
+            AGENT_INSTANCE_HEADER: AGENT_INSTANCE,
+        }
         # #882 — a quarantined bundle is parked on a 304 by the etag we sent
         # last time, so the only way to give it another attempt is to stop
         # sending that etag. Dropping If-None-Match makes the server answer

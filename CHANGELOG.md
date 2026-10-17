@@ -84,6 +84,27 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DNS record change made while an agent is replaced reaches the new
+  agent at once, not five minutes later (#2042).** When a DNS agent is
+  replaced (its pod rolls after a slot upgrade, a container restarts),
+  the API went on holding the old agent's config long-poll, and nothing
+  noticed its client had gone. A record created in the next few seconds
+  was paged into that poll, marked in flight and written to a
+  connection nobody read, so the new agent never got it and the record
+  was not served until the 5-minute unacknowledged-op reset sent it
+  again. The agent now names its process on every config poll, each
+  shipped op records which process it went to, and a poll from a
+  different process returns any op still in flight to its predecessor
+  to the queue and ships it on that poll. A long-poll whose client has
+  disconnected also rolls its page back instead of committing it. An
+  agent that predates this change still recovers through the 5-minute
+  reset. Separately, a zone's server state no longer reads in sync
+  while a server has a change for that zone it has not acknowledged:
+  an agent starting from its cached bundle reports the serial it
+  serves, which can match the target while a record is still
+  undelivered. Both server-state views gain a `pending_ops` count, and
+  the zone sync pill names the unapplied changes.
+
 - **Audit details mask presigned-URL signatures and storage connection
   strings on read.** The read-side redaction of `GET /api/v1/audit/{id}`,
   the Audit page and the copilot's audit tool now also masks the signing
@@ -5277,6 +5298,10 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `e3b7c19f5a42` — #2042: `dns_record_op.dispatched_to`, a nullable
+  string naming the agent process an op was last shipped to. No
+  backfill: NULL means not recorded and is never read as "another
+  agent". Downgrade drops the column.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column

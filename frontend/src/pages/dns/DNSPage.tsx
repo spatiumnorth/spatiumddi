@@ -3287,15 +3287,20 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   const total = state.servers.length;
   if (total === 0) return null;
   const reported = state.servers.filter((s) => s.current_serial !== null);
+  // #2042 — a server with an unacknowledged op for the zone is not in sync,
+  // even when the serial it reported matches.
   const inSync = state.servers.filter(
-    (s) => s.current_serial === state.target_serial,
+    (s) => s.current_serial === state.target_serial && !s.pending_ops,
   );
   const tooltip = state.servers
     .map((s) =>
       s.current_serial === null
         ? `${s.server_name}: not reported`
         : `${s.server_name}: serial ${s.current_serial}` +
-          (s.current_serial !== state.target_serial ? " (drift)" : ""),
+          (s.current_serial !== state.target_serial ? " (drift)" : "") +
+          (s.pending_ops
+            ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
+            : ""),
     )
     .join("\n");
 

@@ -1636,6 +1636,7 @@ async def page_pending_ops(
     up_to: datetime | None = None,
     visible_xacts: str | None = None,
     non_record_only: bool = False,
+    dispatched_to: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """One PAGE of this server's pending ops, oldest first, marked ``in_flight``.
 
@@ -1679,6 +1680,11 @@ async def page_pending_ops(
     ``non_record_only`` (#1946): a split-horizon bundle carries record
     changes in the zone payload and retires their ops, but a DNSSEC op has
     no carrier there; the page then holds only those kinds.
+
+    ``dispatched_to`` (#2042): the instance id of the agent process the page
+    is for, stamped on each op so a replacement agent's poll can tell an op
+    shipped to a predecessor from one shipped to itself
+    (``record_ops.return_ops_dispatched_elsewhere``).
     """
     if server.maintenance_mode:
         return [], 0
@@ -1753,6 +1759,7 @@ async def page_pending_ops(
         op.state = "in_flight"
         # The dispatch time: the stale-``in_flight`` reset measures from it.
         op.updated_at = now
+        op.dispatched_to = dispatched_to
     if ops_to_dispatch:
         await db.flush()
     return page, remaining

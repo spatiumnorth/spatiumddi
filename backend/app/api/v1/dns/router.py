@@ -139,6 +139,7 @@ from app.services.dns.record_ops import (
     enqueue_record_op,
     enqueue_record_ops_batch,
     enqueue_record_ops_bulk,
+    queued_op_counts,
     record_op_payload,
 )
 from app.services.dns.resolver_presets import (
@@ -5000,6 +5001,9 @@ class ServerZoneStateEntry(BaseModel):
     server_status: str
     current_serial: int | None
     reported_at: datetime | None
+    # #2042 — ops for this zone the server has not acknowledged yet (pending
+    # or in flight). Non-zero means not in sync whatever the serial says.
+    pending_ops: int = 0
 
 
 class ServerZoneStateResponse(BaseModel):
@@ -5024,7 +5028,9 @@ async def get_zone_server_state(
     Servers with no state row yet report ``current_serial=None`` — the
     agent hasn't applied a bundle containing this zone yet. ``in_sync``
     is True when every server that's reported matches the zone's
-    target serial (``DNSZone.last_serial``).
+    target serial (``DNSZone.last_serial``) and none has an unacknowledged
+    op for the zone (#2042): a serial an agent reports from its cached
+    bundle can reach the target while a record op is still undelivered.
     """
     from app.models.dns import DNSServer, DNSServerZoneState  # noqa: PLC0415
 
@@ -5044,6 +5050,8 @@ async def get_zone_server_state(
         s.server_id: s for s in state_res.scalars().all()
     }
 
+    queued = await queued_op_counts(db, server_ids=[s.id for s in servers], zone_names=[zone.name])
+
     entries: list[ServerZoneStateEntry] = []
     all_in_sync = True
     target = int(zone.last_serial or 0)
@@ -5052,6 +5060,7 @@ async def get_zone_server_state(
         st = state_by_server.get(srv.id)
         current = int(st.current_serial) if st else None
         reported = st.reported_at if st else None
+        pending = queued.get((srv.id, zone.name), 0)
         entries.append(
             ServerZoneStateEntry(
                 server_id=srv.id,
@@ -5059,13 +5068,14 @@ async def get_zone_server_state(
                 server_status=srv.status,
                 current_serial=current,
                 reported_at=reported,
+                pending_ops=pending,
             )
         )
         if current is None:
             all_in_sync = False
         else:
             any_reported = True
-            if current != target:
+            if current != target or pending:
                 all_in_sync = False
 
     return ServerZoneStateResponse(
@@ -5187,6 +5197,8 @@ class PerServerZoneStateEntry(BaseModel):
     current_serial: int | None
     reported_at: datetime | None
     in_sync: bool
+    # #2042 — see ``ServerZoneStateEntry.pending_ops``.
+    pending_ops: int = 0
 
 
 class PerServerZoneStateResponse(BaseModel):
@@ -5231,6 +5243,8 @@ async def get_server_zone_state(
         s.zone_id: s for s in state_res.scalars().all()
     }
 
+    queued = await queued_op_counts(db, server_ids=[server.id])
+
     entries: list[PerServerZoneStateEntry] = []
     in_sync_count = 0
     drift_count = 0
@@ -5239,7 +5253,9 @@ async def get_server_zone_state(
         st = state_by_zone.get(z.id)
         target = int(z.last_serial or 0)
         current = int(st.current_serial) if st else None
-        in_sync = current is not None and current == target
+        pending = queued.get((server.id, z.name), 0)
+        # #2042 — an unacknowledged op is drift whatever the serial says.
+        in_sync = current is not None and current == target and not pending
         if current is None:
             not_reported_count += 1
         elif in_sync:
@@ -5255,6 +5271,7 @@ async def get_server_zone_state(
                 current_serial=current,
                 reported_at=st.reported_at if st else None,
                 in_sync=in_sync,
+                pending_ops=pending,
             )
         )
 

@@ -549,6 +549,15 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
         server_default=DNS_RECORD_OP_SEQ.next_value(),
         nullable=True,
     )
+    # #2042 — the agent PROCESS the op was last shipped to: the instance id the
+    # agent sends on every config poll (``X-Spatium-Agent-Instance``). A
+    # long-poll the API still holds for an agent that has since been replaced
+    # can page an op into a connection nobody reads; the replacement's polls
+    # carry a different id, which is how the op is recognised as undelivered
+    # and returned to ``pending`` at once instead of after the 5-minute
+    # unacknowledged reset. NULL = shipped to an agent too old to say, or
+    # never shipped; NULL is never treated as "another instance".
+    dispatched_to: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
