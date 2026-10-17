@@ -629,7 +629,9 @@ the formatter handles the rest.
   after the stage had refreshed the image tarballs, which k3s re-imports
   before it starts the kubelet). The slot write now bypasses the page cache
   (`dd oflag=direct iflag=fullblock`), so etcd waits behind one 4 MiB block
-  at most.
+  at most, and the image download, which lands on the same filesystem as
+  etcd's WAL, is flushed to disk every 16 MiB as it arrives instead of
+  piling up 300-400 MB to flush when the write begins.
 - **A rolling upgrade's drain that timed out said "0 pod(s) still present"
   while every pod was still on the node (#1804).** The count was the
   evictions refused in the drain's last cycle, not the pods left on the

@@ -333,6 +333,13 @@ _FETCH_BACKOFF_SECONDS = (5, 10, 20, 40)  # before attempts 2, 3, 4, 5
 # this long is a stall, and a stall is retried like a drop (the wrapper's
 # 45 min cap is the backstop, not the detector).
 _FETCH_READ_TIMEOUT_SECONDS = 120
+# #1804 — the image lands on /var, the filesystem etcd's WAL is on, while
+# the node is still serving (#1743). Left to the kernel, 300-400 MB of it
+# sat dirty until the slot write began, and flushing it then held etcd's
+# fdatasync for up to 8.4 s. Flushed every _FETCH_SYNC_BYTES as it lands,
+# etcd waits behind one small flush at most.
+_FETCH_CHUNK_BYTES = 1024 * 1024
+_FETCH_SYNC_BYTES = 16 * 1024 * 1024
 # Server-side trouble worth another attempt. A 4xx is an answer (a bad
 # token, a deleted image) and is never retried.
 _RETRYABLE_HTTP_STATUS = frozenset({408, 429, 500, 502, 503, 504})
@@ -421,12 +428,18 @@ def _fetch_http_once(
             raise _LocalWriteError(f"cannot write {dst}: {exc}") from exc
         try:
             last_pct = -5
+            unsynced = 0
             while True:
-                chunk = r.read(1024 * 1024)
+                chunk = r.read(_FETCH_CHUNK_BYTES)
                 if not chunk:
                     break
                 try:
                     f.write(chunk)
+                    unsynced += len(chunk)
+                    if unsynced >= _FETCH_SYNC_BYTES:
+                        f.flush()
+                        os.fdatasync(f.fileno())
+                        unsynced = 0
                 except OSError as exc:
                     raise _LocalWriteError(f"cannot write {dst}: {exc}") from exc
                 done += len(chunk)
