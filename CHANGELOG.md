@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DHCP Device Policy dialog: a lease of "10m" is refused, a manual-match
+  policy is no longer called "not rendered", and every DHCP form label names
+  its control (#1991, #1992, part of #1994).** A lease time that was not a
+  whole number of seconds went through `Number()` to NaN, which JSON sends as
+  null, so the typo was stored as "inherit" with no error; it is now refused
+  inline and only a blank field means inherit. A policy with a manual match
+  expression and no device classes (which does reach Kea) was described in the
+  preview as matching nothing and not rendered, and the Device classes hint
+  said the same; the warning now applies only with neither classes nor a
+  manual match, in both the REST preview and `preview_dhcp_device_policy`. The
+  shared DHCP `Field` now links its label to its control (`htmlFor`/`id` on
+  the one input, select or textarea among its children, even beside a
+  `<datalist>` or an inline error line; otherwise a labelled group). The
+  Alerts rule editor's own `Field` is handled separately.
+
 - **Updating an alert rule with a null `enabled` or `severity` answered
   500, and disabling a rule left its open alerts open for good (#1987,
   #1988).** Every NOT NULL field of the rule update (`name`,
