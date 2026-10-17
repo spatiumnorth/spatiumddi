@@ -121,7 +121,10 @@ the formatter handles the rest.
   `--localstorage-file` and shadows jsdom's, so every test calling
   `localStorage.clear()` threw. The vitest workers now start with
   `--no-experimental-webstorage` (`frontend/vite.config.ts`), so jsdom's
-  storage is used on Node 22 and 26 alike. No shipped code changes.
+  storage is used on Node 22 and 26 alike. The flag is passed only where
+  the running Node accepts it: Node 20, still a supported dev version,
+  refuses to start a worker given an unknown option, so the first cut of
+  this fix made every test fail there. No shipped code changes.
 
 - **Kubernetes Detect CIDRs answered 500 when the token held a non-ASCII
   character (#1913).** The bearer token goes straight into an
