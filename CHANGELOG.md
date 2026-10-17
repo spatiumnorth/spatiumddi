@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A PowerDNS primary zone now serves an apex NS, so a BIND9
+  secondary on another host can transfer it (#1985).** The agent
+  rendered the apex SOA but never an NS, and PowerDNS does not create
+  one, so a BIND9 secondary refused every transfer with "has no NS
+  records". The apex NS now follows the BIND9 renderer's rule: the
+  zone's own apex NS records when it has any (used as they are), else
+  its Primary NS when that can resolve, else the `ns1.<zone>`
+  placeholder. It is rendered on every reconcile, so existing zones
+  gain it on upgrade, and an NS the operator declared is never
+  overwritten. Deleting a zone's last NS record puts the default back
+  in the same change, so the zone is never left without one. The
+  placeholder gets no loopback glue on PowerDNS: BIND needs that glue
+  only to load a zone it is primary for, and a BIND9 secondary accepts
+  a transferred zone whose NS has no address, with a warning.
+
 - **The DNS agent no longer holds a large bundle several times over while it
   takes it (#2029).** Fetching a 147 MB bundle (five blocklists on two views,
   about 708k RPZ entries per view) took the agent to 1.70 - 1.74 GB, and since
