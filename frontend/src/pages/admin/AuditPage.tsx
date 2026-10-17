@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { isRefused } from "@/lib/refusal";
 import {
   ClipboardList,
   ChevronLeft,
+  ChevronDown,
   ChevronRight,
   Download,
   ShieldCheck,
@@ -115,6 +116,7 @@ const EMPTY_FILTERS: Record<ColKey, string> = {
 
 export function AuditPage() {
   const [page, setPage] = useState(0);
+  const [expanded, setExpanded] = useState<string | null>(null);
   const [colFilters, setColFilters] =
     useState<Record<ColKey, string>>(EMPTY_FILTERS);
 
@@ -341,66 +343,90 @@ export function AuditPage() {
                 </tr>
               ) : (
                 items.map((entry: AuditLogEntry) => (
-                  <tr
-                    key={entry.id}
-                    className="border-b last:border-0 hover:bg-muted/30"
-                  >
-                    <td className="px-3 py-2 font-mono text-xs text-muted-foreground whitespace-nowrap">
-                      {formatTs(entry.timestamp)}
-                    </td>
-                    <td className="px-3 py-2 whitespace-nowrap">
-                      <span className="font-medium">
-                        {entry.user_display_name}
-                      </span>
-                      {entry.auth_source !== "local" && (
-                        <span className="ml-1.5 text-xs text-muted-foreground">
-                          ({entry.auth_source})
+                  <Fragment key={entry.id}>
+                    <tr className="border-b last:border-0 hover:bg-muted/30">
+                      <td className="px-3 py-2 font-mono text-xs text-muted-foreground whitespace-nowrap">
+                        {formatTs(entry.timestamp)}
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap">
+                        <span className="font-medium">
+                          {entry.user_display_name}
                         </span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 whitespace-nowrap">
-                      <ActionBadge action={entry.action} />
-                    </td>
-                    <td className="px-3 py-2 whitespace-nowrap">
-                      <span className="text-xs text-muted-foreground">
-                        {entry.resource_type}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2 text-muted-foreground max-w-xs truncate">
-                      {entry.resource_display}
-                    </td>
-                    <td className="px-3 py-2 whitespace-nowrap">
-                      <ResultBadge result={entry.result} />
-                    </td>
-                    <td className="px-3 py-2 font-mono text-xs text-muted-foreground whitespace-nowrap">
-                      {entry.source_ip ?? "—"}
-                    </td>
-                    <td className="px-2 py-2 text-right">
-                      <AskAIButton
-                        context={[
-                          `Audit event: ${entry.action} on ${entry.resource_type}`,
-                          `summary: ${entry.resource_display}`,
-                          `result: ${entry.result}`,
-                          `user: ${entry.user_display_name}${
-                            entry.auth_source !== "local"
-                              ? ` (${entry.auth_source})`
-                              : ""
-                          }`,
-                          entry.source_ip
-                            ? `source_ip: ${entry.source_ip}`
-                            : null,
-                          `timestamp: ${entry.timestamp}`,
-                          `audit_id: ${entry.id}`,
-                        ]
-                          .filter(Boolean)
-                          .join(", ")}
-                        tooltip="Ask AI about this event"
-                        prompt="Explain this audit entry in plain English — what happened, who did it, and what changed."
-                        iconOnly
-                        className="px-1.5 py-1"
-                      />
-                    </td>
-                  </tr>
+                        {entry.auth_source !== "local" && (
+                          <span className="ml-1.5 text-xs text-muted-foreground">
+                            ({entry.auth_source})
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap">
+                        <ActionBadge action={entry.action} />
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap">
+                        <span className="text-xs text-muted-foreground">
+                          {entry.resource_type}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-muted-foreground max-w-xs truncate">
+                        {entry.resource_display}
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap">
+                        <ResultBadge result={entry.result} />
+                      </td>
+                      <td className="px-3 py-2 font-mono text-xs text-muted-foreground whitespace-nowrap">
+                        {entry.source_ip ?? "—"}
+                      </td>
+                      <td className="px-2 py-2 text-right whitespace-nowrap">
+                        <button
+                          type="button"
+                          aria-label={`${expanded === entry.id ? "Hide" : "Show"} details for ${entry.action} on ${entry.resource_display}`}
+                          aria-expanded={expanded === entry.id}
+                          title="Details"
+                          onClick={() =>
+                            setExpanded((cur) =>
+                              cur === entry.id ? null : entry.id,
+                            )
+                          }
+                          className="mr-1 rounded px-1.5 py-1 text-muted-foreground hover:bg-accent"
+                        >
+                          {expanded === entry.id ? (
+                            <ChevronDown className="h-4 w-4" />
+                          ) : (
+                            <ChevronRight className="h-4 w-4" />
+                          )}
+                        </button>
+                        <AskAIButton
+                          context={[
+                            `Audit event: ${entry.action} on ${entry.resource_type}`,
+                            `summary: ${entry.resource_display}`,
+                            `result: ${entry.result}`,
+                            `user: ${entry.user_display_name}${
+                              entry.auth_source !== "local"
+                                ? ` (${entry.auth_source})`
+                                : ""
+                            }`,
+                            entry.source_ip
+                              ? `source_ip: ${entry.source_ip}`
+                              : null,
+                            `timestamp: ${entry.timestamp}`,
+                            `audit_id: ${entry.id}`,
+                          ]
+                            .filter(Boolean)
+                            .join(", ")}
+                          tooltip="Ask AI about this event"
+                          prompt="Explain this audit entry in plain English — what happened, who did it, and what changed."
+                          iconOnly
+                          className="px-1.5 py-1"
+                        />
+                      </td>
+                    </tr>
+                    {expanded === entry.id && (
+                      <tr className="border-b bg-muted/20">
+                        <td colSpan={8} className="px-3 py-3">
+                          <AuditDetails id={entry.id} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 ))
               )}
             </tbody>
@@ -436,6 +462,49 @@ export function AuditPage() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/** The entry's recorded details, fetched on expand (#2009) so the list stays
+ *  light. Values arrive redacted from the server. */
+function AuditDetails({ id }: { id: string }) {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["audit-entry", id],
+    queryFn: () => auditApi.get(id),
+  });
+  if (isLoading)
+    return <p className="text-xs text-muted-foreground">Loading details…</p>;
+  if (error || !data)
+    return (
+      <p className="text-xs text-red-600 dark:text-red-400">
+        Could not load details for this entry.
+      </p>
+    );
+  const blocks: [string, unknown][] = [];
+  if (data.changed_fields?.length)
+    blocks.push(["Changed fields", data.changed_fields]);
+  if (data.old_value) blocks.push(["Before", data.old_value]);
+  if (data.new_value) blocks.push(["Details / after", data.new_value]);
+  if (data.error_detail) blocks.push(["Error", data.error_detail]);
+  if (blocks.length === 0)
+    return (
+      <p className="text-xs text-muted-foreground">
+        This entry recorded no details.
+      </p>
+    );
+  return (
+    <div className="grid gap-3 md:grid-cols-2">
+      {blocks.map(([label, val]) => (
+        <div key={label} className="min-w-0">
+          <div className="mb-1 text-xs font-medium text-muted-foreground">
+            {label}
+          </div>
+          <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded border bg-background p-2 font-mono text-xs">
+            {typeof val === "string" ? val : JSON.stringify(val, null, 2)}
+          </pre>
+        </div>
+      ))}
     </div>
   );
 }

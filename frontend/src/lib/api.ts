@@ -2610,6 +2610,12 @@ export interface AuditLogEntry {
   resource_display: string;
   result: string;
   source_ip: string | null;
+  /** Recorded details (#2009): null on the list, filled by `auditApi.get`.
+   *  Credential-shaped values arrive already redacted. */
+  old_value?: Record<string, unknown> | null;
+  new_value?: Record<string, unknown> | null;
+  changed_fields?: string[] | null;
+  error_detail?: string | null;
 }
 
 export interface AuditLogPage {
@@ -2797,6 +2803,9 @@ export const auditApi = {
     result?: string;
     source_ip?: string;
   }) => api.get<AuditLogPage>("/audit", { params }).then((r) => r.data),
+  /** One entry with its old / new values and changed fields (#2009). */
+  get: (id: string) =>
+    api.get<AuditLogEntry>(`/audit/${id}`).then((r) => r.data),
   /** Walk the chain and report any tampering (issue #73). The
    *  ``max_rows`` cap is for huge tables — leave unset for a full
    *  sweep. */

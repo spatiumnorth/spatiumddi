@@ -1,8 +1,10 @@
 """Audit log read endpoints (superadmin or users with `read:audit_log`)."""
 
+import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 
@@ -12,6 +14,7 @@ from app.core.permissions import require_permission
 from app.core.responses import PdfResponse
 from app.models.audit import AuditLog
 from app.services.audit_chain import verify_chain
+from app.services.audit_redact import redact_audit_value
 from app.services.audit_report import generate_change_report_pdf
 
 router = APIRouter(dependencies=[Depends(require_permission("read", "audit_log"))])
@@ -33,6 +36,15 @@ class AuditLogResponse(BaseModel):
     resource_display: str
     result: str
     source_ip: str | None = None
+    # What the entry recorded (#2009): the stored state before / after and the
+    # names of the fields that changed. ``None`` on the list unless the caller
+    # asks with ``include_details`` (payloads can be large and a page is up to
+    # 500 rows); always filled by ``GET /audit/{id}``. Credential-shaped keys
+    # and values are redacted on read (``services/audit_redact``).
+    old_value: dict[str, Any] | None = None
+    new_value: dict[str, Any] | None = None
+    changed_fields: list[str] | None = None
+    error_detail: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -58,6 +70,10 @@ async def list_audit_log(
     resource_display: str | None = Query(default=None),
     result: str | None = Query(default=None),
     source_ip: str | None = Query(default=None),
+    include_details: bool = Query(
+        default=False,
+        description="Also return old_value / new_value / changed_fields per row.",
+    ),
 ) -> AuditLogPage:
     q = select(AuditLog)
 
@@ -80,7 +96,22 @@ async def list_audit_log(
     q = q.order_by(AuditLog.timestamp.desc()).offset(offset).limit(limit)
     rows = (await db.execute(q)).scalars().all()
 
-    return AuditLogPage(total=total, items=list(rows))
+    return AuditLogPage(
+        total=total,
+        items=[_to_response(r, details=include_details) for r in rows],
+    )
+
+
+def _to_response(row: AuditLog, *, details: bool) -> AuditLogResponse:
+    out = AuditLogResponse.model_validate(row)
+    if details:
+        out.old_value = redact_audit_value(row.old_value)
+        out.new_value = redact_audit_value(row.new_value)
+        out.changed_fields = row.changed_fields
+        out.error_detail = redact_audit_value(row.error_detail)
+    else:
+        out.old_value = out.new_value = out.changed_fields = out.error_detail = None
+    return out
 
 
 # ── Compliance / change report PDF (issue #48) ──────────────────────
@@ -197,3 +228,12 @@ async def get_audit_integrity(
             for b in result.breaks
         ],
     )
+
+
+@router.get("/{entry_id}", response_model=AuditLogResponse)
+async def get_audit_entry(entry_id: uuid.UUID, db: DB) -> AuditLogResponse:
+    """One entry with its details (#2009)."""
+    row = await db.get(AuditLog, entry_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Audit entry not found")
+    return _to_response(row, details=True)

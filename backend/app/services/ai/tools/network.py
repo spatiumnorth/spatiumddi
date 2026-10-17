@@ -24,6 +24,7 @@ from app.models.network import (
     NetworkInterface,
 )
 from app.services.ai.tools.base import register_tool
+from app.services.audit_redact import redact_audit_value
 from app.services.oui import is_voip_phone_vendor, lookup_vendor
 
 # ── network devices ───────────────────────────────────────────────────
@@ -252,6 +253,10 @@ async def get_audit_history(
             "resource_display": r.resource_display,
             "result": r.result,
             "changed_fields": r.changed_fields,
+            # #2009: the recorded state, redacted the same way the REST
+            # endpoint does it.
+            "old_value": redact_audit_value(r.old_value),
+            "new_value": redact_audit_value(r.new_value),
         }
         for r in rows
     ]
