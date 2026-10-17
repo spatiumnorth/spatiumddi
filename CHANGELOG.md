@@ -90,7 +90,9 @@ the formatter handles the rest.
   menu) left focus on the row behind the dialog, because Radix returned
   focus to the row after the dialog had taken it, so Enter or typing went
   to the page. The menu now skips that restore when a dialog opened, and
-  puts focus back on the row when the dialog closes.
+  puts focus back on the row when the dialog closes. Only a dialog that
+  appeared after the menu opened counts, so a menu inside an open dialog
+  still returns focus to its row.
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create

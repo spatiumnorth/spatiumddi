@@ -5,14 +5,7 @@
  * Radix returns focus to the trigger row on menu close, after the dialog took
  * it. Uses the real Radix menu and the real shared Modal.
  */
-import {
-  afterAll,
-  afterEach,
-  beforeAll,
-  describe,
-  expect,
-  it,
-} from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   act,
   cleanup,
@@ -42,7 +35,9 @@ function Row({ afterClose }: { afterClose?: () => void }) {
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
-        <ContextMenuItem onSelect={() => setOpen(true)}>Delete…</ContextMenuItem>
+        <ContextMenuItem onSelect={() => setOpen(true)}>
+          Delete…
+        </ContextMenuItem>
         <ContextMenuItem onSelect={() => {}}>Copy</ContextMenuItem>
       </ContextMenuContent>
       {open && (

@@ -15,7 +15,9 @@ let opened: { trigger: HTMLElement; before: Set<Element> } | null = null;
 
 const modalDialogs = () =>
   Array.from(
-    document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]'),
+    document.querySelectorAll<HTMLElement>(
+      '[role="dialog"][aria-modal="true"]',
+    ),
   );
 
 function recordOpen(trigger: HTMLElement) {
