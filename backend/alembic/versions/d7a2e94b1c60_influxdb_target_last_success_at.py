@@ -15,7 +15,7 @@ not recoverable and "never" would be less honest than unknown, but the old
 column never said otherwise either.
 
 Revision ID: d7a2e94b1c60
-Revises: c4f19a2e7d53
+Revises: a9c3e5f71b28
 Create Date: 2026-10-16
 
 """
@@ -27,7 +27,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "d7a2e94b1c60"
-down_revision = "c4f19a2e7d53"
+down_revision = "a9c3e5f71b28"
 branch_labels = None
 depends_on = None
 

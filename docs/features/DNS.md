@@ -1583,7 +1583,10 @@ DNS **pools** (GSLB-lite) map one DNS name (e.g. `www` →
 `www.example.com`) to a set of A / AAAA target IPs and flip each
 target in / out of the served record set based on a periodic health
 check. Members render as regular `DNSRecord` rows (one per healthy +
-enabled member, carrying `pool_member_id`) so BIND9 / PowerDNS /
+enabled member, carrying `pool_member_id`; a **disabled pool renders
+nothing**, and editing a pool's `enabled` or `ttl` reconciles at once
+rather than at the next health-check tick; a TTL change ships as one
+whole-RRset update so no driver drops a sibling member) so BIND9 / PowerDNS /
 Technitium / Windows DNS render unchanged. Config lives on `DNSPool` +
 `DNSPoolMember`; the reconciler is `app.services.dns.pool_apply`.
 

@@ -96,6 +96,10 @@ _K3S_APISERVER_TCP = 6443
 # this renderer must stay byte-identical to it.
 _K3S_KUBELET_TCP = 10250
 _METALLB_MEMBERLIST = 7946
+# #1827 — frr-k8s's validating webhook, peer-scoped under the memberlist gate.
+# See the long note on the same constant in the supervisor's
+# ``firewall_renderer``; this renderer must stay byte-identical to it.
+_FRR_K8S_WEBHOOK = 19443
 
 
 def _profile_name(roles: list[str]) -> str:
@@ -326,6 +330,13 @@ def compile_firewall_body(
                 peer_v6,
                 f"udp dport {_METALLB_MEMBERLIST} accept",
                 "metallb-memberlist-udp",
+            )
+            _emit_family_rule(
+                lines,
+                peer_v4,
+                peer_v6,
+                f"tcp dport {_FRR_K8S_WEBHOOK} accept",
+                "frr-k8s-webhook",
             )
 
     if firewall_extra.strip():
