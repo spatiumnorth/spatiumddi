@@ -43,7 +43,6 @@ AUDITED_TOKEN_BINDING_TOOLS = frozenset(
         "list_dns_zones",
         "query_dns_records",
         "list_dns_records",
-        "preview_dns_zone_move",
         "find_zone_dnssec_info",
         "find_dns_zone_drift",
         "find_zone_update_acls",
@@ -260,8 +259,18 @@ async def test_zone_bound_token_is_refused_dns_inventory_tools(db_session: Async
     e = await _estate(db_session)
     user = _bind_token(await _user(db_session, superadmin=True), "dns_zone", e.zone_a.id)
 
-    for name in ("find_dns_servers", "list_dns_server_groups", "list_dns_views"):
-        resp = await _mcp_call(db_session, user, name)
+    for name, args in (
+        ("find_dns_servers", {}),
+        ("list_dns_server_groups", {}),
+        ("list_dns_views", {}),
+        # Its own zone is in the binding, but the answer describes the target
+        # group, which is not — its name, drivers, views and zone names.
+        (
+            "preview_dns_zone_move",
+            {"zone_id": str(e.zone_a.id), "target_group_id": str(e.group_b.id)},
+        ),
+    ):
+        resp = await _mcp_call(db_session, user, name, args)
         assert _refused(resp), (name, resp)
         assert e.server_b.name not in json.dumps(resp), name
         assert e.group_b.name not in json.dumps(resp), name
@@ -287,6 +296,47 @@ async def test_subnet_bound_token_is_refused_estate_wide_ipam_tools(
 
 
 @pytest.mark.asyncio
+async def test_subnet_bound_token_cannot_resolve_names_outside_its_binding(
+    db_session: AsyncSession,
+) -> None:
+    """The IPAM tools accept a space or block NAME. For a bound token, a name
+    outside the binding answers exactly as a name that does not exist, rather
+    than as a filter that happened to match nothing."""
+    e = await _estate(db_session)
+    other_space = IPSpace(name=f"sp-other-{uuid.uuid4().hex[:6]}")
+    db_session.add(other_space)
+    await db_session.flush()
+    other_block = IPBlock(
+        space_id=other_space.id, network="10.99.0.0/16", name=f"blk-other-{other_space.name}"
+    )
+    db_session.add(other_block)
+    await db_session.commit()
+    user = _bind_token(await _user(db_session, superadmin=True), "subnet", e.subnet_a.id)
+
+    for name, args in (
+        ("list_ip_blocks", {"space_id": other_space.name}),
+        ("list_subnets", {"space_id": other_space.name}),
+        ("list_subnets", {"block_id": other_block.name}),
+        ("find_ip_addresses", {"space_id": other_space.name}),
+    ):
+        missing = await REGISTRY.call(
+            name, {k: "no-such-name" for k in args}, db=db_session, user=user
+        )
+        outside = await REGISTRY.call(name, args, db=db_session, user=user)
+        assert isinstance(outside, dict) and "error" in outside, (name, outside)
+        assert set(outside) == set(missing), (name, outside, missing)
+
+    # The binding's own space and block still resolve by name.
+    own_space = await db_session.get(IPSpace, e.subnet_a.space_id)
+    own_block = await db_session.get(IPBlock, e.subnet_a.block_id)
+    assert own_space is not None and own_block is not None
+    for args in ({"space_id": own_space.name}, {"block_id": own_block.name}):
+        rows = await REGISTRY.call("list_subnets", args, db=db_session, user=user)
+        assert isinstance(rows, list), (args, rows)
+        assert [r["id"] for r in rows] == [str(e.subnet_a.id)], (args, rows)
+
+
+@pytest.mark.asyncio
 async def test_session_caller_is_unaffected_by_token_binding_rule(
     db_session: AsyncSession,
 ) -> None:
@@ -300,6 +350,26 @@ async def test_session_caller_is_unaffected_by_token_binding_rule(
     resp = await _mcp_call(db_session, user, "find_dns_servers")
     assert not _refused(resp), resp
     assert e.server_b.name in json.dumps(resp)
+
+    resp = await _mcp_call(
+        db_session,
+        user,
+        "preview_dns_zone_move",
+        {"zone_id": str(e.zone_a.id), "target_group_id": str(e.group_b.id)},
+    )
+    assert not _refused(resp), resp
+    assert e.group_b.name in json.dumps(resp)
+
+    # Name resolution is unchanged for a caller with no token binding.
+    space = await db_session.get(IPSpace, e.subnet_b.space_id)
+    assert space is not None
+    ipam_reader = await _user(
+        db_session, permissions=[{"action": "read", "resource_type": "subnet"}]
+    )
+    rows = await REGISTRY.call(
+        "list_subnets", {"space_id": space.name}, db=db_session, user=ipam_reader
+    )
+    assert {r["id"] for r in rows} == {str(e.subnet_a.id), str(e.subnet_b.id)}
 
 
 # ── narrowly-scoped role ────────────────────────────────────────────────────

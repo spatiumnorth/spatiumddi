@@ -97,8 +97,10 @@ the formatter handles the rest.
   lists, per-zone DNSSEC / drift / update-ACL reads, the IPAM space /
   block / subnet / address reads, tag lookup and global search) already
   filter or gate on the bound instances, and a test pins the list and
-  checks each one against a second zone and subnet. Sessions and
-  unbound tokens are unaffected.
+  checks each one against a second zone and subnet. The IPAM tools that
+  accept a space or block by name resolve it only within the binding, so a
+  name outside it reads as not found. Sessions and unbound tokens are
+  unaffected.
 
 - **On the appliance, a DNS server whose named is OOM-killed now reads not
   serving and raises Agent daemon not serving (#2018).** The kubelet sets

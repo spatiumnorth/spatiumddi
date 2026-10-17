@@ -354,7 +354,6 @@ class PreviewZoneMoveArgs(BaseModel):
 
 @register_tool(
     name="preview_dns_zone_move",
-    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Report what moving a DNS zone to another server group would do, "
