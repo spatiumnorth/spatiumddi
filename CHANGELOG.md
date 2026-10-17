@@ -97,8 +97,12 @@ the formatter handles the rest.
   agent now qualifies a dot-less target against the zone, which is what
   a BIND9 server serves for the same row, so rows that already exist
   (an importer's included) are served on upgrade. A zone PowerDNS still
-  refuses for any other reason is retried one record set at a time, so
-  only the refused record set is left out and named in the server's
+  refuses for any other reason is retried piecemeal (halved until the
+  refused record sets are isolated, so one bad record in a large zone
+  costs a few dozen requests, not one per record set), so only the
+  refused record set is left out and named in the server's apply
+  status. Such a zone is not reported as in sync by that server even
+  though its serial moved, so the per-server sync status agrees with the
   apply status. On a PowerDNS group, creating or editing a record with
   a dot-less target is now a 422 that shows the two names it could
   mean (`db1.example.com.`, or `db1.example.com.<zone>.`), on the REST

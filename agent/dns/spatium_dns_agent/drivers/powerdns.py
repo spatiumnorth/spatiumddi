@@ -259,6 +259,10 @@ _ZONE_REFUSAL_STATUSES = frozenset({400, 409, 422})
 # a CNAME beside other data — and so are worth retrying one rrset at a time
 # (#2060). A 409 on a create is the zone itself, not its data.
 _RRSET_REFUSAL_STATUSES = frozenset({400, 422})
+# The most PATCHes one zone's piecemeal retry may send (#2060). Bisection finds
+# a few bad rrsets in a handful; this only bounds the case where everything is
+# refused, which says the refusal was about the zone rather than its data.
+_PIECEMEAL_PATCH_BUDGET = 256
 
 
 def _absent_rrsets(
@@ -2420,8 +2424,9 @@ class PowerDNSDriver(DriverBase):
         Every zone is attempted and the verdict is per zone. A zone whose
         DATA PowerDNS refuses (400 / 409 / 422 — a CNAME beside other
         records, a malformed record) is recorded with PowerDNS's reason in
-        ``refused_zones()``. Its rrsets are then sent one at a time (#2060),
-        so only the refused ones keep what PowerDNS held — one bad rrset no
+        ``refused_zones()``. Its rrsets are then sent piecemeal (#2060,
+        halves split until the refused rrsets are isolated), so only the
+        refused ones keep what PowerDNS held — one bad rrset no
         longer strands every other change to the zone; the apply still succeeds,
         so every zone PowerDNS accepted is served and nothing is rolled back.
         Rolling back could not help: the last-known-good bundle usually
@@ -2498,7 +2503,7 @@ class PowerDNSDriver(DriverBase):
                     if resp.status_code in _RRSET_REFUSAL_STATUSES and create_body["rrsets"]:
                         # One refused rrset refuses the whole create, so the
                         # zone would not exist at all (#2060). Create it empty
-                        # and send its rrsets one at a time, so only the
+                        # and send its rrsets piecemeal, so only the
                         # refused ones are missing.
                         first = resp
                         resp = client.post(
@@ -2637,15 +2642,15 @@ class PowerDNSDriver(DriverBase):
                         if resp.status_code in _RRSET_REFUSAL_STATUSES:
                             # PowerDNS applies a PATCH as one transaction, so
                             # one refused rrset used to strand every other
-                            # change to the zone (#2060). Send them one at a
-                            # time: the rest land, the refused ones are named.
+                            # change to the zone (#2060). Send them piecemeal:
+                            # the rest land, the refused ones are named.
                             first = resp
-                            still_refused = self._apply_rrsets_singly(
+                            not_landed = self._apply_rrsets_singly(
                                 client, headers, zone_name, "update", first, rrsets, refused, failures
                             )
-                            if still_refused is None:
+                            if not_landed is None:
                                 continue
-                            soa_landed = all(t != "SOA" for _, t in still_refused)
+                            soa_landed = all(t != "SOA" for _, t in not_landed)
                         elif resp.status_code >= 400:
                             self._zone_not_applied(zone_name, "update", resp, refused, failures)
                             continue
@@ -2847,19 +2852,32 @@ class PowerDNSDriver(DriverBase):
         refused: list[str],
         failures: list[str],
     ) -> list[tuple[str, str]] | None:
-        """Apply ``rrsets`` one PATCH each, after PowerDNS refused them as one
-        (#2060). Returns the ``(name, type)`` of each rrset PowerDNS still
-        refused, or None when the zone could not be applied at all (a status
-        that is not a verdict on its data); the caller then skips the rest of
-        that zone, as for any failed apply.
+        """Apply ``rrsets`` piecemeal, after PowerDNS refused them as one PATCH
+        (#2060). Returns the ``(name, type)`` of each rrset that did not land
+        (refused, or not attempted once the PATCH budget ran out), or None when
+        the zone could not be applied at all (a status that is not a verdict on
+        its data); the caller then skips the rest of that zone, as for any
+        failed apply.
 
-        Deletes go first, so a name changing type (A → CNAME) is free before
-        its new rrset arrives, and the apex SOA goes last, so the serial moves
-        only once the data it announces is there. A refused rrset is recorded
-        under the zone with PowerDNS's reason — the zone is still reported as
-        refused, so the partial apply is visible — and every other rrset is
-        served. If none is refused one at a time, the zone is fully applied
-        and nothing is reported.
+        The list is split in half and each half PATCHed; a half PowerDNS
+        refuses is split again, down to single rrsets. So one bad rrset in a
+        zone of N costs about ``2·log2(N)`` PATCHes rather than N — a reconcile
+        re-sends every rrset of the zone, and this runs on every structural
+        apply until the bad row is fixed. :data:`_PIECEMEAL_PATCH_BUDGET` caps
+        the worst case (every rrset refused, i.e. the refusal was about the
+        zone and not its data, costs ``2N``); what is left when it runs out is
+        reported as not attempted.
+
+        Order is kept — halves are applied left first — and the list is
+        ordered deletes first, so a name changing type (A → CNAME) is free
+        before its new rrset arrives, and the apex SOA last, so the serial
+        moves only once the data it announces is there (in the same PATCH as
+        the last of it at the earliest). A rrset that is only REPLACEd is one
+        change, never a delete and an add, so no name is ever briefly absent.
+        A refused rrset is recorded under the zone with PowerDNS's reason —
+        the zone is still reported as refused, so the partial apply is
+        visible — and every other rrset is served. If nothing is refused
+        piecemeal, the zone is fully applied and nothing is reported.
         """
         url = f"{_PDNS_API_BASE}/zones/{zone_name}"
         deletes = [rs for rs in rrsets if rs.get("changetype") == "DELETE"]
@@ -2869,36 +2887,76 @@ class PowerDNSDriver(DriverBase):
         rest = [
             rs for rs in rrsets if rs.get("changetype") != "DELETE" and rs.get("type") != "SOA"
         ]
+        ordered = [
+            rs if "changetype" in rs else {**rs, "changetype": "REPLACE"}
+            for rs in [*deletes, *rest, *soas]
+        ]
         refused_here: list[str] = []
-        refused_keys: list[tuple[str, str]] = []
-        for rs in [*deletes, *rest, *soas]:
-            change = rs if "changetype" in rs else {**rs, "changetype": "REPLACE"}
-            resp = client.patch(url, headers=headers, json={"rrsets": [change]})
+        not_landed: list[tuple[str, str]] = []
+        unattempted = 0
+        patches = 0
+        # Halves still to try, leftmost on top. The whole list was already
+        # refused as one PATCH, so the first try is its two halves.
+        stack: list[list[dict[str, Any]]] = []
+        if len(ordered) > 1:
+            mid = len(ordered) // 2
+            stack = [ordered[mid:], ordered[:mid]]
+        elif ordered:
+            refused_here.append(
+                f"{ordered[0].get('name')} {ordered[0].get('type')} ({_pdns_error(first)})"
+            )
+            not_landed.append(
+                (str(ordered[0].get("name") or ""), str(ordered[0].get("type") or ""))
+            )
+        while stack:
+            chunk = stack.pop()
+            if patches >= _PIECEMEAL_PATCH_BUDGET:
+                unattempted += len(chunk)
+                not_landed.extend(
+                    (str(rs.get("name") or ""), str(rs.get("type") or "")) for rs in chunk
+                )
+                continue
+            patches += 1
+            resp = client.patch(url, headers=headers, json={"rrsets": chunk})
             if resp.status_code < 400:
                 continue
             if resp.status_code not in _ZONE_REFUSAL_STATUSES:
                 self._zone_not_applied(zone_name, action, resp, refused, failures)
                 return None
-            refused_keys.append((str(rs.get("name") or ""), str(rs.get("type") or "")))
-            refused_here.append(f"{rs.get('name')} {rs.get('type')} ({_pdns_error(resp)})")
+            if len(chunk) == 1:
+                rs = chunk[0]
+                not_landed.append((str(rs.get("name") or ""), str(rs.get("type") or "")))
+                refused_here.append(f"{rs.get('name')} {rs.get('type')} ({_pdns_error(resp)})")
+                continue
+            mid = len(chunk) // 2
+            stack.append(chunk[mid:])
+            stack.append(chunk[:mid])
         log.warning(
-            "powerdns_zone_applied_rrset_by_rrset",
+            "powerdns_zone_applied_piecemeal",
             zone=zone_name,
             action=action,
             rrset_count=len(rrsets),
+            patches=patches,
             refused=refused_here[:5],
+            unattempted=unattempted,
             first_error=_pdns_error(first),
         )
-        if refused_here:
+        if refused_here or unattempted:
             more = f" (and {len(refused_here) - 5} more)" if len(refused_here) > 5 else ""
+            skipped = (
+                f"; {unattempted} not attempted (stopped after {patches} PATCHes)"
+                if unattempted
+                else ""
+            )
             refused.append(
                 f"{zone_name} {action}: HTTP {first.status_code} {_pdns_error(first)}; "
-                f"applied the other {len(rrsets) - len(refused_here)} of {len(rrsets)} "
-                f"rrset change(s) one at a time, refused: "
-                + "; ".join(refused_here[:5])
+                f"applied the other {len(rrsets) - len(not_landed)} of {len(rrsets)} "
+                "rrset change(s) piecemeal, refused: "
+                + ("; ".join(refused_here[:5]) or "none")
                 + more
+                + skipped
             )
-        return refused_keys
+        return not_landed
 
     @staticmethod
     def _zone_not_applied(
@@ -3125,6 +3183,18 @@ class PowerDNSDriver(DriverBase):
         return None
 
     # ── Reload (compatibility with bind9 daemon-pid signal pattern) ────────
+
+    def unconverged_zones(self) -> set[str]:
+        """Zones (lowercase, no trailing dot) the last apply could not serve
+        whole: every zone in :meth:`refused_zones` (#2060).
+
+        Since a refused zone's other rrsets land piecemeal, SOA last, such a
+        zone can serve the bundle's serial with a record missing; the sync
+        loop leaves these out of the zone-state report so they do not read
+        converged. Each refusal this driver records starts with the zone's
+        name (``"<zone> <action>: …"``), and a zone name holds no space.
+        """
+        return {r.split(" ", 1)[0].rstrip(".").lower() for r in self._refused_zones if r}
 
     def served_zone_serials(self, bundle: dict[str, Any]) -> dict[str, int]:
         """Zone name (no trailing dot, lowercased) → the serial pdns serves.

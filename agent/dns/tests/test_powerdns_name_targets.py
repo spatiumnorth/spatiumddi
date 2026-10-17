@@ -252,20 +252,21 @@ _CLASH = [
 def test_one_refused_rrset_does_not_strand_the_rest_of_the_zone(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """A rrset PowerDNS refuses for its data is retried alone; the rest of
-    the zone lands, and the refusal names the rrset."""
+    """A rrset PowerDNS refuses for its data is isolated; the rest of the
+    zone lands, and the refusal names the rrset."""
     seen = _api(monkeypatch, _pdns("example.com.", refuse=_conflict))
     drv = PowerDNSDriver(state_dir=tmp_path)
     drv._reconcile_zones("k", _rendered(tmp_path, _CLASH))  # no raise
     patched = _patched(seen)
     assert ("later.example.com.", "A") in patched
-    single = [
+    retries = [
         [(rs["name"], rs["type"]) for rs in json.loads(r.content)["rrsets"]]
         for r in seen
         if r.method == "PATCH"
     ][1:]
-    assert all(len(p) == 1 for p in single), "the retry sends one rrset per PATCH"
-    assert single[-1] == [("example.com.", "SOA")], "the serial moves after the data"
+    assert [("clash.example.com.", "CNAME")] in retries, "isolated down to the bad rrset"
+    assert retries[-1][-1] == ("example.com.", "SOA"), "the serial moves after the data"
+    assert drv.unconverged_zones() == {"example.com"}
     (refusal,) = drv.refused_zones()
     assert refusal.startswith("example.com. update: HTTP 422")
     assert "refused: clash.example.com. CNAME" in refusal
@@ -301,3 +302,113 @@ def test_a_5xx_during_the_one_by_one_retry_fails_the_apply(tmp_path: Path, monke
     _api(monkeypatch, _pdns("example.com.", refuse=refuse))
     with pytest.raises(RuntimeError, match="update: HTTP 500 backend error"):
         PowerDNSDriver(state_dir=tmp_path)._reconcile_zones("k", _rendered(tmp_path, _CLASH))
+
+
+# ── the piecemeal retry's cost and its edges ─────────────────────────────────
+
+
+def _many(n: int) -> list[dict[str, Any]]:
+    return [{"name": f"h{i}", "type": "A", "value": f"192.0.2.{i % 250 + 1}"} for i in range(n)]
+
+
+def test_one_bad_rrset_in_a_big_zone_costs_a_handful_of_patches(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Bisection, not one PATCH per rrset: a reconcile re-sends every rrset
+    of the zone, and the retry runs on every structural apply until the bad
+    row is fixed, so a 2,000-rrset zone must not cost 2,000 PATCHes each time."""
+    records = [*_many(2000), {"name": "clash", "type": "A", "value": "192.0.2.9"}]
+    records.append({"name": "clash", "type": "CNAME", "value": "www"})
+    seen = _api(monkeypatch, _pdns("example.com.", refuse=_conflict))
+    drv = PowerDNSDriver(state_dir=tmp_path)
+    drv._reconcile_zones("k", _rendered(tmp_path, records))
+    patches = [r for r in seen if r.method == "PATCH"]
+    assert len(patches) <= 30, len(patches)
+    landed = {
+        (rs["name"], rs["type"])
+        for r in patches
+        if _conflict(r) is None
+        for rs in json.loads(r.content)["rrsets"]
+    }
+    assert ("h1999.example.com.", "A") in landed
+    assert ("example.com.", "SOA") in landed
+    assert ("clash.example.com.", "CNAME") not in landed
+    (refusal,) = drv.refused_zones()
+    assert "refused: clash.example.com. CNAME" in refusal
+
+
+def test_a_zone_refused_whole_is_bounded_and_says_what_was_not_tried(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Every rrset refused means the refusal was about the zone, not its data.
+    The retry stops at its budget instead of sending a PATCH per rrset, the
+    rest is reported as not attempted, and the serial does not move, so no
+    NOTIFY announces data that is not there."""
+
+    def refuse_all(request: httpx.Request) -> httpx.Response | None:
+        if request.method == "PATCH":
+            return httpx.Response(422, json={"error": "zone is broken"})
+        return None
+
+    seen = _api(monkeypatch, _pdns("example.com.", refuse=refuse_all))
+    drv = PowerDNSDriver(state_dir=tmp_path)
+    notified: list[str] = []
+    monkeypatch.setattr(drv, "_send_notify", lambda *a: notified.append(a[-1]))
+    drv._reconcile_zones("k", _rendered(tmp_path, _many(1000)))
+    patches = [r for r in seen if r.method == "PATCH"]
+    assert len(patches) <= powerdns._PIECEMEAL_PATCH_BUDGET + 1
+    (refusal,) = drv.refused_zones()
+    assert "not attempted" in refusal
+    assert notified == []
+
+
+def test_a_replaced_rrset_is_never_deleted_first(tmp_path: Path, monkeypatch) -> None:
+    """Only rrsets the bundle dropped are DELETEd; one it still carries is a
+    single REPLACE, so the piecemeal retry never leaves a served name absent."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        refusal = _conflict(request)
+        if refusal is not None:
+            return refusal
+        if request.method == "GET" and request.url.path.endswith("/zones"):
+            return httpx.Response(200, json=[{"name": "example.com."}])
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "name": "example.com.",
+                    "rrsets": [
+                        {"name": "www.example.com.", "type": "A", "records": []},
+                        {"name": "gone.example.com.", "type": "A", "records": []},
+                    ],
+                },
+            )
+        return httpx.Response(204 if request.method == "PATCH" else 201, json={})
+
+    seen = _api(monkeypatch, handler)
+    PowerDNSDriver(state_dir=tmp_path)._reconcile_zones("k", _rendered(tmp_path, _CLASH))
+    deletes = [
+        rs["name"]
+        for r in seen
+        if r.method == "PATCH"
+        for rs in json.loads(r.content)["rrsets"]
+        if rs["changetype"] == "DELETE"
+    ]
+    assert set(deletes) == {"gone.example.com."}
+
+
+def test_a_refused_zone_is_not_reported_converged(tmp_path: Path) -> None:
+    """The sync loop leaves a partly-refused zone out of the zone-state
+    report: its SOA may carry the new serial while a record is missing."""
+    from types import SimpleNamespace
+
+    from spatium_dns_agent.sync import SyncLoop
+
+    drv = PowerDNSDriver(state_dir=tmp_path)
+    drv._refused_zones = ("Example.COM. update: HTTP 422 x; refused: a CNAME (y)",)
+    loop = SyncLoop.__new__(SyncLoop)
+    loop.driver = drv
+    assert loop._unconverged_zone_keys() == {"example.com"}
+    drv._refused_zones = ()
+    drv.held_back = (SimpleNamespace(zone="held.test", view=None),)
+    assert loop._unconverged_zone_keys() == {"held.test"}
