@@ -467,6 +467,8 @@ the formatter handles the rest.
   with Halt, Abort and the Lease read between tries, as #1713 does for
   the Lease. No node starts and no tag moves until it lands, and the
   run fails on it, with the same error, only after 300 s of failures.
+  Only an answer a later try can change is retried (no answer, a 5xx,
+  408, 409 or 429); a 403 or 422 still fails the run at once.
 
 - **Disabling a DNS pool now removes its records, and a pool TTL change
   lands immediately (#1974).** `update_pool` never reconciled and

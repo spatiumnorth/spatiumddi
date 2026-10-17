@@ -62,6 +62,7 @@ class FlakyCluster:
         self.refused: list[str] = []
         self.fail_writes: list[str] = []
         self.fail_reads: list[Exception] = []
+        self.fail_lists: list[int] = []
         self.deployments: list[dict[str, Any]] = []
         self.daemonsets: list[dict[str, Any]] = []
 
@@ -93,6 +94,8 @@ class FlakyCluster:
 
     def list_deployments(self, _selector: str, namespace: str | None = None) -> Any:
         assert namespace == "spatium"
+        if self.fail_lists:
+            return self.fail_lists.pop(0), []
         return 200, list(self.deployments)
 
     def list_daemonsets(self, _selector: str = "", namespace: str | None = None) -> Any:
@@ -436,3 +439,168 @@ async def test_a_flip_that_keeps_failing_fails_the_run_as_before(
     assert len(_events(run, "chart_bump_failed")) == 1
     assert run.last_error.startswith(f"shared tag flip to {TO} failed: could not remove a tag pin")
     assert "still failing after 400 s" in run.last_error
+
+
+# ── What is not retried (validation of the QA fix) ─────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("error", "transient"),
+    [
+        (POST_503, True),
+        ("PATCH status 500: b'...'", True),
+        ("PATCH status 409: b'conflict'", True),
+        ("POST status 429: b'throttled'", True),
+        ("kubeapi GET status 504", True),
+        ("spatium-bootstrap: kubeapi unreachable: kubeapi GET /apis/x: timed out", True),
+        ("Deployment list status 503", True),
+        ("PATCH status 403: b'forbidden'", False),
+        ("spatium-control: HelmChartConfig GET status 401", False),
+        ("POST status 422: b'{\"code\":422}'", False),
+        ("PATCH status 400: b'bad request'", False),
+        ("ServiceAccount not mounted", False),
+        ("ServiceAccount not mounted; kubeapi unreachable", False),
+        ("Deployment list status 403", False),
+        (None, False),
+        ("", False),
+    ],
+)
+def test_only_a_failure_a_later_try_can_get_past_is_transient(
+    error: str | None, transient: bool
+) -> None:
+    assert shared_tags._transient(error) is transient
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refusal",
+    ["POST status 403: b'forbidden'", "POST status 422: b'{\"code\":422}'"],
+)
+async def test_a_hold_refused_for_good_fails_the_run_at_once(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch, refusal: str
+) -> None:
+    """RBAC or an invalid object is not the apiserver restarting: no later try
+    changes the answer, so it is not hidden behind five minutes of retries."""
+    from app.services.upgrades import orchestrator as orch
+
+    run = await _run(db_session, done=[])
+    cluster = FlakyCluster({"spatium-control": CONTROL_OVERRIDES})
+    cluster.fail_writes = [refusal] * 5
+    cluster.install(monkeypatch)
+    _quiet(monkeypatch, orch)
+
+    async def _must_not_run(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("no node may start without the hold")
+
+    monkeypatch.setattr(orch.per_node, "single_node_upgrade", _must_not_run)
+
+    await orch._drive_loop(db_session, run, asyncio.Event(), ME)
+
+    await db_session.refresh(run)
+    assert run.state == "failed"
+    assert cluster.refused == ["spatium-bootstrap"]
+    assert _events(run, "shared_tag_step_retrying") == []
+    assert len(_events(run, "shared_tag_hold_failed")) == 1
+    assert "still failing" not in (run.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_a_flip_whose_workload_list_is_refused_for_good_fails_at_once(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services.upgrades import orchestrator as orch
+
+    run = await _run(db_session, done=NODES, shared=_hold_record())
+    cluster = _held()
+    cluster.fail_lists = [403] * 5
+    cluster.install(monkeypatch)
+    _quiet(monkeypatch, orch)
+
+    await orch._drive_loop(db_session, run, asyncio.Event(), ME)
+
+    await db_session.refresh(run)
+    assert run.state == "failed"
+    assert _events(run, "shared_tag_step_retrying") == []
+    assert len(_events(run, "chart_bump_failed")) == 1
+    # Nothing moved: both pins are still on.
+    assert cluster.values("spatium-bootstrap") == {"global": {"imageTag": FROM}}
+
+
+@pytest.mark.asyncio
+async def test_a_flip_whose_workload_list_went_unanswered_announces_the_end_once(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flip's first read fails before it records its snapshot: the retry
+    still announces the end of the roll once, not once per try."""
+    from app.services.upgrades import orchestrator as orch
+
+    run = await _run(db_session, done=NODES, shared=_hold_record())
+    cluster = _held()
+    cluster.fail_lists = [503, 503]
+    cluster.install(monkeypatch)
+    _quiet(monkeypatch, orch)
+    monkeypatch.setattr(orch, "_enqueue_continuation", lambda rid, *, avoid_version: None)
+
+    await orch._drive_loop(db_session, run, asyncio.Event(), ME)
+
+    await db_session.refresh(run)
+    assert run.state == "running"
+    assert run.progress["shared_tags"]["flip"]["state"] == "flipped"
+    assert cluster.values("spatium-bootstrap") == {}
+    assert len(_events(run, "all_nodes_complete")) == 1
+    assert len(_events(run, "shared_tag_step_retrying")) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_abort_while_the_drive_waits_to_retry_ends_it_before_another_try(
+    db_session: AsyncSession, api: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator aborts a run stuck retrying: the drive sees it at its
+    loop top after the wait, tries nothing more and starts no node."""
+    from app.services.upgrades import orchestrator as orch
+
+    run = await _run(db_session, done=[])
+    _quiet(monkeypatch, orch)
+    monkeypatch.setattr(orch, "_SHARED_TAG_RETRY_S", 0.5)
+    calls: list[int] = []
+    aborts: list[asyncio.Task[Any]] = []
+
+    record_event = orch._record_event
+
+    async def _record(db: AsyncSession, r: SystemUpgradeRun, event: str, **detail: Any) -> None:
+        await record_event(db, r, event, **detail)
+        if event == "shared_tag_step_retrying":
+            # The operator's Abort, from the API's own session. It waits on
+            # the row lock the drive holds until it commits, then lands
+            # while the drive waits to try again.
+            aborts.append(asyncio.create_task(orch.abort_upgrade(api, run.id)))
+
+    monkeypatch.setattr(orch, "_record_event", _record)
+
+    async def _hold(_db: AsyncSession, r: SystemUpgradeRun) -> Any:
+        calls.append(1)
+        shared_tags._store(r, _hold_record())
+        return shared_tags.StepOutcome(
+            ok=False, mode="hold", error=f"spatium-bootstrap: {POST_503}", retryable=True
+        )
+
+    monkeypatch.setattr(orch.shared_tags, "ensure_hold", _hold)
+
+    async def _must_not_run(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("an aborted run must not start a node")
+
+    monkeypatch.setattr(orch.per_node, "single_node_upgrade", _must_not_run)
+
+    await orch._drive_loop(db_session, run, asyncio.Event(), ME)
+    await aborts[0]
+
+    row = await api.get(SystemUpgradeRun, run.id)
+    assert row is not None
+    await api.refresh(row)
+    assert row.state == "aborted"
+    assert calls == [1]
+    names = [e.get("event") for e in row.progress.get("events") or []]
+    assert "shared_tag_step_retrying" in names
+    assert "shared_tag_hold_failed" not in names
+    # The pins may be half on: the record of them is kept for the beat.
+    assert row.progress["shared_tags"]["mode"] == "hold"

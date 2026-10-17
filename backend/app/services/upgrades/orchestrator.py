@@ -140,7 +140,8 @@ _BETWEEN_NODES_PAUSE_S = 10.0
 _LEASE_RELEASE_ATTEMPTS = 5
 
 # A shared-tag step (the hold before a node, the flip at the end) whose
-# kubeapi request went unanswered or was refused is tried again this often,
+# kubeapi request went unanswered or was refused for now (a 5xx, 408, 409 or
+# 429; ``shared_tags._transient``) is tried again this often,
 # and fails the run only once it has kept failing this long. A k3s server
 # answers 503 "apiserver not ready" while its apiserver is not up, as after
 # a restart, and the kubernetes Service keeps routing to it until its
@@ -1551,8 +1552,11 @@ async def _finish_with_flip(
         if why is not None:
             await _bail(db, run, holder, why)
             return None
-        if shared_tags.flip_record(run).get("state") != shared_tags.FLIP_FLIPPING:
-            # Once: a flip tried again has announced the end of the roll already.
+        events = (run.progress or {}).get("events") or []
+        if not any(e.get("event") == "all_nodes_complete" for e in events):
+            # Once: a flip tried again (#2028), whether it failed before or
+            # after it recorded its snapshot, or one a redelivered drive
+            # resumes, has announced the end of the roll already.
             await _record_event(db, run, "all_nodes_complete", shared_tag_flip_starting=True)
         await db.commit()
         flipped = await shared_tags.flip(db, run)
