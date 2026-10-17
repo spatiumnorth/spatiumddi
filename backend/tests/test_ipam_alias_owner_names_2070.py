@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 from httpx import AsyncClient
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ipam.router import AliasInput
@@ -74,3 +75,54 @@ async def test_alias_endpoints_422_a_bad_a_alias_and_write_nothing(
     for body in ({"name": "www", "record_type": "A"}, {"name": "_svc", "record_type": "CNAME"}):
         ok = await client.post(f"/api/v1/ipam/addresses/{host}/aliases", headers=headers, json=body)
         assert ok.status_code == 201, ok.text
+
+
+def test_alias_name_is_stored_in_the_form_the_checks_passed() -> None:
+    # An internationalized A alias passes as its A-label; storing the raw
+    # form would put non-LDH bytes in the zone, which check-names refuses.
+    assert AliasInput(name="Café", record_type="A").name == "xn--caf-dma"
+    assert AliasInput(name="WWW", record_type="A").name == "www"
+    # One message naming the alias, not the alias named twice.
+    with pytest.raises(ValidationError) as exc:
+        AliasInput(name="a..b", record_type="CNAME")
+    assert exc.value.errors()[0]["msg"].count("a..b") == 1
+
+
+@pytest.mark.asyncio
+async def test_alias_too_long_inside_its_zone_is_422_on_every_path(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Four 60-character labels are a legal name alone (243 characters), and
+    over 253 once the zone is appended — the length BIND refuses the zone at."""
+    headers = await _headers(db_session)
+    grp, space, block = await _setup(db_session)
+    zone = _zone(grp, "corp", "primary")
+    db_session.add(zone)
+    await db_session.commit()
+    sid = await _subnet(client, headers, space, block, grp, zone)
+    long_alias = ".".join(c * 60 for c in "abcd")
+    alias = [{"name": long_alias, "record_type": "CNAME"}]
+
+    resp = await client.post(
+        f"/api/v1/ipam/subnets/{sid}/addresses",
+        headers=headers,
+        json={"address": "10.97.5.20", "hostname": "h20", "aliases": alias},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "253" in resp.text
+
+    resp = await client.post(
+        f"/api/v1/ipam/subnets/{sid}/next",
+        headers=headers,
+        json={"hostname": "h21", "aliases": alias},
+    )
+    assert resp.status_code == 422, resp.text
+
+    host = await _allocate(client, headers, sid, "10.97.5.22", "h22")
+    resp = await client.post(
+        f"/api/v1/ipam/addresses/{host}/aliases", headers=headers, json=alias[0]
+    )
+    assert resp.status_code == 422, resp.text
+
+    names = {r[0] for r in await _records(db_session, zone.id)}
+    assert names == {"h22"}, names

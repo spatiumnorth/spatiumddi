@@ -85,14 +85,21 @@ the formatter handles the rest.
 ### Fixed
 
 - **An IPAM alias named `under_score` (type A) is refused, not written
-  into a zone BIND will not load (#2070).** Allocate IP, the IP edit
-  and the Add alias endpoint stored the name and wrote the record; the
-  BIND9 agent then refused the whole zone under check-names and held
+  into a zone BIND will not load (#2070).** Allocate IP, Allocate next
+  IP and the Add alias endpoint stored the name and wrote the record;
+  the BIND9 agent then refused the whole zone under check-names and held
   every later change in it. An alias now passes the DNS record API's own
   owner-name checks (`validate_record_owner` and BIND's check-names rule
   for its type), so an A or AAAA alias must be a host name and the
   request answers 422 naming the alias. A CNAME alias keeps the
-  underscore, as in the DNS API.
+  underscore, as in the DNS API. The alias is stored in the form the
+  checks passed (lower-cased, an internationalized name as its `xn--`
+  A-label), and an alias whose name inside its zone passes 253
+  characters is refused before anything is written. An alias stored
+  before this release still holds its zone back:
+  `GET /api/v1/diagnostics/name-conformance` (or the Copilot's
+  `find_nonconforming_names`) lists it, and deleting it from the
+  address's aliases releases the zone.
 
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
