@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A per-box upgrade stayed `reboot-pending` after it had rebooted and
+  committed (#2007), and its help text said it reboots (#2008).** The
+  host runner ends a staged apply at state `done` / progress
+  `reboot-pending` and is not running when the node comes back, so after
+  the reboot (or an auto-revert) the supervisor kept re-publishing
+  "upgrade staged" to Fleet, the API and MCP. The supervisor now settles
+  the state to `ready` once this boot began after the staging stamp and
+  is not a trial boot, which covers both a committed new slot and a
+  rollback. An upgrade still awaiting its reboot, and a trial boot
+  awaiting its commit, are untouched. The per-box form, the API
+  docstring and the Upgrades docs no longer claim the host reboots into
+  the new slot; only Rolling Upgrade reboots for you.
 - **Disabling a DNS pool now removes its records, and a pool TTL change
   lands immediately (#1974).** `update_pool` never reconciled and
   `apply_pool_state` ignored `pool.enabled`, so a disabled pool kept

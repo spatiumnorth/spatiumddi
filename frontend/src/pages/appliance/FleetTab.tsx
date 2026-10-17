@@ -6022,8 +6022,10 @@ function ApplianceOsUpgradeSection({
             Stamps <code>desired_appliance_version</code> on the appliance row.
             The supervisor reads it on its next heartbeat + writes the
             slot-upgrade trigger; the host runner dd&apos;s the image to the
-            inactive slot + reboots into it (auto-revert if{" "}
-            <code>/health/live</code> fails).
+            inactive slot and stops there. It does not reboot: use{" "}
+            <strong>Reboot to boot new slot</strong> when you are ready, and
+            the node reverts to the old slot if <code>/health/live</code>{" "}
+            fails on the new one.
           </p>
         </div>
       )}

@@ -37,7 +37,7 @@ import re
 import subprocess
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import structlog
@@ -1457,6 +1457,68 @@ def prune_all_trigger_sidecars(keep: int = 5) -> None:
     bounded immediately on upgrade, independent of any fire this tick."""
     for trigger in _PRUNABLE_TRIGGERS:
         _prune_host_config_sidecars(trigger, keep)
+
+
+def _boot_started_at() -> datetime | None:
+    """Wall-clock time this boot began (now minus uptime), or None."""
+    try:
+        up = float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return datetime.now(UTC) - timedelta(seconds=up)
+
+
+def _settle_staged_upgrade(
+    state: str | None,
+    state_at: datetime | None,
+    is_trial_boot: bool | None,
+    *,
+    boot_started: datetime | None = None,
+) -> tuple[str | None, datetime | None]:
+    """#2007 — retire a staged upgrade the node has already rebooted past.
+
+    The host runner ends a successful apply at state ``done`` with progress
+    ``reboot-pending`` and nothing ever moves them: the wrapper is not
+    running when the node comes back, so after the reboot into the new slot
+    (or an auto-revert to the old one) the heartbeat kept re-publishing
+    "upgrade staged — reboot to boot the new slot" for a reboot that had
+    happened. Fleet, the API and MCP all read that field.
+
+    Settles to ``ready`` only when BOTH hold:
+
+    * this boot began AFTER the ``reboot-pending`` stamp, so the node has
+      rebooted since staging. An upgrade staged and still awaiting its
+      reboot has a stamp newer than the boot and is never touched;
+    * the boot is not a trial (running slot == durable default), i.e. the
+      new slot committed, or a failed trial rolled back to the old one.
+      A trial boot awaiting its commit is left alone, and so is an
+      unknown trial state.
+
+    Persisted to the .state sidecar so the answer survives a restart and
+    the next heartbeat ships an empty progress.
+    """
+    if state != "done" or is_trial_boot is not False:
+        return state, state_at
+    progress = _read_slot_upgrade_progress() or {}
+    if progress.get("step") != "reboot-pending":
+        return state, state_at
+    try:
+        staged_at = datetime.fromisoformat(str(progress.get("at")))
+    except ValueError:
+        return state, state_at
+    if staged_at.tzinfo is None:
+        staged_at = staged_at.replace(tzinfo=UTC)
+    started = boot_started if boot_started is not None else _boot_started_at()
+    if started is None or started <= staged_at:
+        return state, state_at
+    now = datetime.now(UTC)
+    try:
+        _write_sidecar_durable(_HOST_SLOT_STATE, f"ready {now.isoformat()}\n")
+    except OSError:
+        # Best-effort: the in-memory answer below still corrects this
+        # heartbeat; the next one retries the write.
+        pass
+    return "ready", now
 
 
 def _read_slot_upgrade_log_tail(lines: int = 40, max_chars: int = 8000) -> str:
@@ -4432,6 +4494,10 @@ def collect() -> dict[str, object]:
     # upgrade is in-flight / failed / awaiting-reboot (done). For idle
     # appliances ship empty so a stale tail/progress is cleared; None
     # off-appliance so the backend leaves the columns alone.
+    if is_appliance:
+        last_state, last_state_at = _settle_staged_upgrade(
+            last_state, last_state_at, is_trial_boot
+        )
     _show_progress = is_appliance and last_state in ("in-flight", "failed", "done")
     if not is_appliance:
         last_upgrade_log_tail = None
