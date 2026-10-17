@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -421,10 +421,18 @@ def _expected_ptr(addr: str, hostname: str, zone_name: str) -> tuple[str, str]:
     return label, hostname  # value rendered with trailing dot at apply time
 
 
-async def compute_block_dns_drift(db: AsyncSession, block_id: uuid.UUID) -> DriftReport:
+async def compute_block_dns_drift(
+    db: AsyncSession,
+    block_id: uuid.UUID,
+    *,
+    subnet_ids: Collection[uuid.UUID] | None = None,
+) -> DriftReport:
     """Aggregate drift across every subnet directly or transitively under
     the given block. Per-subnet zone summaries are dropped (multiple zones
-    likely involved) — caller can fall back to a count."""
+    likely involved) — caller can fall back to a count.
+
+    ``subnet_ids``, when given, limits the report to those subnets (a caller
+    bound to specific subnets); ``None`` covers every subnet in the block."""
     # Walk the block subtree
     descendant_ids: list[uuid.UUID] = []
     queue = [block_id]
@@ -444,15 +452,28 @@ async def compute_block_dns_drift(db: AsyncSession, block_id: uuid.UUID) -> Drif
         .all()
     )
 
-    return await _aggregate(db, sn_ids)
+    return await _aggregate(db, _only(sn_ids, subnet_ids))
 
 
-async def compute_space_dns_drift(db: AsyncSession, space_id: uuid.UUID) -> DriftReport:
-    """Aggregate drift across every subnet in the space."""
+async def compute_space_dns_drift(
+    db: AsyncSession,
+    space_id: uuid.UUID,
+    *,
+    subnet_ids: Collection[uuid.UUID] | None = None,
+) -> DriftReport:
+    """Aggregate drift across every subnet in the space (or, with
+    ``subnet_ids``, across those of them only)."""
     sn_ids = (
         (await db.execute(select(Subnet.id).where(Subnet.space_id == space_id))).scalars().all()
     )
-    return await _aggregate(db, sn_ids)
+    return await _aggregate(db, _only(sn_ids, subnet_ids))
+
+
+def _only(found: Sequence[uuid.UUID], allowed: Collection[uuid.UUID] | None) -> Sequence[uuid.UUID]:
+    if allowed is None:
+        return found
+    keep = set(allowed)
+    return [sid for sid in found if sid in keep]
 
 
 async def _aggregate(db: AsyncSession, subnet_ids: Sequence[uuid.UUID]) -> DriftReport:
