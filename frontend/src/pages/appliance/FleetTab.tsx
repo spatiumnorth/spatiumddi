@@ -1,5 +1,4 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
-import { UpgradeDirectionNotice } from "./UpgradeDirectionNotice";
 import { Link } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -77,6 +76,7 @@ import { ResolverTab } from "./ResolverTab";
 import { SNMPTab } from "./SNMPTab";
 import { SSHTab } from "./SSHTab";
 import { SyslogTab } from "./SyslogTab";
+import { UpgradeDirectionNotice } from "./UpgradeDirectionNotice";
 // #404 — these three moved out of the top-level tab bar into this sidebar.
 import { CertificatesTab } from "./CertificatesTab";
 import { ClusterUpgradeTab } from "./ClusterUpgradeTab";
