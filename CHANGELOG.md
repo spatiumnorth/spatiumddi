@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The audit API and page now show what an entry recorded (#2009).**
+  An entry's `old_value` / `new_value` / `changed_fields` (for example a
+  per-box upgrade's `direction` and `schema_check`) were stored and
+  returned nowhere, so the only way to see them was SQL.
+  `GET /audit/{id}` returns them, `GET /audit` does too with
+  `include_details=true`, the Audit Log page expands a row to show them,
+  and `get_audit_history` carries `old_value` / `new_value` when asked
+  with `include_details` (off by default, because the copilot's provider
+  can be off-premises; non-negotiable #13). Values are
+  redacted on read (credential-shaped keys and secret-shaped strings,
+  a PEM private key whole), because the writers are hundreds of call
+  sites and nothing stops one storing a credential. The writers' own
+  `<field>_set: true` flags are kept, since whether a secret was set is
+  the detail worth reading. Reading details takes the same `read` on
+  `audit_log` as the list. Audit forwarding to syslog / webhook targets
+  still sends the stored values unredacted.
+
 - **A device policy whose classes have no fingerprinted devices yet now says
   why it is not rendered (#2000).** With classes selected and nothing seen in
   them, the policy compiles to an empty expression and is correctly left out of
