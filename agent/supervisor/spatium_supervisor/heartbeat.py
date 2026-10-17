@@ -1202,7 +1202,9 @@ def heartbeat_once(
         # a HelmChartConfig is a separate CR helm-controller merges on top
         # + the deploy controller never reverts. cp-size + the VIP go on
         # spatium-control; the MetalLB pool on spatium-bootstrap.
-        # Idempotent — only writes when the rendered values differ.
+        # Each write MERGES the supervisor's own keys into the live
+        # document (operator keys survive, #2024) and only writes when that
+        # changes the effective values.
         ml_enabled = bool(body_out.get("desired_metallb_enabled"))
         ml_pool = body_out.get("desired_metallb_pool_addresses") or []
         ml_vip = body_out.get("desired_control_plane_vip") or ""
@@ -1334,10 +1336,11 @@ def heartbeat_once(
         elif bs_err:
             log.warning("supervisor.heartbeat.metallb_overrides_failed", error=bs_err)
 
-        # #272 Phase 10 — data-plane resolver VIPs. Patches
-        # dns.useMetalLBVIP / dns.vip / dhcpKea.relayVIP onto the
-        # spatiumddi-appliance HelmChartConfig (a no-op merge until the
-        # chart exists, i.e. until a DNS/DHCP role is assigned somewhere).
+        # #272 Phase 10 — data-plane resolver VIPs. Merges
+        # dns.useMetalLBVIP / dns.vip / dhcpKea.relayVIP into the
+        # spatiumddi-appliance HelmChartConfig, leaving every other key
+        # (an operator's dnsBind9.resources, #2024) as it is. Inert until
+        # the chart exists, i.e. until a DNS/DHCP role is assigned.
         dns_vip = body_out.get("desired_dns_vip") or ""
         relay_vip = body_out.get("desired_dhcp_relay_vip") or ""
         dp_changed, dp_err = k8s_api.apply_dataplane_vip_overrides(

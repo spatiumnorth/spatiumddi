@@ -1143,21 +1143,42 @@ Unlike the api, worker and Postgres limits, this one is **not** sized from
 the node's RAM. The role chart is one HelmChart for the whole cluster and
 every node's supervisor writes it, so it must render the same everywhere
 (#1137), and a DaemonSet has one limit for all its pods. A node whose
-blocklists need more raises it for the cluster with a HelmChartConfig:
+blocklists need more raises it for the cluster in the `spatiumddi-appliance`
+HelmChartConfig. Edit it in place rather than applying a fresh manifest:
+
+```sh
+kubectl -n kube-system edit helmchartconfig spatiumddi-appliance
+```
+
+and add the key beside whatever `spec.valuesContent` already holds:
 
 ```yaml
-apiVersion: helm.cattle.io/v1
-kind: HelmChartConfig
-metadata:
-  name: spatiumddi-appliance
-  namespace: kube-system
 spec:
   valuesContent: |
+    dhcpKea:
+      relayVIP: ""
+    dns:
+      useMetalLBVIP: false
+      vip: ""
     dnsBind9:
       resources:
         limits:
           memory: 4Gi
 ```
+
+The supervisor writes the same CR on every heartbeat, but it owns only its
+data-plane VIP keys (`dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP`): it
+merges them into the live document and leaves every other key as you wrote
+it (#2024). If the CR does not exist yet (no DNS or DHCP role assigned
+anywhere), creating it with `kubectl apply` and only the `dnsBind9` block is
+fine; the supervisor adds its keys beside it. Do not `kubectl apply` a
+manifest over an existing CR: that replaces the whole `valuesContent`, so the
+VIP keys vanish until the next heartbeat restores them, and with a DNS VIP
+configured that is a helm upgrade that moves named back to hostNetwork and
+then off it again. Two things the supervisor's merge does not keep: a value
+you set for one of its three keys (the supervisor's wins), and YAML comments,
+which are dropped the next time it has to change one of its keys and rewrites
+the document.
 
 Size it from the table in [`DNS.md` section 8.0](../features/DNS.md): a
 582k-entry list in a group with one view needs about 4 GiB for named, so a

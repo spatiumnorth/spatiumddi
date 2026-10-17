@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 
+import yaml
+
 from spatium_supervisor import k8s_api
 
 
@@ -169,10 +171,9 @@ def test_dataplane_vip_overrides_render(monkeypatch) -> None:
 
     assert (changed, err) == (True, None)
     body = next(json.loads(b) for m, _, b in rec.calls if m == "POST" and b)
-    vals = body["spec"]["valuesContent"]
-    assert "useMetalLBVIP: true" in vals
-    assert 'vip: "192.168.0.242"' in vals
-    assert 'relayVIP: "192.168.0.243"' in vals
+    vals = yaml.safe_load(body["spec"]["valuesContent"])
+    assert vals["dns"] == {"useMetalLBVIP": True, "vip": "192.168.0.242"}
+    assert vals["dhcpKea"] == {"relayVIP": "192.168.0.243"}
 
 
 def test_dataplane_vip_overrides_empty_disables(monkeypatch) -> None:
@@ -182,10 +183,9 @@ def test_dataplane_vip_overrides_empty_disables(monkeypatch) -> None:
     k8s_api.apply_dataplane_vip_overrides(dns_vip="", dhcp_relay_vip="")
 
     body = next(json.loads(b) for m, _, b in rec.calls if m == "POST" and b)
-    vals = body["spec"]["valuesContent"]
-    assert "useMetalLBVIP: false" in vals
-    assert 'vip: ""' in vals
-    assert 'relayVIP: ""' in vals
+    vals = yaml.safe_load(body["spec"]["valuesContent"])
+    assert vals["dns"] == {"useMetalLBVIP": False, "vip": ""}
+    assert vals["dhcpKea"] == {"relayVIP": ""}
 
 
 # ── issue #566 decision D1 — MetalLB BGP mode overrides ────────────────
@@ -214,15 +214,19 @@ def test_metallb_bgp_overrides_render(monkeypatch) -> None:
 
     assert (changed, err) == (True, None)
     body = next(json.loads(b) for m, _, b in rec.calls if m == "POST" and b)
-    vals = body["spec"]["valuesContent"]
-    assert "frrk8s:\n    enabled: true" in vals
-    assert "bgp:\n    enabled: true" in vals
-    assert '"myASN": 65000' in vals
-    assert '"peerASN": 65001' in vals
-    assert '"peerAddress": "203.0.113.1"' in vals
-    assert '"peerPort": 1179' in vals
-    assert '"holdTime": "90s"' in vals
-    assert '"ipAddressPools": ["spatium-control-plane"]' in vals
+    vals = yaml.safe_load(body["spec"]["valuesContent"])["metallb"]
+    assert vals["frrk8s"] == {"enabled": True}
+    assert vals["bgp"]["enabled"] is True
+    assert vals["bgp"]["peers"] == [
+        {
+            "myASN": 65000,
+            "peerASN": 65001,
+            "peerAddress": "203.0.113.1",
+            "peerPort": 1179,
+            "holdTime": "90s",
+        }
+    ]
+    assert vals["bgp"]["advertisements"] == [{"ipAddressPools": ["spatium-control-plane"]}]
 
 
 def test_metallb_bgp_overrides_disabled_shape(monkeypatch) -> None:
@@ -238,11 +242,10 @@ def test_metallb_bgp_overrides_disabled_shape(monkeypatch) -> None:
 
     assert (changed, err) == (True, None)
     body = next(json.loads(b) for m, _, b in rec.calls if m == "POST" and b)
-    vals = body["spec"]["valuesContent"]
-    assert "frrk8s:\n    enabled: false" in vals
-    assert "bgp:\n    enabled: false" in vals
-    assert "peers: []" in vals
-    assert "advertisements: []" in vals
+    vals = yaml.safe_load(body["spec"]["valuesContent"])["metallb"]
+    assert vals["frrk8s"] == {"enabled": False}
+    assert vals["bgp"] == {"enabled": False, "peers": [], "advertisements": []}
+    assert vals["ipPool"] == {"addresses": ["192.168.0.240/32"]}
 
 
 # ---- #1059: a scale-down is never written blind -----------------------------------

@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An operator's override in the `spatiumddi-appliance` HelmChartConfig
+  is no longer reverted by the next heartbeat (#2024).** The documented
+  way to raise named's memory limit (`dnsBind9.resources` in that CR,
+  `APPLIANCE.md`) was undone within a minute: the supervisor rewrote the
+  CR's whole `valuesContent` to its three data-plane VIP keys on every
+  beat, so the DaemonSet went back to 2Gi. The supervisor now merges its
+  own keys into the live document and writes only when that changes
+  something, so every other key survives; the PATCH is conditional on the
+  resourceVersion it read, so an edit landing in between is retried
+  rather than overwritten. `spatium-metallb` had the same replace-the-
+  document write and goes through the same path; `spatium-control`
+  already merged (#792) and now shares it, keeping #1005's guard against
+  a helm revision that changes nothing. YAML comments in these CRs are
+  dropped when the supervisor next has to change one of its keys; the
+  recipe now says to edit the CR in place rather than `kubectl apply`
+  over it.
 - **Creating an alert rule, firewall policy or alias, conformity policy,
   backup target, API token, DNS group, server, zone, TSIG key, view,
   blocklist entry or exception, or an upgrade run no longer writes an
