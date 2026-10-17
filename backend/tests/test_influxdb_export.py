@@ -23,10 +23,12 @@ from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_str
 from app.core.security import create_access_token, hash_password
+from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import (
     DHCPLease,
@@ -685,3 +687,154 @@ async def test_dhcp_export_omits_an_unmeasured_counter(db_session: AsyncSession)
     assert "receive_drop" not in points[0].fields
     # The traffic counters are unaffected — the point is still emitted.
     assert points[0].fields["discover"] == 5
+
+
+# ── #1989: a blank secret keeps the stored one; clearing is explicit ──────
+
+
+@pytest.mark.asyncio
+async def test_blank_secret_keeps_it_and_only_the_flag_clears(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = {"Authorization": f"Bearer {await _superadmin(db_session)}"}
+    url = "/api/v1/settings/influxdb-targets"
+
+    # v2 token: ``""`` is what a form sends once its field was typed in and
+    # cleared. Before #1989 it cleared the token and the save was refused.
+    r = await client.post(url, headers=h, json=_v2_body(token="tok-secret"))
+    assert r.status_code == 201, r.text
+    tid = r.json()["id"]
+    r = await client.put(
+        f"{url}/{tid}", headers=h, json=_v2_body(token="", push_interval_seconds=90)
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["token_set"] is True
+    assert r.json()["push_interval_seconds"] == 90
+
+    # The flag removes it: a v2 target without a token fails the writable
+    # check, so the explicit clear is refused rather than silently applied.
+    r = await client.put(f"{url}/{tid}", headers=h, json=_v2_body(token="", clear_token=True))
+    assert r.status_code == 422, r.text
+    assert "token is required" in r.text
+
+    # v1 password: blank keeps, flag clears, a new value replaces and wins
+    # over the flag.
+    v1 = {
+        **_v2_body(),
+        "version": "v1",
+        "database": "ddi",
+        "username": "u",
+        "name": "v1t",
+        "password": "pw-secret",
+    }
+    r = await client.post(url, headers=h, json=v1)
+    assert r.status_code == 201, r.text
+    pid = r.json()["id"]
+    assert r.json()["password_set"] is True
+    r = await client.put(f"{url}/{pid}", headers=h, json={**v1, "password": ""})
+    assert r.json()["password_set"] is True
+    r = await client.put(f"{url}/{pid}", headers=h, json={**v1, "password": None})
+    assert r.json()["password_set"] is True
+    r = await client.put(
+        f"{url}/{pid}", headers=h, json={**v1, "password": "new", "clear_password": True}
+    )
+    assert r.json()["password_set"] is True
+    r = await client.put(
+        f"{url}/{pid}", headers=h, json={**v1, "password": "", "clear_password": True}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["password_set"] is False
+
+
+@pytest.mark.asyncio
+async def test_clearing_a_secret_is_audited_without_the_secret(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    h = {"Authorization": f"Bearer {await _superadmin(db_session)}"}
+    url = "/api/v1/settings/influxdb-targets"
+    v1 = {
+        **_v2_body(),
+        "version": "v1",
+        "database": "ddi",
+        "username": "u",
+        "name": "v1-audit",
+        "password": "pw-very-secret",
+        "token": None,
+    }
+    r = await client.post(url, headers=h, json=v1)
+    assert r.status_code == 201, r.text
+    pid = r.json()["id"]
+    # A blank-keep save changes no secret; the explicit clear does.
+    r = await client.put(f"{url}/{pid}", headers=h, json={**v1, "password": ""})
+    assert r.status_code == 200, r.text
+    r = await client.put(
+        f"{url}/{pid}", headers=h, json={**v1, "password": "", "clear_password": True}
+    )
+    assert r.status_code == 200, r.text
+
+    rows = (
+        (
+            await db_session.execute(
+                select(AuditLog)
+                .where(AuditLog.resource_type == "influxdb_target", AuditLog.resource_id == pid)
+                .order_by(AuditLog.seq)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    changes = [(a.action, a.new_value["secret_changes"]) for a in rows]
+    assert changes == [
+        ("create", ["password_set"]),
+        ("update", []),
+        ("update", ["password_cleared"]),
+    ]
+    assert rows[-1].new_value["password_set"] is False
+    assert all("pw-very-secret" not in repr(a.new_value) for a in rows)
+
+
+# ── #1990: the last SUCCESSFUL push is kept apart from the last attempt ──
+
+
+@pytest.mark.asyncio
+async def test_last_success_survives_a_later_failure(db_session: AsyncSession) -> None:
+    row = InfluxDBTarget(
+        name=f"t-{uuid.uuid4().hex[:6]}",
+        version="v2",
+        url="http://influx:8086",
+        org="acme",
+        bucket="ddi",
+        token_encrypted=encrypt_str("tok"),
+        push_dns_metrics=False,
+        push_dhcp_metrics=False,
+        push_subnet_utilization=False,
+        push_dhcp_scope_leases=False,
+    )
+    db_session.add(row)
+    await db_session.flush()
+    assert row.last_success_at is None
+
+    async def _boom(cfg: object, body: str) -> None:
+        raise InfluxDBWriteError("HTTP 500")
+
+    async def _ok(cfg: object, body: str) -> None:
+        return None
+
+    t1 = datetime.now(UTC) - timedelta(minutes=10)
+    with patch("app.services.influxdb.push.write_lines", new=_boom):
+        await push_target(db_session, row, now=t1)
+    # Never delivered: an attempt, but no success.
+    assert row.last_push_at == t1
+    assert row.last_success_at is None
+
+    t2 = t1 + timedelta(minutes=5)
+    with patch("app.services.influxdb.push.write_lines", new=_ok):
+        await push_target(db_session, row, now=t2)
+    assert row.last_success_at == t2
+
+    t3 = t2 + timedelta(minutes=5)
+    with patch("app.services.influxdb.push.write_lines", new=_boom):
+        await push_target(db_session, row, now=t3)
+    assert row.last_push_at == t3
+    assert row.last_success_at == t2
+    assert row.last_push_error == "HTTP 500"
