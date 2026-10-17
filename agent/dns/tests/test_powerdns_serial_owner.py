@@ -594,7 +594,7 @@ def _cached_loop(
         return ok
 
     monkeypatch.setattr(loop, "_post_zone_state", post)
-    monkeypatch.setattr(loop, "_client", lambda: _Client304())
+    monkeypatch.setattr(loop, "_client", _Client304)
     return loop, posted, outcomes
 
 
