@@ -87,13 +87,17 @@ the formatter handles the rest.
 - **The audit API and page now show what an entry recorded (#2009).**
   An entry's `old_value` / `new_value` / `changed_fields` (for example a
   per-box upgrade's `direction` and `schema_check`) were stored and
-  returned nowhere, so the only way to see them was SQL. `GET
-  /audit/{id}` returns them, `GET /audit` does too with
+  returned nowhere, so the only way to see them was SQL.
+  `GET /audit/{id}` returns them, `GET /audit` does too with
   `include_details=true`, the Audit Log page expands a row to show them,
   and `get_audit_history` carries `old_value` / `new_value`. Values are
-  redacted on read (credential-shaped keys and secret-shaped strings),
-  because the writers are ~120 call sites and nothing stops one storing
-  a credential.
+  redacted on read (credential-shaped keys and secret-shaped strings,
+  a PEM private key whole), because the writers are hundreds of call
+  sites and nothing stops one storing a credential. The writers' own
+  `<field>_set: true` flags are kept, since whether a secret was set is
+  the detail worth reading. Reading details takes the same `read` on
+  `audit_log` as the list. Audit forwarding to syslog / webhook targets
+  still sends the stored values unredacted.
 
 - **The alert rule editor no longer rewrites a rule's stored thresholds,
   crashes on a refused save, or leaves its labels unattached (#1986,

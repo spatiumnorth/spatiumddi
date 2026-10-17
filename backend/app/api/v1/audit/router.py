@@ -102,15 +102,30 @@ async def list_audit_log(
     )
 
 
+_DETAIL_FIELDS = ("old_value", "new_value", "changed_fields", "error_detail")
+_SUMMARY_FIELDS = tuple(f for f in AuditLogResponse.model_fields if f not in _DETAIL_FIELDS)
+
+
+def _as_object(value: object) -> dict[str, Any] | None:
+    """The JSONB payload as an object. The columns are typed ``dict`` but
+    nothing stops a writer storing a bare list or scalar; wrapping it keeps
+    one odd row from turning the response into a 500."""
+    if value is None or isinstance(value, dict):
+        return value
+    return {"value": value}
+
+
 def _to_response(row: AuditLog, *, details: bool) -> AuditLogResponse:
-    out = AuditLogResponse.model_validate(row)
+    # Built from the summary columns only, so the list without
+    # ``include_details`` never validates a stored payload: an odd one
+    # cannot break a list that never shows it.
+    out = AuditLogResponse.model_validate({f: getattr(row, f) for f in _SUMMARY_FIELDS})
     if details:
-        out.old_value = redact_audit_value(row.old_value)
-        out.new_value = redact_audit_value(row.new_value)
-        out.changed_fields = row.changed_fields
+        out.old_value = redact_audit_value(_as_object(row.old_value))
+        out.new_value = redact_audit_value(_as_object(row.new_value))
+        cf = row.changed_fields
+        out.changed_fields = [str(f) for f in cf] if isinstance(cf, list) else None
         out.error_detail = redact_audit_value(row.error_detail)
-    else:
-        out.old_value = out.new_value = out.changed_fields = out.error_detail = None
     return out
 
 
