@@ -93,6 +93,89 @@ the formatter handles the rest.
   every zone yet. A server that has not reported is never counted as
   in sync.
 
+- **A rolling upgrade no longer fails on one kubeapi request its
+  shared-tag hold could not land (#2028).** The hold (#1710) pins the
+  shared charts' image tag before each node and removes the pins at the
+  end, a few kubeapi requests each time, and any one of them refused or
+  unanswered (a k3s server answers 503 `apiserver not ready` while it
+  restarts) failed the whole run: before the first node, with the
+  cluster on two versions at a re-assert, or with every node already on
+  the target at the flip. Such a step is now tried again every 15 s,
+  with Halt, Abort and the Lease read between tries, as #1713 does for
+  the Lease. No node starts and no tag moves until it lands, and the
+  run fails on it, with the same error, only after 300 s of failures.
+  Only an answer a later try can change is retried (no answer, a 5xx,
+  408, 409 or 429); a 403 or 422 still fails the run at once.
+
+- **A demoted member promoted again rejoins instead of sitting
+  `joining` on a full disk (#2049).** Every join and leave set the
+  node's k3s identity aside, and with it containerd's whole image
+  store (4-6 GiB); the newest three backups were kept whole. One
+  demote then promote left a 40 GiB member with three stores in
+  backups beside the one its join was importing, the kubelet went into
+  DiskPressure, the supervisor pod was refused, and nothing reported
+  the join. A backup now keeps its image store only while the join
+  that took it can still roll back onto it: the stores of earlier,
+  settled joins and leaves are dropped before the runner writes
+  anything to /var, a join that registered with the seed's etcd
+  drops its own before its long wait for Ready (that branch never
+  rolls back), and a join or leave that settles drops it before
+  reporting. The identity in every backup is kept for manual
+  recovery. A node already carrying three full backups gets the
+  space back on its first join or leave after the upgrade. Found
+  and first fixed by the QA desk.
+
+- **Fleet no longer reports `ssh: retrying` forever after managed SSH is
+  turned off (#2053).** The supervisor's fire-state reader stripped the
+  leading tab of an empty-hash line (`\t1\t<iso>`, written when a plane
+  is turned off), so the fields shifted left, attempts read as the hash
+  and never matched the runner's empty applied sidecar. It now strips
+  only the line ending and parses the empty hash faithfully; the same
+  reader serves every host-config plane (SNMP, NTP, APT, LLDP, syslog,
+  resolver, firewall, timezone, console mode, removable). The appliance
+  console's own copy of the reader had the same bug and reported the
+  plane `retrying` on the dashboard and the health screen; it is fixed
+  too, and its plane list, which had fallen behind by three planes (APT,
+  console mode, removable), now matches the supervisor's, pinned by a
+  test. Two related cases also no longer stick at `retrying`: a config
+  that failed to apply and was then reverted to what the host already
+  runs, and a failed timezone change followed by clearing the timezone.
+  And an "off" that fails to apply now backs off like any other failed
+  apply, instead of re-firing on every heartbeat.
+
+- **IPAM no longer adopts a PTR whose target lacks the trailing dot
+  where that target is served relative to the zone (#2045).** Since
+  #1890 an allocation adopts an operator's identical record instead of
+  writing its own, and for a PTR it also matched the target with the
+  trailing dot removed. The record API stores a value as typed, and
+  BIND9, both Technitium drivers and Windows over RFC 2136 serve a
+  dot-less target relative to the reverse zone, so `db1.example.com`
+  answered `db1.example.com.<reverse zone>.`: IPAM adopted the wrong
+  record, wrote no PTR, and Sync DNS reported nothing missing. The
+  adoption match and the Sync DNS check now compare a PTR target the way
+  the zone's servers serve it. A dot-less target is still adopted where
+  every server in the group takes it as the absolute name (the cloud
+  providers, Windows over WinRM), because writing a second copy there is
+  a duplicate the provider can refuse. The comparison is now also
+  case-insensitive, so `DB1.Example.com.` is adopted rather than
+  duplicated. When IPAM declines a dot-less operator PTR it logs
+  `ipam_ptr_relative_operator_record`; the operator's record stays, and
+  the reverse lookup answers both names until it is fixed or deleted.
+  A/AAAA adoption is unchanged; CNAME, MX and NS are not adopted by this
+  code.
+
+- **Saving SSH settings now repairs a failed or stopped ssh.service
+  (#2054).** The runner validated the staged config with `sshd -t`
+  before restarting, but `sshd -t` needs `/run/sshd`, which is
+  ssh.service's own runtime directory and is removed when the unit
+  stops or fails. With the unit down the check failed and the restart
+  that would have fixed it was never reached, so only a reboot
+  recovered. The runner now creates the directory (root:root 0755,
+  as the unit does) before validating; an invalid config is still
+  refused. And when ssh.socket is not active, a down ssh.service is
+  now started rather than reloaded, since systemd refuses to reload a
+  unit that is not running.
+
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
   the inactive slot would be re-written with the same release and the
