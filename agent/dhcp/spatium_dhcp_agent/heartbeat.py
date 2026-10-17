@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import random
 import threading
+import time
 from typing import Any
 
 import httpx
@@ -18,6 +19,10 @@ from .ha_tls import AGENT_CAPABILITIES
 from .spool import SpoolManager
 
 log = structlog.get_logger(__name__)
+
+# How long a control plane that refused ``capabilities`` (it predates the
+# field) is left alone before the field is offered again.
+CAPABILITIES_RETRY_SECONDS = 600.0
 
 
 class HeartbeatClient:
@@ -50,10 +55,14 @@ class HeartbeatClient:
         # model is ``extra="forbid"`` and predates #1077. Dropping the field
         # keeps the agent's liveness signal alive across the version skew.
         self._spool_field_unsupported = False
-        # Same skew handling for ``capabilities``. It is what opens the HA
-        # peer-credential gate, so only an older control plane — which has no
-        # gate — ever sees it dropped.
-        self._capabilities_field_unsupported = False
+        # Same skew handling for ``capabilities``, with one difference: it is
+        # what opens the HA peer-credential gate, so the field is offered
+        # again every CAPABILITIES_RETRY_SECONDS rather than dropped for the
+        # life of the process. During a rolling upgrade this agent can come up
+        # while an older api pod still answers, and the control plane is then
+        # upgraded under it without the agent re-registering — a latched drop
+        # would keep the gate shut until something restarted the agent.
+        self._capabilities_retry_at = 0.0
 
     def stop(self) -> None:
         self._stop.set()
@@ -106,7 +115,7 @@ class HeartbeatClient:
             # treat that as "unknown", never as "old".
             "kea_version": self._kea_version(),
         }
-        if not self._capabilities_field_unsupported:
+        if time.monotonic() >= self._capabilities_retry_at:
             body["capabilities"] = list(AGENT_CAPABILITIES)
         if self.spool_manager is not None and not self._spool_field_unsupported:
             try:
@@ -131,7 +140,9 @@ class HeartbeatClient:
                     and "capabilities" in resp.text
                 ):
                     log.warning("heartbeat_capabilities_field_unsupported")
-                    self._capabilities_field_unsupported = True
+                    self._capabilities_retry_at = (
+                        time.monotonic() + CAPABILITIES_RETRY_SECONDS
+                    )
                     body.pop("capabilities")
                     resp = c.post(
                         "/api/v1/dhcp/agents/heartbeat",

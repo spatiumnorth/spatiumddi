@@ -48,11 +48,13 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from sqlalchemy import select
 
 from app.core.crypto import decrypt_dict, encrypt_dict
+from app.models.dhcp import DHCPServer, DHCPServerGroup
 
 if TYPE_CHECKING:
-    from app.models.dhcp import DHCPServer, DHCPServerGroup
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 log = structlog.get_logger(__name__)
 
@@ -166,7 +168,10 @@ def rotate_credential(group: DHCPServerGroup) -> None:
 
 def group_credential(group: DHCPServerGroup) -> dict[str, str] | None:
     """The group's decrypted credential, or None if it has none / it is unreadable."""
-    token = group.ha_peer_credential_encrypted
+    return _decode_credential(group.ha_peer_credential_encrypted, group.id)
+
+
+def _decode_credential(token: bytes | None, group_id: object) -> dict[str, str] | None:
     if not token:
         return None
     try:
@@ -174,19 +179,22 @@ def group_credential(group: DHCPServerGroup) -> dict[str, str] | None:
     except ValueError:
         # Encrypted under a key this install does not hold (a restore whose
         # rewrap failed). Never log the value — only that it is unusable.
-        log.warning("dhcp_ha_peer_credential_unreadable", group_id=str(group.id))
+        log.warning("dhcp_ha_peer_credential_unreadable", group_id=str(group_id))
         return None
     if not isinstance(data, dict) or not all(
         isinstance(data.get(k), str) and data.get(k) for k in _CREDENTIAL_KEYS
     ):
-        log.warning("dhcp_ha_peer_credential_malformed", group_id=str(group.id))
+        log.warning("dhcp_ha_peer_credential_malformed", group_id=str(group_id))
         return None
     return {k: data[k] for k in _CREDENTIAL_KEYS}
 
 
-def server_supports_peer_tls(server: DHCPServer) -> bool:
-    caps = server.agent_capabilities or []
+def _caps_support_peer_tls(caps: Any) -> bool:
     return isinstance(caps, list) and HA_PEER_TLS_CAPABILITY in caps
+
+
+def server_supports_peer_tls(server: DHCPServer) -> bool:
+    return _caps_support_peer_tls(server.agent_capabilities)
 
 
 def peer_auth_ready(group: DHCPServerGroup, kea_peers: Iterable[DHCPServer]) -> bool:
@@ -202,8 +210,46 @@ def peer_auth_ready(group: DHCPServerGroup, kea_peers: Iterable[DHCPServer]) -> 
     return bool(group.ha_peer_credential_encrypted)
 
 
+async def current_peer_credential(
+    db: AsyncSession, group: DHCPServerGroup, kea_peers: Iterable[DHCPServer]
+) -> dict[str, str] | None:
+    """The credential to render for the group now, or None while the gate is shut.
+
+    Same rule as :func:`peer_auth_ready`, but read from the database rather
+    than from the ORM objects passed in. The config long-poll keeps one
+    session for its whole wait and re-queries the group on every wake, and a
+    query hands back the objects already in the session's identity map
+    without overwriting their loaded attributes. So when the LAST member of a
+    pair reports the capability, or a superadmin rotates the credential, the
+    partner's parked long-poll would keep seeing the old values and only
+    switch when its long-poll timed out — the two peers flipping up to a
+    long-poll apart instead of together. Column selects are never served from
+    the identity map, so these two always see the committed state.
+    """
+    ids = [s.id for s in kea_peers]
+    if not ids:
+        return None
+    rows = (
+        await db.execute(
+            select(DHCPServer.id, DHCPServer.agent_capabilities).where(DHCPServer.id.in_(ids))
+        )
+    ).all()
+    caps = {row.id: row.agent_capabilities for row in rows}
+    if not all(_caps_support_peer_tls(caps.get(i)) for i in ids):
+        return None
+    token = (
+        await db.execute(
+            select(DHCPServerGroup.ha_peer_credential_encrypted).where(
+                DHCPServerGroup.id == group.id
+            )
+        )
+    ).scalar_one_or_none()
+    return _decode_credential(token, group.id)
+
+
 __all__ = [
     "HA_PEER_TLS_CAPABILITY",
+    "current_peer_credential",
     "encrypted_credential",
     "generate_credential",
     "group_credential",

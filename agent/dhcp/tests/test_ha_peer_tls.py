@@ -239,6 +239,31 @@ def test_heartbeat_drops_the_field_for_a_control_plane_that_refuses_it(
     assert "capabilities" not in sent[-1]
 
 
+def test_heartbeat_offers_the_field_again_once_the_control_plane_is_upgraded(
+    agent_cfg, monkeypatch
+):
+    """An agent that came up against an older api pod mid-upgrade must not
+    keep the HA peer-credential gate shut until it is restarted."""
+    now = [1000.0]
+    monkeypatch.setattr(heartbeat_mod.time, "monotonic", lambda: now[0])
+    hb, sent = _heartbeat(agent_cfg, monkeypatch, refuse_field="capabilities")
+    hb.send_once()
+    assert "capabilities" not in sent[-1]
+
+    # The control plane is upgraded; the agent keeps its token, so it never
+    # re-registers. Its next heartbeats still leave the field out for a while…
+    monkeypatch.setattr(hb, "_client", lambda: _Client(sent, None))
+    now[0] += heartbeat_mod.CAPABILITIES_RETRY_SECONDS / 2
+    hb.send_once()
+    assert "capabilities" not in sent[-1]
+    # …and then offer it again, which the upgraded control plane accepts.
+    now[0] += heartbeat_mod.CAPABILITIES_RETRY_SECONDS
+    hb.send_once()
+    assert sent[-1]["capabilities"] == ["ha_peer_tls"]
+    hb.send_once()
+    assert sent[-1]["capabilities"] == ["ha_peer_tls"]
+
+
 def test_a_url_without_a_port_keeps_its_port_under_https():
     """``http://h/`` meant port 80; Kea reads ``https://h/`` as 443. The
     firewall rule is computed from the stored URL, so the port must not move."""

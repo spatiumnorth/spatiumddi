@@ -53,7 +53,7 @@ from app.services.dhcp.device_policy import (
     compile_device_policy,
     load_fingerprint_snapshot,
 )
-from app.services.dhcp.ha_peer_auth import group_credential, peer_auth_ready
+from app.services.dhcp.ha_peer_auth import current_peer_credential
 from app.services.dhcp.option_validation import (
     options_for_family,
     phone_options_loadable,
@@ -135,9 +135,10 @@ async def _resolve_failover(
     # Kea's listener cannot accept TLS and plaintext at once, so switching one
     # peer before its partner's agent understands the fields would stop the
     # pair talking for the length of the upgrade (ha_peer_auth module doc).
-    tls: dict[str, str] | None = None
-    if peer_auth_ready(group, kea_peers):
-        tls = group_credential(group)
+    # Read fresh from the database, not off ``group`` / ``kea_peers``: in a
+    # parked long-poll those are identity-map objects that a wake does not
+    # refresh (``current_peer_credential`` says why that matters).
+    tls = await current_peer_credential(db, group, kea_peers)
     return FailoverConfig(
         tls_ca_pem=tls["ca_pem"] if tls else None,
         tls_cert_pem=tls["cert_pem"] if tls else None,

@@ -100,7 +100,14 @@ the formatter handles the rest.
   mid-upgrade keeps its current HA config and both members switch
   together when the last one upgrades; a node rolled back to an older
   agent closes the gate again. A superadmin replaces it with
-  `POST /dhcp/server-groups/{id}/ha-peer-credential/rotate`. Existing groups get one from migration `c8e1f5a92d47`.
+  `POST /dhcp/server-groups/{id}/ha-peer-credential/rotate`. Existing
+  groups get one from migration `c8e1f5a92d47`.
+
+- **Support bundle: a PEM private key is redacted through its END line.**
+  The pattern matched only the `-----BEGIN … PRIVATE KEY-----` line, so a
+  key that reached a bundle section lost its header and kept its base64
+  body. The whole block is now replaced; a block with no END line still
+  loses its BEGIN line, as before.
 
 - **InfluxDB Export: a stored password or token survives an edit that
   types in its field and clears it again; "Last push" no longer shows a

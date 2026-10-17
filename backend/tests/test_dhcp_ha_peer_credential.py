@@ -178,6 +178,46 @@ async def test_the_gate_opening_and_a_rotation_both_shift_the_etag(
     assert rotated not in (closed, opened)
 
 
+async def test_a_parked_long_poll_sees_the_partner_and_a_rotation_committed_elsewhere(
+    db_session: AsyncSession,
+) -> None:
+    """The partner's long-poll keeps one session for its whole wait.
+
+    Its group and peer rows are identity-map objects a later query does not
+    overwrite, so the gate and the credential must be read from the database.
+    The two changes below are made with raw SQL, as another request's commit
+    would be — the ORM objects in this session never hear about them.
+    """
+    grp, a, b = await _pair(db_session, ["ha_peer_tls"], None)
+    await db_session.commit()
+    first = await build_config_bundle(db_session, a)
+    assert first.failover is not None and first.failover.tls_key_pem is None
+
+    # The partner's heartbeat reports the capability.
+    await db_session.execute(
+        text("UPDATE dhcp_server SET agent_capabilities = CAST(:caps AS jsonb) WHERE id = :id"),
+        {"caps": '["ha_peer_tls"]', "id": b.id},
+    )
+    await db_session.refresh(a)  # what the long-poll loop does on each wake
+    opened = await build_config_bundle(db_session, a)
+    assert opened.failover is not None
+    cred = group_credential(grp)
+    assert cred and opened.failover.tls_key_pem == cred["key_pem"]
+
+    # A rotation committed by the rotate endpoint.
+    from app.services.dhcp.ha_peer_auth import encrypted_credential
+
+    await db_session.execute(
+        text("UPDATE dhcp_server_group SET ha_peer_credential_encrypted = :v WHERE id = :id"),
+        {"v": encrypted_credential(), "id": grp.id},
+    )
+    await db_session.refresh(a)
+    rotated = await build_config_bundle(db_session, a)
+    assert rotated.failover is not None and rotated.failover.tls_key_pem
+    assert rotated.failover.tls_key_pem != opened.failover.tls_key_pem
+    assert rotated.etag != opened.etag
+
+
 async def test_the_long_poll_wire_carries_the_credential(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
