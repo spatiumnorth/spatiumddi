@@ -6465,9 +6465,14 @@ async def schedule_appliance_upgrade(
     on the appliance row. The supervisor's next heartbeat picks them up
     and fires the slot-upgrade trigger; the host runner downloads + dd's
     the raw.xz to the inactive slot and stops; it does NOT reboot. The
-    operator reboots (Fleet "Reboot to boot new slot") to boot it. Operators
-    who want to cancel can clear desired_* via
-    ``/clear-upgrade`` before the supervisor's next heartbeat.
+    operator reboots (Fleet "Reboot to boot new slot") to boot it.
+
+    Scheduling wakes the supervisor's heartbeat (#358), so the host
+    normally starts the apply within about a second. ``/clear-upgrade``
+    can only cancel in the short window before the host reports it has
+    the trigger (``last_upgrade_state == "in-flight"``); after that it
+    answers 409, because the host deliberately does not stop a running
+    apply (#2021).
 
     For air-gapped fleets, pass ``slot_image_id`` (an
     ``appliance_slot_image`` row from the upload endpoint) instead of
@@ -6589,6 +6594,33 @@ async def schedule_appliance_upgrade(
     return _row_to_schema(row)
 
 
+# #2021 — mirrors the supervisor's _STALE_INFLIGHT_SECONDS: a live runner
+# re-stamps its in-flight marker every ~60 s, so one older than this is a
+# dead apply the supervisor is about to reap, not a running one. Without the
+# allowance the 409 below would lock an operator out of the "cancel and
+# re-apply" recovery the Fleet panel offers for a stuck apply.
+_UPGRADE_INFLIGHT_STALE_SECONDS = 300
+
+
+def upgrade_started_on_host(row: Appliance, now: datetime | None = None) -> bool:
+    """True when the host reports it has taken the slot-upgrade trigger.
+
+    The supervisor reports ``in-flight`` from the moment the trigger file
+    exists (claimed or not, #1825) through download / write. From then a
+    cancel cannot stop it: ``apply_clear_upgrade_command`` loses to a
+    running apply by design.
+    """
+    if row.last_upgrade_state != "in-flight":
+        return False
+    at = row.last_upgrade_state_at
+    if at is None:
+        return True
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=UTC)
+    age = ((now or datetime.now(UTC)) - at).total_seconds()
+    return age <= _UPGRADE_INFLIGHT_STALE_SECONDS
+
+
 @router.post(
     "/appliances/{appliance_id}/clear-upgrade",
     response_model=ApplianceRow,
@@ -6609,6 +6641,11 @@ async def clear_appliance_upgrade(
     columns verbatim on every heartbeat, so without the command the next
     heartbeat restores the failure — and rebooting does not help, because
     those sidecars live on the persistent /var (#786).
+
+    Refuses with 409 (``detail.code == "upgrade_already_started"``) once
+    the host reports the apply is under way: the host does not stop a
+    running apply, so answering 200 would show a cancel that never
+    happened (#2021). The refusal is audited and changes nothing.
     """
     _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
@@ -6618,6 +6655,38 @@ async def clear_appliance_upgrade(
     # the flag set — which permanently suppresses that appliance's heartbeat
     # long-poll. Same gate the other host-command mutators apply.
     _check_appliance_slot_action_allowed(row)
+    if upgrade_started_on_host(row):
+        progress = row.last_upgrade_progress or {}
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="appliance.upgrade_clear_refused",
+                resource_type="appliance",
+                resource_id=str(row.id),
+                resource_display=row.hostname,
+                result="failed",
+                new_value={
+                    "reason": "upgrade_already_started",
+                    "desired_appliance_version": row.desired_appliance_version,
+                    "last_upgrade_state": row.last_upgrade_state,
+                    "step": progress.get("step") if isinstance(progress, dict) else None,
+                },
+            )
+        )
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "upgrade_already_started",
+                "message": (
+                    "The upgrade has already started on the host and cannot be "
+                    "cancelled; the host does not stop a running slot apply. "
+                    "Wait for it to finish (or fail), then clear it."
+                ),
+            },
+        )
     row.desired_appliance_version = None
     row.desired_slot_image_url = None
     row.desired_slot_image_sha256 = None

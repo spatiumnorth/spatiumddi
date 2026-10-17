@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Fleet's "Cancel pending upgrade" no longer reports a cancel that
+  did not happen (#2021).** Scheduling wakes the host at once, so the
+  slot apply usually starts within a second, and the host deliberately
+  never stops a running apply; the cancel still answered 200 and
+  emptied the row. `clear-upgrade` now answers 409
+  (`upgrade_already_started`) once the host reports the apply
+  in-flight, audits the refusal, and leaves the row untouched; a stale
+  in-flight stamp (dead runner) can still be cleared. The Fleet panel
+  hides Cancel and says why. A cancel that lands before the host
+  reports in still works.
+
 - **A per-box upgrade stayed `reboot-pending` after it had rebooted and
   committed (#2007), and its help text said it reboots (#2008).** The
   host runner ends a staged apply at state `done` / progress

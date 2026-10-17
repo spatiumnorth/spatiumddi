@@ -355,3 +355,79 @@ async def test_clear_gives_up_on_a_host_that_can_never_comply(
     ).scalar_one()
     await db_session.refresh(refreshed)
     assert refreshed.clear_upgrade_requested is False
+
+
+# --- #2021: a cancel must not claim to stop an apply the host already began --
+
+
+async def _seed_scheduled(db: AsyncSession, state: str | None, age_s: int = 5) -> Appliance:
+    appliance = await _seed_failed_appliance(db)
+    appliance.last_upgrade_state = state
+    appliance.last_upgrade_state_at = (
+        datetime.now(UTC) - timedelta(seconds=age_s) if state else None
+    )
+    appliance.last_upgrade_progress = {"step": "downloading", "pct": 10} if state else None
+    appliance.last_upgrade_log_tail = None
+    await db.flush()
+    return appliance
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_the_host_starts_still_works(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _make_superadmin(db_session)
+    appliance = await _seed_scheduled(db_session, "ready")
+    resp = await client.post(
+        f"/api/v1/appliance/appliances/{appliance.id}/clear-upgrade", headers=headers
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(appliance)
+    assert appliance.desired_appliance_version is None
+    assert appliance.clear_upgrade_requested is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_the_host_started_is_refused_and_audited(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.audit import AuditLog
+
+    headers = await _make_superadmin(db_session)
+    appliance = await _seed_scheduled(db_session, "in-flight")
+    resp = await client.post(
+        f"/api/v1/appliance/appliances/{appliance.id}/clear-upgrade", headers=headers
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "upgrade_already_started"
+    await db_session.refresh(appliance)
+    assert appliance.desired_appliance_version == "2026.07.30-1"
+    assert appliance.desired_slot_image_url == "https://cp.local/x.raw.xz"
+    assert appliance.clear_upgrade_requested is False
+    assert appliance.last_upgrade_state == "in-flight"
+    rows = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.resource_id == str(appliance.id),
+                    AuditLog.action == "appliance.upgrade_clear_refused",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1 and rows[0].result == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_dead_in_flight_stamp_does_not_lock_the_operator_out(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A stale stamp is a dead runner; 'cancel and re-apply' must still work."""
+    headers = await _make_superadmin(db_session)
+    appliance = await _seed_scheduled(db_session, "in-flight", age_s=900)
+    resp = await client.post(
+        f"/api/v1/appliance/appliances/{appliance.id}/clear-upgrade", headers=headers
+    )
+    assert resp.status_code == 200, resp.text

@@ -48,6 +48,10 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { schemaRollbackRefusal } from "@/lib/schema-rollback";
+import {
+  upgradeAlreadyStartedRefusal,
+  upgradeStartedOnHost,
+} from "@/lib/upgrade-cancel";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -5480,6 +5484,10 @@ function UpgradeStatusPanel({
   }
 
   const rebootPending = progress?.step === "reboot-pending" || state === "done";
+  // #2021 — the host does not stop a running apply, so once it reports
+  // in-flight there is nothing for Cancel to do; offering it reported a
+  // cancel that never happened.
+  const started = upgradeStartedOnHost(row);
   // Where are we? -1 = desired set but no progress reported yet (the
   // supervisor hasn't fired the trigger). Otherwise the index of the
   // current phase in UPGRADE_STEPS.
@@ -5629,7 +5637,14 @@ function UpgradeStatusPanel({
             <Power className="h-3 w-3" /> Reboot to boot new slot
           </button>
         )}
-        {target && (
+        {target && started && (
+          <p className="text-[11px] text-muted-foreground">
+            The host has already started this upgrade, so it can no longer be
+            cancelled — the host never stops a running slot apply. It will
+            finish (or fail) on its own; clear it afterwards if needed.
+          </p>
+        )}
+        {target && !started && (
           <button
             type="button"
             onClick={onCancel}
@@ -5751,8 +5766,13 @@ function ApplianceOsUpgradeSection({
   const direction = upgradeDirection(row.installed_appliance_version, tag);
   const clearUpgrade = useMutation({
     mutationFn: () => applianceApprovalApi.clearUpgrade(row.id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
+    // #2021 — a 409 means the host started first: refetch so the panel
+    // shows the real state instead of a cancel that did not happen.
+    onSettled: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
+  const clearRefusal = clearUpgrade.error
+    ? upgradeAlreadyStartedRefusal(clearUpgrade.error)
+    : null;
   type SlotVars = { slot: "slot_a" | "slot_b"; acknowledge: boolean };
   const setNextBoot = useMutation({
     mutationFn: ({ slot, acknowledge }: SlotVars) =>
@@ -5857,6 +5877,11 @@ function ApplianceOsUpgradeSection({
             />
           ))}
         </div>
+      )}
+      {clearRefusal && (
+        <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+          {clearRefusal}
+        </p>
       )}
       {slotError && (
         <p className="mt-1 text-xs text-rose-700 dark:text-rose-300">
