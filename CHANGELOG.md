@@ -84,6 +84,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A dialog opened from a right-click menu now keeps focus (#2051).**
+  Choosing Delete…, Edit… or any item that opens a dialog from the IPAM
+  tree's context menu (and the DNS, DHCP and VLAN trees, which share the
+  menu) left focus on the row behind the dialog, because Radix returned
+  focus to the row after the dialog had taken it, so Enter or typing went
+  to the page. The menu now skips that restore when a dialog opened, and
+  puts focus back on the row when the dialog closes.
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create
