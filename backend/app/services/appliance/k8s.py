@@ -1220,10 +1220,12 @@ def patch_cnpg_maintenance_window(
 # ── HelmChartConfig + rollout primitives (#296 Phase E) ────────────────
 # The orchestrator's post-loop chart bump patches the same
 # ``helm.cattle.io/v1`` HelmChartConfig CR the supervisor writes to
-# for cp-size / VIP overrides. Helpers mirror the supervisor's
-# ``_helmchartconfig_upsert`` shape so both sides converge on identical
-# kubeapi semantics — see agent/supervisor/spatium_supervisor/k8s_api.py
-# for the durability rationale.
+# for cp-size / VIP overrides. The supervisor merges only its own keys
+# into the live document (``_merge_owned_overrides``, #2024); callers here
+# must do the same — read, change their one key, write the whole document
+# back — so neither side deletes the other's keys. See
+# agent/supervisor/spatium_supervisor/k8s_api.py for the durability
+# rationale.
 
 
 def get_helmchartconfig(
@@ -1255,8 +1257,8 @@ def upsert_helmchartconfig(
 ) -> tuple[bool, str | None]:
     """Create-or-update the HelmChartConfig so its ``spec.valuesContent``
     equals ``values_yaml``. Idempotent — returns ``(True, None)`` when
-    already current. Same shape as the supervisor's
-    ``_helmchartconfig_upsert``."""
+    already current. The caller owns the merge: ``values_yaml`` must be
+    the live document with its own key changed, never just its own key."""
     cfg = get_config()
     if cfg is None:
         return False, "ServiceAccount not mounted"

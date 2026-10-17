@@ -98,6 +98,46 @@ the formatter handles the rest.
   placeholder gets no loopback glue on PowerDNS: BIND needs that glue
   only to load a zone it is primary for, and a BIND9 secondary accepts
   a transferred zone whose NS has no address, with a warning.
+
+- **The DNS agent no longer holds a large bundle several times over while it
+  takes it (#2029).** Fetching a 147 MB bundle (five blocklists on two views,
+  about 708k RPZ entries per view) took the agent to 1.70 - 1.74 GB, and since
+  it shares named's 2Gi container, the container could be OOM-killed before
+  named started. The response body, its decoded text, the parsed bundle and
+  the previous bundle (still referenced for the DNSSEC re-read) were all alive
+  at once. The body is now streamed to a spool file in the state directory and
+  parsed from there, short repeated values are shared instead of copied per
+  entry, and the agent keeps only the previous bundle's zone list. On a
+  synthetic bundle of that shape the agent's peak RSS fell from 1,474 MB to
+  598 MB, and nothing bundle-sized stays resident after the apply. The cache,
+  the rendered zone files and their validation are unchanged. A spool left by
+  an agent killed mid-download is removed at start, a full state disk fails the
+  fetch rather than stopping the sync loop, and a torn cache file still reads
+  as "nothing cached" instead of crashing the agent at boot.
+
+- **An operator's override in the `spatiumddi-appliance` HelmChartConfig
+  is no longer reverted by the next heartbeat (#2024).** The documented
+  way to raise named's memory limit (`dnsBind9.resources` in that CR,
+  `APPLIANCE.md`) was undone within a minute: the supervisor rewrote the
+  CR's whole `valuesContent` to its three data-plane VIP keys on every
+  beat, so the DaemonSet went back to 2Gi. The supervisor now merges its
+  own keys into the live document and writes only when that changes
+  something, so every other key survives; the PATCH is conditional on the
+  resourceVersion it read, so an edit landing in between is retried
+  rather than overwritten. `spatium-metallb` had the same replace-the-
+  document write and goes through the same path; `spatium-control`
+  already merged (#792) and now shares it, keeping #1005's guard against
+  a helm revision that changes nothing. YAML comments in these CRs are
+  dropped when the supervisor next has to change one of its keys; the
+  recipe now says to edit the CR in place rather than `kubectl apply`
+  over it, and `APPLIANCE.md` lists which keys in each of the three CRs
+  belong to the supervisor. That list corrects one earlier claim: the api
+  and worker memory limits in `spatium-control` are sized by the
+  supervisor and put back on every heartbeat, so an override there never
+  held. A CR whose `valuesContent` is only comments now counts as empty
+  instead of unreadable, so commenting an override out no longer freezes
+  the supervisor's own keys in it.
+
 - **PowerDNS serves the control plane's serial, never goes
   backwards, sends NOTIFY, and transfers a secondary
   ([#1965](https://github.com/spatiumnorth/spatiumddi/issues/1965),

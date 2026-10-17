@@ -371,6 +371,7 @@ bootstrap.last                   # last-used PSK hash (for rotation detect)
 config/
   current.json                   # last AgentConfigBundle FETCHED from the control plane
   current.etag
+  fetch.json.part                # a fetched body while it is parsed (#2029); removed after, and at start
   previous.json                  # last bundle that APPLIED cleanly — the revert target
   previous.etag
   quarantine.json                # etag of a bundle that failed to apply, + its backoff
