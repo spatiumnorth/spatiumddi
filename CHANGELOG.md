@@ -95,7 +95,10 @@ the formatter handles the rest.
   entry, and the agent keeps only the previous bundle's zone list. On a
   synthetic bundle of that shape the agent's peak RSS fell from 1,474 MB to
   598 MB, and nothing bundle-sized stays resident after the apply. The cache,
-  the rendered zone files and their validation are unchanged.
+  the rendered zone files and their validation are unchanged. A spool left by
+  an agent killed mid-download is removed at start, a full state disk fails the
+  fetch rather than stopping the sync loop, and a torn cache file still reads
+  as "nothing cached" instead of crashing the agent at boot.
 - **DHCP scope dialog pickers and New PXE profile match rows now have
   accessible names (#2016).** The scope dialog's PXE profile select and its
   "Apply template…" select had no name (now "PXE profile" and "Apply
