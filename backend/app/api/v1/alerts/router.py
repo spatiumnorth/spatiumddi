@@ -20,10 +20,11 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import is_effective_superadmin
+from app.core.update_nulls import resolve_update_changes
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
 from app.services import alerts as alert_service
@@ -144,6 +145,27 @@ class AlertRuleCreate(BaseModel):
         if self.rule_type == alert_service.RULE_TYPE_COMPLIANCE_CHANGE and not self.classification:
             raise ValueError("classification is required for compliance_change rules")
         return self
+
+
+# Update-body fields by column nullability (#1987). Keep in step with
+# ``AlertRule`` — a NOT NULL column missing from the first set is a 500.
+_RULE_NON_NULLABLE_FIELDS = (
+    "name",
+    "description",
+    "enabled",
+    "severity",
+    "notify_syslog",
+    "notify_webhook",
+    "notify_smtp",
+)
+_RULE_CLEARABLE_FIELDS = (
+    "threshold_percent",
+    "threshold_days",
+    "min_free_addresses",
+    "server_type",
+    "classification",
+    "change_scope",
+)
 
 
 class AlertRuleUpdate(BaseModel):
@@ -312,6 +334,7 @@ async def create_rule(body: AlertRuleCreate, db: DB, current_user: CurrentUser) 
     _require_superadmin(current_user)
     rule = AlertRule(**body.model_dump())
     db.add(rule)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             action="create",
@@ -361,12 +384,38 @@ async def update_rule(
             status_code=422,
             detail="classification is required for compliance_change rules",
         )
+    # #1987 — an explicit null for a NOT NULL column is a 422 naming the
+    # field, not the 500 Postgres' 23502 became. The nullable columns
+    # (thresholds, server_type, classification, change_scope) stay
+    # clearable, as they were.
+    changes = resolve_update_changes(
+        body,
+        clearable=_RULE_CLEARABLE_FIELDS,
+        non_nullable=_RULE_NON_NULLABLE_FIELDS,
+    )
     changed: dict[str, Any] = {}
-    for field, value in body.model_dump(exclude_unset=True).items():
+    for field, value in changes.items():
         old = getattr(rule, field)
         if old != value:
             changed[field] = {"old": old, "new": value}
             setattr(rule, field, value)
+    # #1988 — disabling a rule closes what it still has open. The
+    # evaluator only visits enabled rules, so nothing would ever resolve
+    # these: a dashboard counting an alert whose condition may be long
+    # gone. Recorded in the same audit row as the disable. Keyed on the
+    # request (``enabled: false`` sent), not on the column flipping, so a
+    # rule disabled before this fix — whose events are stuck open — can
+    # be cleared by sending the disable again. Resolution is silent, as
+    # the evaluator's own resolve is: no delivery fires for a close.
+    if changes.get("enabled") is False:
+        closed = await db.execute(
+            update(AlertEvent)
+            .where(AlertEvent.rule_id == rule.id, AlertEvent.resolved_at.is_(None))
+            .values(resolved_at=datetime.now(UTC))
+        )
+        closed_count = closed.rowcount or 0
+        if closed_count:
+            changed["resolved_open_events"] = {"old": closed_count, "new": 0}
     if changed:
         db.add(
             AuditLog(
