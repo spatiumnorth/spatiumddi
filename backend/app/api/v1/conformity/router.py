@@ -287,6 +287,7 @@ async def create_policy(body: PolicyCreate, db: DB, current_user: CurrentUser) -
     _require_admin(current_user)
     p = ConformityPolicy(**body.model_dump(), is_builtin=False)
     db.add(p)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             action="create",

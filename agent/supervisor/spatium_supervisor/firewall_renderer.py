@@ -47,6 +47,9 @@ Control-plane derived (#272 Phase 7b + #285 Phase 1 — CP nodes only):
   when the cluster is genuinely multi-node (``cp_member_count >= 2``)
   AND a control-plane VIP is configured — otherwise VIP failover
   silently stops the moment the base accept is removed.
+* frr-k8s's validating webhook ``19443`` tcp scoped to peers, under the
+  same gate as memberlist (#1827). In BGP mode frr-k8s serves it on ONE
+  node's host network, and every other node's apiserver calls it there.
 
 All saddr sets are family-split (``ip saddr`` for v4, ``ip6 saddr``
 for v6) so a v6 peer is scoped by its real ``/128`` rather than a
@@ -203,6 +206,17 @@ _K3S_APISERVER_TCP = 6443
 # allowlist to it would be a privilege escalation nobody asked for.
 _K3S_KUBELET_TCP = 10250
 _METALLB_MEMBERLIST = 7946
+# #1827 — frr-k8s's validating webhook (the ``frr-k8s-statuscleaner`` pod,
+# BGP mode only). It runs with ``hostNetwork: true`` on whichever node the
+# scheduler picks, so the apiserver on every OTHER node reaches it at that
+# node's own address, through this chain. The webhook fails closed, and the
+# speaker's write of its node's ``FRRConfiguration`` lands on whichever
+# apiserver the kubernetes Service picks: with the port dropped, only writes
+# that land on the webhook's own node pass, and the other nodes never peer.
+# Peer-scoped and gated exactly like memberlist (multi-node + VIP): MetalLB
+# runs only with a control-plane VIP, and on a single node the call stays on
+# loopback.
+_FRR_K8S_WEBHOOK = 19443
 
 
 def _profile_name(roles: list[str]) -> str:
@@ -506,8 +520,17 @@ def render_drop_in(
                 f"udp dport {_METALLB_MEMBERLIST} accept",
                 "metallb-memberlist-udp",
             )
+            # #1827 — frr-k8s's webhook, same peers and gate (see the constant).
+            _emit_family_rule(
+                lines,
+                peer_v4,
+                peer_v6,
+                f"tcp dport {_FRR_K8S_WEBHOOK} accept",
+                "frr-k8s-webhook",
+            )
             tcp_ports.add(_METALLB_MEMBERLIST)
             udp_ports.add(_METALLB_MEMBERLIST)
+            tcp_ports.add(_FRR_K8S_WEBHOOK)
 
     if firewall_extra.strip():
         lines.append("")

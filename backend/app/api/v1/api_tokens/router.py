@@ -271,6 +271,7 @@ async def create_token(
         is_active=True,
     )
     db.add(token)
+    await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -278,7 +279,7 @@ async def create_token(
             auth_source=current_user.auth_source,
             action="create",
             resource_type="api_token",
-            resource_id=str(token.id) if token.id else "?",
+            resource_id=str(token.id),
             resource_display=body.name,
             result="success",
             new_value={

@@ -71,6 +71,24 @@ async def _async_verify_and_alert() -> dict:
             )
             return {"ok": False, "rows_checked": result.rows_checked, "broken": len(result.breaks)}
 
+        if not rule.enabled:
+            # #1988 — a disabled rule opens nothing and delivers nothing,
+            # as the acme / upgrade / conformity rules already behave.
+            # Disabling resolves the open events, so without this gate the
+            # next pass would re-open one and deliver it for a rule the
+            # operator switched off. The break is still logged below.
+            logger.error(
+                "audit_chain_broken_rule_disabled",
+                rows_checked=result.rows_checked,
+                breaks=len(result.breaks),
+            )
+            return {
+                "ok": False,
+                "rows_checked": result.rows_checked,
+                "broken": len(result.breaks),
+                "rule_disabled": True,
+            }
+
         # Dedupe: if a still-open break event already exists against
         # the same first-broken seq, skip — the existing event already
         # covers the situation. Subsequent breaks past the first don't

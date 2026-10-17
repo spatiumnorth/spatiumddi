@@ -239,6 +239,14 @@ async def _async_check_and_alert() -> dict:
             logger.error("schema_behind_head_no_rule", detail=result.detail)
             return {"ok": False, "detail": result.detail, "no_rule": True}
 
+        if not rule.enabled:
+            # #1988 — a disabled rule opens nothing and delivers nothing,
+            # as the acme / upgrade / conformity rules already behave.
+            # Disabling resolves the open events, so without this gate the
+            # next tick would re-open one and deliver it for a rule the
+            # operator switched off. The drift is logged above regardless.
+            return {"ok": False, "detail": result.detail, "rule_disabled": True}
+
         # Dedupe: one open event covers the drift. Subject id is the
         # observed (behind) version so a fresh drift to a *different*
         # actual version opens a distinct event.
