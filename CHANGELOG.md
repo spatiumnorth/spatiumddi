@@ -84,6 +84,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A k3s appliance's api, worker and beat never knew their
+  appliance version.** firstboot's `sharedEnv` carried no
+  `APPLIANCE_VERSION`, so `settings.appliance_version` was empty,
+  `/appliance/system/info` said "dev" and `/api/v1/version` said
+  null (#2004). firstboot now stamps it from the running slot's
+  `appliance-release` on every boot, so a slot upgrade stamps the
+  new version and a rollback the old one. `system/info` now
+  reports null for unknown, like `/version`, and the Network &
+  Host tab says "unknown" rather than "dev".
+
 - **Fleet's "Cancel pending upgrade" no longer reports a cancel that
   did not happen (#2021).** Scheduling wakes the host at once, so the
   slot apply usually starts within a second, and the host deliberately

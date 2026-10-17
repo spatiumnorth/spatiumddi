@@ -104,7 +104,7 @@ export function NetworkTab() {
           <InfoCell
             icon={Server}
             label="Appliance version"
-            value={isLoading ? "…" : data?.appliance_version || "dev"}
+            value={isLoading ? "…" : data?.appliance_version || "unknown"}
           />
         </div>
       </section>

@@ -13752,7 +13752,7 @@ export interface ApplianceSystemInfo {
   maintenance_mode: boolean;
   reboot_pending_from_host: boolean;
   reboot_scheduled: boolean;
-  appliance_version: string;
+  appliance_version: string | null;
   appliance_mode: boolean;
 }
 
