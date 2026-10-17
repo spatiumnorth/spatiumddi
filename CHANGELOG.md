@@ -90,7 +90,11 @@ the formatter handles the rest.
   so it remembered the dialog's own input and focus fell to the page
   body on close (New IP Space opened from its button, closed with
   Esc). The opener is now captured during the first render, and an
-  opener that has left the DOM is skipped instead of focused.
+  opener that has left the DOM is skipped instead of focused. A dialog
+  opened from a header-menu item (the item is gone with its menu by
+  the time the dialog closes) returns to the menu's button instead of
+  the body. Under the dev server's StrictMode, the trap no longer
+  takes focus off an autofocused field when React re-runs its effect.
 
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent

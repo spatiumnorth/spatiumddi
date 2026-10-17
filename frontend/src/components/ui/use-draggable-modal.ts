@@ -181,17 +181,17 @@ export function useFocusTrap<T extends HTMLElement>() {
   // then `document.activeElement` is the dialog's own field and "focus
   // return" would restore to a node that is unmounted with the dialog (#2050).
   // Render is the last point focus is still where the operator left it.
-  const openerRef = useRef<HTMLElement | null | undefined>(undefined);
+  // That is first render of THIS hook instance: every caller mounts the
+  // dialog on open and unmounts it on close, which is also what the trap
+  // effect below assumes (it runs once, on mount).
+  const openerRef = useRef<FocusReturnTargets | undefined>(undefined);
   if (openerRef.current === undefined) {
-    openerRef.current =
-      typeof document === "undefined"
-        ? null
-        : (document.activeElement as HTMLElement | null);
+    openerRef.current = captureFocusReturnTargets();
   }
   useEffect(() => {
     const node = ref.current;
     if (!node) return;
-    const previouslyFocused = openerRef.current;
+    const returnTargets = openerRef.current;
     const { token, remove } = trapStack.push(seq);
 
     const focusables = () =>
@@ -243,18 +243,46 @@ export function useFocusTrap<T extends HTMLElement>() {
     return () => {
       document.removeEventListener("keydown", onKeyDown);
       remove();
+      // A dialog still in the document is not closing: this is StrictMode's
+      // simulated unmount (dev), whose re-run would then find focus outside
+      // the dialog and take it off the autofocused field. A real close
+      // removes the node before passive cleanups run.
+      if (node.isConnected) return;
       // Return focus to where it was before the modal opened. An opener
-      // that left the DOM (or is the body) is skipped rather than focused.
-      if (
-        previouslyFocused &&
-        previouslyFocused !== document.body &&
-        previouslyFocused.isConnected
-      ) {
-        previouslyFocused.focus?.();
-      }
+      // that left the DOM (a menu item, unmounted with its menu) falls back
+      // to the menu's trigger; neither is focused once detached.
+      const target = returnTargets?.find(
+        (el) => el !== document.body && el.isConnected,
+      );
+      target?.focus?.();
     };
   }, [seq]);
   return ref;
+}
+
+/** Where focus goes back to when a dialog closes, best first. */
+type FocusReturnTargets = HTMLElement[];
+
+/** The focused element, plus — when it is an item in an ARIA menu — the
+ *  button that controls that menu. A dialog opened from a menu item outlives
+ *  the item (the menu closes as the dialog opens), so the trigger is the
+ *  operator's place in the page. Resolved now, while the menu is still open
+ *  and its trigger still carries ``aria-controls``. */
+function captureFocusReturnTargets(): FocusReturnTargets {
+  if (typeof document === "undefined") return [];
+  const active = document.activeElement as HTMLElement | null;
+  if (!active) return [];
+  const targets = [active];
+  const menu = active.closest<HTMLElement>('[role="menu"][id]');
+  if (menu) {
+    const trigger = Array.from(
+      document.querySelectorAll<HTMLElement>("[aria-controls]"),
+    ).find((el) =>
+      (el.getAttribute("aria-controls") ?? "").split(/\s+/).includes(menu.id),
+    );
+    if (trigger) targets.push(trigger);
+  }
+  return targets;
 }
 
 /** Rendered and focusable: no `hidden` / `display:none` / `visibility:hidden`
