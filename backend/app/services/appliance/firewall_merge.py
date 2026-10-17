@@ -181,6 +181,20 @@ _BUILTIN_SEED: list[tuple[str, str | None, bool, list[tuple]]] = [
                 "metallb-memberlist-udp",
                 _BUILTIN_GUARD,
             ),  # noqa: E501
+            # #1827 — frr-k8s's validating webhook, served on one node's host
+            # network in BGP mode; every other node's apiserver calls it there.
+            # Seeded by a9c3e5f71b28. seq 50 places it after memberlist, where
+            # both hardcoded renderers emit it, under the same guard.
+            (
+                50,
+                "accept",
+                "tcp",
+                (19443,),
+                "cluster_peers",
+                "both",
+                "frr-k8s-webhook",
+                _BUILTIN_GUARD,
+            ),
         ],
     ),
     ("role", "observer", False, []),

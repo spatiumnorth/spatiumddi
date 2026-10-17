@@ -15,6 +15,9 @@ if TYPE_CHECKING:
     from app.models.dns import DNSZone
 
 
+SERIAL_MODULUS = 2**32  # SOA serials are unsigned 32-bit, RFC 1982 arithmetic is mod 2^32
+
+
 def compute_next_serial(current: int, *, now: datetime | None = None) -> int:
     """Return the next serial for a zone with ``current`` as the last value.
 
@@ -27,6 +30,17 @@ def compute_next_serial(current: int, *, now: datetime | None = None) -> int:
       * Otherwise (freshly seeded / garbage value) use today's
         ``YYYYMMDD00`` if that is greater than ``current``, else ``current + 1``.
     """
+    nxt = _next_serial(current, now=now) % SERIAL_MODULUS
+    # #1975 — the increment past 2^32 - 1 wraps (RFC 1982 §3.1), but to 1, not
+    # 0: BIND's own ``increment`` update method skips 0 the same way, and 0 is
+    # this codebase's "never seeded" value — the agents and the zone-file
+    # writer render ``serial or 1``, so a stored 0 would be served as 1 and the
+    # Zone Sync pill would compare the reported 1 against a target of 0.
+    # 1 is still later than 2^32 - 1 in serial arithmetic (distance 2).
+    return nxt or 1
+
+
+def _next_serial(current: int, *, now: datetime | None) -> int:
     now = now or datetime.now(UTC)
     today_base = int(now.strftime("%Y%m%d")) * 100
 
