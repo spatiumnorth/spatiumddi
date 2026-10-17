@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 from collections.abc import Sequence
 from typing import Any
@@ -302,7 +303,14 @@ class WindowsDNSDriver(DNSDriver):
                     *[_format_rdata(r) for r in change.rrset.as_records(rr)],
                 )
         elif change.op == "delete":
-            update.delete(rel_name, rdtype)
+            # #1980 — a delete with no resolved RRset (a DNS pool member's
+            # removal) names ONE value; RFC 2136 can address exactly that RR,
+            # so the siblings at the name survive. Same type set as the WinRM
+            # path, so the two paths agree on what a delete touches.
+            if _delete_match_value(change, rtype) is not None:
+                update.delete(rel_name, rdtype, _format_rdata(rr))
+            else:
+                update.delete(rel_name, rdtype)
         else:  # create | update
             if change.op == "update":
                 update.delete(rel_name, rdtype)
@@ -1048,6 +1056,75 @@ def _ps_add_record(zone: str, name: str, record: RecordData, ttl: int) -> str:
     return create
 
 
+# Types whose rdata ``Get-DnsServerResourceRecord`` exposes as ONE comparable
+# value, so a per-value delete can target just the matching record (#1980).
+# Anything else (CNAME is single-valued; SRV / CAA / TLSA have no single
+# property) keeps the delete-the-whole-RRset behaviour.
+_PS_VALUE_PROP = {
+    "A": "IPv4Address",
+    "AAAA": "IPv6Address",
+    "NS": "NameServer",
+    "PTR": "PtrDomainName",
+    "MX": "MailExchange",
+    "TXT": "DescriptiveText",
+}
+_PS_HOSTNAME_TYPES = frozenset({"NS", "PTR", "MX"})
+
+
+def _delete_match_value(change: RecordChange, rtype: str) -> str | None:
+    """The value a per-value delete must match, or ``None`` to delete all.
+
+    Only a delete with no resolved RRset (``rrset_action`` callers: DNS pool
+    member removal, #1980) is value-targeted. A resolved RRset already says
+    exactly what survives, so those keep the whole-RRset write.
+    """
+    if change.op != "delete" or change.rrset is not None:
+        return None
+    if rtype not in _PS_VALUE_PROP:
+        return None
+    raw = change.record.value or ""
+    if rtype == "TXT":
+        raw = _strip_txt_quotes(raw)
+    else:
+        raw = raw.strip()
+    if not raw:
+        return None
+    if rtype in ("A", "AAAA"):
+        try:
+            return str(ipaddress.ip_address(raw))
+        except ValueError:
+            return None
+    if rtype in _PS_HOSTNAME_TYPES:
+        return raw.rstrip(".")
+    return raw
+
+
+def _ps_value_predicate(rtype: str, rd: str, value: str) -> str:
+    """PowerShell boolean: does record data ``rd`` hold ``value`` (#1980)?
+
+    ``rd`` is an expression for a record's ``RecordData``; ``value`` one for
+    the string ``_delete_match_value`` produced. Shared by the singular and
+    batched scripts so the two cannot match differently.
+
+    * A / AAAA compare as ``[ipaddress]`` (``IPAddress.Equals`` is a byte
+      compare), not as text: ``RecordData.IPv4Address`` / ``IPv6Address`` are
+      ``IPAddress`` objects, and .NET's IPv6 text form need not agree with
+      Python's canonical one.
+    * NS / PTR / MX: Windows returns the FQDN with its trailing dot; the
+      value has it stripped. PowerShell ``-eq`` on strings is
+      case-insensitive, which is right for a DNS name.
+    * TXT: joined exactly as ``_ps_list_records`` reads it, so a value pulled
+      from the server matches itself, and compared case-SENSITIVELY
+      (``-ceq``) — two TXT strings differing only in case are two records.
+    """
+    prop = _PS_VALUE_PROP[rtype]
+    if rtype in ("A", "AAAA"):
+        return f'([ipaddress]"$({rd}.{prop})").Equals([ipaddress]{value})'
+    if rtype == "TXT":
+        return f"((@({rd}.{prop}) -join '') -ceq {value})"
+    return f"(\"$({rd}.{prop})\".TrimEnd('.') -eq {value})"
+
+
 def _ps_apply_record(change: RecordChange) -> str:
     """PowerShell script for ``apply_record_change`` create/update/delete.
 
@@ -1093,11 +1170,20 @@ def _ps_apply_record(change: RecordChange) -> str:
     # zone in SpatiumDDI but the operator never ran Sync with Servers,
     # so deleting an IP tries to delete a PTR from a zone Windows
     # doesn't know about.
+    # #1980 — a per-value delete (no resolved RRset) removes only the record
+    # whose rdata matches the op's value; ``Get-… | Remove-…`` over the whole
+    # (name, type) took every healthy sibling with it.
+    value_filter = ""
+    match_value = _delete_match_value(change, rtype)
+    if match_value is not None:
+        mv = "'" + _ps_escape_single_quoted(match_value) + "'"
+        pred = _ps_value_predicate(rtype, "$_.RecordData", mv)
+        value_filter = f" | Where-Object {{ {pred} }}"
     delete = f"""
 if (-not (Get-DnsServerZone -Name '{zone}' -ErrorAction SilentlyContinue)) {{
     Write-Output "zone '{zone}' not present on server; delete is a no-op"
 }} else {{
-    $rrs = Get-DnsServerResourceRecord -ZoneName '{zone}' -Name '{name}' -RRType {rtype} -ErrorAction SilentlyContinue
+    $rrs = Get-DnsServerResourceRecord -ZoneName '{zone}' -Name '{name}' -RRType {rtype} -ErrorAction SilentlyContinue{value_filter}
     if ($rrs) {{
         $rrs | Remove-DnsServerResourceRecord -ZoneName '{zone}' -Force -ErrorAction Stop
         Write-Output "record '{name}' {rtype} deleted from '{zone}'"
@@ -1197,10 +1283,12 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
         #   adds nothing. Getting this wrong turns a legacy delete into a
         #   remove-then-re-add, i.e. a silent no-op.
         members = _rrset_members_or_self(change)
+        dv: str | None = None
         if members is not None:
             to_add, remove_first = members, True
         elif change.op == "delete":
             to_add, remove_first = [], True
+            dv = _delete_match_value(change, rtype)
         else:
             to_add, remove_first = [change.record], change.op == "update"
         ops.append(
@@ -1217,6 +1305,9 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
                 ),
             }
         )
+        if dv is not None:
+            # #1980 — per-value delete: only the record with this rdata goes.
+            ops[-1]["dv"] = dv
     blob = json.dumps(ops, separators=(",", ":")).encode("utf-8")
     payload_b64 = base64.b64encode(blob).decode("ascii")
 
@@ -1228,6 +1319,21 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
     # (_pack_record_chunks) measures the built script's encoded length
     # and packs each chunk under MAX_ENCODED_COMMAND, so this wrapper's
     # size is accounted for automatically rather than via a fixed count.
+    # #1980 — only ships when some op is a per-value delete, so every other
+    # batch keeps its existing size against the encoded-command budget. The
+    # record data is captured as ``$rd`` before the ``switch``, because a
+    # switch rebinds ``$_`` to its own subject inside each branch. ``dv`` is
+    # only ever set for a type with a branch here; ``default`` keeps the
+    # record (never delete-all on a value the script can't compare).
+    value_filter = ""
+    if any("dv" in o for o in ops):
+        branches = "".join(
+            f"'{t}'{{{_ps_value_predicate(t, '$rd', '$d')}}}" for t in _PS_VALUE_PROP
+        )
+        value_filter = (
+            "$d=$_.dv;if($null -ne $d -and $x){"
+            f"$x=@($x|?{{$rd=$_.RecordData;switch($t){{{branches}default{{$false}}}}}})}};"
+        )
     return (
         # #426: was "$E='Continue'" — a no-op (PS vars are case-insensitive,
         # so it aliased the loop's $e and was immediately overwritten). The
@@ -1257,7 +1363,8 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
         '  if($m.Count -gt 0 -and !$ze){throw "Zone $z not found"}\n'
         "  if($ze -and [int]$_.rm -eq 1){$x=Get-DnsServerResourceRecord -ZoneName $z -Name $n"
         " -RRType $t -EA SilentlyContinue;"
-        "if($x){$x|Remove-DnsServerResourceRecord -ZoneName $z -Force -EA Stop}}\n"
+        + value_filter
+        + "if($x){$x|Remove-DnsServerResourceRecord -ZoneName $z -Force -EA Stop}}\n"
         "  foreach($mm in $m){\n"
         "   $v=$mm.v\n"
         "   switch($t){\n"

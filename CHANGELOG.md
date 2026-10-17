@@ -86,6 +86,111 @@ the formatter handles the rest.
 
 - **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial could not be written ("value out of int32 range") and the agent zone-state report was refused with a 422, leaving the Zone Sync pill unable to show convergence. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment past 4294967295 wraps to 1 (RFC 1982; it skips 0 the way BIND's own `increment` does, because 0 is the "never seeded" value that every renderer serves as 1). It used to produce 4294967296, which is not a valid SOA serial.
 
+- **Disabling a DNS pool now removes its records, and a pool TTL change
+  lands immediately (#1974).** `update_pool` never reconciled and
+  `apply_pool_state` ignored `pool.enabled`, so a disabled pool kept
+  serving its member records (the health-check task skips disabled
+  pools, so nothing ever removed them) and a TTL edit waited for the
+  next health check. A disabled pool now renders nothing, re-enabling
+  restores its healthy members, and both edits reconcile in the request.
+  A TTL change now goes out as one whole-RRset update instead of one
+  value-only update per member: Windows DNS, Route 53 and Google Cloud
+  DNS read a value-only update as "replace the RRset with this value",
+  so each member's update cleared its siblings and the live pool was left
+  answering with its last member alone.
+
+- **`npm test` failed 52 tests on Node 26.** Node 26 defines its own
+  global `localStorage`, which is undefined without
+  `--localstorage-file` and shadows jsdom's, so every test calling
+  `localStorage.clear()` threw. The vitest workers now start with
+  `--no-experimental-webstorage` (`frontend/vite.config.ts`), so jsdom's
+  storage is used on Node 22 and 26 alike. No shipped code changes.
+
+- **Kubernetes Detect CIDRs answered 500 when the token held a non-ASCII
+  character (#1913).** The bearer token goes straight into an
+  `Authorization` header; httpx encodes header values as ASCII and raises
+  while building the client, outside the one `except` the probe had, so a
+  token with a pasted smart quote, accent or zero-width space was a 500
+  from `POST /kubernetes/clusters/detect-cidrs`, against the helper's own
+  "never raises" promise. A token that cannot be a header value (non-ASCII,
+  a control character, or whitespace inside it), or an `api_server_url`
+  httpx cannot parse, is now a 422 saying what is wrong, and `_detect_cidrs`
+  returns a message instead of raising. Whitespace around a pasted token,
+  such as its trailing newline, is stripped rather than refused. The check
+  lives in one helper (`app/core/header_credentials.py`) and also guards
+  the Tailscale, NetBird, Meraki, FortiGate, UniFi, PAN-OS and Proxmox
+  credential fields; it runs on input only, so a credential saved before
+  it still reads back, and an omitted or empty credential on an update
+  still keeps the stored one. Two more paths had the same 500: a webhook
+  custom header (the Test button, and the worker's delivery, which now
+  reports the header instead of raising) and a backup HTTPS-PUT
+  target's credential, header name or extra header, where an uncaught
+  error during a scheduled run left the run stuck `in_progress`. Both are
+  refused when saved.
+
+- **A record op that appends one value to a name no longer replaces the
+  whole name on an agentless DNS server (#1983).** An `update` carrying
+  `rrset_action="add"` opts out of whole-RRset stamping, and the driver-side
+  `RecordChange` has no `rrset_action`, so Windows (WinRM and RFC 2136),
+  Route 53, Google Cloud DNS and Azure DNS each read it as a single-value
+  replace and kept only the last value written. The one reachable case was a
+  DNS pool TTL change, which sends one such `update` per member: on an
+  agentless group the pool was left answering with its last member while the
+  database still listed them all. The agentless record-op path now stamps
+  those ops with the whole folded RRset. The issue was filed against the
+  cutover TTL pre-flight, which emits the same shape for the siblings of a
+  round-robin name; that path never reaches an agentless server (the
+  pre-flight refuses a group whose primary is agentless, and an agent
+  primary's record ops go to agent servers only), so it is covered
+  defensively. Cloudflare stores one row per value and was not affected. A
+  pool's `create` and `delete_value` ops are unchanged, and so is the agent
+  path.
+
+- **Removing one DNS pool member on a Windows DNS server no longer deletes
+  the healthy members too (#1980).** A pool member removal is a `delete` op
+  with `rrset_action="delete_value"` and no resolved RRset, and the Windows
+  driver deleted the whole name and type on both of its paths, so every
+  sibling A / AAAA went with it: over WinRM it piped every
+  `Get-DnsServerResourceRecord` result to `Remove-…`, and over RFC 2136 (a
+  server with no WinRM credentials) it sent a delete-the-RRset update. Over
+  WinRM a value-only delete now keeps only the record whose rdata matches, in
+  both the singular and batched scripts: A and AAAA compared as IP addresses,
+  NS / PTR / MX case-insensitively without the trailing dot, TXT exactly. Over
+  RFC 2136 it deletes that one RR. Both stay a no-op when nothing matches or
+  the zone is absent. CNAME and the types with no single rdata property keep
+  deleting the whole name. The cloud drivers (Route 53, Google, Azure, Cloudflare) were checked
+  and already remove only the matching value.
+
+- **Deleting a DNS pool member, or a whole pool, now withdraws its addresses
+  from DNS (#1966).** `delete_member` / `delete_pool` took the members out of
+  `pool.members` so `apply_pool_state` could enqueue each record's delete
+  first, but the removed member is a delete-orphan and the reconcile's first
+  query autoflushed it: the `dns_record.pool_member_id` `ON DELETE CASCADE`
+  removed the record row in the same statement, the orphan sweep found
+  nothing, and no delete op was ever sent, so the agent (or provider) kept
+  serving the address until an unrelated write reconciled the whole zone.
+  Both handlers now withdraw the members' records (row and `delete_value`
+  op) while the members still exist, and only then delete them, for
+  agent-managed and agentless groups alike. The reconcile's orphan sweep is
+  kept as a safety net and now reads without autoflush, so it no longer
+  loses the rows the same way (which also ends the `DELETE ... 0 were
+  matched` warning).
+
+- **A manual DNSSEC rollover in a group with a view is now delivered
+  to the agent (#1946).** Under split-horizon (or active geo steering) every
+  bundle render retired the server's queued ops as `applied` and the
+  bundle shipped none, whatever their kind. That is right for record ops,
+  which the body carries, but a `dnssec_rollover` has no carrier in it and
+  the BIND9 agent rolls a key only from the op, so the endpoint answered
+  `queued` and no key rolled (PowerDNS / Technitium `dnssec_sign` /
+  `dnssec_unsign` were lost the same way). The views render now retires only
+  `create` / `update` / `delete` ops and still pages every other kind to
+  the agent, which acks it as usual. The BIND9 agent now also rolls the key
+  in every view that holds the zone: a zone in two views made a bare
+  `rndc dnssec -rollover` fail with "found in multiple views" (verified on
+  BIND 9.20). And the endpoint answers 409 instead of `queued` when it wrote
+  no op at all (no primary, or no enabled agent-based server).
+
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored
   policy name, description, reference, result detail and diagnostic, went
@@ -4890,8 +4995,6 @@ the formatter handles the rest.
 
 ### Migrations
 
-- `d2a6e81f3b57` — #1975, widens `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` from `INTEGER` to `BIGINT`. Downgrade narrows them back and fails if a stored serial no longer fits.
-
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column
@@ -4975,6 +5078,7 @@ the formatter handles the rest.
   groups with a `technitium_api` or Windows DNS server with credentials and
   no cloud server, due now; cloud groups are not marked. Downgrade drops
   both columns.
+- `d2a6e81f3b57` — #1975, widens `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` from `INTEGER` to `BIGINT`. Downgrade narrows them back and fails if a stored serial no longer fits.
 
 ## 2026.10.02-1 — 2026-10-02
 

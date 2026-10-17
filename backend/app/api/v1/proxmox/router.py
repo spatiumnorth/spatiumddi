@@ -20,6 +20,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1._common import StatusResponse
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
 from app.models.audit import AuditLog
@@ -89,6 +90,8 @@ class NodeBase(BaseModel):
             raise ValueError("sync_interval_seconds must be ≥ 30")
         return v
 
+    _check_token_id = field_validator("token_id")(header_secret)
+
 
 class NodeCreate(NodeBase):
     # The PVE token secret (UUID). Encrypted before persist. Required
@@ -102,6 +105,8 @@ class NodeCreate(NodeBase):
         if not v:
             raise ValueError("token_secret is required")
         return v
+
+    _check_token_secret = field_validator("token_secret")(header_secret)
 
 
 class NodeUpdate(BaseModel):
@@ -122,6 +127,9 @@ class NodeUpdate(BaseModel):
     include_stopped: bool | None = None
     infer_vnet_subnets: bool | None = None
     sync_interval_seconds: int | None = None
+
+    _check_token_id = field_validator("token_id")(header_secret)
+    _check_token_secret = field_validator("token_secret")(header_secret)
 
 
 class NodeResponse(BaseModel):
@@ -163,6 +171,9 @@ class TestConnectionRequest(BaseModel):
     ca_bundle_pem: str | None = None
     token_id: str | None = None
     token_secret: str | None = None
+
+    _check_token_id = field_validator("token_id")(header_secret)
+    _check_token_secret = field_validator("token_secret")(header_secret)
 
 
 class TestConnectionResponse(BaseModel):

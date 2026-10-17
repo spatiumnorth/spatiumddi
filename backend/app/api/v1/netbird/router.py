@@ -21,6 +21,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1._common import StatusResponse
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
 from app.models.audit import AuditLog
@@ -107,6 +108,8 @@ class InstanceCreate(InstanceBase):
             raise ValueError("api_key is required")
         return v
 
+    _check_api_key = field_validator("api_key")(header_secret)
+
 
 class InstanceUpdate(BaseModel):
     name: str | None = None
@@ -140,6 +143,8 @@ class InstanceUpdate(BaseModel):
     def _floor_interval(cls, v: int | None) -> int | None:
         return None if v is None else _floor_sync_interval(v)
 
+    _check_api_key = field_validator("api_key")(header_secret)
+
 
 class InstanceResponse(BaseModel):
     id: uuid.UUID
@@ -167,6 +172,8 @@ class TestConnectionRequest(BaseModel):
     api_url: str | None = None
     verify_tls: bool = True
     api_key: str | None = None
+
+    _check_api_key = field_validator("api_key")(header_secret)
 
 
 class TestConnectionResponse(BaseModel):
