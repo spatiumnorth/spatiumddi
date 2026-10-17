@@ -28,6 +28,7 @@ from app.core.update_nulls import resolve_update_changes
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
 from app.services import alerts as alert_service
+from app.services.alert_rule_catalogue import RuleTypeSpec, build_catalogue
 
 router = APIRouter()
 
@@ -316,6 +317,16 @@ def _require_superadmin(current_user: CurrentUser) -> None:
 async def list_rules(db: DB, current_user: CurrentUser) -> list[AlertRule]:
     res = await db.execute(select(AlertRule).order_by(AlertRule.name))
     return list(res.scalars().all())
+
+
+@router.get("/rule-types", response_model=list[RuleTypeSpec])
+async def list_rule_types(current_user: CurrentUser) -> list[RuleTypeSpec]:
+    """Every rule type, its label, and the parameters its evaluator reads (#1997).
+
+    Same access as listing rules: any authenticated user. The editor renders
+    from this instead of a hand-kept list that had drifted to 23 of ~64.
+    """
+    return build_catalogue()
 
 
 @router.post("/rules", response_model=AlertRuleResponse, status_code=status.HTTP_201_CREATED)

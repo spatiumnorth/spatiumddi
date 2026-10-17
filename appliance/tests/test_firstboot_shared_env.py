@@ -29,7 +29,13 @@ FIRSTBOOT = (BIN / "spatiumddi-firstboot").read_text(encoding="utf-8")
 # no worker code path reads them today, but the three processes share one
 # ``settings`` and a task that ever creates the platform_settings row lazily
 # must seed it from the operator's Time-source answer, not the default pool.
-SHARED = {"APPLIANCE_MODE", "APPLIANCE_HOSTNAME", "APPLIANCE_HOST_IPS", "INITIAL_NTP_SERVERS"}
+SHARED = {
+    "APPLIANCE_MODE",
+    "APPLIANCE_VERSION",
+    "APPLIANCE_HOSTNAME",
+    "APPLIANCE_HOST_IPS",
+    "INITIAL_NTP_SERVERS",
+}
 
 
 def _values() -> dict:
@@ -75,3 +81,48 @@ def test_no_shared_variable_is_left_on_the_api_alone() -> None:
     does not, and a duplicate name on the api container is order-dependent."""
     api_env = _names(_values()["api"].get("env"))
     assert not (SHARED & set(api_env)), sorted(SHARED & set(api_env))
+
+
+def test_appliance_version_is_stamped_from_the_slot_release_file(tmp_path) -> None:
+    """#2004: the pods got no APPLIANCE_VERSION. Executes firstboot's real
+    version-stamping block against a fake release file, then the real render,
+    so an upgrade (new file contents) is seen to change the rendered value."""
+    blk = re.search(
+        r"^APPLIANCE_VERSION_VAL=\"\"\nif \[ -f /etc/spatiumddi/appliance-release \].*?^fi$",
+        FIRSTBOOT,
+        re.DOTALL | re.MULTILINE,
+    )
+    assert blk, "firstboot no longer derives APPLIANCE_VERSION_VAL every boot"
+    fn = re.search(r"^_render_control_helmchart\(\) \{.*?^\}$", FIRSTBOOT, re.DOTALL | re.MULTILINE)
+    assert fn
+
+    def render(release: str | None, inherited: str = "") -> dict:
+        rel = tmp_path / "appliance-release"
+        rel.unlink(missing_ok=True)
+        if release is not None:
+            rel.write_text(f"APPLIANCE_VERSION={release}\n" if release else "OTHER=1\n")
+        block = blk.group(0).replace("/etc/spatiumddi/appliance-release", str(rel))
+        script = f"""
+            set -euo pipefail
+            APPLIANCE_VERSION={inherited!r}
+            {fn.group(0)}
+            {block}
+            SPATIUMDDI_VERSION=0.0.0-test
+            APP_KEY_SECRET=a; CHART_APP_SECRET=b
+            DNS_AGENT_KEY_VAL=x; DHCP_AGENT_KEY_VAL=x; LG_AGENT_KEY_VAL=x
+            APPLIANCE_HOSTNAME_VAL=test; APPLIANCE_HOST_IPS_VAL=10.0.0.1
+            INITIAL_NTP_SERVERS_VAL=""; CHART_TGZ=/nonexistent
+            _render_control_helmchart "Y2hhcnQ="
+        """
+        out = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, check=True
+        ).stdout
+        vals = yaml.safe_load(yaml.safe_load(out)["spec"]["valuesContent"])
+        return {e["name"]: e["value"] for e in vals["sharedEnv"]}
+
+    assert render("2026.10.16-1")["APPLIANCE_VERSION"] == "2026.10.16-1"
+    assert render("1.0.0")["APPLIANCE_VERSION"] == "1.0.0"  # upgrade / rollback
+    assert render(None)["APPLIANCE_VERSION"] == ""  # unknown, not a made-up value
+    # A release file without the key reads as unknown even though the .env
+    # reconcile earlier in firstboot left APPLIANCE_VERSION set in the shell.
+    assert render("", inherited="0.1.0")["APPLIANCE_VERSION"] == ""
