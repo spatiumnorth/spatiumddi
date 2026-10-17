@@ -464,8 +464,8 @@ the fleet → role → appliance policy layers:
   (2379/2380) + kubelet (10250) never open on a non-CP worker. The control
   node(s) open the control-plane ports scoped to the cluster-peer CIDR set.
 - **Appliance multi-node CP HA (7)** — every CP member opens etcd/kubelet +
-  MetalLB memberlist (7946) scoped to the *peer* CIDRs (never LAN-wide; the
-  #285 fix), and 6443 to peers ∪ pod ∪ service ∪ kubeapi-expose. The
+  MetalLB memberlist (7946) + frr-k8s's webhook (19443, #1827) scoped to the
+  *peer* CIDRs (never LAN-wide; the #285 fix), and 6443 to peers ∪ pod ∪ service ∪ kubeapi-expose. The
   peer-drift cross-check (warn-only) flags a member whose peer entry hasn't
   propagated, or a left member's stale /32.
 
