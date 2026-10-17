@@ -8,6 +8,7 @@ Layout under /var/lib/spatium-dns-agent/:
     config/previous.json           # last bundle that APPLIED cleanly (#882)
     config/previous.etag
     config/quarantine.json         # etag of a bundle that failed to apply (#882)
+    config/apply_guard.json        # bundle being applied/settling + deaths (#2019)
     rendered/                      # managed by driver
     ops/{inflight,failed}/
 """

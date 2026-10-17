@@ -319,7 +319,12 @@ def run(cfg: AgentConfig) -> int:
             else:
                 if not waiting:
                     waiting = True
-                    heartbeat.daemon_status = dict(DEFERRED_DAEMON_STATUS)
+                    # #2019 — a start the sync loop deferred on purpose (the
+                    # cached bundle held back after the daemon died on it)
+                    # already carries the reason; "no bundle yet" would hide it.
+                    reason = str(heartbeat.daemon_status.get("reason") or "")
+                    if not reason.startswith("config_apply_"):
+                        heartbeat.daemon_status = dict(DEFERRED_DAEMON_STATUS)
                 waiting_ticks += 1
                 if wait_log_due(waiting_ticks):
                     log.info(
@@ -336,8 +341,12 @@ def run(cfg: AgentConfig) -> int:
         dead = [t.name for t in threads if not t.is_alive()]
         if dead and not stopping.is_set():
             log.error("dns_agent_thread_died", threads=dead)
+            # #2019 — the agent chose this exit; whatever bundle is still
+            # settling did not kill the daemon, so it is not counted as a death.
+            syncer.note_orderly_exit()
             return 2
 
+    syncer.note_orderly_exit()
     log.info("dns_agent_exiting")
     return 0
 
