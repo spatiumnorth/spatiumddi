@@ -91,7 +91,16 @@ the formatter handles the rest.
   and never matched the runner's empty applied sidecar. It now strips
   only the line ending and parses the empty hash faithfully; the same
   reader serves every host-config plane (SNMP, NTP, APT, LLDP, syslog,
-  resolver, firewall, timezone, console mode, removable).
+  resolver, firewall, timezone, console mode, removable). The appliance
+  console's own copy of the reader had the same bug and reported the
+  plane `retrying` on the dashboard and the health screen; it is fixed
+  too, and its plane list, which had fallen behind by three planes (APT,
+  console mode, removable), now matches the supervisor's, pinned by a
+  test. Two related cases also no longer stick at `retrying`: a config
+  that failed to apply and was then reverted to what the host already
+  runs, and a failed timezone change followed by clearing the timezone.
+  And an "off" that fails to apply now backs off like any other failed
+  apply, instead of re-firing on every heartbeat.
 
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
