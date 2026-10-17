@@ -29,7 +29,7 @@ test_builtin_seed_matches_migration`` keeps this in lock-step with
 ``_BUILTIN_SEED`` in ``app/services/appliance/firewall_merge.py``.
 
 Revision ID: a9c3e5f71b28
-Revises: c4f19a2e7d53
+Revises: d2a6e81f3b57
 Create Date: 2026-10-16
 """
 
@@ -42,7 +42,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "a9c3e5f71b28"
-down_revision: str | None = "c4f19a2e7d53"
+down_revision: str | None = "d2a6e81f3b57"
 branch_labels: str | None = None
 depends_on: str | None = None
 
