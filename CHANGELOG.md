@@ -84,6 +84,27 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **On PowerDNS, a record target with no trailing dot no longer stops
+  its zone converging, and the record API refuses new ones (#2060).**
+  PowerDNS refuses a CNAME / PTR / MX / NS / SRV / SVCB / HTTPS / NAPTR /
+  ALIAS / DNAME target written without its trailing dot (`422 Not in
+  expected format`), and it applies a zone change as one transaction.
+  The record API stored such a value as typed, so one dot-less row made
+  its record op fail on every retry until it was marked `failed`, and
+  made PowerDNS refuse the zone's whole structural update (no other
+  change to that zone was applied, and the server reported a partial
+  apply) or, for a new zone, refuse to create the zone at all. The
+  agent now qualifies a dot-less target against the zone, which is what
+  a BIND9 server serves for the same row, so rows that already exist
+  (an importer's included) are served on upgrade. A zone PowerDNS still
+  refuses for any other reason is retried one record set at a time, so
+  only the refused record set is left out and named in the server's
+  apply status. On a PowerDNS group, creating or editing a record with
+  a dot-less target is now a 422 that shows the two names it could
+  mean (`db1.example.com.`, or `db1.example.com.<zone>.`), on the REST
+  create, edit and bulk-create paths and in the Copilot. Other drivers
+  are unchanged.
+
 - **A PowerDNS primary zone now serves an apex NS, so a BIND9
   secondary on another host can transfer it (#1985).** The agent
   rendered the apex SOA but never an NS, and PowerDNS does not create
