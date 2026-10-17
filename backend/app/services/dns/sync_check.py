@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.services.dns.record_identity import ptr_target_key, zone_target_readings
 from app.services.integration_ownership import dns_record_owned_elsewhere
 
 logger = structlog.get_logger(__name__)
@@ -421,10 +422,18 @@ def _expected_ptr(addr: str, hostname: str, zone_name: str) -> tuple[str, str]:
     return label, hostname  # value rendered with trailing dot at apply time
 
 
-async def compute_block_dns_drift(db: AsyncSession, block_id: uuid.UUID) -> DriftReport:
+async def compute_block_dns_drift(
+    db: AsyncSession,
+    block_id: uuid.UUID,
+    *,
+    subnet_ids: Collection[uuid.UUID] | None = None,
+) -> DriftReport:
     """Aggregate drift across every subnet directly or transitively under
     the given block. Per-subnet zone summaries are dropped (multiple zones
-    likely involved) — caller can fall back to a count."""
+    likely involved) — caller can fall back to a count.
+
+    ``subnet_ids``, when given, limits the report to those subnets (a caller
+    bound to specific subnets); ``None`` covers every subnet in the block."""
     # Walk the block subtree
     descendant_ids: list[uuid.UUID] = []
     queue = [block_id]
@@ -444,15 +453,28 @@ async def compute_block_dns_drift(db: AsyncSession, block_id: uuid.UUID) -> Drif
         .all()
     )
 
-    return await _aggregate(db, sn_ids)
+    return await _aggregate(db, _only(sn_ids, subnet_ids))
 
 
-async def compute_space_dns_drift(db: AsyncSession, space_id: uuid.UUID) -> DriftReport:
-    """Aggregate drift across every subnet in the space."""
+async def compute_space_dns_drift(
+    db: AsyncSession,
+    space_id: uuid.UUID,
+    *,
+    subnet_ids: Collection[uuid.UUID] | None = None,
+) -> DriftReport:
+    """Aggregate drift across every subnet in the space (or, with
+    ``subnet_ids``, across those of them only)."""
     sn_ids = (
         (await db.execute(select(Subnet.id).where(Subnet.space_id == space_id))).scalars().all()
     )
-    return await _aggregate(db, sn_ids)
+    return await _aggregate(db, _only(sn_ids, subnet_ids))
+
+
+def _only(found: Sequence[uuid.UUID], allowed: Collection[uuid.UUID] | None) -> Sequence[uuid.UUID]:
+    if allowed is None:
+        return found
+    keep = set(allowed)
+    return [sid for sid in found if sid in keep]
 
 
 async def _aggregate(db: AsyncSession, subnet_ids: Sequence[uuid.UUID]) -> DriftReport:
@@ -918,13 +940,23 @@ async def compute_subnet_dns_drift(
     return report
 
 
-def _rr_identity(zone_id: uuid.UUID, name: str, rtype: str, value: str) -> tuple[str, ...]:
+def _rr_identity(
+    zone_id: uuid.UUID,
+    name: str,
+    rtype: str,
+    value: str,
+    readings: dict[uuid.UUID, tuple[str, bool]],
+) -> tuple[str, ...]:
     """The #1230 identity of a record, as ``_operator_record_twin`` in the
-    IPAM router matches it: owner name case-insensitive, value trimmed, and a
-    PTR target with or without its trailing dot."""
+    IPAM router matches it: owner name case-insensitive, value trimmed. A PTR
+    target compares as the zone's servers serve it (#2045): case-insensitive,
+    and a target without its trailing dot is relative to the reverse zone on
+    BIND9 / Technitium / Windows Path A, so it does not hide a missing PTR
+    there."""
     v = value.strip()
-    if rtype.upper() == "PTR":
-        v = v.rstrip(".")
+    if rtype.upper() == "PTR" and zone_id in readings:
+        zone_name, relative = readings[zone_id]
+        v = ptr_target_key(v, zone_name, relative=relative)
     return (str(zone_id), name.lower(), rtype.upper(), v)
 
 
@@ -957,9 +989,13 @@ async def _drop_operator_held(db: AsyncSession, missing: list[MissingItem]) -> l
             )
         )
     ).all()
-    held = {_rr_identity(z, n, t, v) for z, n, t, v in rows}
+    readings = await zone_target_readings(
+        db, {m.zone_id for m in missing if m.record_type.upper() == "PTR"}
+    )
+    held = {_rr_identity(z, n, t, v, readings) for z, n, t, v in rows}
     return [
         m
         for m in missing
-        if _rr_identity(m.zone_id, m.expected_name, m.record_type, m.expected_value) not in held
+        if _rr_identity(m.zone_id, m.expected_name, m.record_type, m.expected_value, readings)
+        not in held
     ]
