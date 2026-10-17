@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The alert rule editor no longer rewrites a rule's stored thresholds,
+  crashes on a refused save, or leaves its labels unattached (#1986,
+  #1993, #1994).** Edit then Save with nothing changed sent the editor's
+  own defaults (90, 30) and nulls for every field the rule type does not
+  show, so a stored null threshold became 90 and a stored
+  `threshold_days` became null. The editor now shows stored values (a
+  null stays empty), builds the body from only the fields the rule type
+  shows, and on an edit sends only what changed, nothing at all when
+  nothing did. A select that can only display a stored null as its
+  default (a null server type as `any`, a null change scope as
+  `any_change`) counts as unchanged too, which is how the evaluator reads
+  that null anyway. A 422 carrying FastAPI's validation list is rendered as
+  text through the shared `errMsg` and the dialog stays open, instead of
+  React error #31 replacing the page. Each label is tied to its control
+  with `htmlFor` and `id`. The update handler already used
+  `exclude_unset`.
+
 - **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial could not be written ("value out of int32 range") and the agent zone-state report was refused with a 422, leaving the Zone Sync pill unable to show convergence. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment past 4294967295 wraps to 1 (RFC 1982; it skips 0 the way BIND's own `increment` does, because 0 is the "never seeded" value that every renderer serves as 1). It used to produce 4294967296, which is not a valid SOA serial.
 
 - **Disabling a DNS pool now removes its records, and a pool TTL change
