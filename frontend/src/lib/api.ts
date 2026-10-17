@@ -10406,30 +10406,40 @@ export const apiTokensApi = {
 
 // ── Alerts ─────────────────────────────────────────────────────────────────────
 
-export type AlertRuleType =
-  | "subnet_utilization"
-  | "server_unreachable"
-  | "asn_holder_drift"
-  | "asn_whois_unreachable"
-  | "rpki_roa_expiring"
-  | "rpki_roa_expired"
-  | "domain_expiring"
-  | "domain_nameserver_drift"
-  | "domain_registrar_changed"
-  | "domain_dnssec_status_changed"
-  | "circuit_term_expiring"
-  | "circuit_status_changed"
-  | "service_term_expiring"
-  | "service_resource_orphaned"
-  | "compliance_change"
-  | "voice_lease_count_below"
-  | "stale_ip_count"
-  | "dhcp_pool_exhaustion"
-  | "secret_expiring"
-  | "decom_expiring"
-  | "node_pressure"
-  | "backup_failed"
-  | "backup_stale";
+// The rule-type list is the backend's (``GET /alerts/rule-types``), not a
+// union kept here: a hand-kept union knew 23 of ~64 types (#1997).
+export type AlertRuleType = string;
+export interface AlertParamOption {
+  value: string;
+  label: string;
+}
+export interface AlertParamSpec {
+  name:
+    | "threshold_percent"
+    | "threshold_days"
+    | "min_free_addresses"
+    | "server_type"
+    | "classification"
+    | "change_scope";
+  label: string;
+  kind: "integer" | "select";
+  unit: string | null;
+  min: number | null;
+  max: number | null;
+  /** What the evaluator uses when the stored value is null. */
+  default: number | string | null;
+  /** Starting value for a new rule's form. */
+  initial: number | string | null;
+  hint: string | null;
+  options: AlertParamOption[];
+}
+export interface AlertRuleTypeSpec {
+  rule_type: string;
+  label: string;
+  group: string;
+  description: string | null;
+  params: AlertParamSpec[];
+}
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with
@@ -10521,6 +10531,8 @@ export interface AlertEvaluateResult {
 
 export const alertsApi = {
   listRules: () => api.get<AlertRule[]>("/alerts/rules").then((r) => r.data),
+  ruleTypes: () =>
+    api.get<AlertRuleTypeSpec[]>("/alerts/rule-types").then((r) => r.data),
   createRule: (body: AlertRuleCreate) =>
     api.post<AlertRule>("/alerts/rules", body).then((r) => r.data),
   updateRule: (id: string, body: AlertRuleUpdate) =>
