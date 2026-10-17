@@ -775,6 +775,27 @@ def _token_subnet_scope_uuids(user: Any) -> set[uuid.UUID] | None:
     return out
 
 
+def _refuse_container_scan_for_bound_token(user: Any) -> None:
+    """403 for a subnet-bound token on a route whose answer is a fact about
+    every subnet in a block or space (free space, an allocation plan).
+
+    Rows can be narrowed to a token's subnets; free space cannot — the free
+    ranges of a block are its whole occupancy seen from the other side, and a
+    plan computed from only the token's own subnets would offer ranges that
+    are already allocated. ``ip_block`` / ``ip_space`` are not grantable, so
+    a token bound to subnets has no instance these answers could be scoped to.
+    Sessions, unbound tokens and wildcard ``subnet`` grants are unaffected.
+    """
+    if _token_subnet_scope_uuids(user) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "API token is bound to specific subnets; free-space queries over a "
+                "block or space need a credential that is not"
+            ),
+        )
+
+
 async def _enforce_zone_token_scope(
     db: AsyncSession,
     user: Any,
@@ -3468,6 +3489,11 @@ async def list_spaces(
 @router.post("/spaces", response_model=IPSpaceResponse, status_code=status.HTTP_201_CREATED)
 async def create_space(body: IPSpaceCreate, current_user: CurrentUser, db: DB) -> IPSpace:
     _require_type_write(current_user, "ip_space")
+    # A space's zone binding is inherited by every subnet under it, so a
+    # zone it names must be one the token holds a grant on.
+    await _enforce_zone_token_scope(
+        db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
+    )
     # Pre-check the unique-name constraint so we can return a clean 409
     # instead of letting the DB raise an IntegrityError (→ 500).
     existing = await db.execute(select(IPSpace).where(IPSpace.name == body.name))
@@ -3531,6 +3557,13 @@ async def update_space(
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
+    await _enforce_zone_token_scope(
+        db,
+        current_user,
+        None,
+        [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
+        already=[space.dns_zone_id, *(space.dns_additional_zone_ids or [])],
+    )
 
     old = {"name": space.name, "description": space.description, "tags": space.tags}
     # Rename uniqueness pre-check (#491): the partial unique index on name
@@ -3821,6 +3854,13 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
         except TemplateError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
+    # A block's zone binding is inherited by every subnet under it, so a zone
+    # it names (including one a template filled in) must be one the token
+    # holds a grant on.
+    await _enforce_zone_token_scope(
+        db, current_user, None, [body.dns_zone_id, *(body.dns_additional_zone_ids or [])]
+    )
+
     # Verify parent block exists and belongs to the same space
     if body.parent_block_id:
         parent = await db.get(IPBlock, body.parent_block_id)
@@ -3969,6 +4009,13 @@ async def update_block(
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+    await _enforce_zone_token_scope(
+        db,
+        current_user,
+        None,
+        [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
+        already=[block.dns_zone_id, *(block.dns_additional_zone_ids or [])],
+    )
 
     old = {
         "name": block.name,
@@ -4140,6 +4187,7 @@ async def get_available_subnets(
     Accepts both IPv4 (/1-/32) and IPv6 (/1-/128) prefix lengths — the block's
     own family is inferred from its CIDR.
     """
+    _refuse_container_scan_for_bound_token(current_user)
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
@@ -4209,6 +4257,7 @@ async def get_block_free_space(
     subnets from the block's CIDR. (Nested blocks' own children are accounted for
     inside those nested blocks, not here.)
     """
+    _refuse_container_scan_for_bound_token(current_user)
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
@@ -4269,6 +4318,7 @@ async def plan_block_allocation(
     it. Returns the planned allocations plus anything that couldn't fit. This is
     a preview only; nothing is written.
     """
+    _refuse_container_scan_for_bound_token(current_user)
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
@@ -4461,9 +4511,12 @@ async def get_aggregation_suggestions(
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
 
-    rows = (
-        await db.execute(select(Subnet.id, Subnet.network).where(Subnet.block_id == block.id))
-    ).all()
+    agg_q = select(Subnet.id, Subnet.network).where(Subnet.block_id == block.id)
+    # A subnet-bound token is offered merges among its own subnets only.
+    scoped_subnets = _token_subnet_scope_uuids(current_user)
+    if scoped_subnets is not None:
+        agg_q = agg_q.where(Subnet.id.in_(scoped_subnets))
+    rows = (await db.execute(agg_q)).all()
     if len(rows) < 2:
         return []
 
@@ -5393,6 +5446,8 @@ async def get_stale_ip_report(
             space_id=space_id,
             block_id=block_id,
             subnet_id=subnet_id,
+            # A subnet-bound token's report covers its own subnets only.
+            subnet_ids=_token_subnet_scope_uuids(current_user),
             limit=limit,
             offset=offset,
         )
@@ -5442,6 +5497,7 @@ async def get_ip_hygiene_report(
             stale_reservation_days=stale_reservation_days,
             squat_days=squat_days,
             limit=limit,
+            subnet_ids=_token_subnet_scope_uuids(current_user),
         )
     )
 
@@ -5515,7 +5571,13 @@ async def get_vendor_rollup(
     which ``total_macs_seen`` makes distinguishable from an empty network.
     """
     return VendorRollup.model_validate(
-        await count_by_vendor(db, source=source, vendor_search=vendor_search, limit=limit)
+        await count_by_vendor(
+            db,
+            source=source,
+            vendor_search=vendor_search,
+            limit=limit,
+            subnet_ids=_token_subnet_scope_uuids(current_user),
+        )
     )
 
 
@@ -5536,7 +5598,13 @@ async def get_vendor_devices(
     and subnet context the lease does not.
     """
     return VendorDeviceList.model_validate(
-        await find_devices(db, vendor_search=vendor_search, source=source, limit=limit)
+        await find_devices(
+            db,
+            vendor_search=vendor_search,
+            source=source,
+            limit=limit,
+            subnet_ids=_token_subnet_scope_uuids(current_user),
+        )
     )
 
 
@@ -5584,6 +5652,9 @@ async def deprecate_stale_ips(
     now = datetime.now(UTC)
     stale_cutoff = now - timedelta(days=stale_days)
 
+    # A subnet-bound token deprecates rows in its own subnets only: the
+    # filter is narrowed, and a hand-picked id outside them is skipped.
+    scoped_subnets = _token_subnet_scope_uuids(current_user)
     capped = False
     if body.all_matching:
         # Fetch one past the cap so "exactly at cap, no remainder" doesn't
@@ -5595,6 +5666,7 @@ async def deprecate_stale_ips(
             space_id=body.space_id,
             block_id=body.block_id,
             subnet_id=body.subnet_id,
+            subnet_ids=scoped_subnets,
             cap=MAX_BULK_DEPRECATE + 1,
         )
         capped = len(ids) > MAX_BULK_DEPRECATE
@@ -5613,6 +5685,9 @@ async def deprecate_stale_ips(
     skipped: list[uuid.UUID] = []
     for ip in rows:
         if ip.status != "allocated" or ip.auto_from_lease:
+            skipped.append(ip.id)
+            continue
+        if scoped_subnets is not None and ip.subnet_id not in scoped_subnets:
             skipped.append(ip.id)
             continue
         # Re-check staleness against the request's window so a row that came
@@ -6621,6 +6696,7 @@ async def find_free_space_in_space(
     """
     from app.services.ipam.free_space import find_free_space
 
+    _refuse_container_scan_for_bound_token(current_user)
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
@@ -7324,7 +7400,10 @@ async def dns_sync_preview_block(
 
     if await db.get(IPBlock, block_id) is None:
         raise HTTPException(status_code=404, detail="Block not found")
-    report = await compute_block_dns_drift(db, block_id)
+    # A subnet-bound token sees drift for its own subnets in the block only.
+    report = await compute_block_dns_drift(
+        db, block_id, subnet_ids=_token_subnet_scope_uuids(current_user)
+    )
     return DnsSyncPreviewResponse(
         subnet_id=report.subnet_id,
         forward_zone_id=None,
@@ -7383,7 +7462,9 @@ async def dns_sync_preview_space(
 
     if await db.get(IPSpace, space_id) is None:
         raise HTTPException(status_code=404, detail="Space not found")
-    report = await compute_space_dns_drift(db, space_id)
+    report = await compute_space_dns_drift(
+        db, space_id, subnet_ids=_token_subnet_scope_uuids(current_user)
+    )
     return DnsSyncPreviewResponse(
         subnet_id=report.subnet_id,
         forward_zone_id=None,
