@@ -1117,7 +1117,7 @@ export const EditScopeModal = CreateScopeModal;
  * the picker doesn't open a nested editor (keeps this modal focused
  * on the scope).
  */
-function PXEProfileSection({
+export function PXEProfileSection({
   groupId,
   value,
   onChange,
@@ -1160,6 +1160,7 @@ function PXEProfileSection({
         .
       </p>
       <select
+        aria-label="PXE profile"
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className={inputCls}
@@ -1212,7 +1213,7 @@ function PXEProfileSection({
  * conflict-key list is shown in a small caption so the operator knows what
  * was overwritten.
  */
-function ApplyTemplateControl({
+export function ApplyTemplateControl({
   groupId,
   currentOptions,
   onApply,
@@ -1273,6 +1274,7 @@ function ApplyTemplateControl({
         </span>
       )}
       <select
+        aria-label="Apply template"
         key={pickerKey}
         defaultValue=""
         onChange={(e) => handleSelect(e.target.value)}

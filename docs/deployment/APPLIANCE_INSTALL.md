@@ -238,11 +238,13 @@ layouts.
 ## Upgrades
 
 Every appliance has two identical OS slots. An upgrade writes the new image
-into the inactive slot, reboots into it, and reverts automatically if the
-health check fails — the worst case is one wasted reboot. Schedule it per
-node from **Appliance → Fleet**, or roll a whole cluster one node at a time
-from **Rolling Upgrade**. Air-gapped sites mirror the slot image from
-**Upgrade images** instead of fetching it from GitHub.
+into the inactive slot, and the node then boots it and reverts automatically
+if the health check fails — the worst case is one wasted reboot. Scheduling
+it per node from **Appliance → Fleet** only stages the image: the node keeps
+running the old slot until you press **Reboot to boot new slot**.
+**Rolling Upgrade** reboots each node itself, one node at a time. Air-gapped
+sites mirror the slot image from **Upgrade images** instead of fetching it
+from GitHub.
 
 ---
 
