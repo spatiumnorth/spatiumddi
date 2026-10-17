@@ -10,9 +10,11 @@ stand-in so the counter is real but nothing is sent on the network.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import json
+import textwrap
 import uuid
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -270,6 +272,34 @@ async def test_redis_outage_fails_open_on_both_surfaces(
             assert not is_error and body["exit_code"] == 0, body
 
 
+@pytest.mark.asyncio
+async def test_a_refused_call_spends_no_budget(db_session: AsyncSession) -> None:
+    """The budget is spent only by a call that is going to run: a caller the
+    tool's permission refuses, or arguments that fail validation, leave the
+    counter where it was."""
+    from app.services.ai.tools import ToolArgumentError, ToolPermissionDenied
+
+    plain = User(
+        username=f"rl-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.test",
+        display_name="No tools",
+        hashed_password=hash_password("x"),
+        is_superadmin=False,
+        is_active=True,
+    )
+    db_session.add(plain)
+    await db_session.flush()
+    await db_session.refresh(plain, ["groups"])
+    admin, _ = await _admin(db_session)
+    fake = _CountingRedis()
+    with patch(_REDIS, fake):
+        with pytest.raises(ToolPermissionDenied):
+            await REGISTRY.call("network_ping", {"host": "192.0.2.1"}, db=db_session, user=plain)
+        with pytest.raises(ToolArgumentError):
+            await REGISTRY.call("network_ping", {}, db=db_session, user=admin)
+    assert fake.counts == {}
+
+
 # ── declarations ───────────────────────────────────────────────────────────
 
 # Every copilot tool that runs a probe some ``/api/v1/tools/*`` route also
@@ -284,25 +314,152 @@ _TOOL_TO_REST_ROUTE = {
     "tls_cert_check": "/tls-cert",
     "lookup_mac_vendor": "/mac-vendor",
     "network_whois": "/whois",
+    "forward_dns": "/dig",
+    "reverse_dns": "/dig",
 }
 
-# Calls that send traffic off the SpatiumDDI host. A tool whose executor
-# makes one must declare a budget, whether or not a REST twin exists.
-_OUTBOUND_MARKERS = (
-    "run_ping(",
-    "run_traceroute(",
-    "run_mtr(",
-    "run_dig(",
-    "run_whois(",
-    "test_port(",
-    "inspect_tls_cert(",
-    "create_subprocess_exec(",
-    "_fetch_cert_sync",
-    "socket.create_connection(",
-    "lookup_ip(",
-    "lookup_asn(",
-    "lookup_domain(",
+# ── what counts as sending traffic ─────────────────────────────────────────
+#
+# The guard below does not trust a list of tool names or a grep of the
+# executor's own body: it walks every function the executor reaches inside
+# ``app`` (called directly, passed to ``asyncio.to_thread`` / ``run_in_executor``,
+# or imported inside the function body) and looks for these primitives in the
+# resolved AST — names, not strings, so a docstring that mentions httpx does
+# not count and a helper two calls down that opens a socket does.
+
+# Attribute names that open a connection or send a packet whatever object
+# they are called on (``loop.create_datagram_endpoint``, ``sock.sendto``).
+_OUTBOUND_ATTRS = frozenset(
+    {
+        "create_subprocess_exec",
+        "create_subprocess_shell",
+        "open_connection",
+        "create_connection",
+        "create_datagram_endpoint",
+        "sendto",
+        "urlopen",
+    }
 )
+
+# Dotted prefixes of a resolved module reference (``httpx.AsyncClient``,
+# ``dns.resolver.Resolver``) or of the module an imported name came from.
+_OUTBOUND_MODULES = (
+    "httpx",
+    "aiohttp",
+    "requests",
+    "urllib.request",
+    "dns.resolver",
+    "dns.query",
+    "dns.asyncresolver",
+    "dns.asyncquery",
+    "socket.socket",
+    "winrm",
+    "pysnmp",
+    "asyncssh",
+    "paramiko",
+)
+
+# Tools that DO reach outbound code but deliberately spend no network-tool
+# budget, each with the reason. The guard fails on any other tool that
+# reaches outbound code without ``rate_limit=``, and on a stale entry here.
+_SENDS_TRAFFIC_WITHOUT_A_BUDGET: dict[str, str] = {
+    # Fixed public data providers (RIPEstat / PeeringDB), cached, and their
+    # REST twins under /asns carry no network-tool budget either.
+    "asn_announced_prefixes": "RIPEstat, cached; REST twin unbudgeted",
+    "asn_ixp_presence": "PeeringDB, cached; REST twin unbudgeted",
+    "asn_peering_profile": "PeeringDB, cached; REST twin unbudgeted",
+    "prefix_origin": "RIPEstat, cached; REST twin unbudgeted",
+    "prefix_routing_history": "RIPEstat, cached; REST twin unbudgeted",
+    # Local infrastructure the control plane itself runs on, not a target
+    # the caller chooses.
+    "find_services": "local Docker socket / Kubernetes API, superadmin",
+    "find_upgrade_preflight": "in-cluster slot-image mirror, superadmin",
+    "find_cluster_metrics": "in-cluster CoreDNS probe, superadmin",
+    "find_available_upgrade_images": "fixed release feed, superadmin",
+    # A one-shot migration read of a source server the superadmin names;
+    # its REST twin (/dns/import) carries no network-tool budget either.
+    "find_dns_import_preview": "migration source pull, superadmin",
+}
+
+# Stated limit: the walk follows functions, not methods dispatched through
+# a driver object (``get_driver(...).pull_zone_records``). The tools that
+# reach the network that way (zone drift AXFR, the cutover parity pull)
+# talk to servers the operator has configured, not to a target the caller
+# names, and are outside this budget. ``propose_*`` tools send nothing; the
+# operator's Apply runs the same operation as the REST route.
+
+
+def _dotted(node: ast.AST) -> list[str] | None:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return parts[::-1]
+
+
+def _resolve(parts: list[str], scope: dict[str, Any]) -> tuple[Any, str | None]:
+    """Resolve ``a.b.c`` against ``scope``; return the object (or None) and
+    the best dotted module path for it."""
+    obj = scope.get(parts[0], None)
+    if obj is None:
+        return None, None
+    path = obj.__name__ if inspect.ismodule(obj) else getattr(obj, "__module__", None)
+    if path and inspect.ismodule(obj):
+        path = ".".join([path, *parts[1:]])
+    for attr in parts[1:]:
+        obj = getattr(obj, attr, None)
+        if obj is None:
+            break
+    return obj, path
+
+
+def _outbound_reach(fn: Any, seen: set[Any] | None = None) -> set[str]:
+    """Every outbound primitive ``fn`` reaches through ``app`` code."""
+    seen = set() if seen is None else seen
+    fn = inspect.unwrap(fn)
+    if fn in seen:
+        return set()
+    seen.add(fn)
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    except (OSError, TypeError):
+        return set()
+    scope = dict(getattr(fn, "__globals__", {}))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            for alias in node.names:
+                try:
+                    mod = importlib.import_module(node.module)
+                except ImportError:
+                    continue
+                scope[alias.asname or alias.name] = getattr(mod, alias.name, None) or (
+                    importlib.import_module(f"{node.module}.{alias.name}")
+                )
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                scope[alias.asname or root] = importlib.import_module(
+                    alias.name if alias.asname else root
+                )
+    hits: set[str] = set()
+    where = f"{fn.__module__}.{fn.__qualname__}"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in _OUTBOUND_ATTRS:
+            hits.add(f"{node.attr} in {where}")
+        if not isinstance(node, (ast.Name, ast.Attribute)):
+            continue
+        parts = _dotted(node)
+        if parts is None:
+            continue
+        obj, path = _resolve(parts, scope)
+        if path and any(path == m or path.startswith(m + ".") for m in _OUTBOUND_MODULES):
+            hits.add(f"{path} in {where}")
+        if inspect.isfunction(obj) and (obj.__module__ or "").startswith("app."):
+            hits |= _outbound_reach(obj, seen)
+    return hits
 
 
 def _route_bucket(path: str) -> str:
@@ -327,12 +484,32 @@ def test_tool_spends_the_same_bucket_as_its_rest_route(tool_name: str, path: str
 
 
 def test_every_tool_that_sends_traffic_declares_a_budget() -> None:
-    missing = []
-    for tool in REGISTRY.all():
-        source = inspect.getsource(tool.executor)
-        if any(marker in source for marker in _OUTBOUND_MARKERS) and tool.rate_limit is None:
-            missing.append(tool.name)
+    reach = {tool.name: _outbound_reach(tool.executor) for tool in REGISTRY.all()}
+    missing = {
+        name: sorted(hits)[:3]
+        for name, hits in reach.items()
+        if hits
+        and REGISTRY.get(name).rate_limit is None
+        and name not in _SENDS_TRAFFIC_WITHOUT_A_BUDGET
+    }
     assert not missing, f"tools sending traffic without a rate_limit bucket: {missing}"
+    # An exemption must still be needed, and must not contradict the tool.
+    stale = [n for n in _SENDS_TRAFFIC_WITHOUT_A_BUDGET if not reach.get(n)]
+    assert not stale, f"exempt tools that no longer send traffic (drop them): {stale}"
+    budgeted = [n for n in _SENDS_TRAFFIC_WITHOUT_A_BUDGET if REGISTRY.get(n).rate_limit]
+    assert not budgeted, f"exempt tools that declare a budget anyway: {budgeted}"
+
+
+def test_the_traffic_walk_follows_helpers() -> None:
+    """The guard's walker must see through helpers, or it proves nothing:
+    each of these tools reaches its socket / subprocess / resolver only via
+    another function (a runner, a helper handed to ``asyncio.to_thread``)."""
+    for name in ("network_port_test", "network_ping", "tls_cert_check", "forward_dns"):
+        tool = REGISTRY.get(name)
+        assert tool is not None and _outbound_reach(tool.executor), name
+    # … and a pure database read reaches nothing.
+    tool = REGISTRY.get("list_dns_zones")
+    assert tool is not None and not _outbound_reach(tool.executor)
 
 
 def test_registration_rejects_an_unknown_bucket() -> None:
