@@ -74,7 +74,7 @@ class DNSServerZoneState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("dns_zone.id", ondelete="CASCADE"),
         nullable=False,
     )
-    current_serial: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    current_serial: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     reported_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -507,7 +507,7 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
     zone_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     op: Mapped[str] = mapped_column(String(20), nullable=False)  # create | update | delete
     record: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    target_serial: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    target_serial: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     state: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", index=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -1053,7 +1053,7 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         ForeignKey("dnssec_policy.id", ondelete="SET NULL"),
         nullable=True,
     )
-    last_serial: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_serial: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # #1932 — set when SpatiumDDI auto-created this zone (a subnet's reverse
     # zone) in a group with agentless servers and has not yet confirmed the

@@ -101,6 +101,28 @@ the formatter handles the rest.
   with `htmlFor` and `id`. The update handler already used
   `exclude_unset`.
 
+- **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial could not be written ("value out of int32 range") and the agent zone-state report was refused with a 422, leaving the Zone Sync pill unable to show convergence. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment past 4294967295 wraps to 1 (RFC 1982; it skips 0 the way BIND's own `increment` does, because 0 is the "never seeded" value that every renderer serves as 1). It used to produce 4294967296, which is not a valid SOA serial.
+
+- **Disabling a DNS pool now removes its records, and a pool TTL change
+  lands immediately (#1974).** `update_pool` never reconciled and
+  `apply_pool_state` ignored `pool.enabled`, so a disabled pool kept
+  serving its member records (the health-check task skips disabled
+  pools, so nothing ever removed them) and a TTL edit waited for the
+  next health check. A disabled pool now renders nothing, re-enabling
+  restores its healthy members, and both edits reconcile in the request.
+  A TTL change now goes out as one whole-RRset update instead of one
+  value-only update per member: Windows DNS, Route 53 and Google Cloud
+  DNS read a value-only update as "replace the RRset with this value",
+  so each member's update cleared its siblings and the live pool was left
+  answering with its last member alone.
+
+- **`npm test` failed 52 tests on Node 26.** Node 26 defines its own
+  global `localStorage`, which is undefined without
+  `--localstorage-file` and shadows jsdom's, so every test calling
+  `localStorage.clear()` threw. The vitest workers now start with
+  `--no-experimental-webstorage` (`frontend/vite.config.ts`), so jsdom's
+  storage is used on Node 22 and 26 alike. No shipped code changes.
+
 - **Kubernetes Detect CIDRs answered 500 when the token held a non-ASCII
   character (#1913).** The bearer token goes straight into an
   `Authorization` header; httpx encodes header values as ASCII and raises
@@ -5073,6 +5095,7 @@ the formatter handles the rest.
   groups with a `technitium_api` or Windows DNS server with credentials and
   no cloud server, due now; cloud groups are not marked. Downgrade drops
   both columns.
+- `d2a6e81f3b57` — #1975, widens `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` from `INTEGER` to `BIGINT`. Downgrade narrows them back and fails if a stored serial no longer fits.
 
 ## 2026.10.02-1 — 2026-10-02
 
