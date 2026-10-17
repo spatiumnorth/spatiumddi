@@ -84,6 +84,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Bulk allocate refuses a hostname template whose names are not host
+  names (#2071).** `web{n}-` produced `web1-` / `web2-` and
+  `web{n:_}` produced `web1_000`; preview and commit accepted them, the
+  A records were written and BIND's check-names refused the forward and
+  reverse zones. Preview and commit now check every generated name with
+  the host-label rule the single Allocate IP path uses
+  (`core/dns_names`) and answer 422 naming the offending names, creating
+  nothing. Format specs the dialog's live preview does not implement
+  (`{n:_}`, `{n:,}`, `{n:5d}`, conversions) are refused too, and the
+  dialog now renders and validates with the same rules, so the preview
+  shows the names that are stored.
+
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
   the inactive slot would be re-written with the same release and the
