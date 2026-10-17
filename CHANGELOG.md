@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **In BGP mode every node of a multi-node appliance gets its BGP
+  configuration (#1827).** MetalLB's BGP mode delegates to frr-k8s, whose
+  validating webhook for `FRRConfiguration` objects is served by the
+  `frr-k8s-statuscleaner` pod on one node's host network, at port 19443. The
+  apiserver on every other node calls it at that node's address, and the node
+  firewall accepted nothing on 19443 from peers, so those calls timed out
+  and the webhook, which fails closed, refused the write. Each speaker's write
+  of its node's `FRRConfiguration` lands on whichever apiserver the kubernetes
+  Service picks, so only the writes that happened to reach the webhook's own
+  node passed: on a three-node cluster zero to two nodes peered, while the
+  MetalLB settings reported every speaker ready. Control-plane nodes now accept
+  TCP 19443 from their cluster peers, scoped and gated like the MetalLB
+  memberlist rule (multi-node with a control-plane VIP), in all three firewall
+  renderers, and a seed migration adds the rule to the built-in
+  `control-plane` policy of an existing install so fleet enforcement opens it
+  too.
+
 - **A revoked node's teardown that could not run now says why (#1884).**
   Once revoked, the supervisor runs its teardown on every rejected
   heartbeat. It logged a teardown that stopped something, or one that
