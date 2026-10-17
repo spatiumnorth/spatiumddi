@@ -254,7 +254,9 @@ The bootable image is Debian 13 (trixie), built with
 
 | Component | License | Why it is on the image |
 |---|---|---|
-| [Linux kernel](https://kernel.org/) | GPL v2 | `linux-image-amd64`, not the cloud variant — the cloud kernel strips KMS, leaving an 80x25 console instead of the dense one the dashboard needs |
+| [Linux kernel](https://kernel.org/) | GPL v2 | `linux-image-amd64` / `linux-image-arm64`, not the cloud variant — the cloud kernel strips KMS, leaving an 80x25 console instead of the dense one the dashboard needs |
+| [Raspberry Pi Linux kernel](https://github.com/raspberrypi/linux) | GPL v2 | `linux-image-rpi-2712`, **`rpi5` profile only** — the Pi 5's RP1 onboard NIC needs the Raspberry Pi downstream kernel; Debian's generic arm64 6.12 has no RP1 Ethernet driver. From `archive.raspberrypi.com` (build-time). See `docs/deployment/RASPBERRY_PI_5.md` |
+| [raspi-firmware](https://github.com/raspberrypi/firmware) | Raspberry Pi license (see package `copyright`) | `raspi-firmware`, **`rpi5` profile only** — pulled in with the RPi kernel. From `archive.raspberrypi.com` (build-time) |
 | [Debian](https://www.debian.org/) base | DFSG (mixed) | Base distribution |
 | [systemd](https://systemd.io/) + udev + systemd-resolved | LGPL 2.1+ | Init, device management, host resolver |
 | [GRUB 2](https://www.gnu.org/software/grub/) | GPL v3 | Hybrid BIOS + UEFI boot |
