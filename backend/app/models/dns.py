@@ -1216,6 +1216,14 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     weight: Mapped[int | None] = mapped_column(Integer, nullable=True)
     port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     auto_generated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # #2084 — True for a user-added alias (CNAME or secondary A/AAAA) of an IP
+    # address, written by IPAM's alias paths; False for the address's own host
+    # record(s) (one per forward zone it publishes into) and its PTR. Stored
+    # rather than inferred from name / zone / ``IPAddress.dns_record_id``,
+    # which cannot tell the two apart once a host record sits in an extra zone.
+    ip_alias: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     # TLS certificate monitoring (#118) — per-record opt-in for cert
     # probing (the parent zone's auto_tls_probe opts in the whole zone).
     auto_tls_probe: Mapped[bool] = mapped_column(
