@@ -94,9 +94,13 @@ the formatter handles the rest.
   409, in the wording of the alias CNAME rule (#2080), naming the
   alias; nothing is written. Creating an A / AAAA alias at the
   address's own host name is refused the same way. Background paths
-  (DDNS, lease mirrors, integrations, importers) skip that zone and
-  log `ipam_dns_record_skipped_own_alias` instead of failing or writing
-  a duplicate; a duplicate that already exists is left as it is.
+  (DDNS, lease mirrors, integrations, importers) do not fail and write
+  no duplicate: on an A / AAAA alias they retract the old name and log
+  `ipam_dns_record_skipped_own_alias`, which leaves the zone as a
+  correct rename would (the alias already answers the new name, and the
+  PTR names it); on a CNAME alias they keep the existing CNAME skip,
+  which also retracts the PTR. A duplicate that already exists is left
+  as it is.
 
 - **Editing an IP no longer renames or deletes its own A aliases, and
   the alias lists no longer show a host record as an alias (#2084).**

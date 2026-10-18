@@ -2044,13 +2044,20 @@ async def _sync_dns_record(
                     status.HTTP_409_CONFLICT,
                     _own_alias_clash_detail(ip, clash_zone, first_alias),
                 )
-            logger.warning(
-                "ipam_dns_record_skipped_own_alias",
-                address=str(ip.address),
-                hostname=ip.hostname,
-                zones=[str(z) for z in alias_clashes],
-            )
-            desired_zone_ids = [z for z in desired_zone_ids if z not in alias_clashes]
+            # A CNAME alias is left to the #1441 skip in Phase 2, which also
+            # retracts the PTR (#1493: no PTR may name a CNAME) and reports
+            # the skip to the DDNS path. An A / AAAA alias already answers
+            # ``<hostname> -> address``, so dropping the zone retracts only
+            # the old name: DNS ends up as a correct rename would leave it.
+            dup_zones = {z for z, a in alias_clashes.items() if a.record_type != "CNAME"}
+            if dup_zones:
+                logger.warning(
+                    "ipam_dns_record_skipped_own_alias",
+                    address=str(ip.address),
+                    hostname=ip.hostname,
+                    zones=[str(z) for z in dup_zones],
+                )
+                desired_zone_ids = [z for z in desired_zone_ids if z not in dup_zones]
 
     # Fetch any pre-existing auto-generated A/AAAA for this IP across
     # ALL zones — fanout cleanup needs the full picture. The address

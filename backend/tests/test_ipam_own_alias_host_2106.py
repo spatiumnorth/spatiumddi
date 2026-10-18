@@ -17,10 +17,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ipam.router import _sync_dns_record
-from app.models.dns import DNSRecord, DNSRecordOp, DNSZone
-from app.models.ipam import IPAddress, Subnet
+from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSServerGroup, DNSZone
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from tests.test_ipam_alias_cname_exclusive_2080 import _alloc, _records, _setup
 from tests.test_ipam_alias_marker_2084 import _extra_zone, _rows
+from tests.test_ipam_dns_cname_1441 import _address_records, _ip, _reverse_zone
+from tests.test_ipam_dns_cname_1441 import _setup as _cname_setup
 
 
 async def _ops(db: AsyncSession, op: str | None = None) -> list[tuple[str, str, str, str]]:
@@ -208,3 +210,181 @@ async def test_background_sync_skips_and_never_writes_a_duplicate(
     creates = [o for o in await _ops(db_session, "create") if o[1] == "www"]
     assert len(creates) == 1  # the alias's own create, from allocation
     assert isinstance(zone, DNSZone)
+
+
+# ── Validator: the background (non-strict) paths, decided cases ──────────────
+#
+# A lease, an integration or an importer renames an address onto one of its
+# own aliases. These pin what DNS is left holding, on the sync directly.
+
+
+async def _own_alias_setup(
+    db: AsyncSession, alias_type: str
+) -> tuple[Subnet, DNSZone, IPAddress, DNSRecord]:
+    grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db.add(grp)
+    await db.flush()
+    db.add(
+        DNSServer(
+            group_id=grp.id,
+            driver="bind9",
+            host="10.9.9.9",
+            name=f"ns-{uuid.uuid4().hex[:6]}",
+            is_primary=True,
+            is_enabled=True,
+        )
+    )
+    zone = DNSZone(
+        group_id=grp.id,
+        name="corp.test.",
+        zone_type="primary",
+        kind="forward",
+        primary_ns="ns1.corp.test.",
+        admin_email="admin.corp.test.",
+    )
+    db.add(zone)
+    await db.flush()
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}", description="")
+    db.add(space)
+    await db.flush()
+    block = IPBlock(space_id=space.id, network="10.81.0.0/16", name="b")
+    db.add(block)
+    await db.flush()
+    subnet = Subnet(
+        space_id=space.id,
+        block_id=block.id,
+        network="10.81.1.0/24",
+        name="s",
+        dns_zone_id=str(zone.id),
+        dns_inherit_settings=False,
+    )
+    db.add(subnet)
+    await db.flush()
+    await _reverse_zone(db, subnet, zone)
+    ip = IPAddress(subnet_id=subnet.id, address="10.81.1.30", status="allocated", hostname="h1")
+    db.add(ip)
+    await db.flush()
+    await _sync_dns_record(db, ip, subnet)
+    alias = DNSRecord(
+        zone_id=zone.id,
+        name="www",
+        fqdn="www.corp.test",
+        record_type=alias_type,
+        value="h1.corp.test." if alias_type == "CNAME" else "10.81.1.30",
+        auto_generated=True,
+        ip_alias=True,
+        ip_address_id=ip.id,
+    )
+    db.add(alias)
+    await db.flush()
+    return subnet, zone, ip, alias
+
+
+async def _zone_rows(db: AsyncSession, ip: IPAddress) -> list[tuple[str, str, str, bool]]:
+    rows = await db.execute(
+        select(DNSRecord)
+        .where(DNSRecord.ip_address_id == ip.id)
+        .execution_options(populate_existing=True)
+    )
+    return sorted((r.name, r.record_type, r.value, r.ip_alias) for r in rows.scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_background_rename_onto_own_a_alias_leaves_the_name_answering(
+    db_session: AsyncSession,
+) -> None:
+    """The skip retracts the old name rather than keeping it (question 1).
+
+    The alias already answers ``www -> address``, so after the retraction DNS
+    holds exactly what a correct rename would: ``www`` resolves, the PTR names
+    ``www``, and the stale ``h1`` (which another lease could take) is gone. The
+    next sync after the alias is deleted writes the host record itself.
+    """
+    subnet, zone, ip, alias = await _own_alias_setup(db_session, "A")
+    ip.hostname = "www"
+    await _sync_dns_record(db_session, ip, subnet, action="update")
+    await db_session.flush()
+    assert await _zone_rows(db_session, ip) == [
+        ("30", "PTR", "www.corp.test.", False),
+        ("www", "A", "10.81.1.30", True),
+    ]
+
+    await db_session.delete(alias)
+    await db_session.flush()
+    await _sync_dns_record(db_session, ip, subnet, action="update")
+    await db_session.flush()
+    assert await _zone_rows(db_session, ip) == [
+        ("30", "PTR", "www.corp.test.", False),
+        ("www", "A", "10.81.1.30", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_background_rename_onto_own_cname_alias_keeps_the_1493_ptr_rule(
+    db_session: AsyncSession,
+) -> None:
+    """A CNAME alias on a background path is the #1441 skip, PTR rule included:
+    no PTR may name a CNAME (RFC 1912 section 2.4, #1493), and the DDNS path
+    must hear that nothing was published."""
+    subnet, zone, ip, _alias = await _own_alias_setup(db_session, "CNAME")
+    ip.hostname = "www"
+    published = await _sync_dns_record(db_session, ip, subnet, action="update")
+    await db_session.flush()
+    assert await _zone_rows(db_session, ip) == [("www", "CNAME", "h1.corp.test.", True)]
+    assert published is False
+    assert getattr(ip, "_dns_skipped_cname", False) is True
+
+
+@pytest.mark.asyncio
+async def test_strict_sync_still_skips_an_operator_cname(db_session: AsyncSession) -> None:
+    """#1441 for an operator's CNAME (not an alias) is unchanged on strict paths."""
+    subnet, zone = await _cname_setup(db_session)
+    ip = await _ip(db_session, subnet, "10.81.1.40", "www")
+    await _sync_dns_record(db_session, ip, subnet, strict=True)
+    await db_session.flush()
+    assert await _address_records(db_session, zone, "www") == []
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_that_predates_the_fix_is_left_and_a_rename_away_moves_the_host(
+    db_session: AsyncSession,
+) -> None:
+    """The "zone already carries the name" exemption: host and alias both at
+    ``www`` (written before this fix). A re-sync touches nothing; a rename away
+    moves the host row only, and its delete names the host's row, so the
+    alias's identical RR stays on the wire (#1230)."""
+    subnet, zone, ip, alias = await _own_alias_setup(db_session, "A")
+    # Put the host on the alias's name the way a release before the fix did.
+    host = (
+        await db_session.execute(
+            select(DNSRecord).where(
+                DNSRecord.ip_address_id == ip.id,
+                DNSRecord.record_type == "A",
+                DNSRecord.ip_alias.is_(False),
+            )
+        )
+    ).scalar_one()
+    host.name, host.fqdn = "www", "www.corp.test"
+    ip.hostname = "www"
+    await db_session.flush()
+    forward_before = [o for o in await _ops(db_session) if o[2] == "A"]
+
+    # Not refused, and no forward op: the host already holds the name.
+    await _sync_dns_record(db_session, ip, subnet, action="update", strict=True)
+    await db_session.flush()
+    assert [o for o in await _ops(db_session) if o[2] == "A"] == forward_before
+
+    ip.hostname = "h3"
+    await _sync_dns_record(db_session, ip, subnet, action="update", strict=True)
+    await db_session.flush()
+    rows = await _zone_rows(db_session, ip)
+    assert ("h3", "A", "10.81.1.30", False) in rows
+    assert ("www", "A", "10.81.1.30", True) in rows
+    deletes = (
+        (await db_session.execute(select(DNSRecordOp).where(DNSRecordOp.op == "delete")))
+        .scalars()
+        .all()
+    )
+    www_deletes = [o for o in deletes if o.record.get("name") == "www"]
+    assert [o.record.get("record_id") for o in www_deletes] == [str(host.id)]
+    assert alias.id != host.id
