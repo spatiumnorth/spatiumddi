@@ -5448,6 +5448,8 @@ export interface DNSServer {
    *  to identify which host an agent is on (the operator-set ``host``
    *  is just a label; doesn't reflect NAT / distributed deployments). */
   last_seen_ip: string | null;
+  /** #2078 — the agent's own version; `null` = never reported (unknown). */
+  agent_version: string | null;
   config_apply_status: ConfigApplyStatus | null;
   config_apply_error: string | null;
   config_failed_etag: string | null;
