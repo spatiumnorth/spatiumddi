@@ -139,6 +139,16 @@ _BETWEEN_NODES_PAUSE_S = 10.0
 # How many times a run's end retries releasing the lease (2 s apart).
 _LEASE_RELEASE_ATTEMPTS = 5
 
+# A shared-tag step (the hold before a node, the flip at the end) whose
+# kubeapi request went unanswered or was refused for now (a 5xx, 408, 409 or
+# 429; ``shared_tags._transient``) is tried again this often,
+# and fails the run only once it has kept failing this long. A k3s server
+# answers 503 "apiserver not ready" while its apiserver is not up, as after
+# a restart, and the kubernetes Service keeps routing to it until its
+# endpoint lapses. Every re-assert and the flip follow a node's reboot.
+_SHARED_TAG_RETRY_S = 15.0
+_SHARED_TAG_RETRY_FOR_S = 300.0
+
 
 class OrchestratorError(RuntimeError):
     """Surfaces as 409 / 422 on the api side — bad operator request."""
@@ -956,6 +966,8 @@ async def _drive_loop(
     # Deployments in; the per-node control-plane gate reads the same one.
     release_namespace: str = run.plan.get("release_namespace") or chart_bump.DEFAULT_RELEASE_NS
     paused = False
+    # When the shared-tag step now being tried first failed (None: it has not).
+    shared_tag_failing_since: float | None = None
 
     while True:
         if stop_event.is_set():
@@ -1004,6 +1016,8 @@ async def _drive_loop(
             continue
         if paused:
             paused = False
+            # A step's time to keep failing counts only while it is tried.
+            shared_tag_failing_since = None
             logger.info("upgrade_drive_resumed_lease_confirmed", run_id=str(run.id))
 
         per_node_progress = dict(run.progress.get("per_node") or {})
@@ -1039,10 +1053,26 @@ async def _drive_loop(
         if next_node is None and shared_tags.holds(run):
             # #1710 — every node reports the target: move the shared tags
             # once, then hand the rest to a worker on the target.
-            await _finish_with_flip(
+            untaken = await _finish_with_flip(
                 db, run, stop_event, holder, cnpg_name=cnpg_name, cnpg_namespace=cnpg_namespace
             )
-            return
+            if untaken is None:
+                return
+            # The kubeapi did not take the flip: pause, then try it again.
+            shared_tag_failing_since = await _retry_shared_tag_step(
+                db,
+                run,
+                holder,
+                stop_event,
+                failing_since=shared_tag_failing_since,
+                step="shared_tag_flip",
+                error=f"shared tag flip to {run.target_version} failed: {untaken.error}",
+                event="chart_bump_failed",
+                failed_at_step="chart_bump",
+            )
+            if shared_tag_failing_since is None:
+                return
+            continue
         if next_node is None:
             # Every node committed the new slot. Phase E — bump the
             # chart's image.tag so the api / worker / frontend
@@ -1213,6 +1243,24 @@ async def _drive_loop(
         # before the first node boots the new slot, and re-assert it before
         # every node after.
         hold = await shared_tags.ensure_hold(db, run)
+        if not hold.ok and hold.retryable:
+            # The kubeapi did not take the hold: pause, then try it again from
+            # the loop top, after Halt, Abort and the Lease. No node starts
+            # with the shared tags free to move.
+            shared_tag_failing_since = await _retry_shared_tag_step(
+                db,
+                run,
+                holder,
+                stop_event,
+                failing_since=shared_tag_failing_since,
+                step="shared_tag_hold",
+                error=f"could not hold the shared charts' image tag: {hold.error}",
+                event="shared_tag_hold_failed",
+                failed_at_step="shared_tag_hold",
+            )
+            if shared_tag_failing_since is None:
+                return
+            continue
         if not hold.ok:
             await _fail_at_shared_tags(
                 db,
@@ -1223,6 +1271,7 @@ async def _drive_loop(
                 error=f"could not hold the shared charts' image tag: {hold.error}",
             )
             return
+        shared_tag_failing_since = None
         # The hold went to the kubeapi: re-read before writing it and the
         # node's start, so a Halt or Abort that landed meanwhile is neither
         # overwritten nor followed by a node it was meant to stop (#1702).
@@ -1418,6 +1467,59 @@ async def _fail_at_shared_tags(
     )
 
 
+async def _retry_shared_tag_step(
+    db: AsyncSession,
+    run: SystemUpgradeRun,
+    holder: str | None,
+    stop_event: asyncio.Event,
+    *,
+    failing_since: float | None,
+    step: str,
+    error: str,
+    event: str,
+    failed_at_step: str,
+) -> float | None:
+    """A shared-tag step the kubeapi did not take: wait, so the drive tries
+    it again from its loop top, where Halt, Abort and the Lease (#1713) are
+    read first; or, once it has kept failing for ``_SHARED_TAG_RETRY_FOR_S``,
+    fail the run on it with ``event``, as before.
+
+    Returns when the step's failures began, for the next try, or None when
+    the drive must stop (the run failed, or it is no longer this drive's).
+    The hold's record is committed before the wait: its pins may be half on,
+    and whoever ends the hold finds them by it."""
+    now = _monotonic()
+    if failing_since is not None and now - failing_since >= _SHARED_TAG_RETRY_FOR_S:
+        await _fail_at_shared_tags(
+            db,
+            run,
+            holder,
+            event=event,
+            failed_at_step=failed_at_step,
+            error=f"{error} (still failing after {int(now - failing_since)} s)",
+        )
+        return None
+    why = await _fence(db, run, holder, carry=(shared_tags.PROGRESS_KEY,))
+    if why is not None:
+        await _bail(db, run, holder, why)
+        return None
+    if failing_since is None:
+        await _record_event(db, run, "shared_tag_step_retrying", step=step, error=error)
+    await db.commit()
+    logger.warning(
+        "upgrade_shared_tag_step_retrying",
+        run_id=str(run.id),
+        step=step,
+        error=error,
+        retry_in_s=_SHARED_TAG_RETRY_S,
+    )
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=_SHARED_TAG_RETRY_S)
+    except TimeoutError:
+        pass  # the loop top reads Halt / Abort and the Lease, then tries again
+    return now if failing_since is None else failing_since
+
+
 async def _finish_with_flip(
     db: AsyncSession,
     run: SystemUpgradeRun,
@@ -1426,7 +1528,7 @@ async def _finish_with_flip(
     *,
     cnpg_name: str,
     cnpg_namespace: str | None,
-) -> None:
+) -> shared_tags.StepOutcome | None:
     """Phase E of a run that held the shared tags (#1710, #1829).
 
     1. The flip: the run's last change to the cluster (the pins come off,
@@ -1436,6 +1538,9 @@ async def _finish_with_flip(
        A drive that is killed anyway is redelivered and resumes here: the
        flip is recorded, so it is not repeated.
     3. Wait for every workload the flip moves, then the post-upgrade verify.
+
+    Returns the flip's outcome when the kubeapi did not take it, for the
+    drive to try again; None once the drive is done here, whatever the end.
     """
     record = shared_tags.record_of(run)
     from_tag = str(record.get("from_tag") or "")
@@ -1446,10 +1551,17 @@ async def _finish_with_flip(
         why = await _fence(db, run, holder)
         if why is not None:
             await _bail(db, run, holder, why)
-            return
-        await _record_event(db, run, "all_nodes_complete", shared_tag_flip_starting=True)
+            return None
+        events = (run.progress or {}).get("events") or []
+        if not any(e.get("event") == "all_nodes_complete" for e in events):
+            # Once: a flip tried again (#2028), whether it failed before or
+            # after it recorded its snapshot, or one a redelivered drive
+            # resumes, has announced the end of the roll already.
+            await _record_event(db, run, "all_nodes_complete", shared_tag_flip_starting=True)
         await db.commit()
         flipped = await shared_tags.flip(db, run)
+        if not flipped.ok and flipped.retryable:
+            return flipped
         if not flipped.ok:
             await _fail_at_shared_tags(
                 db,
@@ -1459,13 +1571,13 @@ async def _finish_with_flip(
                 failed_at_step="chart_bump",
                 error=f"shared tag flip to {run.target_version} failed: {flipped.error}",
             )
-            return
+            return None
         # The flip committed its own record (a locked merge); the run may
         # have been stopped while it talked to the kubeapi.
         why = await _fence(db, run, holder)
         if why is not None:
             await _bail(db, run, holder, why)
-            return
+            return None
         await _record_event(
             db, run, "shared_tags_flipped", from_tag=from_tag, to_tag=run.target_version
         )
@@ -1477,7 +1589,7 @@ async def _finish_with_flip(
         why = await _fence(db, run, holder)
         if why is not None:
             await _bail(db, run, holder, why)
-            return
+            return None
         flip_rec = shared_tags.flip_record(run)
         record = shared_tags.record_of(run)
         record["flip"] = {**flip_rec, "handed_off_at": _now().isoformat()}
@@ -1490,14 +1602,14 @@ async def _finish_with_flip(
         _release_lease(run, holder)
         _enqueue_continuation(run.id, avoid_version=from_tag)
         logger.info("upgrade_drive_version_handoff", run_id=str(run.id), from_tag=from_tag)
-        return
+        return None
 
     settled = await shared_tags.settle(db, run)
     # The settle wait is long: the run may have been stopped meanwhile.
     why = await _fence(db, run, holder, carry=(shared_tags.PROGRESS_KEY,))
     if why is not None:
         await _bail(db, run, holder, why)
-        return
+        return None
     await db.commit()
     if not settled.ok:
         await _fail_at_shared_tags(
@@ -1508,7 +1620,7 @@ async def _finish_with_flip(
             failed_at_step="chart_bump",
             error=f"the shared tag flip to {run.target_version} did not settle: {settled.error}",
         )
-        return
+        return None
 
     verify_results = await safety.verify_post_upgrade(
         cnpg_cluster_name=cnpg_name,
@@ -1518,7 +1630,7 @@ async def _finish_with_flip(
     why = await _fence(db, run, holder)
     if why is not None:
         await _bail(db, run, holder, why)
-        return
+        return None
     run.progress = {
         **run.progress,
         "post_upgrade_verify": {
@@ -1553,7 +1665,7 @@ async def _finish_with_flip(
         await db.commit()
         _release_lease(run, holder)
         logger.warning("upgrade_post_verify_failed", run_id=str(run.id), failed_checks=fails)
-        return
+        return None
 
     rolled = list(settled.detail.get("rolled") or [])
     await _transition(
@@ -1573,3 +1685,4 @@ async def _finish_with_flip(
         rolled=rolled,
         post_upgrade_verify=verify_overall,
     )
+    return None
