@@ -90,11 +90,20 @@ the formatter handles the rest.
   A records were written and BIND's check-names refused the forward and
   reverse zones. Preview and commit now check every generated name with
   the host-label rule the single Allocate IP path uses
-  (`core/dns_names`) and answer 422 naming the offending names, creating
-  nothing. Format specs the dialog's live preview does not implement
-  (`{n:_}`, `{n:,}`, `{n:5d}`, conversions) are refused too, and the
-  dialog now renders and validates with the same rules, so the preview
-  shows the names that are stored.
+  (`core/dns_names`), store it lower-cased as that path does, and answer
+  422 naming the offending names, creating nothing. Token format specs
+  are limited to the ones the dialog's live preview renders identically —
+  plain, `d`, `x`, `X`, each optionally zero-padded (`{n:03d}`,
+  `{oct4:03d}`) — so `{n:_}`, `{n:,}`, `{n:5d}` and conversions are
+  refused, and the iterator start must be 0 to 999,999,999 (a negative
+  start zero-padded differently in the browser). The dialog now parses
+  and renders templates exactly as the server does and checks every name
+  in the range, and a shared vectors file is run by both a backend test
+  and a vitest so the two cannot drift. `{oct1}`–`{oct4}` now honour a
+  padding spec instead of silently ignoring it (multicast name templates
+  too). Also fixed on the way: Python's `$` matches before a trailing
+  newline, so a label ending in `\n` passed every host and record-owner
+  name check; the label rules now anchor with `\Z`.
 
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said

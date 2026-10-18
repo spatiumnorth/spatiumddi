@@ -50,6 +50,7 @@ import {
   hostLabelError,
   storedHostname,
   templateFormatError,
+  templateStartError,
 } from "@/lib/bulk-allocate-template";
 
 function ipToBigInt(ip: string): bigint | null {
@@ -249,8 +250,12 @@ export function BulkAllocateModal({
 
   // Client-side live preview: shows the first few rendered hostnames as
   // the operator types so they see the template effect before posting.
-  // Errors are silent — the real validation happens server-side.
+  // Names are normalized as the server stores them; a name it would refuse
+  // is reported by `hostnameError` below, which gates Preview.
   const livePreview = useMemo(() => {
+    // The template as sent (buildBody trims it), so the preview and the
+    // check below see the same string the server renders.
+    const template = hostnameTemplate.trim();
     const startInt = ipToBigInt(rangeStart);
     const endInt = ipToBigInt(rangeEnd);
     if (startInt === null || endInt === null || endInt < startInt) return null;
@@ -263,7 +268,7 @@ export function BulkAllocateModal({
       samples.push({
         ip: ipStr,
         hostname: storedHostname(
-          expandTemplate(hostnameTemplate, ipStr, templateStart + i, v6),
+          expandTemplate(template, ipStr, templateStart + i, v6),
         ),
       });
     }
@@ -276,12 +281,7 @@ export function BulkAllocateModal({
       samples.push({
         ip: lastIp,
         hostname: storedHostname(
-          expandTemplate(
-            hostnameTemplate,
-            lastIp,
-            templateStart + total - 1,
-            v6,
-          ),
+          expandTemplate(template, lastIp, templateStart + total - 1, v6),
         ),
       });
     }
@@ -292,10 +292,13 @@ export function BulkAllocateModal({
   // form refuses what the server would (and the live preview above shows the
   // same names the server stores).
   const hostnameError = useMemo(() => {
+    const template = hostnameTemplate.trim();
+    const startErr = templateStartError(templateStart);
+    if (startErr) return startErr;
     const startInt = ipToBigInt(rangeStart);
     const endInt = ipToBigInt(rangeEnd);
-    if (startInt === null) return null;
-    const fmt = templateFormatError(hostnameTemplate);
+    if (startInt === null || !template) return null;
+    const fmt = templateFormatError(template);
     if (fmt) return fmt;
     const total =
       endInt !== null && endInt >= startInt
@@ -304,7 +307,7 @@ export function BulkAllocateModal({
     for (let i = 0; i < total; i++) {
       const ipStr = bigIntToIp(startInt + BigInt(i), v6);
       const err = hostLabelError(
-        expandTemplate(hostnameTemplate, ipStr, templateStart + i, v6),
+        expandTemplate(template, ipStr, templateStart + i, v6),
       );
       if (err) return `#${i + 1} (${ipStr}): ${err}`;
     }
