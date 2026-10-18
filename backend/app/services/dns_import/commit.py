@@ -29,7 +29,7 @@ from app.core.dns_names import contains_control_chars
 from app.drivers.dns import is_agentless
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone
+from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone, servable_ttl
 from app.services.dns.named_conf_validation import split_zone_forwarders
 from app.services.dns.record_ops import (
     enqueue_record_ops_bulk,
@@ -208,7 +208,9 @@ async def _build_records_for_zone(
                 fqdn=fqdn.lower(),
                 record_type=r.record_type,
                 value=r.value,
-                ttl=r.ttl,
+                # #2073 — a source can carry a TTL no server serves (an
+                # uploaded PowerDNS export with -1); it inherits the $TTL.
+                ttl=servable_ttl(r.ttl),
                 priority=r.priority,
                 weight=r.weight,
                 port=r.port,
@@ -219,6 +221,11 @@ async def _build_records_for_zone(
     if rows:
         db.add_all(rows)
     return rows, skipped
+
+
+def _timer(value: int | None, default: int) -> int:
+    servable = servable_ttl(value)
+    return default if servable is None else servable
 
 
 def _zone_kwargs_from_parsed(
@@ -246,11 +253,14 @@ def _zone_kwargs_from_parsed(
         name=name,
         zone_type=parsed.zone_type,
         kind=parsed.kind,
-        ttl=soa.ttl if soa else 3600,
-        refresh=soa.refresh if soa else 86400,
-        retry=soa.retry if soa else 7200,
-        expire=soa.expire if soa else 3600000,
-        minimum=soa.minimum if soa else 3600,
+        # #2073 — a value outside 0..2^31-1 (negative, or past int4 in an
+        # uploaded export) falls back to the default rather than being
+        # stored for BIND to refuse the zone over, or 500ing the commit.
+        ttl=_timer(soa.ttl if soa else None, 3600),
+        refresh=_timer(soa.refresh if soa else None, 86400),
+        retry=_timer(soa.retry if soa else None, 7200),
+        expire=_timer(soa.expire if soa else None, 3600000),
+        minimum=_timer(soa.minimum if soa else None, 3600),
         primary_ns=soa.primary_ns.rstrip(".") if soa and soa.primary_ns else "",
         admin_email=soa.admin_email.rstrip(".") if soa and soa.admin_email else "",
         last_serial=soa.serial if soa else 0,
