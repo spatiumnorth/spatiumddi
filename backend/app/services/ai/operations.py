@@ -35,10 +35,11 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import bind_check_names_error
+from app.core.dns_names import bind_check_names_error, primary_ns_error
 from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.services.dns.name_targets import absolute_target_error
 from app.services.ipam.probe_policy import check_probe_target
 from app.services.nmap import NmapArgError, build_argv
 from app.services.pcap import (
@@ -2022,6 +2023,10 @@ async def _preview_create_dns_record(
     names_err = bind_check_names_error(rtype, owner, args.value, origin=zone.name)
     if names_err is not None:
         return PreviewResult(ok=False, detail=names_err)
+    # #2060 — nor a dot-less target the group's PowerDNS would refuse.
+    target_err = await absolute_target_error(db, zone.group_id, rtype, args.value, zone.name)
+    if target_err is not None:
+        return PreviewResult(ok=False, detail=target_err)
     # #1381 — nor a CNAME beside other data; apply refuses it too.
     if rtype == "CNAME" and is_apex(name):
         return PreviewResult(ok=False, detail=APEX_CNAME_DETAIL)
@@ -2103,6 +2108,10 @@ async def _apply_create_dns_record(
     names_err = bind_check_names_error(rtype, fqdn, args.value, origin=zone.name)
     if names_err is not None:
         raise ValueError(names_err)
+    # #2060 — the same dot-less-target refusal as the REST create path.
+    target_err = await absolute_target_error(db, zone.group_id, rtype, args.value, zone.name)
+    if target_err is not None:
+        raise ValueError(target_err)
 
     # #1230 — never store the same RR twice; see app.services.dns.record_identity.
     existing = await find_identical_record(
@@ -2354,6 +2363,18 @@ class CreateDNSZoneArgs(BaseModel):
         default="",
         description="Primary nameserver FQDN (e.g. ``ns1.example.com.``). Recommended.",
     )
+
+    @field_validator("primary_ns")
+    @classmethod
+    def _primary_ns_is_host_name(cls, v: str) -> str:
+        # #2075 — same rule as the REST zone create: BIND refuses a zone
+        # whose SOA primary name is not a host name. A host name carries no
+        # zone-file syntax, so this also covers the #597 injection guard.
+        err = primary_ns_error(v)
+        if err is not None:
+            raise ValueError(f"Primary NS (primary_ns) {err}")
+        return v
+
     admin_email: str = Field(
         default="",
         description="Zone admin email rendered into SOA RNAME (e.g. ``hostmaster@example.com``).",

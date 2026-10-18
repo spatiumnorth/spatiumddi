@@ -624,7 +624,9 @@ DNSZone
                                   --   zone under in-addr.arpa / ip6.arpa is reverse (#1310)
   ttl (default SOA TTL)
   refresh, retry, expire, minimum (SOA fields)
-  primary_ns, admin_email         (SOA fields)
+  primary_ns, admin_email         (SOA fields; primary_ns is a fully qualified
+                                  --   host name, trailing dot optional, or empty
+                                  --   for "use the zone's NS" (#2075))
   is_auto_generated: bool         -- created automatically for a subnet
   linked_subnet_id (nullable FK)  -- if reverse zone, tied to a subnet
   dnssec_enabled: bool
@@ -960,6 +962,20 @@ RPZ zones:
 | agent while it renders | about 1.0 - 1.2 GB, plus short-lived children |
 | the pod's peak | 2.8 GB on the first apply, 3.6 GB on the next |
 
+**The agent taking a bundle (#2029).** The agent used to hold several copies
+of the bundle while it took a new one: the HTTP body as bytes, its decoded
+text, the parsed bundle, and the previous bundle (kept for the DNSSEC
+re-read) all at once. ddi-pg saw it reach 1.70 - 1.74 GB taking a 147 MB
+bundle (five lists on two views, about 708k entries per view), enough on its
+own to get the container OOM-killed before named started. The body is now
+streamed to `config/fetch.json.part` and parsed from there, short repeated
+values (`"block"`, `"nxdomain"`) are shared rather than copied per entry, and
+only the zone list of the previous bundle is kept. Measured on a synthetic
+bundle of that shape (180 MB): the agent's peak RSS went from 1,474 MB to
+598 MB, on the fetch path and the cache path alike — about 3.3x the bundle
+size, which is the bundle's text plus its parsed form while `json` runs.
+The spool file needs free disk in the state directory for one bundle.
+
 Before #1725 the pod had no memory limit, so that peak was the node's: the
 kubelet evicted the worker, Postgres and the api, then the kernel killed
 named. The pod now carries a memory request (256Mi) and a limit (2Gi), so an
@@ -985,18 +1001,54 @@ Where to change it:
 - Docker Compose: `DNS_BIND9_MEM_LIMIT` in `.env` (default `2g`).
 - Raw manifests: edit `k8s/dns/bind9-statefulset.yaml`.
 
-**When the limit is hit.** The kernel kills named inside the pod, the agent
-exits, and the orchestrator restarts the container into the same config, so
-a list that does not fit is a crash loop on that server. The agent reads the
-container's OOM-kill counter, records the kill in its state directory, and
-from the restart on reports the daemon as not serving with the reason
-(`oom_killed: named was killed for exceeding the container's 2 GiB memory
-limit …`). That is the red chip on the server row and, after its 5-minute
-grace, the default-on **Agent daemon not serving** alert. The record clears
-once named has stayed up for 10 minutes. If a structural apply was in flight
-when named died, the apply's own failure (`agent_config_rejected`) names the
-OOM kill instead. If the kernel picks the agent rather than named, nothing
-can be written first: the pod's last state (`OOMKilled`) is the record.
+**When the limit is hit.** named is killed inside the pod and the
+orchestrator restarts the container into the same config, so a list that
+does not fit is a crash loop on that server. From the restart on, the server
+reports the daemon as not serving with the reason (`oom_killed: …`): the red
+chip on the server row and, after its 5-minute grace, the default-on **Agent
+daemon not serving** alert. The state clears once the daemon has stayed up
+for 10 minutes, longer than Kubernetes' 5-minute crash-loop back-off. Who
+records the kill depends on how the container is killed (#2018):
+
+- **Appliance (and any Kubernetes install).** The kubelet sets
+  `memory.oom.group` on every container (cgroup v2, Kubernetes 1.28+), so
+  the kernel kills the whole container at once: named, the DNS agent beside
+  it, and anything else in it. The agent cannot record a kill it died in,
+  and its restarted self is a new cgroup that cannot see it. The kubelet
+  can: it records `OOMKilled` as the container's last state. The appliance
+  supervisor reports that on its heartbeat (its service watchdog, every 5
+  minutes, for this node's pod only), and the control plane turns it into
+  the `oom_killed:` state on the server row that container serves (the
+  engine's live row: one a past registration left behind is not touched),
+  whatever the restarted agent says, timed from the kill rather than from
+  the report. A container stuck in CrashLoopBackOff, with no agent heartbeat
+  at all, reads not serving the same way. The report counts only while the
+  supervisor is still heartbeating (15 minutes): one that stopped leaves
+  its last word in place, and that must not hold a recovered server down.
+  The times compared are the kubelet's and the control plane's, so a node
+  clock far off moves the 10-minute recovery by the same amount. The DHCP
+  (Kea) container is group-killed the same way and is not covered yet. A plain Helm install (umbrella
+  chart) has no supervisor, so there the pod's last state
+  (`kubectl get pod … -o jsonpath='{.status.containerStatuses[0].lastState}'`)
+  is the only record; setting the kubelet's `singleProcessOOMKill: true`
+  (Kubernetes 1.32+) restores the single-process kill and with it the
+  agent's own record, for every container on that node.
+- **Docker Compose.** Docker does not group-kill: the kernel kills the
+  largest process, named, and the agent survives. It reads the container's
+  OOM-kill counter, records the kill in its state directory, exits so the
+  container restarts, and reports it from then on. If a structural apply
+  was in flight when named died, the apply's own failure
+  (`agent_config_rejected`) names the OOM kill instead.
+
+**Undoing the change ends the loop (#2019).** A restarted agent whose named
+died while (or within 5 minutes of) applying a bundle does not re-apply that
+cached bundle at startup: it asks the control plane first, so removing the
+blocklists or the extra view in the UI reaches the server on its next start.
+After two deaths the agent itself watched (named exiting while the agent
+lived) the bundle is quarantined and only retried on a backoff; on the
+appliance today the OOM kill takes the agent with named (#2018), so there the
+agent stops at syncing first and the kubelet backs off the crash loop. See `docs/deployment/DNS_AGENT.md` (last-known-good revert) for what
+serves meanwhile.
 
 **Resolver cache.** BIND's `max-cache-size` sizes one cache, every view with
 recursion has its own, and the default is 90 % of physical memory for each:

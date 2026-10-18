@@ -116,6 +116,7 @@ async def push_target(db: AsyncSession, row: InfluxDBTarget, *, now: datetime) -
     if dhcp_watermark is not None:
         row.last_dhcp_bucket_at = dhcp_watermark
     row.last_push_at = now
+    row.last_success_at = now
     row.last_push_points = len(points)
     row.last_push_error = None
     logger.info("influxdb_push_ok", target=row.name, points=len(points))

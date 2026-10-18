@@ -34,7 +34,7 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 - **k3s static binary** (~70 MB) at `/usr/local/bin/k3s`; `kubectl` / `crictl` / `ctr` symlink to it.
 - **k3s airgap images** (CoreDNS / local-path / pause / metrics-server) as zst-compressed tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst`. k3s auto-imports them into containerd at boot.
 - **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.10.2-alpine for the Control plane role.
-- **Control-plane environment** is written once, under the chart's `sharedEnv` value, which the umbrella chart appends to the api, worker AND beat containers (#1826). That is where `APPLIANCE_MODE`, `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and `INITIAL_NTP_SERVERS` live. When the slot-image mirror is on, its URL and secret go to the api and the worker (the worker's upgrade preflight checks the mirror's free space), not to beat. The worker runs alert evaluation (`node_pressure`, `cluster_dns_degraded`) and the rolling-upgrade orchestrator, so a variable only the api carries makes every `appliance_mode` gate read as off there. Agent pre-shared keys stay under `api.env`: only the api reads them. `charts-render-check.sh` fails a render where api, worker and beat disagree on the shared set, or where beat carries the mirror secret.
+- **Control-plane environment** is written once, under the chart's `sharedEnv` value, which the umbrella chart appends to the api, worker AND beat containers (#1826). That is where `APPLIANCE_MODE`, `APPLIANCE_VERSION` (re-read from the booted slot's `/etc/spatiumddi/appliance-release` on every boot, so it follows an upgrade or rollback; on a multi-node cluster it is the seed's, since only the seed renders this manifest), `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and `INITIAL_NTP_SERVERS` live. When the slot-image mirror is on, its URL and secret go to the api and the worker (the worker's upgrade preflight checks the mirror's free space), not to beat. The worker runs alert evaluation (`node_pressure`, `cluster_dns_degraded`) and the rolling-upgrade orchestrator, so a variable only the api carries makes every `appliance_mode` gate read as off there. Agent pre-shared keys stay under `api.env`: only the api reads them. `charts-render-check.sh` fails a render where api, worker and beat disagree on the shared set, or where beat carries the mirror secret.
 - **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Appliance installs (and the supervisor on the Control plane); the umbrella chart drives the Control plane. Built at release time + signed.
 - **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
 
@@ -92,9 +92,11 @@ not the operator's:
   processes on nodes of 12 GiB or less — and writes them into the
   `spatium-control` HelmChartConfig, where they survive k3s restarts and
   helm re-applies. (`kubectl set resources` on the Deployment does not:
-  k3s re-applies the on-disk HelmChart manifest on every restart.) If you
-  need different limits, put them in that HelmChartConfig, not on the
-  Deployment.
+  k3s re-applies the on-disk HelmChart manifest on every restart.) These
+  limits are keys the supervisor **owns**, so a different value written
+  into that HelmChartConfig by hand is put back on the next heartbeat; there
+  is no supported per-install override for them today (see "Who owns which
+  HelmChartConfig key" below).
 - A bulk load creates one queued record op per record per agent server;
   the api ships them to the agent a page at a time (5000 by default,
   `dns_agent_ops_batch`). A group of 250k records drains in ~50 polls; the
@@ -550,11 +552,38 @@ state on its heartbeat:
   real `_render_control_helmchart` and fails, naming the keys, if the merge
   stops being a no-op. Add an override key without rendering it in firstboot
   and every install silently goes back to two revisions.
+
+  **Who owns which HelmChartConfig key
+  ([#2024](https://github.com/spatiumnorth/spatiumddi/issues/2024)).** The
+  supervisor owns individual keys, never a whole document: on every heartbeat
+  it reads the live `valuesContent`, merges its own keys on top, and writes
+  only when that changes something, with the PATCH conditional on the
+  `resourceVersion` it read (an edit landing in between is a 409, retried
+  against the new document on the next beat). Every key not listed here is
+  the operator's and survives. A key that *is* listed is the supervisor's:
+  setting it by hand lasts until the next heartbeat.
+
+  | HelmChartConfig | Supervisor-owned keys (source) |
+  |---|---|
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
+  | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
+
+  `image.tag` on `spatium-control` is written by the backend's chart bump,
+  not the supervisor, and the supervisor's merge leaves it alone. Lists are
+  owned whole (`tolerations`, `peers`, `addresses`): a merge replaces a list,
+  it never appends to one. An owned key is always written explicitly, `false`
+  or `""` when off, because a merge cannot remove a key by leaving it out. A
+  HelmChartConfig whose `valuesContent` will not parse as a YAML mapping is
+  never overwritten; the supervisor logs
+  `supervisor.helmchartconfig.unparseable_values` (or `values_not_a_mapping`)
+  and `…_overrides_failed` on every heartbeat and changes none of its own
+  keys in that CR until it is fixed or deleted.
 - **MetalLB / VIP (Phase 7c).** The operator's pool + VIP live on the
   `platform_settings` singleton (`metallb_enabled` /
   `metallb_pool_addresses` / `control_plane_vip`); the seed supervisor
-  upserts the `spatium-bootstrap` HelmChartConfig (`metallb.enabled` +
-  `ipPool.addresses`) via `k8s_api.apply_bootstrap_overrides()`, and
+  merges `metallb.enabled` + `ipPool.addresses` (and the BGP keys) into the
+  `spatium-metallb` HelmChartConfig via `k8s_api.apply_metallb_overrides()`, and
   `frontend.controlPlaneVIP` rides the `spatium-control` override above.
   The VIP also auto-threads into the api's `APPLIANCE_EXTRA_CERT_SANS` so
   the served cert validates on it.
@@ -569,8 +598,8 @@ state on its heartbeat:
   `dhcp_relay_vip` (an additional :67 LoadBalancer fronting the Kea
   relay→server unicast forward — Kea keeps `hostNetwork` for
   direct-attached broadcast). Both live on the same `platform_settings`
-  singleton + the `…/control-plane/metallb` endpoint; the seed upserts
-  the `spatiumddi-appliance` HelmChartConfig (`dns.useMetalLBVIP` /
+  singleton + the `…/control-plane/metallb` endpoint; the seed merges
+  them into the `spatiumddi-appliance` HelmChartConfig (`dns.useMetalLBVIP` /
   `dns.vip` / `dhcpKea.relayVIP`) via
   `k8s_api.apply_dataplane_vip_overrides()`. Each must fall in the pool
   and differ from the control-plane VIP + each other; empty = the
@@ -1143,21 +1172,46 @@ Unlike the api, worker and Postgres limits, this one is **not** sized from
 the node's RAM. The role chart is one HelmChart for the whole cluster and
 every node's supervisor writes it, so it must render the same everywhere
 (#1137), and a DaemonSet has one limit for all its pods. A node whose
-blocklists need more raises it for the cluster with a HelmChartConfig:
+blocklists need more raises it for the cluster in the `spatiumddi-appliance`
+HelmChartConfig. Edit it in place rather than applying a fresh manifest:
+
+```sh
+kubectl -n kube-system edit helmchartconfig spatiumddi-appliance
+```
+
+and add the key beside whatever `spec.valuesContent` already holds (the
+supervisor writes the document with sorted keys and single-quoted empty
+strings, so this is roughly what you will see):
 
 ```yaml
-apiVersion: helm.cattle.io/v1
-kind: HelmChartConfig
-metadata:
-  name: spatiumddi-appliance
-  namespace: kube-system
 spec:
   valuesContent: |
+    dhcpKea:
+      relayVIP: ''
+    dns:
+      useMetalLBVIP: false
+      vip: ''
     dnsBind9:
       resources:
         limits:
           memory: 4Gi
 ```
+
+The supervisor writes the same CR on every heartbeat, but it owns only its
+data-plane VIP keys (`dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP`): it
+merges them into the live document and leaves every other key as you wrote
+it (#2024). The supervisor creates this CR on its first heartbeat, so on a
+running appliance it already exists. Do not `kubectl apply` a manifest over
+it: `valuesContent` is a single string, so an apply replaces all of it, the
+VIP keys vanish until the next heartbeat puts them back, and
+with a DNS VIP configured that is two helm upgrades, the first moving named
+back onto hostNetwork and the second moving it off again. Only if the CR is
+absent (`kubectl -n kube-system get helmchartconfig spatiumddi-appliance`
+answers NotFound) is creating it with `kubectl apply` and only the
+`dnsBind9` block fine; the supervisor adds its keys beside it. Two things
+the supervisor's merge does not keep: a value you set for one of its three
+keys (the supervisor's wins), and YAML comments, which are dropped the next
+time it has to change one of its keys and rewrites the document.
 
 Size it from the table in [`DNS.md` section 8.0](../features/DNS.md): a
 582k-entry list in a group with one view needs about 4 GiB for named, so a
@@ -3217,6 +3271,16 @@ the cluster runs until every node reports the target:
   writing it, with the old tag.
 - When every node is done, the run removes the pins and ends the hold in
   one step. Each node's DNS and DHCP pods restart once at that moment.
+
+A pin, or the removal of the pins, that the kubeapi does not take (a
+request refused or unanswered, as while a k3s server restarts) does
+not end the run. The drive tries it again every 15 s, reading Halt,
+Abort and the Lease between tries, and starts no node and moves no tag
+until it lands. Only once it has kept failing for 5 minutes does the
+run fail on it, with the kubeapi's answer as its error (#2028). Only an
+answer a later try can change is retried: no answer at all, a 5xx, or a
+408, 409 or 429. A refusal that will not change (a 403 from RBAC, a 422
+for an invalid object) fails the run at once, as before.
 
 A run that fails or is aborted keeps its hold, because nodes on two
 versions are exactly what it protects. A new run's Start takes it over,

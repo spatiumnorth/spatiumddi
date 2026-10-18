@@ -4070,7 +4070,10 @@ export interface InfluxDBTarget {
   push_dhcp_metrics: boolean;
   push_subnet_utilization: boolean;
   push_dhcp_scope_leases: boolean;
+  /** The last attempt; moves on failure. */
   last_push_at: string | null;
+  /** The last push the destination accepted; null = never. */
+  last_success_at: string | null;
   last_push_points: number;
   last_push_error: string | null;
   last_dns_bucket_at: string | null;
@@ -4088,11 +4091,15 @@ export interface InfluxDBTargetWrite {
   timeout_seconds: number;
   database: string;
   username: string;
-  /** ``null`` = keep what is stored, ``""`` = clear, else replace. */
+  /** Absent, ``null`` or ``""`` = keep what is stored; else replace. */
   password?: string | null;
+  /** Explicitly remove the stored password (a blank field never does). */
+  clear_password?: boolean;
   org: string;
   bucket: string;
   token?: string | null;
+  /** Explicitly remove the stored token (a blank field never does). */
+  clear_token?: boolean;
   measurement_prefix: string;
   push_interval_seconds: number;
   push_dns_metrics: boolean;
@@ -5441,6 +5448,8 @@ export interface DNSServer {
    *  to identify which host an agent is on (the operator-set ``host``
    *  is just a label; doesn't reflect NAT / distributed deployments). */
   last_seen_ip: string | null;
+  /** #2078 — the agent's own version; `null` = never reported (unknown). */
+  agent_version: string | null;
   config_apply_status: ConfigApplyStatus | null;
   config_apply_error: string | null;
   config_failed_etag: string | null;
@@ -6547,7 +6556,12 @@ export const dnsApi = {
   importZonePreview: (
     groupId: string,
     zoneId: string,
-    data: { zone_file: string; zone_name?: string; view_id?: string | null },
+    data: {
+      zone_file: string;
+      zone_name?: string;
+      view_id?: string | null;
+      conflict_strategy?: "merge" | "replace" | "append";
+    },
   ) =>
     api
       .post<DNSImportPreview>(
@@ -6654,6 +6668,7 @@ export interface DNSImportPreview {
   unchanged: DNSRecordChange[];
   soa_detected: boolean;
   record_count: number;
+  skipped: string[];
 }
 
 export interface DNSImportCommit {
@@ -6664,6 +6679,8 @@ export interface DNSImportCommit {
   deleted: number;
   unchanged: number;
   conflict_strategy: string;
+  provider_warning: string | null;
+  skipped: string[];
 }
 
 // ── DNS Blocking Lists ─────────────────────────────────────────────────────
@@ -13752,7 +13769,7 @@ export interface ApplianceSystemInfo {
   maintenance_mode: boolean;
   reboot_pending_from_host: boolean;
   reboot_scheduled: boolean;
-  appliance_version: string;
+  appliance_version: string | null;
   appliance_mode: boolean;
 }
 

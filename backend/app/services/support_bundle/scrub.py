@@ -142,6 +142,21 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     # A Shared Access Signature in a query string: a Teams Workflows
     # (Power Automate / Logic Apps) webhook, or any Azure SAS URL.
     ("sas-signature", re.compile(r"(?<=[?&]sig=)[A-Za-z0-9%_+/=-]+"), _REDACTED),
+    # A presigned S3 / GCS URL: the query string is the credential, so
+    # whoever holds the URL can use it until it expires. Only the values of
+    # the signing parameters are replaced; the character class excludes the
+    # square brackets of the replacement so a second pass cannot re-match.
+    (
+        "presigned-url",
+        re.compile(
+            r"(?i)(?:(?<=[?&]x-amz-signature=)|(?<=[?&]x-amz-credential=)"
+            r"|(?<=[?&]x-amz-security-token=)|(?<=[?&]x-goog-signature=)"
+            r"|(?<=[?&]x-goog-credential=))[A-Za-z0-9%_+/=.~-]+"
+        ),
+        _REDACTED,
+    ),
+    # An Azure storage connection string carries the account key inline.
+    ("azure-account-key", re.compile(r"(?i)(?<=AccountKey=)[A-Za-z0-9+/=]+"), _REDACTED),
 )
 
 # Matched on KEY name, for structured data (env dumps, settings rows,
@@ -158,6 +173,8 @@ SECRET_KEY_NAME_RE = re.compile(
     # incoming-webhook URL is a bearer credential in its own right — the
     # path segment IS the authentication — so both are matched by name.
     r"|auth[_-]?header|authorization|webhook[_-]?url"
+    # A storage connection string carries its account key inline.
+    r"|connection[_-]?string"
     # Any name ENDING in "key" or "keys". Broad on purpose: the agent
     # PSKs ship as DNS_AGENT_KEY / DHCP_AGENT_KEY / LG_AGENT_KEY, whose
     # values are raw hex with no shape a value-matcher could recognise —

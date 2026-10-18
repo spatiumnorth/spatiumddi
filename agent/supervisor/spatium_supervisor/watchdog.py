@@ -44,6 +44,7 @@ bookkeeping; sub-100 ms.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -151,6 +152,61 @@ def _derive_pod_status(pod: k8s_api.PodStatus) -> str:
     return "healthy"
 
 
+def _own_node_name() -> str | None:
+    """This node's k8s Node name (downward-API ``spec.nodeName``), or None
+    when the supervisor was not told it. k3s lowercases the hostname."""
+    name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME")
+    return name.strip().rstrip(".").lower() if name and name.strip() else None
+
+
+def _on_node(pod: k8s_api.PodStatus, node: str | None) -> bool:
+    return node is not None and pod.node_name.strip().rstrip(".").lower() == node
+
+
+def container_runtime(pod: k8s_api.PodStatus, service: str) -> dict[str, Any] | None:
+    """The service container's restart history, as the kubelet reports it
+    (#2018).
+
+    The kubelet puts every container on the appliance in a cgroup with
+    ``memory.oom.group`` set (cgroup v2, Kubernetes 1.28+), so a container
+    that reaches its memory limit is killed WHOLE: the DNS daemon and the
+    agent beside it die in the same instant, and the agent never gets to
+    write its OOM record. The restarted agent cannot see it either: a
+    restarted container is a new cgroup whose ``oom_kill`` counter starts at
+    zero. The kubelet is the one party that saw it, in the container's
+    ``lastState.terminated.reason`` (``OOMKilled``), which this carries to
+    the control plane. ``running_since`` (None while the container is not
+    running, e.g. in CrashLoopBackOff) lets the control plane tell a kill
+    that is still current from one the daemon has since outlived.
+    """
+    statuses = pod.container_statuses or []
+    cs = next((c for c in statuses if c.get("name") == service), None)
+    if cs is None:
+        if len(statuses) != 1:
+            return None
+        cs = statuses[0]
+    state = cs.get("state") or {}
+    running = state.get("running") or {}
+    terminated = (cs.get("lastState") or {}).get("terminated") or None
+    last: dict[str, Any] | None = None
+    if isinstance(terminated, dict):
+        last = {
+            "reason": terminated.get("reason"),
+            "exit_code": terminated.get("exitCode"),
+            "finished_at": terminated.get("finishedAt"),
+        }
+    try:
+        restarts = int(cs.get("restartCount") or 0)
+    except (TypeError, ValueError):
+        restarts = 0
+    return {
+        "restart_count": restarts,
+        "running_since": running.get("startedAt") if running else None,
+        "last_termination": last,
+        "memory_limit": pod.memory_limits.get(str(cs.get("name") or service)),
+    }
+
+
 def _check_health_k3s(
     env_file: Path,
     desired_services: dict[str, str],
@@ -195,10 +251,21 @@ def _check_health_k3s(
         namespace="spatium",
         label_selector="app.kubernetes.io/part-of=spatiumddi",
     )
+    # #2018 — prefer THIS node's pod. The role workloads are DaemonSets, so
+    # on a multi-node cluster every node has a pod with the same component
+    # label and the last one listed used to win, whichever node it ran on.
+    own_node = _own_node_name()
     by_service: dict[str, k8s_api.PodStatus] = {}
     for pod in pods:
         component = pod.labels.get("app.kubernetes.io/component")
-        if component in desired_services:
+        if component not in desired_services:
+            continue
+        current = by_service.get(component)
+        if (
+            current is None
+            or not _on_node(current, own_node)
+            or _on_node(pod, own_node)
+        ):
             by_service[component] = pod
 
     missing_services: list[str] = []
@@ -221,12 +288,19 @@ def _check_health_k3s(
         else:
             since_wall = prev[2]
 
-        out[svc] = {
+        entry: dict[str, Any] = {
             "role": role,
             "status": status,
             "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since_wall)),
             "container_id": container_id,
         }
+        # #2018 — only a pod known to be this node's: another node's OOM
+        # kill must not be reported as this appliance's.
+        if pod is not None and (own_node is None or _on_node(pod, own_node)):
+            runtime = container_runtime(pod, svc)
+            if runtime is not None:
+                entry["container"] = runtime
+        out[svc] = entry
 
     if auto_heal and missing_services:
         log.warning(

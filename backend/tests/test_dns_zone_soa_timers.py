@@ -219,3 +219,61 @@ async def test_a_zone_created_without_timers_serves_what_every_zone_always_has(
     bundle = await build_config_bundle(db_session, server)
     (shipped,) = [z for z in bundle["zones"] if z["id"] == zone["id"]]
     assert tuple(shipped[k] for k in TIMERS) == (3600, 600, 86400, 300)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [-1, 2**31])
+async def test_a_zone_default_ttl_out_of_range_is_refused_2073(
+    client: AsyncClient, db_session: AsyncSession, value: int
+) -> None:
+    """``-1`` was stored (201) and BIND then refused the zone file for a bad
+    ``$TTL``; the field is named in the 422 on both create and update."""
+    headers = await _headers(db_session)
+    grp, _server = await _group_with_server(db_session)
+
+    created = await client.post(
+        f"/api/v1/dns/groups/{grp.id}/zones",
+        json={"name": f"z{uuid.uuid4().hex[:6]}.example.test", "ttl": value},
+        headers=headers,
+    )
+    assert created.status_code == 422, created.text
+    assert "ttl" in created.text
+
+    zone = await _zone_via_api(client, headers, grp)
+    updated = await client.put(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone['id']}", json={"ttl": value}, headers=headers
+    )
+    assert updated.status_code == 422, updated.text
+    assert "ttl" in updated.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0, 300, 2**31 - 1])
+async def test_a_zone_default_ttl_in_range_is_accepted_2073(
+    client: AsyncClient, db_session: AsyncSession, value: int
+) -> None:
+    headers = await _headers(db_session)
+    grp, _server = await _group_with_server(db_session)
+    zone = await _zone_via_api(client, headers, grp, ttl=value)
+    assert zone["ttl"] == value
+    updated = await client.put(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone['id']}", json={"ttl": 60}, headers=headers
+    )
+    assert updated.status_code == 200, updated.text
+
+
+@pytest.mark.asyncio
+async def test_a_record_ttl_out_of_range_is_refused_2073(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _headers(db_session)
+    grp, _server = await _group_with_server(db_session)
+    zone = await _zone_via_api(client, headers, grp)
+    base = f"/api/v1/dns/groups/{grp.id}/zones/{zone['id']}/records"
+    for bad in (-1, 2**31):
+        r = await client.post(
+            base,
+            json={"name": "www", "record_type": "A", "value": "192.0.2.1", "ttl": bad},
+            headers=headers,
+        )
+        assert r.status_code == 422, r.text

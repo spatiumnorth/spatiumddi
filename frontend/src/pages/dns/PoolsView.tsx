@@ -27,6 +27,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { poolHealthCheckFields } from "@/lib/formPayloads";
+import { parseTtlInput, POOL_TTL_BOUNDS } from "@/lib/dnsNames";
 
 /**
  * Pools view — manages health-checked A / AAAA pools for one zone.
@@ -418,7 +419,7 @@ export function PoolModal({
   const [recordType, setRecordType] = useState<"A" | "AAAA">(
     pool?.record_type ?? "A",
   );
-  const [ttl, setTtl] = useState(pool?.ttl ?? 30);
+  const [ttlText, setTtlText] = useState(String(pool?.ttl ?? 30));
   const [enabled, setEnabled] = useState(pool?.enabled ?? true);
   const [hcType, setHcType] = useState<DNSPoolWrite["hc_type"]>(
     pool?.hc_type ?? "tcp",
@@ -461,6 +462,9 @@ export function PoolModal({
         .split(/[,\s]+/)
         .map((s) => parseInt(s, 10))
         .filter((n) => !Number.isNaN(n) && n >= 100 && n <= 599);
+      // #2086 — the ttl was checked at submit; this narrows it for the types.
+      const ttl = parseTtlInput(ttlText, POOL_TTL_BOUNDS);
+      if (typeof ttl !== "number") throw new Error("invalid pool TTL");
       const body: DNSPoolWrite = {
         name,
         description,
@@ -576,6 +580,13 @@ export function PoolModal({
         onSubmit={(e) => {
           e.preventDefault();
           setError(null);
+          // #2086 — empty is refused, not turned into 30: an edit that
+          // cleared the field would otherwise silently save a different TTL.
+          const parsed = parseTtlInput(ttlText, POOL_TTL_BOUNDS);
+          if (parsed === null || typeof parsed === "string") {
+            setError(`TTL ${parsed ?? "is required"}.`);
+            return;
+          }
           mut.mutate();
         }}
         className="space-y-4"
@@ -619,11 +630,10 @@ export function PoolModal({
           </Field>
           <Field label="TTL (seconds)">
             <input
-              type="number"
-              min={1}
-              max={86400}
-              value={ttl}
-              onChange={(e) => setTtl(parseInt(e.target.value, 10) || 30)}
+              type="text"
+              inputMode="numeric"
+              value={ttlText}
+              onChange={(e) => setTtlText(e.target.value)}
               className={inputCls}
             />
           </Field>
