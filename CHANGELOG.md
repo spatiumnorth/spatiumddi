@@ -84,6 +84,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An `A` alias can be added to an IPv6 address again (#2081).**
+  `POST /ipam/addresses/{id}/aliases` with an `A` alias on an IPv6
+  address wrote the AAAA record the alias follows the address family
+  into, then looked the new row up by the requested type `A`, found
+  nothing, answered 409 and rolled the write back, so the alias could
+  never be added there. The lookup now uses the type that was written,
+  from the same helper the writer and the CNAME-rule check use.
+  The alias lists and the per-address alias count matched only
+  CNAME and A, so a stored AAAA alias was missing from them; they
+  match AAAA now. Allocate and next-IP were not affected. `AAAA` is
+  still refused as an alias type (422), so an IPv4 address can never
+  get one.
+
 - **An IP's DNS alias no longer breaks the CNAME-and-other-data rule
   (#2080).** An alias given when allocating an IP (Allocate IP,
   Allocate next IP) or added with `POST /ipam/addresses/{id}/aliases`
