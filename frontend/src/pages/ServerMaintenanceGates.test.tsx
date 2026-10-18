@@ -97,6 +97,7 @@ describe.each(MODALS)("#2076 %s server detail modal", (_n, make) => {
   ])("offers a superadmin %s", async (label, paused) => {
     signInAs(true);
     await show(make(paused));
-    expect(btn(label).disabled).toBe(false);
+    // The grant arrives asynchronously; until it does the gate denies.
+    await waitFor(() => expect(btn(label).disabled).toBe(false));
   });
 });
