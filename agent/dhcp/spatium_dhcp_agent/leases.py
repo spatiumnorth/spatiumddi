@@ -79,6 +79,22 @@ _DRAIN_BUDGET = 5.0
 _STATE_MAP = {"0": "active", "1": "declined", "2": "expired", "3": "released"}
 
 
+
+
+def _state(raw: str, valid_lifetime: int) -> str:
+    """The event state for one CSV row.
+
+    A row with ``valid_lifetime`` 0 is how the memfile records a DELETED lease
+    (``lease4-del`` / ``lease6-del``, #1287): Kea appends the lease once more
+    with lifetime 0 and LFC drops both rows later. Its ``state`` is still 0, so
+    read naively it said "active" and the control plane re-created the lease,
+    its IPAM mirror and its DDNS records the moment they were removed.
+    """
+    if valid_lifetime == 0:
+        return "expired"
+    return _STATE_MAP.get(raw.strip(), "active")
+
+
 # kea-leases6.csv ``lease_type``: 0 = IA_NA. 1 (IA_TA) and 2 (IA_PD) are skipped.
 _LEASE6_IA_NA = "0"
 
@@ -113,7 +129,7 @@ def _parse_row_v6(row: list[str]) -> dict[str, Any] | None:
         iaid = int(row[7]) if row[7].strip() else None
         hostname = row[11].strip() or None
         mac = row[12].strip() or None
-        state = _STATE_MAP.get(row[13].strip(), "active")
+        state = _state(row[13], valid_lifetime)
     except (ValueError, IndexError):
         return None
     starts_at, ends_at = _times(expire_epoch, valid_lifetime)
@@ -147,7 +163,7 @@ def _parse_row(row: list[str]) -> dict[str, Any] | None:
         valid_lifetime = int(row[3]) if row[3] else 0
         expire_epoch = int(row[4]) if row[4] else 0
         hostname = row[8].strip() or None
-        state = _STATE_MAP.get(row[9].strip(), "active")
+        state = _state(row[9], valid_lifetime)
         starts_at, ends_at = _times(expire_epoch, valid_lifetime)
         # #428: emit the server's LeaseEventBatch/LeaseEvent shape exactly —
         # field names ip_address/mac_address (NOT ip/mac) and an explicit
