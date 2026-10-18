@@ -6604,6 +6604,11 @@ _RULE_TYPE_MODULE: dict[str, str] = {
 }
 
 
+def rule_type_module(rule_type: str) -> str | None:
+    """The feature module a rule type is gated on, or None when un-gated."""
+    return _RULE_TYPE_MODULE.get(rule_type)
+
+
 async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     """Evaluate every enabled rule; open / resolve events as needed.
 

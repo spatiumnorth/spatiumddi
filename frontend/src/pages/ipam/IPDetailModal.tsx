@@ -47,6 +47,7 @@ import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { IPNetworkTab } from "./IPNetworkTab";
 import { SeenDot } from "./SeenDot";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { RpkiPill } from "@/components/network/bgp-route-table";
 
@@ -157,6 +158,7 @@ export function IPDetailModal({
 }: IPDetailModalProps) {
   const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
     useModalDialog(onClose);
+  const dhcpOn = useModuleOn("core.dhcp");
   const zoneNames = zoneNameById ?? {};
 
   // Wake-on-LAN (#533) — self-contained like the "Re-profile now" action.
@@ -462,14 +464,16 @@ export function IPDetailModal({
                 dash(null)
               )}
             </Field>
-            <Field label="DNS / DHCP linkage">
+            <Field label={dhcpOn ? "DNS / DHCP linkage" : "DNS linkage"}>
               <span className="space-x-2 text-[11px] text-muted-foreground">
                 {addr.dns_record_id && <span>A-record</span>}
-                {addr.dhcp_lease_id && <span>· DHCP lease</span>}
-                {addr.static_assignment_id && <span>· DHCP static</span>}
+                {dhcpOn && addr.dhcp_lease_id && <span>· DHCP lease</span>}
+                {dhcpOn && addr.static_assignment_id && (
+                  <span>· DHCP static</span>
+                )}
                 {!addr.dns_record_id &&
-                  !addr.dhcp_lease_id &&
-                  !addr.static_assignment_id &&
+                  !(dhcpOn && addr.dhcp_lease_id) &&
+                  !(dhcpOn && addr.static_assignment_id) &&
                   dash(null)}
               </span>
             </Field>
@@ -1203,8 +1207,11 @@ function DeviceProfileSection({
   // Passive fingerprint — Phase 2. The endpoint 404s when no MAC or
   // no fingerprint has been observed; treat 404 as "no data" rather
   // than a hard error.
+  // #2130 — fingerprints are read off DHCP traffic; with DHCP off there is
+  // nothing to read, so neither the query nor the panel is shown.
+  const dhcpOn = useModuleOn("core.dhcp");
   const fingerprintQuery = useQuery({
-    enabled: !!addr.mac_address,
+    enabled: !!addr.mac_address && dhcpOn,
     queryKey: ["dhcp-fingerprint", addr.id],
     queryFn: async () => {
       try {
@@ -1265,10 +1272,11 @@ function DeviceProfileSection({
     fingerprintQuery.data?.fingerbank_manufacturer ??
     null;
   const hasPassive =
-    !!passiveType ||
-    !!passiveClass ||
-    !!passiveManufacturer ||
-    !!fingerprintQuery.data;
+    dhcpOn &&
+    (!!passiveType ||
+      !!passiveClass ||
+      !!passiveManufacturer ||
+      !!fingerprintQuery.data);
 
   return (
     <div>
@@ -1388,9 +1396,10 @@ function DeviceProfileSection({
         if (!havePrior && !isScanning) {
           return (
             <p className="text-xs text-muted-foreground italic">
-              No active profile yet. Auto-profiling triggers on a fresh DHCP
-              lease when the subnet's "Device profiling" toggle is enabled, or
-              run one ad-hoc via the button above.
+              No active profile yet.{" "}
+              {dhcpOn
+                ? `Auto-profiling triggers on a fresh DHCP lease when the subnet's "Device profiling" toggle is enabled, or run one ad-hoc via the button above.`
+                : "Run one ad-hoc via the button above."}
             </p>
           );
         }

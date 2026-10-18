@@ -4523,6 +4523,21 @@ async def update_appliance_roles(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 f"{sorted(dns_engines)} are mutually exclusive — one DNS engine per appliance.",
             )
+        # #2130 — the DHCP role needs the DHCP module. Accepting it with
+        # ``core.dhcp`` off just moved the failure to the agent: its register
+        # call is refused (the DHCP routes are gated) and it loops. Refused
+        # here, naming the reason and the toggle. The DHCP *agent* routers
+        # stay ungated on purpose (#1068); this is the operator-facing write.
+        if "dhcp" in body.roles:
+            from app.services.feature_modules import is_module_enabled
+
+            if not await is_module_enabled(db, "core.dhcp"):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "Cannot assign the 'dhcp' role: the DHCP module (core.dhcp) is "
+                    "disabled. Enable it under Administration > Features & "
+                    "Integrations, or remove the role.",
+                )
         # Capability gate. Each requested role must be backed by the
         # supervisor's advertised cap. Skips for ``observer`` / ``custom``
         # which don't have a single-flag capability today.

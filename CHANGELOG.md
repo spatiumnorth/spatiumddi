@@ -107,6 +107,30 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Turning DHCP off now hides DHCP everywhere, and stops the `/dhcp/*`
+  calls that 404ed (#2130).** `core.dhcp` hid the DHCP sidebar but left
+  DHCP tabs, columns, settings and pickers across IPAM, Logs, Settings,
+  Dashboard and Admin, and several of them still called `/dhcp/*` and
+  failed. With DHCP off: the subnet DHCP Pools tab, the DHCP Pool column,
+  the DHCP and DDNS tabs and device-profiling toggle in the Space / Block /
+  Subnet dialogs, the Logs DHCP Activity and DHCP Audit tabs (a
+  `?tab=dhcp-activity` link lands on DNS Queries), Settings DHCP Defaults /
+  DHCP Lease Sync / Device Profiling, the Subnet Planner, IPAM Templates
+  and Services DHCP pickers, the Fleet DHCP role chip, the Cutover DHCP
+  pickers, and the DHCP rule types in the alert editor are gone, and none of
+  them reads `/dhcp/*`. The agent bootstrap keys stay. `dhcp` and
+  `static_dhcp` are no longer offered as an IP status, but an address that
+  already has one still shows it and keeps it when you edit something else.
+  A hard reload used to fire one `/dhcp` read before the module list had
+  loaded (Dashboard on the DHCP tab, Import defaulting to DHCP); both now
+  wait for it. Saving a Fleet role assignment that includes `dhcp` while
+  DHCP is off is refused with a 422 naming `core.dhcp` (it used to be
+  accepted and the agent was then refused at register); the Copilot's
+  `assign_appliance_role` follows. DDNS settings are hidden with it: they
+  only act on DHCP leases (`apply_ddns_for_lease`), never on static
+  allocations. Not done here: the New Devices block action, the `/dhcp`
+  direct-URL notice (#2129), label-only mentions, and the `core.dns` pass.
+
 - **Integration sync-interval fields no longer read `1h` as 1
   second, or turn a cleared field into the default (#2110).** The
   sync interval on the PAN-OS, UniFi, Meraki, Cloud, Docker,

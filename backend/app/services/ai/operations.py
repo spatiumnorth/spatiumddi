@@ -4019,6 +4019,14 @@ async def _apply_assign_appliance_role_locked(
     group_problem = await _assign_role_group_problem(db, args)
     if group_problem is not None:
         raise ValueError(group_problem)
+    if "dhcp" in args.roles:
+        # #2130 — same refusal as the REST route: the DHCP role needs core.dhcp.
+        from app.services.feature_modules import is_module_enabled  # noqa: PLC0415
+
+        if not await is_module_enabled(db, "core.dhcp"):
+            raise ValueError(
+                "Cannot assign the 'dhcp' role: the DHCP module (core.dhcp) is disabled."
+            )
     catalog_problem = await _assign_role_catalog_problem(db, row, args)
     if catalog_problem is not None:
         raise ValueError(catalog_problem)

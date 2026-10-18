@@ -125,6 +125,7 @@ import {
 import { BgpAdvertisedChip } from "@/components/network/bgp-lg-chips";
 import { BgpRouteMiniTable } from "@/components/network/bgp-route-table";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import {
   MODAL_BACKDROP_CLS,
   useModalDialog,
@@ -992,6 +993,7 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   const [vrfId, setVrfId] = useState<string | null>(null);
   const [asnId, setAsnId] = useState<string | null>(null);
   const [customerId, setCustomerId] = useState<string | null>(null);
+  const dhcpOn = useModuleOn("core.dhcp");
   const [tab, setTab] = useState<"dns" | "dhcp" | "networking">("dns");
 
   const mutation = useMutation({
@@ -1046,7 +1048,7 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
       <ModalTabs
         tabs={[
           { key: "dns", label: "DNS" },
-          { key: "dhcp", label: "DHCP" },
+          ...(dhcpOn ? [{ key: "dhcp" as const, label: "DHCP" }] : []),
           { key: "networking", label: "Networking" },
         ]}
         active={tab}
@@ -2571,6 +2573,7 @@ export function CreateSubnetModal({
   const [siteId, setSiteId] = useState<string | null>(null);
   // Optional template pre-fill (issue #26).
   const [templateId, setTemplateId] = useState<string>("");
+  const dhcpOn = useModuleOn("core.dhcp");
   const [tab, setTab] = useState<
     "general" | "dns" | "dhcp" | "ddns" | "advanced"
   >("general");
@@ -2902,8 +2905,8 @@ export function CreateSubnetModal({
         tabs={[
           { key: "general", label: "General" },
           { key: "dns", label: "DNS" },
-          { key: "dhcp", label: "DHCP" },
-          { key: "ddns", label: "DDNS" },
+          ...(dhcpOn ? [{ key: "dhcp" as const, label: "DHCP" }] : []),
+          ...(dhcpOn ? [{ key: "ddns" as const, label: "DDNS" }] : []),
           { key: "advanced", label: "Advanced" },
         ]}
         active={tab}
@@ -3032,15 +3035,17 @@ export function CreateSubnetModal({
 
       {tab === "advanced" && (
         <div className="space-y-4">
-          <ProfilingSettingsSection
-            enabled={autoProfileEnabled}
-            preset={autoProfilePreset}
-            refreshDays={autoProfileRefreshDays}
-            onEnabledChange={setAutoProfileEnabled}
-            onPresetChange={setAutoProfilePreset}
-            onRefreshDaysChange={setAutoProfileRefreshDays}
-          />
-          <div className="border-t pt-4">
+          {dhcpOn && (
+            <ProfilingSettingsSection
+              enabled={autoProfileEnabled}
+              preset={autoProfilePreset}
+              refreshDays={autoProfileRefreshDays}
+              onEnabledChange={setAutoProfileEnabled}
+              onPresetChange={setAutoProfilePreset}
+              onRefreshDaysChange={setAutoProfileRefreshDays}
+            />
+          )}
+          <div className={dhcpOn ? "border-t pt-4" : ""}>
             <DiscoverySettingsSection
               enabled={discoveryEnabled}
               intervalMinutes={discoveryIntervalMinutes}
@@ -3128,6 +3133,19 @@ const ALLOCATE_STATUS_OPTIONS = [
   "deprecated",
 ] as const;
 
+// ``dhcp`` / ``static_dhcp`` describe addresses a DHCP server owns, so with
+// ``core.dhcp`` off they are not offered as CHOICES (#2130). An address that
+// already carries one still shows it: callers pass its stored value through
+// ``withStoredValue`` / the ``known`` fallback below, so it stays the current
+// value and an unrelated edit does not change it.
+const DHCP_ONLY_STATUSES = new Set(["dhcp", "static_dhcp"]);
+function statusChoices<T extends string>(
+  options: readonly T[],
+  dhcpOn: boolean,
+): readonly T[] {
+  return dhcpOn ? options : options.filter((s) => !DHCP_ONLY_STATUSES.has(s));
+}
+
 // Double-click-to-change status badge on the IP table (sibling of
 // InlineEditableText). Swallows single clicks so it doesn't open the row
 // detail; commit on select, Escape/blur cancels. Disabled on read-only rows.
@@ -3141,12 +3159,11 @@ function InlineStatusSelect({
   onSave: (next: string) => void;
 }) {
   const [editing, setEditing] = useState(false);
+  const dhcpOn = useModuleOn("core.dhcp");
   if (disabled) return <StatusBadge status={status} />;
   if (editing) {
-    const known = (IP_STATUS_OPTIONS as readonly string[]).includes(status);
-    const opts = known
-      ? (IP_STATUS_OPTIONS as readonly string[])
-      : [status, ...IP_STATUS_OPTIONS];
+    const choices: readonly string[] = statusChoices(IP_STATUS_OPTIONS, dhcpOn);
+    const opts = choices.includes(status) ? choices : [status, ...choices];
     return (
       <select
         autoFocus
@@ -3825,7 +3842,7 @@ export function AddAddressModal({
               value={ipStatus}
               onChange={(e) => setIpStatus(e.target.value)}
             >
-              {ALLOCATE_STATUS_OPTIONS.map((s) => (
+              {statusChoices(ALLOCATE_STATUS_OPTIONS, dhcpOn).map((s) => (
                 <option key={s} value={s}>
                   {s}
                 </option>
@@ -4097,6 +4114,23 @@ function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
 // ``HeaderMenu`` under components/ui/ and this became a description of
 // the items. Behaviourally identical, plus the keyboard handling the
 // local copy never had.
+// The IP table's columns. ``pool`` reads DHCP pool membership, so with
+// ``core.dhcp`` off it is dropped altogether — header, filter and cell
+// (#2130). Every consumer takes this list, so they cannot disagree.
+const ADDRESS_COLUMNS = [
+  "address",
+  "hostname",
+  "mac",
+  "description",
+  "tags",
+  "status",
+  "pool",
+  "dns",
+] as const;
+function addressColumns(dhcpOn: boolean) {
+  return ADDRESS_COLUMNS.filter((c) => dhcpOn || c !== "pool");
+}
+
 function SyncMenu({
   onSyncDns,
   onSyncDhcp,
@@ -4628,7 +4662,7 @@ type AddressOrPoolRow =
 
 // ─── Subnet Detail Panel (right pane) ────────────────────────────────────────
 
-function SubnetDetail({
+export function SubnetDetail({
   subnet,
   spaceName,
   block,
@@ -4949,6 +4983,12 @@ function SubnetDetail({
   // reload before the real state is known.
   const { enabled: dhcpFeature, ready: dhcpFeatureReady } = useFeatureModules();
   const dhcpOn = dhcpFeatureReady && dhcpFeature("core.dhcp");
+  // A DHCP tab left selected when the module goes off (or a restored
+  // selection) falls back to the address list rather than a blank pane.
+  useEffect(() => {
+    if (dhcpFeatureReady && !dhcpOn && activeSubnetTab === "dhcp")
+      setActiveSubnetTab("addresses");
+  }, [dhcpFeatureReady, dhcpOn, activeSubnetTab]);
   const { data: dhcpScopes = [] } = useQuery({
     queryKey: ["dhcp-scopes-subnet", subnet.id],
     queryFn: () => dhcpApi.listScopesBySubnet(subnet.id),
@@ -5452,7 +5492,7 @@ function SubnetDetail({
               Refresh
             </HeaderButton>
             <SyncMenu
-              hasDhcp={dhcpScopes.length > 0}
+              hasDhcp={dhcpOn && dhcpScopes.length > 0}
               onSyncDns={() => setShowDnsSync(true)}
               onSyncDhcp={() => setShowDhcpSync(true)}
               onSyncAll={() => setShowSyncAll(true)}
@@ -5714,17 +5754,19 @@ function SubnetDetail({
           >
             IP Addresses
           </button>
-          <button
-            onClick={() => setActiveSubnetTab("dhcp")}
-            className={cn(
-              "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
-              activeSubnetTab === "dhcp"
-                ? "border-primary text-foreground"
-                : "border-transparent text-muted-foreground hover:text-foreground",
-            )}
-          >
-            DHCP Pools
-          </button>
+          {dhcpOn && (
+            <button
+              onClick={() => setActiveSubnetTab("dhcp")}
+              className={cn(
+                "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+                activeSubnetTab === "dhcp"
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground",
+              )}
+            >
+              DHCP Pools
+            </button>
+          )}
           <button
             onClick={() => setActiveSubnetTab("aliases")}
             className={cn(
@@ -5822,7 +5864,7 @@ function SubnetDetail({
         </div>
       </div>
 
-      {activeSubnetTab === "dhcp" && (
+      {activeSubnetTab === "dhcp" && dhcpOn && (
         <div className="flex-1 overflow-auto">
           <DHCPSubnetPanel subnetId={subnet.id} />
         </div>
@@ -6029,18 +6071,7 @@ function SubnetDetail({
                           );
                         })()}
                       </th>
-                      {(
-                        [
-                          "address",
-                          "hostname",
-                          "mac",
-                          "description",
-                          "tags",
-                          "status",
-                          "pool",
-                          "dns",
-                        ] as const
-                      ).map((col) => {
+                      {addressColumns(dhcpOn).map((col) => {
                         const label =
                           col === "mac"
                             ? "MAC"
@@ -6137,18 +6168,7 @@ function SubnetDetail({
                     {showFilters && (
                       <tr className="border-b bg-muted/10 text-xs">
                         <td />
-                        {(
-                          [
-                            "address",
-                            "hostname",
-                            "mac",
-                            "description",
-                            "tags",
-                            "status",
-                            "pool",
-                            "dns",
-                          ] as const
-                        ).map((col) => (
+                        {addressColumns(dhcpOn).map((col) => (
                           <td key={col} className="px-2 py-1">
                             {col === "status" ? (
                               <select
@@ -6648,41 +6668,43 @@ function SubnetDetail({
                                   ) : null}
                                 </span>
                               </td>
-                              <td className="px-4 py-2">
-                                {(() => {
-                                  // A static reservation sits outside every
-                                  // dynamic pool (validation forbids overlap),
-                                  // so the range match below never hits and the
-                                  // cell would read "—" for a DHCP-managed IP.
-                                  // Label it explicitly.
-                                  if (addr.status === "static_dhcp")
+                              {dhcpOn && (
+                                <td className="px-4 py-2">
+                                  {(() => {
+                                    // A static reservation sits outside every
+                                    // dynamic pool (validation forbids overlap),
+                                    // so the range match below never hits and the
+                                    // cell would read "—" for a DHCP-managed IP.
+                                    // Label it explicitly.
+                                    if (addr.status === "static_dhcp")
+                                      return (
+                                        <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400">
+                                          Reservation
+                                        </span>
+                                      );
+                                    const pi = ipPoolInfo(addr);
+                                    if (!pi)
+                                      return (
+                                        <span className="text-muted-foreground/40">
+                                          —
+                                        </span>
+                                      );
+                                    const cls =
+                                      pi.type === "dynamic"
+                                        ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
+                                        : pi.type === "reserved"
+                                          ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
+                                          : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
                                     return (
-                                      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400">
-                                        Reservation
+                                      <span
+                                        className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
+                                      >
+                                        {pi.name}
                                       </span>
                                     );
-                                  const pi = ipPoolInfo(addr);
-                                  if (!pi)
-                                    return (
-                                      <span className="text-muted-foreground/40">
-                                        —
-                                      </span>
-                                    );
-                                  const cls =
-                                    pi.type === "dynamic"
-                                      ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
-                                      : pi.type === "reserved"
-                                        ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
-                                        : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
-                                  return (
-                                    <span
-                                      className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
-                                    >
-                                      {pi.name}
-                                    </span>
-                                  );
-                                })()}
-                              </td>
+                                  })()}
+                                </td>
+                              )}
                               <td className="px-4 py-2">
                                 {dnsState === "in-sync" ? (
                                   <span
@@ -7889,6 +7911,7 @@ export function EditSubnetModal({
     | "ddns"
     | "advanced"
     | "danger";
+  const dhcpOn = useModuleOn("core.dhcp");
   const [tab, setTab] = useState<SubnetEditTab>("general");
 
   // Detect whether network/broadcast records currently exist
@@ -8178,8 +8201,8 @@ export function EditSubnetModal({
   const tabsList: { key: SubnetEditTab; label: string }[] = [
     { key: "general", label: "General" },
     { key: "dns", label: "DNS" },
-    { key: "dhcp", label: "DHCP" },
-    { key: "ddns", label: "DDNS" },
+    ...(dhcpOn ? [{ key: "dhcp" as const, label: "DHCP" }] : []),
+    ...(dhcpOn ? [{ key: "ddns" as const, label: "DDNS" }] : []),
     { key: "advanced", label: "Advanced" },
   ];
   if (onDeleted) {
@@ -8363,15 +8386,17 @@ export function EditSubnetModal({
 
       {tab === "advanced" && (
         <div className="space-y-4">
-          <ProfilingSettingsSection
-            enabled={autoProfileEnabled}
-            preset={autoProfilePreset}
-            refreshDays={autoProfileRefreshDays}
-            onEnabledChange={setAutoProfileEnabled}
-            onPresetChange={setAutoProfilePreset}
-            onRefreshDaysChange={setAutoProfileRefreshDays}
-          />
-          <div className="border-t pt-4">
+          {dhcpOn && (
+            <ProfilingSettingsSection
+              enabled={autoProfileEnabled}
+              preset={autoProfilePreset}
+              refreshDays={autoProfileRefreshDays}
+              onEnabledChange={setAutoProfileEnabled}
+              onPresetChange={setAutoProfilePreset}
+              onRefreshDaysChange={setAutoProfileRefreshDays}
+            />
+          )}
+          <div className={dhcpOn ? "border-t pt-4" : ""}>
             <DiscoverySettingsSection
               enabled={discoveryEnabled}
               intervalMinutes={discoveryIntervalMinutes}
@@ -9216,7 +9241,10 @@ export function EditAddressModal({
             value={status}
             onChange={(e) => setStatus(e.target.value)}
           >
-            {withStoredValue(ADDRESS_STATUSES, address.status).map((s) => (
+            {withStoredValue(
+              statusChoices(ADDRESS_STATUSES, dhcpOn),
+              address.status,
+            ).map((s) => (
               <option key={s} value={s}>
                 {s}
               </option>
@@ -10196,6 +10224,7 @@ function BulkEditAddressesModal({
   onDone: () => void;
 }) {
   const qc = useQueryClient();
+  const dhcpOn = useModuleOn("core.dhcp");
   const [editStatus, setEditStatus] = useState(false);
   const [status, setStatus] = useState<string>("allocated");
   const [editDescription, setEditDescription] = useState(false);
@@ -10409,13 +10438,16 @@ function BulkEditAddressesModal({
               value={status}
               onChange={(e) => setStatus(e.target.value)}
             >
-              {[
-                "available",
-                "allocated",
-                "reserved",
-                "static_dhcp",
-                "deprecated",
-              ].map((s) => (
+              {statusChoices(
+                [
+                  "available",
+                  "allocated",
+                  "reserved",
+                  "static_dhcp",
+                  "deprecated",
+                ],
+                dhcpOn,
+              ).map((s) => (
                 <option key={s} value={s}>
                   {s}
                 </option>
@@ -11366,6 +11398,7 @@ export function EditSpaceModal({
   const [doNotProbeReason, setDoNotProbeReason] = useState(
     space.do_not_probe_reason ?? "",
   );
+  const dhcpOn = useModuleOn("core.dhcp");
   const [tab, setTab] = useState<"dns" | "dhcp" | "networking" | "danger">(
     "dns",
   );
@@ -11566,7 +11599,7 @@ export function EditSpaceModal({
       <ModalTabs
         tabs={[
           { key: "dns", label: "DNS" },
-          { key: "dhcp", label: "DHCP" },
+          ...(dhcpOn ? [{ key: "dhcp" as const, label: "DHCP" }] : []),
           { key: "networking", label: "Networking" },
           { key: "danger", label: "Danger zone" },
         ]}
@@ -11820,6 +11853,7 @@ export function CreateBlockModal({
   const [siteId, setSiteId] = useState<string | null>(null);
   // Optional template pre-fill (issue #26).
   const [templateId, setTemplateId] = useState<string>("");
+  const dhcpOn = useModuleOn("core.dhcp");
   const [tab, setTab] = useState<"general" | "dns" | "dhcp" | "networking">(
     "general",
   );
@@ -11946,7 +11980,7 @@ export function CreateBlockModal({
         tabs={[
           { key: "general", label: "General" },
           { key: "dns", label: "DNS" },
-          { key: "dhcp", label: "DHCP" },
+          ...(dhcpOn ? [{ key: "dhcp" as const, label: "DHCP" }] : []),
           { key: "networking", label: "Networking" },
         ]}
         active={tab}
@@ -12139,6 +12173,7 @@ export function EditBlockModal({
   const [doNotProbeReason, setDoNotProbeReason] = useState(
     block.do_not_probe_reason ?? "",
   );
+  const dhcpOn = useModuleOn("core.dhcp");
   const [tab, setTab] = useState<
     "general" | "dns" | "dhcp" | "networking" | "danger"
   >("general");
@@ -12386,7 +12421,7 @@ export function EditBlockModal({
         tabs={[
           { key: "general", label: "General" },
           { key: "dns", label: "DNS" },
-          { key: "dhcp", label: "DHCP" },
+          ...(dhcpOn ? [{ key: "dhcp" as const, label: "DHCP" }] : []),
           { key: "networking", label: "Networking" },
           { key: "danger", label: "Danger zone" },
         ]}
