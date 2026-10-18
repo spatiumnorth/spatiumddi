@@ -1680,8 +1680,10 @@ async def _dns_import_pull(db: AsyncSession, args: CommitDNSImportArgs) -> Any:
         target_view_id=args.target_view_id,
     )
     from app.services.dns_import.apex_ns import annotate_apex_ns  # noqa: PLC0415
+    from app.services.dns_import.cname_check import annotate_cname_conflicts  # noqa: PLC0415
 
     await annotate_apex_ns(db, preview, args.target_group_id)
+    annotate_cname_conflicts(preview)
     return preview
 
 

@@ -6554,7 +6554,12 @@ export const dnsApi = {
   importZonePreview: (
     groupId: string,
     zoneId: string,
-    data: { zone_file: string; zone_name?: string; view_id?: string | null },
+    data: {
+      zone_file: string;
+      zone_name?: string;
+      view_id?: string | null;
+      conflict_strategy?: "merge" | "replace" | "append";
+    },
   ) =>
     api
       .post<DNSImportPreview>(
@@ -6661,6 +6666,7 @@ export interface DNSImportPreview {
   unchanged: DNSRecordChange[];
   soa_detected: boolean;
   record_count: number;
+  skipped: string[];
 }
 
 export interface DNSImportCommit {

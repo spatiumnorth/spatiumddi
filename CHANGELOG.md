@@ -84,6 +84,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DNS import no longer stores a CNAME beside other data, or at the
+  zone apex (#2089).** The record API refuses both (#1381); the importers
+  stored them anyway, so the server then refused the zone (BIND's "CNAME
+  and other data", PowerDNS's "Conflicts with pre-existing RRset") while
+  the import reported success. The zone-file import into an existing zone
+  and the BIND9, Windows, PowerDNS, Technitium and cloud importers now
+  apply the same rule, through the shared `cname_conflict` module. The
+  preview lists each record that will not be imported, with its reason
+  (`skipped` on the zone-file preview, a warning on the others), and the
+  commit skips it and says so in its result; the rest of the import still
+  lands. A clash within the imported set keeps the non-CNAME data and drops
+  the CNAME (the first of several CNAMEs is kept); a clash with a record
+  already in the zone keeps the existing record. Records are compared per
+  view, a record with no view counting in every view. The zone-file preview
+  now takes `conflict_strategy`, since a `replace` frees the names of the
+  records it deletes.
+
 - **Fleet no longer reports `ssh: retrying` forever after managed SSH is
   turned off (#2053).** The supervisor's fire-state reader stripped the
   leading tab of an empty-hash line (`\t1\t<iso>`, written when a plane
