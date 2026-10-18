@@ -275,6 +275,24 @@ header.
 
 Alembic is idempotent, so re-running the migrate Job is always safe.
 
+**GitOps with `helm template` (Argo CD).** A controller that renders with
+`helm template` always sees revision `1`, so the Job is `<release>-migrate-r1` on every sync,
+and the first image bump fails with `spec.template: field is immutable`. Set
+`migrate.annotations` to make the Job a sync hook that is deleted and recreated
+on every sync:
+
+```yaml
+migrate:
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+```
+
+`helm template` also defeats the chart's `lookup()`, so generated secrets change
+on every render. Pre-create them and set the matching `existingSecret` values;
+the [chart README](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#gitops-with-helm-template-argo-cd)
+lists which keys each Secret needs.
+
 ---
 
 ## 5. Replicas, resources, and autoscaling
