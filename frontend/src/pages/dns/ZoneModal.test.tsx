@@ -279,6 +279,57 @@ describe("the zone dialog's Primary NS (#2075)", () => {
   });
 });
 
+describe("Default TTL field (#2073 / #2074)", () => {
+  const ttlInput = () =>
+    screen.getByPlaceholderText("3600") as HTMLInputElement;
+
+  it("is a bounded numeric input", () => {
+    groups = [{ id: "grp-1", server_drivers: ["bind9"] }];
+    open();
+    expect(ttlInput().type).toBe("number");
+    expect(ttlInput().min).toBe("0");
+    expect(ttlInput().max).toBe("2147483647");
+  });
+
+  // A number input never holds "1h": the browser drops it, leaving the field
+  // empty, which is refused rather than sent as 1 (or NaN → null).
+  it.each([["-1"], ["1.5"], [""], ["1h"]])(
+    "refuses %j with a reason and sends nothing",
+    async (typed) => {
+      open();
+      typeName("ttl.example.com");
+      fireEvent.change(ttlInput(), { target: { value: typed } });
+      fireEvent.submit(control("Kind").form!);
+      await screen.findByText(/^Default TTL (must be|is required)/);
+      expect(createZone).not.toHaveBeenCalled();
+    },
+  );
+
+  it("sends 1e3 as 1000, not 1", async () => {
+    open();
+    typeName("ttl.example.com");
+    fireEvent.change(ttlInput(), { target: { value: "1e3" } });
+    await save();
+    expect(createZone.mock.calls[0][1]).toMatchObject({ ttl: 1000 });
+  });
+});
+
+describe("a zone with both a bad Default TTL and a bad Primary NS", () => {
+  it("refuses, naming both reasons, and sends nothing", async () => {
+    open();
+    typeName("both.example.test");
+    fireEvent.change(control("Primary NS"), { target: { value: "ns1" } });
+    fireEvent.change(screen.getByPlaceholderText("3600"), {
+      target: { value: "-1" },
+    });
+    fireEvent.submit(control("Kind").form!);
+    await screen.findByText(
+      /^Primary NS must be a fully qualified host name.*; Default TTL must be a whole number/,
+    );
+    expect(createZone).not.toHaveBeenCalled();
+  });
+});
+
 describe("zoneKindForName", () => {
   it.each([
     ["81.98.10.in-addr.arpa", "reverse"],

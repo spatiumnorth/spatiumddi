@@ -114,7 +114,13 @@ import {
   type ResolverPreset,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
-import { fqdnError, recordOwnerError, zoneKindForName } from "@/lib/dnsNames";
+import {
+  DNS_TTL_MAX,
+  fqdnError,
+  parseTtlInput,
+  recordOwnerError,
+  zoneKindForName,
+} from "@/lib/dnsNames";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -2628,8 +2634,19 @@ export function ZoneModal({
   function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
-    if (primaryNsBlocks) {
-      setError(primaryNsErr ?? "");
+    // Both checks run, so a zone wrong in two ways names both reasons at
+    // once instead of making the operator fix one to discover the other.
+    const problems: string[] = [];
+    // #2075 — a Primary NS that is not a host name stops BIND loading the
+    // zone; a stored legacy value saved unchanged is let through (flagged).
+    if (primaryNsBlocks && primaryNsErr) problems.push(primaryNsErr);
+    // #2073 / #2074 — the hidden field (technitium_api) keeps its default.
+    const zoneTtl = parseTtlInput(ttl);
+    if (zoneTtl === null || typeof zoneTtl === "string") {
+      problems.push(`Default TTL ${zoneTtl ?? "is required"}`);
+    }
+    if (problems.length > 0 || typeof zoneTtl !== "number") {
+      setError(`${problems.join("; ")}.`);
       return;
     }
     const payload: Record<string, unknown> = {
@@ -2639,7 +2656,7 @@ export function ZoneModal({
       view_id: viewId || null,
       primary_ns: primaryNs,
       admin_email: adminEmail,
-      ttl: parseInt(ttl, 10),
+      ttl: zoneTtl,
       color,
       domain_id: domainId,
       customer_id: customerId,
@@ -2857,6 +2874,10 @@ export function ZoneModal({
           {!technitiumApi && (
             <Field label="Default TTL (seconds)">
               <input
+                type="number"
+                min={0}
+                max={DNS_TTL_MAX}
+                step={1}
                 className={inputCls}
                 value={ttl}
                 onChange={(e) => setTtl(e.target.value)}
@@ -3044,11 +3065,16 @@ function RecordModal({
       setError("SRV records require priority, weight, and port.");
       return;
     }
+    const recordTtl = parseTtlInput(ttl);
+    if (typeof recordTtl === "string") {
+      setError(`TTL ${recordTtl}.`);
+      return;
+    }
     mut.mutate({
       name,
       record_type: type,
       value,
-      ttl: ttl ? parseInt(ttl, 10) : null,
+      ttl: recordTtl,
       // Only send the structured fields the type actually uses, so the API
       // never sees a stray weight/port on a non-SRV record.
       priority: usesPriority && priority !== "" ? parseInt(priority, 10) : null,
@@ -3212,6 +3238,10 @@ function RecordModal({
         <div className="grid grid-cols-2 gap-3">
           <Field label="TTL (leave blank for zone default)">
             <input
+              type="number"
+              min={0}
+              max={DNS_TTL_MAX}
+              step={1}
               className={inputCls}
               value={ttl}
               onChange={(e) => setTtl(e.target.value)}
