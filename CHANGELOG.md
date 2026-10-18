@@ -109,6 +109,22 @@ the formatter handles the rest.
   record left in an extra zone under an old name becomes an alias: it
   keeps answering and can be deleted from the alias list.
 
+- **Registering a DNS agent no longer deadlocks against the render of
+  its first bundle (#2031).** The worker's bundle store wrote the
+  server row in two UPDATEs, and Postgres re-runs a row's foreign-key
+  checks on a second UPDATE of a version the transaction itself wrote,
+  so the render's second write took `FOR KEY SHARE` on the server's
+  group (and appliance) row. Registration's SOA-timer switch held the
+  group row `FOR UPDATE` and, marking the group's bundles at commit,
+  queued for the server row behind the render's first write: 40P01.
+  The switch lost, logged `dns_group_soa_timers_failed` and only ran
+  again at the agent's first heartbeat. The store now writes the server
+  row in one statement, so the render never waits on a parent row (this
+  also covers a group rename and an appliance role save, which hold
+  those rows `FOR UPDATE` for a reason a lock strength cannot change),
+  and the switch locks the group and its zones `FOR NO KEY UPDATE`, the
+  strength of the write it makes.
+
 - **A zone's Primary NS must be a host name, or it is refused (#2075).**
   The zone dialog stored `ns_1.<zone>.` or a 64-character label as typed
   and answered 201; the BIND9 agent then wrote it as the SOA MNAME, named's
@@ -5786,12 +5802,6 @@ the formatter handles the rest.
 
 ### Migrations
 
-- `b3d7f1a82c54` — #2084, schema + data: adds
-  `dns_record.ip_alias` (NOT NULL, default false) and backfills it.
-  Among auto-generated CNAME / A / AAAA rows tied to an address, an
-  A / AAAA named like the address's hostname in its forward or an extra
-  zone (or the row `ip_address.dns_record_id` names) stays false; the
-  rest are aliases. Downgrade drops the column.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column
@@ -5885,6 +5895,12 @@ the formatter handles the rest.
   zone it belonged to, so NULL stays. Downgrade drops the column.
 - `a2078c5e1d90` — #2078, adds nullable `dns_server.agent_version`
   (String(64)); no backfill, NULL means the agent has not reported one.
+- `b3d7f1a82c54` — #2084, schema + data: adds
+  `dns_record.ip_alias` (NOT NULL, default false) and backfills it.
+  Among auto-generated CNAME / A / AAAA rows tied to an address, an
+  A / AAAA named like the address's hostname in its forward or an extra
+  zone (or the row `ip_address.dns_record_id` names) stays false; the
+  rest are aliases. Downgrade drops the column.
 
 ## 2026.10.02-1 — 2026-10-02
 
