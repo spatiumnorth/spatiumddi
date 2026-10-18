@@ -84,6 +84,27 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DNS import no longer stores a CNAME beside other data, or at the
+  zone apex (#2089).** The record API refuses both (#1381); the importers
+  stored them anyway, so the server then refused the zone (BIND's "CNAME
+  and other data", PowerDNS's "Conflicts with pre-existing RRset") while
+  the import reported success. The zone-file import into an existing zone
+  and the BIND9, Windows, PowerDNS, Technitium and cloud importers now
+  apply the same rule, through the shared `cname_conflict` module. The
+  preview lists each record that will not be imported, with its reason
+  (`skipped` on the zone-file preview, a warning on the others), and the
+  commit skips it and says so in its result; the rest of the import still
+  lands. A clash within the imported set keeps the non-CNAME data and drops
+  the CNAME (the first of several CNAMEs is kept); a clash with a record
+  already in the zone keeps the existing record. Records are compared per
+  view, a record with no view counting in every view. The zone-file preview
+  now takes `conflict_strategy` (default `merge`, so an older client is
+  unaffected), since a `replace` frees the names of the records it deletes.
+  Records in the trash do not count; IPAM-generated records do. A record the
+  commit already drops for a control character no longer costs the CNAME at
+  its name its place. The Copilot's import preview says how many records will
+  not be imported, and its commit reports them.
+
 - **Bulk allocate refuses a hostname template whose names are not host
   names (#2071).** `web{n}-` produced `web1-` / `web2-` and
   `web{n:_}` produced `web1_000`; preview and commit accepted them, the
