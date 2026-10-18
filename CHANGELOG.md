@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A zone's Primary NS must be a host name, or it is refused (#2075).**
+  The zone dialog stored `ns_1.<zone>.` or a 64-character label as typed
+  and answered 201; the BIND9 agent then wrote it as the SOA MNAME, named's
+  check-names refused the zone, and the server row went `reverted` with the
+  zone never served. A single label such as `ns1` was stored too, and served
+  as a name at the root rather than under the zone. Zone create (REST and the
+  dialog), the Copilot's `create_dns_zone` and the zone importers now apply
+  the host-name rule: letters, digits and hyphens, at most 63 per label and
+  253 in all, at least two labels, trailing dot optional; empty still means
+  "use the zone's NS". A zone **update** refuses only a changed value, so a
+  zone stored before this stays editable by a save that re-sends it (the
+  dialog shows a warning under the field until it is changed). The importer leaves an
+  unservable source MNAME unset and says so in the commit warnings. On BIND9
+  a stored value of that kind no longer stops the group: the agent serves the
+  zone's first apex NS record, or the `ns1.<zone>` placeholder, as the SOA
+  primary name and logs `unusable_field`. The responsible-person name is
+  unchanged, since a mailbox is not a host.
+
 - **Allocate IP no longer stores a hostname whose name in its zone
   passes 253 characters (#2072).** A 243-character hostname is valid
   alone, but IPAM publishes `<hostname>.<zone>`, and the length cap

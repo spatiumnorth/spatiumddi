@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import bind_check_names_error
+from app.core.dns_names import bind_check_names_error, primary_ns_error
 from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, Subnet
@@ -2363,6 +2363,18 @@ class CreateDNSZoneArgs(BaseModel):
         default="",
         description="Primary nameserver FQDN (e.g. ``ns1.example.com.``). Recommended.",
     )
+
+    @field_validator("primary_ns")
+    @classmethod
+    def _primary_ns_is_host_name(cls, v: str) -> str:
+        # #2075 — same rule as the REST zone create: BIND refuses a zone
+        # whose SOA primary name is not a host name. A host name carries no
+        # zone-file syntax, so this also covers the #597 injection guard.
+        err = primary_ns_error(v)
+        if err is not None:
+            raise ValueError(f"Primary NS (primary_ns) {err}")
+        return v
+
     admin_email: str = Field(
         default="",
         description="Zone admin email rendered into SOA RNAME (e.g. ``hostmaster@example.com``).",

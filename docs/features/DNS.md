@@ -624,7 +624,9 @@ DNSZone
                                   --   zone under in-addr.arpa / ip6.arpa is reverse (#1310)
   ttl (default SOA TTL)
   refresh, retry, expire, minimum (SOA fields)
-  primary_ns, admin_email         (SOA fields)
+  primary_ns, admin_email         (SOA fields; primary_ns is a fully qualified
+                                  --   host name, trailing dot optional, or empty
+                                  --   for "use the zone's NS" (#2075))
   is_auto_generated: bool         -- created automatically for a subnet
   linked_subnet_id (nullable FK)  -- if reverse zone, tied to a subnet
   dnssec_enabled: bool
