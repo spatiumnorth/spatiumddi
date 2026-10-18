@@ -766,12 +766,12 @@ async def compute_subnet_dns_drift(
 
     # #2107 — an address with ``extra_zone_ids`` also publishes its host record
     # into each of those zones IPAM authors, so it is checked in every one.
+    # Every zone any address lists is loaded in one query for the subnet, the
+    # subnet's own zone included: which zone is an address's primary is
+    # decided per address in the walk below, not here.
     primary_id = forward_zone.id if forward_zone else None
     wanted_extra_ids = {
-        z
-        for ip_row in ips
-        for z in forward_zone_ids_in_order(primary_id, ip_row.extra_zone_ids)
-        if z != primary_id
+        z for ip_row in ips for z in forward_zone_ids_in_order(None, ip_row.extra_zone_ids)
     }
     extra_zones_by_id: dict[uuid.UUID, DNSZone] = {}
     if wanted_extra_ids:

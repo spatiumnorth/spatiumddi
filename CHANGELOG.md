@@ -93,7 +93,10 @@ the formatter handles the rest.
   now checked in all of its zones, using the same zone list the sync
   writes, so a correct record is in sync, a missing one is listed as
   missing in its zone, and a wrong one as mismatched with that zone
-  named. A zone IPAM does not author still takes no record.
+  named. A zone IPAM does not author still takes no record. In the
+  Sync DNS dialog, an address missing its record in more than one zone
+  now lists one row per zone, each ticked on its own; the rows used to
+  share a key, so they toggled together.
 
 - **Editing an IP no longer renames or deletes its own A aliases, and
   the alias lists no longer show a host record as an alias (#2084).**
