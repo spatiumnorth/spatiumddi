@@ -84,6 +84,28 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Allocate IP no longer stores a hostname whose name in its zone
+  passes 253 characters (#2072).** A 243-character hostname is valid
+  alone, but IPAM publishes `<hostname>.<zone>`, and the length cap
+  only looked at the hostname. The allocate answered 201, the A record
+  was queued, and BIND refused both the forward zone and the reverse
+  zone holding the PTR ("ran out of space"), so every later change to
+  either waited behind it. The limit is now applied to the whole name
+  (253 characters of dotted form, 255 octets on the wire, each label
+  63 at most) by one shared helper in `core/dns_names.py`. Allocate IP,
+  edit IP, bulk allocate and bulk edit DNS zone answer 422 naming
+  `hostname` and the length it would reach, storing nothing. The DNS
+  record API and the copilot apply it to a record's owner and to a
+  CNAME / MX / NS / SRV / PTR / DNAME target too. A subnet's Sync DNS
+  lists the address under its errors instead of counting it as synced.
+  DDNS, importers and DHCP static reservations never fail a lease or a
+  batch: they publish nothing for the over-long name, retract the A and
+  PTR an earlier name had published, and log `ipam_dns_name_too_long`.
+  The Allocate IP dialog shows the same reason as you type. Nothing is
+  ever truncated. A record already stored too long holds back only its
+  own zones on the agent, as before; shorten the hostname or delete the
+  record to release them.
+
 - **A DNS import no longer stores a CNAME beside other data, or at the
   zone apex (#2089).** The record API refuses both (#1381); the importers
   stored them anyway, so the server then refused the zone (BIND's "CNAME

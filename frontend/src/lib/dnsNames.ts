@@ -58,6 +58,22 @@ export function hostnameError(name: string): string | null {
   return null;
 }
 
+/**
+ * Whether `<hostname>.<zone>` fits a DNS name (issue #2072): at most 253
+ * characters of dotted presentation form (255 octets on the wire), the
+ * whole name and not just the hostname. Mirrors `name_in_zone_error` in
+ * `app/core/dns_names.py`.
+ */
+export function nameInZoneError(host: string, zone: string): string | null {
+  const h = host.trim().replace(/\.+$/, "");
+  const z = zone.trim().replace(/\.+$/, "");
+  if (!h || !z) return null;
+  const full = `${h}.${z}`;
+  if (full.length > MAX_NAME_LEN)
+    return `"${h.length > 40 ? h.slice(0, 37) + "..." : h}" in zone "${z}" makes a ${full.length}-character name; a DNS name holds at most ${MAX_NAME_LEN}. Shorten the hostname or choose another zone.`;
+  return null;
+}
+
 /** Validate a DNS record owner (RFC 2181 — permits `_`, leftmost `*`, and `@`). */
 export function recordOwnerError(name: string): string | null {
   const raw = name.trim();
