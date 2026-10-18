@@ -33,6 +33,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Shown in the create modal so operators know what to run on their
@@ -425,7 +426,7 @@ function ClusterModal({
   const [podCidr, setPodCidr] = useState(cluster?.pod_cidr ?? "");
   const [serviceCidr, setServiceCidr] = useState(cluster?.service_cidr ?? "");
   const [syncInterval, setSyncInterval] = useState(
-    cluster?.sync_interval_seconds ?? 60,
+    String(cluster?.sync_interval_seconds ?? 60),
   );
   const [mirrorPods, setMirrorPods] = useState(cluster?.mirror_pods ?? false);
   const [showGuide, setShowGuide] = useState(!editing);
@@ -491,7 +492,7 @@ function ClusterModal({
           dns_group_id: dnsGroupId || null,
           pod_cidr: podCidr,
           service_cidr: serviceCidr,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
           mirror_pods: mirrorPods,
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
@@ -512,7 +513,7 @@ function ClusterModal({
         dns_group_id: dnsGroupId || null,
         pod_cidr: podCidr,
         service_cidr: serviceCidr,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
         mirror_pods: mirrorPods,
       };
       return kubernetesApi.createCluster(create);
@@ -533,6 +534,17 @@ function ClusterModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -735,7 +747,7 @@ function ClusterModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
