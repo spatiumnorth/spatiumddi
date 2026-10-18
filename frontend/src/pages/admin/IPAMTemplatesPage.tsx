@@ -13,6 +13,7 @@ import {
 import { Modal } from "@/components/ui/modal";
 import { parseTtlInput } from "@/lib/dnsNames";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { useModuleOn } from "@/hooks/useModuleOn";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -166,9 +167,12 @@ function TemplateEditor({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
   });
+  // #2130 — no DHCP server groups to pick while core.dhcp is off.
+  const dhcpOn = useModuleOn("core.dhcp");
   const dhcpGroupsQ = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
+    enabled: dhcpOn,
   });
 
   function set<K extends keyof TemplateForm>(key: K, v: TemplateForm[K]) {
@@ -331,23 +335,25 @@ function TemplateEditor({
                   ))}
                 </select>
               </div>
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  DHCP server group
-                </label>
-                <select
-                  value={form.dhcp_group_id}
-                  onChange={(e) => set("dhcp_group_id", e.target.value)}
-                  className={inputCls}
-                >
-                  <option value="">— none —</option>
-                  {(dhcpGroupsQ.data ?? []).map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {dhcpOn && (
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    DHCP server group
+                  </label>
+                  <select
+                    value={form.dhcp_group_id}
+                    onChange={(e) => set("dhcp_group_id", e.target.value)}
+                    className={inputCls}
+                  >
+                    <option value="">— none —</option>
+                    {(dhcpGroupsQ.data ?? []).map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-muted-foreground">
@@ -565,6 +571,7 @@ function ReapplyConfirmModal({
 }
 
 export function IPAMTemplatesPage() {
+  const dhcpOn = useModuleOn("core.dhcp");
   // #1341 — a read-only user is offered no write it would be refused:
   // the router asks write (delete) on 'manage_ipam_templates'.
   const perms = usePermissions();
@@ -743,7 +750,7 @@ export function IPAMTemplatesPage() {
                 <th className="px-3 py-2">Name</th>
                 <th className="px-3 py-2">Applies to</th>
                 <th className="px-3 py-2">DNS group</th>
-                <th className="px-3 py-2">DHCP group</th>
+                {dhcpOn && <th className="px-3 py-2">DHCP group</th>}
                 <th className="px-3 py-2">Children</th>
                 <th className="px-3 py-2">Applied</th>
                 <th className="px-3 py-2 text-right">Actions</th>
@@ -786,9 +793,11 @@ export function IPAMTemplatesPage() {
                   <td className="px-3 py-2 text-xs font-mono">
                     {t.dns_group_id ? t.dns_group_id.slice(0, 8) : "—"}
                   </td>
-                  <td className="px-3 py-2 text-xs font-mono">
-                    {t.dhcp_group_id ? t.dhcp_group_id.slice(0, 8) : "—"}
-                  </td>
+                  {dhcpOn && (
+                    <td className="px-3 py-2 text-xs font-mono">
+                      {t.dhcp_group_id ? t.dhcp_group_id.slice(0, 8) : "—"}
+                    </td>
+                  )}
                   <td className="px-3 py-2 text-xs">
                     {t.child_layout?.children?.length ?? 0}
                   </td>
