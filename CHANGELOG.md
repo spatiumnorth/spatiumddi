@@ -84,6 +84,195 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS server shows the version its agent actually runs
+  (#2078).** The DNS agent registered with a literal
+  `"2026.04.14.1"` that nothing rewrote, and the control plane
+  seeded the operator's `notes` with it (`agent v2026.04.14.1`)
+  and kept no version anywhere else; the heartbeat's
+  `agent_version` was accepted and dropped. The agent now sends
+  its stamped release, the register and heartbeat handlers store
+  it in a new `dns_server.agent_version`, the server response
+  carries it, the server detail dialog shows it (unknown when
+  never reported, n/a for an agentless driver), and the
+  `find_dns_servers` copilot tool reports it. `notes` is no
+  longer seeded by the agent; existing rows keep whatever note
+  they have. An agent of an earlier release still registers with
+  the old literal, which is ignored rather than stored, so it
+  never overwrites the real version that agent's heartbeat
+  reports. Migration `a2078c5e1d90`.
+
+- **Three more TTL fields no longer read `1h` as 1 second (#2086).**
+  The IPAM DDNS TTL override (on a new or edited subnet), the IPAM
+  template's DDNS TTL and the DNS pool TTL read the field with
+  `parseInt`, which keeps the leading digits: `1h` and `1e3` were both
+  saved as 1. They now use the same reading as the zone and record
+  dialogs (#2085): a whole number of seconds, `1e3` is 1000, anything
+  else is refused with the reason and nothing is sent. A blank DDNS
+  override still means inherit. The pool TTL is checked against the
+  API's own 1 to 86400, and a cleared pool field is now refused as
+  required instead of being saved as 30 without a word.
+
+- **A zone or record TTL outside RFC 2181's range is refused with a
+  422 instead of stored (#2073).** Add Zone with Default TTL `-1`
+  answered 201 and saved it, and the BIND9 agent then refused the
+  zone for a bad TTL, so it was never served. The zone `ttl`, a
+  record's `ttl` and the IPAM / IPAM-template `ddns_ttl` (which
+  stamps every DDNS record) are now bounded to 0..2147483647 on
+  create and update, like the SOA timers already were, and the 422
+  names the field. The importers store a servable value rather than
+  what the source said: a record TTL outside the range inherits the
+  zone's, and a zone TTL or SOA timer outside it takes the default
+  (a TTL past 2147483647 would not fit the column and failed the
+  commit). A TTL stored
+  negative before this fix is not rewritten, but no longer reaches a
+  server: the agent bundle ships the zone with a `$TTL` of 3600 and
+  the record inheriting it, and record updates send it as inherit.
+  Edit the row to clear it. The Add/Edit Zone and record dialogs
+  take a number and refuse anything that is not a whole number in
+  range with a reason; they used to send `parseInt` of the text, so
+  `1h` went out as 1 (#2074), and `1e3`, which a number field
+  accepts, would have too.
+
+- **An `A` alias can be added to an IPv6 address again (#2081).**
+  `POST /ipam/addresses/{id}/aliases` with an `A` alias on an IPv6
+  address wrote the AAAA record the alias follows the address family
+  into, then looked the new row up by the requested type `A`, found
+  nothing, answered 409 and rolled the write back, so the alias could
+  never be added there. The lookup now uses the type that was written,
+  from the same helper the writer and the CNAME-rule check use.
+  The alias lists and the per-address alias count matched only
+  CNAME and A, so a stored AAAA alias was missing from them; they
+  match AAAA now. Allocate and next-IP were not affected. `AAAA` is
+  still refused as an alias type (422), so an IPv4 address can never
+  get one.
+
+- **An IP's DNS alias no longer breaks the CNAME-and-other-data rule
+  (#2080).** An alias given when allocating an IP (Allocate IP,
+  Allocate next IP) or added with `POST /ipam/addresses/{id}/aliases`
+  went straight into the zone without the check the DNS record API has
+  run since #1381. A CNAME alias on a name that already held an A (or
+  the IP's own host name, or another alias in the same request), an
+  A / AAAA alias on a name that was already a CNAME, and a CNAME alias
+  at the apex were all stored, and BIND then refused the whole zone,
+  so the agent stayed on its last good config. The alias path now asks
+  the same shared check, before anything is written, in every view:
+  409 for a clash, 422 for a CNAME at the apex, with the DNS API's
+  message. An A alias on an IPv6 address is checked as the AAAA it is
+  written as, and a clash inside one request names both sides (for
+  example the address's own AAAA record). An alias stored before this
+  fix is not removed: BIND holds back only the zone it is in (#1403),
+  the server reports it through the `agent_config_rejected` alert, and
+  deleting the alias (`DELETE /ipam/addresses/{id}/aliases/{record_id}`)
+  releases the zone.
+
+- **The DNS and DHCP server detail modals offered Pause and Resume to
+  a user the API refuses (#2076).** Both routes take a superadmin, and
+  the server rows already showed the buttons disabled with "Requires
+  superadmin"; the detail modal opened from the same row did not, so a
+  DNS or DHCP Editor clicked Pause, typed a reason, and only then got
+  a 403. The modals now use the same gate as the rows.
+
+- **An IPAM alias named `under_score` (type A) is refused, not written
+  into a zone BIND will not load (#2070).** Allocate IP, Allocate next
+  IP and the Add alias endpoint stored the name and wrote the record;
+  the BIND9 agent then refused the whole zone under check-names and held
+  every later change in it. An alias now passes the DNS record API's own
+  owner-name checks (`validate_record_owner` and BIND's check-names rule
+  for its type), so an A or AAAA alias must be a host name and the
+  request answers 422 naming the alias. A CNAME alias keeps the
+  underscore, as in the DNS API. The alias is stored in the form the
+  checks passed (lower-cased, an internationalized name as its `xn--`
+  A-label), and an alias whose name inside its zone passes 253
+  characters is refused before anything is written. An alias stored
+  before this release still holds its zone back:
+  `GET /api/v1/diagnostics/name-conformance` (or the Copilot's
+  `find_nonconforming_names`) lists it, and deleting it from the
+  address's aliases releases the zone.
+
+- **On PowerDNS, a record target with no trailing dot no longer stops
+  its zone converging, and the record API refuses new ones (#2060).**
+  PowerDNS refuses a CNAME / PTR / MX / NS / SRV / SVCB / HTTPS / NAPTR /
+  ALIAS / DNAME target written without its trailing dot (`422 Not in
+  expected format`), and it applies a zone change as one transaction.
+  The record API stored such a value as typed, so one dot-less row made
+  its record op fail on every retry until it was marked `failed`, and
+  made PowerDNS refuse the zone's whole structural update (no other
+  change to that zone was applied, and the server reported a partial
+  apply) or, for a new zone, refuse to create the zone at all. The
+  agent now qualifies a dot-less target against the zone, which is what
+  a BIND9 server serves for the same row, so rows that already exist
+  (an importer's included) are served on upgrade. A zone PowerDNS still
+  refuses for any other reason is retried piecemeal (halved until the
+  refused record sets are isolated, so one bad record in a large zone
+  costs a few dozen requests, not one per record set), so only the
+  refused record set is left out and named in the server's apply
+  status. Such a zone is not reported as in sync by that server even
+  though its serial moved, so the per-server sync status agrees with the
+  apply status. On a PowerDNS group, creating or editing a record with
+  a dot-less target is now a 422 that shows the two names it could
+  mean (`db1.example.com.`, or `db1.example.com.<zone>.`), on the REST
+  create, edit and bulk-create paths and in the Copilot. Other drivers
+  are unchanged.
+
+- **The DNS group's Health line reports what the servers say
+  (#2077).** DNS, a server group, Servers read "all servers assumed
+  consistent (per-server serials arrive in Wave 3)" whatever the
+  servers reported, even while one had refused a zone. It now comes
+  from each server's own zone-state rollup: in sync on N servers, or
+  how many servers are behind, refused zones, or have not reported
+  every zone yet. A server that has not reported is never counted as
+  in sync.
+
+- **A rolling upgrade no longer fails on one kubeapi request its
+  shared-tag hold could not land (#2028).** The hold (#1710) pins the
+  shared charts' image tag before each node and removes the pins at the
+  end, a few kubeapi requests each time, and any one of them refused or
+  unanswered (a k3s server answers 503 `apiserver not ready` while it
+  restarts) failed the whole run: before the first node, with the
+  cluster on two versions at a re-assert, or with every node already on
+  the target at the flip. Such a step is now tried again every 15 s,
+  with Halt, Abort and the Lease read between tries, as #1713 does for
+  the Lease. No node starts and no tag moves until it lands, and the
+  run fails on it, with the same error, only after 300 s of failures.
+  Only an answer a later try can change is retried (no answer, a 5xx,
+  408, 409 or 429); a 403 or 422 still fails the run at once.
+
+- **A demoted member promoted again rejoins instead of sitting
+  `joining` on a full disk (#2049).** Every join and leave set the
+  node's k3s identity aside, and with it containerd's whole image
+  store (4-6 GiB); the newest three backups were kept whole. One
+  demote then promote left a 40 GiB member with three stores in
+  backups beside the one its join was importing, the kubelet went into
+  DiskPressure, the supervisor pod was refused, and nothing reported
+  the join. A backup now keeps its image store only while the join
+  that took it can still roll back onto it: the stores of earlier,
+  settled joins and leaves are dropped before the runner writes
+  anything to /var, a join that registered with the seed's etcd
+  drops its own before its long wait for Ready (that branch never
+  rolls back), and a join or leave that settles drops it before
+  reporting. The identity in every backup is kept for manual
+  recovery. A node already carrying three full backups gets the
+  space back on its first join or leave after the upgrade. Found
+  and first fixed by the QA desk.
+
+- **Fleet no longer reports `ssh: retrying` forever after managed SSH is
+  turned off (#2053).** The supervisor's fire-state reader stripped the
+  leading tab of an empty-hash line (`\t1\t<iso>`, written when a plane
+  is turned off), so the fields shifted left, attempts read as the hash
+  and never matched the runner's empty applied sidecar. It now strips
+  only the line ending and parses the empty hash faithfully; the same
+  reader serves every host-config plane (SNMP, NTP, APT, LLDP, syslog,
+  resolver, firewall, timezone, console mode, removable). The appliance
+  console's own copy of the reader had the same bug and reported the
+  plane `retrying` on the dashboard and the health screen; it is fixed
+  too, and its plane list, which had fallen behind by three planes (APT,
+  console mode, removable), now matches the supervisor's, pinned by a
+  test. Two related cases also no longer stick at `retrying`: a config
+  that failed to apply and was then reverted to what the host already
+  runs, and a failed timezone change followed by clearing the timezone.
+  And an "off" that fails to apply now backs off like any other failed
+  apply, instead of re-firing on every heartbeat.
+
 - **IPAM no longer adopts a PTR whose target lacks the trailing dot
   where that target is served relative to the zone (#2045).** Since
   #1890 an allocation adopts an operator's identical record instead of
@@ -116,23 +305,6 @@ the formatter handles the rest.
   refused. And when ssh.socket is not active, a down ssh.service is
   now started rather than reloaded, since systemd refuses to reload a
   unit that is not running.
-
-- **The DNS server shows the version its agent actually runs
-  (#2078).** The DNS agent registered with a literal
-  `"2026.04.14.1"` that nothing rewrote, and the control plane
-  seeded the operator's `notes` with it (`agent v2026.04.14.1`)
-  and kept no version anywhere else; the heartbeat's
-  `agent_version` was accepted and dropped. The agent now sends
-  its stamped release, the register and heartbeat handlers store
-  it in a new `dns_server.agent_version`, the server response
-  carries it, the server detail dialog shows it (unknown when
-  never reported, n/a for an agentless driver), and the
-  `find_dns_servers` copilot tool reports it. `notes` is no
-  longer seeded by the agent; existing rows keep whatever note
-  they have. An agent of an earlier release still registers with
-  the old literal, which is ignored rather than stored, so it
-  never overwrites the real version that agent's heartbeat
-  reports. Migration `a2078c5e1d90`.
 
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
@@ -5507,9 +5679,6 @@ the formatter handles the rest.
 
 ### Migrations
 
-- `a2078c5e1d90` — #2078, adds nullable `dns_server.agent_version`
-  (String(64)); no backfill, NULL means the agent has not reported one.
-
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column
@@ -5601,6 +5770,8 @@ the formatter handles the rest.
   key to `dns_zone` (`ON DELETE SET NULL`) with an index. Set on every op
   queued from now on. No backfill: an older op cannot say which view's
   zone it belonged to, so NULL stays. Downgrade drops the column.
+- `a2078c5e1d90` — #2078, adds nullable `dns_server.agent_version`
+  (String(64)); no backfill, NULL means the agent has not reported one.
 
 ## 2026.10.02-1 — 2026-10-02
 

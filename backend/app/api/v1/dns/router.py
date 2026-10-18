@@ -70,11 +70,13 @@ from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.dns import (
     DEFAULT_ALLOW_RECURSION,
+    DNS_TTL_MAX,
     DNSSEC_ALGORITHMS,
     ZONE_DEFAULT_EXPIRE,
     ZONE_DEFAULT_MINIMUM,
     ZONE_DEFAULT_REFRESH,
     ZONE_DEFAULT_RETRY,
+    ZONE_DEFAULT_TTL,
     DNSAcl,
     DNSAclEntry,
     DNSKey,
@@ -117,6 +119,12 @@ from app.services.dns.delegation import (
     preview_to_dict,
 )
 from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
+from app.services.dns.name_targets import (
+    absolute_target_error,
+    dotless_target,
+    dotless_target_error,
+    group_needs_absolute_targets,
+)
 from app.services.dns.named_conf_validation import (
     ADDRESS_MATCH_LIST_OPTIONS,
     AclCycleError,
@@ -1130,8 +1138,9 @@ def _validate_masters_format(v: list[str] | None) -> list[str]:
 # serves, so it moves the serial (update_zone).
 _ZONE_FILE_TIMER_FIELDS = ("ttl", "refresh", "retry", "expire", "minimum")
 # RFC 2181 section 8 bounds a TTL at 2^31 - 1; it is also the column's (int4).
-# BIND refuses a zone whose SOA carries a negative timer, so one never reaches it.
-_SOA_TIMER_MAX = 2**31 - 1
+# BIND refuses a zone whose SOA carries a negative timer, or a negative $TTL or
+# record TTL (#2073), so one never reaches it.
+_SOA_TIMER_MAX = DNS_TTL_MAX
 
 
 class ZoneCreate(BaseModel):
@@ -1141,7 +1150,7 @@ class ZoneCreate(BaseModel):
     # #1310 — omitted ⇒ ``resolved_zone_kind``: a primary zone's is taken
     # from its name.
     kind: str | None = None
-    ttl: int = 3600
+    ttl: int = Field(ZONE_DEFAULT_TTL, ge=0, le=_SOA_TIMER_MAX)
     refresh: int = Field(ZONE_DEFAULT_REFRESH, ge=0, le=_SOA_TIMER_MAX)
     retry: int = Field(ZONE_DEFAULT_RETRY, ge=0, le=_SOA_TIMER_MAX)
     expire: int = Field(ZONE_DEFAULT_EXPIRE, ge=0, le=_SOA_TIMER_MAX)
@@ -1235,7 +1244,7 @@ class ZoneUpdate(BaseModel):
     view_id: uuid.UUID | None = None
     zone_type: str | None = None
     kind: str | None = None
-    ttl: int | None = None
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     refresh: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     retry: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     expire: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
@@ -1450,7 +1459,8 @@ class RecordCreate(BaseModel):
     name: str
     record_type: str
     value: str
-    ttl: int | None = None
+    # #2073 — null inherits the zone's $TTL.
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     priority: int | None = None
     weight: int | None = None
     port: int | None = None
@@ -1478,7 +1488,8 @@ class RecordCreate(BaseModel):
 class RecordUpdate(BaseModel):
     name: str | None = None
     value: str | None = None
-    ttl: int | None = None
+    # #2073 — null inherits the zone's $TTL.
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     priority: int | None = None
     weight: int | None = None
     port: int | None = None
@@ -1656,6 +1667,19 @@ def _validate_soa_field(v: str | None) -> str:
 # (freeform, quoted at render), the structured types (SVCB / HTTPS / NAPTR /
 # CAA / SSHFP / TLSA / LOC / LUA), and A/AAAA (IP-validated below).
 _HOSTNAME_TARGET_RECORD_TYPES = frozenset({"CNAME", "NS", "PTR", "DNAME", "ALIAS"})
+
+
+async def _enforce_absolute_target(db: DB, zone: DNSZone, record_type: str, value: str) -> None:
+    """422 a name target with no trailing dot on a PowerDNS group (#2060).
+
+    PowerDNS's API refuses the dot-less spelling, and an operator there
+    almost certainly means the absolute name, so the row is refused with both
+    spellings it could have meant rather than stored and served as the
+    relative one. See ``app.services.dns.name_targets``.
+    """
+    err = await absolute_target_error(db, zone.group_id, record_type, value, zone.name)
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
 
 
 def _validate_address_record_value(record_type: str, value: str) -> None:
@@ -7724,6 +7748,7 @@ async def create_record(
         body.record_type, body.priority, body.weight, body.port
     )
     _validate_address_record_value(body.record_type, body.value)
+    await _enforce_absolute_target(db, zone, body.record_type, body.value)
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
     _enforce_bind_check_names(body.record_type, fqdn, body.value, zone.name)
     # #1230 — a client retry (Ansible, a flaky network, a double click) must
@@ -7841,6 +7866,10 @@ async def update_record(
     # blocking edits to legacy data, contrary to the validate-on-write stance.
     if "value" in changes:
         _validate_address_record_value(record.record_type, record.value)
+        # Resubmitting a row's own value (a TTL edit) does not re-judge a row
+        # that predates the rule, as for check-names below.
+        if zone is not None and (record.value or "").strip() != (before_value or "").strip():
+            await _enforce_absolute_target(db, zone, record.record_type, record.value)
     if "name" in changes and zone:
         record.fqdn = f"{record.name}.{zone.name}" if record.name != "@" else zone.name
     # #1378 — what the edit actually changes is checked against BIND's
@@ -8424,8 +8453,15 @@ async def bulk_create_records(
         return BulkCreateRecordsResponse(created=0, skipped=skipped, target_serial=None)
 
     records: list[DNSRecord] = []
+    needs_absolute = any(
+        dotless_target(r.record_type, r.value) is not None for r in accepted
+    ) and await group_needs_absolute_targets(db, zone.group_id)
     for r in accepted:
         _validate_address_record_value(r.record_type, r.value)
+        if needs_absolute:
+            target_err = dotless_target_error(r.record_type, r.value, zone.name)
+            if target_err is not None:
+                raise HTTPException(status_code=422, detail=f"{r.name}: {target_err}")
         fqdn = f"{r.name}.{zone.name}" if r.name != "@" else zone.name
         _enforce_bind_check_names(r.record_type, fqdn, r.value, zone.name)
         records.append(

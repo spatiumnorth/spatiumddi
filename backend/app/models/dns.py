@@ -962,6 +962,27 @@ ZONE_DEFAULT_RETRY = 600
 ZONE_DEFAULT_EXPIRE = 86400
 ZONE_DEFAULT_MINIMUM = 300
 
+# The largest TTL a zone ($TTL), a record or an SOA timer may carry: RFC 2181
+# section 8 bounds a TTL at 2^31 - 1, and it is also what the int4 columns hold.
+# A negative one is never servable: BIND refuses the whole zone file over it
+# (#2073). Every API that stores an operator's TTL bounds it 0..DNS_TTL_MAX.
+DNS_TTL_MAX = 2**31 - 1
+# A zone's default TTL ($TTL) when none is given at create.
+ZONE_DEFAULT_TTL = 3600
+
+
+def servable_ttl(ttl: int | None) -> int | None:
+    """``ttl`` when a server can serve it, else ``None``.
+
+    The API bounds every TTL it stores (#2073), but rows written before the
+    bound can hold a negative one. Shipping it makes BIND refuse the whole
+    zone file, so the senders map it to ``None``: a record then inherits the
+    zone's ``$TTL``, and a zone falls back to ``ZONE_DEFAULT_TTL``.
+    """
+    if ttl is None or ttl < 0 or ttl > DNS_TTL_MAX:
+        return None
+    return ttl
+
 
 class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """DNS zone — authoritative, secondary, stub, or forward."""
@@ -992,7 +1013,7 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     kind: Mapped[str] = mapped_column(String(10), nullable=False, default="forward")
 
     # SOA fields
-    ttl: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
+    ttl: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_TTL)
     refresh: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_REFRESH)
     retry: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_RETRY)
     expire: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_EXPIRE)

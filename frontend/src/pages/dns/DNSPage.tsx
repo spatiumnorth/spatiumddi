@@ -5,6 +5,7 @@ import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
 import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { ZoneSerialsLine } from "./ZoneSerialsLine";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
   Globe,
@@ -112,7 +113,13 @@ import {
   type ResolverPreset,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
-import { fqdnError, recordOwnerError, zoneKindForName } from "@/lib/dnsNames";
+import {
+  DNS_TTL_MAX,
+  fqdnError,
+  parseTtlInput,
+  recordOwnerError,
+  zoneKindForName,
+} from "@/lib/dnsNames";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -2619,6 +2626,12 @@ export function ZoneModal({
   function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
+    // #2073 / #2074 — the hidden field (technitium_api) keeps its default.
+    const zoneTtl = parseTtlInput(ttl);
+    if (zoneTtl === null || typeof zoneTtl === "string") {
+      setError(`Default TTL ${zoneTtl ?? "is required"}.`);
+      return;
+    }
     const payload: Record<string, unknown> = {
       name,
       zone_type: zoneType,
@@ -2626,7 +2639,7 @@ export function ZoneModal({
       view_id: viewId || null,
       primary_ns: primaryNs,
       admin_email: adminEmail,
-      ttl: parseInt(ttl, 10),
+      ttl: zoneTtl,
       color,
       domain_id: domainId,
       customer_id: customerId,
@@ -2831,6 +2844,10 @@ export function ZoneModal({
           {!technitiumApi && (
             <Field label="Default TTL (seconds)">
               <input
+                type="number"
+                min={0}
+                max={DNS_TTL_MAX}
+                step={1}
                 className={inputCls}
                 value={ttl}
                 onChange={(e) => setTtl(e.target.value)}
@@ -3018,11 +3035,16 @@ function RecordModal({
       setError("SRV records require priority, weight, and port.");
       return;
     }
+    const recordTtl = parseTtlInput(ttl);
+    if (typeof recordTtl === "string") {
+      setError(`TTL ${recordTtl}.`);
+      return;
+    }
     mut.mutate({
       name,
       record_type: type,
       value,
-      ttl: ttl ? parseInt(ttl, 10) : null,
+      ttl: recordTtl,
       // Only send the structured fields the type actually uses, so the API
       // never sees a stray weight/port on a non-SRV record.
       priority: usesPriority && priority !== "" ? parseInt(priority, 10) : null,
@@ -3186,6 +3208,10 @@ function RecordModal({
         <div className="grid grid-cols-2 gap-3">
           <Field label="TTL (leave blank for zone default)">
             <input
+              type="number"
+              min={0}
+              max={DNS_TTL_MAX}
+              step={1}
               className={inputCls}
               value={ttl}
               onChange={(e) => setTtl(e.target.value)}
@@ -5362,12 +5388,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   </span>
                 ) : null,
             )}
-            <span className="ml-auto text-muted-foreground">
-              Zone serials:{" "}
-              {zones.length === 0
-                ? "no zones"
-                : `${zones.length} zone${zones.length === 1 ? "" : "s"} · all servers assumed consistent (per-server serials arrive in Wave 3)`}
-            </span>
+            <ZoneSerialsLine zoneCount={zones.length} servers={servers} />
           </div>
         </div>
       )}
