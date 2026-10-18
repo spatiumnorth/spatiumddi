@@ -100,7 +100,14 @@ the formatter handles the rest.
   `dns_record.ip_alias` column says what a row is; every alias writer
   sets it and the sync, the three lists, alias delete and the DNS
   drift check read it. The drift check no longer reports an alias as a
-  mismatched host record.
+  mismatched host record. The upgrade marks the aliases already stored:
+  an A / AAAA named like the address's hostname in its forward zone or
+  an extra zone stays the host record (extra-zone ids compared as
+  UUIDs, whatever case they were sent in), and where the address's
+  linked record sits in a zone, a second row at the same name, left by
+  renaming an address onto its own alias, stays an alias. A host
+  record left in an extra zone under an old name becomes an alias: it
+  keeps answering and can be deleted from the alias list.
 
 - **A zone's Primary NS must be a host name, or it is refused (#2075).**
   The zone dialog stored `ns_1.<zone>.` or a 64-character label as typed
