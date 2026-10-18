@@ -84,6 +84,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS and DHCP server detail modals offered Pause and Resume to
+  a user the API refuses (#2076).** Both routes take a superadmin, and
+  the server rows already showed the buttons disabled with "Requires
+  superadmin"; the detail modal opened from the same row did not, so a
+  DNS or DHCP Editor clicked Pause, typed a reason, and only then got
+  a 403. The modals now use the same gate as the rows.
+
 - **An IPAM alias named `under_score` (type A) is refused, not written
   into a zone BIND will not load (#2070).** Allocate IP, Allocate next
   IP and the Add alias endpoint stored the name and wrote the record;
