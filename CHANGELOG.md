@@ -125,10 +125,14 @@ the formatter handles the rest.
   `agent_version` was accepted and dropped. The agent now sends
   its stamped release, the register and heartbeat handlers store
   it in a new `dns_server.agent_version`, the server response
-  carries it, and the server detail dialog shows it (unknown
-  when never reported). `notes` is no longer seeded by the
-  agent; existing rows keep whatever note they have. An older
-  agent that sends no version leaves the column as it was.
+  carries it, the server detail dialog shows it (unknown when
+  never reported, n/a for an agentless driver), and the
+  `find_dns_servers` copilot tool reports it. `notes` is no
+  longer seeded by the agent; existing rows keep whatever note
+  they have. An agent of an earlier release still registers with
+  the old literal, which is ignored rather than stored, so it
+  never overwrites the real version that agent's heartbeat
+  reports. Migration `a2078c5e1d90`.
 
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
