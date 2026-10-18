@@ -174,6 +174,38 @@ def test_statement_name_is_a_safe_identifier() -> None:
     assert zone_tls_statement_name("a.b") != zone_tls_statement_name("a-b")
 
 
+def test_hostnames_differing_only_in_case_share_one_statement(tmp_path: Path) -> None:
+    """The statement name is built from the lower-cased host, so two zones
+    naming one provider in different case rendered two clauses under ONE
+    name, and named refused the duplicate clause: the whole file."""
+    zones = [
+        _fwd_zone("a.example.", ["9.9.9.9"], forward_transport="tls", forward_tls_hostname=h)
+        for h in ("DNS.Quad9.net", "dns.quad9.net")
+    ]
+    zones[1]["name"] = "b.example."
+    conf = _render(tmp_path, _bundle(zones, {}))
+    name = zone_tls_statement_name("dns.quad9.net")
+    assert conf.count(f"tls {name} {{") == 1
+    assert 'remote-hostname "dns.quad9.net";' in conf
+
+
+@pytest.mark.parametrize(
+    "hostname",
+    [
+        "a" * 63 + ".example.net",
+        "dns-over-tls.resolver.internal.corp.example.com",
+        "xn--bcher-kva.example",
+    ],
+)
+def test_statement_name_is_one_dns_label(hostname: str) -> None:
+    """BIND parses a tls statement name as a domain name: a label over 63
+    octets is "not a valid name" and named refuses the file."""
+    name = zone_tls_statement_name(hostname)
+    assert len(name) <= 63
+    assert "." not in name
+    assert not name.endswith("-")
+
+
 @pytest.mark.parametrize(
     "extra",
     [
@@ -207,6 +239,22 @@ def test_rendered_config_loads_in_named_checkconf(tmp_path: Path) -> None:
             forward_transport="tls",
             forward_tls_hostname="dns.quad9.net",
         ),
+        # The same provider in another case: one statement, not a duplicate.
+        _fwd_zone(
+            "corp2.example.",
+            ["9.9.9.9", "2620:fe::9@853", "2001:db8::53@53"],
+            forward_transport="tls",
+            forward_tls_hostname="DNS.Quad9.net",
+        ),
+        # A long certificate name: the statement name must stay one label.
+        _fwd_zone(
+            "long.example.",
+            ["10.2.2.2"],
+            forward_transport="tls",
+            forward_tls_hostname="dns-over-tls.resolver.internal.corp.example.com",
+        ),
+        # No forwarders: skipped, never an empty forwarders block.
+        _fwd_zone("empty.example.", [], forward_transport="tls", forward_tls_hostname="x.example"),
     ]
     conf = _render(tmp_path, _bundle(zones, DOT_GROUP))
     path = tmp_path / "check.conf"

@@ -910,13 +910,6 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 else list(getattr(z, "forwarders", []) or [])
             ),
             "forward_only": bool(getattr(z, "forward_only", True)),
-            # A forward zone's OWN upstream transport (#2121). It used to
-            # inherit the group's ``forward_transport``; an agent older than
-            # #2121 ignores these keys and keeps inheriting, so the fix needs
-            # the agent upgraded too. Inside zone_payload, so a change shifts
-            # the structural etag.
-            "forward_transport": getattr(z, "forward_transport", None) or "do53",
-            "forward_tls_hostname": getattr(z, "forward_tls_hostname", None),
             # Secondary / stub primaries (issue #336). The agent renders these
             # as ``masters { <ip> [port <n>]; … };`` for slave/stub zones;
             # ignored for primary / forward.
@@ -965,6 +958,20 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             # one SOA per serial (``soa_timers.served_soa_timers``).
             **served_soa_timers(z, serves_soa_timers),
         }
+        # A forward zone's OWN upstream transport (#2121). It used to inherit
+        # the group's ``forward_transport``; an agent older than #2121 ignores
+        # these keys and keeps inheriting, so the fix needs the agent upgraded
+        # too. Shipped only when the zone forwards over something other than
+        # plain DNS: an absent key reads as ``do53`` on the agent
+        # (``_forwarders.zone_forward_transport``), so a group that does not
+        # use the feature ships the bundle it did before and its etag does not
+        # move on upgrade, which would reload every agent in the fleet for a
+        # byte-identical named.conf. Inside zone_payload, so setting or
+        # clearing a transport shifts the structural etag.
+        zone_transport = getattr(z, "forward_transport", None) or "do53"
+        if getattr(z, "zone_type", None) == "forward" and zone_transport != "do53":
+            base_zp["forward_transport"] = zone_transport
+            base_zp["forward_tls_hostname"] = getattr(z, "forward_tls_hostname", None)
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone
         # files for serving — primary/secondary distinction matters for

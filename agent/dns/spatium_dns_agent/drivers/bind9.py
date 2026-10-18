@@ -33,14 +33,14 @@ except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
 from ..oom_watch import cgroup_memory_limit_bytes as _cgroup_memory_limit_bytes
+from ._forwarders import bind_zone_forwarders as _bind_zone_forwarders
+from ._forwarders import bind_zone_tls_statement as _bind_zone_tls_statement
 from ._process import (
     find_running_daemon,
     is_zombie,
     spawn_guard,
     wait_for_daemon,
 )
-from ._forwarders import bind_zone_forwarders as _bind_zone_forwarders
-from ._forwarders import bind_zone_tls_statement as _bind_zone_tls_statement
 from ._txt import quote_txt as _quote_txt
 from .base import RRSET_OP_KINDS, DriverBase, HeldZone
 

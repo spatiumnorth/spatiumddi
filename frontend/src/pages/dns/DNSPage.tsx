@@ -2632,6 +2632,13 @@ export function ZoneModal({
     forwardTlsHostname,
     groupDrivers,
   );
+  // The API holds an edit to the transport only when the transport or its
+  // hostname changes, so a zone stored before the check stays editable; the
+  // form shows the problem but blocks the save on the same terms.
+  const transportChanged =
+    !zone ||
+    forwardTransport !== (zone.forward_transport ?? "do53") ||
+    forwardTlsHostname.trim() !== (zone.forward_tls_hostname ?? "");
   // Secondary / stub primaries (issue #336) — the master IPs (ip or
   // ip@port) this zone transfers FROM. Only shown / submitted for
   // secondary + stub types.
@@ -2714,14 +2721,17 @@ export function ZoneModal({
         setError("Forward zones need at least one forwarder IP");
         return;
       }
-      if (transportErr) {
+      if (transportErr && transportChanged) {
         setError(transportErr);
         return;
       }
       payload.forwarders = fwds;
       payload.forward_only = forwardOnly;
       payload.forward_transport = forwardTransport;
-      payload.forward_tls_hostname = forwardTlsHostname.trim() || null;
+      // The hostname field is hidden on plain DNS; a value left in it from
+      // an earlier choice is not the operator's intent for this save.
+      payload.forward_tls_hostname =
+        forwardTransport === "do53" ? null : forwardTlsHostname.trim() || null;
     }
     if (zoneType === "secondary" || zoneType === "stub") {
       const masters = mastersText

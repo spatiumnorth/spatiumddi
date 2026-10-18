@@ -433,8 +433,11 @@ async def test_bundle_carries_the_zone_transport_and_the_etag_moves(
 
     before = await build_config_bundle(db_session, srv)
     shipped = {z["name"]: z for z in before["zones"]}[TAILNET]
-    assert shipped["forward_transport"] == "do53"
-    assert shipped["forward_tls_hostname"] is None
+    # A plain-DNS zone ships neither key: the agent reads their absence as
+    # do53, and a group not using the feature keeps the bundle (and the etag)
+    # it had before #2121, so an upgrade does not reload every agent.
+    assert "forward_transport" not in shipped
+    assert "forward_tls_hostname" not in shipped
 
     zone.forward_transport = "tls"
     zone.forward_tls_hostname = "dns.quad9.net"
@@ -445,6 +448,15 @@ async def test_bundle_carries_the_zone_transport_and_the_etag_moves(
     assert shipped["forward_tls_hostname"] == "dns.quad9.net"
     assert before["etag"] != after["etag"]
     assert before["structural_etag"] != after["structural_etag"]
+
+    # Back to plain DNS: the keys go again, and the bundle is the one a
+    # zone that never had a transport ships.
+    zone.forward_transport = "do53"
+    zone.forward_tls_hostname = None
+    await db_session.flush()
+    reset = await build_config_bundle(db_session, srv)
+    assert "forward_transport" not in {z["name"]: z for z in reset["zones"]}[TAILNET]
+    assert reset["structural_etag"] == before["structural_etag"]
 
 
 # ── Migration ───────────────────────────────────────────────────────────────

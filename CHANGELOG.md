@@ -133,11 +133,17 @@ the formatter handles the rest.
   **Behaviour change:** the upgrade sets every existing forward zone to
   plain DNS, including zones in groups that forward over TLS today. A
   zone that really did want DoT must be switched back on the zone, with
-  its TLS hostname. **The fix is in the DNS agent:** an agent older than
+  its TLS hostname. That includes any forward zone pointed at a resolver
+  that answers only over TLS (Mullvad, or an internal DoT-only
+  resolver): it stops resolving at the upgrade until its transport is
+  set back to DNS-over-TLS, and the API now refuses to save a catalogued
+  encrypted-only upstream on plain DNS. **The fix is in the DNS agent:** an agent older than
   this release ignores the zone's transport and keeps inheriting the
   group's, so upgrade the DNS agents with the control plane. A new agent
   talking to an older control plane treats every forward zone as plain
-  DNS.
+  DNS. A zone on plain DNS ships no transport in the agent bundle, so a
+  group that does not use the setting keeps its bundle etag across the
+  upgrade and no agent reloads for it.
 
 - **Editing an IP no longer renames or deletes its own A aliases, and
   the alias lists no longer show a host record as an alias (#2084).**

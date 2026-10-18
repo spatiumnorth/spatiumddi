@@ -2,7 +2,7 @@
 
 Shared, byte for byte, with ``agent/dns/spatium_dns_agent/drivers/
 _forwarders.py``: the agent image cannot import ``app``, so it carries a copy,
-and ``backend/tests/test_zone_forward_transport_parity.py`` fails when the two
+and ``backend/tests/test_zone_forward_transport.py`` fails when the two
 differ. Change them together. The agent renderer is what every agent-managed
 BIND9 server runs; the control-plane template is the config preview. #878 is
 what happens when two renderers of one setting disagree.
@@ -38,6 +38,11 @@ BIND_ZONE_FORWARD_TRANSPORTS = ("do53", "tls")
 CA_BUNDLE_PATH = "/etc/ssl/certs/ca-certificates.crt"
 
 _TLS_NAME_PREFIX = "spatium-zone-tls-"
+#: BIND parses a ``tls`` statement name as a domain name, so the generated
+#: name is ONE label and a label is at most 63 octets: a longer one is "not a
+#: valid name" and named refuses the whole file. Prefix (17) + "-" + digest (8)
+#: leave 37 for the readable part.
+_TLS_NAME_READABLE_MAX = 63 - len(_TLS_NAME_PREFIX) - 1 - 8
 _SAFE_HOSTNAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,253})$")
 
 
@@ -49,9 +54,15 @@ def zone_forward_transport(zone: Mapping[str, Any]) -> tuple[str, str | None]:
     the zone inherited the group's transport, which is the bug. An unknown
     transport (a newer control plane) reads as the value itself so the caller
     can refuse it rather than guess.
+
+    The hostname is lower-cased: certificate names compare case-insensitively,
+    and two zones naming one provider in different case must share one ``tls``
+    statement. Rendered as two, they get the same statement name (it is built
+    from the lower-cased host) and named refuses the duplicate clause, i.e.
+    the whole file.
     """
     transport = str(zone.get("forward_transport") or "do53").strip().lower()
-    hostname = str(zone.get("forward_tls_hostname") or "").strip().rstrip(".")
+    hostname = str(zone.get("forward_tls_hostname") or "").strip().rstrip(".").lower()
     return transport, (hostname or None)
 
 
@@ -64,7 +75,7 @@ def safe_tls_hostname(hostname: str | None) -> str | None:
     """
     if not hostname:
         return None
-    host = hostname.strip().rstrip(".")
+    host = hostname.strip().rstrip(".").lower()
     return host if _SAFE_HOSTNAME.match(host) else None
 
 
@@ -74,10 +85,12 @@ def zone_tls_statement_name(hostname: str) -> str:
     One statement per distinct hostname, shared by every zone that forwards
     to that provider. The name is interpolated into named.conf unquoted, so it
     is built from ``[a-z0-9-]`` only (the #934 lesson), and a digest of the
-    exact hostname keeps two names that sanitise alike apart.
+    exact hostname keeps two names that sanitise alike apart. The whole name
+    is one DNS label, so it is kept within 63 octets.
     """
     host = hostname.strip().rstrip(".").lower()
-    safe = re.sub(r"[^a-z0-9-]+", "-", host).strip("-")[:40].strip("-") or "upstream"
+    safe = re.sub(r"[^a-z0-9-]+", "-", host).strip("-")
+    safe = safe[:_TLS_NAME_READABLE_MAX].strip("-") or "upstream"
     digest = hashlib.sha256(host.encode("utf-8")).hexdigest()[:8]
     return f"{_TLS_NAME_PREFIX}{safe}-{digest}"
 
