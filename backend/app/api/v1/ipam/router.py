@@ -1353,6 +1353,97 @@ async def _batched_dns_ops(db: AsyncSession) -> Any:
         _dns_op_collector.reset(token)
 
 
+def _alias_written_type(requested: str, *, is_v6: bool) -> str:
+    """The record type an alias of the REQUESTED type is stored as (#2081).
+
+    An alias of type ``A`` on an IPv6 address is an AAAA: the alias follows
+    the address family. The writer, the CNAME-rule check and the endpoint's
+    follow-up lookup all go through here, so they cannot disagree about the
+    type that lands in the zone.
+    """
+    rtype = requested.upper()
+    return "AAAA" if rtype == "A" and is_v6 else rtype
+
+
+async def _assert_alias_cname_rules(
+    db: AsyncSession,
+    subnet: Subnet,
+    aliases: list[Any],
+    *,
+    hostname: str | None,
+    address: Any,
+    zone_id: uuid.UUID | None,
+) -> None:
+    """Refuse an alias set that would put a CNAME beside other data (#2080).
+
+    A name that holds a CNAME holds nothing else (RFC 1034 section 3.6.2,
+    RFC 2181 section 10.1); BIND refuses the whole zone otherwise and the
+    agent stays on its last good config. This is the check the DNS record
+    API runs (``app.services.dns.cname_conflict``, status and message shape
+    included: 422 for a CNAME at the apex, 409 for a clash), applied to
+    every alias before anything is written, in both directions: a CNAME
+    alias onto a name that holds data, and an A / AAAA alias onto a name that
+    is a CNAME. It also covers the IP's own host name and the aliases of the
+    same request, which are not in the database yet. Rows are matched in
+    every view, since an alias is a no-view row and renders into all of them.
+    """
+    from app.services.dns.cname_conflict import (  # noqa: PLC0415
+        APEX_CNAME_DETAIL,
+        describe_cname_conflict,
+        find_cname_conflict,
+        is_apex,
+    )
+
+    if not aliases or not hostname:
+        return
+    effective_zone_id = zone_id or await _resolve_effective_zone(db, subnet)
+    if not effective_zone_id:
+        return
+    zone = await db.get(DNSZone, effective_zone_id)
+    if zone is None or not ipam_authors_zone(zone):
+        return
+    zone_domain = zone.name.rstrip(".")
+    try:
+        is_v6 = isinstance(ipaddress.ip_address(str(address)), ipaddress.IPv6Address)
+    except ValueError:
+        is_v6 = False
+    host_rtype = "AAAA" if is_v6 else "A"
+    # name (lower-cased) -> what the request itself will put there, as
+    # (is_cname, label) pairs; the label names it in the refusal.
+    pending: dict[str, list[tuple[bool, str]]] = {
+        hostname.strip().lower(): [(False, f"the address's own {host_rtype} record")]
+    }
+    for al in aliases:
+        rtype = (getattr(al, "record_type", None) or al.get("record_type") or "CNAME").upper()
+        rtype = _alias_written_type(rtype, is_v6=is_v6)
+        name = (getattr(al, "name", None) or al.get("name") or "").strip().rstrip(".")
+        if not name or rtype not in {"CNAME", "A", "AAAA"}:
+            continue
+        fqdn = f"{name}.{zone_domain}"
+        if rtype == "CNAME" and is_apex(name):
+            raise HTTPException(status_code=422, detail=APEX_CNAME_DETAIL)
+        other = await find_cname_conflict(
+            db, effective_zone_id, view_id=None, name=name, record_type=rtype
+        )
+        if other is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, describe_cname_conflict(rtype, fqdn, other)
+            )
+        is_cname = rtype == "CNAME"
+        what = f"{'an' if rtype.startswith('A') else 'a'} {rtype} alias"
+        siblings = pending.setdefault(name.lower(), [])
+        clash = next((lbl for c, lbl in siblings if is_cname or c), None)
+        if clash is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{fqdn} would hold both {clash} and {what} from this "
+                "request. A CNAME must be the only record at its name (RFC 1034 "
+                "section 3.6.2, RFC 2181 section 10.1); PowerDNS and BIND both "
+                "refuse a zone that breaks this, and the server stops applying it.",
+            )
+        siblings.append((is_cname, what))
+
+
 async def _assert_alias_names_fit(
     db: AsyncSession,
     aliases: list[Any],
@@ -1425,8 +1516,7 @@ async def _create_alias_records(
     for al in aliases:
         rtype = (getattr(al, "record_type", None) or al.get("record_type") or "CNAME").upper()
         # Callers using "A" on an IPv6 primary really mean AAAA; normalise.
-        if rtype == "A" and is_v6:
-            rtype = "AAAA"
+        rtype = _alias_written_type(rtype, is_v6=is_v6)
         name = (getattr(al, "name", None) or al.get("name") or "").strip().rstrip(".")
         if not name or rtype not in {"CNAME", "A", "AAAA"}:
             continue
@@ -7702,7 +7792,7 @@ async def _alias_counts_for(db: AsyncSession, ips: list[IPAddress]) -> dict[uuid
     conds = [
         DNSRecord.ip_address_id.in_(ip_ids),
         DNSRecord.auto_generated.is_(True),
-        DNSRecord.record_type.in_(["CNAME", "A"]),
+        DNSRecord.record_type.in_(["CNAME", "A", "AAAA"]),
     ]
     if primary_ids:
         conds.append(DNSRecord.id.notin_(primary_ids))
@@ -8052,6 +8142,14 @@ async def create_address(
         if warnings:
             raise _collision_http_exc(warnings)
 
+    await _assert_alias_cname_rules(
+        db,
+        subnet,
+        body.aliases,
+        hostname=body.hostname,
+        address=body.address,
+        zone_id=explicit_zone,
+    )
     ip = IPAddress(
         subnet_id=subnet_id,
         created_by_user_id=current_user.id,
@@ -8569,7 +8667,7 @@ async def list_aliases(address_id: uuid.UUID, current_user: CurrentUser, db: DB)
         select(DNSRecord).where(
             DNSRecord.ip_address_id == ip.id,
             DNSRecord.auto_generated.is_(True),
-            DNSRecord.record_type.in_(["CNAME", "A"]),
+            DNSRecord.record_type.in_(["CNAME", "A", "AAAA"]),
         )
     )
     out = []
@@ -8613,13 +8711,22 @@ async def add_alias(
         )
     if ip.hostname:
         await _assert_alias_names_fit(db, [body], zone_id)
+    await _assert_alias_cname_rules(
+        db, subnet, [body], hostname=ip.hostname, address=ip.address, zone_id=zone_id
+    )
     await _create_alias_records(db, ip, subnet, [body], zone_id=zone_id)
-    # Find the just-created record
+    # Find the just-created record by the type that was written: an A alias
+    # on an IPv6 address is stored as AAAA (#2081).
+    try:
+        is_v6 = isinstance(ipaddress.ip_address(str(ip.address)), ipaddress.IPv6Address)
+    except ValueError:
+        is_v6 = False
+    written_type = _alias_written_type(body.record_type, is_v6=is_v6)
     res = await db.execute(
         select(DNSRecord).where(
             DNSRecord.zone_id == zone_id,
             DNSRecord.name == body.name,
-            DNSRecord.record_type == body.record_type,
+            DNSRecord.record_type == written_type,
             DNSRecord.ip_address_id == ip.id,
         )
     )
@@ -9705,6 +9812,14 @@ async def allocate_next_ip(
         if public_warnings:
             raise _collision_http_exc(public_warnings)
 
+    await _assert_alias_cname_rules(
+        db,
+        subnet,
+        body.aliases,
+        hostname=body.hostname,
+        address=chosen,
+        zone_id=explicit_zone,
+    )
     ip = IPAddress(
         subnet_id=subnet_id,
         address=str(chosen),
@@ -10217,7 +10332,7 @@ async def list_subnet_aliases(
     conds = [
         DNSRecord.ip_address_id.in_(list(ip_by_id.keys())),
         DNSRecord.auto_generated.is_(True),
-        DNSRecord.record_type.in_(["CNAME", "A"]),
+        DNSRecord.record_type.in_(["CNAME", "A", "AAAA"]),
     ]
     if primary_ids:
         conds.append(DNSRecord.id.notin_(primary_ids))

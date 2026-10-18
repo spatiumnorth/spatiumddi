@@ -105,6 +105,38 @@ the formatter handles the rest.
   its name its place. The Copilot's import preview says how many records will
   not be imported, and its commit reports them.
 
+- **An `A` alias can be added to an IPv6 address again (#2081).**
+  `POST /ipam/addresses/{id}/aliases` with an `A` alias on an IPv6
+  address wrote the AAAA record the alias follows the address family
+  into, then looked the new row up by the requested type `A`, found
+  nothing, answered 409 and rolled the write back, so the alias could
+  never be added there. The lookup now uses the type that was written,
+  from the same helper the writer and the CNAME-rule check use.
+  The alias lists and the per-address alias count matched only
+  CNAME and A, so a stored AAAA alias was missing from them; they
+  match AAAA now. Allocate and next-IP were not affected. `AAAA` is
+  still refused as an alias type (422), so an IPv4 address can never
+  get one.
+
+- **An IP's DNS alias no longer breaks the CNAME-and-other-data rule
+  (#2080).** An alias given when allocating an IP (Allocate IP,
+  Allocate next IP) or added with `POST /ipam/addresses/{id}/aliases`
+  went straight into the zone without the check the DNS record API has
+  run since #1381. A CNAME alias on a name that already held an A (or
+  the IP's own host name, or another alias in the same request), an
+  A / AAAA alias on a name that was already a CNAME, and a CNAME alias
+  at the apex were all stored, and BIND then refused the whole zone,
+  so the agent stayed on its last good config. The alias path now asks
+  the same shared check, before anything is written, in every view:
+  409 for a clash, 422 for a CNAME at the apex, with the DNS API's
+  message. An A alias on an IPv6 address is checked as the AAAA it is
+  written as, and a clash inside one request names both sides (for
+  example the address's own AAAA record). An alias stored before this
+  fix is not removed: BIND holds back only the zone it is in (#1403),
+  the server reports it through the `agent_config_rejected` alert, and
+  deleting the alias (`DELETE /ipam/addresses/{id}/aliases/{record_id}`)
+  releases the zone.
+
 - **The DNS and DHCP server detail modals offered Pause and Resume to
   a user the API refuses (#2076).** Both routes take a superadmin, and
   the server rows already showed the buttons disabled with "Requires
