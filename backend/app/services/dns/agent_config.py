@@ -910,6 +910,13 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 else list(getattr(z, "forwarders", []) or [])
             ),
             "forward_only": bool(getattr(z, "forward_only", True)),
+            # A forward zone's OWN upstream transport (#2121). It used to
+            # inherit the group's ``forward_transport``; an agent older than
+            # #2121 ignores these keys and keeps inheriting, so the fix needs
+            # the agent upgraded too. Inside zone_payload, so a change shifts
+            # the structural etag.
+            "forward_transport": getattr(z, "forward_transport", None) or "do53",
+            "forward_tls_hostname": getattr(z, "forward_tls_hostname", None),
             # Secondary / stub primaries (issue #336). The agent renders these
             # as ``masters { <ip> [port <n>]; … };`` for slave/stub zones;
             # ignored for primary / forward.
