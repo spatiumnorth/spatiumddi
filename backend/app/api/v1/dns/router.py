@@ -598,6 +598,8 @@ class ServerResponse(BaseModel):
     agent_id: uuid.UUID | None
     last_seen_at: datetime | None
     last_seen_ip: str | None
+    # #2078 — the agent's own version; NULL = never reported (UNKNOWN).
+    agent_version: str | None = None
     last_config_etag: str | None
     pending_approval: bool
     is_primary: bool
@@ -680,6 +682,7 @@ class ServerResponse(BaseModel):
             agent_id=s.agent_id,
             last_seen_at=s.last_seen_at,
             last_seen_ip=s.last_seen_ip,
+            agent_version=s.agent_version,
             last_config_etag=s.last_config_etag,
             pending_approval=s.pending_approval,
             is_primary=s.is_primary,
