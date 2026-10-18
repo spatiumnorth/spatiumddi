@@ -39,6 +39,7 @@ from app.drivers.dns.base import TsigKey
 from app.models.appliance import ApplianceCertificate
 from app.models.dns import (
     DEFAULT_ALLOW_RECURSION,
+    ZONE_DEFAULT_TTL,
     DNSAcl,
     DNSRecord,
     DNSRecordOp,
@@ -50,6 +51,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
     DNSZoneUpdateAcl,
+    servable_ttl,
 )
 from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
@@ -425,6 +427,13 @@ def _safe_update_acl(zone_id: Any, entries: list[dict[str, Any]]) -> list[dict[s
             continue
         kept.append(entry)
     return kept
+
+
+def _zone_ttl(zone: Any) -> int:
+    """The zone's ``$TTL`` as shipped: the stored one, or ``ZONE_DEFAULT_TTL``
+    when it is not servable (a negative one stored before #2073)."""
+    ttl = servable_ttl(getattr(zone, "ttl", None))
+    return ZONE_DEFAULT_TTL if ttl is None else ttl
 
 
 def _safe_zone_forwarders(zone: Any) -> list[str]:
@@ -846,7 +855,9 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         return {
             "name": r.name,
             "type": r.record_type,
-            "ttl": r.ttl,
+            # #2073 — a TTL stored negative before the API bounded it would
+            # make BIND refuse the whole zone file; the record inherits $TTL.
+            "ttl": servable_ttl(r.ttl),
             "value": r.value,
             "priority": r.priority,
             "weight": r.weight,
@@ -884,7 +895,9 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             # #430 — was getattr(z, "default_ttl", 3600): DNSZone has no
             # default_ttl, so this silently pinned every zone's $TTL to the
             # literal 3600 and editing a zone's TTL never re-rendered.
-            "ttl": getattr(z, "ttl", 3600),
+            # #2073 — a $TTL stored negative before the API bounded it makes
+            # BIND refuse the zone file, so it ships as the create default.
+            "ttl": _zone_ttl(z),
             # #430 (D1) — the agent's zone-state reporter skips any zone with
             # serial=None, so omitting this made it report nothing for every
             # zone and the per-server ZoneSyncPill stayed empty. Ship the

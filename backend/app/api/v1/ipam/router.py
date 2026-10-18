@@ -42,7 +42,7 @@ from app.core.permissions import (
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
-from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
+from app.models.dns import DNS_TTL_MAX, DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import (
     IP_ROLES,
     IP_ROLES_SHARED,
@@ -1354,6 +1354,18 @@ async def _batched_dns_ops(db: AsyncSession) -> Any:
         _dns_op_collector.reset(token)
 
 
+def _alias_written_type(requested: str, *, is_v6: bool) -> str:
+    """The record type an alias of the REQUESTED type is stored as (#2081).
+
+    An alias of type ``A`` on an IPv6 address is an AAAA: the alias follows
+    the address family. The writer, the CNAME-rule check and the endpoint's
+    follow-up lookup all go through here, so they cannot disagree about the
+    type that lands in the zone.
+    """
+    rtype = requested.upper()
+    return "AAAA" if rtype == "A" and is_v6 else rtype
+
+
 async def _assert_alias_cname_rules(
     db: AsyncSession,
     subnet: Subnet,
@@ -1404,9 +1416,7 @@ async def _assert_alias_cname_rules(
     }
     for al in aliases:
         rtype = (getattr(al, "record_type", None) or al.get("record_type") or "CNAME").upper()
-        # The writer turns an A alias on an IPv6 address into an AAAA.
-        if rtype == "A" and is_v6:
-            rtype = "AAAA"
+        rtype = _alias_written_type(rtype, is_v6=is_v6)
         name = (getattr(al, "name", None) or al.get("name") or "").strip().rstrip(".")
         if not name or rtype not in {"CNAME", "A", "AAAA"}:
             continue
@@ -1507,8 +1517,7 @@ async def _create_alias_records(
     for al in aliases:
         rtype = (getattr(al, "record_type", None) or al.get("record_type") or "CNAME").upper()
         # Callers using "A" on an IPv6 primary really mean AAAA; normalise.
-        if rtype == "A" and is_v6:
-            rtype = "AAAA"
+        rtype = _alias_written_type(rtype, is_v6=is_v6)
         name = (getattr(al, "name", None) or al.get("name") or "").strip().rstrip(".")
         if not name or rtype not in {"CNAME", "A", "AAAA"}:
             continue
@@ -2533,7 +2542,7 @@ class IPSpaceCreate(BaseModel):
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     # Fragile-device probe suppression (#722). Set at any level of the
     # space → block → subnet chain; ORs downward and cannot be
     # overridden from below.
@@ -2583,7 +2592,7 @@ class IPSpaceUpdate(BaseModel):
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     do_not_probe: bool | None = None
     do_not_probe_reason: str | None = None
     vrf_id: uuid.UUID | None = None
@@ -2663,7 +2672,7 @@ class IPBlockCreate(BaseModel):
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     ddns_inherit_settings: bool = True
     # Fragile-device probe suppression (#722) — see IPSpaceCreate.
     do_not_probe: bool = False
@@ -2714,7 +2723,7 @@ class IPBlockUpdate(BaseModel):
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     ddns_inherit_settings: bool | None = None
     do_not_probe: bool | None = None
     do_not_probe_reason: str | None = None
@@ -2826,7 +2835,7 @@ class SubnetCreate(BaseModel):
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     ddns_inherit_settings: bool = True
     # Device profiling — see Subnet model. Default off because nmap is loud.
     auto_profile_on_dhcp_lease: bool = False
@@ -2990,7 +2999,7 @@ class SubnetUpdate(BaseModel):
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     ddns_inherit_settings: bool | None = None
     auto_profile_on_dhcp_lease: bool | None = None
     auto_profile_preset: str | None = None
@@ -7784,7 +7793,7 @@ async def _alias_counts_for(db: AsyncSession, ips: list[IPAddress]) -> dict[uuid
     conds = [
         DNSRecord.ip_address_id.in_(ip_ids),
         DNSRecord.auto_generated.is_(True),
-        DNSRecord.record_type.in_(["CNAME", "A"]),
+        DNSRecord.record_type.in_(["CNAME", "A", "AAAA"]),
     ]
     if primary_ids:
         conds.append(DNSRecord.id.notin_(primary_ids))
@@ -8659,7 +8668,7 @@ async def list_aliases(address_id: uuid.UUID, current_user: CurrentUser, db: DB)
         select(DNSRecord).where(
             DNSRecord.ip_address_id == ip.id,
             DNSRecord.auto_generated.is_(True),
-            DNSRecord.record_type.in_(["CNAME", "A"]),
+            DNSRecord.record_type.in_(["CNAME", "A", "AAAA"]),
         )
     )
     out = []
@@ -8707,12 +8716,18 @@ async def add_alias(
         db, subnet, [body], hostname=ip.hostname, address=ip.address, zone_id=zone_id
     )
     await _create_alias_records(db, ip, subnet, [body], zone_id=zone_id)
-    # Find the just-created record
+    # Find the just-created record by the type that was written: an A alias
+    # on an IPv6 address is stored as AAAA (#2081).
+    try:
+        is_v6 = isinstance(ipaddress.ip_address(str(ip.address)), ipaddress.IPv6Address)
+    except ValueError:
+        is_v6 = False
+    written_type = _alias_written_type(body.record_type, is_v6=is_v6)
     res = await db.execute(
         select(DNSRecord).where(
             DNSRecord.zone_id == zone_id,
             DNSRecord.name == body.name,
-            DNSRecord.record_type == body.record_type,
+            DNSRecord.record_type == written_type,
             DNSRecord.ip_address_id == ip.id,
         )
     )
@@ -10389,7 +10404,7 @@ async def list_subnet_aliases(
     conds = [
         DNSRecord.ip_address_id.in_(list(ip_by_id.keys())),
         DNSRecord.auto_generated.is_(True),
-        DNSRecord.record_type.in_(["CNAME", "A"]),
+        DNSRecord.record_type.in_(["CNAME", "A", "AAAA"]),
     ]
     if primary_ids:
         conds.append(DNSRecord.id.notin_(primary_ids))
