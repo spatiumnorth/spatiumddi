@@ -84,6 +84,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Registering a DNS agent no longer deadlocks against the render of
+  its first bundle (#2031).** The worker's bundle store wrote the
+  server row in two UPDATEs, and Postgres re-runs a row's foreign-key
+  checks on a second UPDATE of a version the transaction itself wrote,
+  so the render's second write took `FOR KEY SHARE` on the server's
+  group (and appliance) row. Registration's SOA-timer switch held the
+  group row `FOR UPDATE` and, marking the group's bundles at commit,
+  queued for the server row behind the render's first write: 40P01.
+  The switch lost, logged `dns_group_soa_timers_failed` and only ran
+  again at the agent's first heartbeat. The store now writes the server
+  row in one statement, so the render never waits on a parent row (this
+  also covers a group rename and an appliance role save, which hold
+  those rows `FOR UPDATE` for a reason a lock strength cannot change),
+  and the switch locks the group and its zones `FOR NO KEY UPDATE`, the
+  strength of the write it makes.
+
 - **A zone's Primary NS must be a host name, or it is refused (#2075).**
   The zone dialog stored `ns_1.<zone>.` or a 64-character label as typed
   and answered 201; the BIND9 agent then wrote it as the SOA MNAME, named's
