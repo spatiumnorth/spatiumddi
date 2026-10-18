@@ -105,6 +105,23 @@ the formatter handles the rest.
   newline, so a label ending in `\n` passed every host and record-owner
   name check; the label rules now anchor with `\Z`.
 
+- **The DNS server shows the version its agent actually runs
+  (#2078).** The DNS agent registered with a literal
+  `"2026.04.14.1"` that nothing rewrote, and the control plane
+  seeded the operator's `notes` with it (`agent v2026.04.14.1`)
+  and kept no version anywhere else; the heartbeat's
+  `agent_version` was accepted and dropped. The agent now sends
+  its stamped release, the register and heartbeat handlers store
+  it in a new `dns_server.agent_version`, the server response
+  carries it, the server detail dialog shows it (unknown when
+  never reported, n/a for an agentless driver), and the
+  `find_dns_servers` copilot tool reports it. `notes` is no
+  longer seeded by the agent; existing rows keep whatever note
+  they have. An agent of an earlier release still registers with
+  the old literal, which is ignored rather than stored, so it
+  never overwrites the real version that agent's heartbeat
+  reports. Migration `a2078c5e1d90`.
+
 - **Three more TTL fields no longer read `1h` as 1 second (#2086).**
   The IPAM DDNS TTL override (on a new or edited subnet), the IPAM
   template's DDNS TTL and the DNS pool TTL read the field with
@@ -5774,6 +5791,8 @@ the formatter handles the rest.
   key to `dns_zone` (`ON DELETE SET NULL`) with an index. Set on every op
   queued from now on. No backfill: an older op cannot say which view's
   zone it belonged to, so NULL stays. Downgrade drops the column.
+- `a2078c5e1d90` — #2078, adds nullable `dns_server.agent_version`
+  (String(64)); no backfill, NULL means the agent has not reported one.
 
 ## 2026.10.02-1 — 2026-10-02
 

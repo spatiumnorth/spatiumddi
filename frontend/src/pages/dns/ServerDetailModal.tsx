@@ -321,6 +321,15 @@ function OverviewInfo({ server }: { server: DNSServer }) {
       />
       <InfoCard label="Agent ID" value={server.agent_id ?? "—"} mono />
       <InfoCard
+        label="Agent version"
+        value={
+          server.is_agentless
+            ? "n/a (agentless)"
+            : (server.agent_version ?? "unknown")
+        }
+        mono
+      />
+      <InfoCard
         label="Pending approval"
         value={server.pending_approval ? "yes" : "no"}
         accent={server.pending_approval ? "warning" : undefined}
