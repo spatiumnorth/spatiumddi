@@ -84,6 +84,31 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Editing an IP no longer renames or deletes its own A aliases, and
+  the alias lists no longer show a host record as an alias (#2084).**
+  An address's A/AAAA aliases and its own host records are both
+  auto-generated rows tied to the address, so the DNS sync loaded the
+  aliases as the host record: an edit or rename could rewrite an alias
+  into the host name (leaving the real host missing or duplicated), an
+  alias in a zone the host does not publish to was deleted, and giving
+  an address the default `gateway` name deleted every alias. The
+  mirror image was in the alias lists (`GET /addresses/{id}/aliases`,
+  `GET /subnets/{id}/aliases`, the per-address alias count): they told
+  an alias from the host only by `ip.dns_record_id`, so a host record
+  published into an extra zone was listed and counted as an alias and
+  could be deleted through the alias endpoint (now 409). A new
+  `dns_record.ip_alias` column says what a row is; every alias writer
+  sets it and the sync, the three lists, alias delete and the DNS
+  drift check read it. The drift check no longer reports an alias as a
+  mismatched host record. The upgrade marks the aliases already stored:
+  an A / AAAA named like the address's hostname in its forward zone or
+  an extra zone stays the host record (extra-zone ids compared as
+  UUIDs, whatever case they were sent in), and where the address's
+  linked record sits in a zone, a second row at the same name, left by
+  renaming an address onto its own alias, stays an alias. A host
+  record left in an extra zone under an old name becomes an alias: it
+  keeps answering and can be deleted from the alias list.
+
 - **Registering a DNS agent no longer deadlocks against the render of
   its first bundle (#2031).** The worker's bundle store wrote the
   server row in two UPDATEs, and Postgres re-runs a row's foreign-key
@@ -5870,6 +5895,12 @@ the formatter handles the rest.
   zone it belonged to, so NULL stays. Downgrade drops the column.
 - `a2078c5e1d90` — #2078, adds nullable `dns_server.agent_version`
   (String(64)); no backfill, NULL means the agent has not reported one.
+- `b3d7f1a82c54` — #2084, schema + data: adds
+  `dns_record.ip_alias` (NOT NULL, default false) and backfills it.
+  Among auto-generated CNAME / A / AAAA rows tied to an address, an
+  A / AAAA named like the address's hostname in its forward or an extra
+  zone (or the row `ip_address.dns_record_id` names) stays false; the
+  rest are aliases. Downgrade drops the column.
 
 ## 2026.10.02-1 — 2026-10-02
 
