@@ -84,6 +84,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An IP's DNS alias no longer breaks the CNAME-and-other-data rule
+  (#2080).** An alias given when allocating an IP (Allocate IP,
+  Allocate next IP) or added with `POST /ipam/addresses/{id}/aliases`
+  went straight into the zone without the check the DNS record API has
+  run since #1381. A CNAME alias on a name that already held an A (or
+  the IP's own host name, or another alias in the same request), an
+  A / AAAA alias on a name that was already a CNAME, and a CNAME alias
+  at the apex were all stored, and BIND then refused the whole zone,
+  so the agent stayed on its last good config. The alias path now asks
+  the same shared check, before anything is written, in every view:
+  409 for a clash, 422 for a CNAME at the apex, with the DNS API's
+  message. An A alias on an IPv6 address is checked as the AAAA it is
+  written as, and a clash inside one request names both sides (for
+  example the address's own AAAA record). An alias stored before this
+  fix is not removed: BIND holds back only the zone it is in (#1403),
+  the server reports it through the `agent_config_rejected` alert, and
+  deleting the alias (`DELETE /ipam/addresses/{id}/aliases/{record_id}`)
+  releases the zone.
+
 - **The DNS and DHCP server detail modals offered Pause and Resume to
   a user the API refuses (#2076).** Both routes take a superadmin, and
   the server rows already showed the buttons disabled with "Requires
