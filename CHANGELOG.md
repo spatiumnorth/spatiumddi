@@ -105,6 +105,44 @@ the formatter handles the rest.
   its name its place. The Copilot's import preview says how many records will
   not be imported, and its commit reports them.
 
+- **Bulk allocate refuses a hostname template whose names are not host
+  names (#2071).** `web{n}-` produced `web1-` / `web2-` and
+  `web{n:_}` produced `web1_000`; preview and commit accepted them, the
+  A records were written and BIND's check-names refused the forward and
+  reverse zones. Preview and commit now check every generated name with
+  the host-label rule the single Allocate IP path uses
+  (`core/dns_names`), store it lower-cased as that path does, and answer
+  422 naming the offending names, creating nothing. Token format specs
+  are limited to the ones the dialog's live preview renders identically —
+  plain, `d`, `x`, `X`, each optionally zero-padded (`{n:03d}`,
+  `{oct4:03d}`) — so `{n:_}`, `{n:,}`, `{n:5d}` and conversions are
+  refused, and the iterator start must be 0 to 999,999,999 (a negative
+  start zero-padded differently in the browser). The dialog now parses
+  and renders templates exactly as the server does and checks every name
+  in the range, and a shared vectors file is run by both a backend test
+  and a vitest so the two cannot drift. `{oct1}`–`{oct4}` now honour a
+  padding spec instead of silently ignoring it (multicast name templates
+  too). Also fixed on the way: Python's `$` matches before a trailing
+  newline, so a label ending in `\n` passed every host and record-owner
+  name check; the label rules now anchor with `\Z`.
+
+- **The DNS server shows the version its agent actually runs
+  (#2078).** The DNS agent registered with a literal
+  `"2026.04.14.1"` that nothing rewrote, and the control plane
+  seeded the operator's `notes` with it (`agent v2026.04.14.1`)
+  and kept no version anywhere else; the heartbeat's
+  `agent_version` was accepted and dropped. The agent now sends
+  its stamped release, the register and heartbeat handlers store
+  it in a new `dns_server.agent_version`, the server response
+  carries it, the server detail dialog shows it (unknown when
+  never reported, n/a for an agentless driver), and the
+  `find_dns_servers` copilot tool reports it. `notes` is no
+  longer seeded by the agent; existing rows keep whatever note
+  they have. An agent of an earlier release still registers with
+  the old literal, which is ignored rather than stored, so it
+  never overwrites the real version that agent's heartbeat
+  reports. Migration `a2078c5e1d90`.
+
 - **Three more TTL fields no longer read `1h` as 1 second (#2086).**
   The IPAM DDNS TTL override (on a new or edited subnet), the IPAM
   template's DDNS TTL and the DNS pool TTL read the field with
@@ -5774,6 +5812,8 @@ the formatter handles the rest.
   key to `dns_zone` (`ON DELETE SET NULL`) with an index. Set on every op
   queued from now on. No backfill: an older op cannot say which view's
   zone it belonged to, so NULL stays. Downgrade drops the column.
+- `a2078c5e1d90` — #2078, adds nullable `dns_server.agent_version`
+  (String(64)); no backfill, NULL means the agent has not reported one.
 
 ## 2026.10.02-1 — 2026-10-02
 
