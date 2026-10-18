@@ -150,6 +150,19 @@ class AgentRegisterRequestV2(BaseModel):
         return v
 
 
+# #2078 — every DNS agent released before this fix registered with this
+# literal, whatever build it ran (its heartbeat already sent the real stamp).
+# It names no build, so it is treated as "not reported": stored, it would show
+# a version the agent does not run until the next heartbeat corrected it.
+_UNSTAMPED_REGISTER_VERSION = "2026.04.14.1"
+
+
+def _reported_agent_version(version: str | None) -> str | None:
+    if not version or version == _UNSTAMPED_REGISTER_VERSION:
+        return None
+    return version
+
+
 class AgentRegisterResponseV2(BaseModel):
     server_id: str
     agent_id: str
@@ -436,7 +449,8 @@ async def agent_register(
             agent_fingerprint=body.fingerprint,
             pending_approval=require_approval,
             is_primary=not has_primary,
-            notes=f"agent v{body.version}" if body.version else "auto-registered",
+            # ``notes`` is the operator's field; the agent never writes it.
+            agent_version=_reported_agent_version(body.version),
         )
         pending_approval = require_approval
         db.add(server)
@@ -460,6 +474,12 @@ async def agent_register(
         server.driver = body.driver
         server.roles = body.roles
         server.status = "active"
+        # Only overwrite when the agent actually reported one: an older agent
+        # sends the fixed literal (or nothing) and must not overwrite the real
+        # version its own heartbeat already recorded.
+        reported = _reported_agent_version(body.version)
+        if reported:
+            server.agent_version = reported
         if server.agent_id is None:
             server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
 
@@ -908,6 +928,9 @@ async def agent_heartbeat(
     # reason.
     if body.daemon_version:
         server.daemon_version = body.daemon_version
+    # #2078 — likewise only when reported (an older agent omits it).
+    if body.agent_version:
+        server.agent_version = body.agent_version
     # #1171 — on every heartbeat, from the header: the same server row is run
     # by an older agent until the upgrade replaces its pod, and by an older one
     # again if a node is rolled back.

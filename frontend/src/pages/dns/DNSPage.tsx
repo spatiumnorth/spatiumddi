@@ -793,6 +793,7 @@ function ImportZoneModal({
       dnsApi.importZonePreview(groupId, zone.id, {
         zone_file: zoneFile,
         zone_name: zone.name,
+        conflict_strategy: strategy,
       }),
     onSuccess: (data) => {
       setPreview(data);
@@ -890,9 +891,10 @@ function ImportZoneModal({
           <select
             className={inputCls}
             value={strategy}
-            onChange={(e) =>
-              setStrategy(e.target.value as "merge" | "replace" | "append")
-            }
+            onChange={(e) => {
+              setStrategy(e.target.value as "merge" | "replace" | "append");
+              setPreview(null);
+            }}
           >
             <option value="merge">
               Merge — add new, update changed, keep existing
@@ -931,6 +933,20 @@ function ImportZoneModal({
               "Unchanged",
               preview.unchanged,
               "text-muted-foreground",
+            )}
+            {preview.skipped.length > 0 && (
+              <details className="rounded border" open>
+                <summary className="cursor-pointer px-2 py-1 text-xs font-medium text-amber-600">
+                  Will not be imported ({preview.skipped.length})
+                </summary>
+                <ul className="max-h-40 overflow-auto px-2 py-1 text-xs">
+                  {preview.skipped.map((s, i) => (
+                    <li key={i} className="break-all">
+                      {s}
+                    </li>
+                  ))}
+                </ul>
+              </details>
             )}
           </div>
         )}

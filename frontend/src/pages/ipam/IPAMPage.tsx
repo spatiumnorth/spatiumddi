@@ -102,6 +102,7 @@ import {
 } from "@/lib/customFieldValues";
 import {
   hostnameError,
+  nameInZoneError,
   parseTtlInput,
   summarizeZoneNames,
 } from "@/lib/dnsNames";
@@ -3568,7 +3569,12 @@ export function AddAddressModal({
 
   // Hostname is required here; only surface the inline reason once the
   // operator has typed something (empty is already blocked by canSubmit).
-  const hostnameErr = hostname.trim() ? hostnameError(hostname) : null;
+  const selectedZone = availableZones.find((z: DNSZone) => z.id === dnsZoneId);
+  // The hostname plus its zone must fit a DNS name (#2072).
+  const hostnameErr = hostname.trim()
+    ? (hostnameError(hostname) ??
+      (selectedZone ? nameInZoneError(hostname, selectedZone.name) : null))
+    : null;
 
   const canSubmit =
     !!hostname.trim() &&
@@ -3576,7 +3582,6 @@ export function AddAddressModal({
     (mode === "next" ? !!nextPreview?.address : !!address);
 
   // Compute preview FQDN
-  const selectedZone = availableZones.find((z: DNSZone) => z.id === dnsZoneId);
   const fqdnPreview =
     hostname && selectedZone
       ? `${hostname}.${selectedZone.name.replace(/\.$/, "")}`

@@ -201,6 +201,7 @@ from app.services.dns.zone_templates import (
 from app.services.dns_io import (
     RecordChange,
     ZoneParseError,
+    apply_cname_rule,
     diff_records,
     parse_zone_file,
     write_zone_file,
@@ -601,6 +602,8 @@ class ServerResponse(BaseModel):
     agent_id: uuid.UUID | None
     last_seen_at: datetime | None
     last_seen_ip: str | None
+    # #2078 — the agent's own version; NULL = never reported (UNKNOWN).
+    agent_version: str | None = None
     last_config_etag: str | None
     pending_approval: bool
     is_primary: bool
@@ -683,6 +686,7 @@ class ServerResponse(BaseModel):
             agent_id=s.agent_id,
             last_seen_at=s.last_seen_at,
             last_seen_ip=s.last_seen_ip,
+            agent_version=s.agent_version,
             last_config_etag=s.last_config_etag,
             pending_approval=s.pending_approval,
             is_primary=s.is_primary,
@@ -8556,9 +8560,8 @@ class ImportPreviewRequest(BaseModel):
     zone_file: str
     zone_name: str | None = None
     view_id: uuid.UUID | None = None
-
-
-class ImportCommitRequest(ImportPreviewRequest):
+    # The preview needs the strategy to know which existing records survive
+    # (a ``replace`` deletes the ones the file lacks), for the CNAME rule (#2089).
     conflict_strategy: str = "merge"
 
     @field_validator("conflict_strategy")
@@ -8569,6 +8572,10 @@ class ImportCommitRequest(ImportPreviewRequest):
                 f"conflict_strategy must be one of {sorted(VALID_CONFLICT_STRATEGIES)}"
             )
         return v
+
+
+class ImportCommitRequest(ImportPreviewRequest):
+    pass
 
 
 class RecordChangeResponse(BaseModel):
@@ -8592,6 +8599,8 @@ class ImportPreviewResponse(BaseModel):
     unchanged: list[RecordChangeResponse]
     soa_detected: bool
     record_count: int
+    # Records the file carries that are not offered, each with its reason (#2089).
+    skipped: list[str] = Field(default_factory=list)
 
 
 class ImportCommitResponse(BaseModel):
@@ -8608,6 +8617,7 @@ class ImportCommitResponse(BaseModel):
     # not hold all of it yet. Always None for an agent-served zone, whose
     # ops apply asynchronously by design.
     provider_warning: str | None = None
+    skipped: list[str] = Field(default_factory=list)
 
 
 def _resolve_zone_name(body: ImportPreviewRequest, existing_zone: DNSZone | None) -> str:
@@ -8665,6 +8675,7 @@ async def import_zone_preview(
 
     existing = await _load_zone_records(zone_id, db)
     diff = diff_records(parsed.records, existing, zone_default_ttl=zone.ttl)
+    apply_cname_rule(diff, existing, replace=body.conflict_strategy == "replace")
 
     return ImportPreviewResponse(
         zone_id=zone.id,
@@ -8675,6 +8686,7 @@ async def import_zone_preview(
         unchanged=[_change_to_response(c) for c in diff.unchanged],
         soa_detected=parsed.soa is not None,
         record_count=len(parsed.records),
+        skipped=diff.skipped,
     )
 
 
@@ -8715,6 +8727,7 @@ async def import_zone_commit(
 
     existing = await _load_zone_records(zone_id, db)
     diff = diff_records(parsed.records, existing, zone_default_ttl=zone.ttl)
+    apply_cname_rule(diff, existing, replace=body.conflict_strategy == "replace")
 
     # #1861 — the route takes ``write`` on ``dns_record``; a ``replace`` that
     # would remove records also takes ``delete``, as the record DELETE does.
@@ -8833,6 +8846,7 @@ async def import_zone_commit(
                 "updated": updated,
                 "deleted": deleted,
                 "unchanged": unchanged_count,
+                "skipped": diff.skipped,
                 "target_serial": target_serial,
                 "changes": {
                     "create": [
@@ -8888,6 +8902,7 @@ async def import_zone_commit(
         unchanged=unchanged_count,
         conflict_strategy=body.conflict_strategy,
         provider_warning=provider_warning,
+        skipped=diff.skipped,
     )
 
 

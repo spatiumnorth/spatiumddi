@@ -27,7 +27,9 @@ from app.api.v1.ipam.io_router import router as io_router
 from app.core.dns_names import (
     MAX_NAME_LEN,
     bind_check_names_error,
+    name_in_zone_error,
     validate_fqdn,
+    validate_host_label,
     validate_hostname,
     validate_record_owner,
 )
@@ -1736,6 +1738,26 @@ async def _operator_ptr_twin(
     return None
 
 
+def _name_too_long_for_zone(ip: IPAddress, zone_domain: str, strict: bool) -> bool:
+    """True when ``<hostname>.<zone>`` is not a legal DNS name (#2072).
+
+    ``strict`` raises the 422 instead (the request paths); otherwise the
+    caller skips the zone, and this logs why.
+    """
+    err = name_in_zone_error(ip.hostname or "", zone_domain, field="hostname")
+    if err is None:
+        return False
+    if strict:
+        raise HTTPException(status_code=422, detail=err)
+    logger.warning(
+        "ipam_dns_name_too_long",
+        ip=str(ip.address),
+        zone=zone_domain,
+        hostname_length=len(ip.hostname or ""),
+    )
+    return True
+
+
 async def _sync_dns_record(
     db: AsyncSession,
     ip: IPAddress,
@@ -1745,6 +1767,7 @@ async def _sync_dns_record(
     ttl: int | None = None,
     *,
     backfill_reverse_zone: bool = True,
+    strict: bool = False,
 ) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
@@ -1765,6 +1788,12 @@ async def _sync_dns_record(
     ran (or, with ``skip_reverse_zone``, deliberately did not run) the
     reverse-zone step, and the gateway placeholder's sync must not undo the
     opt-out (spatiumddi#1150).
+
+    ``strict=True`` (the request paths) answers a 422 naming ``hostname`` when
+    ``<hostname>.<zone>`` passes the 253-character DNS name limit (#2072);
+    otherwise (DDNS, importers, DHCP statics) the over-long name is skipped
+    and logged, because those paths must not fail a lease or a batch over one
+    row, and the name must not reach a zone BIND would then refuse whole.
 
     Returns whether the sync had anything to do: False when the row carries
     no hostname, when there is no primary zone and no extra zone to publish
@@ -1844,9 +1873,18 @@ async def _sync_dns_record(
             pass
 
     zone_domain = zone.name.rstrip(".") if zone else ""
-    fqdn = f"{ip.hostname}.{zone_domain}" if zone_domain else None
+    # #2072 — ``<hostname>.<zone>`` past 253 characters is no DNS name, and
+    # BIND refuses the zone holding it and the reverse zone whose PTR names
+    # it. Strict paths 422 here, before anything is written. Otherwise the
+    # primary zone drops out of the desired set below, so a record an earlier
+    # name published there is retracted (as is its PTR, ``fqdn`` being None)
+    # rather than left naming a host the row no longer carries.
+    primary_too_long = bool(zone_domain) and _name_too_long_for_zone(ip, zone_domain, strict)
+    fqdn = f"{ip.hostname}.{zone_domain}" if zone_domain and not primary_too_long else None
     if fqdn:
         ip.fqdn = fqdn
+    elif primary_too_long:
+        ip.fqdn = None
 
     # Forward record type depends on the address family: AAAA for IPv6, A for IPv4.
     try:
@@ -1899,6 +1937,11 @@ async def _sync_dns_record(
             zone if desired_zone_id == effective_zone_id else await db.get(DNSZone, desired_zone_id)
         )
         if target is not None and ipam_authors_zone(target):
+            if desired_zone_id == effective_zone_id:
+                if primary_too_long:
+                    continue  # #2072 — logged above
+            elif _name_too_long_for_zone(ip, target.name.rstrip("."), strict):
+                continue  # #2072 — an extra zone the name does not fit in
             authored_zone_ids.append(desired_zone_id)
     desired_zone_ids = authored_zone_ids
 
@@ -2248,6 +2291,11 @@ async def _sync_dns_record(
             # Read by the DDNS path so it reports the CNAME clash, not "no
             # forward zone" (not a mapped column; lives for this request).
             ip._dns_skipped_cname = True  # type: ignore[attr-defined]
+            return False
+        if primary_too_long and not forward_published:
+            # #2072 — read by the DDNS path the same way, so it reports the
+            # over-long name, not "no forward zone".
+            ip._dns_skipped_too_long = True  # type: ignore[attr-defined]
             return False
         return True
     try:
@@ -7331,11 +7379,16 @@ async def _apply_dns_sync(
                     errors.append(f"{ip.address}: parent subnet missing")
                     continue
                 try:
-                    await _sync_dns_record(db, ip, sn, action="create")
+                    # #2072 — strict, so a name too long for its zone is
+                    # reported in ``errors`` instead of counted as synced. The
+                    # refusal comes before anything is written for this IP.
+                    await _sync_dns_record(db, ip, sn, action="create", strict=True)
                     if ip.id in body.create_for_ip_ids:
                         created += 1
                     else:
                         updated += 1
+                except HTTPException as exc:
+                    errors.append(f"{ip.address}: {exc.detail}")
                 except Exception as exc:
                     errors.append(f"{ip.address}: {exc}")
         # #1536 — a batched agentless op that came back ``failed`` was
@@ -8164,7 +8217,7 @@ async def create_address(
         await _record_mac_history(db, ip.id, body.mac_address)
 
     # Sync DNS A record
-    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
+    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
     # User-specified alias records (CNAME / A) tied to this IP
     if body.aliases:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
@@ -8605,9 +8658,11 @@ async def update_address(
         # zone_cleared is handled above, so an explicit zone here is a real
         # UUID; otherwise preserve the IP's current forward zone (#493).
         zone_id = uuid.UUID(body.dns_zone_id) if dns_zone_explicit else ip.forward_zone_id
-        await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update")
+        await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update", strict=True)
     elif subnet and restoring:
-        await _sync_dns_record(db, ip, subnet, zone_id=ip.forward_zone_id, action="create")
+        await _sync_dns_record(
+            db, ip, subnet, zone_id=ip.forward_zone_id, action="create", strict=True
+        )
 
     # #1628 — keep the DHCP reservation in step with the row: a MAC /
     # hostname change lands on the linked DHCPStaticAssignment, flipping
@@ -9154,7 +9209,20 @@ async def purge_orphans(
 
 _BULK_MAX_IPS = 1024
 _BULK_ALLOC_ALLOWED_STATUSES = frozenset({"allocated", "reserved", "deprecated"})
-_HOSTNAME_LABEL_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,62})$")
+# Token format specs the console's live preview also implements (#2071), for
+# ``{n}`` and ``{oct1}``-``{oct4}`` alike: plain, ``d``, ``x`` / ``X``, each
+# optionally zero-padded to a width of at most 99 (``03``, ``03d``, ``04x``).
+# Anything else renders differently in Python and in the browser (``{n:_}``,
+# ``{n:,}``, ``{oct4:03}`` on a string octet gives ``100``) or pads with spaces
+# (``{n:5d}``), so it is refused instead of previewing one name and storing
+# another. The width cap also stops ``{n:0999999999d}`` allocating a gigabyte
+# per candidate.
+# Matched with ``fullmatch``: ``$`` also matches before a trailing newline,
+# which let ``{n:d\n}`` through to render as the unpadded fallback.
+_BULK_SPEC_RE = re.compile(r"(?:0[1-9][0-9]?)?[dxX]?")
+# Upper bound on the iterator: the browser computes names with IEEE doubles,
+# which stop being exact integers past 2**53, and render 1e21 as ``1e+21``.
+_BULK_TEMPLATE_START_MAX = 999_999_999
 _BULK_TEMPLATE_FIELDS: frozenset[str] = frozenset({"n", "oct1", "oct2", "oct3", "oct4"})
 
 
@@ -9172,6 +9240,40 @@ def _bulk_template_has_token(template: str) -> bool:
         if field_name in _BULK_TEMPLATE_FIELDS:
             return True
     return False
+
+
+def _bulk_template_format_error(template: str) -> str | None:
+    """Reason the template uses a token form the live preview can't mirror."""
+    if not template.isascii():
+        # validate_host_label would IDNA-encode a unicode name to ``xn--…``,
+        # which the console cannot preview; bulk names stay ASCII.
+        return "Template must be ASCII; host names are letters, digits and hyphens."
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError as exc:
+        return f"Template is malformed: {exc}"
+    for _literal, field_name, spec, conversion in parsed:
+        if field_name is None:
+            continue
+        if conversion:
+            return f"Template token {{{field_name}!{conversion}}}: conversions are not supported."
+        if field_name in _BULK_TEMPLATE_FIELDS and not _BULK_SPEC_RE.fullmatch(spec or ""):
+            return (
+                f"Template token {{{field_name}:{spec}}} is not supported; use "
+                f"{{{field_name}}}, {{{field_name}:03d}} (zero-pad), "
+                f"{{{field_name}:x}} or {{{field_name}:X}}."
+            )
+    return None
+
+
+def _bulk_stored_hostname(rendered: str) -> str:
+    """The name bulk allocate stores for one rendered template (#2071).
+
+    Raises ``ValueError`` when the rendering is not a host label. Pinned
+    against the console's copy (``frontend/src/lib/bulk-allocate-template.ts``)
+    by the shared vectors in ``bulk-allocate-template.vectors.json``.
+    """
+    return validate_host_label(rendered, field="hostname")
 
 
 def _expand_bulk_template(
@@ -9193,9 +9295,10 @@ def _expand_bulk_template(
     Replaced by Python's stdlib ``string.Formatter`` parser, which is
     a C-implemented linear-time tokenizer — exactly the grammar we
     want anyway (``{n}`` / ``{n:03d}`` / ``{oct1}``) without the
-    custom regex. Bad format specs degrade to ``str(n)`` rather than
-    raising so preview still renders something the operator can
-    correct."""
+    custom regex. A spec ``format`` refuses degrades to ``str(value)``
+    rather than raising; the IPAM bulk path refuses such specs up front
+    (``_bulk_template_format_error``, #2071), and the multicast path, which
+    has no browser-side preview to disagree with, renders the fallback."""
     octets = str(ip_obj).split(".") if isinstance(ip_obj, ipaddress.IPv4Address) else []
 
     def _value_for(field_name: str) -> str | int | None:
@@ -9203,7 +9306,9 @@ def _expand_bulk_template(
             return n
         if len(field_name) == 4 and field_name.startswith("oct") and field_name[3] in "1234":
             idx = int(field_name[3]) - 1
-            return octets[idx] if 0 <= idx < len(octets) else ""
+            # An int, so ``{oct4:03d}`` pads like ``{n:03d}`` (as a string
+            # octet ``d`` raised and the spec was silently dropped).
+            return int(octets[idx]) if 0 <= idx < len(octets) else ""
         return None  # unknown token — leave literal
 
     formatter = string.Formatter()
@@ -9247,7 +9352,7 @@ class BulkAllocateRequest(BaseModel):
     range_start: str
     range_end: str
     hostname_template: str = Field(min_length=1, max_length=128)
-    template_start: int = 1
+    template_start: int = Field(default=1, ge=0, le=_BULK_TEMPLATE_START_MAX)
     status: str = "allocated"
     description: str | None = None
     dns_zone_id: str | None = None
@@ -9328,15 +9433,36 @@ async def _build_bulk_allocate_candidates(
             detail=f"Range too large ({total} IPs); max {_BULK_MAX_IPS} per call",
         )
 
-    # Validate the template against the first candidate. RFC 1035 label
-    # rules: ≤ 63 chars, alphanumeric + hyphen, no leading hyphen.
-    probe = _expand_bulk_template(body.hostname_template, start, body.template_start)
-    if not probe or not _HOSTNAME_LABEL_RE.match(probe):
+    # Every generated name must be a host label by the rule the single
+    # allocate path applies to each label of its hostname (core/dns_names,
+    # #2071); the stored name is the normalized (lower-cased) one, as there,
+    # so preview == stored.
+    fmt_err = _bulk_template_format_error(body.hostname_template)
+    if fmt_err:
+        raise HTTPException(status_code=422, detail=fmt_err)
+    hostnames: list[str] = []
+    bad_names: list[str] = []
+    bad_count = 0
+    for idx in range(total):
+        ip_obj = ipaddress.ip_address(int(start) + idx)
+        raw = _expand_bulk_template(body.hostname_template, ip_obj, body.template_start + idx)
+        try:
+            hostnames.append(_bulk_stored_hostname(raw))
+        except ValueError as exc:
+            hostnames.append(raw)
+            bad_count += 1
+            if len(bad_names) < 5:
+                bad_names.append(f"#{idx + 1} ({ip_obj}) '{raw}': {exc}")
+    if bad_count:
+        more = f" (and {bad_count - len(bad_names)} more)" if bad_count > len(bad_names) else ""
         raise HTTPException(
             status_code=422,
             detail=(
-                f"Template produces invalid hostname for range_start: '{probe}'. "
-                "Hostnames must match ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$."
+                f"Template produces {bad_count} invalid host name(s): "
+                + "; ".join(bad_names)
+                + more
+                + ". Host names are letters, digits and hyphens, with no leading or "
+                "trailing hyphen, at most 63 characters."
             ),
         )
 
@@ -9360,7 +9486,7 @@ async def _build_bulk_allocate_candidates(
         ip_int = int(start) + idx
         ip_obj = ipaddress.ip_address(ip_int)
         ip_str = str(ip_obj)
-        hostname = _expand_bulk_template(body.hostname_template, ip_obj, body.template_start + idx)
+        hostname = hostnames[idx]
         items.append(
             BulkAllocateItem(
                 address=ip_str,
@@ -9547,7 +9673,9 @@ async def bulk_allocate_commit(
             await db.flush()
 
             if body.create_dns_records:
-                await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
+                await _sync_dns_record(
+                    db, ip, subnet, zone_id=explicit_zone, action="create", strict=True
+                )
 
             db.add(
                 _audit(
@@ -9842,7 +9970,7 @@ async def allocate_next_ip(
         await _record_mac_history(db, ip.id, body.mac_address)
 
     # Sync DNS A record
-    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
+    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
     # User-specified alias records (CNAME / A) tied to this IP
     if body.aliases:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
@@ -10757,7 +10885,9 @@ async def bulk_edit_addresses(
                         subnet_cache[ip.subnet_id] = subnet
                 if subnet is not None:
                     old["forward_zone_id"] = str(ip.forward_zone_id) if ip.forward_zone_id else None
-                    await _sync_dns_record(db, ip, subnet, zone_id=new_zone_id, action="update")
+                    await _sync_dns_record(
+                        db, ip, subnet, zone_id=new_zone_id, action="update", strict=True
+                    )
 
             db.add(
                 _audit(

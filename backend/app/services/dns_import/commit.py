@@ -37,6 +37,7 @@ from app.services.dns.record_ops import (
     resolve_primary_server,
 )
 
+from . import cname_check
 from .apex_ns import ApexNsPolicy, group_names, is_apex_ns_warning, replace_apex_ns
 from .canonical import (
     ConflictAction,
@@ -59,6 +60,8 @@ class CommitZoneResult:
     records_created: int = 0
     records_deleted: int = 0
     error: str | None = None
+    # Records dropped rather than stored, each with its reason (#2089).
+    skipped_records: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -178,8 +181,12 @@ async def _build_records_for_zone(
 
     rows: list[DNSRecord] = []
     skipped: list[str] = []
-    for r in parsed.records:
+    cname_refused = cname_check.cname_skips(parsed)  # #2089
+    for idx, r in enumerate(parsed.records):
         if r.record_type == "SOA":
+            continue
+        if idx in cname_refused:
+            skipped.append(cname_check.describe_skip(parsed, idx, cname_refused[idx]))
             continue
         if contains_control_chars(r.name) or contains_control_chars(r.value):
             skipped.append(
@@ -419,6 +426,7 @@ async def _create_zone_at(
         zone_id=str(zone.id),
         records_created=records_created,
         records_deleted=overwrote_records,
+        skipped_records=skipped_records,
     )
 
 
@@ -664,7 +672,8 @@ async def commit_import(
         .all()
     )
     bind9_target = not drivers or "bind9" in drivers
-    warnings = list(preview.warnings)
+    # The CNAME-rule warnings are recomputed below from the zones as committed.
+    warnings = [w for w in preview.warnings if not cname_check.is_cname_warning(w)]
     # #1892 — "replace" swaps an imported apex NS naming a host outside the
     # group for the group's own servers; "keep" (default) imports it as is.
     apex_names = await group_names(db, target_group_id) if apex_ns_policy == "replace" else None
@@ -732,6 +741,9 @@ async def commit_import(
                 error=str(exc),
             )
         results.append(result)
+        warnings.extend(
+            f"Zone {parsed.name!r}: record not imported, {why}" for why in result.skipped_records
+        )
 
     return CommitResult(
         target_group_id=target_group_id,
