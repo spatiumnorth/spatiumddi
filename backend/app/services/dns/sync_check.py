@@ -775,7 +775,12 @@ async def compute_subnet_dns_drift(
             "AAAA" if ipaddress.ip_address(str(ip.address)).version == 6 else "A"
         )
         ip_forward_records = [
-            r for r in recs_by_ip.get(ip.id, []) if r.record_type in ("A", "AAAA")
+            # #2084 — an alias is an A / AAAA of the address too, but it is
+            # not the host record: it would read as a mismatch and the sync
+            # would rewrite it into the host name.
+            r
+            for r in recs_by_ip.get(ip.id, [])
+            if r.record_type in ("A", "AAAA") and not r.ip_alias
         ]
         ip_ptr_records = [r for r in recs_by_ip.get(ip.id, []) if r.record_type == "PTR"]
 

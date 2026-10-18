@@ -1540,6 +1540,7 @@ async def _create_alias_records(
             record_type=rtype,
             value=value,
             auto_generated=True,
+            ip_alias=True,  # #2084 — the marker every alias reader keys on
             ip_address_id=ip.id,
             created_by_user_id=ip.created_by_user_id,
         )
@@ -1952,6 +1953,10 @@ async def _sync_dns_record(
         select(DNSRecord).where(
             DNSRecord.ip_address_id == ip.id,
             DNSRecord.auto_generated.is_(True),
+            # #2084 — the host record(s) only: an alias is also an A / AAAA
+            # tied to this address, and must be neither renamed into the host
+            # nor retracted as a zone the host does not publish to.
+            DNSRecord.ip_alias.is_(False),
             DNSRecord.record_type.in_(["A", "AAAA"]),
         )
     )
@@ -7841,14 +7846,12 @@ async def _alias_counts_for(db: AsyncSession, ips: list[IPAddress]) -> dict[uuid
     if not ips:
         return {}
     ip_ids = [ip.id for ip in ips]
-    primary_ids = {ip.dns_record_id for ip in ips if ip.dns_record_id is not None}
     conds = [
         DNSRecord.ip_address_id.in_(ip_ids),
         DNSRecord.auto_generated.is_(True),
+        DNSRecord.ip_alias.is_(True),  # #2084
         DNSRecord.record_type.in_(["CNAME", "A", "AAAA"]),
     ]
-    if primary_ids:
-        conds.append(DNSRecord.id.notin_(primary_ids))
     q = (
         select(DNSRecord.ip_address_id, func.count(DNSRecord.id))
         .where(*conds)
@@ -8716,21 +8719,17 @@ async def list_aliases(address_id: uuid.UUID, current_user: CurrentUser, db: DB)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
     _enforce_subnet_token_scope(current_user, ip.subnet_id)
-    # Aliases are auto-generated records linked to this IP that aren't the
-    # primary forward A (which is stored separately on ip.dns_record_id).
+    # Aliases are the records marked ``ip_alias`` (#2084): the host record(s),
+    # including one published into an extra zone, are not.
     res = await db.execute(
         select(DNSRecord).where(
             DNSRecord.ip_address_id == ip.id,
             DNSRecord.auto_generated.is_(True),
+            DNSRecord.ip_alias.is_(True),
             DNSRecord.record_type.in_(["CNAME", "A", "AAAA"]),
         )
     )
-    out = []
-    for r in res.scalars().all():
-        if ip.dns_record_id is not None and r.id == ip.dns_record_id:
-            continue  # exclude the primary A
-        out.append(r)
-    return out
+    return list(res.scalars().all())
 
 
 @router.post(
@@ -8783,6 +8782,7 @@ async def add_alias(
             DNSRecord.name == body.name,
             DNSRecord.record_type == written_type,
             DNSRecord.ip_address_id == ip.id,
+            DNSRecord.ip_alias.is_(True),
         )
     )
     rec = res.scalar_one_or_none()
@@ -8824,10 +8824,12 @@ async def delete_alias(
     rec = await db.get(DNSRecord, record_id)
     if rec is None or rec.ip_address_id != ip.id:
         raise HTTPException(status_code=404, detail="Alias not found")
-    if ip.dns_record_id == rec.id:
+    if not rec.ip_alias:
+        # #2084 — a host record (the primary, or one published into an extra
+        # zone) or a PTR is not an alias, whatever the address links to.
         raise HTTPException(
             status_code=409,
-            detail="Can't delete the primary A record — change the IP's hostname or delete the IP instead.",
+            detail="Can't delete the address's own DNS record — change the IP's hostname, its extra zones, or delete the IP instead.",
         )
     zone = await db.get(DNSZone, rec.zone_id)
     if zone is not None:
@@ -10443,7 +10445,7 @@ async def list_subnet_aliases(
 ) -> list[SubnetAliasResponse]:
     """List every user-added DNS alias (CNAME or secondary A) for IPs in this subnet.
 
-    Primary A records (pointed to by ``IPAddress.dns_record_id``) are excluded.
+    The address's own host records are excluded (aliases carry ``ip_alias``, #2084).
     """
     if await db.get(Subnet, subnet_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
@@ -10456,14 +10458,12 @@ async def list_subnet_aliases(
     if not ips:
         return []
     ip_by_id = {ip.id: ip for ip in ips}
-    primary_ids = {ip.dns_record_id for ip in ips if ip.dns_record_id is not None}
     conds = [
         DNSRecord.ip_address_id.in_(list(ip_by_id.keys())),
         DNSRecord.auto_generated.is_(True),
+        DNSRecord.ip_alias.is_(True),  # #2084
         DNSRecord.record_type.in_(["CNAME", "A", "AAAA"]),
     ]
-    if primary_ids:
-        conds.append(DNSRecord.id.notin_(primary_ids))
     records = list((await db.execute(select(DNSRecord).where(*conds))).scalars().all())
     out: list[SubnetAliasResponse] = []
     for rec in records:

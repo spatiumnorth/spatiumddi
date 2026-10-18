@@ -84,6 +84,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Editing an IP no longer renames or deletes its own A aliases, and
+  the alias lists no longer show a host record as an alias (#2084).**
+  An address's A/AAAA aliases and its own host records are both
+  auto-generated rows tied to the address, so the DNS sync loaded the
+  aliases as the host record: an edit or rename could rewrite an alias
+  into the host name (leaving the real host missing or duplicated), an
+  alias in a zone the host does not publish to was deleted, and giving
+  an address the default `gateway` name deleted every alias. The
+  mirror image was in the alias lists (`GET /addresses/{id}/aliases`,
+  `GET /subnets/{id}/aliases`, the per-address alias count): they told
+  an alias from the host only by `ip.dns_record_id`, so a host record
+  published into an extra zone was listed and counted as an alias and
+  could be deleted through the alias endpoint (now 409). A new
+  `dns_record.ip_alias` column says what a row is; every alias writer
+  sets it and the sync, the three lists, alias delete and the DNS
+  drift check read it. The drift check no longer reports an alias as a
+  mismatched host record.
+
 - **Allocate IP no longer stores a hostname whose name in its zone
   passes 253 characters (#2072).** A 243-character hostname is valid
   alone, but IPAM publishes `<hostname>.<zone>`, and the length cap
@@ -5743,6 +5761,12 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `b3d7f1a82c54` — #2084, schema + data: adds
+  `dns_record.ip_alias` (NOT NULL, default false) and backfills it.
+  Among auto-generated CNAME / A / AAAA rows tied to an address, an
+  A / AAAA named like the address's hostname in its forward or an extra
+  zone (or the row `ip_address.dns_record_id` names) stays false; the
+  rest are aliases. Downgrade drops the column.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column
