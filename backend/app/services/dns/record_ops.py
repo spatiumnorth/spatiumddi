@@ -32,7 +32,7 @@ from app.core.agent_wake import collect_wake, dns_group_channel
 from app.drivers.dns import AGENTLESS_DRIVERS, get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
 from app.models.audit import AuditLog
-from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone
+from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone, servable_ttl
 from app.models.ipam import IPAddress
 from app.services.dns.row_locks import ids_in, lock_op_ids
 from app.services.dns.rrset import rrset_key as record_rrset_key
@@ -1358,7 +1358,9 @@ def record_op_payload(record: DNSRecord) -> dict[str, Any]:
         "name": record.name,
         "type": record.record_type,
         "value": record.value,
-        "ttl": record.ttl,
+        # #2073 — a TTL stored negative before the API bounded it is sent as
+        # null (inherit the zone's), never as a value no server accepts.
+        "ttl": servable_ttl(record.ttl),
         "priority": record.priority,
         "weight": record.weight,
         "port": record.port,
