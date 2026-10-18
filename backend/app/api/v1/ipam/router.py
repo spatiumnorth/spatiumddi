@@ -24,7 +24,13 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
-from app.core.dns_names import validate_fqdn, validate_hostname, validate_record_owner
+from app.core.dns_names import (
+    MAX_NAME_LEN,
+    bind_check_names_error,
+    validate_fqdn,
+    validate_hostname,
+    validate_record_owner,
+)
 from app.core.permissions import (
     is_effective_superadmin,
     require_any_resource_or_scoped,
@@ -1347,6 +1353,121 @@ async def _batched_dns_ops(db: AsyncSession) -> Any:
         _dns_op_collector.reset(token)
 
 
+async def _assert_alias_cname_rules(
+    db: AsyncSession,
+    subnet: Subnet,
+    aliases: list[Any],
+    *,
+    hostname: str | None,
+    address: Any,
+    zone_id: uuid.UUID | None,
+) -> None:
+    """Refuse an alias set that would put a CNAME beside other data (#2080).
+
+    A name that holds a CNAME holds nothing else (RFC 1034 section 3.6.2,
+    RFC 2181 section 10.1); BIND refuses the whole zone otherwise and the
+    agent stays on its last good config. This is the check the DNS record
+    API runs (``app.services.dns.cname_conflict``, status and message shape
+    included: 422 for a CNAME at the apex, 409 for a clash), applied to
+    every alias before anything is written, in both directions: a CNAME
+    alias onto a name that holds data, and an A / AAAA alias onto a name that
+    is a CNAME. It also covers the IP's own host name and the aliases of the
+    same request, which are not in the database yet. Rows are matched in
+    every view, since an alias is a no-view row and renders into all of them.
+    """
+    from app.services.dns.cname_conflict import (  # noqa: PLC0415
+        APEX_CNAME_DETAIL,
+        describe_cname_conflict,
+        find_cname_conflict,
+        is_apex,
+    )
+
+    if not aliases or not hostname:
+        return
+    effective_zone_id = zone_id or await _resolve_effective_zone(db, subnet)
+    if not effective_zone_id:
+        return
+    zone = await db.get(DNSZone, effective_zone_id)
+    if zone is None or not ipam_authors_zone(zone):
+        return
+    zone_domain = zone.name.rstrip(".")
+    try:
+        is_v6 = isinstance(ipaddress.ip_address(str(address)), ipaddress.IPv6Address)
+    except ValueError:
+        is_v6 = False
+    host_rtype = "AAAA" if is_v6 else "A"
+    # name (lower-cased) -> what the request itself will put there, as
+    # (is_cname, label) pairs; the label names it in the refusal.
+    pending: dict[str, list[tuple[bool, str]]] = {
+        hostname.strip().lower(): [(False, f"the address's own {host_rtype} record")]
+    }
+    for al in aliases:
+        rtype = (getattr(al, "record_type", None) or al.get("record_type") or "CNAME").upper()
+        # The writer turns an A alias on an IPv6 address into an AAAA.
+        if rtype == "A" and is_v6:
+            rtype = "AAAA"
+        name = (getattr(al, "name", None) or al.get("name") or "").strip().rstrip(".")
+        if not name or rtype not in {"CNAME", "A", "AAAA"}:
+            continue
+        fqdn = f"{name}.{zone_domain}"
+        if rtype == "CNAME" and is_apex(name):
+            raise HTTPException(status_code=422, detail=APEX_CNAME_DETAIL)
+        other = await find_cname_conflict(
+            db, effective_zone_id, view_id=None, name=name, record_type=rtype
+        )
+        if other is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, describe_cname_conflict(rtype, fqdn, other)
+            )
+        is_cname = rtype == "CNAME"
+        what = f"{'an' if rtype.startswith('A') else 'a'} {rtype} alias"
+        siblings = pending.setdefault(name.lower(), [])
+        clash = next((lbl for c, lbl in siblings if is_cname or c), None)
+        if clash is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{fqdn} would hold both {clash} and {what} from this "
+                "request. A CNAME must be the only record at its name (RFC 1034 "
+                "section 3.6.2, RFC 2181 section 10.1); PowerDNS and BIND both "
+                "refuse a zone that breaks this, and the server stops applying it.",
+            )
+        siblings.append((is_cname, what))
+
+
+async def _assert_alias_names_fit(
+    db: AsyncSession,
+    aliases: list[Any],
+    zone_id: uuid.UUID | None,
+) -> None:
+    """422 an alias whose name inside its zone passes 253 characters.
+
+    ``AliasInput`` checks the alias on its own; only here is the zone known.
+    A name longer than a DNS name can carry makes BIND refuse the whole zone
+    ("ran out of space"), so it is refused before anything is written —
+    ``_create_alias_records`` runs after the host record, which an agentless
+    primary has already applied by then. Mirrors that function's skips: no
+    zone, or a zone IPAM does not author, writes no alias, so refuses none.
+    """
+    if not aliases or zone_id is None:
+        return
+    zone = await db.get(DNSZone, zone_id)
+    if zone is None or not ipam_authors_zone(zone):
+        return
+    zone_domain = zone.name.rstrip(".")
+    for al in aliases:
+        fqdn = f"{al.name}.{zone_domain}"
+        if len(fqdn) > MAX_NAME_LEN:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"alias '{al.name}': its name in zone {zone_domain} is "
+                    f"{len(fqdn)} characters, over the {MAX_NAME_LEN} a DNS name "
+                    "can carry. BIND refuses a zone that holds it, which stops "
+                    "the server applying its configuration."
+                ),
+            )
+
+
 async def _create_alias_records(
     db: AsyncSession,
     ip: IPAddress,
@@ -1522,24 +1643,87 @@ async def _operator_record_twin(
     """
     from app.services.dns.record_identity import find_identical_record  # noqa: PLC0415
 
-    # A PTR target is written with or without its trailing dot by hand.
-    values = {value}
-    if rtype == "PTR":
-        values.add(value.rstrip(".") if value.endswith(".") else value + ".")
-    for candidate in values:
-        found = await find_identical_record(
-            db,
-            zone_id,
-            view_id=None,
-            name=name,
-            record_type=rtype,
-            value=candidate,
-            priority=None,
-            weight=None,
-            port=None,
+    if rtype.upper() == "PTR":
+        return await _operator_ptr_twin(db, zone_id, name=name, value=value)
+    found = await find_identical_record(
+        db,
+        zone_id,
+        view_id=None,
+        name=name,
+        record_type=rtype,
+        value=value,
+        priority=None,
+        weight=None,
+        port=None,
+    )
+    if found is not None and not found.auto_generated:
+        return found
+    return None
+
+
+async def _operator_ptr_twin(
+    db: AsyncSession, zone_id: uuid.UUID, *, name: str, value: str
+) -> DNSRecord | None:
+    """The operator-written PTR IPAM's own would duplicate, or None (#2045).
+
+    A PTR is the same record when the servers SERVE the same target: compared
+    case-insensitively, and with a target written without its trailing dot
+    read the way the zone's servers read it. On BIND9, Technitium and Windows
+    Path A ``db1.example.com`` is relative to the reverse zone, so it names
+    ``db1.example.com.<zone>.`` and is not ours: IPAM writes its own PTR
+    beside it, and the operator's wrong one is logged so it can be found. On
+    the cloud providers and Windows Path B the same spelling is the absolute
+    name, and adopting it is what stops a duplicate the provider refuses.
+    """
+    from app.services.dns.record_identity import (  # noqa: PLC0415
+        ptr_target_key,
+        zone_target_readings,
+    )
+
+    readings = await zone_target_readings(db, [zone_id])
+    if zone_id not in readings:
+        return None
+    zone_name, relative = readings[zone_id]
+    want = ptr_target_key(value, zone_name, relative=relative)
+    rows = (
+        (
+            await db.execute(
+                select(DNSRecord).where(
+                    DNSRecord.zone_id == zone_id,
+                    DNSRecord.view_id.is_(None),
+                    func.lower(DNSRecord.name) == name.lower(),
+                    func.upper(DNSRecord.record_type) == "PTR",
+                    DNSRecord.auto_generated.is_(False),
+                    DNSRecord.priority.is_(None),
+                    DNSRecord.weight.is_(None),
+                    DNSRecord.port.is_(None),
+                )
+            )
         )
-        if found is not None and not found.auto_generated:
-            return found
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        if ptr_target_key(row.value, zone_name, relative=relative) == want:
+            return row
+    for row in rows:
+        if relative and ptr_target_key(row.value, zone_name, relative=False) == want:
+            # The operator meant our target and left off the trailing dot, so
+            # the servers answer a name under the reverse zone. Not adopted;
+            # IPAM's PTR now stands beside it and the reverse lookup answers
+            # both until the operator fixes or deletes theirs.
+            logger.warning(
+                "ipam_ptr_relative_operator_record",
+                zone=zone_name,
+                name=name,
+                operator_record_id=str(row.id),
+                operator_value=row.value,
+                detail=(
+                    f"PTR {row.value!r} has no trailing dot, so it is served as "
+                    f"{ptr_target_key(row.value, zone_name, relative=True)}; "
+                    f"IPAM wrote {value} beside it"
+                ),
+            )
     return None
 
 
@@ -3084,6 +3268,27 @@ class AliasInput(BaseModel):
         if not v:
             raise ValueError("alias name is required")
         return v
+
+    @model_validator(mode="after")
+    def _owner_rule(self) -> "AliasInput":
+        """Apply the DNS record API's owner-name rules to the alias (#2070).
+
+        The same two checks ``POST /dns/.../records`` runs: the RFC 2181
+        owner syntax, then BIND's check-names rule for the record type (an
+        A/AAAA owner must be a host name, so ``under_score`` is refused as
+        an A alias; a CNAME owner may keep an underscore).
+        """
+        owner = validate_record_owner(self.name, field=f"alias '{self.name}'")
+        err = bind_check_names_error(self.record_type, owner, None, origin="")
+        if err is not None:
+            raise ValueError(f"alias '{self.name}': {err}")
+        # Store the name the checks passed, as the record API does: an
+        # internationalized alias becomes its ``xn--`` A-label and the name
+        # is lower-cased. Keeping the raw form would write ``café`` into the
+        # zone, which check-names refuses for an A record even though its
+        # A-label passed.
+        self.name = owner
+        return self
 
 
 def _validate_role(v: Any) -> Any:
@@ -7896,6 +8101,8 @@ async def create_address(
     # check sees the same forward_zone_id that will land on the row.
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
+    if body.hostname:
+        await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
         warnings = await _check_ip_collisions(
             db,
@@ -7926,6 +8133,14 @@ async def create_address(
         if warnings:
             raise _collision_http_exc(warnings)
 
+    await _assert_alias_cname_rules(
+        db,
+        subnet,
+        body.aliases,
+        hostname=body.hostname,
+        address=body.address,
+        zone_id=explicit_zone,
+    )
     ip = IPAddress(
         subnet_id=subnet_id,
         created_by_user_id=current_user.id,
@@ -8485,6 +8700,11 @@ async def add_alias(
                 "records into it."
             ),
         )
+    if ip.hostname:
+        await _assert_alias_names_fit(db, [body], zone_id)
+    await _assert_alias_cname_rules(
+        db, subnet, [body], hostname=ip.hostname, address=ip.address, zone_id=zone_id
+    )
     await _create_alias_records(db, ip, subnet, [body], zone_id=zone_id)
     # Find the just-created record
     res = await db.execute(
@@ -9518,6 +9738,8 @@ async def allocate_next_ip(
     )
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
+    if body.hostname:
+        await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
         warnings = await _check_ip_collisions(
             db,
@@ -9575,6 +9797,14 @@ async def allocate_next_ip(
         if public_warnings:
             raise _collision_http_exc(public_warnings)
 
+    await _assert_alias_cname_rules(
+        db,
+        subnet,
+        body.aliases,
+        hostname=body.hostname,
+        address=chosen,
+        zone_id=explicit_zone,
+    )
     ip = IPAddress(
         subnet_id=subnet_id,
         address=str(chosen),

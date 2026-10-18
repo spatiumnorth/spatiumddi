@@ -682,7 +682,7 @@ class SyncLoop:
         if bundle is None:
             return
         self._boot_report_attempts += 1
-        done = self._report_zone_state(bundle, skip={h.zone.lower() for h in self.driver.held_back})
+        done = self._report_zone_state(bundle, skip=self._unconverged_zone_keys())
         if done or self._boot_report_attempts >= BOOT_REPORT_MAX_ATTEMPTS:
             if not done:
                 log.warning(
@@ -866,7 +866,7 @@ class SyncLoop:
             # roll back the apply (we already serve the new config). A zone
             # held back (#1403) is not serving the serial it was rendered
             # with, so it is left out and keeps the serial it last reported.
-            self._report_zone_state(bundle, skip={h.zone.lower() for h in self.driver.held_back})
+            self._report_zone_state(bundle, skip=self._unconverged_zone_keys())
             # This bundle replaces the one applied at startup, and its report
             # covers the same question.
             self._boot_report_bundle = None
@@ -929,8 +929,15 @@ class SyncLoop:
             # just reported is the pre-rollover set. Look again soon.
             self._dnssec_settle_streak = 0
             self._dnssec_recheck_soon()
+        # A zone the structural apply left partly refused (#2060) is not
+        # reported converged by an op that landed beside the refusal either.
+        unconverged = self._unconverged_zone_keys()
         self._report_reached_serials(
-            {zone: serial for zone, serial in reached.items() if zone not in failed_zones}
+            {
+                zone: serial
+                for zone, serial in reached.items()
+                if zone not in failed_zones and zone.lower() not in unconverged
+            }
         )
 
         # #882 — we got here with nothing quarantined and nothing to
@@ -1221,6 +1228,24 @@ class SyncLoop:
             "status": "degraded",
             "reason": f"config_apply_{status.status}: {status.error}",
         }
+
+    def _unconverged_zone_keys(self) -> set[str]:
+        """Zones (lowercase, no trailing dot) the live apply did not converge,
+        whose serial is therefore not reported as served (#1403, #2060).
+
+        A zone held back serves an older serial than it was rendered with. A
+        zone whose data the daemon refused in part may serve the NEW serial —
+        PowerDNS applies the rest of such a zone piecemeal, SOA last — with
+        records missing, and reporting that serial would make per-server sync
+        status read "in sync" beside the very refusal the apply status names.
+        Left out, the zone keeps the serial it last reported and reads behind
+        until an apply serves it whole.
+        """
+        keys = {h.zone.rstrip(".").lower() for h in self.driver.held_back}
+        hook = getattr(self.driver, "unconverged_zones", None)
+        if callable(hook):
+            keys |= {str(z).rstrip(".").lower() for z in hook()}
+        return keys
 
     def _report_zone_state(self, bundle: dict[str, Any], skip: set[str] | None = None) -> bool:
         """POST ``{zones: [{zone_name, serial}, ...]}`` after a successful apply.
