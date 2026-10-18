@@ -84,6 +84,21 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Integration sync-interval fields no longer read `1h` as 1
+  second, or turn a cleared field into the default (#2110).** The
+  sync interval on the PAN-OS, UniFi, Meraki, Cloud, Docker,
+  Tailscale, OPNsense, Kubernetes, NetBird, FortiGate and Proxmox
+  forms, the network device poll interval and SNMP timeout, and
+  the DNS pool health-check interval and timeout all read
+  themselves with `parseInt(...) || N`. They now go through one
+  `parseSecondsInput` (`lib/seconds.ts`, the reader `parseTtlInput`
+  delegates to): a whole number within the API's own bounds, `1e3`
+  is 1000, anything else is refused with the reason and nothing is
+  sent. An empty field is refused as required, because omitting it
+  on an edit means "unchanged" and the default would have silently
+  rewritten it. Bounds are the API's: 30 s (60 s for Cloud), `>= 0`
+  for device polling, 10..3600 and 1..60 for the pool check.
+
 - **Registering a DNS agent no longer deadlocks against the render of
   its first bundle (#2031).** The worker's bundle store wrote the
   server row in two UPDATEs, and Postgres re-runs a row's foreign-key

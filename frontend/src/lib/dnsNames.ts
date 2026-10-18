@@ -16,6 +16,8 @@
  * silently converted, since the browser can't run IDNA reliably.
  */
 
+import { parseSecondsInput } from "./seconds";
+
 export const MAX_LABEL_LEN = 63;
 export const MAX_NAME_LEN = 253;
 
@@ -156,13 +158,7 @@ export function parseTtlInput(
   text: string,
   bounds: { min: number; max: number } = { min: 0, max: DNS_TTL_MAX },
 ): number | null | string {
-  const t = text.trim();
-  if (t === "") return null;
-  const n = Number(t);
-  if (!Number.isInteger(n) || n < bounds.min || n > bounds.max) {
-    return `must be a whole number of seconds from ${bounds.min} to ${bounds.max}`;
-  }
-  return n;
+  return parseSecondsInput(text, bounds);
 }
 
 /** A DNS pool's TTL bounds: the API's `ge=1, le=86400` (`api/v1/dns/pools.py`). */
