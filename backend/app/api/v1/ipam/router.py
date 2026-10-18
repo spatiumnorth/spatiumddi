@@ -29,6 +29,7 @@ from app.core.dns_names import (
     bind_check_names_error,
     name_in_zone_error,
     validate_fqdn,
+    validate_host_label,
     validate_hostname,
     validate_record_owner,
 )
@@ -9208,7 +9209,20 @@ async def purge_orphans(
 
 _BULK_MAX_IPS = 1024
 _BULK_ALLOC_ALLOWED_STATUSES = frozenset({"allocated", "reserved", "deprecated"})
-_HOSTNAME_LABEL_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,62})$")
+# Token format specs the console's live preview also implements (#2071), for
+# ``{n}`` and ``{oct1}``-``{oct4}`` alike: plain, ``d``, ``x`` / ``X``, each
+# optionally zero-padded to a width of at most 99 (``03``, ``03d``, ``04x``).
+# Anything else renders differently in Python and in the browser (``{n:_}``,
+# ``{n:,}``, ``{oct4:03}`` on a string octet gives ``100``) or pads with spaces
+# (``{n:5d}``), so it is refused instead of previewing one name and storing
+# another. The width cap also stops ``{n:0999999999d}`` allocating a gigabyte
+# per candidate.
+# Matched with ``fullmatch``: ``$`` also matches before a trailing newline,
+# which let ``{n:d\n}`` through to render as the unpadded fallback.
+_BULK_SPEC_RE = re.compile(r"(?:0[1-9][0-9]?)?[dxX]?")
+# Upper bound on the iterator: the browser computes names with IEEE doubles,
+# which stop being exact integers past 2**53, and render 1e21 as ``1e+21``.
+_BULK_TEMPLATE_START_MAX = 999_999_999
 _BULK_TEMPLATE_FIELDS: frozenset[str] = frozenset({"n", "oct1", "oct2", "oct3", "oct4"})
 
 
@@ -9226,6 +9240,40 @@ def _bulk_template_has_token(template: str) -> bool:
         if field_name in _BULK_TEMPLATE_FIELDS:
             return True
     return False
+
+
+def _bulk_template_format_error(template: str) -> str | None:
+    """Reason the template uses a token form the live preview can't mirror."""
+    if not template.isascii():
+        # validate_host_label would IDNA-encode a unicode name to ``xn--…``,
+        # which the console cannot preview; bulk names stay ASCII.
+        return "Template must be ASCII; host names are letters, digits and hyphens."
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError as exc:
+        return f"Template is malformed: {exc}"
+    for _literal, field_name, spec, conversion in parsed:
+        if field_name is None:
+            continue
+        if conversion:
+            return f"Template token {{{field_name}!{conversion}}}: conversions are not supported."
+        if field_name in _BULK_TEMPLATE_FIELDS and not _BULK_SPEC_RE.fullmatch(spec or ""):
+            return (
+                f"Template token {{{field_name}:{spec}}} is not supported; use "
+                f"{{{field_name}}}, {{{field_name}:03d}} (zero-pad), "
+                f"{{{field_name}:x}} or {{{field_name}:X}}."
+            )
+    return None
+
+
+def _bulk_stored_hostname(rendered: str) -> str:
+    """The name bulk allocate stores for one rendered template (#2071).
+
+    Raises ``ValueError`` when the rendering is not a host label. Pinned
+    against the console's copy (``frontend/src/lib/bulk-allocate-template.ts``)
+    by the shared vectors in ``bulk-allocate-template.vectors.json``.
+    """
+    return validate_host_label(rendered, field="hostname")
 
 
 def _expand_bulk_template(
@@ -9247,9 +9295,10 @@ def _expand_bulk_template(
     Replaced by Python's stdlib ``string.Formatter`` parser, which is
     a C-implemented linear-time tokenizer — exactly the grammar we
     want anyway (``{n}`` / ``{n:03d}`` / ``{oct1}``) without the
-    custom regex. Bad format specs degrade to ``str(n)`` rather than
-    raising so preview still renders something the operator can
-    correct."""
+    custom regex. A spec ``format`` refuses degrades to ``str(value)``
+    rather than raising; the IPAM bulk path refuses such specs up front
+    (``_bulk_template_format_error``, #2071), and the multicast path, which
+    has no browser-side preview to disagree with, renders the fallback."""
     octets = str(ip_obj).split(".") if isinstance(ip_obj, ipaddress.IPv4Address) else []
 
     def _value_for(field_name: str) -> str | int | None:
@@ -9257,7 +9306,9 @@ def _expand_bulk_template(
             return n
         if len(field_name) == 4 and field_name.startswith("oct") and field_name[3] in "1234":
             idx = int(field_name[3]) - 1
-            return octets[idx] if 0 <= idx < len(octets) else ""
+            # An int, so ``{oct4:03d}`` pads like ``{n:03d}`` (as a string
+            # octet ``d`` raised and the spec was silently dropped).
+            return int(octets[idx]) if 0 <= idx < len(octets) else ""
         return None  # unknown token — leave literal
 
     formatter = string.Formatter()
@@ -9301,7 +9352,7 @@ class BulkAllocateRequest(BaseModel):
     range_start: str
     range_end: str
     hostname_template: str = Field(min_length=1, max_length=128)
-    template_start: int = 1
+    template_start: int = Field(default=1, ge=0, le=_BULK_TEMPLATE_START_MAX)
     status: str = "allocated"
     description: str | None = None
     dns_zone_id: str | None = None
@@ -9382,15 +9433,36 @@ async def _build_bulk_allocate_candidates(
             detail=f"Range too large ({total} IPs); max {_BULK_MAX_IPS} per call",
         )
 
-    # Validate the template against the first candidate. RFC 1035 label
-    # rules: ≤ 63 chars, alphanumeric + hyphen, no leading hyphen.
-    probe = _expand_bulk_template(body.hostname_template, start, body.template_start)
-    if not probe or not _HOSTNAME_LABEL_RE.match(probe):
+    # Every generated name must be a host label by the rule the single
+    # allocate path applies to each label of its hostname (core/dns_names,
+    # #2071); the stored name is the normalized (lower-cased) one, as there,
+    # so preview == stored.
+    fmt_err = _bulk_template_format_error(body.hostname_template)
+    if fmt_err:
+        raise HTTPException(status_code=422, detail=fmt_err)
+    hostnames: list[str] = []
+    bad_names: list[str] = []
+    bad_count = 0
+    for idx in range(total):
+        ip_obj = ipaddress.ip_address(int(start) + idx)
+        raw = _expand_bulk_template(body.hostname_template, ip_obj, body.template_start + idx)
+        try:
+            hostnames.append(_bulk_stored_hostname(raw))
+        except ValueError as exc:
+            hostnames.append(raw)
+            bad_count += 1
+            if len(bad_names) < 5:
+                bad_names.append(f"#{idx + 1} ({ip_obj}) '{raw}': {exc}")
+    if bad_count:
+        more = f" (and {bad_count - len(bad_names)} more)" if bad_count > len(bad_names) else ""
         raise HTTPException(
             status_code=422,
             detail=(
-                f"Template produces invalid hostname for range_start: '{probe}'. "
-                "Hostnames must match ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$."
+                f"Template produces {bad_count} invalid host name(s): "
+                + "; ".join(bad_names)
+                + more
+                + ". Host names are letters, digits and hyphens, with no leading or "
+                "trailing hyphen, at most 63 characters."
             ),
         )
 
@@ -9414,7 +9486,7 @@ async def _build_bulk_allocate_candidates(
         ip_int = int(start) + idx
         ip_obj = ipaddress.ip_address(ip_int)
         ip_str = str(ip_obj)
-        hostname = _expand_bulk_template(body.hostname_template, ip_obj, body.template_start + idx)
+        hostname = hostnames[idx]
         items.append(
             BulkAllocateItem(
                 address=ip_str,

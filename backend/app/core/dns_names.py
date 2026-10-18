@@ -47,15 +47,17 @@ MAX_NAME_LEN = 253
 
 # RFC 1123 host label: LDH, 1–63 chars, no leading/trailing hyphen. A
 # single-character label is legal (the alternation's optional tail covers
-# the ≥ 2 char case).
-_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+# the ≥ 2 char case). Anchored with ``\Z``, not ``$``: Python's ``$`` also
+# matches before a trailing newline, so ``web1\n`` passed as a host label
+# (#2071 — a bulk-allocate template ending in a newline stored one).
+_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 
 # RFC 2181 owner label as we choose to constrain it: LDH plus underscore.
 # Underscore is what the DNS protocol allows and the LDH host rule forbids
 # — it is load-bearing for _acme-challenge / _dmarc / _443._tcp owners.
 # A leading/trailing hyphen is still rejected; a leading underscore is the
-# whole point, so it is allowed.
-_DNS_LABEL_RE = re.compile(r"^(?![-])[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$")
+# whole point, so it is allowed. ``\Z`` for the same reason as above.
+_DNS_LABEL_RE = re.compile(r"^(?![-])[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?\Z")
 
 # Characters that are unsafe inside a zone-file master-format line
 # (RFC 1035 §5.1): whitespace splits tokens, a newline injects a new
