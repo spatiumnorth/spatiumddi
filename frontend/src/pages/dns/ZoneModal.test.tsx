@@ -203,6 +203,82 @@ describe("Add Zone on an experimental technitium_api group (#1784)", () => {
   });
 });
 
+function zoneRow(primaryNs: string): DNSZone {
+  return {
+    id: "zone-1",
+    group_id: "grp-1",
+    view_id: null,
+    name: "legacy.test.",
+    zone_type: "primary",
+    kind: "forward",
+    ttl: 3600,
+    primary_ns: primaryNs,
+    admin_email: "",
+    dnssec_enabled: false,
+    color: null,
+    forwarders: [],
+    forward_only: true,
+    masters: [],
+    domain_id: null,
+    customer_id: null,
+  } as unknown as DNSZone;
+}
+
+describe("the zone dialog's Primary NS (#2075)", () => {
+  it.each(["ns_1.ns-underscore.test.", "a".repeat(64) + ".x.test.", "ns1"])(
+    "refuses %s at Add Zone, with the reason, and sends nothing",
+    async (value) => {
+      open();
+      typeName("ns-underscore.test");
+      fireEvent.change(control("Primary NS"), { target: { value } });
+      fireEvent.submit(control("Kind").form!);
+      await waitFor(() =>
+        expect(
+          screen.getAllByText(/^Primary NS (must|has|label)/).length,
+        ).toBeGreaterThan(0),
+      );
+      expect(createZone).not.toHaveBeenCalled();
+    },
+  );
+
+  it("sends a host name", async () => {
+    open();
+    typeName("corp.example.test");
+    fireEvent.change(control("Primary NS"), {
+      target: { value: "ns1.corp.example.test." },
+    });
+    await save();
+    expect(createZone.mock.calls[0][1]).toMatchObject({
+      primary_ns: "ns1.corp.example.test.",
+    });
+  });
+
+  it("lets a zone stored with a bad value be saved unchanged, and flags it", async () => {
+    open(zoneRow("ns1"));
+    expect(screen.getByText(/Stored before this was checked/)).toBeTruthy();
+    fireEvent.change(control("Default TTL (seconds)"), {
+      target: { value: "600" },
+    });
+    await save();
+    expect(updateZone.mock.calls[0][2]).toMatchObject({
+      primary_ns: "ns1",
+      ttl: 600,
+    });
+  });
+
+  it("refuses changing a stored value to another non-host name", async () => {
+    open(zoneRow("ns1"));
+    fireEvent.change(control("Primary NS"), {
+      target: { value: "ns_1.legacy.test." },
+    });
+    fireEvent.submit(control("Kind").form!);
+    await waitFor(() =>
+      expect(screen.getAllByText(/^Primary NS label "ns_1"/).length).toBe(2),
+    );
+    expect(updateZone).not.toHaveBeenCalled();
+  });
+});
+
 describe("Default TTL field (#2073 / #2074)", () => {
   const ttlInput = () =>
     screen.getByPlaceholderText("3600") as HTMLInputElement;
@@ -235,6 +311,22 @@ describe("Default TTL field (#2073 / #2074)", () => {
     fireEvent.change(ttlInput(), { target: { value: "1e3" } });
     await save();
     expect(createZone.mock.calls[0][1]).toMatchObject({ ttl: 1000 });
+  });
+});
+
+describe("a zone with both a bad Default TTL and a bad Primary NS", () => {
+  it("refuses, naming both reasons, and sends nothing", async () => {
+    open();
+    typeName("both.example.test");
+    fireEvent.change(control("Primary NS"), { target: { value: "ns1" } });
+    fireEvent.change(screen.getByPlaceholderText("3600"), {
+      target: { value: "-1" },
+    });
+    fireEvent.submit(control("Kind").form!);
+    await screen.findByText(
+      /^Primary NS must be a fully qualified host name.*; Default TTL must be a whole number/,
+    );
+    expect(createZone).not.toHaveBeenCalled();
   });
 });
 
