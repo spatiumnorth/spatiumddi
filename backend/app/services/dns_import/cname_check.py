@@ -16,6 +16,7 @@ trusts the preview's report: the plan round-trips through the client.
 
 from __future__ import annotations
 
+from app.core.dns_names import contains_control_chars
 from app.services.dns.cname_conflict import NameRow, refused_by_cname_rule
 
 from .canonical import ImportedZone, ImportPreview
@@ -25,8 +26,16 @@ _PREFIX = "CNAME rule: "
 
 def cname_skips(zone: ImportedZone) -> dict[int, str]:
     """``{index into zone.records: reason}`` for each record that cannot be
-    stored under the CNAME rule. The SOA is not stored as a record."""
-    idx = [i for i, r in enumerate(zone.records) if r.record_type != "SOA"]
+    stored under the CNAME rule. The SOA is not stored as a record, and nor
+    is a record the commit drops for a control character (#597): a row that
+    never lands must not cost another row its place."""
+    idx = [
+        i
+        for i, r in enumerate(zone.records)
+        if r.record_type != "SOA"
+        and not contains_control_chars(r.name)
+        and not contains_control_chars(r.value)
+    ]
     rows = [
         NameRow(zone.records[i].name, zone.records[i].record_type, zone.records[i].value)
         for i in idx
@@ -40,6 +49,7 @@ def describe_skip(zone: ImportedZone, index: int, reason: str) -> str:
 
 
 def is_cname_warning(warning: str) -> bool:
+    """Whether a preview warning is one :func:`annotate_cname_conflicts` added."""
     return warning.startswith(_PREFIX)
 
 
@@ -54,3 +64,8 @@ def annotate_cname_conflicts(preview: ImportPreview) -> None:
     """Add one preview warning per record the commit will skip."""
     for z in preview.zones:
         preview.warnings.extend(zone_warnings(z))
+
+
+def count_cname_warnings(warnings: list[str]) -> int:
+    """How many records a preview says the commit will skip under the rule."""
+    return sum(1 for w in warnings if is_cname_warning(w))

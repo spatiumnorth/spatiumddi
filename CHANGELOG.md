@@ -98,8 +98,12 @@ the formatter handles the rest.
   the CNAME (the first of several CNAMEs is kept); a clash with a record
   already in the zone keeps the existing record. Records are compared per
   view, a record with no view counting in every view. The zone-file preview
-  now takes `conflict_strategy`, since a `replace` frees the names of the
-  records it deletes.
+  now takes `conflict_strategy` (default `merge`, so an older client is
+  unaffected), since a `replace` frees the names of the records it deletes.
+  Records in the trash do not count; IPAM-generated records do. A record the
+  commit already drops for a control character no longer costs the CNAME at
+  its name its place. The Copilot's import preview says how many records will
+  not be imported, and its commit reports them.
 
 - **The DNS and DHCP server detail modals offered Pause and Resume to
   a user the API refuses (#2076).** Both routes take a superadmin, and

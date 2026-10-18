@@ -220,7 +220,7 @@ def refused_by_cname_rule(
                     r
                     for j, r in enumerate(new_rows)
                     if j not in refused
-                    and r is not row
+                    and j != i
                     and _meet(row, r)
                     and r.record_type.strip().upper() != "CNAME"
                 ),

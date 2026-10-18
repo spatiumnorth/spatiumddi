@@ -396,3 +396,146 @@ async def test_zone_file_apex_cname_is_not_in_the_dns_python_parse(
     grp, zone = await _zone_with(db_session, [])
     cm = await _post(client, headers, grp, zone, "@ IN CNAME t.example.org.\n", "commit")
     assert cm["created"] == 0 and "apex" in cm["skipped"][0]
+
+
+# ── validator additions ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_parity_with_the_record_api_check(db_session: AsyncSession) -> None:
+    """The in-memory twin answers exactly as ``find_cname_conflict`` does, for
+    one standing row and one candidate, across types, views and name case.
+    (The apex is the caller's check in both paths, so it is left out here.)"""
+    from app.services.dns.cname_conflict import find_cname_conflict
+
+    grp, zone = await _zone_with(db_session, [])
+    v1 = DNSView(group_id=grp.id, name="v1")
+    v2 = DNSView(group_id=grp.id, name="v2")
+    db_session.add_all([v1, v2])
+    await db_session.flush()
+    views: list[uuid.UUID | None] = [None, v1.id, v2.id]
+    types = ["A", "CNAME", "TXT", "MX"]
+    cases = 0
+    for st_type in types:
+        for st_view in views:
+            row = DNSRecord(
+                zone_id=zone.id,
+                name="Host",
+                fqdn=f"host.{ZONE}",
+                record_type=st_type,
+                value="x",
+                view_id=st_view,
+            )
+            db_session.add(row)
+            await db_session.flush()
+            standing = [NameRow("Host", st_type, "x", st_view)]
+            for new_type in types:
+                for new_view in views:
+                    for spelling in ("host", "HOST", "Host", "other"):
+                        db_hit = await find_cname_conflict(
+                            db_session,
+                            zone.id,
+                            view_id=new_view,
+                            name=spelling,
+                            record_type=new_type,
+                        )
+                        mem = refused_by_cname_rule(
+                            [NameRow(spelling, new_type, "y", new_view)], standing
+                        )
+                        assert (db_hit is not None) == bool(mem), (
+                            st_type,
+                            st_view,
+                            new_type,
+                            new_view,
+                            spelling,
+                        )
+                        cases += 1
+            await db_session.delete(row)
+            await db_session.flush()
+    assert cases == 4 * 3 * 4 * 3 * 4
+
+
+@pytest.mark.asyncio
+async def test_zone_file_trashed_record_blocks_nothing_auto_generated_does(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    from datetime import UTC, datetime
+
+    _, headers = await _admin(db_session)
+    grp, zone = await _zone_with(db_session, [])
+    db_session.add_all(
+        [
+            DNSRecord(
+                zone_id=zone.id,
+                name="gone",
+                fqdn=f"gone.{ZONE}",
+                record_type="A",
+                value="192.0.2.9",
+                deleted_at=datetime.now(UTC),
+            ),
+            DNSRecord(
+                zone_id=zone.id,
+                name="ipam",
+                fqdn=f"ipam.{ZONE}",
+                record_type="A",
+                value="192.0.2.10",
+                auto_generated=True,
+            ),
+        ]
+    )
+    await db_session.commit()
+    lines = "gone IN CNAME t.example.org.\nipam IN CNAME t.example.org.\n"
+    pv = await _post(client, headers, grp, zone, lines, "preview")
+    assert [c["name"] for c in pv["to_create"]] == ["gone"]
+    assert len(pv["skipped"]) == 1 and pv["skipped"][0].startswith("ipam CNAME")
+
+
+@pytest.mark.asyncio
+async def test_zone_file_replace_commit_swaps_a_for_cname(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    _, headers = await _admin(db_session)
+    grp, zone = await _zone_with(db_session, [("www", "A", "192.0.2.1", None)])
+    cm = await _post(
+        client, headers, grp, zone, "www IN CNAME t.example.org.\n", "commit", "replace"
+    )
+    assert cm["created"] == 1 and cm["deleted"] == 1 and cm["skipped"] == []
+    rows = (await db_session.execute(select(DNSRecord))).scalars().all()
+    assert [(r.name, r.record_type) for r in rows] == [("www", "CNAME")]
+
+
+@pytest.mark.asyncio
+async def test_preview_request_without_strategy_defaults_to_merge(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """An older client posts no ``conflict_strategy`` to the preview."""
+    _, headers = await _admin(db_session)
+    grp, zone = await _zone_with(db_session, [("www", "A", "192.0.2.1", None)])
+    r = await client.post(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}/import/preview",
+        headers=headers,
+        json={"zone_file": _file("www IN CNAME t.example.org.\n")},
+    )
+    assert r.status_code == 200, r.text
+    assert len(r.json()["skipped"]) == 1
+
+
+def test_control_char_row_does_not_cost_the_cname_its_place() -> None:
+    """A row the commit drops for a control character (#597) never lands, so
+    it must not make the CNAME at its name look like a clash."""
+    z = _zone(
+        [
+            ImportedRecord("www", "TXT", "bad\nvalue", 300),
+            ImportedRecord("www", "CNAME", "t.example.org.", 300),
+        ]
+    )
+    assert cname_check.cname_skips(z) == {}
+
+
+def test_copilot_preview_text_counts_the_skips() -> None:
+    from app.services.ai.operations_writes import _dns_preview_text
+
+    p = _preview(_clash_zone())
+    cname_check.annotate_cname_conflicts(p)
+    assert "2 record(s) will NOT be imported" in _dns_preview_text(p)
+    assert "NOT be imported" not in _dns_preview_text(_preview(_zone([])))

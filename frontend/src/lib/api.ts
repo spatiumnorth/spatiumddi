@@ -6677,6 +6677,8 @@ export interface DNSImportCommit {
   deleted: number;
   unchanged: number;
   conflict_strategy: string;
+  provider_warning: string | null;
+  skipped: string[];
 }
 
 // ── DNS Blocking Lists ─────────────────────────────────────────────────────
