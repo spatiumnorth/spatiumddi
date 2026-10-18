@@ -71,7 +71,11 @@ from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
-from app.services.dns.sync_check import ipam_authors_zone, resolve_reverse_zone
+from app.services.dns.sync_check import (
+    forward_zone_ids_in_order,
+    ipam_authors_zone,
+    resolve_reverse_zone,
+)
 from app.services.ipam.address_set_gate import (
     WritableSetRanges,
     load_writable_set_ranges,
@@ -1906,24 +1910,12 @@ async def _sync_dns_record(
     # Desired set of forward zones: primary + extras, deduped, with
     # the primary always first. ``extra_zone_ids`` is JSONB list[str];
     # each entry is a UUID stored as string.
-    desired_zone_ids: list[uuid.UUID] = []
     # #1493 — whether the primary zone's forward record was skipped for a
     # CNAME at the hostname, and whether any forward record was published.
     primary_cname_skip = False
     forward_published = False
-    seen_extras: set[uuid.UUID] = set()
-    if effective_zone_id is not None:
-        desired_zone_ids.append(effective_zone_id)
-        seen_extras.add(effective_zone_id)
-    for raw in ip.extra_zone_ids or []:
-        try:
-            extra_uuid = uuid.UUID(str(raw))
-        except (ValueError, TypeError):
-            continue
-        if extra_uuid in seen_extras:
-            continue
-        seen_extras.add(extra_uuid)
-        desired_zone_ids.append(extra_uuid)
+    # One ordering for this and the drift check (#2107).
+    desired_zone_ids = forward_zone_ids_in_order(effective_zone_id, ip.extra_zone_ids)
 
     # #1633 — IPAM writes a forward record only into a zone it serves as
     # primary, the rule #1419 set for PTRs. A forwarder, a secondary or a stub,

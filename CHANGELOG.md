@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Sync DNS reads an address in every zone it publishes to
+  (#2107).** An address with extra zones has its host record in its
+  forward zone and in each extra zone IPAM authors, but the drift
+  check compared every forward record with the forward zone alone. A
+  correct record in an extra zone read as mismatched, and one that had
+  gone missing from an extra zone was never reported. Each address is
+  now checked in all of its zones, using the same zone list the sync
+  writes, so a correct record is in sync, a missing one is listed as
+  missing in its zone, and a wrong one as mismatched with that zone
+  named. A zone IPAM does not author still takes no record.
+
 - **Editing an IP no longer renames or deletes its own A aliases, and
   the alias lists no longer show a host record as an alias (#2084).**
   An address's A/AAAA aliases and its own host records are both
