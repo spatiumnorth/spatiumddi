@@ -10,14 +10,18 @@ alias. ``dns_record.ip_alias`` now says which is which.
 
 from __future__ import annotations
 
+import importlib.util
 import uuid
+from pathlib import Path
+from typing import Any
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSZone
+from app.models.ipam import IPAddress, Subnet
 from tests.test_ipam_alias_cname_exclusive_2080 import _alloc, _setup
 
 
@@ -205,3 +209,141 @@ async def test_every_alias_writer_sets_the_marker_and_hosts_do_not(
         for rec in await _rows(db_session, resp.json()["id"]):
             is_alias = rec.name in {"a1", "c1", "a2", "a3"}
             assert rec.ip_alias is is_alias, (rec.name, rec.record_type)
+
+
+@pytest.mark.asyncio
+async def test_rename_onto_an_own_alias_keeps_the_alias_an_alias(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Renaming onto an A alias's name leaves two rows at it; the alias stays one."""
+    headers, sid, zone = await _setup(client, db_session)
+    r = await _alloc(
+        client, headers, sid, "10.98.5.40", "h1", aliases=[{"name": "www", "record_type": "A"}]
+    )
+    ip_id = r.json()["id"]
+    put = await client.put(
+        f"/api/v1/ipam/addresses/{ip_id}", headers=headers, json={"hostname": "www"}
+    )
+    assert put.status_code == 200, put.text
+    listed = await client.get(f"/api/v1/ipam/addresses/{ip_id}/aliases", headers=headers)
+    assert [a["name"] for a in listed.json()] == ["www"]
+    # Renaming away again moves the host only; the alias keeps answering.
+    put = await client.put(
+        f"/api/v1/ipam/addresses/{ip_id}", headers=headers, json={"hostname": "h3"}
+    )
+    assert put.status_code == 200, put.text
+    rows = await _rows(db_session, ip_id)
+    assert _summary(rows, "A") == sorted([("h3", str(zone.id)), ("www", str(zone.id))])
+
+
+def _backfill_statement(monkeypatch: pytest.MonkeyPatch) -> Any:
+    from alembic import op as alembic_op
+
+    path = next(Path(__file__).parents[1].glob("alembic/versions/b3d7f1a82c54_*.py"))
+    spec = importlib.util.spec_from_file_location("mig_2084", path)
+    assert spec is not None and spec.loader is not None
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+    statements: list[Any] = []
+    monkeypatch.setattr(alembic_op, "add_column", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(alembic_op, "execute", statements.append, raising=False)
+    mig.upgrade()
+    assert len(statements) == 1
+    return statements[0]
+
+
+@pytest.mark.asyncio
+async def test_upgrade_backfill_classifies_existing_rows(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The migration's backfill marks the aliases already in the database, and
+    only them: rows are built the way main left them (no marker), then the
+    migration's own UPDATE runs."""
+    stmt = _backfill_statement(monkeypatch)
+    _, sid, z1 = await _setup(client, db_session)
+    z2 = await _extra_zone(db_session, z1)
+    z3 = await _extra_zone(db_session, z1)
+    rz = DNSZone(group_id=z1.group_id, name="98.10.in-addr.arpa.", kind="reverse")
+    db_session.add(rz)
+    subnet = await db_session.get(Subnet, uuid.UUID(sid))
+    assert subnet is not None
+
+    def ip(addr: str, hostname: str | None, fwd: DNSZone | None, extras: list[str]) -> IPAddress:
+        row = IPAddress(
+            subnet_id=subnet.id,
+            address=addr,
+            status="allocated",
+            hostname=hostname,
+            forward_zone_id=fwd.id if fwd else None,
+            extra_zone_ids=extras,
+        )
+        db_session.add(row)
+        return row
+
+    # Mixed-case hostname; the extra zone stored as an upper-case UUID string,
+    # which the API accepts and stores as sent.
+    i1 = ip("10.98.5.50", "Web", z1, [str(z2.id).upper()])
+    i2 = ip("fd00:2084::5", "v6h", z1, [])
+    i3 = ip("10.98.5.51", "www", z1, [])  # renamed onto its own alias
+    i4 = ip("10.98.5.52", "legacy", None, [])  # no forward zone recorded
+    await db_session.flush()
+
+    def rec(i: IPAddress, zone: DNSZone, name: str, rtype: str) -> DNSRecord:
+        row = DNSRecord(
+            zone_id=zone.id,
+            name=name,
+            record_type=rtype,
+            value=str(i.address) if rtype in ("A", "AAAA") else "x.example.",
+            auto_generated=True,
+            ip_address_id=i.id,
+        )
+        db_session.add(row)
+        return row
+
+    expect: dict[str, tuple[DNSRecord, bool]] = {
+        "host": (rec(i1, z1, "web", "A"), False),
+        "host in an extra zone": (rec(i1, z2, "web", "A"), False),
+        "CNAME alias": (rec(i1, z1, "www", "CNAME"), True),
+        "A alias in the host zone": (rec(i1, z1, "ftp", "A"), True),
+        "A alias in a foreign zone": (rec(i1, z3, "mail", "A"), True),
+        "A alias named like the host, foreign zone": (rec(i1, z3, "web", "A"), True),
+        "PTR": (rec(i1, rz, "50", "PTR"), False),
+        "v6 host": (rec(i2, z1, "v6h", "AAAA"), False),
+        "v6 AAAA alias": (rec(i2, z1, "v6a", "AAAA"), True),
+        "renamed-onto host": (rec(i3, z1, "www", "A"), False),
+        "renamed-onto alias": (rec(i3, z1, "www", "A"), True),
+        "host, no forward zone": (rec(i4, z1, "legacy", "A"), False),
+    }
+    await db_session.flush()
+    i1.dns_record_id = expect["host"][0].id
+    i2.dns_record_id = expect["v6 host"][0].id
+    i3.dns_record_id = expect["renamed-onto host"][0].id
+    for row, _ in expect.values():
+        row.ip_alias = False  # as main stored them
+    await db_session.commit()
+
+    await db_session.execute(text(stmt))
+    await db_session.commit()
+    got = {}
+    for label, (row, _) in expect.items():
+        await db_session.refresh(row)
+        got[label] = row.ip_alias
+    assert got == {label: want for label, (_, want) in expect.items()}
+
+
+@pytest.mark.asyncio
+async def test_drift_does_not_report_an_a_alias_as_a_mismatched_host(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Sync DNS's drift report: an A alias is not the host record, so it is not
+    a mismatch to be rewritten into the host name."""
+    from app.services.dns.sync_check import compute_subnet_dns_drift
+
+    headers, sid, _zone = await _setup(client, db_session)
+    r = await _alloc(
+        client, headers, sid, "10.98.5.60", "h1", aliases=[{"name": "www", "record_type": "A"}]
+    )
+    assert r.status_code == 201, r.text
+    report = await compute_subnet_dns_drift(db_session, uuid.UUID(sid))
+    assert [m.current_name for m in report.mismatched] == []
+    assert [s.name for s in report.stale] == []
