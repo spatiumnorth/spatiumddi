@@ -24,7 +24,13 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
-from app.core.dns_names import validate_fqdn, validate_hostname, validate_record_owner
+from app.core.dns_names import (
+    MAX_NAME_LEN,
+    bind_check_names_error,
+    validate_fqdn,
+    validate_hostname,
+    validate_record_owner,
+)
 from app.core.permissions import (
     is_effective_superadmin,
     require_any_resource_or_scoped,
@@ -1345,6 +1351,40 @@ async def _batched_dns_ops(db: AsyncSession) -> Any:
         results.extend(await _flush_dns_op_collector(db, collector))
     finally:
         _dns_op_collector.reset(token)
+
+
+async def _assert_alias_names_fit(
+    db: AsyncSession,
+    aliases: list[Any],
+    zone_id: uuid.UUID | None,
+) -> None:
+    """422 an alias whose name inside its zone passes 253 characters.
+
+    ``AliasInput`` checks the alias on its own; only here is the zone known.
+    A name longer than a DNS name can carry makes BIND refuse the whole zone
+    ("ran out of space"), so it is refused before anything is written —
+    ``_create_alias_records`` runs after the host record, which an agentless
+    primary has already applied by then. Mirrors that function's skips: no
+    zone, or a zone IPAM does not author, writes no alias, so refuses none.
+    """
+    if not aliases or zone_id is None:
+        return
+    zone = await db.get(DNSZone, zone_id)
+    if zone is None or not ipam_authors_zone(zone):
+        return
+    zone_domain = zone.name.rstrip(".")
+    for al in aliases:
+        fqdn = f"{al.name}.{zone_domain}"
+        if len(fqdn) > MAX_NAME_LEN:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"alias '{al.name}': its name in zone {zone_domain} is "
+                    f"{len(fqdn)} characters, over the {MAX_NAME_LEN} a DNS name "
+                    "can carry. BIND refuses a zone that holds it, which stops "
+                    "the server applying its configuration."
+                ),
+            )
 
 
 async def _create_alias_records(
@@ -3147,6 +3187,27 @@ class AliasInput(BaseModel):
         if not v:
             raise ValueError("alias name is required")
         return v
+
+    @model_validator(mode="after")
+    def _owner_rule(self) -> "AliasInput":
+        """Apply the DNS record API's owner-name rules to the alias (#2070).
+
+        The same two checks ``POST /dns/.../records`` runs: the RFC 2181
+        owner syntax, then BIND's check-names rule for the record type (an
+        A/AAAA owner must be a host name, so ``under_score`` is refused as
+        an A alias; a CNAME owner may keep an underscore).
+        """
+        owner = validate_record_owner(self.name, field=f"alias '{self.name}'")
+        err = bind_check_names_error(self.record_type, owner, None, origin="")
+        if err is not None:
+            raise ValueError(f"alias '{self.name}': {err}")
+        # Store the name the checks passed, as the record API does: an
+        # internationalized alias becomes its ``xn--`` A-label and the name
+        # is lower-cased. Keeping the raw form would write ``café`` into the
+        # zone, which check-names refuses for an A record even though its
+        # A-label passed.
+        self.name = owner
+        return self
 
 
 def _validate_role(v: Any) -> Any:
@@ -7959,6 +8020,8 @@ async def create_address(
     # check sees the same forward_zone_id that will land on the row.
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
+    if body.hostname:
+        await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
         warnings = await _check_ip_collisions(
             db,
@@ -8548,6 +8611,8 @@ async def add_alias(
                 "records into it."
             ),
         )
+    if ip.hostname:
+        await _assert_alias_names_fit(db, [body], zone_id)
     await _create_alias_records(db, ip, subnet, [body], zone_id=zone_id)
     # Find the just-created record
     res = await db.execute(
@@ -9581,6 +9646,8 @@ async def allocate_next_ip(
     )
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
+    if body.hostname:
+        await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
         warnings = await _check_ip_collisions(
             db,

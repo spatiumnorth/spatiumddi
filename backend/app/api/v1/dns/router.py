@@ -117,6 +117,12 @@ from app.services.dns.delegation import (
     preview_to_dict,
 )
 from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
+from app.services.dns.name_targets import (
+    absolute_target_error,
+    dotless_target,
+    dotless_target_error,
+    group_needs_absolute_targets,
+)
 from app.services.dns.named_conf_validation import (
     ADDRESS_MATCH_LIST_OPTIONS,
     AclCycleError,
@@ -1654,6 +1660,19 @@ def _validate_soa_field(v: str | None) -> str:
 # (freeform, quoted at render), the structured types (SVCB / HTTPS / NAPTR /
 # CAA / SSHFP / TLSA / LOC / LUA), and A/AAAA (IP-validated below).
 _HOSTNAME_TARGET_RECORD_TYPES = frozenset({"CNAME", "NS", "PTR", "DNAME", "ALIAS"})
+
+
+async def _enforce_absolute_target(db: DB, zone: DNSZone, record_type: str, value: str) -> None:
+    """422 a name target with no trailing dot on a PowerDNS group (#2060).
+
+    PowerDNS's API refuses the dot-less spelling, and an operator there
+    almost certainly means the absolute name, so the row is refused with both
+    spellings it could have meant rather than stored and served as the
+    relative one. See ``app.services.dns.name_targets``.
+    """
+    err = await absolute_target_error(db, zone.group_id, record_type, value, zone.name)
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
 
 
 def _validate_address_record_value(record_type: str, value: str) -> None:
@@ -7722,6 +7741,7 @@ async def create_record(
         body.record_type, body.priority, body.weight, body.port
     )
     _validate_address_record_value(body.record_type, body.value)
+    await _enforce_absolute_target(db, zone, body.record_type, body.value)
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
     _enforce_bind_check_names(body.record_type, fqdn, body.value, zone.name)
     # #1230 — a client retry (Ansible, a flaky network, a double click) must
@@ -7839,6 +7859,10 @@ async def update_record(
     # blocking edits to legacy data, contrary to the validate-on-write stance.
     if "value" in changes:
         _validate_address_record_value(record.record_type, record.value)
+        # Resubmitting a row's own value (a TTL edit) does not re-judge a row
+        # that predates the rule, as for check-names below.
+        if zone is not None and (record.value or "").strip() != (before_value or "").strip():
+            await _enforce_absolute_target(db, zone, record.record_type, record.value)
     if "name" in changes and zone:
         record.fqdn = f"{record.name}.{zone.name}" if record.name != "@" else zone.name
     # #1378 — what the edit actually changes is checked against BIND's
@@ -8422,8 +8446,15 @@ async def bulk_create_records(
         return BulkCreateRecordsResponse(created=0, skipped=skipped, target_serial=None)
 
     records: list[DNSRecord] = []
+    needs_absolute = any(
+        dotless_target(r.record_type, r.value) is not None for r in accepted
+    ) and await group_needs_absolute_targets(db, zone.group_id)
     for r in accepted:
         _validate_address_record_value(r.record_type, r.value)
+        if needs_absolute:
+            target_err = dotless_target_error(r.record_type, r.value, zone.name)
+            if target_err is not None:
+                raise HTTPException(status_code=422, detail=f"{r.name}: {target_err}")
         fqdn = f"{r.name}.{zone.name}" if r.name != "@" else zone.name
         _enforce_bind_check_names(r.record_type, fqdn, r.value, zone.name)
         records.append(

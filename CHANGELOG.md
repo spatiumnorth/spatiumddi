@@ -101,6 +101,96 @@ the formatter handles the rest.
   now takes `conflict_strategy`, since a `replace` frees the names of the
   records it deletes.
 
+- **The DNS and DHCP server detail modals offered Pause and Resume to
+  a user the API refuses (#2076).** Both routes take a superadmin, and
+  the server rows already showed the buttons disabled with "Requires
+  superadmin"; the detail modal opened from the same row did not, so a
+  DNS or DHCP Editor clicked Pause, typed a reason, and only then got
+  a 403. The modals now use the same gate as the rows.
+
+- **An IPAM alias named `under_score` (type A) is refused, not written
+  into a zone BIND will not load (#2070).** Allocate IP, Allocate next
+  IP and the Add alias endpoint stored the name and wrote the record;
+  the BIND9 agent then refused the whole zone under check-names and held
+  every later change in it. An alias now passes the DNS record API's own
+  owner-name checks (`validate_record_owner` and BIND's check-names rule
+  for its type), so an A or AAAA alias must be a host name and the
+  request answers 422 naming the alias. A CNAME alias keeps the
+  underscore, as in the DNS API. The alias is stored in the form the
+  checks passed (lower-cased, an internationalized name as its `xn--`
+  A-label), and an alias whose name inside its zone passes 253
+  characters is refused before anything is written. An alias stored
+  before this release still holds its zone back:
+  `GET /api/v1/diagnostics/name-conformance` (or the Copilot's
+  `find_nonconforming_names`) lists it, and deleting it from the
+  address's aliases releases the zone.
+
+- **On PowerDNS, a record target with no trailing dot no longer stops
+  its zone converging, and the record API refuses new ones (#2060).**
+  PowerDNS refuses a CNAME / PTR / MX / NS / SRV / SVCB / HTTPS / NAPTR /
+  ALIAS / DNAME target written without its trailing dot (`422 Not in
+  expected format`), and it applies a zone change as one transaction.
+  The record API stored such a value as typed, so one dot-less row made
+  its record op fail on every retry until it was marked `failed`, and
+  made PowerDNS refuse the zone's whole structural update (no other
+  change to that zone was applied, and the server reported a partial
+  apply) or, for a new zone, refuse to create the zone at all. The
+  agent now qualifies a dot-less target against the zone, which is what
+  a BIND9 server serves for the same row, so rows that already exist
+  (an importer's included) are served on upgrade. A zone PowerDNS still
+  refuses for any other reason is retried piecemeal (halved until the
+  refused record sets are isolated, so one bad record in a large zone
+  costs a few dozen requests, not one per record set), so only the
+  refused record set is left out and named in the server's apply
+  status. Such a zone is not reported as in sync by that server even
+  though its serial moved, so the per-server sync status agrees with the
+  apply status. On a PowerDNS group, creating or editing a record with
+  a dot-less target is now a 422 that shows the two names it could
+  mean (`db1.example.com.`, or `db1.example.com.<zone>.`), on the REST
+  create, edit and bulk-create paths and in the Copilot. Other drivers
+  are unchanged.
+
+- **The DNS group's Health line reports what the servers say
+  (#2077).** DNS, a server group, Servers read "all servers assumed
+  consistent (per-server serials arrive in Wave 3)" whatever the
+  servers reported, even while one had refused a zone. It now comes
+  from each server's own zone-state rollup: in sync on N servers, or
+  how many servers are behind, refused zones, or have not reported
+  every zone yet. A server that has not reported is never counted as
+  in sync.
+
+- **A rolling upgrade no longer fails on one kubeapi request its
+  shared-tag hold could not land (#2028).** The hold (#1710) pins the
+  shared charts' image tag before each node and removes the pins at the
+  end, a few kubeapi requests each time, and any one of them refused or
+  unanswered (a k3s server answers 503 `apiserver not ready` while it
+  restarts) failed the whole run: before the first node, with the
+  cluster on two versions at a re-assert, or with every node already on
+  the target at the flip. Such a step is now tried again every 15 s,
+  with Halt, Abort and the Lease read between tries, as #1713 does for
+  the Lease. No node starts and no tag moves until it lands, and the
+  run fails on it, with the same error, only after 300 s of failures.
+  Only an answer a later try can change is retried (no answer, a 5xx,
+  408, 409 or 429); a 403 or 422 still fails the run at once.
+
+- **A demoted member promoted again rejoins instead of sitting
+  `joining` on a full disk (#2049).** Every join and leave set the
+  node's k3s identity aside, and with it containerd's whole image
+  store (4-6 GiB); the newest three backups were kept whole. One
+  demote then promote left a 40 GiB member with three stores in
+  backups beside the one its join was importing, the kubelet went into
+  DiskPressure, the supervisor pod was refused, and nothing reported
+  the join. A backup now keeps its image store only while the join
+  that took it can still roll back onto it: the stores of earlier,
+  settled joins and leaves are dropped before the runner writes
+  anything to /var, a join that registered with the seed's etcd
+  drops its own before its long wait for Ready (that branch never
+  rolls back), and a join or leave that settles drops it before
+  reporting. The identity in every backup is kept for manual
+  recovery. A node already carrying three full backups gets the
+  space back on its first join or leave after the upgrade. Found
+  and first fixed by the QA desk.
+
 - **Fleet no longer reports `ssh: retrying` forever after managed SSH is
   turned off (#2053).** The supervisor's fire-state reader stripped the
   leading tab of an empty-hash line (`\t1\t<iso>`, written when a plane
