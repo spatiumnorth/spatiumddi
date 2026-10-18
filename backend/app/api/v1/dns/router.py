@@ -14,7 +14,7 @@ from typing import Any, Self
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
@@ -41,6 +41,7 @@ from app.core.dns_names import (
     bind_check_names_error,
     contains_control_chars,
     contains_zonefile_unsafe,
+    primary_ns_error,
     validate_fqdn,
     validate_record_owner,
 )
@@ -1229,8 +1230,8 @@ class ZoneCreate(BaseModel):
 
     @field_validator("primary_ns", "admin_email")
     @classmethod
-    def validate_soa_fields(cls, v: str) -> str:
-        return _validate_soa_field(v)
+    def validate_soa_fields(cls, v: str, info: ValidationInfo) -> str:
+        return _validate_soa_field(v, field=info.field_name)
 
 
 class ZoneUpdate(BaseModel):
@@ -1283,6 +1284,9 @@ class ZoneUpdate(BaseModel):
     @classmethod
     def validate_soa_fields(cls, v: str | None) -> str | None:
         # Optional on update; same injection guard as ZoneCreate (issue #597).
+        # The #2075 host-name rule for primary_ns is applied in update_zone,
+        # to a CHANGED value only: a zone stored before it must stay
+        # editable by a request that re-sends what it holds.
         if v is None:
             return v
         return _validate_soa_field(v)
@@ -1631,7 +1635,7 @@ def _normalize_record_struct_fields(
     return None, None, None
 
 
-def _validate_soa_field(v: str | None) -> str:
+def _validate_soa_field(v: str | None, field: str | None = None) -> str:
     """Reject a zone SOA ``primary_ns`` / ``admin_email`` that could inject.
 
     Both are interpolated raw into the BIND9 SOA line (issue #597 review), so
@@ -1648,6 +1652,12 @@ def _validate_soa_field(v: str | None) -> str:
             "must be a bare domain name — no whitespace, control characters, "
             "or zone-file syntax (e.g. ';' '$' '@')"
         )
+    if field == "primary_ns":
+        # #2075 — a Primary NS BIND's check-names refuses stops the zone
+        # being served at all, so it is a host name or it is not stored.
+        err = primary_ns_error(v)
+        if err is not None:
+            raise ValueError(f"Primary NS (primary_ns) {err}")
     return v
 
 
@@ -5636,6 +5646,15 @@ async def update_zone(
     # row — so an operator can't flip a zone to secondary without masters,
     # nor empty the masters on an existing secondary.
     _refuse_superadmin_zone_fields(current_user, changes, zone)
+    # #2075 — a Primary NS that is not a host name makes BIND refuse the zone.
+    # Only a changed value is held to it (the #1784 / #1310 rule): the Edit
+    # dialog and a GET-then-PUT client re-send the stored value on every save,
+    # and a row written before this check must not block an edit to its TTL.
+    # The agent renders a fallback for such a row, so keeping it breaks nothing.
+    if "primary_ns" in changes and (changes["primary_ns"] or "") != (zone.primary_ns or ""):
+        ns_err = primary_ns_error(changes["primary_ns"])
+        if ns_err is not None:
+            raise HTTPException(status_code=422, detail=f"Primary NS (primary_ns) {ns_err}")
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
