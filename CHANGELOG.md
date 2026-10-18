@@ -27,6 +27,29 @@ the formatter handles the rest.
 
 ### Added
 
+- **The Helm chart's migrate Job takes annotations, so it works under
+  GitOps (#2114).** Under `helm template`, which is how Argo CD and
+  similar tools render a chart, the Helm revision is always 1. The
+  migrate Job was therefore always `<release>-migrate-r1`, and since a
+  Job's pod template cannot change, the first sync after an image bump
+  failed with `field is immutable` until the old Job was deleted by
+  hand. New `migrate.annotations` (empty by default) sets annotations on
+  the Job; with Argo CD's `hook: Sync` and
+  `hook-delete-policy: BeforeHookCreation` the Job is recreated and
+  re-run on every sync. The chart README gains a GitOps section, which
+  also covers pre-creating the secrets `helm template` would otherwise
+  regenerate on every render, and no longer describes the migrate Job as
+  a pre-upgrade hook. `k8s/README.md` shows the same fix as a kustomize
+  patch for the plain manifests.
+
+- **Per-server `nodeSelector` and `tolerations` for DNS agents in the
+  Helm chart (#2114).** DNS agents only prefer separate nodes, so after
+  a node drain an agent could reschedule next to another one and stay
+  there. Each `dnsAgents.servers[]` entry now accepts `nodeSelector` and
+  `tolerations`, so a server can be pinned to a node to keep one agent
+  per node behind a shared address. Both are unset by default and the
+  chart renders unchanged.
+
 - **Alerts when a scheduled backup fails or stops running, on by
   default (#1262).** A failed scheduled backup used to write an audit
   row and nothing else, so on a default install a nightly backup could
