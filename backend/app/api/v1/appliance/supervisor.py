@@ -4528,7 +4528,9 @@ async def update_appliance_roles(
         # call is refused (the DHCP routes are gated) and it loops. Refused
         # here, naming the reason and the toggle. The DHCP *agent* routers
         # stay ungated on purpose (#1068); this is the operator-facing write.
-        if "dhcp" in body.roles:
+        # Only when the role is newly ADDED: an appliance that already holds
+        # it must still be able to re-save (firewall, DNS group, …).
+        if "dhcp" in body.roles and "dhcp" not in prev_dns_roles:
             from app.services.feature_modules import is_module_enabled
 
             if not await is_module_enabled(db, "core.dhcp"):

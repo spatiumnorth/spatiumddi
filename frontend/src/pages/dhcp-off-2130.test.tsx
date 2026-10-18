@@ -180,6 +180,19 @@ describe("Logs tabs", () => {
     await screen.findByText("DNS Queries");
     expect(screen.queryByText("DHCP Activity")).toBeNull();
     expect(dhcpCalls()).toEqual([]);
+    // Nor does it mount DNS Queries in the meantime: the deep link may be
+    // valid once the module set says DHCP is on.
+    expect(calls).not.toContain("logsApi.dnsQueries");
+  });
+
+  it("?tab=dhcp-activity opens DHCP Activity while DHCP is on (control)", async () => {
+    logs("/logs?tab=dhcp-activity");
+    // The fixture has no DHCP agent, so the DHCP Activity tab shows its
+    // empty state: proof the deep link landed there, not on DNS Queries.
+    expect(
+      await screen.findByText("No DHCP servers using a SpatiumDDI agent."),
+    ).toBeTruthy();
+    expect(calls).not.toContain("logsApi.dnsQueries");
   });
 });
 
@@ -350,6 +363,15 @@ describe("Edit IP status choices", () => {
     expect(values).not.toContain("dhcp");
     expect(values).not.toContain("static_dhcp");
     expect(values).toContain("allocated");
+  });
+
+  it("a stored static_dhcp address shows no 'create a scope' notice while DHCP is off", () => {
+    dhcpOff();
+    options("static_dhcp");
+    expect(
+      screen.queryByText("No DHCP scope exists", { exact: false }),
+    ).toBeNull();
+    expect(dhcpCalls()).toEqual([]);
   });
 
   it.each(["dhcp", "static_dhcp"])(

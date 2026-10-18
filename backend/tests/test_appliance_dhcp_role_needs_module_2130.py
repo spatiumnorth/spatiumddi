@@ -138,3 +138,54 @@ async def test_alert_catalogue_drops_dhcp_rule_types_when_module_off(
     assert "dhcp_pool_exhaustion" not in off
     assert "dhcp_scope_uncoordinated" not in off
     assert "subnet_utilization" in off
+
+
+@pytest.mark.asyncio
+async def test_resave_of_an_existing_dhcp_role_is_not_refused_when_module_off(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The refusal is on ADDING the role. An appliance that already holds it
+    must still save — or turning DHCP off would freeze its whole assignment."""
+    u, h = await _superadmin(db_session)
+    a = await _appliance(db_session)
+    a.assigned_roles = ["dhcp"]
+    await db_session.flush()
+    await _set_dhcp(db_session, u, False)
+
+    r = await client.put(
+        f"/api/v1/appliance/appliances/{a.id}/roles",
+        json={"roles": ["dhcp", "dns-bind9"]},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert set(r.json()["assigned_roles"]) == {"dhcp", "dns-bind9"}
+
+
+@pytest.mark.asyncio
+async def test_copilot_assign_refuses_new_dhcp_role_but_not_a_held_one(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.ai.operations import (
+        AssignApplianceRoleArgs,
+        _apply_assign_appliance_role,
+        _preview_assign_appliance_role,
+    )
+
+    u, _h = await _superadmin(db_session)
+    a = await _appliance(db_session)
+    await _set_dhcp(db_session, u, False)
+
+    args = AssignApplianceRoleArgs(appliance_id=str(a.id), roles=["dhcp"])
+    preview = await _preview_assign_appliance_role(db_session, u, args)
+    assert not preview.ok
+    assert "core.dhcp" in (preview.detail or "")
+    with pytest.raises(ValueError, match="core.dhcp"):
+        await _apply_assign_appliance_role(db_session, u, args)
+
+    a2 = await _appliance(db_session)
+    a2.assigned_roles = ["dhcp"]
+    await db_session.commit()
+    preview = await _preview_assign_appliance_role(
+        db_session, u, AssignApplianceRoleArgs(appliance_id=str(a2.id), roles=["dhcp"])
+    )
+    assert preview.ok, preview.detail

@@ -3888,7 +3888,7 @@ export function AddAddressModal({
             <div />
           )}
         </div>
-        {needsDhcpScope && dhcpScopes.length === 0 && (
+        {dhcpOn && needsDhcpScope && dhcpScopes.length === 0 && (
           <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
             No DHCP scope exists for this subnet — a reservation needs one, so
             the server will create the address without one and say so.
@@ -9255,7 +9255,7 @@ export function EditAddressModal({
             Mirrors AddAddressModal, incl. the #472 inline create-scope
             escape hatch. There is no scope picker (#1629): the server
             picks the subnet's sole matching scope itself. */}
-        {needsDhcpScope && dhcpScopes.length === 0 && (
+        {dhcpOn && needsDhcpScope && dhcpScopes.length === 0 && (
           <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
             No DHCP scope exists for this subnet — a reservation needs one, so
             the server will save the address without one and say so.

@@ -4982,8 +4982,13 @@ function ApplianceRoleAssignmentSection({
       <div className="mt-2 flex flex-wrap gap-2">
         {ROLE_OPTIONS.filter(
           // A DHCP role already on the row stays visible so it can be
-          // un-assigned; it is just never offered as a new choice.
-          (opt) => opt.value !== "dhcp" || dhcpOn || roles.has("dhcp"),
+          // kept or un-assigned; it is just never offered as a new choice.
+          // Keyed on the SAVED row, not the form, so unticking it by mistake
+          // does not make it vanish before Save.
+          (opt) =>
+            opt.value !== "dhcp" ||
+            dhcpOn ||
+            (row.assigned_roles ?? []).includes("dhcp"),
         ).map((opt) => {
           const cap = opt.capKey
             ? (caps[opt.capKey as keyof SupervisorCapabilities] as
@@ -5036,8 +5041,9 @@ function ApplianceRoleAssignmentSection({
       )}
       {dhcpRoleActive && !dhcpOn && (
         <p className="mt-3 text-xs text-amber-600">
-          DHCP is switched off (Features &amp; Integrations), so this role
-          cannot be saved. Untick it to continue.
+          DHCP is switched off (Features &amp; Integrations). This appliance
+          keeps the DHCP role it already holds, and its DHCP group can be
+          changed once DHCP is back on; untick the role to remove it.
         </p>
       )}
       {dhcpRoleActive && dhcpOn && (

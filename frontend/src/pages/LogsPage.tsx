@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useSearchParams } from "react-router-dom";
-import { useModuleOn } from "@/hooks/useModuleOn";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import {
   Activity,
   AlertTriangle,
@@ -90,7 +90,12 @@ export function LogsPage() {
   // #2130 — the DHCP tabs read DHCP logs, so they exist only while core.dhcp
   // is on. A deep link to one with it off (or before the module set has
   // loaded) lands on DNS Queries, not on a tab that is not there.
-  const dhcpOn = useModuleOn("core.dhcp");
+  const { enabled: moduleEnabled, ready: modulesReady } = useFeatureModules();
+  const dhcpOn = modulesReady && moduleEnabled("core.dhcp");
+  // A DHCP deep link on a hard reload waits for the module set rather than
+  // mounting DNS Queries (and firing its query) for a moment first.
+  const awaitingModules =
+    !modulesReady && !!requested && DHCP_TABS.has(requested);
   const tab: Tab =
     requested &&
     TABS.includes(requested) &&
@@ -238,7 +243,9 @@ export function LogsPage() {
         </div>
       </div>
 
-      {tab === "dns-queries" && <DNSQueriesTab sources={dnsAgentSources} />}
+      {tab === "dns-queries" && !awaitingModules && (
+        <DNSQueriesTab sources={dnsAgentSources} />
+      )}
       {tab === "dns-threat" && <DNSThreatTab />}
       {tab === "dhcp-activity" && dhcpOn && (
         <DHCPActivityTab sources={dhcpAgentSources} />

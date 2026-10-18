@@ -123,10 +123,14 @@ the formatter handles the rest.
   already has one still shows it and keeps it when you edit something else.
   A hard reload used to fire one `/dhcp` read before the module list had
   loaded (Dashboard on the DHCP tab, Import defaulting to DHCP); both now
-  wait for it. Saving a Fleet role assignment that includes `dhcp` while
-  DHCP is off is refused with a 422 naming `core.dhcp` (it used to be
-  accepted and the agent was then refused at register); the Copilot's
-  `assign_appliance_role` follows. DDNS settings are hidden with it: they
+  wait for it, and a `?tab=dhcp-activity` link on a hard reload waits too
+  rather than flashing DNS Queries first. Adding the `dhcp` role to a Fleet
+  appliance while DHCP is off is refused with a 422 naming `core.dhcp` (it
+  used to be accepted and the agent was then refused at register); an
+  appliance that already holds the role can still be re-saved, and the
+  Copilot's `assign_appliance_role` (preview and apply) follows the same
+  rule. An existing alert rule of a hidden type keeps its stored parameters
+  and says why they cannot be edited. DDNS settings are hidden with it: they
   only act on DHCP leases (`apply_ddns_for_lease`), never on static
   allocations. Not done here: the New Devices block action, the `/dhcp`
   direct-URL notice (#2129), label-only mentions, and the `core.dns` pass.
