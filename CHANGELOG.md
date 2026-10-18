@@ -106,6 +106,51 @@ the formatter handles the rest.
   own zones on the agent, as before; shorten the hostname or delete the
   record to release them.
 
+- **Three more TTL fields no longer read `1h` as 1 second (#2086).**
+  The IPAM DDNS TTL override (on a new or edited subnet), the IPAM
+  template's DDNS TTL and the DNS pool TTL read the field with
+  `parseInt`, which keeps the leading digits: `1h` and `1e3` were both
+  saved as 1. They now use the same reading as the zone and record
+  dialogs (#2085): a whole number of seconds, `1e3` is 1000, anything
+  else is refused with the reason and nothing is sent. A blank DDNS
+  override still means inherit. The pool TTL is checked against the
+  API's own 1 to 86400, and a cleared pool field is now refused as
+  required instead of being saved as 30 without a word.
+
+- **A zone or record TTL outside RFC 2181's range is refused with a
+  422 instead of stored (#2073).** Add Zone with Default TTL `-1`
+  answered 201 and saved it, and the BIND9 agent then refused the
+  zone for a bad TTL, so it was never served. The zone `ttl`, a
+  record's `ttl` and the IPAM / IPAM-template `ddns_ttl` (which
+  stamps every DDNS record) are now bounded to 0..2147483647 on
+  create and update, like the SOA timers already were, and the 422
+  names the field. The importers store a servable value rather than
+  what the source said: a record TTL outside the range inherits the
+  zone's, and a zone TTL or SOA timer outside it takes the default
+  (a TTL past 2147483647 would not fit the column and failed the
+  commit). A TTL stored
+  negative before this fix is not rewritten, but no longer reaches a
+  server: the agent bundle ships the zone with a `$TTL` of 3600 and
+  the record inheriting it, and record updates send it as inherit.
+  Edit the row to clear it. The Add/Edit Zone and record dialogs
+  take a number and refuse anything that is not a whole number in
+  range with a reason; they used to send `parseInt` of the text, so
+  `1h` went out as 1 (#2074), and `1e3`, which a number field
+  accepts, would have too.
+
+- **An `A` alias can be added to an IPv6 address again (#2081).**
+  `POST /ipam/addresses/{id}/aliases` with an `A` alias on an IPv6
+  address wrote the AAAA record the alias follows the address family
+  into, then looked the new row up by the requested type `A`, found
+  nothing, answered 409 and rolled the write back, so the alias could
+  never be added there. The lookup now uses the type that was written,
+  from the same helper the writer and the CNAME-rule check use.
+  The alias lists and the per-address alias count matched only
+  CNAME and A, so a stored AAAA alias was missing from them; they
+  match AAAA now. Allocate and next-IP were not affected. `AAAA` is
+  still refused as an alias type (422), so an IPv4 address can never
+  get one.
+
 - **An IP's DNS alias no longer breaks the CNAME-and-other-data rule
   (#2080).** An alias given when allocating an IP (Allocate IP,
   Allocate next IP) or added with `POST /ipam/addresses/{id}/aliases`
