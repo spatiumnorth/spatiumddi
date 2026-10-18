@@ -84,6 +84,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Three more TTL fields no longer read `1h` as 1 second (#2086).**
+  The IPAM DDNS TTL override (on a new or edited subnet), the IPAM
+  template's DDNS TTL and the DNS pool TTL read the field with
+  `parseInt`, which keeps the leading digits: `1h` and `1e3` were both
+  saved as 1. They now use the same reading as the zone and record
+  dialogs (#2085): a whole number of seconds, `1e3` is 1000, anything
+  else is refused with the reason and nothing is sent. A blank DDNS
+  override still means inherit. The pool TTL is checked against the
+  API's own 1 to 86400, and a cleared pool field is now refused as
+  required instead of being saved as 30 without a word.
+
 - **A zone or record TTL outside RFC 2181's range is refused with a
   422 instead of stored (#2073).** Add Zone with Default TTL `-1`
   answered 201 and saved it, and the BIND9 agent then refused the

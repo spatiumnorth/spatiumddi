@@ -100,7 +100,11 @@ import {
   customFieldChecked,
   withCustomFieldDefaults,
 } from "@/lib/customFieldValues";
-import { hostnameError, summarizeZoneNames } from "@/lib/dnsNames";
+import {
+  hostnameError,
+  parseTtlInput,
+  summarizeZoneNames,
+} from "@/lib/dnsNames";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -1947,27 +1951,31 @@ function NetworkRoleField({
   );
 }
 
-function DdnsSettingsSection({
+export function DdnsSettingsSection({
   enabled,
   policy,
   domainOverride,
-  ttl,
+  ttlText,
   subnetNetwork,
   onEnabledChange,
   onPolicyChange,
   onDomainOverrideChange,
-  onTtlChange,
+  onTtlTextChange,
 }: {
   enabled: boolean;
   policy: DdnsPolicy;
   domainOverride: string | null;
-  ttl: number | null;
+  ttlText: string;
   subnetNetwork?: string;
   onEnabledChange: (v: boolean) => void;
   onPolicyChange: (v: DdnsPolicy) => void;
   onDomainOverrideChange: (v: string | null) => void;
-  onTtlChange: (v: number | null) => void;
+  onTtlTextChange: (v: string) => void;
 }) {
+  // #2086 — the text is the caller's state (this section unmounts when the
+  // tab changes), read with parseTtlInput: "1h" is refused, not sent as 1.
+  const ttlParsed = parseTtlInput(ttlText);
+  const ttlError = typeof ttlParsed === "string" ? ttlParsed : null;
   // Preview: synthesise what ``dhcp-<tail>`` would look like for the
   // first host IP in this subnet. Mirrors the Python implementation in
   // ``backend/app/services/dns/ddns.py::_generate_hostname`` — keep in
@@ -2064,17 +2072,23 @@ function DdnsSettingsSection({
               TTL override (seconds, optional)
             </span>
             <input
-              type="number"
-              min={30}
-              value={ttl ?? ""}
-              onChange={(e) => {
-                const v = e.target.value.trim();
-                onTtlChange(v ? parseInt(v, 10) : null);
-              }}
+              type="text"
+              inputMode="numeric"
+              value={ttlText}
+              onChange={(e) => onTtlTextChange(e.target.value)}
               placeholder="300"
               disabled={disabled}
+              aria-invalid={ttlError !== null}
               className="w-full rounded-md border bg-background px-2 py-1 text-sm disabled:opacity-60"
             />
+            {ttlError && (
+              <span
+                role="alert"
+                className="mt-0.5 block text-[11px] text-destructive"
+              >
+                TTL override {ttlError}. Leave blank to inherit.
+              </span>
+            )}
           </label>
         </div>
       )}
@@ -2526,7 +2540,8 @@ export function CreateSubnetModal({
   const [ddnsDomainOverride, setDdnsDomainOverride] = useState<string | null>(
     null,
   );
-  const [ddnsTtl, setDdnsTtl] = useState<number | null>(null);
+  const [ddnsTtlText, setDdnsTtlText] = useState("");
+  const ddnsTtl = parseTtlInput(ddnsTtlText);
   // Device profiling state — Phase 1 active layer.
   const [autoProfileEnabled, setAutoProfileEnabled] = useState(false);
   const [autoProfilePreset, setAutoProfilePreset] =
@@ -2582,7 +2597,7 @@ export function CreateSubnetModal({
       setDdnsEnabled(v.ddns.enabled);
       setDdnsPolicy(v.ddns.policy);
       setDdnsDomainOverride(v.ddns.domainOverride);
-      setDdnsTtl(v.ddns.ttl);
+      setDdnsTtlText(v.ddns.ttl == null ? "" : String(v.ddns.ttl));
     }
     if (v.dns) {
       setDnsInherit(false);
@@ -2692,7 +2707,7 @@ export function CreateSubnetModal({
         ddns_enabled: ddnsEnabled,
         ddns_hostname_policy: ddnsPolicy,
         ddns_domain_override: ddnsDomainOverride,
-        ddns_ttl: ddnsTtl,
+        ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
@@ -3005,12 +3020,12 @@ export function CreateSubnetModal({
           enabled={ddnsEnabled}
           policy={ddnsPolicy}
           domainOverride={ddnsDomainOverride}
-          ttl={ddnsTtl}
+          ttlText={ddnsTtlText}
           subnetNetwork={effectiveNetwork}
           onEnabledChange={setDdnsEnabled}
           onPolicyChange={setDdnsPolicy}
           onDomainOverrideChange={setDdnsDomainOverride}
-          onTtlChange={setDdnsTtl}
+          onTtlTextChange={setDdnsTtlText}
         />
       )}
 
@@ -3068,6 +3083,10 @@ export function CreateSubnetModal({
         <button
           onClick={() => {
             setError(null);
+            if (typeof ddnsTtl === "string") {
+              setError(`DDNS TTL override ${ddnsTtl}. Leave blank to inherit.`);
+              return;
+            }
             mutation.mutate();
           }}
           disabled={!effectiveNetwork || !blockId || mutation.isPending}
@@ -7803,9 +7822,10 @@ export function EditSubnetModal({
   const [ddnsDomainOverride, setDdnsDomainOverride] = useState<string | null>(
     subnet.ddns_domain_override ?? null,
   );
-  const [ddnsTtl, setDdnsTtl] = useState<number | null>(
-    subnet.ddns_ttl ?? null,
+  const [ddnsTtlText, setDdnsTtlText] = useState(
+    subnet.ddns_ttl == null ? "" : String(subnet.ddns_ttl),
   );
+  const ddnsTtl = parseTtlInput(ddnsTtlText);
   // Device profiling state — initialised from subnet (Phase 1).
   const [autoProfileEnabled, setAutoProfileEnabled] = useState(
     subnet.auto_profile_on_dhcp_lease ?? false,
@@ -7958,7 +7978,7 @@ export function EditSubnetModal({
         ddns_enabled: ddnsEnabled,
         ddns_hostname_policy: ddnsPolicy,
         ddns_domain_override: ddnsDomainOverride,
-        ddns_ttl: ddnsTtl,
+        ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
@@ -8327,12 +8347,12 @@ export function EditSubnetModal({
           enabled={ddnsEnabled}
           policy={ddnsPolicy}
           domainOverride={ddnsDomainOverride}
-          ttl={ddnsTtl}
+          ttlText={ddnsTtlText}
           subnetNetwork={subnet.network}
           onEnabledChange={setDdnsEnabled}
           onPolicyChange={setDdnsPolicy}
           onDomainOverrideChange={setDdnsDomainOverride}
-          onTtlChange={setDdnsTtl}
+          onTtlTextChange={setDdnsTtlText}
         />
       )}
 
@@ -8413,6 +8433,10 @@ export function EditSubnetModal({
         <button
           onClick={() => {
             setError(null);
+            if (typeof ddnsTtl === "string") {
+              setError(`DDNS TTL override ${ddnsTtl}. Leave blank to inherit.`);
+              return;
+            }
             mutation.mutate();
           }}
           disabled={mutation.isPending}

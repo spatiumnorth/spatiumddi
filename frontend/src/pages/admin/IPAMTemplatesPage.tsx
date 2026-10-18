@@ -11,6 +11,7 @@ import {
   type IPAMTemplateUpdate,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { parseTtlInput } from "@/lib/dnsNames";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
@@ -44,7 +45,8 @@ interface TemplateForm {
   children: ChildEntryForm[];
 }
 
-const EMPTY: TemplateForm = {
+// eslint-disable-next-line react-refresh/only-export-components -- exported for its test
+export const EMPTY: TemplateForm = {
   name: "",
   description: "",
   applies_to: "subnet",
@@ -84,7 +86,8 @@ function formFromTemplate(t: IPAMTemplate): TemplateForm {
   };
 }
 
-function toCreatePayload(form: TemplateForm): IPAMTemplateCreate {
+// eslint-disable-next-line react-refresh/only-export-components -- exported for its test
+export function toCreatePayload(form: TemplateForm): IPAMTemplateCreate {
   let tags: Record<string, unknown> = {};
   let cfs: Record<string, unknown> = {};
   try {
@@ -116,7 +119,11 @@ function toCreatePayload(form: TemplateForm): IPAMTemplateCreate {
       }),
     };
   }
-  const ttl = form.ddns_ttl ? parseInt(form.ddns_ttl, 10) : null;
+  // #2086 — "1h" is refused, never saved as 1; blank means no override.
+  const ttl = parseTtlInput(form.ddns_ttl);
+  if (typeof ttl === "string") {
+    throw new Error(`TTL override ${ttl}. Leave blank for the zone default.`);
+  }
   return {
     name: form.name.trim(),
     description: form.description,

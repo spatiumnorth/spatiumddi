@@ -136,12 +136,18 @@ export const DNS_TTL_MAX = 2147483647;
  * string when it is not a whole number in 0..DNS_TTL_MAX. Never `parseInt`:
  * it reads `"1h"` as 1 and `"1e3"` (a number input accepts it) as 1.
  */
-export function parseTtlInput(text: string): number | null | string {
+export function parseTtlInput(
+  text: string,
+  bounds: { min: number; max: number } = { min: 0, max: DNS_TTL_MAX },
+): number | null | string {
   const t = text.trim();
   if (t === "") return null;
   const n = Number(t);
-  if (!Number.isInteger(n) || n < 0 || n > DNS_TTL_MAX) {
-    return `must be a whole number of seconds from 0 to ${DNS_TTL_MAX}`;
+  if (!Number.isInteger(n) || n < bounds.min || n > bounds.max) {
+    return `must be a whole number of seconds from ${bounds.min} to ${bounds.max}`;
   }
   return n;
 }
+
+/** A DNS pool's TTL bounds: the API's `ge=1, le=86400` (`api/v1/dns/pools.py`). */
+export const POOL_TTL_BOUNDS = { min: 1, max: 86400 } as const;
