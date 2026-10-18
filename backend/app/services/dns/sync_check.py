@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.services.dns.record_identity import ptr_target_key, zone_target_readings
 from app.services.integration_ownership import dns_record_owned_elsewhere
 
 logger = structlog.get_logger(__name__)
@@ -939,13 +940,23 @@ async def compute_subnet_dns_drift(
     return report
 
 
-def _rr_identity(zone_id: uuid.UUID, name: str, rtype: str, value: str) -> tuple[str, ...]:
+def _rr_identity(
+    zone_id: uuid.UUID,
+    name: str,
+    rtype: str,
+    value: str,
+    readings: dict[uuid.UUID, tuple[str, bool]],
+) -> tuple[str, ...]:
     """The #1230 identity of a record, as ``_operator_record_twin`` in the
-    IPAM router matches it: owner name case-insensitive, value trimmed, and a
-    PTR target with or without its trailing dot."""
+    IPAM router matches it: owner name case-insensitive, value trimmed. A PTR
+    target compares as the zone's servers serve it (#2045): case-insensitive,
+    and a target without its trailing dot is relative to the reverse zone on
+    BIND9 / Technitium / Windows Path A, so it does not hide a missing PTR
+    there."""
     v = value.strip()
-    if rtype.upper() == "PTR":
-        v = v.rstrip(".")
+    if rtype.upper() == "PTR" and zone_id in readings:
+        zone_name, relative = readings[zone_id]
+        v = ptr_target_key(v, zone_name, relative=relative)
     return (str(zone_id), name.lower(), rtype.upper(), v)
 
 
@@ -978,9 +989,13 @@ async def _drop_operator_held(db: AsyncSession, missing: list[MissingItem]) -> l
             )
         )
     ).all()
-    held = {_rr_identity(z, n, t, v) for z, n, t, v in rows}
+    readings = await zone_target_readings(
+        db, {m.zone_id for m in missing if m.record_type.upper() == "PTR"}
+    )
+    held = {_rr_identity(z, n, t, v, readings) for z, n, t, v in rows}
     return [
         m
         for m in missing
-        if _rr_identity(m.zone_id, m.expected_name, m.record_type, m.expected_value) not in held
+        if _rr_identity(m.zone_id, m.expected_name, m.record_type, m.expected_value, readings)
+        not in held
     ]

@@ -5,6 +5,7 @@ import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
 import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { ZoneSerialsLine } from "./ZoneSerialsLine";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
   Globe,
@@ -5362,12 +5363,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   </span>
                 ) : null,
             )}
-            <span className="ml-auto text-muted-foreground">
-              Zone serials:{" "}
-              {zones.length === 0
-                ? "no zones"
-                : `${zones.length} zone${zones.length === 1 ? "" : "s"} · all servers assumed consistent (per-server serials arrive in Wave 3)`}
-            </span>
+            <ZoneSerialsLine zoneCount={zones.length} servers={servers} />
           </div>
         </div>
       )}

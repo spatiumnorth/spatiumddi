@@ -354,7 +354,9 @@ def test_identical_records_collapse_to_one(tmp_path: Path) -> None:
                 _rec("www", "A", "192.0.2.1", 60),  # the IPAM twin, lower TTL
                 _rec("WWW", "A", "192.0.2.2", None),  # same name, other case
                 _rec("alias", "CNAME", "Target.example.com.", None),
-                _rec("alias", "CNAME", "target.example.com", None),
+                # Case only: one record. (A DOT-LESS ``target.example.com``
+                # is another name — relative to the zone, #2060.)
+                _rec("alias", "CNAME", "target.example.com.", None),
                 _rec("txt", "TXT", "Hello", None),
                 _rec("txt", "TXT", "hello", None),  # free text: case matters
             ],
