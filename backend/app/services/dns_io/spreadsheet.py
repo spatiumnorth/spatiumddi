@@ -132,6 +132,14 @@ _MANAGED_REASON = {
 }
 
 
+def managed_reason(record: DNSRecord) -> str | None:
+    """Why *record* is read-only to an import, or None when the operator owns
+    it. Shared with the zone-file import (#2167), so the two importers protect
+    the same rows with the same words."""
+    owner = managed_by(record)
+    return None if owner is None else _MANAGED_REASON[owner]
+
+
 def record_comment(record: DNSRecord) -> str | None:
     tags = record.tags or {}
     value = tags.get(COMMENT_TAG)
