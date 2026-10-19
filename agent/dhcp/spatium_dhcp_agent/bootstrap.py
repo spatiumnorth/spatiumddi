@@ -24,6 +24,7 @@ import structlog
 from . import __version__
 from .cache import load_or_create_agent_id, load_token, save_token
 from .config import AgentConfig
+from .ha_tls import AGENT_CAPABILITIES
 
 log = structlog.get_logger(__name__)
 
@@ -57,6 +58,9 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
         "fingerprint": _fingerprint(agent_id),
         "agent_id": agent_id,
         "version": __version__,
+        # Register's request model ignores unknown keys, so an older control
+        # plane accepts this unchanged.
+        "capabilities": list(AGENT_CAPABILITIES),
     }
     backoff = 2.0
     while True:
