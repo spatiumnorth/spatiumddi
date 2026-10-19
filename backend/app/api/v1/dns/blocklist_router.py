@@ -16,6 +16,7 @@ produced by `app.services.dns_blocklist`.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import uuid
 from datetime import datetime
@@ -64,11 +65,52 @@ router = APIRouter(dependencies=[Depends(require_resource_permission("dns_blockl
 
 VALID_SOURCE_TYPES = {"manual", "url", "file_upload"}
 VALID_FEED_FORMATS = {"hosts", "domains", "adblock"}
-VALID_BLOCK_MODES = {"nxdomain", "sinkhole", "refused"}
+VALID_BLOCK_MODES = {"nxdomain", "sinkhole"}
 VALID_ENTRY_TYPES = {"block", "redirect", "nxdomain"}
 # update_interval_hours: 0 = manual refresh only; otherwise the hourly sweep
 # refreshes the feed once the interval has passed (#1467). Capped at a year.
 MAX_UPDATE_INTERVAL_HOURS = 8760
+
+
+def _check_block_mode(v: str | None) -> str | None:
+    """``block_mode`` is ``nxdomain`` or ``sinkhole`` (#2124).
+
+    ``refused`` used to be accepted and is now a 422 naming why: BIND's RPZ
+    has no action that answers REFUSED (its actions are NXDOMAIN, NODATA,
+    PASSTHRU, DROP, TCP-only and local data), so the mode was rendered as
+    NXDOMAIN on the agent and as a dropped query by the control-plane
+    renderer — never as what it said.
+    """
+    if v is None:
+        return v
+    if v == "refused":
+        raise ValueError(
+            "block_mode 'refused' is not supported: DNS response-policy zones "
+            "have no action that answers REFUSED. Use 'nxdomain' (fail fast "
+            "with NXDOMAIN) or 'sinkhole' (answer with a sinkhole address)."
+        )
+    if v not in VALID_BLOCK_MODES:
+        raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
+    return v
+
+
+def _check_sinkhole_ip(v: str | None) -> str | None:
+    """A sinkhole address is an IPv4 or IPv6 literal (#2124).
+
+    It is rendered into the RPZ zone as A / AAAA rdata, where anything else
+    makes BIND refuse the WHOLE zone (#878). Stored normalised, so
+    ``::0`` and ``::`` are one value. Blank means "the default"
+    (``0.0.0.0`` and ``::``) and is stored as NULL.
+    """
+    if v is None:
+        return None
+    text = v.strip()
+    if not text:
+        return None
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        raise ValueError(f"sinkhole_ip must be an IPv4 or IPv6 address, not {v!r}") from None
 
 
 def _check_interval(v: int | None) -> int | None:
@@ -119,9 +161,13 @@ class BlockListCreate(BaseModel):
     @field_validator("block_mode")
     @classmethod
     def _v_mode(cls, v: str) -> str:
-        if v not in VALID_BLOCK_MODES:
-            raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
+        _check_block_mode(v)
         return v
+
+    @field_validator("sinkhole_ip")
+    @classmethod
+    def _v_sinkhole(cls, v: str | None) -> str | None:
+        return _check_sinkhole_ip(v)
 
 
 class BlockListUpdate(BaseModel):
@@ -159,9 +205,21 @@ class BlockListUpdate(BaseModel):
     @field_validator("block_mode")
     @classmethod
     def _v_mode(cls, v: str | None) -> str | None:
-        if v is not None and v not in VALID_BLOCK_MODES:
-            raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
-        return v
+        return _check_block_mode(v)
+
+    @field_validator("sinkhole_ip")
+    @classmethod
+    def _v_sinkhole(cls, v: str | None) -> str | None:
+        return _check_sinkhole_ip(v)
+
+
+class FeedParseSkipped(BaseModel):
+    """Rules the last adblock-format refresh could not enforce (#2123)."""
+
+    regex: int = 0
+    modifier: int = 0
+    badfilter: int = 0
+    malformed: int = 0
 
 
 class BlockListResponse(BaseModel):
@@ -181,6 +239,8 @@ class BlockListResponse(BaseModel):
     last_sync_status: str | None
     last_sync_error: str | None
     entry_count: int
+    # NULL = no adblock refresh has recorded counts (or not an adblock feed).
+    feed_parse_skipped: FeedParseSkipped | None = None
     created_at: datetime
     modified_at: datetime
     applied_group_ids: list[uuid.UUID] = []
@@ -276,6 +336,9 @@ class ExceptionResponse(BaseModel):
     list_id: uuid.UUID
     domain: str
     reason: str
+    # manual | feed — a feed row is the feed's own ``@@`` rule (#2123) and is
+    # re-synced by every refresh.
+    source: str = "manual"
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -347,6 +410,9 @@ def _to_response(bl: DNSBlockList) -> BlockListResponse:
         last_sync_status=bl.last_sync_status,
         last_sync_error=bl.last_sync_error,
         entry_count=bl.entry_count,
+        feed_parse_skipped=(
+            FeedParseSkipped(**bl.feed_parse_skipped) if bl.feed_parse_skipped else None
+        ),
         created_at=bl.created_at,
         modified_at=bl.modified_at,
         applied_group_ids=[g.id for g in bl.server_groups],
@@ -474,6 +540,13 @@ class SubscribeFromCatalogRequest(BaseModel):
     update_interval_hours: int = 24
     block_mode: str = "nxdomain"
     enabled: bool = True
+
+    @field_validator("block_mode")
+    @classmethod
+    def _v_bm(cls, v: str) -> str:
+        # Was unvalidated: any string reached the row and the renderers.
+        _check_block_mode(v)
+        return v
 
 
 @router.get("/blocklists/catalog", response_model=CatalogResponse)
@@ -664,9 +737,7 @@ class FromTemplateRequest(BaseModel):
     @field_validator("block_mode")
     @classmethod
     def _v_bm(cls, v: str | None) -> str | None:
-        if v is not None and v not in VALID_BLOCK_MODES:
-            raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
-        return v
+        return _check_block_mode(v)
 
 
 async def _materialise_template(

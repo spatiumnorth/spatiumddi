@@ -443,6 +443,48 @@ def _redirect_rdata(target: str) -> str | None:
     return f"{'AAAA' if ip.version == 6 else 'A'} {ip}"
 
 
+#: Answer a ``sinkhole`` list gives when it names no address of a family
+#: (#2124). The unspecified address is what every DNS sinkhole answers with
+#: (Pi-hole, AdGuard Home): a client connecting to it fails at once, rather
+#: than waiting out a resolver timeout as ``rpz-drop`` makes it.
+DEFAULT_SINKHOLE_V4 = "0.0.0.0"
+DEFAULT_SINKHOLE_V6 = "::"
+
+
+def sinkhole_rdatas(sinkhole_ip: Any) -> tuple[tuple[str, ...], bool]:
+    """RPZ local data for a ``sinkhole`` entry: an A *and* an AAAA (#2124).
+
+    Both families are answered, so an AAAA lookup fails fast too instead of
+    falling through to NODATA and a retry over v4. The list's
+    ``sinkhole_ip`` replaces the default of its own family; the other
+    family keeps the unspecified address.
+
+    Returns ``(rdatas, usable)``. ``usable`` is False when ``sinkhole_ip``
+    was set but is not an IP address, in which case the defaults are used:
+    the API validates the field now, but a legacy row is not, and an
+    unparseable address in the rdata would make BIND refuse the WHOLE zone
+    (#878) — answering with the unspecified address is the closer reading
+    of "sinkhole this" than enforcing nothing.
+
+    Mirrored by ``_sinkhole_rdatas`` in the control plane's BIND9 driver;
+    the two implement one contract and must not diverge.
+    """
+    v4, v6 = DEFAULT_SINKHOLE_V4, DEFAULT_SINKHOLE_V6
+    usable = True
+    text = str(sinkhole_ip).strip() if sinkhole_ip is not None else ""
+    if text:
+        try:
+            ip = ipaddress.ip_address(text)
+        except ValueError:
+            usable = False
+        else:
+            if ip.version == 6:
+                v6 = str(ip)
+            else:
+                v4 = str(ip)
+    return (f"A {v4}", f"AAAA {v6}"), usable
+
+
 # ── Resolver cache ceiling (issue #1725) ────────────────────────────────────
 # BIND's ``max-cache-size`` defaults to 90 % of PHYSICAL memory for every view
 # with recursion, and named reads the host's RAM rather than the container's
@@ -1817,9 +1859,9 @@ class Bind9Driver(DriverBase):
         def _rpz_stanza(bl: dict[str, Any], file_prefix: str) -> str:
             """Build an RPZ ``zone "..." { ... };`` and write its file.
 
-            Entries render as CNAME records: nxdomain → CNAME .,
-            sinkhole → CNAME rpz-drop., redirect → CNAME <target>.,
-            exceptions → CNAME rpz-passthru.
+            Entries render as RPZ policy records: nxdomain → CNAME .,
+            sinkhole → A + AAAA local data (#2124), redirect → CNAME
+            <target>. or A/AAAA, exceptions → CNAME rpz-passthru.
             """
             zname = bl["rpz_zone_name"]
             rel = f"zones/{file_prefix}{zname.rstrip('.')}.db"
@@ -2155,6 +2197,14 @@ class Bind9Driver(DriverBase):
           - CNAME <target>.    → rewrite response to CNAME target
           - A / AAAA <ip>      → answer with a literal address
 
+        ``block_mode`` maps onto those as: ``nxdomain`` → ``CNAME .``;
+        ``sinkhole`` → an ``A`` and an ``AAAA`` (the list's
+        ``sinkhole_ip``, else the unspecified address; #2124). Nothing
+        renders ``rpz-drop``: a dropped query leaves the client waiting out
+        its resolver timeout, the worst answer an ad blocker can give. A
+        legacy ``refused`` (BIND's RPZ has no REFUSED action, and #2124
+        retired the mode) renders as NXDOMAIN, as it always did here.
+
         Wildcard entries are emitted as `*.<domain>` *in addition to* the
         bare name, because an RPZ wildcard matches subdomains only — a
         `*.example.com`-only rule leaves the apex resolving normally.
@@ -2184,13 +2234,28 @@ class Bind9Driver(DriverBase):
         path.parent.mkdir(parents=True, exist_ok=True)
         zname = bl["rpz_zone_name"]
         # ``seen`` is the owner-name collision ledger (#878) and must stay.
-        seen: dict[str, str] = {}
+        seen: dict[str, tuple[str, ...]] = {}
         collisions: list[str] = []
         bad_targets: list[str] = []
+        bad_sinkholes: set[str] = set()
         with path.open("w", encoding="utf-8", buffering=1 << 20) as fh:
-            for line in self._rpz_zone_lines(bl, seen, collisions, bad_targets):
+            for line in self._rpz_zone_lines(
+                bl, seen, collisions, bad_targets, bad_sinkholes
+            ):
                 fh.write(line)
                 fh.write("\n")
+        if bad_sinkholes:
+            log.warning(
+                "bind9_rpz_sinkhole_ip_unusable",
+                zone=zname,
+                sinkhole_ips=sorted(bad_sinkholes)[:5],
+                detail=(
+                    "A sinkhole list's sinkhole_ip is not an IP address, so "
+                    "its entries answer with 0.0.0.0 / :: instead. Rendering "
+                    "it would make BIND reject the whole zone. Correct the "
+                    "list's sinkhole address."
+                ),
+            )
         if bad_targets:
             log.warning(
                 "bind9_rpz_redirect_target_unusable",
@@ -2212,8 +2277,9 @@ class Bind9Driver(DriverBase):
                 sample=sorted(set(collisions))[:5],
                 detail=(
                     "The same domain appears in two assigned blocklists with "
-                    "different block modes. The first was rendered and the "
-                    "rest ignored — emitting both would put two CNAMEs on one "
+                    "different block modes or sinkhole addresses. The first "
+                    "was rendered and the rest ignored — emitting both would "
+                    "put two CNAMEs, or a CNAME beside an address, on one "
                     "owner name, which makes BIND reject the whole zone."
                 ),
             )
@@ -2227,9 +2293,10 @@ class Bind9Driver(DriverBase):
     def _rpz_zone_lines(
         self,
         bl: dict[str, Any],
-        seen: dict[str, str],
+        seen: dict[str, tuple[str, ...]],
         collisions: list[str],
         bad_targets: list[str],
+        bad_sinkholes: set[str] | None = None,
     ) -> Iterator[str]:
         """Yield the RPZ zone file's lines; see ``_write_rpz_zone_file``."""
         yield "$TTL 60"
@@ -2265,21 +2332,31 @@ class Bind9Driver(DriverBase):
                 if rewrite is None:
                     bad_targets.append(domain)
                     continue
-                rdata = rewrite
+                rdatas: tuple[str, ...] = (rewrite,)
             elif block_mode == "sinkhole":
-                rdata = "CNAME rpz-drop."
-            else:  # default: nxdomain
-                rdata = "CNAME ."
+                # Local data, not ``rpz-drop`` (#2124): drop made named
+                # send no response at all, so every blocked lookup hung
+                # for the client's resolver timeout, and the list's
+                # ``sinkhole_ip`` was never read.
+                rdatas, usable = sinkhole_rdatas(e.get("sinkhole_ip"))
+                if not usable and bad_sinkholes is not None:
+                    bad_sinkholes.add(str(e.get("sinkhole_ip")))
+            else:  # nxdomain, and a legacy ``refused`` (#2124)
+                rdatas = ("CNAME .",)
             if key in seen:
                 # An identical repeat is harmless duplication (BIND loads
-                # it); only a differing one would have killed the zone.
-                if seen[key] != rdata:
+                # it); only a differing one would have killed the zone —
+                # and an A beside a CNAME at one owner is as fatal as two
+                # CNAMEs, so the whole rdata set is compared.
+                if seen[key] != rdatas:
                     collisions.append(domain)
                 continue
-            seen[key] = rdata
-            yield f"{domain} {rdata}"
+            seen[key] = rdatas
+            for rdata in rdatas:
+                yield f"{domain} {rdata}"
             if is_wildcard:
-                yield f"*.{domain} {rdata}"
+                for rdata in rdatas:
+                    yield f"*.{domain} {rdata}"
         # Exceptions → passthrough (never blocked even if a broader rule
         # matches). Deduped on the same lowercased key so two spellings of
         # one name cannot land twice either.

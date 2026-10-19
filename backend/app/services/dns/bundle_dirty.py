@@ -180,7 +180,13 @@ _NOT_RENDERED: dict[type, frozenset[str]] = {
     DNSPool: frozenset({"last_checked_at", "next_check_at"}),
     # Feed refresh bookkeeping; the entries themselves are their own rows.
     DNSBlockList: frozenset(
-        {"last_synced_at", "last_sync_status", "last_sync_error", "entry_count"}
+        {
+            "last_synced_at",
+            "last_sync_status",
+            "last_sync_error",
+            "entry_count",
+            "feed_parse_skipped",
+        }
     ),
 }
 # Models where the bundle reads a small, known set of columns: only these
