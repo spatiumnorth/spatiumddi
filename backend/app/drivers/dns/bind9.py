@@ -24,6 +24,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoes
 
 from app.core.dns_names import strip_control_chars
 from app.drivers.dns._axfr import resolve_server_address
+from app.drivers.dns._forwarders import bind_zone_forwarders, bind_zone_tls_statement
 from app.drivers.dns._txt import quote_txt as _quote_txt
 from app.drivers.dns.base import (
     ConfigBundle,
@@ -185,6 +186,15 @@ def _render_update_clause(zone: ZoneData) -> str:
     return f"allow-update {{ {' '.join(items)} }};" if items else ""
 
 
+def _zone_forward_view(zone: ZoneData) -> dict[str, Any]:
+    """The bundle-shaped mapping ``_forwarders`` reads, from a ``ZoneData``."""
+    return {
+        "forwarders": list(zone.forwarders),
+        "forward_transport": zone.forward_transport,
+        "forward_tls_hostname": zone.forward_tls_hostname,
+    }
+
+
 class BIND9Driver(DNSDriver):
     name = "bind9"
 
@@ -228,6 +238,16 @@ class BIND9Driver(DNSDriver):
         # zone name appears once per view, so a name-only key would collapse
         # the copies and drop all but one view's stanza from the preview.
         zone_stanzas = {(z.view_name, z.name): self.render_zone_config(z) for z in zones}
+        # One ``tls`` statement per upstream hostname a TLS forward zone uses
+        # (#2121), rendered above ``options`` exactly as the agent does.
+        zone_tls_hosts = {
+            host
+            for z in zones
+            if z.zone_type == "forward"
+            for host in [bind_zone_forwarders(_zone_forward_view(z))[1]]
+            if host
+        }
+        zone_tls_statements = "".join(bind_zone_tls_statement(h) for h in sorted(zone_tls_hosts))
 
         return tmpl.render(
             server_id=str(server_id),
@@ -244,6 +264,7 @@ class BIND9Driver(DNSDriver):
             blocklists=blocklists,
             dnssec_policies=dnssec_policies,
             zone_stanzas=zone_stanzas,
+            zone_tls_statements=zone_tls_statements,
             # Issue #50 — this preview renders from ``ServerOptions`` alone,
             # which carries the operator's intent but not the cert material
             # (that only exists in the agent-facing bundle). Assume the cert
@@ -258,7 +279,21 @@ class BIND9Driver(DNSDriver):
     def render_zone_config(self, zone: ZoneData) -> str:
         env = _env()
         tmpl = env.get_template("zone.stanza.j2")
-        return tmpl.render(zone=zone, update_clause=_render_update_clause(zone))
+        forwarder_tokens: list[str] = []
+        if zone.zone_type == "forward":
+            # Same helper as the agent (#2121), so a forward zone renders the
+            # ZONE's transport, and ``ip@port`` renders as ``ip port n``
+            # rather than the unloadable ``ip@port`` the template emitted
+            # verbatim. A zone the agent would skip (no usable forwarder, or a
+            # transport BIND cannot speak) renders nothing here either.
+            forwarder_tokens, _host, refusal = bind_zone_forwarders(_zone_forward_view(zone))
+            if refusal or not forwarder_tokens:
+                return ""
+        return tmpl.render(
+            zone=zone,
+            update_clause=_render_update_clause(zone),
+            forwarder_tokens=forwarder_tokens,
+        )
 
     def render_zone_file(self, zone: ZoneData, records: list[RecordData]) -> str:
         env = _env()

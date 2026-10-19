@@ -76,6 +76,7 @@ import httpx
 import structlog
 
 from ..secure_io import write_private
+from ._forwarders import zone_forward_transport as _zone_forward_transport
 from ._process import find_running_daemon, is_zombie
 from ._txt import txt_strings
 from .base import RRSET_OP_KINDS, DriverBase
@@ -380,27 +381,31 @@ def _paired_address(
     return _address_with_ip(name, host)
 
 
-def _zone_forwarder(entry: str, options: dict[str, Any]) -> str:
+def _zone_forwarder(entry: str, zone: dict[str, Any]) -> str:
     """A forward zone's upstream as its FWD record should carry it.
 
-    The group's encrypted ``forward_transport`` applies to per-zone
-    upstreams too, as it does on BIND9 (#50): a plain IP with no scheme and
-    no DoT port, in a group forwarding over tls/https/quic with a
-    ``forward_tls_hostname``, becomes ``tls://<name> (<ip>)`` (or the DoH /
+    The transport is the ZONE's own ``forward_transport`` (#2121), not the
+    group's: the group's applies to its resolver forwarders only. A plain IP
+    with no scheme and no port, in a zone forwarding over tls/https/quic with
+    a ``forward_tls_hostname``, becomes ``tls://<name> (<ip>)`` (or the DoH /
     DoQ equivalent) instead of going out as cleartext UDP. An address that
-    names its own scheme or port is the operator's choice and kept.
+    names its own scheme or port is the operator's choice and kept, and that
+    includes an explicit ``@53``: it says "this one is plain DNS", and was
+    upgraded to DoT before #2121.
+
+    A zone from a control plane older than #2121 carries no transport and
+    reads as plain DNS (``_forwarders.zone_forward_transport``).
     """
     text = _technitium_forwarder(entry)
-    transport = str(options.get("forward_transport") or "do53")
-    hostname = str(options.get("forward_tls_hostname") or "").strip()
+    transport, hostname = _zone_forward_transport(zone)
     if transport not in ("tls", "https", "quic") or not hostname:
         return text
     if "://" in text or "(" in text or _forwarder_protocol(text) != "Udp":
         return text
     host, port = _split_host_port(text)
-    if port and port != "53":
-        # An explicit non-53 port on a plain address is a deliberate
-        # target; keep it rather than guess what it speaks.
+    if port:
+        # An explicit port on a plain address is a deliberate target; keep
+        # it rather than guess what it speaks.
         return text
     paired = _paired_address(host, hostname, transport, scheme=True)
     return paired if paired is not None else text
@@ -2330,8 +2335,7 @@ class TechnitiumDriver(DriverBase):
                     # zone that is refused every AXFR and expires.
                     entry["tsig_unresolved"] = True
             if forwarders:
-                group_opts = bundle.get("options") or {}
-                entry["forwarders"] = [_zone_forwarder(f, group_opts) for f in forwarders]
+                entry["forwarders"] = [_zone_forwarder(f, zone) for f in forwarders]
             if ztype == "Forwarder":
                 dnssec = _dnssec_flag((bundle.get("options") or {}).get("dnssec_validation"))
                 if dnssec is not None:
