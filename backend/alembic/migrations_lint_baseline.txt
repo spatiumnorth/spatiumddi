@@ -118,6 +118,7 @@ backend/alembic/versions/a1c7f3e9b284_bgp_hijack_monitoring.py:drop_table:206
 backend/alembic/versions/a1f4c7e92b30_dhcp_scope_provider_refs.py:drop_column:38
 backend/alembic/versions/a1f4d97c8e25_network_device_poll_igmp.py:drop_column:48
 backend/alembic/versions/a1f4d97c8e25_network_device_poll_igmp.py:drop_column:49
+backend/alembic/versions/a2078c5e1d90_dns_server_agent_version.py:drop_column:38
 backend/alembic/versions/a2e7f31c9b48_influxdb_push_export.py:drop_table:99
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:83
 backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:84
@@ -223,6 +224,7 @@ backend/alembic/versions/b2f7e91d3c48_dhcp_pull_interval_seconds.py:rename_colum
 backend/alembic/versions/b3a82c0d4e95_appliance_k3s_kubeconfig.py:drop_column:43
 backend/alembic/versions/b3a82c0d4e95_appliance_k3s_kubeconfig.py:drop_column:44
 backend/alembic/versions/b3c71e9a4d25_dns_group_tsig_secret_encrypted.py:drop_column:95
+backend/alembic/versions/b3d7f1a82c54_dns_record_ip_alias.py:drop_column:87
 backend/alembic/versions/b3e7d1f9a204_appliance_host_migration_health.py:drop_column:47
 backend/alembic/versions/b3e7d21c9f04_dhcp_scope_cascade_soft_delete.py:drop_column:148
 backend/alembic/versions/b3e7d21c9f04_dhcp_scope_cascade_soft_delete.py:drop_column:149
@@ -407,6 +409,8 @@ backend/alembic/versions/c7a3e1f90d24_subnet_utilization_history.py:drop_table:4
 backend/alembic/versions/c7a3f1e28d94_appliance_cluster_join_state_at.py:drop_column:57
 backend/alembic/versions/c7d1f04e9a2b_tls_cert_target_ip_address.py:drop_column:44
 backend/alembic/versions/c7d1f04e9a2b_tls_cert_target_ip_address.py:drop_constraint_fk:43
+backend/alembic/versions/c7d2e9a41f63_dns_record_op_zone_id.py:drop_column:53
+backend/alembic/versions/c7d2e9a41f63_dns_record_op_zone_id.py:drop_constraint_fk:52
 backend/alembic/versions/c7d3f9a15e28_dhcp_lease_cache.py:drop_column:71
 backend/alembic/versions/c7d3f9a15e28_dhcp_lease_cache.py:drop_column:72
 backend/alembic/versions/c7d3f9a15e28_dhcp_lease_cache.py:drop_column:73
@@ -558,6 +562,7 @@ backend/alembic/versions/d6e1a4b9f082_add_dns_auto_sync_settings.py:drop_column:
 backend/alembic/versions/d6e1a4b9f082_add_dns_auto_sync_settings.py:drop_column:63
 backend/alembic/versions/d72a36e159c4_ai_prompts.py:drop_table:102
 backend/alembic/versions/d7a2b6e9f134_add_address_family_to_dhcp_scope.py:drop_column:44
+backend/alembic/versions/d7a2e94b1c60_influxdb_target_last_success_at.py:drop_column:47
 backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_column:65
 backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_column:66
 backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_column:67

@@ -31,6 +31,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Steps an operator follows in the OPNsense web UI to mint a read-only
@@ -411,7 +412,7 @@ function RouterModal({
   );
   const [mirrorArp, setMirrorArp] = useState(router?.mirror_arp ?? false);
   const [syncInterval, setSyncInterval] = useState(
-    router?.sync_interval_seconds ?? 60,
+    String(router?.sync_interval_seconds ?? 60),
   );
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
@@ -454,7 +455,7 @@ function RouterModal({
           mirror_dhcp_leases: mirrorDhcpLeases,
           mirror_static_mappings: mirrorStaticMappings,
           mirror_arp: mirrorArp,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (apiSecret) update.api_secret = apiSecret;
@@ -475,7 +476,7 @@ function RouterModal({
         mirror_dhcp_leases: mirrorDhcpLeases,
         mirror_static_mappings: mirrorStaticMappings,
         mirror_arp: mirrorArp,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return opnsenseApi.createRouter(create);
     },
@@ -495,6 +496,17 @@ function RouterModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -685,7 +697,7 @@ function RouterModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 

@@ -32,6 +32,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 
 // One-shot snippet operators can paste into Settings → Control
 // Plane → Integrations on UniFi OS to mint an API key with the
@@ -356,7 +357,7 @@ export function UnifiPage() {
 
 // ── Create / Edit modal ─────────────────────────────────────────────
 
-function ControllerModal({
+export function ControllerModal({
   controller,
   onClose,
 }: {
@@ -418,7 +419,7 @@ function ControllerModal({
     controller?.include_vpn ?? false,
   );
   const [syncInterval, setSyncInterval] = useState(
-    controller?.sync_interval_seconds ?? 60,
+    String(controller?.sync_interval_seconds ?? 60),
   );
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
@@ -494,7 +495,7 @@ function ControllerModal({
           include_wired: includeWired,
           include_wireless: includeWireless,
           include_vpn: includeVpn,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (caBundle) update.ca_bundle_pem = caBundle;
         if (apiKey) update.api_key = apiKey;
@@ -525,7 +526,7 @@ function ControllerModal({
         include_wired: includeWired,
         include_wireless: includeWireless,
         include_vpn: includeVpn,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return unifiApi.createController(create);
     },
@@ -545,6 +546,17 @@ function ControllerModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -849,7 +861,7 @@ function ControllerModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 

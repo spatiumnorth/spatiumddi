@@ -76,6 +76,8 @@ vi.mock("@/hooks/useFeatureModules", () => ({
 
 const { DNSPage } = await import("@/pages/dns/DNSPage");
 
+const zoneDialogs = await import("@/pages/dns/ZoneDeleteDialogs");
+
 const STAMP = "2026-10-15T00:00:00Z";
 
 const GROUP = {
@@ -246,6 +248,47 @@ describe("bulk zone delete (zones list)", () => {
 
     await waitFor(() => expect(deleteZone).toHaveBeenCalledTimes(2));
     expect(deleteZone.mock.calls.map((c) => c.length)).toEqual([2, 2]);
+  });
+});
+
+describe("the Trash warning agrees in number (#2048)", () => {
+  const { DeleteZoneDialog, BulkDeleteZonesDialog } = zoneDialogs;
+  const noop = () => {};
+
+  function step2(ui: ReactNode): string {
+    show(ui, "/");
+    fireEvent.click(
+      within(topDialog()).getByRole("button", { name: /^Continue$/ }),
+    );
+    return words(topDialog());
+  }
+
+  it("is singular for one zone", () => {
+    const said = step2(
+      <DeleteZoneDialog
+        zoneName="example.com."
+        onConfirm={noop}
+        onClose={noop}
+      />,
+    );
+    expect(said).toContain("The zone and its records move to Trash.");
+  });
+
+  it("is singular for a bulk selection of one", () => {
+    const said = step2(
+      <BulkDeleteZonesDialog count={1} onConfirm={noop} onClose={noop} />,
+    );
+    expect(said).toContain("The zone and its records move to Trash.");
+  });
+
+  it("is plural for two zones", () => {
+    const said = step2(
+      <BulkDeleteZonesDialog count={2} onConfirm={noop} onClose={noop} />,
+    );
+    expect(said).toContain(
+      "The 2 zones and all their records move to Trash. A superadmin can restore them",
+    );
+    expect(said).not.toContain("The zone and its records");
   });
 });
 

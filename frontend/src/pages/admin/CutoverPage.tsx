@@ -44,6 +44,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useSessionState } from "@/lib/useSessionState";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
@@ -655,10 +656,14 @@ function NewPlanModal({
     queryFn: dnsApi.listGroups,
     enabled: canQuery,
   });
+  // The cutover module does not require core.dhcp, so a DNS-only install
+  // can have this page with DHCP off: the DHCP pickers and their /dhcp
+  // reads are skipped then (#2130).
+  const dhcpOn = useModuleOn("core.dhcp");
   const dhcpGroupsQ = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
-    enabled: canQuery,
+    enabled: canQuery && dhcpOn,
   });
   // DNS servers are only listable per group, so the picker fans out over the
   // groups it just loaded.
@@ -676,7 +681,7 @@ function NewPlanModal({
   const dhcpServersQ = useQuery({
     queryKey: ["cutover", "dhcp-servers"],
     queryFn: () => dhcpApi.listServers(),
-    enabled: canQuery,
+    enabled: canQuery && dhcpOn,
   });
 
   const windowsDns = (dnsServersQ.data ?? []).filter(
@@ -774,53 +779,57 @@ function NewPlanModal({
             </select>
           </div>
 
-          <div>
-            <label className="block text-sm font-medium">
-              Source Windows DHCP server
-            </label>
-            <p className="mb-1 text-[11px] text-muted-foreground">
-              What scopes and leases are pulled from. Needs the{" "}
-              <code>windows_dhcp</code> driver.
-            </p>
-            <select
-              value={dhcpSource}
-              onChange={(e) => setDhcpSource(e.target.value)}
-              className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-            >
-              <option value="">— none —</option>
-              {windowsDhcp.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name} ({s.host})
-                </option>
-              ))}
-            </select>
-            {!dhcpServersQ.isLoading && windowsDhcp.length === 0 && (
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                No Windows DHCP servers are configured.
+          {dhcpOn && (
+            <div>
+              <label className="block text-sm font-medium">
+                Source Windows DHCP server
+              </label>
+              <p className="mb-1 text-[11px] text-muted-foreground">
+                What scopes and leases are pulled from. Needs the{" "}
+                <code>windows_dhcp</code> driver.
               </p>
-            )}
-          </div>
+              <select
+                value={dhcpSource}
+                onChange={(e) => setDhcpSource(e.target.value)}
+                className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="">— none —</option>
+                {windowsDhcp.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name} ({s.host})
+                  </option>
+                ))}
+              </select>
+              {!dhcpServersQ.isLoading && windowsDhcp.length === 0 && (
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  No Windows DHCP servers are configured.
+                </p>
+              )}
+            </div>
+          )}
 
-          <div>
-            <label className="block text-sm font-medium">
-              Target DHCP server group
-            </label>
-            <p className="mb-1 text-[11px] text-muted-foreground">
-              The SpatiumDDI group taking the scopes over.
-            </p>
-            <select
-              value={dhcpTarget}
-              onChange={(e) => setDhcpTarget(e.target.value)}
-              className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-            >
-              <option value="">— none —</option>
-              {(dhcpGroupsQ.data ?? []).map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </div>
+          {dhcpOn && (
+            <div>
+              <label className="block text-sm font-medium">
+                Target DHCP server group
+              </label>
+              <p className="mb-1 text-[11px] text-muted-foreground">
+                The SpatiumDDI group taking the scopes over.
+              </p>
+              <select
+                value={dhcpTarget}
+                onChange={(e) => setDhcpTarget(e.target.value)}
+                className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="">— none —</option>
+                {(dhcpGroupsQ.data ?? []).map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
         </div>
 
         <div className="flex flex-wrap justify-end gap-2">

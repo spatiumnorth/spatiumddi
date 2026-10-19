@@ -596,6 +596,16 @@ migrate:
   # Without a TTL the cluster would slowly accumulate one completed Job
   # per Helm revision.
   ttlSecondsAfterFinished: 600
+  # Annotations on the Job object (not its pod). For GitOps controllers that
+  # render the chart with ``helm template``, where ``.Release.Revision`` is
+  # always 1: the Job is then ``<release>-migrate-r1`` on every sync, and a
+  # Job's pod template is immutable, so the first image bump fails with
+  # "field is immutable" until the old Job is deleted by hand. Under Argo CD,
+  # make it a sync hook so it is recreated (and re-run) on every sync:
+  #   argocd.argoproj.io/hook: Sync
+  #   argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+  # Plain ``helm install`` / ``helm upgrade`` ignore these.
+  annotations: {}
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits:   { cpu: 200m, memory: 256Mi }
@@ -910,6 +920,10 @@ dnsAgents:
     #   role: primary            # primary | secondary
     #   group: internal-resolvers
     #   storage: { agentState: 1Gi, dnsState: 2Gi }
+    #   # Optional placement. Agents only PREFER separate nodes; pin with
+    #   # nodeSelector to keep one per node across drains.
+    #   nodeSelector: { kubernetes.io/hostname: node-a }
+    #   tolerations: []
     #   service: { type: LoadBalancer }
     #   # LoadBalancer Services keep the client address by default
     #   # (externalTrafficPolicy: Local — each server is a single-replica

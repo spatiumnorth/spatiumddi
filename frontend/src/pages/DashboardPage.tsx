@@ -1422,12 +1422,15 @@ export function DashboardPage() {
   // fall back to Overview so we don't render a panel against a 404'd
   // endpoint.
   useEffect(() => {
-    if (!tabVisible(tab)) {
+    // ``ready``: before the module set loads ``enabled`` answers true, so
+    // a persisted ``dhcp`` tab is neither reset nor — see the panel guards
+    // below — mounted against a module that may turn out to be off (#2130).
+    if (ready && !tabVisible(tab)) {
       setTab("overview");
       localStorage.setItem("dashboard-tab", "overview");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, enabled]);
+  }, [tab, enabled, ready]);
 
   // IPAM
   const { data: spaces } = useQuery({
@@ -2182,12 +2185,12 @@ export function DashboardPage() {
         )}
 
         {/* ── DHCP pools + traffic (DHCP tab only) ───────────────────── */}
-        {tab === "dhcp" && (
+        {tab === "dhcp" && dhcpOn && (
           <WidgetErrorBoundary title="DHCP pools">
-            <DhcpPoolPressure />
+            <DhcpPoolPressure dhcpOn={dhcpOn} />
           </WidgetErrorBoundary>
         )}
-        {tab === "dhcp" && (
+        {tab === "dhcp" && dhcpOn && (
           <WidgetErrorBoundary title="DHCP traffic">
             <DHCPTrafficCard dhcpServers={dhcpServers} />
           </WidgetErrorBoundary>
@@ -2577,7 +2580,7 @@ export function DashboardPage() {
             )}
           </div>
         )}
-        {tab === "dhcp" && dhcpServers.length === 0 && (
+        {tab === "dhcp" && dhcpOn && dhcpServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
             <Server className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
             <p className="text-sm font-medium">No DHCP servers registered</p>
@@ -2999,11 +3002,13 @@ function ServerRow({
  * offered to a client and a reserved one is *supposed* to fill up, so
  * either would render as a red exhaustion bar for behaving correctly.
  */
-function DhcpPoolPressure() {
+function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
   const { data, isLoading, isError } = useQuery({
     queryKey: ["dhcp-pool-occupancy", "fleet"],
     queryFn: () => dhcpApi.fleetPoolOccupancy(8),
     refetchInterval: 60_000,
+    // Belt and braces with the caller's ``dhcpOn`` guard (#2130).
+    enabled: dhcpOn,
   });
 
   // A failed fetch must not render as "no pools configured" — that is the

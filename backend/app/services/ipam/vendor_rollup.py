@@ -19,44 +19,55 @@ from __future__ import annotations
 
 import uuid
 from collections import Counter
+from collections.abc import Collection
 from typing import Any, Literal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dhcp import DHCPLease
+from app.models.dhcp import DHCPLease, DHCPScope
 from app.models.ipam import IPAddress, Subnet
 from app.services.oui import bulk_lookup_vendors, normalize_mac_key
 
 VendorSource = Literal["ipam", "dhcp_active", "all"]
 
 
-async def collect_mac_keys(db: AsyncSession, source: str) -> set[str]:
+def _active_leases(subnet_ids: Collection[uuid.UUID] | None) -> Any:
+    """Active leases, limited to leases in ``subnet_ids``' scopes when given.
+    A lease with no scope cannot be placed in a subnet, so a limited caller
+    does not see it."""
+    stmt = select(DHCPLease).where(DHCPLease.state == "active")
+    if subnet_ids is not None:
+        stmt = stmt.join(DHCPScope, DHCPLease.scope_id == DHCPScope.id).where(
+            DHCPScope.subnet_id.in_(list(subnet_ids))
+        )
+    return stmt
+
+
+async def collect_mac_keys(
+    db: AsyncSession, source: str, *, subnet_ids: Collection[uuid.UUID] | None = None
+) -> set[str]:
     """Normalized MAC keys present in scope.
 
     ``ipam`` reads ``IPAddress.mac_address`` (managed + DHCP-mirrored rows),
     ``dhcp_active`` reads currently-active leases, ``all`` is the union
     deduplicated by MAC — a device with both a managed row and a live lease is
-    one device.
+    one device. ``subnet_ids`` limits both sources to those subnets (a caller
+    bound to specific subnets); ``None`` applies no limit.
     """
     out: set[str] = set()
     if source in ("ipam", "all"):
-        rows = (
-            (
-                await db.execute(
-                    select(IPAddress.mac_address).where(IPAddress.mac_address.is_not(None))
-                )
-            )
-            .scalars()
-            .all()
-        )
+        ipam_q = select(IPAddress.mac_address).where(IPAddress.mac_address.is_not(None))
+        if subnet_ids is not None:
+            ipam_q = ipam_q.where(IPAddress.subnet_id.in_(list(subnet_ids)))
+        rows = (await db.execute(ipam_q)).scalars().all()
         for raw in rows:
             key = normalize_mac_key(str(raw)) if raw is not None else None
             if key:
                 out.add(key)
     if source in ("dhcp_active", "all"):
         rows = (
-            (await db.execute(select(DHCPLease.mac_address).where(DHCPLease.state == "active")))
+            (await db.execute(_active_leases(subnet_ids).with_only_columns(DHCPLease.mac_address)))
             .scalars()
             .all()
         )
@@ -73,6 +84,7 @@ async def count_by_vendor(
     source: str = "ipam",
     vendor_search: str | None = None,
     limit: int = 100,
+    subnet_ids: Collection[uuid.UUID] | None = None,
 ) -> dict[str, Any]:
     """Vendor → device-count buckets, most common first.
 
@@ -81,7 +93,7 @@ async def count_by_vendor(
     how complete the OUI table is, and collapsing it would make a stale table
     look like an empty network.
     """
-    keys = await collect_mac_keys(db, source)
+    keys = await collect_mac_keys(db, source, subnet_ids=subnet_ids)
     # bulk_lookup_vendors keys its output by the same canonical 12-char form
     # normalize_mac_key produces, so the key set is passed straight through.
     vendors_map = await bulk_lookup_vendors(db, list(keys))
@@ -118,13 +130,15 @@ async def find_devices(
     vendor_search: str,
     source: str = "ipam",
     limit: int = 100,
+    subnet_ids: Collection[uuid.UUID] | None = None,
 ) -> dict[str, Any]:
     """The matching devices themselves, IPAM rows first.
 
     IPAM rows carry hostname / subnet context an active lease does not, so
     when the same MAC appears in both the richer row wins — deduplicated by
     normalized MAC, not by row, or a device with a managed row *and* a live
-    lease would be listed twice.
+    lease would be listed twice. ``subnet_ids`` limits both sources to those
+    subnets, as in :func:`collect_mac_keys`.
     """
     needle = vendor_search.lower().strip()
     if not needle:
@@ -144,19 +158,18 @@ async def find_devices(
         # between a list comprehension and a materialised estate. The inner
         # per-row ``db.get(Subnet, …)`` was the obvious N+1; this is the outer
         # one, and it matters more now the path is reachable over HTTP.
-        ipam_rows = (
-            await db.execute(
-                select(
-                    IPAddress.address,
-                    IPAddress.mac_address,
-                    IPAddress.hostname,
-                    IPAddress.fqdn,
-                    IPAddress.subnet_id,
-                    IPAddress.status,
-                    IPAddress.last_seen_at,
-                ).where(IPAddress.mac_address.is_not(None))
-            )
-        ).all()
+        device_q = select(
+            IPAddress.address,
+            IPAddress.mac_address,
+            IPAddress.hostname,
+            IPAddress.fqdn,
+            IPAddress.subnet_id,
+            IPAddress.status,
+            IPAddress.last_seen_at,
+        ).where(IPAddress.mac_address.is_not(None))
+        if subnet_ids is not None:
+            device_q = device_q.where(IPAddress.subnet_id.in_(list(subnet_ids)))
+        ipam_rows = (await db.execute(device_q)).all()
         vendors_map = await bulk_lookup_vendors(
             db, [str(r.mac_address) if r.mac_address else None for r in ipam_rows]
         )
@@ -208,9 +221,7 @@ async def find_devices(
                 return {"vendor_search": vendor_search, "matches": matches}
 
     if source in ("dhcp_active", "all"):
-        lease_rows = (
-            (await db.execute(select(DHCPLease).where(DHCPLease.state == "active"))).scalars().all()
-        )
+        lease_rows = (await db.execute(_active_leases(subnet_ids))).scalars().all()
         # mypy invariance — bulk_lookup_vendors takes list[str | None], so
         # spell the element type rather than letting the comprehension lock it.
         lease_macs: list[str | None] = [str(le.mac_address) for le in lease_rows]

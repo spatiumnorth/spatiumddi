@@ -28,6 +28,7 @@ Semantics:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -65,11 +66,13 @@ def _stale_stmt(
     space_id: uuid.UUID | None,
     block_id: uuid.UUID | None,
     subnet_id: uuid.UUID | None,
+    subnet_ids: Collection[uuid.UUID] | None = None,
 ) -> Select[Any]:
     """Base SELECT over stale IPAddress rows, scope filters applied.
 
     Joins Subnet so callers can scope by space / block and so soft-deleted
-    subnets drop out of the report.
+    subnets drop out of the report. ``subnet_ids`` limits the rows to those
+    subnets (a caller bound to specific subnets); ``None`` applies no limit.
     """
     stmt = (
         select(IPAddress)
@@ -83,6 +86,8 @@ def _stale_stmt(
     )
     if subnet_id is not None:
         stmt = stmt.where(IPAddress.subnet_id == subnet_id)
+    if subnet_ids is not None:
+        stmt = stmt.where(IPAddress.subnet_id.in_(list(subnet_ids)))
     if block_id is not None:
         stmt = stmt.where(Subnet.block_id == block_id)
     if space_id is not None:
@@ -104,6 +109,7 @@ async def build_stale_ip_report(
     space_id: uuid.UUID | None = None,
     block_id: uuid.UUID | None = None,
     subnet_id: uuid.UUID | None = None,
+    subnet_ids: Collection[uuid.UUID] | None = None,
     limit: int = 200,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -122,6 +128,7 @@ async def build_stale_ip_report(
         space_id=space_id,
         block_id=block_id,
         subnet_id=subnet_id,
+        subnet_ids=subnet_ids,
     )
 
     total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
@@ -189,6 +196,7 @@ async def select_stale_ip_ids(
     space_id: uuid.UUID | None = None,
     block_id: uuid.UUID | None = None,
     subnet_id: uuid.UUID | None = None,
+    subnet_ids: Collection[uuid.UUID] | None = None,
     cap: int = MAX_BULK_DEPRECATE,
 ) -> list[uuid.UUID]:
     """Resolve the full set of stale IP ids matching the filter (capped).
@@ -205,6 +213,7 @@ async def select_stale_ip_ids(
         space_id=space_id,
         block_id=block_id,
         subnet_id=subnet_id,
+        subnet_ids=subnet_ids,
     )
     rows = (await db.execute(base.with_only_columns(IPAddress.id).limit(max(1, cap)))).all()
     return [row[0] for row in rows]

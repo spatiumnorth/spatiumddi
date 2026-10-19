@@ -27,6 +27,12 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { poolHealthCheckFields } from "@/lib/formPayloads";
+import { parseTtlInput, POOL_TTL_BOUNDS } from "@/lib/dnsNames";
+import {
+  POOL_HC_INTERVAL_BOUNDS,
+  POOL_HC_TIMEOUT_BOUNDS,
+  secondsFieldError,
+} from "@/lib/seconds";
 
 /**
  * Pools view — manages health-checked A / AAAA pools for one zone.
@@ -418,7 +424,7 @@ export function PoolModal({
   const [recordType, setRecordType] = useState<"A" | "AAAA">(
     pool?.record_type ?? "A",
   );
-  const [ttl, setTtl] = useState(pool?.ttl ?? 30);
+  const [ttlText, setTtlText] = useState(String(pool?.ttl ?? 30));
   const [enabled, setEnabled] = useState(pool?.enabled ?? true);
   const [hcType, setHcType] = useState<DNSPoolWrite["hc_type"]>(
     pool?.hc_type ?? "tcp",
@@ -430,8 +436,12 @@ export function PoolModal({
   const [hcCodes, setHcCodes] = useState<string>(
     (pool?.hc_expected_status_codes ?? [200]).join(","),
   );
-  const [hcInterval, setHcInterval] = useState(pool?.hc_interval_seconds ?? 30);
-  const [hcTimeout, setHcTimeout] = useState(pool?.hc_timeout_seconds ?? 5);
+  const [hcInterval, setHcInterval] = useState(
+    String(pool?.hc_interval_seconds ?? 30),
+  );
+  const [hcTimeout, setHcTimeout] = useState(
+    String(pool?.hc_timeout_seconds ?? 5),
+  );
   const [hcUnhealthy, setHcUnhealthy] = useState(
     pool?.hc_unhealthy_threshold ?? 2,
   );
@@ -461,6 +471,9 @@ export function PoolModal({
         .split(/[,\s]+/)
         .map((s) => parseInt(s, 10))
         .filter((n) => !Number.isNaN(n) && n >= 100 && n <= 599);
+      // #2086 — the ttl was checked at submit; this narrows it for the types.
+      const ttl = parseTtlInput(ttlText, POOL_TTL_BOUNDS);
+      if (typeof ttl !== "number") throw new Error("invalid pool TTL");
       const body: DNSPoolWrite = {
         name,
         description,
@@ -474,8 +487,8 @@ export function PoolModal({
         ...poolHealthCheckFields({ hcType, hcPort, hcVerifyTls }, editing),
         hc_expected_status_codes:
           codes.length > 0 ? codes : [200, 201, 202, 204, 301, 302, 304],
-        hc_interval_seconds: hcInterval,
-        hc_timeout_seconds: hcTimeout,
+        hc_interval_seconds: Number(hcInterval.trim()),
+        hc_timeout_seconds: Number(hcTimeout.trim()),
         hc_unhealthy_threshold: hcUnhealthy,
         hc_healthy_threshold: hcHealthy,
       };
@@ -576,6 +589,28 @@ export function PoolModal({
         onSubmit={(e) => {
           e.preventDefault();
           setError(null);
+          // #2086 — empty is refused, not turned into 30: an edit that
+          // cleared the field would otherwise silently save a different TTL.
+          const parsed = parseTtlInput(ttlText, POOL_TTL_BOUNDS);
+          if (parsed === null || typeof parsed === "string") {
+            setError(`TTL ${parsed ?? "is required"}.`);
+            return;
+          }
+          const hcError =
+            secondsFieldError(
+              "Health-check interval",
+              hcInterval,
+              POOL_HC_INTERVAL_BOUNDS,
+            ) ??
+            secondsFieldError(
+              "Health-check timeout",
+              hcTimeout,
+              POOL_HC_TIMEOUT_BOUNDS,
+            );
+          if (hcError) {
+            setError(hcError);
+            return;
+          }
           mut.mutate();
         }}
         className="space-y-4"
@@ -619,11 +654,10 @@ export function PoolModal({
           </Field>
           <Field label="TTL (seconds)">
             <input
-              type="number"
-              min={1}
-              max={86400}
-              value={ttl}
-              onChange={(e) => setTtl(parseInt(e.target.value, 10) || 30)}
+              type="text"
+              inputMode="numeric"
+              value={ttlText}
+              onChange={(e) => setTtlText(e.target.value)}
               className={inputCls}
             />
           </Field>
@@ -740,9 +774,7 @@ export function PoolModal({
                 min={10}
                 max={3600}
                 value={hcInterval}
-                onChange={(e) =>
-                  setHcInterval(parseInt(e.target.value, 10) || 30)
-                }
+                onChange={(e) => setHcInterval(e.target.value)}
                 className={inputCls}
               />
             </Field>
@@ -752,9 +784,7 @@ export function PoolModal({
                 min={1}
                 max={60}
                 value={hcTimeout}
-                onChange={(e) =>
-                  setHcTimeout(parseInt(e.target.value, 10) || 5)
-                }
+                onChange={(e) => setHcTimeout(e.target.value)}
                 className={inputCls}
               />
             </Field>

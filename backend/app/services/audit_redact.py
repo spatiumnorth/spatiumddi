@@ -14,7 +14,8 @@ on READ, over whatever is stored, rather than trusting every writer:
   ``auth_pass`` / ``priv_pass``, ``*_key_pem``, ``headers``, ``creds``) has
   its value replaced;
 * any string value is run through the same secret-VALUE patterns
-  (JWTs, Fernet tokens, bearer strings, chat-webhook URLs ...), and a string
+  (JWTs, Fernet tokens, bearer strings, chat-webhook URLs, presigned-URL
+  signatures ...), and a string
   carrying a PEM private key is replaced WHOLE — the shared pattern matches
   only the ``BEGIN`` line, which would leave the key body readable.
 
