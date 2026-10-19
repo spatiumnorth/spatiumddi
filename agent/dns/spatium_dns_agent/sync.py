@@ -763,8 +763,9 @@ class SyncLoop:
             log.error("dns_daemon_died_during_config_apply_watched", etag=etag)
 
     def note_orderly_exit(self) -> None:
-        """The process is exiting by choice (SIGTERM, a re-bootstrap): an
-        apply still settling did not kill anything, so it is not a death."""
+        """The process is exiting by choice (SIGTERM, a critical thread
+        ending): an apply still settling did not kill anything, so it is not a
+        death. A 401/404 re-registration does not exit (#2052)."""
         self._guard.disarm()
 
     def _poll_once(self) -> None:
