@@ -123,6 +123,9 @@ async def _drive_in_session(rid: uuid.UUID, run_id: str, me: str) -> dict[str, s
         except Exception as exc:  # noqa: BLE001 — surface ANY error to the row
             if is_transient_db_error(exc):
                 raise  # #2177 — an outage, not a crash: ``_async_drive`` handles it
+            # Logged before the row is written: when the database is lost
+            # during that write (#2177), the crash would otherwise go unlogged.
+            logger.exception("upgrade_orchestrator_crashed", run_id=run_id)
             # Mark the row as failed so the UI doesn't show "running"
             # forever after the worker crashed. The orchestrator's own
             # halt-on-failure handles step-level failures; this catches
@@ -167,7 +170,6 @@ async def _drive_in_session(rid: uuid.UUID, run_id: str, me: str) -> dict[str, s
                 # row could not be written (#2177): the run is then left
                 # ``running``, and the orphan sweep re-drives it.
                 mutex.release_if_held(holder=me)
-            logger.exception("upgrade_orchestrator_crashed", run_id=run_id)
             return {"run_id": run_id, "state": "failed", "error": str(exc)}
 
     return {"run_id": str(run.id), "state": run.state}

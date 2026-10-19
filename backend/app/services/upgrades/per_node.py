@@ -179,6 +179,8 @@ _POLL_INTERVAL_S = 3.0
 # re-reads the appliance row and judges it afresh (see the module docstring).
 DB_FAILOVER_BUDGET_S = 90.0
 _DB_RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 15.0)
+# Separate outages one step rides out before the next one fails it.
+_DB_MAX_OUTAGES_PER_STEP = 3
 
 
 @dataclass
@@ -1563,6 +1565,10 @@ async def single_node_upgrade(
         results.append(r)
         return r.ok
 
+    # When this invocation first sent a fresh stamp's commit (#2177): set before
+    # the commit, so a commit whose acknowledgement was lost still counts.
+    fresh_stamp_sent_at: datetime | None = None
+
     async def _trigger_and_commit() -> StepResult:
         # #1445 — the supervisor reads the desired slot image from its
         # heartbeat, in another session, so it sees the stamp only once it is
@@ -1571,9 +1577,21 @@ async def single_node_upgrade(
         # out its timeout for a node that had never been told to upgrade. The
         # commit is part of the step (#2177): a commit lost to a database
         # failover discards the stamp, so the retry has to stamp again.
+        nonlocal fresh_stamp_sent_at
         r = await _step_trigger_slot_apply(db, node_name, target_version, slot_image)
-        if r.ok:
-            await db.commit()
+        if not r.ok:
+            return r
+        if r.detail.get("fresh_stamp"):
+            fresh_stamp_sent_at = datetime.now(UTC)
+        elif fresh_stamp_sent_at is not None:
+            # #2177 — the previous attempt's commit landed and only its
+            # acknowledgement was lost, so this attempt found its own stamp
+            # already there. It is still this run's fresh stamp: judged as a
+            # re-driven node's (no ``stamped_at``), a ``failed`` or ``done``
+            # left from an earlier attempt would count as this one's.
+            r.detail["fresh_stamp"] = True
+            r.detail["stamp_commit_ack_lost"] = True
+        await db.commit()
         return r
 
     if not await _run(
@@ -1607,7 +1625,7 @@ async def single_node_upgrade(
     stamped_at: datetime | None = None
     if start_index <= steps_in_order.index("trigger_slot_apply"):
         if results and results[-1].detail.get("fresh_stamp"):
-            stamped_at = datetime.now(UTC)
+            stamped_at = fresh_stamp_sent_at or datetime.now(UTC)
     # #1463 — the host fetches and writes the slot while the node is still in
     # service, before anything below takes the node out of it.
     if not await _run(
@@ -1734,15 +1752,30 @@ async def _run_step_riding_db_failover(
     """
     budget = DB_FAILOVER_BUDGET_S if budget_s is None else budget_s
     first_failure: float | None = None
+    outages = 0
     attempt = 0
     while True:
+        attempt_started = _db_retry_clock()
         try:
             return await make()
         except Exception as exc:  # noqa: BLE001 — last-resort wrapper
             if is_transient_db_error(exc):
                 now = _db_retry_clock()
+                # An attempt that ran longer than the budget was served by the
+                # database for a while: this is a second outage, with a budget
+                # of its own. A wait step (stage, health gate) runs for many
+                # minutes and can outlive one failover. Capped, so a step can
+                # not be restarted indefinitely.
+                if (
+                    first_failure is not None
+                    and now - attempt_started >= budget
+                    and outages < _DB_MAX_OUTAGES_PER_STEP
+                ):
+                    first_failure = None
+                    attempt = 0
                 if first_failure is None:
                     first_failure = now
+                    outages += 1
                 delay = _DB_RETRY_BACKOFF_S[min(attempt, len(_DB_RETRY_BACKOFF_S) - 1)]
                 if now - first_failure + delay <= budget:
                     attempt += 1
@@ -1763,13 +1796,15 @@ async def _run_step_riding_db_failover(
                     step=step,
                     node=node_name,
                     db_unavailable_s=round(now - first_failure),
+                    db_outages=outages,
+                )
+                lost = (
+                    f"database unreachable for {now - first_failure:.0f}s"
+                    if now - attempt_started < budget
+                    else f"database lost {outages + 1} times in one step"
                 )
                 return StepResult(name=step, started_at=_now_iso()).finish(
-                    False,
-                    error=(
-                        f"step crashed: database unreachable for "
-                        f"{now - first_failure:.0f}s: {exc}"
-                    ),
+                    False, error=f"step crashed: {lost}: {exc}"
                 )
             logger.exception("single_node_upgrade_step_crashed", step=step, node=node_name)
             return StepResult(name=step, started_at=_now_iso()).finish(

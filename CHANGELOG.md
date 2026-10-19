@@ -186,8 +186,13 @@ the formatter handles the rest.
   after 5, 10, 15, 30 and 30 s; the retry takes the Lease over at
   once and resumes from `progress.per_node`. Only connection errors
   are retried (refused, reset, timed out, closed, server shutting
-  down, a demoted primary): any other error still fails the run at
-  once. A drive that gives up leaves the run `running` with the Lease
+  down, a demoted primary), and a refused or timed-out socket counts
+  only when the database driver raised it: from a kubeapi or Redis
+  call it still fails the run at once, as does any other error. A
+  slot stamp whose commit landed but was never acknowledged is still
+  treated as this run's fresh stamp, and a long wait step that rides
+  out one failover gets a fresh budget for a later one (three at
+  most). A drive that gives up leaves the run `running` with the Lease
   free, so the orphan sweep re-drives it within a couple of minutes,
   and the crash handler now releases the Lease even when it cannot
   write the row.
