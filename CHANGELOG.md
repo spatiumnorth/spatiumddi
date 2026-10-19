@@ -107,6 +107,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Allocate IP no longer drops an alias that another record already
+  holds (#2122).** Allocate IP and next-IP skipped, without a word, an
+  alias whose zone, name and type another record already held: the
+  request succeeded and the alias did not exist. Both now answer 409
+  naming the alias and what holds it (an alias or the host record of
+  another address, or an operator record), as adding a single alias
+  from Edit IP does, and nothing is written: no address row, no host
+  record, no other alias. Names compare case-insensitively. Adding an
+  alias the address already has is a no-op that returns it, for a CNAME
+  as well as an A, rather than a 409, and is not audited as a create.
+  The same alias given twice in one request is written once.
+
 - **An address can no longer be named after one of its own aliases
   (#2106).** Renaming an address onto its own A / AAAA alias left two
   identical rows at the name, and deleting the alias afterwards queued
