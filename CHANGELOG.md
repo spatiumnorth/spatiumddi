@@ -107,6 +107,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An address can no longer be named after one of its own aliases
+  (#2106).** Renaming an address onto its own A / AAAA alias left two
+  identical rows at the name, and deleting the alias afterwards queued
+  a delete for an RR the host record still claimed, so the host's own
+  record vanished from the served zone while IPAM still showed it. A
+  CNAME alias there put a CNAME beside the host's address record. The
+  edit, the extra-zone edit and the bulk DNS-zone change now answer
+  409, in the wording of the alias CNAME rule (#2080), naming the
+  alias; nothing is written. Creating an A / AAAA alias at the
+  address's own host name is refused the same way. Background paths
+  (DDNS, lease mirrors, integrations, importers) do not fail and write
+  no duplicate: on an A / AAAA alias they retract the old name and log
+  `ipam_dns_record_skipped_own_alias`, which leaves the zone as a
+  correct rename would (the alias already answers the new name, and the
+  PTR names it); on a CNAME alias they keep the existing CNAME skip,
+  which also retracts the PTR. A duplicate that already exists is left
+  as it is.
+
 - **A record op the split-horizon render retires is stamped like
   any applied op (#2108).** In a DNS group with views, the bundle
   render retires a server's queued record ops as `applied`, but
