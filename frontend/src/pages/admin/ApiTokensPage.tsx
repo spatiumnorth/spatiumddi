@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Copy,
@@ -87,6 +88,9 @@ function CreateTokenModal({
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
 
+  // DNS off (#2135): a token can no longer be bound to a zone, and the
+  // zone pickers stop reading /dns/*.
+  const dnsOn = useModuleOn("core.dns");
   const subnetsQ = useQuery({
     queryKey: ["subnets"],
     queryFn: () => ipamApi.listSubnets(),
@@ -95,12 +99,12 @@ function CreateTokenModal({
   const dnsGroupsQ = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
-    enabled: bindType === "dns_zone",
+    enabled: dnsOn && bindType === "dns_zone",
   });
   const zonesQ = useQuery({
     queryKey: ["dns-zones", bindGroupId],
     queryFn: () => dnsApi.listZones(bindGroupId),
-    enabled: bindType === "dns_zone" && !!bindGroupId,
+    enabled: dnsOn && bindType === "dns_zone" && !!bindGroupId,
   });
 
   const resourceGrants: ApiTokenResourceGrant[] =
@@ -254,7 +258,9 @@ function CreateTokenModal({
             >
               <option value="none">No resource binding</option>
               <option value="subnet">Subnet</option>
-              <option value="dns_zone">DNS zone</option>
+              {(dnsOn || bindType === "dns_zone") && (
+                <option value="dns_zone">DNS zone</option>
+              )}
             </select>
             {bindType !== "none" && (
               <select

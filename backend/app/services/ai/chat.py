@@ -62,6 +62,7 @@ from app.services.ai.tools import (
     ToolNotFound,
     ToolPermissionDenied,
     effective_tool_names,
+    is_rate_limit_refusal,
 )
 
 logger = structlog.get_logger(__name__)
@@ -1091,7 +1092,7 @@ class ChatOrchestrator:
                         effective=effective_tools,
                     )
                     result_text = json.dumps(result, default=str)
-                    is_error = False
+                    is_error = is_rate_limit_refusal(result)
                 except ToolNotFound:
                     # Smaller open-weight models (gemma, llama-3-8b, etc.)
                     # sometimes hallucinate a generic-sounding name like
