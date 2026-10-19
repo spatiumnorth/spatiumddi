@@ -120,6 +120,24 @@ the formatter handles the rest.
   create.
   The same alias given twice in one request is written once.
 
+- **Copilot and MCP network tools share the Tools page's per-user rate
+  limit.** The `/api/v1/tools/*` routes cap each user at 20 on-prem
+  probes and 8 off-prem lookups per minute. The copilot and MCP tools
+  that run the same probes (`network_ping`, `network_traceroute`,
+  `network_dig`, `forward_dns`, `reverse_dns`, `network_port_test`,
+  `network_tls_cert`, `lookup_mac_vendor`, `ping_host`, `tls_cert_check`)
+  and off-prem lookups (`network_whois`, `lookup_whois_ip` / `_asn` /
+  `_domain`, `find_ct_log_entries`) had no limit.
+  Each now declares its budget with `rate_limit=` on `register_tool`, and
+  `ToolRegistry.call` spends it from the same per-user Redis counter the
+  REST route uses, so a user has one budget whichever surface they use.
+  A call past the budget does not run; it returns a refusal naming the
+  limit and the wait, which MCP marks `isError`. As on the REST routes,
+  the limit is not enforced while Redis is unreachable. A call the tool's
+  permission refuses, or whose arguments fail validation, spends nothing. A
+  test walks every function each tool reaches and fails any tool that
+  sends traffic without declaring a budget or a recorded exemption.
+
 - **An address can no longer be named after one of its own aliases
   (#2106).** Renaming an address onto its own A / AAAA alias left two
   identical rows at the name, and deleting the alias afterwards queued
