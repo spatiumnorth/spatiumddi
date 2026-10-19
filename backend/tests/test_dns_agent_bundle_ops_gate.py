@@ -439,3 +439,34 @@ async def test_a_retired_op_is_stamped_like_any_applied_op(
     assert item["state"] == "applied"
     assert item["applied_at"] is not None
     assert item["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_retired_backed_off_op_clears_its_failure(db_session: AsyncSession) -> None:
+    """#2108 — an op backing off after a failed dispatch, then retired by the
+    split-horizon render, reads as delivered: its error and retry time are
+    cleared and the render counts as one more attempt."""
+    server, zone, _headers = await _agent(db_session, views=True)
+    old = datetime.now(UTC) - timedelta(hours=1)
+    op = _op(server.id, zone, "early", created_at=old)
+    op.updated_at = old
+    op.attempts = 2
+    op.last_error = "the agent reported an error"
+    op.next_attempt_at = datetime.now(UTC) + timedelta(minutes=5)
+    db_session.add(op)
+    db_session.add(_record(zone, "early"))
+    await db_session.commit()
+    op_id = op.id
+
+    await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+
+    row = (
+        await db_session.execute(select(DNSRecordOp).where(DNSRecordOp.id == op_id))
+    ).scalar_one()
+    await db_session.refresh(row)
+    assert row.state == "applied"
+    assert row.applied_at is not None
+    assert row.attempts == 3
+    assert row.last_error is None
+    assert row.next_attempt_at is None
