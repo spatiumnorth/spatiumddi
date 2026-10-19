@@ -76,6 +76,7 @@ from app.services.dns.sync_check import (
     ipam_authors_zone,
     resolve_reverse_zone,
 )
+from app.services.feature_modules import is_module_enabled, require_module
 from app.services.ipam.address_set_gate import (
     WritableSetRanges,
     load_writable_set_ranges,
@@ -173,9 +174,13 @@ router.include_router(io_router)
 # rows. Lives under /api/v1/ipam/nat-mappings. Imported here to avoid
 # touching the top-level api/v1/router.py — natural home is alongside
 # the other IPAM tools.
+#
+# Behind the ``ipam.nat`` feature module (#2100): 404 while it is off, the
+# same "not installed" answer every other module gives. The rows are not
+# touched — the firewall mirrors keep writing them regardless.
 from app.api.v1.ipam.nat import router as nat_router  # noqa: E402
 
-router.include_router(nat_router)
+router.include_router(nat_router, dependencies=[Depends(require_module("ipam.nat"))])
 
 # IPAM templates (issue #26) — reusable stamp templates that pre-fill
 # tags / CFs / DNS / DHCP / DDNS settings on block or subnet create.
@@ -8176,7 +8181,11 @@ async def _enrich_addresses(db: AsyncSession, rows: list[IPAddress]) -> None:
     page — never the whole matching set — so the bulk lookups stay cheap.
     """
     counts = await _alias_counts_for(db, rows)
-    nat_counts = await _nat_mapping_counts_for(db, rows)
+    # #2100 — with NAT mappings switched off the count is neither shown nor
+    # worth a query; report 0 rather than leak a hidden surface's data.
+    nat_counts = (
+        await _nat_mapping_counts_for(db, rows) if await is_module_enabled(db, "ipam.nat") else {}
+    )
     vendors = await bulk_lookup_vendors(
         db, [str(ip.mac_address) if ip.mac_address else None for ip in rows]
     )
