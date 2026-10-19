@@ -135,6 +135,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The IP table can hide its "N free, click to allocate" rows
+  (#2137).** On a very large or integration-mirrored subnet (a
+  Tailscale `100.64.0.0/10` holding a few dozen nodes) nearly every
+  row was a green gap bar, and "click to allocate" invited a manual
+  allocation the overlay would never honour. Edit Subnet gains
+  "Free-range rows in the address table" (Default / Show / Hide,
+  stored as nullable `subnet.show_free_ranges`) and the table header
+  gains a "Hide free ranges" checkbox beside "Hide network/broadcast",
+  remembered per subnet for the session. Default when the subnet has no
+  setting: hidden for an integration-owned subnet (new read-only
+  `integration_owner` on the subnet response) and for anything larger
+  than a /16 IPv4 (shorter than /48 IPv6, where gap rows are not drawn
+  today); an explicit value always wins. Display only: Total /
+  Allocated / Utilization, the Allocate IP button and Next available
+  are unchanged. The `get_subnet_summary` copilot tool reports
+  `show_free_ranges` and `integration_owner`.
+
 - **A DNS record change made while an agent is replaced reaches the new
   agent at once, not five minutes later (#2042).** When a DNS agent is
   replaced (its pod rolls after a slot upgrade, a container restarts),
@@ -6329,6 +6346,9 @@ the formatter handles the rest.
   `dns_record_op.dispatched_poll_at`, when the long-poll that shipped it
   started. No backfill: NULL means not recorded and is never read as
   "another agent". Downgrade drops both columns.
+- `c4a8e1f26d93` — #2137: `subnet.show_free_ranges`, a nullable
+  boolean. No backfill: NULL means "use the default rule". Downgrade
+  drops the column.
 
 ## 2026.10.02-1 — 2026-10-02
 
