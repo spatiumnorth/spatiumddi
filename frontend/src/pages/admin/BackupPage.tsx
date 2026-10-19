@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   AlertTriangle,
   Database,
@@ -12,7 +12,9 @@ import {
 } from "lucide-react";
 
 import {
+  authApi,
   backupApi,
+  formatApiError,
   type BackupManifestPreviewResponse,
   type BackupRestoreResponse,
 } from "@/lib/api";
@@ -44,6 +46,14 @@ type Tab = "manual" | "destinations" | "drills" | "factory-reset";
 
 export function BackupPage() {
   const [tab, setTab] = useState<Tab>("manual");
+  // Every backup route requires a superadmin (server-side, authoritative);
+  // the page only stops offering writes the API will refuse (#2204).
+  const { data: me } = useQuery({
+    queryKey: ["me"],
+    queryFn: authApi.me,
+    staleTime: 60_000,
+  });
+  const isSuperadmin = me?.is_superadmin ?? false;
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <div className="border-b bg-card px-6 py-4">
@@ -53,12 +63,13 @@ export function BackupPage() {
         </div>
         <p className="mt-1 text-xs text-muted-foreground">
           <strong>Manual</strong> — one-off download + restore-from-file.{" "}
-          <strong>Destinations</strong> — configure local volumes, S3, SCP,
-          Azure Blob. Schedule a recurring backup, view archives at the
-          destination, restore from any archive. <strong>Restore Drills</strong>{" "}
-          — prove an archive is actually restorable by test-restoring it into a
-          throwaway database. <strong>Factory Reset</strong> — wipe
-          configuration back to defaults per-section or everything-at-once.
+          <strong>Destinations</strong> — configure where scheduled backups go
+          (Add target lists every destination kind). Schedule a recurring
+          backup, view archives at the destination, restore from any archive.{" "}
+          <strong>Restore Drills</strong> — prove an archive is actually
+          restorable by test-restoring it into a throwaway database.{" "}
+          <strong>Factory Reset</strong> — wipe configuration back to defaults
+          per-section or everything-at-once.
         </p>
         <div className="-mb-px mt-3 flex gap-1 border-b">
           {(
@@ -86,7 +97,17 @@ export function BackupPage() {
       </div>
 
       <div className="flex-1 overflow-auto p-6">
-        <div className="mx-auto flex max-w-6xl flex-col gap-6">
+        {me && !isSuperadmin && (
+          <div className="mx-auto mb-4 max-w-6xl rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
+            You don&rsquo;t have permission to use backup &amp; restore. Every
+            backup action requires a superadmin, so the controls below are
+            disabled.
+          </div>
+        )}
+        <fieldset
+          disabled={me ? !isSuperadmin : false}
+          className="mx-auto flex min-w-0 max-w-6xl flex-col gap-6 border-0 p-0"
+        >
           {tab === "manual" && (
             <>
               {/* Manual download + restore — stack on narrow, sit
@@ -106,7 +127,7 @@ export function BackupPage() {
           )}
           {tab === "drills" && <RestoreDrillsSection />}
           {tab === "factory-reset" && <FactoryResetSection />}
-        </div>
+        </fieldset>
       </div>
     </div>
   );
@@ -269,8 +290,8 @@ function RestoreBackupCard() {
       setPreview(data);
       setPreviewError(null);
     },
-    onError: (err: Error) => {
-      setPreviewError(err.message || "Manifest preview failed");
+    onError: (err: unknown) => {
+      setPreviewError(formatApiError(err, "Manifest preview failed"));
       setPreview(null);
     },
   });
@@ -327,10 +348,21 @@ function RestoreBackupCard() {
         <div className="flex items-start gap-2">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
           <div>
-            Restore is a <strong>hard overwrite</strong>. Every table on this
-            install is replaced with what&rsquo;s in the archive. A pre-restore
-            safety dump is taken first so a botched restore can be rolled back,
-            but you should still take a fresh backup before running this.
+            Restore is a <strong>hard overwrite</strong>.{" "}
+            {mode === "selective" ? (
+              <>
+                Only the sections you tick below are replaced with what&rsquo;s
+                in the archive; the rest of the install is left as it is.
+              </>
+            ) : (
+              <>
+                Every table on this install is replaced with what&rsquo;s in the
+                archive.
+              </>
+            )}{" "}
+            A pre-restore safety dump is taken first so a botched restore can be
+            rolled back, but you should still take a fresh backup before running
+            this.
           </div>
         </div>
       </div>
@@ -440,7 +472,7 @@ function RestoreBackupCard() {
           </button>
           {restoreMut.isError && (
             <span className="text-xs text-destructive">
-              {(restoreMut.error as Error)?.message || "Restore failed."}
+              {formatApiError(restoreMut.error, "Restore failed.")}
             </span>
           )}
         </div>

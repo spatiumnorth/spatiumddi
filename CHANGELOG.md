@@ -200,6 +200,23 @@ the formatter handles the rest.
   uses, and `selective_restore_supported`. The card reads them, keeps
   Apply disabled for a selective restore of a plain archive, and says
   why. A full restore of the same archive is still offered.
+- **Backup page and branding title show the API's reason and stop
+  offering what is refused** (#2203, #2204, #2200, #2202, #2205).
+  A refused archive preview, restore or drill schedule now shows the
+  API's `detail` instead of "Request failed with status code N", and a
+  target's Run now / Test connection / Delete, which showed nothing at
+  all when refused, now show it too. A non-superadmin (every backup,
+  drill and factory-reset route is superadmin-only) sees a permission
+  notice with the backup controls disabled, and Restore Drills /
+  Destinations say a refused read was refused rather than "No backup
+  targets configured". The page's copy names no destination kind
+  instead of four of the ten (or one); Add target's Kind list is the
+  authority. The Manual restore warning follows the chosen mode
+  (selective replaces only the ticked sections). The API now refuses an
+  Application title over 255 characters or an External URL over 500
+  with a 422 naming the field (it used to reach the database and come
+  back as the catch-all "cannot be stored as sent"), the inputs stop at
+  those lengths, and a refused settings save shows the API's reason.
 - **Tailscale warns before its 90-day API token expires, and alerts
   when it has (#2138).** Tailscale caps an API access token at 90
   days; when it lapsed, every sync got HTTP 401, the mirror stopped

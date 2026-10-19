@@ -26,6 +26,7 @@ import {
   type BackupTargetUpdate,
 } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
 
 /**
@@ -69,9 +70,8 @@ export function BackupTargetsSection() {
         <div>
           <h2 className="text-sm font-semibold">Scheduled targets</h2>
           <p className="text-xs text-muted-foreground">
-            Build backups on a cron schedule and write them to a local volume, a
-            network share or an object store. Add target lists every destination
-            kind this build supports.
+            Build backups on a cron schedule and write them to a destination.
+            Add target lists every destination kind this build supports.
           </p>
         </div>
         <button
@@ -90,13 +90,14 @@ export function BackupTargetsSection() {
           Loading…
         </div>
       ) : targetsQ.isError ? (
-        <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-          Failed to load backup targets.
+        <div className="rounded-md border border-dashed px-3 py-2 text-xs">
+          <ListReadError error={targetsQ.error} what="backup targets" />
         </div>
       ) : (targetsQ.data ?? []).length === 0 ? (
         <div className="rounded-md border border-dashed px-3 py-4 text-center text-xs text-muted-foreground">
           No backup targets configured. Click <strong>Add target</strong> to
-          schedule a recurring backup to a local volume.
+          schedule a recurring backup; its <strong>Kind</strong> list shows
+          every destination it can write to.
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
@@ -281,6 +282,25 @@ function TargetRow({
           />
         </div>
       </div>
+      {/* A refused request (403, 404, 409 …) never reaches the ``data``
+          panels below; show the API's reason (#2203). */}
+      {(
+        [
+          [runMut, "run failed"],
+          [testMut, "test failed"],
+          [deleteMut, "delete failed"],
+        ] as const
+      ).map(([m, fallback]) =>
+        m.isError ? (
+          <div
+            key={fallback}
+            className="border-t bg-destructive/5 px-3 py-1.5 text-xs text-destructive"
+          >
+            <ServerCrash className="mr-1 inline h-3.5 w-3.5" />
+            {formatApiError(m.error, fallback)}
+          </div>
+        ) : null,
+      )}
       {testMut.data && (
         <div
           className={`border-t px-3 py-1.5 text-xs ${
