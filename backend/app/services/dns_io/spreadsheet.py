@@ -46,9 +46,11 @@ unchanged, a changed one is skipped with the reason.
 
 from __future__ import annotations
 
+import codecs
 import csv
 import io
 import uuid
+import zipfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -57,7 +59,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSView, DNSZone
-from app.services.csv_text import CSVReadError, read_csv_table
 from app.services.dns.cname_conflict import NameRow, refused_by_cname_rule
 from app.services.ipam_io.export import FORMULA_TRIGGERS, sanitize_cell
 
@@ -81,6 +82,16 @@ EXAMPLE_MARKER = "EXAMPLE"
 COMMENT_TAG = "comment"
 # Bound per request: rows in one file (one transaction, one op batch).
 MAX_ROWS = 10_000
+# Rows read at all, blank ones included: the cap above counts only rows with
+# data, so without this a file of a few million empty rows would still be
+# walked (and, for CSV, held) in full before anything refused it.
+MAX_SHEET_ROWS = 100_000
+# An XLSX is a zip: the upload cap bounds the compressed size only, and
+# openpyxl holds the shared-strings part in memory whole. The declared
+# uncompressed size of every member is checked before openpyxl sees the file
+# (zipfile never inflates a member past its declared size, so the sum is a
+# real bound, not the archive's say-so).
+MAX_XLSX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 SHEET_TITLE = "records"
 
@@ -283,7 +294,12 @@ def _rows_from_table(headers: list[Any], data: Iterable[tuple[int, list[Any]]]) 
             + f"; expected {', '.join(RECORD_COLUMNS)} (download the template)"
         )
     out: list[SheetRow] = []
-    for rownum, cells in data:
+    for seen, (rownum, cells) in enumerate(data, start=1):
+        if seen > MAX_SHEET_ROWS:
+            raise SpreadsheetError(
+                f"the file has more than {MAX_SHEET_ROWS} rows (blank ones included); "
+                f"import at most {MAX_ROWS} records at a time"
+            )
         values = {norm[i]: cells[i] for i in range(min(len(norm), len(cells))) if norm[i]}
         if all(_cell(v) is None for v in values.values()):
             continue
@@ -307,18 +323,49 @@ def _rows_from_table(headers: list[Any], data: Iterable[tuple[int, list[Any]]]) 
     return out
 
 
+def _decode_csv(data: bytes) -> str:
+    """UTF-8 (with or without the BOM Excel writes), or UTF-16 when the file
+    carries a UTF-16 BOM (Excel's "Unicode text" export). Anything else is
+    read as UTF-8 with replacement, so a stray byte is one odd character in
+    one cell, not a 500."""
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError as exc:
+            raise SpreadsheetError(f"the file is not valid UTF-16: {exc}") from exc
+    return data.decode("utf-8-sig", errors="replace")
+
+
 def parse_csv(data: bytes) -> list[SheetRow]:
-    text = data.decode("utf-8-sig", errors="replace")
+    """Streamed row by row (newline handling as ``csv_text``, #1370), so the
+    row caps refuse a huge file before it is all held in memory."""
+    text = _decode_csv(data)
+    reader = csv.reader(io.StringIO(text, newline=""))
     try:
-        table = read_csv_table(text)
-    except CSVReadError as exc:
-        raise SpreadsheetError(str(exc)) from exc
-    if not table.fieldnames:
-        raise SpreadsheetError("the file is empty")
-    data_rows = (
-        (i + 2, [row.get(h) for h in table.fieldnames]) for i, row in enumerate(table.rows)
-    )
-    return _rows_from_table(list(table.fieldnames), data_rows)
+        header = next(reader, None)
+        if not header or not any(h.strip() for h in header):
+            raise SpreadsheetError("the file is empty")
+
+        def data_rows() -> Iterable[tuple[int, list[Any]]]:
+            for i, cells in enumerate(reader):
+                yield i + 2, list(cells)
+
+        return _rows_from_table(list(header), data_rows())
+    except csv.Error as exc:
+        raise SpreadsheetError(f"CSV could not be read: {exc}") from exc
+
+
+def _check_xlsx_size(data: bytes) -> None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            total = sum(info.file_size for info in zf.infolist())
+    except (zipfile.BadZipFile, ValueError) as exc:
+        raise SpreadsheetError(f"not a readable XLSX workbook: {exc}") from exc
+    if total > MAX_XLSX_UNCOMPRESSED_BYTES:
+        raise SpreadsheetError(
+            f"the workbook expands to more than "
+            f"{MAX_XLSX_UNCOMPRESSED_BYTES // (1024 * 1024)} MB; save it as CSV or split it"
+        )
 
 
 def parse_xlsx(data: bytes) -> list[SheetRow]:
@@ -329,6 +376,7 @@ def parse_xlsx(data: bytes) -> list[SheetRow]:
     """
     from openpyxl import load_workbook
 
+    _check_xlsx_size(data)
     try:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except Exception as exc:  # noqa: BLE001 — any unreadable workbook is the file's fault
@@ -343,6 +391,13 @@ def parse_xlsx(data: bytes) -> list[SheetRow]:
             raise SpreadsheetError("the sheet is empty")
         data_rows = ((i + 2, list(r)) for i, r in enumerate(rows))
         return _rows_from_table(list(header), data_rows)
+    except SpreadsheetError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — read_only parses the sheet lazily, here
+        # A worksheet's XML is only parsed as its rows are read, so a corrupt
+        # (or entity-expanding, refused by expat) sheet fails in this loop,
+        # not in load_workbook: still the file's fault, a 422 and not a 500.
+        raise SpreadsheetError(f"not a readable XLSX workbook: {exc}") from exc
     finally:
         wb.close()
 
@@ -574,8 +629,81 @@ def plan_import(
                 continue
             plan.deletes.append(r)
 
+    _refuse_twins(plan, existing)
     _apply_cname_rule(plan, existing)
     return plan
+
+
+def _identity(
+    view_id: uuid.UUID | None,
+    name: str,
+    rtype: str,
+    value: str,
+    priority: int | None,
+    weight: int | None,
+    port: int | None,
+) -> tuple[Any, ...]:
+    """What makes two records the same RR (#1230's ``find_identical_record``)."""
+    return (view_id, name.lower(), rtype.upper(), value.strip(), priority, weight, port)
+
+
+def _refuse_twins(plan: ImportPlan, existing: list[DNSRecord]) -> None:
+    """A row that would leave the zone holding the same RR twice is an error,
+    as the record API's create and edit refuse it with a 409 (#1230): two
+    identical new rows in one sheet, or an edit that turns a record into a
+    copy of another. Twins the zone already holds are left alone — only a
+    row this import writes is judged."""
+    written = {str(u.record.id) for u in plan.updates} | {str(r.id) for r in plan.deletes}
+    holder: dict[tuple[Any, ...], str] = {}
+    for r in existing:
+        if str(r.id) in written:
+            continue
+        key = _identity(r.view_id, r.name, r.record_type, r.value, r.priority, r.weight, r.port)
+        holder.setdefault(key, "a record the zone already holds")
+
+    def clash(c: Candidate) -> str | None:
+        key = _identity(c.view_id, c.name, c.record_type, c.value, c.priority, c.weight, c.port)
+        if key in holder:
+            return holder[key]
+        holder[key] = f"row {c.row}"
+        return None
+
+    identity_fields = {"name", "value", "priority", "weight", "port", "view_id"}
+    kept_updates: list[PlannedUpdate] = []
+    for u in plan.updates:
+        if not identity_fields.intersection(u.changed):
+            # A TTL / comment edit keeps the RR it is; as on the record API it
+            # is not re-judged against a twin that predates the rule.
+            kept_updates.append(u)
+            c = u.candidate
+            holder.setdefault(
+                _identity(c.view_id, c.name, c.record_type, c.value, c.priority, c.weight, c.port),
+                f"row {c.row}",
+            )
+            continue
+        other = clash(u.candidate)
+        if other is None:
+            kept_updates.append(u)
+        else:
+            plan.errors.append(_twin_issue(u.candidate, other))
+    kept_creates: list[Candidate] = []
+    for c in plan.creates:
+        other = clash(c)
+        if other is None:
+            kept_creates.append(c)
+        else:
+            plan.errors.append(_twin_issue(c, other))
+    plan.updates, plan.creates = kept_updates, kept_creates
+
+
+def _twin_issue(c: Candidate, other: str) -> RowIssue:
+    return RowIssue(
+        row=c.row,
+        reason=f"the same record as {other} (same view, name, type and value); remove one",
+        name=c.name,
+        record_type=c.record_type,
+        value=c.value,
+    )
 
 
 def _apply_cname_rule(plan: ImportPlan, existing: list[DNSRecord]) -> None:

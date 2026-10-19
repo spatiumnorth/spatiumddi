@@ -668,3 +668,202 @@ def test_csv_header_aliases_and_row_numbers() -> None:
         b"Name,Record Type,Value\r\nwww,A,192.0.2.1\r\n,,\r\nx,A,192.0.2.2\r\n"
     )
     assert [(r.row, r.name, r.type) for r in rows] == [(2, "www", "A"), (4, "x", "A")]
+
+
+# ── validator review (#2139) ────────────────────────────────────────────────
+
+
+async def test_identical_rows_and_an_edit_onto_a_twin_are_errors(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1230: the record API refuses to store one RR twice (a 409 on create
+    and on an edit); a sheet must not do it either."""
+    h = await _headers(db_session)
+    grp, zone, _ = await _zone(db_session)
+    a = _rec(zone, "a", "A", "192.0.2.1")
+    b = _rec(zone, "b", "A", "192.0.2.2")
+    db_session.add_all([a, b])
+    await db_session.flush()
+    await db_session.commit()
+    data = _csv(
+        [
+            {"name": "new", "type": "A", "value": "192.0.2.9"},
+            {"name": "NEW", "type": "A", "value": "192.0.2.9"},
+            # An edit by id that turns ``b`` into a copy of ``a``.
+            {"id": str(b.id), "name": "a", "type": "A", "value": "192.0.2.1"},
+            {"id": str(a.id), "name": "a", "type": "A", "value": "192.0.2.1"},
+        ]
+    )
+    p = await _preview(client, h, grp, zone, data)
+    reasons = {e["row"]: e["reason"] for e in p["errors"]}
+    assert set(reasons) == {3, 4}, p
+    assert "row 2" in reasons[3]
+    assert "already holds" in reasons[4] or "row 5" in reasons[4]
+    await _commit(client, h, grp, zone, data, expect=422)
+
+
+async def test_a_legacy_twin_can_still_take_a_ttl_edit(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Twins that predate #1230 are not re-judged on an edit that keeps the RR."""
+    h = await _headers(db_session)
+    grp, zone, _ = await _zone(db_session)
+    t1 = _rec(zone, "dup", "A", "192.0.2.1")
+    t2 = _rec(zone, "dup", "A", "192.0.2.1")
+    db_session.add_all([t1, t2])
+    await db_session.flush()
+    await db_session.commit()
+    data = _csv(
+        [
+            {"id": str(t1.id), "name": "dup", "type": "A", "value": "192.0.2.1", "ttl": 60},
+            {"id": str(t2.id), "name": "dup", "type": "A", "value": "192.0.2.1"},
+        ]
+    )
+    p = await _preview(client, h, grp, zone, data)
+    assert p["errors"] == []
+    assert [u["existing_id"] for u in p["to_update"]] == [str(t1.id)]
+
+
+async def test_absolute_names_are_made_relative_or_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """``www.<zone>.`` is ``www``; the record API alone would store it as
+    ``www.<zone>`` relative, i.e. ``www.<zone>.<zone>``."""
+    h = await _headers(db_session)
+    grp, zone, _ = await _zone(db_session)
+    await db_session.commit()
+    data = _csv(
+        [
+            {"name": f"www.{ZONE}", "type": "A", "value": "192.0.2.1"},
+            {"name": ZONE.upper(), "type": "TXT", "value": '"apex"'},
+            {"name": "host.other.example.", "type": "A", "value": "192.0.2.2"},
+            {"name": "rel", "type": "A", "value": "192.0.2.3"},
+        ]
+    )
+    p = await _preview(client, h, grp, zone, data)
+    assert [e["row"] for e in p["errors"]] == [4]
+    assert "is not in the zone" in p["errors"][0]["reason"]
+    assert sorted(c["name"] for c in p["to_create"]) == ["@", "rel", "www"]
+
+
+async def test_a_legacy_out_of_range_ttl_round_trips(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A TTL that predates the #2073 bounds is not re-judged when the row
+    leaves it as it is; changing it to another out-of-range value is a row
+    error, not a 500."""
+    h = await _headers(db_session)
+    grp, zone, _ = await _zone(db_session)
+    old = _rec(zone, "old", "A", "192.0.2.1", ttl=-5)
+    db_session.add(old)
+    await db_session.flush()
+    await db_session.commit()
+    keep = _csv([{"id": str(old.id), "name": "old", "type": "A", "value": "192.0.2.4", "ttl": -5}])
+    p = await _preview(client, h, grp, zone, keep)
+    assert p["errors"] == [], p
+    assert p["to_update"][0]["changed_fields"] == ["value"]
+    assert p["to_update"][0]["ttl"] == -5
+    bad = _csv([{"id": str(old.id), "name": "old", "type": "A", "value": "192.0.2.1", "ttl": -6}])
+    p = await _preview(client, h, grp, zone, bad)
+    assert len(p["errors"]) == 1 and "ttl" in p["errors"][0]["reason"]
+
+
+async def test_the_managed_column_is_never_trusted(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Clearing ``managed`` on an IPAM record's row does not un-protect it."""
+    h = await _headers(db_session)
+    grp, zone, _ = await _zone(db_session)
+    ipam = _rec(zone, "host", "A", "192.0.2.1", auto_generated=True)
+    db_session.add(ipam)
+    await db_session.flush()
+    await db_session.commit()
+    data = _csv(
+        [{"id": str(ipam.id), "name": "host", "type": "A", "value": "192.0.2.99", "managed": ""}]
+    )
+    p = await _preview(client, h, grp, zone, data)
+    assert p["to_update"] == []
+    assert "IPAM" in p["skipped"][0]["reason"]
+
+
+def test_csv_utf16_and_bom_are_read() -> None:
+    text = "name,type,value\r\nwww,A,192.0.2.1\r\n"
+    for data in (
+        text.encode("utf-16"),  # BOM + UTF-16LE (Excel's "Unicode text")
+        b"\xef\xbb\xbf" + text.encode(),
+    ):
+        rows = sheet_io.parse_csv(data)
+        assert [(r.name, r.value) for r in rows] == [("www", "192.0.2.1")]
+
+
+def test_blank_rows_are_bounded_before_they_are_all_read() -> None:
+    data = b"name,type,value\n" + b",,\n" * (sheet_io.MAX_SHEET_ROWS + 1)
+    try:
+        sheet_io.parse_csv(data)
+    except sheet_io.SpreadsheetError as exc:
+        assert "blank ones included" in str(exc)
+    else:
+        raise AssertionError("a file of blank rows was read in full")
+
+
+def test_xlsx_that_expands_too_far_is_refused_before_parsing() -> None:
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("xl/sharedStrings.xml", b"\0" * (sheet_io.MAX_XLSX_UNCOMPRESSED_BYTES + 1))
+    assert len(buf.getvalue()) < 1024 * 1024  # small on the wire
+    try:
+        sheet_io.parse_xlsx(buf.getvalue())
+    except sheet_io.SpreadsheetError as exc:
+        assert "expands to more than" in str(exc)
+    else:
+        raise AssertionError("an oversized workbook reached openpyxl")
+
+
+def _xlsx_with_sheet_xml(transform: Any) -> bytes:
+    import zipfile
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "records"
+    ws.append(["name", "type", "value"])
+    ws.append(["www", "A", "192.0.2.1"])
+    raw = io.BytesIO()
+    wb.save(raw)
+    src = zipfile.ZipFile(io.BytesIO(raw.getvalue()))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        for n in src.namelist():
+            d = src.read(n)
+            zf.writestr(n, transform(d.decode()).encode() if n == "xl/worksheets/sheet1.xml" else d)
+    return out.getvalue()
+
+
+def test_a_corrupt_or_entity_bomb_sheet_is_a_spreadsheet_error() -> None:
+    """read_only parses a sheet lazily, as its rows are iterated: a sheet
+    whose XML fails there must be a SpreadsheetError (a 422), not escape as
+    a ParseError (a 500)."""
+    lol = (
+        '<!DOCTYPE lolz [<!ENTITY lol "lol">'
+        + "".join(
+            f'<!ENTITY lol{i} "' + (f"&lol{i - 1};" if i > 1 else "&lol;") * 10 + '">'
+            for i in range(1, 10)
+        )
+        + "]>"
+    )
+
+    def bomb(t: str) -> str:
+        # openpyxl writes inline strings and no XML declaration.
+        assert "<t>name</t>" in t, t
+        return lol + t.replace("<t>name</t>", "<t>&lol9;</t>", 1)
+
+    for data in (
+        _xlsx_with_sheet_xml(lambda t: t[: len(t) // 2]),
+        _xlsx_with_sheet_xml(bomb),
+    ):
+        try:
+            sheet_io.parse_xlsx(data)
+        except sheet_io.SpreadsheetError:
+            continue
+        raise AssertionError("a broken sheet did not raise SpreadsheetError")

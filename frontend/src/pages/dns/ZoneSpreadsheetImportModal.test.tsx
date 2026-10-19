@@ -20,7 +20,8 @@ import { confirmsZone } from "@/lib/dnsNames";
 
 let nextPreview: DNSSheetImportPreview;
 const preview = vi.fn(() => Promise.resolve(nextPreview));
-const commit = vi.fn(() => Promise.resolve({}));
+let nextCommit: Record<string, unknown> = {};
+const commit = vi.fn(() => Promise.resolve(nextCommit));
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -73,14 +74,14 @@ function basePreview(over: Partial<DNSSheetImportPreview> = {}) {
   } as DNSSheetImportPreview;
 }
 
-function open() {
+function open(onClose: () => void = () => {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={qc}>
       <ZoneSpreadsheetImportModal
         groupId="g1"
         zone={{ id: "z1", name: "example.com." } as DNSZone}
-        onClose={() => {}}
+        onClose={onClose}
       />
     </QueryClientProvider>,
   );
@@ -95,6 +96,7 @@ afterEach(() => {
   cleanup();
   preview.mockClear();
   commit.mockClear();
+  nextCommit = {};
 });
 
 describe("confirmsZone", () => {
@@ -154,5 +156,44 @@ describe("spreadsheet import modal (#2139)", () => {
       (screen.getByRole("button", { name: "Import" }) as HTMLButtonElement)
         .disabled,
     ).toBe(true);
+  });
+
+  it("keeps the modal open to show a provider warning (#1538)", async () => {
+    nextPreview = basePreview({
+      mode: "merge",
+      to_delete: [],
+      to_create: [{ ...basePreview().to_delete[0], op: "create", row: 2 }],
+    });
+    nextCommit = { provider_warning: "Route 53 refused the change" };
+    const onClose = vi.fn();
+    open(onClose);
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await waitFor(() => expect(screen.getByText(/Create \(1\)/)).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Import" }));
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toMatch(
+        /Route 53 refused the change/,
+      ),
+    );
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Import" })).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: "Import" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+  });
+
+  it("closes after a clean commit", async () => {
+    nextPreview = basePreview({
+      mode: "merge",
+      to_delete: [],
+      to_create: [{ ...basePreview().to_delete[0], op: "create", row: 2 }],
+    });
+    const onClose = vi.fn();
+    open(onClose);
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await waitFor(() => expect(screen.getByText(/Create \(1\)/)).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Import" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   });
 });

@@ -9196,6 +9196,16 @@ def _validation_message(exc: ValidationError) -> str:
     return "; ".join(parts)
 
 
+def _same_int(cell: Any, current: int | None) -> bool:
+    """Whether a sheet cell holds *current* (blank is None; ``"300"`` is 300)."""
+    if cell is None or current is None:
+        return cell is None and current is None
+    try:
+        return int(str(cell).strip()) == current
+    except ValueError:
+        return False
+
+
 def _sheet_row_validator(
     zone: DNSZone, gated: dict[str, str], needs_absolute: bool
 ) -> sheet_io.RowValidator:
@@ -9221,12 +9231,36 @@ def _sheet_row_validator(
             return "type is required"
         if row.value is None:
             return "value is required"
+        name = row.name if row.name is not None else target.name  # type: ignore[union-attr]
+        # A trailing dot makes a name absolute, as in a zone file: it must sit
+        # in this zone, and is stored relative. Without it the name is relative
+        # to the zone, as on the record API. (The record API strips a trailing
+        # dot and keeps the rest, so ``www.example.com.`` typed into a sheet
+        # would otherwise become ``www.example.com.example.com.``.)
+        stripped = name.strip()
+        if stripped.endswith(".") and stripped not in (".", "@."):
+            absolute = stripped.lower()
+            zone_abs = zone.name.lower() if zone.name.endswith(".") else zone.name.lower() + "."
+            if absolute == zone_abs:
+                name = "@"
+            elif absolute.endswith("." + zone_abs):
+                name = stripped[: -(len(zone_abs) + 1)]
+            else:
+                return (
+                    f"name {stripped!r} is not in the zone {zone_abs!r}; give the name "
+                    "relative to the zone, or end it with the zone's name"
+                )
+        # As the record API's update: what the row does not change is not
+        # re-judged, so a record whose TTL predates the #2073 bounds can still
+        # be re-imported with its TTL as it is.
+        ttl = row.ttl
+        keep_ttl = target is not None and _same_int(row.ttl, target.ttl)
         try:
             body = RecordCreate(
-                name=row.name if row.name is not None else target.name,  # type: ignore[union-attr]
+                name=name,
                 record_type=rtype,
                 value=row.value,
-                ttl=row.ttl,
+                ttl=None if keep_ttl else ttl,
                 priority=row.priority,
                 weight=row.weight,
                 port=row.port,
@@ -9265,7 +9299,7 @@ def _sheet_row_validator(
             name=body.name,
             record_type=body.record_type,
             value=body.value,
-            ttl=body.ttl,
+            ttl=target.ttl if keep_ttl and target is not None else body.ttl,
             priority=prio,
             weight=weight,
             port=port,

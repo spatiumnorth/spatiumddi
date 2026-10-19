@@ -113,6 +113,7 @@ export function ZoneSpreadsheetImportModal({
   const [confirm, setConfirm] = useState("");
   const [preview, setPreview] = useState<DNSSheetImportPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [providerWarning, setProviderWarning] = useState<string | null>(null);
 
   const previewMut = useMutation({
     mutationFn: () =>
@@ -136,9 +137,17 @@ export function ZoneSpreadsheetImportModal({
         mode,
         mode === "replace" ? confirm : undefined,
       ),
-    onSuccess: () => {
+    onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
       qc.invalidateQueries({ queryKey: ["dns-zones", groupId] });
+      // #1538 / #1539 — on an agentless group the provider is called after
+      // the commit; a change it refused is retried in the background, and
+      // until then it is not served. Say so rather than close as if clean.
+      if (res.provider_warning) {
+        setProviderWarning(res.provider_warning);
+        setPreview(null);
+        return;
+      }
       onClose();
     },
     onError: (err) => setError(formatApiError(err, "Import failed")),
@@ -216,6 +225,15 @@ export function ZoneSpreadsheetImportModal({
           </div>
         )}
 
+        {providerWarning && (
+          <div
+            role="status"
+            className="rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 break-words dark:text-amber-400"
+          >
+            The records were saved, but the DNS provider has not taken every
+            change yet; it will be retried: {providerWarning}
+          </div>
+        )}
         {error && (
           <div className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive break-words">
             {error}
@@ -270,7 +288,7 @@ export function ZoneSpreadsheetImportModal({
             onClick={onClose}
             className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
           >
-            Cancel
+            {providerWarning ? "Close" : "Cancel"}
           </button>
           <button
             onClick={() => previewMut.mutate()}
@@ -283,6 +301,7 @@ export function ZoneSpreadsheetImportModal({
             onClick={() => commitMut.mutate()}
             disabled={
               !preview ||
+              providerWarning != null ||
               hasErrors ||
               nothingToDo ||
               !confirmed ||

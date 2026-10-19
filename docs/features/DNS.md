@@ -1312,13 +1312,13 @@ case-insensitive and `record_type` is accepted for `type`.
 | Column | On export | On import |
 |---|---|---|
 | `id` | The record's UUID | Which record the row edits (see below). Blank: match by content or create. `EXAMPLE`: the row is ignored |
-| `name` | Owner, relative to the zone; `@` is the apex | Required for a new record |
+| `name` | Owner, relative to the zone; `@` is the apex | Required for a new record. Relative to the zone, as on the record API, unless it ends in a dot: then it is absolute, as in a zone file, and must be in this zone (`www.example.com.` is `www`; a name outside the zone is an error) |
 | `type` | `A`, `MX`, … | Required. Cannot change on an existing record |
 | `ttl` | Blank when the record inherits the zone's `$TTL` | Blank = inherit |
 | `value` | The rdata, as the record API stores it | Required |
 | `priority` / `weight` / `port` | The model's structured columns: MX uses `priority`, SRV all three | As the record API: SRV needs all three, MX defaults `priority` to 10, any other type takes none |
 | `view` | The split-horizon view's name; blank renders in every view | A view of the zone's group, by name (case-insensitive) |
-| `comment` | The record's `comment` tag | Stored as the `comment` tag. Never reaches a DNS server, so a comment-only change does not bump the serial |
+| `comment` | The record's `comment` tag | Stored as the `comment` tag (records have no comment column, so a `comment` tag set in the record form *is* this column; clearing the cell removes it). Never reaches a DNS server, so a comment-only change does not bump the serial or queue a record op |
 | `managed` | Why a row is read-only: `ipam`, `pool`, `tailscale`, `netbird`, `kubernetes` | Ignored |
 
 CAA, TLSA, SSHFP, NAPTR, SVCB / HTTPS and the other structured types have no
@@ -1339,7 +1339,11 @@ rdata string; edit them in `value` exactly as the record form takes them
    else that differs (TTL, priority, weight, port, comment) is an update.
    Matching nothing makes the row a new record.
 
-Two rows that resolve to one record make the second an error. Matching by
+Two rows that resolve to one record make the second an error, and so does a
+row that would leave the zone holding the same record twice — two identical new
+rows, or an edit that turns one record into a copy of another — as the record
+API refuses it with a 409 (#1230). Twins the zone already holds are not
+re-judged by an edit that keeps them what they are (a TTL or a comment). Matching by
 value rather than by `(name, type)` is deliberate: an RRset has several
 members, and keying on the RRset would turn "add a second A record" into
 "replace the first".
@@ -1384,7 +1388,14 @@ uploaded as it is.
 the same path as the zone-file import (#1683), so agents and agentless
 providers receive the changes and the group's agents are woken. One
 `dns_zone_import` audit row carries the counts and every change. A file is
-bounded at 10 MB and 10,000 rows.
+bounded at 10 MB and 10,000 rows (100,000 read at all, blank ones included),
+and an XLSX at 100 MB uncompressed, checked before the workbook is opened. A
+CSV is read as UTF-8, with or without a BOM, or as UTF-16 when it starts with
+a UTF-16 BOM (Excel's "Unicode text"); an unreadable file or a corrupt sheet
+is a 422, never a 500.
+
+**A record whose TTL predates the #2073 bounds** (negative, say) re-imports
+with its TTL as it is; a row that sets a TTL out of bounds is a row error.
 
 **Copilot.** `export_dns_zone_records` (read-only, enabled by default) returns
 the same rows as the export. There is no import tool: a bulk write is the

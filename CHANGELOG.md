@@ -50,6 +50,18 @@ the formatter handles the rest.
   `POST …/zones/{id}/import/spreadsheet/{preview,commit}`. New
   read-only Copilot tool `export_dns_zone_records`, default on; no
   import tool, by decision (#13). See `docs/features/DNS.md` §9.
+  A sheet cannot store one record twice: two identical new rows, or an
+  edit that turns a record into a copy of another, is a row error, as
+  the record API's 409 (#1230). A name ending in a dot is absolute, as
+  in a zone file (`www.example.com.` is `www`; a name outside the zone
+  is an error), where the record API alone would have stored
+  `www.example.com.example.com.`. A record whose TTL predates the #2073
+  bounds re-imports with its TTL as it is. Uploads are bounded before
+  they are parsed (an XLSX at 100 MB uncompressed, 100,000 rows read
+  at all), a CSV may be UTF-16 (Excel's "Unicode text"), and a corrupt
+  or entity-expanding sheet is a 422 rather than a 500. On an agentless
+  group, a change the provider has not taken yet is shown in the import
+  dialog instead of the dialog closing as if it were clean.
 
 - **The Helm chart's migrate Job takes annotations, so it works under
   GitOps (#2114).** Under `helm template`, which is how Argo CD and
