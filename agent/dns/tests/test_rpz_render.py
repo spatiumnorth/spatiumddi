@@ -504,3 +504,26 @@ def test_every_block_mode_renders_a_zone_bind_loads(tmp_path: Path) -> None:
         check=False,
     )
     assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_feed_exception_shipped_only_as_its_own_carve_out(tmp_path: Path) -> None:
+    """#2123 / #2124: an AdGuard-style feed ``@@``-excepts ``x.example.test``,
+    which the operator's manual list blocks. The control plane leaves it out
+    of the exceptions, so the agent still blocks it; the feed's own
+    carve-out ``c.feed.test`` renders as a passthru."""
+    out = tmp_path / "rpz.zone"
+    Bind9Driver(state_dir=tmp_path)._write_rpz_zone_file(
+        out,
+        {
+            "rpz_zone_name": "z.rpz.",
+            "entries": [
+                {"domain": "x.example.test", "action": "block"},
+                {"domain": "feed.test", "action": "block", "is_wildcard": True},
+            ],
+            "exceptions": ["c.feed.test"],
+        },
+    )
+    text = out.read_text()
+    assert "x.example.test CNAME .\n" in text
+    assert "c.feed.test CNAME rpz-passthru.\n" in text
+    assert "x.example.test CNAME rpz-passthru." not in text

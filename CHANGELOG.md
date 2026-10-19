@@ -150,7 +150,9 @@ the formatter handles the rest.
   come back at once. On Technitium a sinkhole with no address is now
   `AnyAddress` (it used to become `NxDomain`), and one with an address is
   `CustomAddress` with it. BIND's RPZ has no action that answers REFUSED,
-  so `block_mode: "refused"` is now a 422 that says so; stored `refused`
+  so `block_mode: "refused"` is now a 422 that says so (a deliberate
+  decision: accepting it and storing `nxdomain` would be the same silent
+  substitution this fixes); stored `refused`
   lists become `nxdomain`, which is what the agent always served them.
   `sinkhole_ip` must now be an IP address (a bad legacy value renders the
   default rather than breaking the zone), and the catalog subscribe
@@ -163,10 +165,12 @@ the formatter handles the rest.
   block, and `$domain=`, `$third-party`, `$client=` and similar rules,
   which narrow a block DNS cannot narrow, became unconditional blocks.
   Now `@@` rules become the list's exceptions (marked `source: feed` and
-  re-synced on each refresh; exceptions you add stay yours, and adding
-  or editing one the feed already lists makes it yours). Like any
-  exception, a feed's `@@` applies to every list on the same group or
-  view. `$important` is a plain block that still beats a plain `@@` for
+  re-synced on each refresh; exceptions you add stay yours). A feed's
+  `@@` applies to that feed's own list only: it carves a name out of the
+  feed's own blocks and never unblocks a name your manual list, or any
+  other list on the same group or view, blocks. Exceptions you add by
+  hand still apply to every list, and adding or editing one the feed
+  already lists makes it yours, and so group-wide. `$important` is a plain block that still beats a plain `@@` for
   the same name, a `$badfilter` rule drops the rule it names, and a
   rule with any other modifier is skipped. Regex rules, path rules and
   other rules that are not `||name^` are skipped too. Each skipped rule is

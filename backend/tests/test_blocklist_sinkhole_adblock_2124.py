@@ -15,6 +15,7 @@ block, and narrowing modifiers became unconditional blocks.
 from __future__ import annotations
 
 import contextlib
+import uuid
 
 import pytest
 from httpx import AsyncClient
@@ -25,9 +26,19 @@ from app.core.security import create_access_token, hash_password
 from app.drivers.dns.base import BlocklistEntry, EffectiveBlocklistData
 from app.drivers.dns.bind9 import BIND9Driver
 from app.models.auth import User
-from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSBlockListException
+from app.models.dns import (
+    DNSBlockList,
+    DNSBlockListEntry,
+    DNSBlockListException,
+    DNSServerGroup,
+)
 from app.services.dns.agent_config import _entry_dict
-from app.services.dns_blocklist import parse_feed_detailed
+from app.services.dns_blocklist import (
+    build_effective_for_group,
+    effective_lists_for_group,
+    exception_domains,
+    parse_feed_detailed,
+)
 from app.tasks import dns as dns_tasks
 
 # ── #2124: the control-plane renderer ───────────────────────────────────────
@@ -422,3 +433,122 @@ async def test_adding_a_feed_exception_by_hand_makes_it_the_operators(
         headers=headers,
     )
     assert dup.status_code == 409, dup.text
+
+
+# ── Feed exceptions apply to the feed's own list only (decided on #2124) ────
+
+
+async def _group_with_feed_and_manual(db: AsyncSession) -> DNSServerGroup:
+    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:8]}")
+    manual = DNSBlockList(name="a-manual", block_mode="nxdomain")
+    feed = DNSBlockList(
+        name="z-adguard", source_type="url", feed_format="adblock", block_mode="nxdomain"
+    )
+    manual.server_groups = [group]
+    feed.server_groups = [group]
+    db.add_all([group, manual, feed])
+    await db.flush()
+
+    def entry(bl: DNSBlockList, domain: str, wild: bool) -> DNSBlockListEntry:
+        return DNSBlockListEntry(
+            list_id=bl.id, domain=domain, entry_type="block", source="manual", is_wildcard=wild
+        )
+
+    db.add_all(
+        [
+            # The operator's own blocks.
+            entry(manual, "x.example", False),
+            entry(manual, "p.example", True),
+            entry(manual, "deep.d.feed.example", False),
+            entry(manual, "m.example", False),
+            # The feed's own wildcard block it carves exceptions out of.
+            entry(feed, "feed.example", True),
+        ]
+    )
+    for domain in (
+        "x.example",  # the operator blocks it exactly
+        "sub.p.example",  # the operator blocks it through a wildcard
+        "c.feed.example",  # a carve-out from the feed's own block: honoured
+        "d.feed.example",  # a carve-out, but the operator blocks a name under it
+        "lone.example",  # the feed blocks nothing above it
+    ):
+        db.add(DNSBlockListException(list_id=feed.id, domain=domain, reason="feed", source="feed"))
+    # An exception the operator added (or adopted) on the feed's list is
+    # group-wide, as every manual exception is.
+    db.add(DNSBlockListException(list_id=feed.id, domain="m.example", reason="mine"))
+    await db.commit()
+    return group
+
+
+@pytest.mark.asyncio
+async def test_a_feed_exception_never_unblocks_another_lists_block(
+    db_session: AsyncSession,
+) -> None:
+    group = await _group_with_feed_and_manual(db_session)
+    eff = await build_effective_for_group(db_session, group.id)
+    assert eff.exceptions == {"c.feed.example", "m.example"}
+
+    # The streamed bundle (#1662) reads exceptions through the same helper.
+    lists = await effective_lists_for_group(db_session, group.id)
+    assert lists is not None
+    assert await exception_domains(db_session, lists) == eff.exceptions
+
+    # Rendered by the control-plane driver (which skips exceptions rather
+    # than emitting passthru): the operator's blocks all survive, and the
+    # operator's own exception still unblocks m.example across lists.
+    zone = BIND9Driver().render_rpz_zone(
+        EffectiveBlocklistData(
+            rpz_zone_name="spatium-blocklist.rpz.",
+            entries=[
+                BlocklistEntry(
+                    domain=e.domain,
+                    action=e.action,
+                    block_mode=e.block_mode,
+                    sinkhole_ip=e.sinkhole_ip,
+                    target=e.target,
+                    is_wildcard=e.is_wildcard,
+                )
+                for e in eff.entries
+            ],
+            exceptions=frozenset(eff.exceptions),
+        )
+    )
+    assert "x.example IN CNAME ." in zone
+    assert "*.p.example IN CNAME ." in zone
+    assert "deep.d.feed.example IN CNAME ." in zone
+    assert "\nm.example IN CNAME ." not in zone
+
+
+@pytest.mark.asyncio
+async def test_without_another_list_a_feed_carve_out_still_applies(
+    db_session: AsyncSession,
+) -> None:
+    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:8]}")
+    feed = DNSBlockList(name="only-feed", source_type="url", feed_format="adblock")
+    feed.server_groups = [group]
+    db_session.add_all([group, feed])
+    await db_session.flush()
+    db_session.add(
+        DNSBlockListEntry(
+            list_id=feed.id,
+            domain="feed.example",
+            entry_type="block",
+            source="manual",
+            is_wildcard=True,
+        )
+    )
+    db_session.add_all(
+        [
+            DNSBlockListException(list_id=feed.id, domain="ok.feed.example", source="feed"),
+            DNSBlockListException(list_id=feed.id, domain="lone.example", source="feed"),
+        ]
+    )
+    await db_session.commit()
+    eff = await build_effective_for_group(db_session, group.id)
+    assert eff.exceptions == {"ok.feed.example"}
+
+
+def test_a_name_the_feed_blocks_and_excepts_is_not_an_entry() -> None:
+    p = parse_feed_detailed("||both.example^\n@@||both.example^\n||ads.example^\n", "adblock")
+    assert p.domains == ["ads.example"]
+    assert p.exceptions == ["both.example"]

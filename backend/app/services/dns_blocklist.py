@@ -17,7 +17,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import exists, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -78,7 +78,6 @@ async def _collect_lists(
     db: AsyncSession, lists: list[DNSBlockList]
 ) -> tuple[list[EffectiveEntry], set[str], list[uuid.UUID]]:
     entries: list[EffectiveEntry] = []
-    exceptions: set[str] = set()
     list_ids: list[uuid.UUID] = []
 
     # Column rows, not ORM entities (#1109, the #948 pattern): a Family
@@ -112,11 +111,7 @@ async def _collect_lists(
             for domain, entry_type, target, is_wildcard in entry_result.tuples()
         )
 
-        exc_result = await db.execute(
-            select(DNSBlockListException.domain).where(DNSBlockListException.list_id == bl.id)
-        )
-        exceptions.update(domain.lower() for domain in exc_result.scalars())
-
+    exceptions = await exception_domains(db, lists)
     return entries, exceptions, list_ids
 
 
@@ -243,15 +238,122 @@ async def has_entries(db: AsyncSession, lists: list[DNSBlockList]) -> bool:
     return bool(await db.scalar(select(exists().where(DNSBlockListEntry.list_id.in_(ids)))))
 
 
-async def exception_domains(db: AsyncSession, lists: list[DNSBlockList]) -> set[str]:
-    """The exceptions of the enabled lists of ``lists``, as ``_collect_lists``
-    collects them."""
-    out: set[str] = set()
-    for bl in _enabled(lists):
+def _ancestors(name: str) -> list[str]:
+    """``a.b.example.com`` → ``[b.example.com, example.com, com]``."""
+    labels = name.split(".")
+    return [".".join(labels[i:]) for i in range(1, len(labels))]
+
+
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def _pooled_feed_exceptions(
+    db: AsyncSession, enabled: list[DNSBlockList], feed: dict[uuid.UUID, set[str]]
+) -> set[str]:
+    """The feed exceptions (``source='feed'``, adblock ``@@``) that may join
+    the pooled exception set (#2123, decided on #2124).
+
+    Every renderer applies the pooled set to EVERY list of the zone: BIND
+    emits ``N`` and ``*.N`` as ``rpz-passthru`` and drops any entry equal to
+    ``N``; Technitium puts ``N`` in its allowed set, which unblocks ``N`` and
+    everything under it. A remote feed may only carve exceptions out of its
+    OWN blocks, so a feed's exception ``N`` is pooled only when:
+
+    * the feed's own list blocks it through a wildcard ancestor (``||p^``
+      with ``@@||n.p^``) — otherwise there is nothing of its own to carve
+      out of, and an exact block of ``N`` the parser already dropped;
+    * no OTHER list of the zone blocks ``N`` itself or through a wildcard
+      ancestor; and
+    * no other list blocks a name under ``N`` (Technitium's allowed set
+      covers the whole subtree).
+
+    Every other feed exception is stored, shown and has no effect. That
+    over-blocks rather than under-blocks: a carve-out lost to another list
+    is what that other list asked for.
+    """
+    candidates: dict[uuid.UUID, set[str]] = {}
+    for bl in enabled:
+        names = feed.get(bl.id)
+        if not names:
+            continue
+        lookup = {a for n in names for a in _ancestors(n)}
+        if not lookup:
+            continue
         rows = await db.execute(
-            select(DNSBlockListException.domain).where(DNSBlockListException.list_id == bl.id)
+            select(DNSBlockListEntry.domain).where(
+                DNSBlockListEntry.list_id == bl.id,
+                DNSBlockListEntry.is_wildcard.is_(True),
+                DNSBlockListEntry.domain.in_(lookup),
+            )
         )
-        out.update(domain.lower() for domain in rows.scalars())
+        own = {d.lower() for d in rows.scalars()}
+        useful = {n for n in names if any(a in own for a in _ancestors(n))}
+        if useful:
+            candidates[bl.id] = useful
+
+    pooled: set[str] = set()
+    for list_id, names in candidates.items():
+        others = [bl.id for bl in enabled if bl.id != list_id]
+        if not others:
+            pooled |= names
+            continue
+        lookup = set(names) | {a for n in names for a in _ancestors(n)}
+        cover = await db.execute(
+            select(DNSBlockListEntry.domain, DNSBlockListEntry.is_wildcard).where(
+                DNSBlockListEntry.list_id.in_(others),
+                DNSBlockListEntry.domain.in_(lookup),
+            )
+        )
+        exact: set[str] = set()
+        wild: set[str] = set()
+        for d, is_wild in cover.tuples():
+            exact.add(d.lower())
+            if is_wild:
+                wild.add(d.lower())
+        safe = {n for n in names if n not in exact and not any(a in wild for a in _ancestors(n))}
+        if not safe:
+            continue
+        # A name UNDER a carve-out, blocked by another list. One pass over
+        # the other lists' entries, and only for the few carve-outs that
+        # survived the indexed checks above.
+        patterns = [f"%.{_like_escape(n)}" for n in sorted(safe)]
+        rows = await db.execute(
+            select(DNSBlockListEntry.domain).where(
+                DNSBlockListEntry.list_id.in_(others),
+                or_(*(DNSBlockListEntry.domain.like(p) for p in patterns)),
+            )
+        )
+        under = {d.lower() for d in rows.scalars()}
+        pooled |= {n for n in safe if not any(u.endswith("." + n) for u in under)}
+    return pooled
+
+
+async def exception_domains(db: AsyncSession, lists: list[DNSBlockList]) -> set[str]:
+    """The exceptions every renderer applies across all of ``lists``.
+
+    An operator's exception (``source='manual'``) applies to every list of
+    the zone, as it always has. A feed's own ``@@`` rule (``source='feed'``,
+    #2123) applies only to that feed's list: see
+    :func:`_pooled_feed_exceptions`.
+    """
+    enabled = _enabled(lists)
+    out: set[str] = set()
+    feed: dict[uuid.UUID, set[str]] = {}
+    for bl in enabled:
+        rows = await db.execute(
+            select(DNSBlockListException.domain, DNSBlockListException.source).where(
+                DNSBlockListException.list_id == bl.id
+            )
+        )
+        for domain, source in rows.tuples():
+            name = domain.lower().rstrip(".")
+            if source == "feed":
+                feed.setdefault(bl.id, set()).add(name)
+            else:
+                out.add(domain.lower())
+    if feed:
+        out |= await _pooled_feed_exceptions(db, enabled, feed)
     return out
 
 

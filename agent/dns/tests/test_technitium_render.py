@@ -4535,3 +4535,26 @@ def test_forwarder_stale_delete_of_a_gone_record_is_not_a_failure(tmp_path: Path
     d._apply_failures = []
     d._sync_forwarder_records("t", "f.test", [("192.0.2.53", "Udp", 0)], None)
     assert d._apply_failures == []
+
+
+def test_blocking_payload_keeps_a_name_another_list_blocks_and_a_feed_excepts() -> None:
+    """#2123 / #2124: the control plane ships only the feed carve-outs no
+    other list blocks (``c.feed.test``). The operator's ``x.example.test``,
+    which an AdGuard-style feed ``@@``-excepts, is NOT in the exceptions, so
+    it stays in the blocked set and out of the allowed one."""
+    out = _blocking_payload(
+        _bl(
+            [
+                {"domain": "x.example.test", "action": "block", "block_mode": "nxdomain"},
+                {
+                    "domain": "feed.test",
+                    "action": "block",
+                    "block_mode": "nxdomain",
+                    "is_wildcard": True,
+                },
+            ],
+            ["c.feed.test"],
+        )
+    )
+    assert "x.example.test" in out["blocked"]
+    assert out["allowed"] == ["c.feed.test"]

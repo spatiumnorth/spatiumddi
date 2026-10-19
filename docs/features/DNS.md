@@ -833,10 +833,16 @@ DNSBlockListException
   rest of the syntax ([#2123](https://github.com/spatiumnorth/spatiumddi/issues/2123)):
   - `@@||name^` becomes an **exception** on the list (source `feed`),
     re-synced by every refresh. An exception you add by hand is never
-    removed by a refresh, and adding (or editing) one the feed already
-    lists makes it yours. Like every exception, it applies to **every
-    list** assigned to the same group or view, not only the feed's own:
-    a feed's `@@` rule can unblock a name another list blocks.
+    removed by a refresh. A feed's `@@` rule applies to **the feed's own
+    list only**: it carves a name out of that feed's own blocks (for
+    example `@@||cdn.ads.example^` under `||ads.example^`), and it never
+    unblocks a name that your manual list, or any other list on the same
+    group or view, blocks exactly, through a wildcard, or anywhere under
+    it. Such a feed exception is still stored and listed, but has no
+    effect. An exception you add by hand applies to every list on the
+    group or view, as before. Adding or editing one that the feed already
+    lists makes it yours, and so makes it group-wide too: that is the
+    operator's call, not the feed's.
   - `$important` is kept as a plain block, and still beats a plain `@@`
     for the same name in the feed (that is what it means), so that
     exception is not stored.
@@ -871,7 +877,7 @@ sinkhole without an address is `AnyAddress` (Technitium's name for
 `0.0.0.0` / `::`); with one it is `CustomAddress` with that address and
 the other family's unspecified address.
 
-There is **no `refused` mode**. BIND's RPZ has no action that answers
+There is **no `refused` mode**, deliberately. BIND's RPZ has no action that answers
 REFUSED (its actions are NXDOMAIN, NODATA, PASSTHRU, DROP, TCP-only and
 local data), so the API refuses `refused` with a 422. It used to be
 accepted and was served as NXDOMAIN; upgrading rewrites stored `refused`
