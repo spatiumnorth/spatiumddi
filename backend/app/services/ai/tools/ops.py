@@ -563,6 +563,7 @@ class HelpWritePermissionArgs(BaseModel):
 
 @register_tool(
     name="help_write_permission",
+    honours_token_binding=True,
     permission="authenticated",
     description=(
         "Build the RBAC permission JSON to paste into a Role's "

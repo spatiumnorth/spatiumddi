@@ -5694,6 +5694,11 @@ export interface DNSZone {
   // Conditional-forwarder config. Meaningful only when zone_type==="forward".
   forwarders: string[];
   forward_only: boolean;
+  // #2121 — the forward zone's OWN upstream transport (do53 | tls | https |
+  // quic). It does not inherit the group's forward_transport. Optional so a
+  // response from an older control plane still type-checks; absent = do53.
+  forward_transport?: "do53" | "tls" | "https" | "quic";
+  forward_tls_hostname?: string | null;
   // Secondary / stub primaries (issue #336). The master server IPs this
   // zone transfers FROM (ip or ip@port). Required when
   // zone_type==="secondary" | "stub"; empty otherwise.

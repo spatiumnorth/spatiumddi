@@ -115,6 +115,37 @@ def tool_permission_allows(user: User, permission: ToolPermission) -> bool:
     return any(user_has_permission(user, action, rt) for rt in types)
 
 
+def _carries_token_binding(user: User) -> bool:
+    """Whether the caller's credential is an API token bound to specific
+    resource instances (#374). Sessions and unbound tokens return False."""
+    from app.core.permissions import _token_grants_for  # noqa: PLC0415
+
+    return bool(_token_grants_for(user))
+
+
+def tool_callable_by(user: User, tool: Tool) -> bool:
+    """Whether ``user`` may call ``tool`` — the one decision both
+    ``tools/list`` and dispatch use.
+
+    Two independent conditions:
+
+    * the tool's ``permission`` declaration allows the caller; and
+    * when the credential is an API token bound to specific zones / subnets,
+      the tool must declare ``honours_token_binding=True``. The coarse
+      permission check only knows the resource TYPE, so a token bound to one
+      zone passes it for every DNS tool; only a tool that narrows its own
+      output to the bound instances (as the REST routes do) can serve such a
+      token. A tool that does not declare it is refused rather than trusted
+      to have remembered — the same structural floor
+      ``app.api.token_path_scope`` gives the REST routers.
+    """
+    if tool.permission is None or not tool_permission_allows(user, tool.permission):
+        return False
+    if not tool.honours_token_binding and _carries_token_binding(user):
+        return False
+    return True
+
+
 def describe_tool_permission(permission: ToolPermission) -> str:
     if isinstance(permission, str):
         return permission
@@ -170,6 +201,12 @@ class Tool:
     # ``/api/v1/tools/*`` route spends, so REST and copilot calls share
     # it. None for tools that only read the database.
     rate_limit: str | None = None
+    # Whether the tool narrows its output to the instances an API token is
+    # bound to (``app.services.ai.tools.scope``). A token bound to specific
+    # zones / subnets may only call tools that set this — see
+    # :func:`tool_callable_by`. Leave False unless every row the tool can
+    # return is filtered by, or gated on, the token's bound instances.
+    honours_token_binding: bool = False
 
     def parameters_schema(self) -> dict[str, Any]:
         """JSON Schema for the args. Both OpenAI and MCP consume this
@@ -232,11 +269,7 @@ class ToolRegistry:
     def callable_by(self, user: User, tools: list[Tool]) -> list[Tool]:
         """The subset of ``tools`` ``user`` is authorized to call — what
         ``tools/list`` and the chat tool schema advertise."""
-        return [
-            t
-            for t in tools
-            if t.permission is not None and tool_permission_allows(user, t.permission)
-        ]
+        return [t for t in tools if tool_callable_by(user, t)]
 
     async def call(
         self,
@@ -259,7 +292,8 @@ class ToolRegistry:
         explicitly disabled. Pass None only where the caller has
         already resolved the effective set itself.
 
-        The tool's ``permission`` is enforced here for EVERY caller,
+        The tool's ``permission`` (and, for an instance-bound API token,
+        ``honours_token_binding``) is enforced here for EVERY caller,
         regardless of ``effective`` (GHSA-4wrc-78rq-vgcg).
 
         A tool declaring ``rate_limit`` spends one call from the caller's
@@ -273,7 +307,7 @@ class ToolRegistry:
             raise ToolNotFound(name)
         if effective is not None and name not in effective:
             raise ToolDisabled(name, scope="platform")
-        if tool.permission is None or not tool_permission_allows(user, tool.permission):
+        if not tool_callable_by(user, tool):
             raise ToolPermissionDenied(name, tool.permission)
         try:
             args = tool.args_model.model_validate(raw_args or {})
@@ -354,12 +388,14 @@ def register_tool(
     module: str | None = None,
     permission: ToolPermission,
     rate_limit: str | None = None,
+    honours_token_binding: bool = False,
 ) -> Callable[[ToolExecutor], ToolExecutor]:
     """Decorator. Use on each tool's executor function.
 
     ``permission`` is mandatory — see ``ToolPermission``. ``rate_limit``
     names the network-tool budget bucket for a tool that sends traffic off
-    the host (see ``Tool.rate_limit``).
+    the host (see ``Tool.rate_limit``). ``honours_token_binding`` — see
+    :func:`tool_callable_by`.
 
     Example::
 
@@ -392,6 +428,7 @@ def register_tool(
                 module=module,
                 permission=permission,
                 rate_limit=rate_limit,
+                honours_token_binding=honours_token_binding,
             )
         )
         return fn
