@@ -160,6 +160,22 @@ the formatter handles the rest.
   structural etag carries no server id and the new row's bundle
   re-renders nothing.
 
+- **Sync DNS no longer lists an address's host A as missing when its
+  own A alias already serves the name (#2118).** Since #2117 a rename
+  onto an address's own alias skips the host record, because the alias
+  answers for the name. Drift ignored alias rows, so it still listed
+  that A as missing, and applying the sync (or auto-sync, every
+  interval) reported the refusal in its errors. Drift now treats the
+  name as satisfied when one of the address's own alias rows of the same
+  type already holds it in that zone, compared case-insensitively. A
+  different address's alias, or an AAAA alias for an A, does not count,
+  and the PTR is still expected. The same holds for an AAAA host record
+  and an AAAA alias, and in each extra zone the address publishes to.
+  Applying the sync for an address that also lacks its PTR used to stop
+  at the same refusal, so the PTR was never written; the apply now skips
+  the zone the alias serves and writes the PTR. A CNAME alias at the
+  name is still refused.
+
 - **The IP table can hide its "N free, click to allocate" rows
   (#2137).** On a very large or integration-mirrored subnet (a
   Tailscale `100.64.0.0/10` holding a few dozen nodes) nearly every
