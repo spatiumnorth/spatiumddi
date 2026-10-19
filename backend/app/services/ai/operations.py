@@ -3723,6 +3723,9 @@ async def _preview_assign_appliance_role(
     group_problem = await _assign_role_group_problem(db, args)
     if group_problem is not None:
         return PreviewResult(ok=False, detail=group_problem)
+    dhcp_module_problem = await _assign_role_dhcp_module_problem(db, row, args)
+    if dhcp_module_problem is not None:
+        return PreviewResult(ok=False, detail=dhcp_module_problem)
     catalog_problem = await _assign_role_catalog_problem(db, row, args)
     if catalog_problem is not None:
         return PreviewResult(ok=False, detail=catalog_problem)
@@ -3837,6 +3840,25 @@ async def _assign_role_signer_problem(
     if own is not None:
         return None
     return await second_signer_refusal(db, group, driver=driver, lock=lock)
+
+
+async def _assign_role_dhcp_module_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#2130 — same refusal as the REST role-assign route: the DHCP role
+    needs ``core.dhcp``. Only when the role is newly ADDED, so an appliance
+    already holding it can still re-save (e.g. to change its DNS group)."""
+    from app.services.feature_modules import is_module_enabled  # noqa: PLC0415
+
+    if "dhcp" not in args.roles or "dhcp" in (row.assigned_roles or []):
+        return None
+    if await is_module_enabled(db, "core.dhcp"):
+        return None
+    return (
+        "Cannot assign the 'dhcp' role: the DHCP module (core.dhcp) is "
+        "disabled. Enable it under Administration > Features & "
+        "Integrations, or remove the role."
+    )
 
 
 async def _assign_role_cluster_dns_problem(
@@ -4019,6 +4041,9 @@ async def _apply_assign_appliance_role_locked(
     group_problem = await _assign_role_group_problem(db, args)
     if group_problem is not None:
         raise ValueError(group_problem)
+    dhcp_module_problem = await _assign_role_dhcp_module_problem(db, row, args)
+    if dhcp_module_problem is not None:
+        raise ValueError(dhcp_module_problem)
     catalog_problem = await _assign_role_catalog_problem(db, row, args)
     if catalog_problem is not None:
         raise ValueError(catalog_problem)

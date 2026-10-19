@@ -32,6 +32,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 
 // ── Page ─────────────────────────────────────────────────────────────
 
@@ -563,7 +564,7 @@ function FirewallModal({
     firewall?.mirror_dhcp_leases ?? false,
   );
   const [syncInterval, setSyncInterval] = useState(
-    firewall?.sync_interval_seconds ?? 60,
+    String(firewall?.sync_interval_seconds ?? 60),
   );
   const [error, setError] = useState("");
 
@@ -605,7 +606,7 @@ function FirewallModal({
           mirror_nat_rules: mirrorNatRules,
           mirror_interfaces: mirrorInterfaces,
           mirror_dhcp_leases: mirrorDhcpLeases,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (apiToken) update.api_token = apiToken;
@@ -627,7 +628,7 @@ function FirewallModal({
         mirror_nat_rules: mirrorNatRules,
         mirror_interfaces: mirrorInterfaces,
         mirror_dhcp_leases: mirrorDhcpLeases,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return fortinetApi.create(create);
     },
@@ -647,6 +648,17 @@ function FirewallModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -828,7 +840,7 @@ function FirewallModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
