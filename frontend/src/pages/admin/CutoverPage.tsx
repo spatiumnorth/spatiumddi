@@ -651,10 +651,13 @@ function NewPlanModal({
   const [dhcpTarget, setDhcpTarget] = useState("");
   const [error, setError] = useState<string | null>(null);
 
+  // A DHCP-only install can have this page with DNS off: the DNS pickers
+  // and their /dns reads are skipped then (#2135).
+  const dnsOn = useModuleOn("core.dns");
   const dnsGroupsQ = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
-    enabled: canQuery,
+    enabled: canQuery && dnsOn,
   });
   // The cutover module does not require core.dhcp, so a DNS-only install
   // can have this page with DHCP off: the DHCP pickers and their /dhcp
@@ -676,7 +679,7 @@ function NewPlanModal({
       );
       return perGroup.flat();
     },
-    enabled: canQuery && dnsGroupIds.length > 0,
+    enabled: canQuery && dnsOn && dnsGroupIds.length > 0,
   });
   const dhcpServersQ = useQuery({
     queryKey: ["cutover", "dhcp-servers"],
@@ -731,53 +734,57 @@ function NewPlanModal({
         </div>
 
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <div>
-            <label className="block text-sm font-medium">
-              Source Windows DNS server
-            </label>
-            <p className="mb-1 text-[11px] text-muted-foreground">
-              What zones are pulled from. Needs the <code>windows_dns</code>{" "}
-              driver.
-            </p>
-            <select
-              value={dnsSource}
-              onChange={(e) => setDnsSource(e.target.value)}
-              className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-            >
-              <option value="">— none —</option>
-              {windowsDns.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name} ({s.host})
-                </option>
-              ))}
-            </select>
-            {!dnsServersQ.isLoading && windowsDns.length === 0 && (
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                No Windows DNS servers are configured.
-              </p>
-            )}
-          </div>
+          {dnsOn && (
+            <>
+              <div>
+                <label className="block text-sm font-medium">
+                  Source Windows DNS server
+                </label>
+                <p className="mb-1 text-[11px] text-muted-foreground">
+                  What zones are pulled from. Needs the <code>windows_dns</code>{" "}
+                  driver.
+                </p>
+                <select
+                  value={dnsSource}
+                  onChange={(e) => setDnsSource(e.target.value)}
+                  className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                >
+                  <option value="">— none —</option>
+                  {windowsDns.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name} ({s.host})
+                    </option>
+                  ))}
+                </select>
+                {!dnsServersQ.isLoading && windowsDns.length === 0 && (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    No Windows DNS servers are configured.
+                  </p>
+                )}
+              </div>
 
-          <div>
-            <label className="block text-sm font-medium">
-              Target DNS server group
-            </label>
-            <p className="mb-1 text-[11px] text-muted-foreground">
-              The SpatiumDDI group taking the zones over.
-            </p>
-            <select
-              value={dnsTarget}
-              onChange={(e) => setDnsTarget(e.target.value)}
-              className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-            >
-              <option value="">— none —</option>
-              {(dnsGroupsQ.data ?? []).map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </div>
+              <div>
+                <label className="block text-sm font-medium">
+                  Target DNS server group
+                </label>
+                <p className="mb-1 text-[11px] text-muted-foreground">
+                  The SpatiumDDI group taking the zones over.
+                </p>
+                <select
+                  value={dnsTarget}
+                  onChange={(e) => setDnsTarget(e.target.value)}
+                  className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                >
+                  <option value="">— none —</option>
+                  {(dnsGroupsQ.data ?? []).map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {g.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </>
+          )}
 
           {dhcpOn && (
             <div>
