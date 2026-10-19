@@ -106,6 +106,15 @@ import {
   parseTtlInput,
   summarizeZoneNames,
 } from "@/lib/dnsNames";
+import {
+  GATEWAY_FORWARD_SKIPPED_LABEL,
+  GATEWAY_FORWARD_SKIPPED_NOTE,
+  classifyIpDnsState,
+  isDefaultGatewayHostnameInput,
+  staleReasonText,
+  type IpDnsState,
+} from "@/lib/gatewayDns";
+import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -3748,6 +3757,8 @@ export function AddAddressModal({
           {hostnameErr && (
             <p className="mt-1 text-xs text-destructive">{hostnameErr}</p>
           )}
+          {isDefaultGatewayHostnameInput(hostname) &&
+            availableZones.length > 0 && <GatewayHostnameNote />}
         </Field>
         {/* DNS zone selector — only shown when zones are available */}
         {availableZones.length > 0 && (
@@ -5059,6 +5070,9 @@ export function SubnetDetail({
   const outOfSyncIpIds = new Set<string>([
     ...(dnsDrift?.missing.map((m) => m.ip_id) ?? []),
     ...(dnsDrift?.mismatched.map((m) => m.ip_id) ?? []),
+    // Sync DNS is about to delete these records, so the row is not "in sync"
+    // (#2101). ``ip_id`` is null for records whose address is gone.
+    ...(dnsDrift?.stale.flatMap((s) => (s.ip_id ? [s.ip_id] : [])) ?? []),
   ]);
   const subnetHasDnsZone = !!(
     dnsDrift?.forward_zone_id ||
@@ -5066,16 +5080,14 @@ export function SubnetDetail({
     dnsDrift?.reverse_zone_names?.length
   );
 
-  function ipDnsState(addr: IPAddress): "in-sync" | "out-of-sync" | "n/a" {
-    if (!subnetHasDnsZone) return "n/a";
-    if (
-      addr.status === "network" ||
-      addr.status === "broadcast" ||
-      addr.status === "orphan"
-    )
-      return "n/a";
-    if (!addr.hostname || addr.hostname === "gateway") return "n/a";
-    return outOfSyncIpIds.has(addr.id) ? "out-of-sync" : "in-sync";
+  function ipDnsState(addr: IPAddress): IpDnsState {
+    return classifyIpDnsState({
+      status: addr.status,
+      hostname: addr.hostname,
+      subnetHasDnsZone,
+      hasForwardZone: !!dnsDrift?.forward_zone_id,
+      outOfSync: outOfSyncIpIds.has(addr.id),
+    });
   }
 
   function applyFilter(
@@ -6216,6 +6228,9 @@ export function SubnetDetail({
                                 <option value="">All</option>
                                 <option value="in-sync">In sync</option>
                                 <option value="out-of-sync">Out of sync</option>
+                                <option value="forward-skipped">
+                                  Forward DNS skipped
+                                </option>
                                 <option value="n/a">N/A</option>
                               </select>
                             ) : (
@@ -6728,6 +6743,14 @@ export function SubnetDetail({
                                     <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
                                     out of sync
                                   </span>
+                                ) : dnsState === "forward-skipped" ? (
+                                  <span
+                                    className="inline-flex items-center gap-1 text-xs text-muted-foreground"
+                                    title={GATEWAY_FORWARD_SKIPPED_NOTE}
+                                  >
+                                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/50" />
+                                    {GATEWAY_FORWARD_SKIPPED_LABEL}
+                                  </span>
                                 ) : (
                                   <span className="text-muted-foreground/40">
                                     —
@@ -7033,6 +7056,7 @@ export function SubnetDetail({
           address={viewingAddress}
           subnet={subnet}
           zoneNameById={zoneNameById}
+          hasForwardZone={!!dnsDrift?.forward_zone_id}
           canEdit={
             !(
               viewingAddress.status === "network" ||
@@ -7491,7 +7515,7 @@ function DnsSyncModal({
               {data.stale.length > 0 && (
                 <DriftSection
                   title="Stale records"
-                  description="Auto-generated records that no longer have a live IPAM address. Selecting will permanently delete them and push the delete to BIND."
+                  description="Auto-generated records IPAM no longer wants (the reason is shown under each one). Selecting will permanently delete them and push the delete to BIND."
                   count={data.stale.length}
                   selected={selStale.size}
                   onToggleAll={() =>
@@ -7512,7 +7536,7 @@ function DnsSyncModal({
                       type={s.record_type}
                       zone={s.zone_name}
                       primary={`${s.name} → ${s.value}`}
-                      secondary={`reason: ${s.reason}`}
+                      secondary={staleReasonText(s.reason)}
                       destructive
                     />
                   ))}
@@ -7788,8 +7812,9 @@ function DriftRow({
         >
           {primary}
         </div>
-        <div className="text-[11px] text-muted-foreground truncate">
-          {secondary} · {zone}
+        <div className="text-[11px] text-muted-foreground">
+          {secondary}
+          {zone ? ` · ${zone}` : ""}
         </div>
       </div>
     </label>
@@ -9185,6 +9210,8 @@ export function EditAddressModal({
           {hostnameErr && (
             <p className="mt-1 text-xs text-destructive">{hostnameErr}</p>
           )}
+          {isDefaultGatewayHostnameInput(hostname) &&
+            availableZones.length > 0 && <GatewayHostnameNote />}
         </Field>
         {/* DNS zone — only shown when zones are available */}
         {availableZones.length > 0 && (

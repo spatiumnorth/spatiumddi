@@ -37,6 +37,8 @@ import {
   type Subnet,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { isDefaultGatewayHostname } from "@/lib/gatewayDns";
+import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
 import { OT_PROTOCOL_LABELS, OT_ROLE_LABELS } from "@/lib/otLabels";
 import { CertsCompactTable } from "@/pages/network/CertificatesPage";
 import {
@@ -125,6 +127,9 @@ export interface IPDetailModalProps {
   address: IPAddress;
   subnet?: Subnet | null;
   zoneNameById?: Record<string, string>;
+  /** Whether the subnet resolves to a forward zone, i.e. whether a
+   *  "gateway" host has a forward record to skip (#2101). */
+  hasForwardZone?: boolean;
   canEdit: boolean;
   onClose: () => void;
   onEdit: () => void;
@@ -149,6 +154,7 @@ export function IPDetailModal({
   address: addr,
   subnet,
   zoneNameById,
+  hasForwardZone,
   canEdit,
   onClose,
   onEdit,
@@ -479,6 +485,12 @@ export function IPDetailModal({
                   dash(null)}
               </span>
             </Field>
+            {isDefaultGatewayHostname(addr.hostname) &&
+              (hasForwardZone ?? !!addr.forward_zone_id) && (
+                <div className="sm:col-span-2">
+                  <GatewayHostnameNote />
+                </div>
+              )}
           </div>
 
           {/* Counters row */}
