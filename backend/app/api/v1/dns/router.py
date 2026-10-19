@@ -9,12 +9,29 @@ import uuid
 import zipfile
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
@@ -55,7 +72,7 @@ from app.core.permissions import (
     token_scoped_resource_ids,
     user_has_permission,
 )
-from app.core.responses import DnsZoneResponse, ZipResponse
+from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
 from app.core.update_nulls import resolve_update_changes
 from app.drivers._winrm import validate_transport
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
@@ -209,6 +226,7 @@ from app.services.dns_io import (
     parse_zone_file,
     write_zone_file,
 )
+from app.services.dns_io import spreadsheet as sheet_io
 from app.services.feature_modules import require_module
 from app.services.soft_delete import (
     SoftDeleteBatch,
@@ -8787,6 +8805,42 @@ def _change_to_response(c: RecordChange) -> RecordChangeResponse:
     )
 
 
+async def _queue_import_ops(
+    db: DB,
+    zone: DNSZone,
+    *,
+    deletes: list[dict[str, Any]],
+    updates: list[DNSRecord],
+    creates: list[DNSRecord],
+) -> tuple[int | None, list[Any], str | None]:
+    """Queue an import's record changes, shared by the zone-file and the
+    spreadsheet import (#1683, #2139). Rows are already written (``deletes``
+    are the payloads of rows already removed, taken before they went).
+
+    One serial bump and one batch for the whole import, as
+    bulk_create_records does. Deletes go first, in the order the agent
+    drains them: a CNAME that replaces an A at one name can only land once
+    the A is gone. Each op carries the RRset as the whole import leaves it
+    (#773), read after the flush. Returns ``(target_serial, op rows,
+    provider warning)``.
+    """
+    if not (creates or updates or deletes):
+        return None, [], None
+    target_serial = bump_zone_serial(zone)
+    await db.flush()
+    ops = [
+        *({"op": "delete", "record": p} for p in deletes),
+        *({"op": "update", "record": record_op_payload(r)} for r in updates),
+        *({"op": "create", "record": record_op_payload(r)} for r in creates),
+    ]
+    op_rows = await enqueue_record_ops_batch(
+        db, zone, [{**o, "target_serial": target_serial} for o in ops]
+    )
+    # #1538 — a change the agentless provider did not take is surfaced,
+    # not audited as a clean success.
+    return target_serial, op_rows, _agentless_batch_warning(op_rows)
+
+
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/preview",
     response_model=ImportPreviewResponse,
@@ -8944,28 +8998,9 @@ async def import_zone_commit(
             await db.delete(row)
             deleted += 1
 
-    # One serial bump and one batch for the whole import, as
-    # bulk_create_records does. Deletes go first, in the order the agent
-    # drains them: a CNAME that replaces an A at one name can only land once
-    # the A is gone. Each op carries the RRset as the whole import leaves it
-    # (#773), read after the flush.
-    target_serial: int | None = None
-    provider_warning: str | None = None
-    op_rows: list[Any] = []
-    if create_rows or update_rows or delete_payloads:
-        target_serial = bump_zone_serial(zone)
-        await db.flush()
-        ops = [
-            *({"op": "delete", "record": p} for p in delete_payloads),
-            *({"op": "update", "record": record_op_payload(r)} for r in update_rows),
-            *({"op": "create", "record": record_op_payload(r)} for r in create_rows),
-        ]
-        op_rows = await enqueue_record_ops_batch(
-            db, zone, [{**o, "target_serial": target_serial} for o in ops]
-        )
-        # #1538 — a change the agentless provider did not take is surfaced,
-        # not audited as a clean success.
-        provider_warning = _agentless_batch_warning(op_rows)
+    target_serial, op_rows, provider_warning = await _queue_import_ops(
+        db, zone, deletes=delete_payloads, updates=update_rows, creates=create_rows
+    )
 
     db.add(
         AuditLog(
@@ -9142,22 +9177,65 @@ async def sync_zone_with_server_endpoint(
     )
 
 
+# ── Spreadsheet import / export (#2139) ─────────────────────────────────────
+# The format and the import plan live in app.services.dns_io.spreadsheet; the
+# per-row checks are the record API's own (below), and the commit queues its
+# changes through ``_queue_import_ops``, the zone-file import's path.
+
+_SHEET_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+_SHEET_MODES = ("merge", "replace")
+_SPREADSHEET_CONTENT: dict[int | str, dict[str, Any]] = {
+    200: {
+        "description": "Zone file, CSV or XLSX, by ``format``",
+        "content": {"text/csv": {}, sheet_io.XLSX_MEDIA_TYPE: {}},
+    }
+}
+
+
+def _sheet_filename(zone: DNSZone, ext: str, *, template: bool = False) -> str:
+    ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    stem = zone.name.rstrip(".") or "root"
+    kind = "dns-zone-template" if template else "dns-zone"
+    return f"{kind}-{stem}-{ts}.{ext}"
+
+
+def _sheet_response(rows: list[dict[str, Any]], fmt: str, filename: str) -> Response:
+    disposition = {"Content-Disposition": content_disposition(filename)}
+    if fmt == "xlsx":
+        return Response(
+            content=sheet_io.to_xlsx(rows),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers=disposition,
+        )
+    return Response(content=sheet_io.to_csv(rows), media_type="text/csv", headers=disposition)
+
+
+async def _group_views(db: DB, group_id: uuid.UUID) -> list[DNSView]:
+    res = await db.execute(select(DNSView).where(DNSView.group_id == group_id))
+    return list(res.scalars().all())
+
+
 @router.get(
     "/groups/{group_id}/zones/{zone_id}/export",
     # ``response_class`` REPLACES the documented application/json (#921);
     # a ``responses={200: {"content": ...}}`` entry merges with it instead,
-    # leaving the route declaring a JSON body it never produces.
+    # which is what adds the two spreadsheet types to text/dns here.
     response_class=DnsZoneResponse,
-    responses={200: {"description": "Zone file in master-file format"}},
+    responses=_SPREADSHEET_CONTENT,
 )
 async def export_zone(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
     db: DB,
     current_user: CurrentUser,
+    format: Literal["zone", "csv", "xlsx"] = Query(default="zone"),
 ) -> Response:
-    """Return the zone as an RFC 1035 zone file."""
+    """Return the zone as an RFC 1035 zone file (``format=zone``, the default),
+    or its records as a CSV / XLSX sheet for bulk editing (#2139)."""
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    if format in ("csv", "xlsx"):
+        rows = await sheet_io.zone_record_rows(db, zone)
+        return _sheet_response(rows, format, _sheet_filename(zone, format))
     records = await _load_zone_records(zone_id, db)
     text = write_zone_file(zone, records)
     ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
@@ -9166,6 +9244,512 @@ async def export_zone(
         content=text,
         media_type="text/dns",
         headers={"Content-Disposition": content_disposition(filename)},
+    )
+
+
+@router.get(
+    "/groups/{group_id}/zones/{zone_id}/import/template",
+    response_class=CsvResponse,
+    responses={200: {"content": {sheet_io.XLSX_MEDIA_TYPE: {}}}},
+)
+async def zone_import_template(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    format: Literal["csv", "xlsx"] = Query(default="csv"),
+) -> Response:
+    """A blank records sheet: the header row and one example per common type.
+    The examples carry ``id=EXAMPLE``, which import ignores (#2139)."""
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    filename = _sheet_filename(zone, format, template=True)
+    return _sheet_response(sheet_io.template_rows(), format, filename)
+
+
+class SheetRecordChange(BaseModel):
+    row: int | None = None
+    op: str
+    name: str
+    record_type: str
+    value: str
+    ttl: int | None = None
+    priority: int | None = None
+    weight: int | None = None
+    port: int | None = None
+    view: str | None = None
+    comment: str | None = None
+    existing_id: str | None = None
+    changed_fields: list[str] = Field(default_factory=list)
+    # Set on an unchanged row for a record an integration owns (IPAM, a pool):
+    # the import leaves it alone whatever the row says.
+    read_only: bool = False
+
+
+class SheetRowIssue(BaseModel):
+    row: int | None = None
+    reason: str
+    name: str | None = None
+    record_type: str | None = None
+    value: str | None = None
+
+
+class SheetImportPreviewResponse(BaseModel):
+    zone_id: uuid.UUID
+    zone_name: str
+    format: str
+    mode: str
+    row_count: int
+    examples_ignored: int
+    to_create: list[SheetRecordChange]
+    to_update: list[SheetRecordChange]
+    to_delete: list[SheetRecordChange]
+    unchanged: list[SheetRecordChange]
+    # A row with an error blocks the whole commit (never a partial import).
+    errors: list[SheetRowIssue]
+    # Rows / records left alone on purpose, each with its reason.
+    skipped: list[SheetRowIssue]
+
+
+class SheetImportCommitResponse(BaseModel):
+    zone_id: uuid.UUID
+    batch_id: uuid.UUID
+    format: str
+    mode: str
+    created: int
+    updated: int
+    deleted: int
+    unchanged: int
+    skipped: list[SheetRowIssue] = Field(default_factory=list)
+    target_serial: int | None = None
+    provider_warning: str | None = None
+
+
+def _validation_message(exc: ValidationError) -> str:
+    parts = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ()) if p != "__root__")
+        msg = str(err.get("msg", "invalid")).removeprefix("Value error, ")
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(parts)
+
+
+def _same_int(cell: Any, current: int | None) -> bool:
+    """Whether a sheet cell holds *current* (blank is None; ``"300"`` is 300)."""
+    if cell is None or current is None:
+        return cell is None and current is None
+    try:
+        return int(str(cell).strip()) == current
+    except ValueError:
+        return False
+
+
+def _sheet_row_validator(
+    zone: DNSZone, gated: dict[str, str], needs_absolute: bool
+) -> sheet_io.RowValidator:
+    """The record API's checks for one spreadsheet row, as a per-row verdict.
+
+    The same functions ``create_record`` / ``update_record`` call: the
+    ``RecordCreate`` schema (type, the RFC 2181 owner rule, the #2073 TTL
+    bounds), the per-type structured fields (#424), the value checks (#467 /
+    #597), absolute targets on PowerDNS (#2060), and BIND's check-names plus
+    the #2072 lengths (#1378). A refusal becomes the row's error message
+    instead of a 422. For a row that edits an existing record only what it
+    changes is re-judged, as on the record API, so a row that predates a rule
+    can still be re-saved with a new TTL.
+    """
+
+    def check(
+        row: sheet_io.SheetRow, view_id: uuid.UUID | None, target: DNSRecord | None
+    ) -> sheet_io.Candidate | str:
+        rtype = row.type or (target.record_type if target is not None else None)
+        if not row.name and target is None:
+            return "name is required"
+        if not rtype:
+            return "type is required"
+        if row.value is None:
+            return "value is required"
+        name = row.name if row.name is not None else target.name  # type: ignore[union-attr]
+        # A trailing dot makes a name absolute, as in a zone file: it must sit
+        # in this zone, and is stored relative. Without it the name is relative
+        # to the zone, as on the record API. (The record API strips a trailing
+        # dot and keeps the rest, so ``www.example.com.`` typed into a sheet
+        # would otherwise become ``www.example.com.example.com.``.)
+        stripped = name.strip()
+        if stripped.endswith(".") and stripped not in (".", "@."):
+            absolute = stripped.lower()
+            zone_abs = zone.name.lower() if zone.name.endswith(".") else zone.name.lower() + "."
+            if absolute == zone_abs:
+                name = "@"
+            elif absolute.endswith("." + zone_abs):
+                name = stripped[: -(len(zone_abs) + 1)]
+            else:
+                return (
+                    f"name {stripped!r} is not in the zone {zone_abs!r}; give the name "
+                    "relative to the zone, or end it with the zone's name"
+                )
+        # As the record API's update: what the row does not change is not
+        # re-judged, so a record whose TTL predates the #2073 bounds can still
+        # be re-imported with its TTL as it is.
+        ttl = row.ttl
+        keep_ttl = target is not None and _same_int(row.ttl, target.ttl)
+        try:
+            body = RecordCreate(
+                name=name,
+                record_type=rtype,
+                value=row.value,
+                ttl=None if keep_ttl else ttl,
+                priority=row.priority,
+                weight=row.weight,
+                port=row.port,
+                view_id=view_id,
+            )
+        except ValidationError as exc:
+            return _validation_message(exc)
+        if body.record_type in gated:
+            return gated[body.record_type]
+        name_changed = target is None or body.name.lower() != (target.name or "").lower()
+        value_changed = target is None or body.value.strip() != (target.value or "").strip()
+        try:
+            prio, weight, port = _normalize_record_struct_fields(
+                body.record_type, body.priority, body.weight, body.port
+            )
+            if value_changed:
+                _validate_address_record_value(body.record_type, body.value)
+                if needs_absolute:
+                    err = dotless_target_error(body.record_type, body.value, zone.name)
+                    if err is not None:
+                        return err
+            fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
+            if name_changed or value_changed:
+                _enforce_bind_check_names(
+                    body.record_type,
+                    fqdn,
+                    body.value,
+                    zone.name,
+                    check_owner=name_changed,
+                    check_target=value_changed,
+                )
+        except HTTPException as exc:
+            return str(exc.detail)
+        return sheet_io.Candidate(
+            row=row.row,
+            name=body.name,
+            record_type=body.record_type,
+            value=body.value,
+            ttl=target.ttl if keep_ttl and target is not None else body.ttl,
+            priority=prio,
+            weight=weight,
+            port=port,
+            view_id=view_id,
+            view=row.view,
+            comment=row.comment,
+        )
+
+    return check
+
+
+async def _plan_sheet_import(
+    db: DB, zone: DNSZone, file: UploadFile, mode: str
+) -> tuple[str, sheet_io.ImportPlan, dict[uuid.UUID, str]]:
+    if mode not in _SHEET_MODES:
+        raise HTTPException(status_code=422, detail=f"mode must be one of {list(_SHEET_MODES)}")
+    data = await file.read(_SHEET_MAX_UPLOAD_BYTES + 1)
+    if len(data) > _SHEET_MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Upload exceeds {_SHEET_MAX_UPLOAD_BYTES // (1024 * 1024)} MB",
+        )
+    try:
+        fmt, rows = sheet_io.parse_spreadsheet(data, file.filename or "", file.content_type)
+    except sheet_io.SpreadsheetError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    existing = await _load_zone_records(zone.id, db)
+    views = await _group_views(db, zone.group_id)
+    # The async checks run once per distinct type, as bulk_create_records does.
+    gated: dict[str, str] = {}
+    for rtype in sorted({(r.type or "").strip().upper() for r in rows if r.type}):
+        try:
+            await _check_driver_gated_record_type(rtype, zone.group_id, db)
+        except HTTPException as exc:
+            gated[rtype] = str(exc.detail)
+    needs_absolute = any(
+        r.type and r.value and dotless_target(r.type.strip().upper(), r.value) is not None
+        for r in rows
+    ) and await group_needs_absolute_targets(db, zone.group_id)
+
+    plan = sheet_io.plan_import(
+        rows,
+        existing,
+        views_by_name={v.name: v.id for v in views},
+        mode=mode,
+        validate=_sheet_row_validator(zone, gated, needs_absolute),
+    )
+    return fmt, plan, {v.id: v.name for v in views}
+
+
+def _sheet_change(
+    op: str, rec: DNSRecord | sheet_io.Candidate, views: dict[uuid.UUID, str], **extra: Any
+) -> SheetRecordChange:
+    fields: dict[str, Any] = {
+        "op": op,
+        "name": rec.name,
+        "record_type": rec.record_type,
+        "value": rec.value,
+        "ttl": rec.ttl,
+        "priority": rec.priority,
+        "weight": rec.weight,
+        "port": rec.port,
+        "view": views.get(rec.view_id) if rec.view_id else None,
+    }
+    if isinstance(rec, DNSRecord):
+        fields["comment"] = sheet_io.record_comment(rec)
+        fields["existing_id"] = str(rec.id)
+    else:
+        fields["comment"] = rec.comment
+    fields.update(extra)
+    return SheetRecordChange(**fields)
+
+
+def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
+    return SheetRowIssue(
+        row=i.row, reason=i.reason, name=i.name, record_type=i.record_type, value=i.value
+    )
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview",
+    response_model=SheetImportPreviewResponse,
+)
+async def import_zone_spreadsheet_preview(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    file: UploadFile = File(...),
+    mode: str = Form(default="merge"),
+) -> SheetImportPreviewResponse:
+    """Diff a CSV / XLSX records sheet against the zone (#2139). Writes nothing.
+
+    Each row is checked as the record API checks it; a bad row is an entry in
+    ``errors`` with its row number, never a 500. See ``docs/features/DNS.md``
+    for the columns and the match rule.
+    """
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    fmt, plan, views = await _plan_sheet_import(db, zone, file, mode)
+    return SheetImportPreviewResponse(
+        zone_id=zone.id,
+        zone_name=zone.name,
+        format=fmt,
+        mode=mode,
+        row_count=plan.row_count,
+        examples_ignored=plan.examples_ignored,
+        to_create=[_sheet_change("create", c, views, row=c.row) for c in plan.creates],
+        to_update=[
+            _sheet_change(
+                "update",
+                u.candidate,
+                views,
+                row=u.candidate.row,
+                existing_id=str(u.record.id),
+                changed_fields=["view" if f == "view_id" else f for f in u.changed],
+            )
+            for u in plan.updates
+        ],
+        to_delete=[_sheet_change("delete", r, views) for r in plan.deletes],
+        unchanged=[
+            _sheet_change(
+                "unchanged",
+                r,
+                views,
+                row=rownum,
+                read_only=sheet_io.managed_by(r) is not None,
+            )
+            for rownum, r in plan.unchanged
+        ],
+        errors=[_sheet_issue(i) for i in plan.errors],
+        skipped=[_sheet_issue(i) for i in plan.skipped],
+    )
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/commit",
+    response_model=SheetImportCommitResponse,
+    dependencies=[Depends(require_permission("write", "dns_record"))],
+)
+async def import_zone_spreadsheet_commit(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    file: UploadFile = File(...),
+    mode: str = Form(default="merge"),
+    confirm_zone: str | None = Form(default=None),
+) -> SheetImportCommitResponse:
+    """Apply a CSV / XLSX records sheet to the zone in one transaction (#2139).
+
+    Re-plans from the file (the preview is advisory) and refuses the whole
+    file while any row has an error. ``mode=replace`` deletes the records no
+    row matched and needs ``confirm_zone`` typed as the zone's name. Changes
+    are queued as record ops in one batch on one serial bump, like the
+    zone-file import, and audited as one ``dns_zone_import`` row.
+    """
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    if mode == "replace" and (confirm_zone or "").strip().rstrip(".").lower() != (
+        zone.name.rstrip(".").lower()
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "A replace deletes every record the file does not list: type the "
+                f"zone's name ({zone.name.rstrip('.')}) in confirm_zone to go ahead."
+            ),
+        )
+    _reject_if_synthesised_zone(zone, "import")
+    fmt, plan, views = await _plan_sheet_import(db, zone, file, mode)
+    if plan.errors:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    f"{len(plan.errors)} row(s) have errors; nothing was imported. "
+                    "Fix them and preview again."
+                ),
+                "errors": [_sheet_issue(i).model_dump() for i in plan.errors],
+            },
+        )
+    if plan.deletes and not user_has_permission(current_user, "delete", "dns_record"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: need 'delete' on 'dns_record'",
+        )
+
+    batch_id = uuid.uuid4()
+    delete_payloads: list[dict[str, Any]] = []
+    update_rows: list[DNSRecord] = []
+    create_rows: list[DNSRecord] = []
+    audit_changes: dict[str, list[dict[str, Any]]] = {"create": [], "update": [], "delete": []}
+
+    for rec in plan.deletes:
+        # The payload before the row goes: it names the row (#1230).
+        delete_payloads.append(record_op_payload(rec))
+        audit_changes["delete"].append(
+            {"name": rec.name, "type": rec.record_type, "value": rec.value}
+        )
+        await db.delete(rec)
+
+    for u in plan.updates:
+        rec, c = u.record, u.candidate
+        before = record_op_payload(rec)
+        rec.name = c.name
+        rec.fqdn = f"{c.name}.{zone.name}" if c.name != "@" else zone.name
+        rec.value = c.value
+        rec.ttl = c.ttl
+        rec.priority, rec.weight, rec.port = c.priority, c.weight, c.port
+        rec.view_id = c.view_id
+        if "comment" in u.changed:
+            tags = dict(rec.tags or {})
+            if c.comment:
+                tags[sheet_io.COMMENT_TAG] = c.comment
+            else:
+                tags.pop(sheet_io.COMMENT_TAG, None)
+            rec.tags = tags
+        audit_changes["update"].append(
+            {
+                "id": str(rec.id),
+                "name": c.name,
+                "type": c.record_type,
+                "value": c.value,
+                "fields": u.changed,
+            }
+        )
+        if not u.wire_changed:
+            continue  # a comment is ours alone; no server serves it
+        if u.renamed:
+            # #1773 — a rename is delete-at-old-name + create-at-new-name.
+            delete_payloads.append(before)
+            create_rows.append(rec)
+        else:
+            update_rows.append(rec)
+
+    for c in plan.creates:
+        rec = DNSRecord(
+            zone_id=zone.id,
+            view_id=c.view_id,
+            name=c.name,
+            fqdn=f"{c.name}.{zone.name}" if c.name != "@" else zone.name,
+            record_type=c.record_type,
+            value=c.value,
+            ttl=c.ttl,
+            priority=c.priority,
+            weight=c.weight,
+            port=c.port,
+            tags={sheet_io.COMMENT_TAG: c.comment} if c.comment else {},
+            created_by_user_id=current_user.id,
+        )
+        db.add(rec)
+        create_rows.append(rec)
+        audit_changes["create"].append({"name": c.name, "type": c.record_type, "value": c.value})
+
+    # Comment-only edits are written without a serial bump; everything a
+    # server serves goes out as record ops on one bump.
+    await db.flush()
+    target_serial, op_rows, provider_warning = await _queue_import_ops(
+        db, zone, deletes=delete_payloads, updates=update_rows, creates=create_rows
+    )
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="import",
+            resource_type="dns_zone_import",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            new_value={
+                "batch_id": str(batch_id),
+                "source": "spreadsheet",
+                "format": fmt,
+                "mode": mode,
+                "created": len(plan.creates),
+                "updated": len(plan.updates),
+                "deleted": len(plan.deletes),
+                "unchanged": len(plan.unchanged),
+                "skipped": [i.reason for i in plan.skipped],
+                "target_serial": target_serial,
+                "changes": audit_changes,
+            },
+            result="error" if provider_warning else "success",
+        )
+    )
+    collect_wake(dns_group_channel(zone.group_id))
+    await db.commit()
+    # #1539 — agentless ops are dispatched by the commit; read the outcome now.
+    provider_warning = provider_warning or _agentless_batch_warning(op_rows)
+    logger.info(
+        "dns_zone_spreadsheet_import",
+        batch_id=str(batch_id),
+        zone_id=str(zone.id),
+        format=fmt,
+        mode=mode,
+        created=len(plan.creates),
+        updated=len(plan.updates),
+        deleted=len(plan.deletes),
+        target_serial=target_serial,
+    )
+    return SheetImportCommitResponse(
+        zone_id=zone.id,
+        batch_id=batch_id,
+        format=fmt,
+        mode=mode,
+        created=len(plan.creates),
+        updated=len(plan.updates),
+        deleted=len(plan.deletes),
+        unchanged=len(plan.unchanged),
+        skipped=[_sheet_issue(i) for i in plan.skipped],
+        target_serial=target_serial,
+        provider_warning=provider_warning,
     )
 
 

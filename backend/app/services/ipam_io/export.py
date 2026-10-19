@@ -224,6 +224,12 @@ def _sanitize_cell(value: Any) -> Any:
     return value
 
 
+# Public names for the other spreadsheet exporters (the DNS zone records sheet,
+# #2139), so the escape stays one rule rather than a copy per exporter.
+FORMULA_TRIGGERS = _FORMULA_TRIGGERS
+sanitize_cell = _sanitize_cell
+
+
 # ── Serialisers ────────────────────────────────────────────────────────────────
 
 
