@@ -7198,6 +7198,17 @@ const SUBNET_STATUSES = [
 
 // ─── DNS Sync Modal ──────────────────────────────────────────────────────────
 
+// One missing row per IP, record type AND zone: an address with extra zones
+// (#2107) can be missing its A in more than one zone, and a key without the
+// zone collapsed those rows into one selection and one React key.
+function missingKey(m: {
+  ip_id: string;
+  record_type: string;
+  zone_id: string;
+}): string {
+  return `${m.ip_id}:${m.record_type}:${m.zone_id}`;
+}
+
 type DnsSyncScope =
   | { kind: "subnet"; id: string; label: string }
   | { kind: "block"; id: string; label: string }
@@ -7277,9 +7288,7 @@ function DnsSyncModal({
   // individual rows to skip suspected manual edits.
   useEffect(() => {
     if (!data) return;
-    setSelMissing(
-      new Set(data.missing.map((m) => m.ip_id + ":" + m.record_type)),
-    );
+    setSelMissing(new Set(data.missing.map((m) => missingKey(m))));
     setSelMismatched(new Set(data.mismatched.map((m) => m.record_id)));
     setSelStale(new Set(data.stale.map((s) => s.record_id)));
   }, [data]);
@@ -7298,12 +7307,13 @@ function DnsSyncModal({
       } catch (e) {
         setBackfillError((e as Error).message || "Backfill failed");
       }
-      // missing items keyed as `ip_id:record_type` so a single IP can have
-      // both A and PTR ticked or unticked independently. Backend just needs
-      // unique IP IDs to re-sync — sync_dns_record handles both records.
+      // missing items keyed as `ip_id:record_type:zone_id` so a single IP can
+      // have its A, its PTR and each extra-zone A (#2107) ticked or unticked
+      // independently. Backend just needs unique IP IDs to re-sync —
+      // sync_dns_record handles every record.
       const ipIds = new Set<string>();
       for (const m of data.missing) {
-        if (selMissing.has(m.ip_id + ":" + m.record_type)) ipIds.add(m.ip_id);
+        if (selMissing.has(missingKey(m))) ipIds.add(m.ip_id);
       }
       return commitFn({
         create_for_ip_ids: Array.from(ipIds),
@@ -7486,14 +7496,14 @@ function DnsSyncModal({
                   selected={selMissing.size}
                   onToggleAll={() =>
                     toggleAll(
-                      data.missing.map((m) => m.ip_id + ":" + m.record_type),
+                      data.missing.map((m) => missingKey(m)),
                       selMissing,
                       setSelMissing,
                     )
                   }
                 >
                   {data.missing.map((m) => {
-                    const key = m.ip_id + ":" + m.record_type;
+                    const key = missingKey(m);
                     return (
                       <DriftRow
                         key={key}
