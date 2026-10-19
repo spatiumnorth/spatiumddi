@@ -41,6 +41,7 @@ from app.models.overlay import OverlayNetwork
 from app.models.vrf import VRF
 from app.services.ai.tools.base import register_tool, tool_permission_allows
 from app.services.ai.tools.scope import token_allows_subnet, token_subnet_ids, token_zone_ids
+from app.services.integration_ownership import owning_integration
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
@@ -431,8 +432,10 @@ async def get_subnet_summary(
         "do_not_probe_reason": probe.reason,
         "do_not_probe_source": probe.source or None,
         # #2137 — the subnet's own display choice; null = the default rule
-        # (hidden for integration-owned / larger-than-/16 subnets).
+        # (hidden for integration-owned / larger-than-/16 subnets), so the
+        # owning integration rides alongside it.
         "show_free_ranges": subnet.show_free_ranges,
+        "integration_owner": owning_integration(subnet),
     }
 
 

@@ -41,7 +41,8 @@ the formatter handles the rest.
   than a /16 IPv4 (shorter than /48 IPv6, where gap rows are not drawn
   today); an explicit value always wins. Display only: Total /
   Allocated / Utilization, the Allocate IP button and Next available
-  are unchanged. `get_subnet` copilot tool reports the field.
+  are unchanged. The `get_subnet_summary` copilot tool reports
+  `show_free_ranges` and `integration_owner`.
 
 - **The Helm chart's migrate Job takes annotations, so it works under
   GitOps (#2114).** Under `helm template`, which is how Argo CD and

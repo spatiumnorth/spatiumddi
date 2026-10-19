@@ -113,3 +113,24 @@ async def test_integration_owner_is_derived_from_the_ownership_fk(
     assert out.integration_owner == "tailscale"
     assert out.show_free_ranges is None
     await db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_copilot_subnet_summary_reports_setting_and_owner(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from sqlalchemy import select
+
+    from app.services.ai.tools.ipam import SubnetSummaryArgs, get_subnet_summary
+
+    headers, sp, blk = await _setup(db_session)
+    body = await _create(client, headers, (sp, blk), "10.3.0.0/24", show_free_ranges=False)
+    user = (
+        (await db_session.execute(select(User).where(User.is_superadmin.is_(True))))
+        .scalars()
+        .first()
+    )
+    assert user is not None
+    out = await get_subnet_summary(db_session, user, SubnetSummaryArgs(subnet_id=body["id"]))
+    assert out["show_free_ranges"] is False
+    assert out["integration_owner"] is None
