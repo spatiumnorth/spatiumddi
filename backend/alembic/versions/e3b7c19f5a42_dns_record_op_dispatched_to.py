@@ -17,7 +17,7 @@ an agent, that did not record an instance, and is never read as "another
 instance".
 
 Revision ID: e3b7c19f5a42
-Revises: d7a2e94b1c60
+Revises: b3d7f1a82c54
 Create Date: 2026-10-17
 
 """
@@ -29,7 +29,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "e3b7c19f5a42"
-down_revision = "d7a2e94b1c60"
+down_revision = "b3d7f1a82c54"
 branch_labels = None
 depends_on = None
 
