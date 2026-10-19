@@ -107,6 +107,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The IPAM bulk-delete dialog kept describing what was submitted after
+  an approval policy took it (#2046).** With a `delete:subnet` approval
+  policy, bulk-deleting two subnets showed "2 of 2 submitted for
+  approval." under a dialog that now read "This will move 0 empty blocks
+  to Trash." and "I understand 0 empty Blocks will be moved to Trash.",
+  because the page clears its selection when the requests are filed and
+  the dialog recounted from it. The space and block views now freeze the
+  selection when the dialog opens, and the delete sends that same frozen
+  list, so the confirm describes exactly what goes out. A delete that
+  actually runs still closes the dialog and clears the selection as
+  before. A retry after a partial failure now resends only the items that
+  failed; it used to resend the ones already in Trash too, which came back
+  as fresh failures.
+
 - **A forward zone no longer inherits the group's DNS-over-TLS, so a
   plain-DNS upstream such as Tailscale's 100.100.100.100 resolves again
   (#2121).** When a server group forwarded over DoT (#50), every
