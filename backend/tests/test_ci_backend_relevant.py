@@ -100,6 +100,11 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_slot_image_url_scheme_1752.py": (
         "agent/supervisor/spatium_supervisor/appliance_state.py",
     ),
+    # #2071 — the bulk-allocate template vectors are shared with the console's
+    # live preview, so an edit to them must run the server's half too.
+    "test_ipam_bulk_allocate_template_vectors_2071.py": (
+        "frontend/src/lib/bulk-allocate-template.vectors.json"
+    ),
     "test_e911_held.py": (
         "frontend/default.conf.template",
         "charts/spatiumddi/templates/frontend-tls-config.yaml",

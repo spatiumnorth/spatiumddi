@@ -16,7 +16,13 @@
  */
 
 import { describe, expect, it, vi, afterEach } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { HeaderMenu, type HeaderMenuItem } from "./header-menu";
 
 afterEach(cleanup);
@@ -50,6 +56,108 @@ describe("open / close", () => {
     // without it, Escape drops focus to <body> and the next Tab
     // restarts from the top of the page.
     expect(document.activeElement).toBe(trigger);
+  });
+
+  it("closes on Escape after a mouse open, focus still on the trigger (#2047)", () => {
+    render(<HeaderMenu label="Zone" items={[item()]} />);
+    const trigger = screen.getByRole("button", { name: /Zone/ });
+    trigger.focus();
+    openMenu();
+    // Mouse open: focus never moved into the panel.
+    expect(document.activeElement).toBe(trigger);
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("closes on Escape pressed on <body> and does not reach a window handler", () => {
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    render(<HeaderMenu label="Zone" items={[item()]} />);
+    openMenu();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    window.removeEventListener("keydown", onWindow);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(onWindow).not.toHaveBeenCalled();
+  });
+
+  it("does not swallow Escape while the menu is closed", () => {
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    render(<HeaderMenu label="Zone" items={[item()]} />);
+    const trigger = screen.getByRole("button", { name: /Zone/ });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    window.removeEventListener("keydown", onWindow);
+    expect(onWindow).toHaveBeenCalledOnce();
+  });
+
+  it("leaves an Escape that ends an IME composition alone", () => {
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    render(<HeaderMenu label="Zone" items={[item()]} />);
+    openMenu();
+    fireEvent.keyDown(document.body, { key: "Escape", isComposing: true });
+    window.removeEventListener("keydown", onWindow);
+    expect(screen.getByRole("menu")).toBeTruthy();
+    expect(onWindow).toHaveBeenCalledOnce();
+  });
+
+  it("does not take an Escape from a layer that has focus outside the menu", () => {
+    // A palette or overlay opened by a shortcut while the menu was open:
+    // its Esc is its own, and focus must not jump back behind it.
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    render(
+      <>
+        <HeaderMenu label="Zone" items={[item()]} />
+        <input aria-label="palette" />
+      </>,
+    );
+    openMenu();
+    const input = screen.getByLabelText("palette");
+    // The click left focus on <body> (jsdom, like Safari, does not focus
+    // a clicked button), so no focusout reaches the menu and it stays
+    // open: this is the backstop guard on its own.
+    act(() => input.focus());
+    expect(screen.getByRole("menu")).toBeTruthy();
+    fireEvent.keyDown(input, { key: "Escape" });
+    window.removeEventListener("keydown", onWindow);
+    expect(onWindow).toHaveBeenCalledOnce();
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("closes when focus leaves for another control", () => {
+    render(
+      <>
+        <HeaderMenu label="Zone" items={[item()]} />
+        <HeaderMenu label="Data" items={[item({ key: "b", label: "Beta" })]} />
+      </>,
+    );
+    const zone = screen.getByRole("button", { name: /Zone/ });
+    const data = screen.getByRole("button", { name: /Data/ });
+    zone.focus();
+    openMenu("Zone");
+    // Tab to the next menu's trigger, open it from the keyboard: only one
+    // menu is ever open, so one Esc can never close two.
+    act(() => data.focus());
+    expect(screen.queryByRole("menu")).toBeNull();
+    fireEvent.keyDown(data, { key: "Enter" });
+    expect(screen.getAllByRole("menu")).toHaveLength(1);
+    fireEvent.keyDown(data, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(data);
+  });
+
+  it("removes its Escape listener when unmounted while open", () => {
+    const onWindow = vi.fn();
+    window.addEventListener("keydown", onWindow);
+    const { unmount } = render(<HeaderMenu label="Zone" items={[item()]} />);
+    openMenu();
+    unmount();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    window.removeEventListener("keydown", onWindow);
+    expect(onWindow).toHaveBeenCalledOnce();
   });
 
   it("closes on an outside mousedown", () => {

@@ -30,6 +30,7 @@ import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerChip } from "@/components/ownership/pickers";
 import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { useModuleOn } from "@/hooks/useModuleOn";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -220,13 +221,17 @@ function useResourcePool() {
     staleTime: 60_000,
   });
 
+  // #2130 — DHCP scopes can only be attached while core.dhcp is on; the
+  // reads would 404 otherwise.
+  const dhcpOn = useModuleOn("core.dhcp");
   const dhcpGroups = useQuery({
     queryKey: ["dhcp-groups", "all"],
     queryFn: () => dhcpApi.listGroups(),
     staleTime: 60_000,
+    enabled: dhcpOn,
   });
   const dhcpScopes = useQuery({
-    enabled: !!dhcpGroups.data,
+    enabled: dhcpOn && !!dhcpGroups.data,
     queryKey: ["dhcp-scopes", "all", (dhcpGroups.data ?? []).map((g) => g.id)],
     queryFn: async () => {
       const groups = dhcpGroups.data ?? [];
@@ -313,6 +318,7 @@ function ResourcesTab({
 }) {
   const qc = useQueryClient();
   const pool = useResourcePool();
+  const dhcpOn = useModuleOn("core.dhcp");
 
   const [addKind, setAddKind] = useState<ServiceResourceKind>("vrf");
   const [addId, setAddId] = useState<string>("");
@@ -427,11 +433,13 @@ function ResourcesTab({
               setAddId("");
             }}
           >
-            {RESOURCE_KINDS.map((k) => (
-              <option key={k} value={k}>
-                {RESOURCE_KIND_LABELS[k]}
-              </option>
-            ))}
+            {RESOURCE_KINDS.filter((k) => dhcpOn || k !== "dhcp_scope").map(
+              (k) => (
+                <option key={k} value={k}>
+                  {RESOURCE_KIND_LABELS[k]}
+                </option>
+              ),
+            )}
           </select>
           <select
             className={inputCls}

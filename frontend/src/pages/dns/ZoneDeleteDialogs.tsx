@@ -6,8 +6,11 @@ import { ConfirmDestroyModal } from "./ConfirmDestroyModal";
 // can restore rather than promising a DNS Editor they can undo it themselves.
 // "Permanent" belongs to the Trash page's purge and the superadmin
 // ?permanent=true path, not to these dialogs (#1880).
-const TRASH_WARNING =
-  "The zone and its records move to Trash. A superadmin can restore them from Administration → Trash.";
+function trashWarning(count: number): string {
+  return count === 1
+    ? "The zone and its records move to Trash. A superadmin can restore them from Administration → Trash."
+    : `The ${count} zones and all their records move to Trash. A superadmin can restore them from Administration → Trash.`;
+}
 
 export function DeleteZoneDialog({
   zoneName,
@@ -30,7 +33,7 @@ export function DeleteZoneDialog({
       description={`Move zone "${zoneName}" and all its records to Trash? The zone stops being served until a superadmin restores it from Administration → Trash.`}
       checkLabel={`I understand "${zoneName}" and all its records will be moved to Trash.`}
       confirmTitle="Move Zone to Trash"
-      warning={TRASH_WARNING}
+      warning={trashWarning(1)}
       confirmButtonLabel="Move to Trash"
       onConfirm={onConfirm}
       onClose={onClose}
@@ -67,7 +70,7 @@ export function BulkDeleteZonesDialog({
       }
       checkLabel={`I understand ${count} zone${s} and all their records will be moved to Trash.`}
       confirmTitle={`Move ${count} Zone${s} to Trash`}
-      warning={TRASH_WARNING}
+      warning={trashWarning(count)}
       confirmButtonLabel="Move to Trash"
       onConfirm={onConfirm}
       onClose={onClose}

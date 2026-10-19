@@ -119,11 +119,19 @@ async def reconcile_soa_timers(db: AsyncSession, group_id: uuid.UUID) -> bool | 
 
     # Decide again under the group's row lock, so that two agents reporting in
     # the same instant switch the group, and move its serials, once.
+    #
+    # FOR NO KEY UPDATE (#2031), the strength of the UPDATE this makes: it
+    # writes ``serves_soa_timers`` and zone serials, never a key. FOR UPDATE
+    # also blocks the FOR KEY SHARE every foreign-key check on the group and
+    # zone rows takes, and this transaction then waits for the group's server
+    # rows when it marks their bundles at commit: a writer of one of those
+    # rows whose foreign-key check reached the group (the worker's bundle
+    # render did) held the row this was waiting for, and waited for this.
     group = (
         await db.execute(
             select(DNSServerGroup)
             .where(DNSServerGroup.id == group_id)
-            .with_for_update()
+            .with_for_update(key_share=True)
             .execution_options(populate_existing=True)
         )
     ).scalar_one()
@@ -138,7 +146,7 @@ async def reconcile_soa_timers(db: AsyncSession, group_id: uuid.UUID) -> bool | 
             await db.execute(
                 select(DNSZone)
                 .where(DNSZone.group_id == group_id, _timers_not_literal())
-                .with_for_update()
+                .with_for_update(key_share=True)
                 .execution_options(include_deleted=True, populate_existing=True)
             )
         )

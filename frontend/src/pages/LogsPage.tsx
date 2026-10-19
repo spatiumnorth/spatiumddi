@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useSearchParams } from "react-router-dom";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import {
   Activity,
   AlertTriangle,
@@ -76,6 +77,8 @@ const TABS: readonly Tab[] = [
   "audit",
 ] as const;
 
+const DHCP_TABS: ReadonlySet<Tab> = new Set<Tab>(["dhcp-activity", "audit"]);
+
 export function LogsPage() {
   // ``?tab=`` entry point so other surfaces can deep-link a specific
   // tab — the Security dashboard's DNS-tunneling card needs to land on
@@ -84,8 +87,21 @@ export function LogsPage() {
   // shareable and survives a refresh.
   const [searchParams, setSearchParams] = useSearchParams();
   const requested = searchParams.get("tab") as Tab | null;
+  // #2130 — the DHCP tabs read DHCP logs, so they exist only while core.dhcp
+  // is on. A deep link to one with it off (or before the module set has
+  // loaded) lands on DNS Queries, not on a tab that is not there.
+  const { enabled: moduleEnabled, ready: modulesReady } = useFeatureModules();
+  const dhcpOn = modulesReady && moduleEnabled("core.dhcp");
+  // A DHCP deep link on a hard reload waits for the module set rather than
+  // mounting DNS Queries (and firing its query) for a moment first.
+  const awaitingModules =
+    !modulesReady && !!requested && DHCP_TABS.has(requested);
   const tab: Tab =
-    requested && TABS.includes(requested) ? requested : "dns-queries";
+    requested &&
+    TABS.includes(requested) &&
+    (dhcpOn || !DHCP_TABS.has(requested))
+      ? requested
+      : "dns-queries";
   const setTab = (next: Tab) => {
     const params = new URLSearchParams(searchParams);
     params.set("tab", next);
@@ -193,14 +209,16 @@ export function LogsPage() {
             label="DNS Threat"
             hint="Per-client tunneling / exfiltration scoring over the query log. Requires the security.dns_threat module (default off — it reads query content)."
           />
-          <TabButton
-            active={tab === "dhcp-activity"}
-            onClick={() => setTab("dhcp-activity")}
-            icon={Activity}
-            label="DHCP Activity"
-            hint="Kea DHCPv4 activity (DISCOVER / OFFER / REQUEST / ACK, lease alloc, declines)"
-            count={dhcpAgentSources.length || undefined}
-          />
+          {dhcpOn && (
+            <TabButton
+              active={tab === "dhcp-activity"}
+              onClick={() => setTab("dhcp-activity")}
+              icon={Activity}
+              label="DHCP Activity"
+              hint="Kea DHCPv4 activity (DISCOVER / OFFER / REQUEST / ACK, lease alloc, declines)"
+              count={dhcpAgentSources.length || undefined}
+            />
+          )}
           <TabButton
             active={tab === "events"}
             onClick={() => setTab("events")}
@@ -209,27 +227,31 @@ export function LogsPage() {
             hint="Windows DNS/DHCP service events (scope load, zone transfer, auth)"
             count={hasWindows ? sources?.length : undefined}
           />
-          <TabButton
-            active={tab === "audit"}
-            onClick={() => setTab("audit")}
-            icon={FileClock}
-            label="DHCP Audit"
-            hint="Windows DHCP per-lease events (grants, renewals, releases)"
-            count={
-              sources?.filter((s) => s.server_kind === "dhcp").length ||
-              undefined
-            }
-          />
+          {dhcpOn && (
+            <TabButton
+              active={tab === "audit"}
+              onClick={() => setTab("audit")}
+              icon={FileClock}
+              label="DHCP Audit"
+              hint="Windows DHCP per-lease events (grants, renewals, releases)"
+              count={
+                sources?.filter((s) => s.server_kind === "dhcp").length ||
+                undefined
+              }
+            />
+          )}
         </div>
       </div>
 
-      {tab === "dns-queries" && <DNSQueriesTab sources={dnsAgentSources} />}
+      {tab === "dns-queries" && !awaitingModules && (
+        <DNSQueriesTab sources={dnsAgentSources} />
+      )}
       {tab === "dns-threat" && <DNSThreatTab />}
-      {tab === "dhcp-activity" && (
+      {tab === "dhcp-activity" && dhcpOn && (
         <DHCPActivityTab sources={dhcpAgentSources} />
       )}
       {tab === "events" && <EventLogTab sources={tabSources} />}
-      {tab === "audit" && <DhcpAuditTab sources={tabSources} />}
+      {tab === "audit" && dhcpOn && <DhcpAuditTab sources={tabSources} />}
     </div>
   );
 }

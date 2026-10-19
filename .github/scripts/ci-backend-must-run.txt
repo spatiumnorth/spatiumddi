@@ -158,3 +158,9 @@ frontend/default.conf.template
 # proxy's value with $scheme.
 frontend/16-trusted-proxies.envsh
 charts/spatiumddi/templates/frontend-tls-config.yaml
+
+# test_ipam_bulk_allocate_template_vectors_2071.py (#2071) runs the server's
+# bulk-allocate hostname rule over the vectors the console's live preview is
+# tested against; editing them must run the backend half, or the two sides
+# could disagree with only the frontend job noticing.
+frontend/src/lib/bulk-allocate-template.vectors.json
