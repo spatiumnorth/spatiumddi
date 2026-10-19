@@ -215,7 +215,8 @@ async def test_every_alias_writer_sets_the_marker_and_hosts_do_not(
 async def test_rename_onto_an_own_alias_keeps_the_alias_an_alias(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Renaming onto an A alias's name leaves two rows at it; the alias stays one."""
+    """Renaming onto an A alias's name is refused (#2106, it used to leave two
+    rows at the name); the alias stays an alias and survives a rename away."""
     headers, sid, zone = await _setup(client, db_session)
     r = await _alloc(
         client, headers, sid, "10.98.5.40", "h1", aliases=[{"name": "www", "record_type": "A"}]
@@ -224,10 +225,10 @@ async def test_rename_onto_an_own_alias_keeps_the_alias_an_alias(
     put = await client.put(
         f"/api/v1/ipam/addresses/{ip_id}", headers=headers, json={"hostname": "www"}
     )
-    assert put.status_code == 200, put.text
+    assert put.status_code == 409, put.text
     listed = await client.get(f"/api/v1/ipam/addresses/{ip_id}/aliases", headers=headers)
     assert [a["name"] for a in listed.json()] == ["www"]
-    # Renaming away again moves the host only; the alias keeps answering.
+    # Renaming elsewhere moves the host only; the alias keeps answering.
     put = await client.put(
         f"/api/v1/ipam/addresses/{ip_id}", headers=headers, json={"hostname": "h3"}
     )
