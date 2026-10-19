@@ -1152,6 +1152,7 @@ async def check_kea_ha_version_skew() -> PreflightResult:
     unknown: list[str] = []
     groups: list[dict[str, Any]] = []
     off_appliance: list[str] = []
+    off_by_group: dict[str, list[str]] = {}
     for name, members in ha_groups.items():
         majors = {_kea_major(m["kea_version"]) for m in members}
         known = {m for m in majors if m is not None}
@@ -1168,7 +1169,9 @@ async def check_kea_ha_version_skew() -> PreflightResult:
         else:
             affected = False
         if affected:
-            off_appliance.extend(m["server_name"] for m in members if not m["on_appliance"])
+            outsiders = [m["server_name"] for m in members if not m["on_appliance"]]
+            off_by_group[name] = outsiders
+            off_appliance.extend(outsiders)
         groups.append(
             {
                 "group": name,
@@ -1191,19 +1194,22 @@ async def check_kea_ha_version_skew() -> PreflightResult:
         "off_appliance_members": off_appliance,
         "groups": groups,
     }
+
     # A member this run does not upgrade cannot be converged by it — say so,
-    # or "completing this upgrade fixes it" is false for that pair.
-    off_note = (
-        (
-            f" {'Members' if len(off_appliance) > 1 else 'Member'} "
-            f"{', '.join(off_appliance)} {'are' if len(off_appliance) > 1 else 'is'} "
-            "not on an appliance node, so this upgrade does not touch "
-            f"{'them' if len(off_appliance) > 1 else 'it'} — upgrade "
-            f"{'them' if len(off_appliance) > 1 else 'it'} separately to the same Kea major."
+    # or "completing this upgrade fixes it" is false for that pair. Only the
+    # outsiders of the groups the returned message names: a note naming a
+    # member of a group the message never mentions reads as belonging to it.
+    def off_note(named: list[str]) -> str:
+        names = [s for g in named for s in off_by_group.get(g, [])]
+        if not names:
+            return ""
+        many = len(names) > 1
+        return (
+            f" {'Members' if many else 'Member'} {', '.join(names)} "
+            f"{'are' if many else 'is'} not on an appliance node, so this upgrade "
+            f"does not touch {'them' if many else 'it'} — upgrade "
+            f"{'them' if many else 'it'} separately to the same Kea major."
         )
-        if off_appliance
-        else ""
-    )
 
     if mixed:
         return PreflightResult(
@@ -1213,7 +1219,8 @@ async def check_kea_ha_version_skew() -> PreflightResult:
                 f"Kea HA {'pairs' if len(mixed) > 1 else 'pair'} {', '.join(mixed)} "
                 "already span different Kea major versions, so HA lease sync is "
                 "broken right now. Completing this upgrade is what converges every "
-                "member onto one version — expect HA to stay degraded until it finishes." + off_note
+                "member onto one version — expect HA to stay degraded until it finishes."
+                + off_note(mixed)
             ),
             detail=detail,
         )
@@ -1226,7 +1233,8 @@ async def check_kea_ha_version_skew() -> PreflightResult:
                 "run Kea < 3.0. This upgrade moves nodes one at a time, and Kea 3.0's "
                 "HA hook cannot exchange lease updates with a pre-2.7 peer — so the "
                 "pair will fall out of sync until every member has crossed. DHCP keeps "
-                "serving throughout; only HA replication between the peers is affected." + off_note
+                "serving throughout; only HA replication between the peers is affected."
+                + off_note(pre_3)
             ),
             detail=detail,
         )
@@ -1237,7 +1245,7 @@ async def check_kea_ha_version_skew() -> PreflightResult:
             message=(
                 f"Kea version unknown for {'groups' if len(unknown) > 1 else 'group'} "
                 f"{', '.join(unknown)} (agent has not reported it yet). If those members "
-                "are on Kea < 3.0, HA will be degraded mid-upgrade." + off_note
+                "are on Kea < 3.0, HA will be degraded mid-upgrade." + off_note(unknown)
             ),
             detail=detail,
         )

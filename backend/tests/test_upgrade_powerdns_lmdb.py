@@ -229,3 +229,48 @@ def test_heartbeat_schema_still_forbids_unknown_fields() -> None:
 def test_heartbeat_schema_daemon_version_optional() -> None:
     """A pre-#638 agent doesn't send the field at all and must keep working."""
     assert AgentHeartbeatRequest.model_validate({}).daemon_version is None
+
+
+async def _approved(db: AsyncSession, hostname: str, **kw: object) -> Appliance:
+    a = Appliance(
+        hostname=hostname,
+        public_key_der=b"x",
+        public_key_fingerprint=uuid.uuid4().hex,
+        state=kw.pop("state", APPLIANCE_STATE_APPROVED),
+        deployment_kind="appliance",
+        **kw,
+    )
+    db.add(a)
+    await db.flush()
+    return a
+
+
+async def test_repaired_box_still_claimed_beside_its_revoked_row(db_session: AsyncSession) -> None:
+    """A re-paired appliance leaves its old row behind, revoked, under the same
+    hostname. Unlike the move/Fleet ownership rule, the preflight asks "is this
+    on SOME node the run touches", so the duplicate must not disable the match —
+    the approved twin still claims the row (#2179 narrowed the rule to approved
+    appliances; this pins that the narrowing does not lose a real node)."""
+    hostname = f"ddi-{uuid.uuid4().hex[:8]}"
+    await _approved(db_session, hostname, state="revoked")
+    await _approved(db_session, hostname.upper())
+    names = await _servers(db_session, [("powerdns", "4.9.5", None)], host=hostname, agent=True)
+    r = await check_powerdns_lmdb_migration()
+    assert r.level == "warn"
+    assert r.detail["pre_5_0"] == names
+
+
+async def test_appliance_mid_upgrade_still_claims(db_session: AsyncSession) -> None:
+    """The upgrade never moves an appliance out of ``approved`` — it records
+    progress in ``last_upgrade_state`` — so a node mid-roll (or one whose last
+    apply failed) is still a node this run touches. Pinned because the Plan is
+    re-read while a run is in flight."""
+    hostname = f"ddi-{uuid.uuid4().hex[:8]}"
+    await _approved(db_session, hostname, last_upgrade_state="in-progress")
+    other = f"ddi-{uuid.uuid4().hex[:8]}"
+    await _approved(db_session, other, last_upgrade_state="failed")
+    a = await _servers(db_session, [("powerdns", "4.9.5", None)], host=hostname, agent=True)
+    b = await _servers(db_session, [("powerdns", "4.9.5", None)], host=other, agent=True)
+    r = await check_powerdns_lmdb_migration()
+    assert r.level == "warn"
+    assert sorted(r.detail["pre_5_0"]) == sorted(a + b)

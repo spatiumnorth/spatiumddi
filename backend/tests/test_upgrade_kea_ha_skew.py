@@ -313,3 +313,26 @@ async def test_docker_supervisor_does_not_claim(db_session: AsyncSession) -> Non
     await _real_group(db_session, [("2.6.5", a1, "host", _URL), ("3.0.3", a2, "host", _URL)])
     r = await check_kea_ha_version_skew()
     assert r.level == "ok"
+
+
+async def test_off_appliance_note_names_only_the_reported_groups(db_session: AsyncSession) -> None:
+    """The message names the mixed-major group only (it returns first); the
+    docker member of a separate unknown-version group must not be appended to
+    it, or it reads as a member of the mixed pair."""
+    a1 = await _appliance(db_session)
+    a2 = await _appliance(db_session)
+    a3 = await _appliance(db_session)
+    mixed, _ = await _real_group(
+        db_session, [("2.6.5", a1, "host", _URL), ("3.0.3", a2, "host", _URL)]
+    )
+    unknown, servers = await _real_group(
+        db_session, [(None, a3, "host", _URL), ("3.0.3", None, "none", _URL)]
+    )
+    r = await check_kea_ha_version_skew()
+    assert r.level == "warn"
+    assert r.detail["mixed_major"] == [mixed]
+    assert r.detail["unknown_version"] == [unknown]
+    # Still in the detail, which lists every affected group's outsiders …
+    assert r.detail["off_appliance_members"] == [servers[1]]
+    # … but not in a message about a different group.
+    assert servers[1] not in r.message
