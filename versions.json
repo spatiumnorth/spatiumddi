@@ -254,7 +254,7 @@
     },
 
     "nginx": {
-      "version": "1.31.6-alpine",
+      "version": "1.31.7-alpine",
       "pinned_in": [
         { "path": "frontend/Dockerfile", "match": "FROM nginx:{version}", "count": 1 },
         { "path": "charts/spatiumddi-appliance/values.yaml", "match": "tag: {version}", "count": 1 },

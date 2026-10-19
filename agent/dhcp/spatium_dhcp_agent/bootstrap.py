@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+import threading
 import time
 
 import httpx
@@ -24,6 +25,7 @@ import structlog
 from . import __version__
 from .cache import load_or_create_agent_id, load_token, save_token
 from .config import AgentConfig
+from .ha_tls import AGENT_CAPABILITIES
 
 log = structlog.get_logger(__name__)
 
@@ -57,6 +59,9 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
         "fingerprint": _fingerprint(agent_id),
         "agent_id": agent_id,
         "version": __version__,
+        # Register's request model ignores unknown keys, so an older control
+        # plane accepts this unchanged.
+        "capabilities": list(AGENT_CAPABILITIES),
     }
     backoff = 2.0
     while True:
@@ -100,3 +105,88 @@ def ensure_token(cfg: AgentConfig) -> tuple[str, str]:
         return agent_id, token
     agent_id, token, _ = register(cfg)
     return agent_id, token
+
+
+# #2052 — one re-bootstrap at a time. The sync loop and the heartbeat both see
+# the same 401/404 within moments of each other; the second must find the
+# token already replaced rather than register a second row.
+_reauth_lock = threading.Lock()
+
+#: A re-registration within this many seconds of the previous one counts as a
+#: repeat, and waits before registering. A 401/404 is answered by registering,
+#: and a successful register returns at once, so a token the control plane
+#: keeps refusing straight after minting it (two agents sharing one agent id
+#: off a cloned state dir overwrite each other's token hash; replicas that
+#: disagree on the signing key) would otherwise loop register → poll → 401 as
+#: fast as the network allows. The container restart this replaced was paced
+#: by the orchestrator's restart back-off; this is that pacing.
+REAUTH_REPEAT_WINDOW_SECONDS = 60.0
+REAUTH_REPEAT_MAX_DELAY_SECONDS = 300.0
+_last_reauth_at: float | None = None
+_reauth_streak = 0
+_reauth_generation = 0
+
+
+def reauth_generation() -> int:
+    """How many times this process has re-registered (#2052).
+
+    A re-registration after a 404 lands on a NEW server row, which has seen
+    none of the per-server reports a fresh process sends at startup. Workers
+    that send such reports compare this counter with the value they last saw
+    and resend them when it moves — whichever thread happened to register.
+    """
+    return _reauth_generation
+
+
+def _repeat_delay(now: float) -> float:
+    """Seconds to wait before this re-registration; 0 for the first in a while."""
+    global _reauth_streak
+    if _last_reauth_at is None or now - _last_reauth_at >= REAUTH_REPEAT_WINDOW_SECONDS:
+        _reauth_streak = 0
+        return 0.0
+    _reauth_streak += 1
+    base = min(5.0 * 2 ** (_reauth_streak - 1), REAUTH_REPEAT_MAX_DELAY_SECONDS)
+    return base + random.uniform(0, 2)
+
+
+def reauthenticate(cfg: AgentConfig, token_ref: list[str], stale_token: str) -> str:
+    """Replace a rejected token in place, from the PSK. Returns the live token.
+
+    Called from the sync / heartbeat threads on a 401 or 404 (token expired,
+    or the server row was deleted). It drops the cached token and registers
+    again WITHOUT ending the calling thread, so the supervisor's dead-thread
+    watch never fires and the daemon keeps serving from its cached config
+    (non-negotiable #5) — the previous behaviour stopped the thread, which
+    made the supervisor exit the container and took the daemon down with it.
+
+    ``register`` retries with jittered backoff (cap 5 min) until the control
+    plane answers, so an unreachable control plane or a wrong PSK waits and
+    retries instead of spinning or exiting. A re-registration repeated within
+    ``REAUTH_REPEAT_WINDOW_SECONDS`` of the last one waits first, doubling up
+    to 5 min. Another thread may have refreshed the token while this one
+    waited for the lock; then nothing is registered.
+    """
+    global _last_reauth_at, _reauth_generation
+    with _reauth_lock:
+        if token_ref[0] != stale_token:
+            return token_ref[0]
+        delay = _repeat_delay(time.monotonic())
+        if delay:
+            log.warning(
+                "reauthenticate_repeated_backoff", delay_s=round(delay, 1), streak=_reauth_streak
+            )
+            time.sleep(delay)
+        save_token(cfg.state_dir, "")
+        _agent_id, token, _ = register(cfg)
+        token_ref[0] = token
+        _last_reauth_at = time.monotonic()
+        _reauth_generation += 1
+        return token
+
+
+def _reset_reauth_state() -> None:
+    """Tests only: forget earlier re-registrations."""
+    global _last_reauth_at, _reauth_streak, _reauth_generation
+    _last_reauth_at = None
+    _reauth_streak = 0
+    _reauth_generation = 0

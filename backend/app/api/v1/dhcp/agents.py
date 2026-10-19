@@ -13,7 +13,7 @@ import ipaddress
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
@@ -26,6 +26,7 @@ from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    collect_wake,
     dhcp_wake_channels,
     wake_subscription,
 )
@@ -86,6 +87,23 @@ LONGPOLL_POLL_INTERVAL = 2.0
 AGENT_CAPABLE_DRIVERS = frozenset({"kea"})
 
 
+def _record_capabilities(server: DHCPServer, reported: list[str]) -> None:
+    """Store what the agent says it renders; wake its group when that changes.
+
+    The HA peer credential is gated on every Kea member advertising
+    ``ha_peer_tls`` (``services/dhcp/ha_peer_auth.py``), so the moment the last
+    member of a pair upgrades, BOTH members' bundles change. Waking the group
+    channel makes the partner — parked in its long-poll — pick that up now
+    rather than on the safety tick, which keeps the window where one side has
+    switched and the other has not to seconds.
+    """
+    caps = sorted(set(reported))
+    if (server.agent_capabilities or []) == caps and server.agent_capabilities is not None:
+        return
+    server.agent_capabilities = caps
+    collect_wake(*dhcp_wake_channels(server))
+
+
 class AgentRegisterRequest(BaseModel):
     # Bounds mirror the columns these land in (DHCPServer.name/host 255,
     # .driver 50, .agent_fingerprint 128, DHCPServerGroup.name 255) — an
@@ -98,6 +116,11 @@ class AgentRegisterRequest(BaseModel):
     group_name: str | None = Field(default=None, max_length=255)
     fingerprint: str = Field(max_length=128)
     agent_id: str | None = None
+    # What this agent renders (e.g. ``["ha_peer_tls"]``). Optional: an agent
+    # that predates the field registers exactly as before.
+    capabilities: list[Annotated[str, Field(max_length=64)]] | None = Field(
+        default=None, max_length=32
+    )
 
     @field_validator("driver")
     @classmethod
@@ -138,6 +161,13 @@ class AgentHeartbeatRequest(BaseModel):
     # this model is extra="forbid", so an undeclared field would 422 every
     # heartbeat from a current agent.
     kea_version: str | None = None
+    # What this agent renders, e.g. ``["ha_peer_tls"]``. Absent from an agent
+    # that predates the field, which the handler records as "nothing" — so a
+    # node rolled BACK to an older agent closes the HA peer-credential gate
+    # again rather than being left a credential its Kea will not load.
+    capabilities: list[Annotated[str, Field(max_length=64)]] | None = Field(
+        default=None, max_length=32
+    )
     daemon: dict[str, Any] = {}
     # #882 — the agent's last config-apply verdict:
     # ``{status, etag, failed_etag, phase, error}``. See the DNS agent's
@@ -503,6 +533,7 @@ async def agent_register(
             agent_approved=not require_approval,
             agent_fingerprint=body.fingerprint,
             agent_version=body.version,
+            agent_capabilities=sorted(set(body.capabilities or [])),
             description=(
                 f"auto-registered agent v{body.version}" if body.version else "auto-registered"
             ),
@@ -520,6 +551,7 @@ async def agent_register(
         server.roles = body.roles
         server.status = "active"
         server.agent_version = body.version
+        _record_capabilities(server, body.capabilities or [])
         server.agent_registered = True
         if server.agent_id is None:
             server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
@@ -917,6 +949,18 @@ async def agent_config_longpoll(
                                 "max_response_delay_ms": bundle.failover.max_response_delay_ms,
                                 "max_ack_delay_ms": bundle.failover.max_ack_delay_ms,
                                 "max_unacked_clients": bundle.failover.max_unacked_clients,
+                                # HA peer credential (PEM). Absent until every
+                                # Kea member advertises ``ha_peer_tls``; an
+                                # agent that predates it ignores the key.
+                                "tls": (
+                                    {
+                                        "ca_pem": bundle.failover.tls_ca_pem,
+                                        "cert_pem": bundle.failover.tls_cert_pem,
+                                        "key_pem": bundle.failover.tls_key_pem,
+                                    }
+                                    if bundle.failover.tls_key_pem
+                                    else None
+                                ),
                             }
                             if bundle.failover is not None
                             else None
@@ -1005,6 +1049,7 @@ async def agent_heartbeat(
     # make the HA-skew preflight fall back to "unknown" for no reason.
     if body.kea_version:
         server.kea_version = body.kea_version
+    _record_capabilities(server, body.capabilities or [])
 
     # Phase 8f-2 — persist whatever slot state the agent reported. Only
     # overwrite when the agent actually sent a value (older agents

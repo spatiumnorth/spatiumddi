@@ -10,6 +10,7 @@ import httpx
 import structlog
 
 from . import __version__, features
+from .bootstrap import reauthenticate
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
@@ -147,6 +148,7 @@ class HeartbeatClient:
         # supervisor's heartbeat (one producer instead of three).
         # The DNS service container drops the host bind mounts in C1
         # so it can no longer read those signals anyway.
+        sent_token = self.token_ref[0]
         try:
             with self._client() as c:
                 resp = c.post(
@@ -172,15 +174,10 @@ class HeartbeatClient:
                     save_token(self.cfg.state_dir, rotated)
                     log.info("dns_agent_token_rotated")
             elif resp.status_code in (401, 404):
-                # Issue #248 — mirror sync.py's 401/404 recovery path.
-                # 401 = token expired / invalid; 404 = the server row
-                # was deleted on the control plane. Both recover by
-                # the same path: drop cached token + stop the thread.
-                # The supervisor's dead-thread watch exits the
-                # container; the next start re-bootstraps from PSK.
-                # Pre-#248 the heartbeat just spam-warned until sync
-                # noticed the same 401 (could be a full heartbeat
-                # interval later).
+                # Issue #248 / #2052 — 401 = token expired / invalid; 404 =
+                # the server row was deleted. Re-register from the PSK in
+                # this thread; stopping it would have the supervisor exit the
+                # container and stop the daemon that is serving from cache.
                 log.warning(
                     "heartbeat_will_rebootstrap",
                     status=resp.status_code,
@@ -188,8 +185,7 @@ class HeartbeatClient:
                         "token_invalid" if resp.status_code == 401 else "server_missing"
                     ),
                 )
-                save_token(self.cfg.state_dir, "")
-                self._stop.set()
+                reauthenticate(self.cfg, self.token_ref, sent_token)
             else:
                 log.warning("heartbeat_failed", status=resp.status_code)
         except httpx.HTTPError as e:
