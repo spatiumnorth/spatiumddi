@@ -37,6 +37,7 @@ class MaintenanceStatusArgs(BaseModel):
 
 @register_tool(
     name="maintenance_status",
+    honours_token_binding=True,
     permission="authenticated",
     description=(
         "Report whether SpatiumDDI is in system-wide maintenance mode "

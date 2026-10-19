@@ -2183,7 +2183,7 @@ export function DashboardPage() {
         )}
 
         {/* ── DNS query rate (DNS tab only) ──────────────────────────── */}
-        {tab === "dns" && (
+        {tab === "dns" && dnsOn && (
           <WidgetErrorBoundary title="DNS query rate">
             <DNSQueryRateCard dnsServers={allDnsServers} />
           </WidgetErrorBoundary>
@@ -2473,7 +2473,7 @@ export function DashboardPage() {
         )}
 
         {/* ── DNS tab: Server list ──────────────────────────────────── */}
-        {tab === "dns" && allDnsServers.length > 0 && (
+        {tab === "dns" && dnsOn && allDnsServers.length > 0 && (
           <div className="rounded-lg border bg-card">
             <div className="flex items-center justify-between border-b px-4 py-2.5">
               <div className="flex items-center gap-2">
@@ -2514,7 +2514,7 @@ export function DashboardPage() {
             </div>
           </div>
         )}
-        {tab === "dns" && allDnsServers.length === 0 && (
+        {tab === "dns" && dnsOn && allDnsServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
             <Globe2 className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
             <p className="text-sm font-medium">No DNS servers registered</p>
@@ -4531,11 +4531,20 @@ function ConformityPanel() {
 //     soon (left), circuit alerts + orphan services + overlay
 //     impact (right).
 function NetworkPanel() {
-  const { data, isLoading } = useQuery<NetworkDashboardSummary>({
+  const { data, isLoading, isError } = useQuery<NetworkDashboardSummary>({
     queryKey: ["dashboards", "network"],
     queryFn: () => dashboardsApi.networkSummary(),
     refetchInterval: 60_000,
   });
+
+  if (isError) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        Network signals are unavailable. Your role may not include read access
+        to ASNs, circuits, services or overlays.
+      </div>
+    );
+  }
 
   if (isLoading || !data) {
     return (
@@ -4823,11 +4832,20 @@ function NetworkKpi({
 // Overview tab (the legacy one is per-target chips, this one is the
 // rollup-driven tab body).
 function IntegrationsDashboardTabPanel() {
-  const { data, isLoading } = useQuery<IntegrationsDashboardSummary>({
+  const { data, isLoading, isError } = useQuery<IntegrationsDashboardSummary>({
     queryKey: ["dashboards", "integrations"],
     queryFn: () => dashboardsApi.integrationsSummary(),
     refetchInterval: 30_000,
   });
+
+  if (isError) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        Integration health is unavailable. Your role may not include read access
+        to any integration.
+      </div>
+    );
+  }
 
   if (isLoading || !data) {
     return (

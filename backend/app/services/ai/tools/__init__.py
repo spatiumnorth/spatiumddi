@@ -80,6 +80,7 @@ from app.services.ai.tools.base import (
     ToolPermissionDenied,
     ToolRegistry,
     effective_tool_names,
+    is_rate_limit_refusal,
     register_tool,
 )
 
@@ -93,4 +94,5 @@ __all__ = [
     "ToolPermissionDenied",
     "register_tool",
     "effective_tool_names",
+    "is_rate_limit_refusal",
 ]

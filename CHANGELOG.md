@@ -135,6 +135,213 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Allocate IP no longer drops an alias that another record already
+  holds (#2122).** Allocate IP and next-IP skipped, without a word, an
+  alias whose zone, name and type another record already held: the
+  request succeeded and the alias did not exist. Both now answer 409
+  naming the alias and what holds it (an alias or the host record of
+  another address, or an operator record), as adding a single alias
+  from Edit IP does, and nothing is written: no address row, no host
+  record, no other alias. Names compare case-insensitively. Adding an
+  alias the address already has is a no-op that returns it with 200, for
+  a CNAME as well as an A, rather than a 409, and is not audited as a
+  create.
+  The same alias given twice in one request is written once.
+
+- **Upgrade note for #2121: a forward zone's own transport needs
+  upgraded agents.** An agent from before this release ignores the
+  zone's `forward_transport` and `forward_tls_hostname` and forwards
+  every forward zone the way the group forwards: over the group's
+  transport, checked against the group's certificate name. So until
+  the DNS agents (BIND9 and Technitium) are upgraded, a zone whose
+  transport or hostname differs from the group's does not get it. In a
+  DoT group, a zone on plain DNS still goes out over TLS and fails
+  against a Do53-only upstream, as before this release; a DoT zone
+  with another provider's hostname (a group on `cloudflare-dns.com`, a
+  zone forwarding to Quad9 as `dns.quad9.net`) fails certificate
+  verification, and every name in the zone SERVFAILs. In a plain-DNS
+  group, a zone set to DoT is still forwarded in plaintext. Upgrade
+  the DNS agents before giving a zone a transport or hostname different
+  from its group's. A zone that matches its group works on old and new
+  agents alike.
+
+- **The zone move preview reports a forward transport the target group
+  cannot serve (#2121 follow-up).** Moving a forward zone to another
+  server group (#935) re-checks the zone's own `forward_transport`
+  against the target: a DoH or DoQ zone cannot land on a BIND9 group,
+  and a TLS zone cannot land on Windows DNS. Only the commit refused
+  that; the preview said nothing, so the operator learned of it after
+  filling in the move. The preview now returns the refusal as
+  `forward_transport_refusal`, shown in the move dialog with the move
+  blocked, and in the `preview_dns_zone_move` Copilot tool. The preview
+  and the commit run the same check that zone create and update run, so
+  they cannot disagree. The 422 for a forward zone whose forwarders
+  present two TLS certificate names now names the zone, its forwarders
+  and its `forward_tls_hostname`, rather than repeating the group-level
+  wording that said one hostname applies to "the whole group".
+
+- **Copilot and MCP network tools share the Tools page's per-user rate
+  limit.** The `/api/v1/tools/*` routes cap each user at 20 on-prem
+  probes and 8 off-prem lookups per minute. The copilot and MCP tools
+  that run the same probes (`network_ping`, `network_traceroute`,
+  `network_dig`, `forward_dns`, `reverse_dns`, `network_port_test`,
+  `network_tls_cert`, `lookup_mac_vendor`, `ping_host`, `tls_cert_check`)
+  and off-prem lookups (`network_whois`, `lookup_whois_ip` / `_asn` /
+  `_domain`, `find_ct_log_entries`) had no limit.
+  Each now declares its budget with `rate_limit=` on `register_tool`, and
+  `ToolRegistry.call` spends it from the same per-user Redis counter the
+  REST route uses, so a user has one budget whichever surface they use.
+  A call past the budget does not run; it returns a refusal naming the
+  limit and the wait, which MCP marks `isError`. As on the REST routes,
+  the limit is not enforced while Redis is unreachable. A call the tool's
+  permission refuses, or whose arguments fail validation, spends nothing. A
+  test walks every function each tool reaches and fails any tool that
+  sends traffic without declaring a budget or a recorded exemption.
+
+- **An address can no longer be named after one of its own aliases
+  (#2106).** Renaming an address onto its own A / AAAA alias left two
+  identical rows at the name, and deleting the alias afterwards queued
+  a delete for an RR the host record still claimed, so the host's own
+  record vanished from the served zone while IPAM still showed it. A
+  CNAME alias there put a CNAME beside the host's address record. The
+  edit, the extra-zone edit and the bulk DNS-zone change now answer
+  409, in the wording of the alias CNAME rule (#2080), naming the
+  alias; nothing is written. Creating an A / AAAA alias at the
+  address's own host name is refused the same way. Background paths
+  (DDNS, lease mirrors, integrations, importers) do not fail and write
+  no duplicate: on an A / AAAA alias they retract the old name and log
+  `ipam_dns_record_skipped_own_alias`, which leaves the zone as a
+  correct rename would (the alias already answers the new name, and the
+  PTR names it); on a CNAME alias they keep the existing CNAME skip,
+  which also retracts the PTR. A duplicate that already exists is left
+  as it is.
+
+- **A record op the split-horizon render retires is stamped like
+  any applied op (#2108).** In a DNS group with views, the bundle
+  render retires a server's queued record ops as `applied`, but
+  `retire_queued_ops` set only the state: `applied_at` stayed NULL,
+  `attempts` 0 and `updated_at` at creation, so
+  `GET /dns/servers/{id}/pending-ops` reported an applied op with no
+  time and no attempt for every record change. It now goes through
+  `_mark_applied`, the helper the dispatch path uses, so the op
+  reads `applied_at` and `updated_at` set, has any earlier error and
+  retry time cleared, and counts one more attempt (the render
+  delivered it once).
+
+- **Turning DNS off hides DNS everywhere and stops the `/dns` calls
+  that 404ed (#2135).** The DNS counterpart of #2130: `core.dns` hid
+  the DNS sidebar but left DNS pickers, panels and reads elsewhere.
+  Every one is now gated on `ready && enabled("core.dns")` through
+  the shared `useModuleOn` hook: the IPAM zone pickers (Add, Edit and
+  Bulk-edit IP, Bulk allocate), DNS aliases, the DNS column, the
+  Sync DNS entries and drift banner, the DNS and DDNS tabs of the
+  space / block / subnet dialogs, the IP detail zones and DNS
+  linkage, the DNS server group pickers on all eleven integration
+  forms, the Subnet Planner and IPAM Templates pickers, Services
+  (DNS zone resources), API tokens (zone binding), the Domain
+  detail Linked DNS Zones tab, the Cutover plan DNS half, Fleet's
+  DNS roles and group, the Logs DNS tabs and the four Settings DNS
+  sections. A stored value (a template's DNS group, an
+  integration's `dns_group_id`) is never cleared by saving a form
+  that no longer shows it. The Logs page keeps a valid default tab
+  with DNS off (DHCP Activity) and with both off (Event Log), and a
+  hard reload waits for the module set before mounting a tab that
+  reads `/dns`. Backend: the Fleet role assignment (REST and the
+  Copilot's `assign_appliance_role`) refuses a newly added DNS role
+  with a 422 while `core.dns` is off. An appliance that already
+  holds one can still be re-saved or have it removed, and the DNS
+  agent routers stay outside the module gate on purpose. Swapping to
+  another DNS engine is refused too, since it brings up a new DNS
+  service. The IPAM Templates DDNS tab now needs both DHCP and DNS,
+  as the IPAM dialogs' DDNS tab does.
+
+- **An API token bound to specific DNS zones or subnets only reaches
+  the Operator Copilot / MCP tools that narrow their answers to those
+  zones or subnets.** The tools' permission check looks at the resource
+  type, so a token bound to one zone cleared it for every DNS tool, and
+  the tools that list server groups, servers, views or query rates, or
+  count IPAM resources estate-wide, answered as though the token were
+  unbound. The tool registry now refuses an instance-bound token any
+  tool that does not declare `honours_token_binding`, for `tools/list`,
+  MCP `tools/call` and in-app chat alike, the same structural floor the
+  REST routers have. The tools that do declare it (zone and record
+  lists, per-zone DNSSEC / drift / update-ACL reads, the IPAM space /
+  block / subnet / address reads, tag lookup and global search) already
+  filter or gate on the bound instances, and a test pins the list and
+  checks each one against a second zone and subnet. The IPAM tools that
+  accept a space or block by name resolve it only within the binding, so a
+  name outside it reads as not found. Sessions and unbound tokens are
+
+- **Dashboard rollups and the DNS / DHCP traffic series read with the
+  caller's own grants.** `GET /metrics/dns/timeseries` now needs `read` on a
+  DNS type (`dns_group` / `dns_zone` / `dns_record`, as the `/dns` routes do)
+  and `GET /metrics/dhcp/timeseries` needs `read` on `dhcp_server`; both
+  previously answered any signed-in account. The Network and Integrations
+  dashboard tabs need `read` on at least one of the types they summarise and
+  fill only the panels the caller can read — an integration's panel and its
+  recent reconciler errors appear only with `read` on that integration — and
+  say so instead of loading forever when the role covers none of them; the
+  DNS query-rate and DHCP traffic cards likewise say the data is unavailable
+  rather than "No data yet". The tag autocomplete (`GET /tags/keys`,
+  `/tags/values`) offers only tags from tables the caller can read. The
+  built-in Viewer (`read *`) sees everything it saw before. A new guard test
+  walks the route table and fails for any `GET` route with no permission
+  dependency unless it is listed with the reason (pre-sign-in, agent or token
+  authenticated, own rows, static reference data, or checked in the handler);
+  see `docs/PERMISSIONS.md`.
+
+- **The IPAM bulk-delete dialog kept describing what was submitted after
+  an approval policy took it (#2046).** With a `delete:subnet` approval
+  policy, bulk-deleting two subnets showed "2 of 2 submitted for
+  approval." under a dialog that now read "This will move 0 empty blocks
+  to Trash." and "I understand 0 empty Blocks will be moved to Trash.",
+  because the page clears its selection when the requests are filed and
+  the dialog recounted from it. The space and block views now freeze the
+  selection when the dialog opens, and the delete sends that same frozen
+  list, so the confirm describes exactly what goes out. A delete that
+  actually runs still closes the dialog and clears the selection as
+  before. A retry after a partial failure now resends only the items that
+  failed; it used to resend the ones already in Trash too, which came back
+  as fresh failures.
+
+- **A forward zone no longer inherits the group's DNS-over-TLS, so a
+  plain-DNS upstream such as Tailscale's 100.100.100.100 resolves again
+  (#2121).** When a server group forwarded over DoT (#50), every
+  conditional forward zone in it was forced onto DoT too: the zone's
+  queries went to port 853 over TLS, checked against the group
+  provider's certificate name. A forward zone usually points at
+  something internal that answers plain DNS on port 53 only (Tailscale
+  MagicDNS, an AD domain controller, a cloud VPC resolver), so every
+  name in it failed, and an explicit `@53` still got TLS appended. The
+  transport is now the zone's own setting: `forward_transport` on the
+  zone (`do53` by default, `tls`, plus `https` / `quic` on a
+  Technitium-only group) with `forward_tls_hostname`, on the zone API,
+  the add / edit forward-zone form, the zone detail and the
+  `list_dns_zones` Copilot tool. The group's transport now applies to
+  the group's resolver forwarders only. A TLS zone gets its own BIND
+  `tls` statement with its own `remote-hostname`; an entry with an
+  explicit `@53` is always plain DNS, on BIND9 and Technitium. The API
+  refuses an encrypted zone with no hostname, a transport a server in
+  the group cannot speak, an encrypted zone whose forwarders span two
+  certificate names (the #877 rule), and a plain-DNS zone pointed at an
+  encrypted-only upstream. The control-plane config preview renders
+  zone forwarders through the same helper as the agent, which also
+  fixes it emitting `ip@port` verbatim as an unloadable `1.1.1.1@53;`.
+  **Behaviour change:** the upgrade sets every existing forward zone to
+  plain DNS, including zones in groups that forward over TLS today. A
+  zone that really did want DoT must be switched back on the zone, with
+  its TLS hostname. That includes any forward zone pointed at a resolver
+  that answers only over TLS (Mullvad, or an internal DoT-only
+  resolver): it stops resolving at the upgrade until its transport is
+  set back to DNS-over-TLS, and the API now refuses to save a catalogued
+  encrypted-only upstream on plain DNS. **The fix is in the DNS agent:** an agent older than
+  this release ignores the zone's transport and keeps inheriting the
+  group's, so upgrade the DNS agents with the control plane. A new agent
+  talking to an older control plane treats every forward zone as plain
+  DNS. A zone on plain DNS ships no transport in the agent bundle, so a
+  group that does not use the setting keeps its bundle etag across the
+  upgrade and no agent reloads for it.
+
 - **The BIND9 importer reads zones declared with their class
   (#2099).** `zone "x" IN { ... };` is valid BIND, and it is how
   RHEL's and Fedora's stock `named.conf` writes every zone, but the
@@ -6052,6 +6259,12 @@ the formatter handles the rest.
   A / AAAA named like the address's hostname in its forward or an extra
   zone (or the row `ip_address.dns_record_id` names) stays false; the
   rest are aliases. Downgrade drops the column.
+- `c4f8a2e61d37` — #2121, schema + data: adds
+  `dns_zone.forward_transport` (String(10), NOT NULL, server default
+  `'do53'`) and nullable `dns_zone.forward_tls_hostname`
+  (String(255)). The server default is the backfill: every existing
+  zone, including a forward zone in a group that forwards over TLS,
+  becomes `do53`. Downgrade drops both columns.
 
 ## 2026.10.02-1 — 2026-10-02
 

@@ -167,6 +167,9 @@ export function IPDetailModal({
   const dhcpOn = useModuleOn("core.dhcp");
   // #2100 — the NAT badge goes with the ``ipam.nat`` module.
   const natOn = useModuleOn("ipam.nat");
+  // #2135 — zones, the DNS linkage and the alias count are DNS state: hidden
+  // while core.dns is off (the stored values are untouched).
+  const dnsOn = useModuleOn("core.dns");
   const zoneNames = zoneNameById ?? {};
 
   // Wake-on-LAN (#533) — self-contained like the "Re-profile now" action.
@@ -451,41 +454,56 @@ export function IPDetailModal({
                 )}
               </span>
             </Field>
-            <Field label="Forward DNS zone">
-              {addr.forward_zone_id ? (
-                <span className="font-mono text-xs">
-                  {/* #516 — zoneNameById is now supplied by the caller (it was
+            {dnsOn && (
+              <Field label="Forward DNS zone">
+                {addr.forward_zone_id ? (
+                  <span className="font-mono text-xs">
+                    {/* #516 — zoneNameById is now supplied by the caller (it was
                       previously never passed, so this always rendered "—").
                       Fall back to the raw id if the map lacks the zone. */}
-                  {zoneNames[addr.forward_zone_id] ?? addr.forward_zone_id}
-                </span>
-              ) : (
-                dash(null)
-              )}
-            </Field>
-            <Field label="Reverse DNS zone">
-              {addr.reverse_zone_id ? (
-                <span className="font-mono text-xs">
-                  {zoneNames[addr.reverse_zone_id] ?? addr.reverse_zone_id}
-                </span>
-              ) : (
-                dash(null)
-              )}
-            </Field>
-            <Field label={dhcpOn ? "DNS / DHCP linkage" : "DNS linkage"}>
-              <span className="space-x-2 text-[11px] text-muted-foreground">
-                {addr.dns_record_id && <span>A-record</span>}
-                {dhcpOn && addr.dhcp_lease_id && <span>· DHCP lease</span>}
-                {dhcpOn && addr.static_assignment_id && (
-                  <span>· DHCP static</span>
+                    {zoneNames[addr.forward_zone_id] ?? addr.forward_zone_id}
+                  </span>
+                ) : (
+                  dash(null)
                 )}
-                {!addr.dns_record_id &&
-                  !(dhcpOn && addr.dhcp_lease_id) &&
-                  !(dhcpOn && addr.static_assignment_id) &&
-                  dash(null)}
-              </span>
-            </Field>
-            {isDefaultGatewayHostname(addr.hostname) &&
+              </Field>
+            )}
+            {dnsOn && (
+              <Field label="Reverse DNS zone">
+                {addr.reverse_zone_id ? (
+                  <span className="font-mono text-xs">
+                    {zoneNames[addr.reverse_zone_id] ?? addr.reverse_zone_id}
+                  </span>
+                ) : (
+                  dash(null)
+                )}
+              </Field>
+            )}
+            {(dnsOn || dhcpOn) && (
+              <Field
+                label={
+                  dnsOn
+                    ? dhcpOn
+                      ? "DNS / DHCP linkage"
+                      : "DNS linkage"
+                    : "DHCP linkage"
+                }
+              >
+                <span className="space-x-2 text-[11px] text-muted-foreground">
+                  {dnsOn && addr.dns_record_id && <span>A-record</span>}
+                  {dhcpOn && addr.dhcp_lease_id && <span>· DHCP lease</span>}
+                  {dhcpOn && addr.static_assignment_id && (
+                    <span>· DHCP static</span>
+                  )}
+                  {!(dnsOn && addr.dns_record_id) &&
+                    !(dhcpOn && addr.dhcp_lease_id) &&
+                    !(dhcpOn && addr.static_assignment_id) &&
+                    dash(null)}
+                </span>
+              </Field>
+            )}
+            {dnsOn &&
+              isDefaultGatewayHostname(addr.hostname) &&
               (hasForwardZone ?? !!addr.forward_zone_id) && (
                 <div className="sm:col-span-2">
                   <GatewayHostnameNote />
@@ -494,10 +512,10 @@ export function IPDetailModal({
           </div>
 
           {/* Counters row */}
-          {((addr.alias_count ?? 0) > 0 ||
+          {((dnsOn && (addr.alias_count ?? 0) > 0) ||
             (natOn && (addr.nat_mapping_count ?? 0) > 0)) && (
             <div className="flex flex-wrap items-center gap-2 text-[11px]">
-              {(addr.alias_count ?? 0) > 0 && (
+              {dnsOn && (addr.alias_count ?? 0) > 0 && (
                 <span className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400">
                   +{addr.alias_count} alias
                   {addr.alias_count === 1 ? "" : "es"}

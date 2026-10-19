@@ -122,6 +122,12 @@ import {
   zoneKindForName,
 } from "@/lib/dnsNames";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
+import {
+  ZONE_FORWARD_TRANSPORT_LABELS,
+  type ZoneForwardTransport,
+  zoneTransportError,
+  zoneTransportOptions,
+} from "@/lib/zone-forward-transport";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
@@ -2579,9 +2585,9 @@ export function ZoneModal({
     queryFn: () => dnsApi.listGroups(),
     staleTime: 30_000,
   });
-  const technitiumApi = (
-    groupList?.find((g) => g.id === groupId)?.server_drivers ?? []
-  ).includes("technitium_api");
+  const groupDrivers =
+    groupList?.find((g) => g.id === groupId)?.server_drivers ?? [];
+  const technitiumApi = groupDrivers.includes("technitium_api");
   // Client-side FQDN check (create only — the name is locked on edit).
   const nameErr = !zone && name.trim() ? fqdnError(name) : null;
   // #986 — TLD scope hint under the name field. Classified server-side so
@@ -2609,6 +2615,30 @@ export function ZoneModal({
     (zone?.forwarders ?? []).join(", "),
   );
   const [forwardOnly, setForwardOnly] = useState(zone?.forward_only ?? true);
+  // #2121 — the zone's OWN upstream transport, default plain DNS. The
+  // group's forward transport applies to its resolver forwarders only.
+  const [forwardTransport, setForwardTransport] =
+    useState<ZoneForwardTransport>(zone?.forward_transport ?? "do53");
+  const [forwardTlsHostname, setForwardTlsHostname] = useState(
+    zone?.forward_tls_hostname ?? "",
+  );
+  const transportChoices = zoneTransportOptions(groupDrivers);
+  // A stored transport this group can no longer offer stays visible.
+  if (!transportChoices.includes(forwardTransport)) {
+    transportChoices.push(forwardTransport);
+  }
+  const transportErr = zoneTransportError(
+    forwardTransport,
+    forwardTlsHostname,
+    groupDrivers,
+  );
+  // The API holds an edit to the transport only when the transport or its
+  // hostname changes, so a zone stored before the check stays editable; the
+  // form shows the problem but blocks the save on the same terms.
+  const transportChanged =
+    !zone ||
+    forwardTransport !== (zone.forward_transport ?? "do53") ||
+    forwardTlsHostname.trim() !== (zone.forward_tls_hostname ?? "");
   // Secondary / stub primaries (issue #336) — the master IPs (ip or
   // ip@port) this zone transfers FROM. Only shown / submitted for
   // secondary + stub types.
@@ -2691,8 +2721,17 @@ export function ZoneModal({
         setError("Forward zones need at least one forwarder IP");
         return;
       }
+      if (transportErr && transportChanged) {
+        setError(transportErr);
+        return;
+      }
       payload.forwarders = fwds;
       payload.forward_only = forwardOnly;
+      payload.forward_transport = forwardTransport;
+      // The hostname field is hidden on plain DNS; a value left in it from
+      // an earlier choice is not the operator's intent for this save.
+      payload.forward_tls_hostname =
+        forwardTransport === "do53" ? null : forwardTlsHostname.trim() || null;
     }
     if (zoneType === "secondary" || zoneType === "stub") {
       const masters = mastersText
@@ -2806,6 +2845,41 @@ export function ZoneModal({
                 </option>
               </select>
             </Field>
+            <Field label="Upstream transport">
+              <select
+                className={inputCls}
+                value={forwardTransport}
+                onChange={(e) =>
+                  setForwardTransport(e.target.value as ZoneForwardTransport)
+                }
+              >
+                {transportChoices.map((t) => (
+                  <option key={t} value={t}>
+                    {ZONE_FORWARD_TRANSPORT_LABELS[t]}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <p className="text-[11px] text-muted-foreground">
+              This zone&apos;s own setting. It does not follow the group&apos;s
+              forwarder transport: an internal resolver such as an AD domain
+              controller or Tailscale&apos;s 100.100.100.100 answers plain DNS
+              only. An entry with an explicit <code>@53</code> is always sent as
+              plain DNS.
+            </p>
+            {forwardTransport !== "do53" && (
+              <Field label="TLS hostname (the upstream certificate's name)">
+                <input
+                  className={inputCls}
+                  value={forwardTlsHostname}
+                  onChange={(e) => setForwardTlsHostname(e.target.value)}
+                  placeholder="dns.quad9.net"
+                />
+              </Field>
+            )}
+            {transportErr && (
+              <p className="text-xs text-destructive">{transportErr}</p>
+            )}
           </div>
         )}
         {(zoneType === "secondary" || zoneType === "stub") && (
@@ -3470,7 +3544,8 @@ function MoveZoneModal({
       preview.acl_names_lost.length > 0 ||
       preview.key_names_lost.length > 0 ||
       !!preview.technitium_api_refusal ||
-      !!preview.tsig_algorithm_refusal);
+      !!preview.tsig_algorithm_refusal ||
+      !!preview.forward_transport_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -3534,6 +3609,11 @@ function MoveZoneModal({
             {preview.tsig_algorithm_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.tsig_algorithm_refusal}
+              </div>
+            )}
+            {preview.forward_transport_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.forward_transport_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
@@ -4338,6 +4418,35 @@ function ZoneDetailView({
                   {zone.forward_only
                     ? "Queries are sent only to the forwarders. If they all fail, BIND returns SERVFAIL — it never falls back to recursion."
                     : "Queries are sent to the forwarders first. If they all fail, BIND falls back to normal recursion via the root servers."}
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded border bg-card px-4 py-3 text-sm">
+              <div className="text-xs font-medium text-muted-foreground">
+                Upstream transport
+              </div>
+              <div className="mt-1">
+                <span className="font-mono">
+                  {
+                    ZONE_FORWARD_TRANSPORT_LABELS[
+                      zone.forward_transport ?? "do53"
+                    ]
+                  }
+                </span>
+                {zone.forward_transport &&
+                  zone.forward_transport !== "do53" && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Certificate checked against{" "}
+                      <span className="font-mono">
+                        {zone.forward_tls_hostname ?? "—"}
+                      </span>
+                      .
+                    </p>
+                  )}
+                <p className="mt-1 text-xs text-muted-foreground">
+                  The zone&apos;s own setting; the group&apos;s forwarder
+                  transport does not apply to it.
                 </p>
               </div>
             </div>
@@ -7849,11 +7958,12 @@ function OptionsTab({ groupId }: { groupId: string }) {
           {forwardTransport !== "do53" && (
             <>
               <p className="text-xs text-muted-foreground">
-                Applies to the forwarders configured above, and to per-zone
-                forwarders. Forwarders default to port 853 unless one pins its
-                own. BIND has no client-side HTTP or QUIC transport, so the
-                https and quic options are rejected for a group containing a
-                BIND9 server — use a Technitium-only group for those.
+                Applies to the forwarders configured above only. A conditional
+                forward zone has its own transport, set on the zone. Forwarders
+                default to port 853 unless one pins its own. BIND has no
+                client-side HTTP or QUIC transport, so the https and quic
+                options are rejected for a group containing a BIND9 server — use
+                a Technitium-only group for those.
               </p>
               {forwardTransport === "tls" && (
                 <label className="flex items-center gap-2 cursor-pointer text-sm">
