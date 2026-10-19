@@ -68,6 +68,10 @@ the formatter handles the rest.
 
 ### Changed
 
+- **nginx 1.31.6 → 1.31.7-alpine (#2161)** for the frontend image and the
+  appliance landing page, which the bake array and chart values carry as
+  well, so all five copies move together.
+
 - **Dependency pins current (#1625): GoBGP 4.9.0 → 4.10.0 and the
   vendored Swagger UI bundle 5.33.0 → 5.33.1.** GoBGP 4.10.0's own
   go.mod pins the x/net, x/text and grpc versions the Looking Glass
