@@ -516,6 +516,43 @@ def test_importing_reads_the_real_proc(tmp_path, monkeypatch) -> None:
     assert mod.importing([held, idle]) == set()
 
 
+def test_importing_knows_the_tarball_by_another_name(tmp_path, monkeypatch) -> None:
+    """k3s may open the tarball under a name that is not ours: through a bind
+    mount, or a symlinked directory. The kernel's fd link then reads that
+    name, so a path compare misses the import and verify would touch the
+    tarball k3s is importing, which is #2109 again. A hard link stands in for
+    a bind mount: the same file under a path no realpath() turns into ours."""
+    mod = _load(monkeypatch)
+    images, other = tmp_path / "images", tmp_path / "bind"
+    images.mkdir()
+    other.mkdir()
+    ours = images / "pg.tar.zst"
+    ours.write_bytes(b"x")
+    os.link(ours, other / "pg.tar.zst")
+    (tmp_path / "linked").symlink_to(images)
+    monkeypatch.setattr(mod, "PROC_DIR", Path("/proc"))
+    for name in (other / "pg.tar.zst", tmp_path / "linked" / "pg.tar.zst"):
+        with open(name, "rb"):
+            assert mod.importing([ours]) == {ours}, name
+    assert mod.importing([ours]) == set()
+
+
+def test_importing_skips_a_process_that_exits_mid_scan(tmp_path, monkeypatch) -> None:
+    """A pid listed in /proc can be gone by the time its fds are read, and an
+    fd can close between its readlink and its stat. Neither is an error."""
+    mod = _load(monkeypatch)
+    tarball = tmp_path / "pg.tar.zst"
+    tarball.write_bytes(b"x")
+    proc = tmp_path / "proc"
+    (proc / "41").mkdir(parents=True)                                  # exited: no fd dir
+    (proc / "42" / "fd").mkdir(parents=True)
+    (proc / "42" / "fd" / "3").symlink_to(tmp_path / "gone.tar.zst")   # closed mid-scan
+    (proc / "43" / "fd").mkdir(parents=True)
+    (proc / "43" / "fd" / "7").symlink_to(tarball)
+    monkeypatch.setattr(mod, "PROC_DIR", proc)
+    assert mod.importing([tarball]) == {tarball}
+
+
 # ── firstboot ────────────────────────────────────────────────────────────────
 
 

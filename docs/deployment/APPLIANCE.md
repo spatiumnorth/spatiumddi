@@ -2758,7 +2758,10 @@ introduced by an upgrade don't clobber operator-created ones.
    re-import whatever is missing, never one it is still
    importing (`spatium-k3s-images verify --repair`, #1630).
    It waits at most what is left of firstboot's 10-minute
-   start timeout.
+   start timeout. If k3s is still importing when that runs
+   out, the slot is not committed; once
+   `spatium-k3s-images verify` passes, **Approve trial** in
+   Fleet keeps it before the next reboot reverts it.
 7. On health-OK: `grub-set-default <new_slot>` commits the
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack

@@ -120,6 +120,8 @@ def test_a_trial_boot_with_an_image_missing_does_not_commit(tmp_path) -> None:
     )
     assert proc.returncode == 1, "a trial boot that does not commit must leave firstboot failed"
     assert "trial boot: NOT committing this slot; next reboot reverts." in proc.stderr
+    # #2109 — a slow import is not a bad slot; the operator is told how to keep it.
+    assert "Fleet (Approve trial, on this node's slot) before the next reboot." in proc.stderr
     assert (tmp_path / "helper.log").read_text().split()[:2] == ["verify", "--repair"]
 
 
@@ -166,7 +168,8 @@ def _budget_args(tmp_path: Path, uptime: str) -> list[str]:
     ("uptime", "expected"),
     [
         ("echo 400", ["--max-wait", "255"]),   # 600 - (400 - 100) - 45
-        ("echo 700", ["--max-wait", "60"]),    # past the budget: the floor
+        ("echo 650", ["--max-wait", "10"]),    # 5 s left: the floor, a verdict before systemd's kill
+        ("echo 700", ["--max-wait", "10"]),    # past the budget: the floor
         ("echo 0", ["--max-wait", "600"]),     # a clock behind T0: never past the unit's timeout
         ("return 1", ["--max-wait", "600"]),   # /proc/uptime unreadable: read as 0, capped
     ],

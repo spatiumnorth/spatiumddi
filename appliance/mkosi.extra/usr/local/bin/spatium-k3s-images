@@ -237,11 +237,24 @@ def importing(tarballs: list[Path]) -> set[Path]:
     """The tarballs some process holds open right now: the ones k3s is
     importing (#2109). Reads every ``/proc/<pid>/fd``, which needs root, as
     firstboot is. An fd that cannot be read counts as not open, so without
-    the access this answers "nothing" and verify judges as it did before."""
-    wanted = {os.path.realpath(t): t for t in tarballs}
+    the access this answers "nothing" and verify judges as it did before.
+
+    An fd is matched by its file's (device, inode), not by the path its link
+    reads: the kernel spells that path through the mount the opener used, so
+    a bind mount or a symlinked directory gives the same file another name.
+    Only links naming a ``*.tar.zst`` are stat'd, which keeps one scan to a
+    readlink per fd on the host (a few thousand, a few milliseconds)."""
+    by_id: dict[tuple[int, int], Path] = {}
+    for t in tarballs:
+        try:
+            st = os.stat(t)
+        except OSError:
+            continue
+        by_id[(st.st_dev, st.st_ino)] = t
     busy: set[Path] = set()
-    if not wanted:
+    if not by_id:
         return busy
+    suffix = TARBALL_GLOB.lstrip("*")
     try:
         pids = [p for p in PROC_DIR.iterdir() if p.name.isdigit()]
     except OSError:
@@ -254,11 +267,16 @@ def importing(tarballs: list[Path]) -> set[Path]:
             continue
         for fd in fds:
             try:
-                target = os.readlink(fd.path)
+                if not os.readlink(fd.path).endswith(suffix):
+                    continue
+                # stat through the fd: the open file itself, whatever its name
+                st = os.stat(fd.path)
             except OSError:
+                # the process closed it, or exited, between the two calls
                 continue
-            if target in wanted:
-                busy.add(wanted[target])
+            hit = by_id.get((st.st_dev, st.st_ino))
+            if hit is not None:
+                busy.add(hit)
     return busy
 
 

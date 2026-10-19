@@ -127,8 +127,12 @@ the formatter handles the rest.
   touches one that is, and judges once none is. It waits at most what
   is left of firstboot's 10-minute start timeout, and if k3s is still
   importing then it reports that and does not commit, rather than
-  calling an unfinished import a missing image. On a node whose
-  import finished long ago it judges at once, as before.
+  calling an unfinished import a missing image, and names the Fleet
+  action (Approve trial) that keeps the slot once the import is over.
+  An open tarball is recognised by its inode rather than its path, so
+  a tarball k3s opened under another name (a bind mount, a symlinked
+  directory) still counts as being imported. On a node whose import
+  finished long ago it judges at once, as before.
 
 - **The BIND9 importer reads zones declared with their class
   (#2099).** `zone "x" IN { ... };` is valid BIND, and it is how
