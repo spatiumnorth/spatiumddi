@@ -159,6 +159,35 @@ the formatter handles the rest.
   group that does not use the setting keeps its bundle etag across the
   upgrade and no agent reloads for it.
 
+- **Upgrade note for #2121: a TLS forward zone with a different
+  provider's hostname than its group needs upgraded agents.** Until
+  a DNS agent is upgraded, it renders every forward zone with the
+  group's `tls` statement, so it checks the upstream against the
+  group's certificate name, not the zone's. A zone set to DNS-over-TLS
+  with a `forward_tls_hostname` for a different provider than the group
+  (a group on `cloudflare-dns.com`, a zone forwarding to Quad9 as
+  `dns.quad9.net`) therefore fails certificate verification on an old
+  agent, and every name in the zone SERVFAILs. Upgrade the DNS agents
+  before switching such a zone to its own provider, or keep the zone's
+  hostname equal to the group's until they are upgraded. A zone on
+  plain DNS, or a TLS zone using the group's own hostname, works on old
+  and new agents alike.
+
+- **The zone move preview reports a forward transport the target group
+  cannot serve (#2121 follow-up).** Moving a forward zone to another
+  server group (#935) re-checks the zone's own `forward_transport`
+  against the target: a DoH or DoQ zone cannot land on a BIND9 group,
+  and a TLS zone cannot land on Windows DNS. Only the commit refused
+  that; the preview said nothing, so the operator learned of it after
+  filling in the move. The preview now returns the refusal as
+  `forward_transport_refusal`, shown in the move dialog with the move
+  blocked, and in the `preview_dns_zone_move` Copilot tool. The preview
+  and the commit run the same check that zone create and update run, so
+  they cannot disagree. The 422 for a forward zone whose forwarders
+  present two TLS certificate names now names the zone, its forwarders
+  and its `forward_tls_hostname`, rather than repeating the group-level
+  wording that said one hostname applies to "the whole group".
+
 - **The BIND9 importer reads zones declared with their class
   (#2099).** `zone "x" IN { ... };` is valid BIND, and it is how
   RHEL's and Fedora's stock `named.conf` writes every zone, but the

@@ -434,6 +434,7 @@ async def preview_dns_zone_move(
         "key_names_lost": plan.key_names_lost,
         "technitium_api_refusal": plan.technitium_api_refusal,
         "tsig_algorithm_refusal": plan.tsig_algorithm_refusal,
+        "forward_transport_refusal": plan.forward_transport_refusal,
         "warnings": plan.warnings,
         "required_acknowledgements": plan.required_acknowledgements,
     }
