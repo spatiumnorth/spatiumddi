@@ -1148,6 +1148,18 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     forward_only: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
+    # A forward zone's OWN upstream transport (#2121): ``do53`` | ``tls``, plus
+    # ``https`` | ``quic`` on a Technitium group. It does NOT inherit the
+    # group's ``DNSServerOptions.forward_transport`` — that one applies to the
+    # group's resolver forwarders only. A conditional forwarder usually points
+    # at something internal that speaks plain DNS (Tailscale MagicDNS, an AD
+    # DC), and inheriting the group's DoT sent it TLS it never answers.
+    # ``forward_tls_hostname`` is the name the upstream's certificate is
+    # checked against; required for every encrypted transport.
+    forward_transport: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="do53", server_default=sa_text("'do53'")
+    )
+    forward_tls_hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Primary (master) server IPs this zone transfers FROM (issue #336).
     # Required + non-empty for ``zone_type`` in {secondary, stub}: a

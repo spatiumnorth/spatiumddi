@@ -199,13 +199,17 @@ function useResourcePool() {
     staleTime: 60_000,
   });
 
+  // #2135 — DNS zones can only be attached while core.dns is on; the reads
+  // would 404 otherwise.
+  const dnsOn = useModuleOn("core.dns");
   const dnsGroups = useQuery({
     queryKey: ["dns-groups", "all"],
     queryFn: () => dnsApi.listGroups(),
     staleTime: 60_000,
+    enabled: dnsOn,
   });
   const dnsZones = useQuery({
-    enabled: !!dnsGroups.data,
+    enabled: dnsOn && !!dnsGroups.data,
     queryKey: ["dns-zones", "all", (dnsGroups.data ?? []).map((g) => g.id)],
     queryFn: async () => {
       const groups = dnsGroups.data ?? [];
@@ -319,6 +323,7 @@ function ResourcesTab({
   const qc = useQueryClient();
   const pool = useResourcePool();
   const dhcpOn = useModuleOn("core.dhcp");
+  const dnsOn = useModuleOn("core.dns");
 
   const [addKind, setAddKind] = useState<ServiceResourceKind>("vrf");
   const [addId, setAddId] = useState<string>("");
@@ -433,13 +438,14 @@ function ResourcesTab({
               setAddId("");
             }}
           >
-            {RESOURCE_KINDS.filter((k) => dhcpOn || k !== "dhcp_scope").map(
-              (k) => (
-                <option key={k} value={k}>
-                  {RESOURCE_KIND_LABELS[k]}
-                </option>
-              ),
-            )}
+            {RESOURCE_KINDS.filter(
+              (k) =>
+                (dhcpOn || k !== "dhcp_scope") && (dnsOn || k !== "dns_zone"),
+            ).map((k) => (
+              <option key={k} value={k}>
+                {RESOURCE_KIND_LABELS[k]}
+              </option>
+            ))}
           </select>
           <select
             className={inputCls}
