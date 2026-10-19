@@ -135,6 +135,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An OOM-killed Kea is reported, so the server row reads not
+  serving and the alert fires (#2023).** The DHCP side of #2018. When
+  Kea reached the dhcp-kea container's memory limit the container was
+  killed and restarted into the same config, and the DHCP server row
+  read ok through every kill: the DHCP agent kept no OOM record, and on
+  the appliance the kubelet kills the whole container, agent included.
+  The appliance supervisor already reported the kubelet's `OOMKilled`
+  for `dhcp-kea`; the control plane now maps it onto the live Kea row
+  (from the supervisor heartbeat and over the restarted agent's `ok`,
+  timed from the kill), as the DNS side does. On Docker Compose the
+  DHCP agent now reads the container cgroup's `oom_kill` counter, keeps
+  a record across restarts and reports it on the heartbeat ahead of the
+  sync loop's own `ok`. Either way the row reads not serving and the
+  existing default-on Agent daemon not serving alert fires; no new
+  column, rule or migration. A plain Helm install has no supervisor and
+  is not covered (see DHCP.md 4d).
+
 - **A DNS record change made while an agent is replaced reaches the new
   agent at once, not five minutes later (#2042).** When a DNS agent is
   replaced (its pod rolls after a slot upgrade, a container restarts),
