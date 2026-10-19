@@ -27,6 +27,42 @@ the formatter handles the rest.
 
 ### Added
 
+- **A zone's records export and import as CSV / XLSX, for bulk
+  editing in a spreadsheet (#2139).** The zone's Data menu gains
+  Export CSV, Export XLSX, Download template and Import CSV / XLSX,
+  beside the zone file. One row per record, with `priority` / `weight`
+  / `port`, `view` and `comment` as their own columns and the record's
+  `id` so a re-import edits the same record: a row with an `id`
+  updates that record (a rename included), a row without one matches
+  by view, name, type and value, or is added. Merge (default) never
+  deletes; replace deletes what the sheet does not list and needs the
+  zone's name typed back. Every row runs the record API's own checks
+  and a bad one is a per-row error with its row number; the commit
+  refuses the whole file while any remain. Records IPAM or an
+  integration owns are never changed or deleted; CNAME-rule clashes
+  are skipped with the reason, as in the zone-file import. Cells are
+  escaped against formula injection on export and read as text on
+  import. The commit goes out as record ops on one serial bump through
+  the zone-file import's own path, and is audited. The template's
+  example rows carry `id=EXAMPLE` and are ignored on import. REST:
+  `GET …/zones/{id}/export?format=csv|xlsx`,
+  `GET …/zones/{id}/import/template`,
+  `POST …/zones/{id}/import/spreadsheet/{preview,commit}`. New
+  read-only Copilot tool `export_dns_zone_records`, default on; no
+  import tool, by decision (#13). See `docs/features/DNS.md` §9.
+  A sheet cannot store one record twice: two identical new rows, or an
+  edit that turns a record into a copy of another, is a row error, as
+  the record API's 409 (#1230). A name ending in a dot is absolute, as
+  in a zone file (`www.example.com.` is `www`; a name outside the zone
+  is an error), where the record API alone would have stored
+  `www.example.com.example.com.`. A record whose TTL predates the #2073
+  bounds re-imports with its TTL as it is. Uploads are bounded before
+  they are parsed (an XLSX at 100 MB uncompressed, 100,000 rows read
+  at all), a CSV may be UTF-16 (Excel's "Unicode text"), and a corrupt
+  or entity-expanding sheet is a 422 rather than a 500. On an agentless
+  group, a change the provider has not taken yet is shown in the import
+  dialog instead of the dialog closing as if it were clean.
+
 - **NAT mappings can be turned off: they are now the `ipam.nat`
   feature module (#2100).** Settings → Features has a NAT mappings
   entry. Off, it removes the IPAM → NAT Mappings sidebar entry, the
@@ -170,6 +206,33 @@ the formatter handles the rest.
 - **Testing a Tailscale tenant with a new, unsaved key no longer
   clears the stored key's sync error (#2138).** Replacing the key does
   clear an HTTP 401 error, since it belonged to the old key.
+
+- **A zone-file import in replace mode no longer deletes records IPAM
+  or an integration owns, and works on one view (#2167).** Replace
+  deleted every record the file lacked, including an IP address's host
+  record and its aliases (IPAM kept showing records that were gone)
+  and the records a DNS pool, Tailscale, NetBird or a Kubernetes
+  cluster maintains, ACME challenge records, and the records an AD
+  domain controller or DHCP server registered in the live zone through
+  dynamic updates (#641) — which a replace removed from the server
+  too; merge also rewrote their TTLs. Those rows are now
+  left alone and listed under `skipped` with the reason, using the
+  same ownership rule as the spreadsheet import (#2139), which now
+  protects the dynamic-update records too and no longer calls an ACME
+  record IPAM's. The import
+  also honours the `view_id` it already accepted and silently ignored:
+  it matches, updates and deletes only records in that view (or, with
+  no view, only the shared records), creates new ones there, and never
+  touches another scope. A view-scoped replace keeps the shared
+  records, which serve every view; a shared import does not create a
+  shared copy of a record that exists only in views, since it would
+  appear in views that deliberately lack it. Records left out of scope
+  are counted per view in `skipped`. Twins with the same name, type
+  and value are now all matched, rather than one of them being
+  neither kept nor deleted. A `view_id` from another server group is a
+  422. The import dialog has no view picker, so in a group with views it
+  now says that it works on the shared records only, and the Replace
+  option no longer promises to make the zone match the file exactly.
 
 - **A zone's records export and import as CSV / XLSX, for bulk
   editing in a spreadsheet (#2139).** The zone's Data menu gains

@@ -74,6 +74,17 @@ class FakeRecord:
     priority: int | None = None
     weight: int | None = None
     port: int | None = None
+    # Scope + ownership, read by the diff since #2167.
+    view_id: object = None
+    pool_member_id: object = None
+    tailscale_tenant_id: object = None
+    netbird_instance_id: object = None
+    kubernetes_cluster_id: object = None
+    ip_address_id: object = None
+    auto_generated: bool = False
+    ip_alias: bool = False
+    tags: dict | None = None
+    import_source: str | None = None
 
 
 def test_diff_detects_create_update_delete() -> None:
