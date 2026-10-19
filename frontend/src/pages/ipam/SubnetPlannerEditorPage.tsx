@@ -628,10 +628,13 @@ function PropertiesPanel({
 }) {
   // Canonical group keys (#367) — match the rest of the app so create/edit
   // invalidations refresh these pickers without a full reload.
+  // #2135 — DNS server groups only exist while core.dns is on.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
     staleTime: 5 * 60 * 1000,
+    enabled: dnsOn,
   });
   // #2130 — DHCP server groups only exist while core.dhcp is on.
   const dhcpOn = useModuleOn("core.dhcp");
@@ -726,21 +729,25 @@ function PropertiesPanel({
         <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
           Resources (optional — blank = inherit)
         </p>
-        <Field label="DNS server group">
-          <select
-            value={node.dns_group_id ?? ""}
-            onChange={(e) => onChange({ dns_group_id: e.target.value || null })}
-            disabled={readOnly}
-            className="w-full rounded border bg-background px-2 py-1 text-sm disabled:opacity-50"
-          >
-            <option value="">— inherit —</option>
-            {dnsGroups.map((g) => (
-              <option key={g.id} value={g.id}>
-                {g.name}
-              </option>
-            ))}
-          </select>
-        </Field>
+        {dnsOn && (
+          <Field label="DNS server group">
+            <select
+              value={node.dns_group_id ?? ""}
+              onChange={(e) =>
+                onChange({ dns_group_id: e.target.value || null })
+              }
+              disabled={readOnly}
+              className="w-full rounded border bg-background px-2 py-1 text-sm disabled:opacity-50"
+            >
+              <option value="">— inherit —</option>
+              {dnsGroups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
         {dhcpOn && (
           <Field label="DHCP server group">
             <select
