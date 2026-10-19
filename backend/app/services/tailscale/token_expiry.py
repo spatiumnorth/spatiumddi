@@ -38,15 +38,12 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-import structlog
 
 from app.models.tailscale import (
     API_KEY_EXPIRY_SOURCE_API,
     API_KEY_EXPIRY_SOURCE_OPERATOR,
     TailscaleTenant,
 )
-
-logger = structlog.get_logger(__name__)
 
 _BASE_URL = "https://api.tailscale.com/api/v2"
 
