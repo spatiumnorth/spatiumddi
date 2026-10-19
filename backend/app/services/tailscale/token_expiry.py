@@ -35,6 +35,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import structlog
@@ -121,8 +122,14 @@ async def fetch_token_expiry(
         async with httpx.AsyncClient(
             base_url=_BASE_URL, headers=headers, timeout=timeout, transport=transport
         ) as client:
-            r = await client.get(f"/tailnet/{tailnet}/keys/{key_id}")
-    except httpx.HTTPError as exc:
+            # The tailnet is operator-typed; quote it so it stays one path
+            # segment (the key id is alphanumeric by the regex above).
+            r = await client.get(f"/tailnet/{quote(tailnet, safe='@')}/keys/{key_id}")
+    except Exception as exc:  # noqa: BLE001
+        # Broad on purpose: "never raises" is what lets the daily refresh
+        # move on to the next tenant and a save succeed. ``httpx.InvalidURL``
+        # derives from Exception, not ``HTTPError``. Only the exception's
+        # TYPE is reported: its text can echo the request.
         return TokenExpiryRead(None, note=f"could not reach Tailscale ({type(exc).__name__})")
     if r.status_code == 401:
         return TokenExpiryRead(None, invalid=True, note="HTTP 401 — token invalid or revoked")

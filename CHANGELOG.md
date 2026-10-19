@@ -88,14 +88,17 @@ the formatter handles the rest.
 
 ### Changed
 
-- **A `secret_expiring` rule is now seeded, enabled, on installs that
-  have none (#2138).** It was only ever created by hand, so on a
-  default install no expiring credential alerted at all. The seeded
-  "Credential expiring or rejected" rule (warning, 30 days, escalating
-  to critical) also covers supervisor certificates, API tokens with an
-  expiry and the Let's Encrypt Web UI certificate, so those can start
-  alerting after the upgrade. It is not seeded when any
-  `secret_expiring` rule already exists.
+- **Upgrading adds an enabled `secret_expiring` alert rule, so existing
+  installs may start alerting on credentials that were expiring all
+  along (#2138).** The rule was only ever created by hand, so on a
+  default install no expiring credential alerted at all. The upgrade
+  adds "Credential expiring or rejected" (warning, 30 days, escalating
+  to critical as expiry nears). It covers Tailscale API tokens and also
+  supervisor certificates, API tokens with an expiry and the Let's
+  Encrypt Web UI certificate, so after the upgrade an install may start
+  alerting on any of those that expire within 30 days. It is not added
+  when a `secret_expiring` rule already exists. It is added once, by the
+  migration, so if you delete it, it stays deleted.
 
 - **Testing a Tailscale tenant with a new, unsaved key no longer
   clears the stored key's sync error (#2138).** Replacing the key does
@@ -5921,7 +5924,10 @@ the formatter handles the rest.
   (nullable timestamp) and `api_key_expiry_source` (nullable string,
   `api` or `operator`, checked by a constraint). No backfill: NULL
   means unknown until the next test, save or daily refresh reads it.
-  Downgrade drops the constraint and both columns.
+  Also inserts the "Credential expiring or rejected" `secret_expiring`
+  alert rule, enabled, unless a rule of that type or name already
+  exists. Downgrade drops the constraint and both columns and leaves
+  the rule in place.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column

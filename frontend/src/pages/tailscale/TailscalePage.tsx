@@ -561,8 +561,13 @@ function TenantModal({
                 const v = e.target.value;
                 setApiKey(v);
                 // Tailscale's maximum lifetime; the server replaces it with
-                // the real expiry whenever Tailscale reports one.
-                if (v && !expiresOn) setExpiresOn(dateInDays(90));
+                // the real expiry whenever Tailscale reports one. A date
+                // entered for the OLD key says nothing about a new one, so
+                // replacing the key resets it too; clearing the key again
+                // puts the stored date back.
+                if (!v) setExpiresOn(initialExpiresOn);
+                else if (!expiresOn || expiresOn === initialExpiresOn)
+                  setExpiresOn(dateInDays(90));
               }}
               placeholder={
                 editing && tenant?.api_key_present

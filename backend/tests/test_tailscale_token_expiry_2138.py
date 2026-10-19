@@ -16,7 +16,7 @@ gets HTTP 401. These tests pin:
 
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -164,6 +164,36 @@ async def test_fetch_network_error_is_unread_and_never_echoes_the_token() -> Non
     )
     assert read.expires_at is None
     assert TOKEN not in (read.note or "")
+
+
+@pytest.mark.asyncio
+async def test_fetch_never_raises_on_a_non_httpx_error() -> None:
+    """``httpx.InvalidURL`` and friends derive from Exception, not
+    ``HTTPError``; one bad tenant must not abort the daily refresh."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError(f"boom {request.headers['Authorization']}")
+
+    read = await fetch_token_expiry(
+        api_key=TOKEN, tailnet="-", transport=httpx.MockTransport(handler)
+    )
+    assert read.expires_at is None
+    assert TOKEN not in (read.note or "")
+    assert "RuntimeError" in (read.note or "")
+
+
+@pytest.mark.asyncio
+async def test_fetch_quotes_the_tailnet_into_one_path_segment() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.raw_path.decode())
+        return httpx.Response(200, json=SPEC_KEY)
+
+    await fetch_token_expiry(
+        api_key=TOKEN, tailnet="a/../b?x", transport=httpx.MockTransport(handler)
+    )
+    assert seen == ["/api/v2/tailnet/a%2F..%2Fb%3Fx/keys/k123456CNTRL"]
 
 
 @pytest.mark.asyncio
@@ -373,11 +403,30 @@ async def test_secret_expiring_ignores_disabled_tenants_and_a_disabled_integrati
     assert f"tailscale_tenant:{off.id}" not in ids
 
 
+_MIGRATION = (
+    Path(__file__).resolve().parents[1]
+    / "alembic"
+    / "versions"
+    / "c8e2a5f71d39_tailscale_api_key_expiry.py"
+)
+
+
+def _load_migration() -> Any:
+    spec = importlib.util.spec_from_file_location("_mig_c8e2a5f71d39", _MIGRATION)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 @pytest.mark.asyncio
-async def test_seed_creates_one_enabled_rule_and_respects_an_existing_one(
+async def test_migration_seed_creates_one_enabled_rule_and_respects_an_existing_one(
     db_session: AsyncSession,
 ) -> None:
+    """The rule is seeded by the migration's own statement, once."""
     from sqlalchemy import func, select  # noqa: PLC0415
+
+    mig = _load_migration()
 
     async def count() -> int:
         return int(
@@ -389,20 +438,39 @@ async def test_seed_creates_one_enabled_rule_and_respects_an_existing_one(
             or 0
         )
 
-    await alerts.seed_secret_expiring_alert_rule(db_session)
-    await alerts.seed_secret_expiring_alert_rule(db_session)
+    async def run_seed() -> None:
+        await db_session.execute(mig.SEED_SECRET_EXPIRING_RULE_SQL, mig.seed_params())
+        await db_session.commit()
+
+    await run_seed()
+    await run_seed()
     assert await count() == 1
     rule = await db_session.scalar(
         select(AlertRule).where(AlertRule.rule_type == "secret_expiring")
     )
-    assert rule is not None and rule.enabled and rule.threshold_days == 30
+    assert rule is not None
+    assert rule.enabled and rule.threshold_days == 30 and rule.severity == "warning"
+    assert rule.name == "Credential expiring or rejected"
+    assert rule.notify_syslog and rule.notify_webhook and not rule.notify_smtp
 
     # An operator's own rule of the type, under another name, suppresses it.
     await db_session.delete(rule)
     db_session.add(_rule())
     await db_session.commit()
-    await alerts.seed_secret_expiring_alert_rule(db_session)
+    await run_seed()
     assert await count() == 1
+
+
+def test_secret_expiring_rule_is_not_seeded_at_startup() -> None:
+    """A startup seed keyed on "none exists" brings a DELETED rule back on
+    every restart. The rule is seeded by the migration only."""
+    import inspect  # noqa: PLC0415
+
+    import app.main as main_mod  # noqa: PLC0415
+
+    src = inspect.getsource(main_mod)
+    assert "seed_secret_expiring_alert_rule" not in src
+    assert not hasattr(alerts, "seed_secret_expiring_alert_rule")
 
 
 # ── Daily refresh ────────────────────────────────────────────────────

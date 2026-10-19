@@ -164,7 +164,9 @@ def _build_panel(
             warnings += 1
         else:
             healthy += 1
-        cred = credential(t) if credential is not None else None
+        # A disabled target syncs nothing, so a lapsed credential breaks
+        # nothing and ``secret_expiring`` skips it; the dashboard does too.
+        cred = credential(t) if credential is not None and getattr(t, "enabled", True) else None
         rows.append(
             IntegrationTargetRow(
                 id=str(t.id),
