@@ -24,6 +24,7 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { IPSpacePicker } from "@/components/ipam/space-picker";
 
+import { DEVICE_SECONDS_BOUNDS, secondsFieldError } from "@/lib/seconds";
 import { DEVICE_TYPE_OPTIONS, Field, errMsg, inputCls } from "./_shared";
 
 // ── Static option lists ──────────────────────────────────────────────
@@ -82,7 +83,7 @@ export function DeviceFormModal({
   );
   const [snmpPort, setSnmpPort] = useState(device?.snmp_port ?? 161);
   const [snmpTimeout, setSnmpTimeout] = useState(
-    device?.snmp_timeout_seconds ?? 5,
+    String(device?.snmp_timeout_seconds ?? 5),
   );
   const [snmpRetries, setSnmpRetries] = useState(device?.snmp_retries ?? 1);
 
@@ -112,7 +113,7 @@ export function DeviceFormModal({
 
   // Polling
   const [pollInterval, setPollInterval] = useState(
-    device?.poll_interval_seconds ?? 300,
+    String(device?.poll_interval_seconds ?? 300),
   );
   const [pollArp, setPollArp] = useState(device?.poll_arp ?? true);
   const [pollFdb, setPollFdb] = useState(device?.poll_fdb ?? true);
@@ -164,7 +165,11 @@ export function DeviceFormModal({
           return "Privacy key is required for authPriv";
       }
     }
-    return null;
+    // #2110 — "1h" and an empty field are refused, never read as 1 / the default.
+    return (
+      secondsFieldError("SNMP timeout", snmpTimeout, DEVICE_SECONDS_BOUNDS) ??
+      secondsFieldError("Poll interval", pollInterval, DEVICE_SECONDS_BOUNDS)
+    );
   }
 
   // ── Build payload ──
@@ -178,9 +183,9 @@ export function DeviceFormModal({
       description: description || null,
       snmp_version: snmpVersion,
       snmp_port: snmpPort,
-      snmp_timeout_seconds: snmpTimeout,
+      snmp_timeout_seconds: Number(snmpTimeout.trim()),
       snmp_retries: snmpRetries,
-      poll_interval_seconds: pollInterval,
+      poll_interval_seconds: Number(pollInterval.trim()),
       poll_arp: pollArp,
       poll_fdb: pollFdb,
       poll_interfaces: pollInterfaces,
@@ -219,9 +224,9 @@ export function DeviceFormModal({
       description: description || null,
       snmp_version: snmpVersion,
       snmp_port: snmpPort,
-      snmp_timeout_seconds: snmpTimeout,
+      snmp_timeout_seconds: Number(snmpTimeout.trim()),
       snmp_retries: snmpRetries,
-      poll_interval_seconds: pollInterval,
+      poll_interval_seconds: Number(pollInterval.trim()),
       poll_arp: pollArp,
       poll_fdb: pollFdb,
       poll_interfaces: pollInterfaces,
@@ -425,9 +430,7 @@ export function DeviceFormModal({
                   value={snmpTimeout}
                   min={1}
                   max={60}
-                  onChange={(e) =>
-                    setSnmpTimeout(parseInt(e.target.value) || 5)
-                  }
+                  onChange={(e) => setSnmpTimeout(e.target.value)}
                 />
               </Field>
               <Field label="Retries">
@@ -597,7 +600,7 @@ export function DeviceFormModal({
               value={pollInterval}
               min={30}
               max={86400}
-              onChange={(e) => setPollInterval(parseInt(e.target.value) || 300)}
+              onChange={(e) => setPollInterval(e.target.value)}
             />
           </Field>
           <div className="flex flex-wrap gap-4">

@@ -320,13 +320,25 @@ async def list_rules(db: DB, current_user: CurrentUser) -> list[AlertRule]:
 
 
 @router.get("/rule-types", response_model=list[RuleTypeSpec])
-async def list_rule_types(current_user: CurrentUser) -> list[RuleTypeSpec]:
+async def list_rule_types(db: DB, current_user: CurrentUser) -> list[RuleTypeSpec]:
     """Every rule type, its label, and the parameters its evaluator reads (#1997).
 
     Same access as listing rules: any authenticated user. The editor renders
     from this instead of a hand-kept list that had drifted to 23 of ~64.
+
+    A type whose feature module is off is left out (#2130): the evaluator
+    never runs it (``_RULE_TYPE_MODULE``), so offering it would let an
+    operator create a rule that can never fire. Rules already stored keep
+    working and stay listed by ``GET /rules``.
     """
-    return build_catalogue()
+    from app.services import feature_modules
+
+    enabled = await feature_modules.get_enabled_modules(db)
+    return [
+        spec
+        for spec in build_catalogue()
+        if (mod := alert_service.rule_type_module(spec.rule_type)) is None or mod in enabled
+    ]
 
 
 @router.post("/rules", response_model=AlertRuleResponse, status_code=status.HTTP_201_CREATED)
