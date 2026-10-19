@@ -346,6 +346,8 @@ class _Row:
     ip_address_id: object = None
     auto_generated: bool = False
     ip_alias: bool = False
+    tags: dict | None = None
+    import_source: str | None = None
 
 
 def test_a_record_linked_to_an_ip_is_protected() -> None:
@@ -372,3 +374,114 @@ def _ipam_reason() -> str:
     from app.services.dns_io.spreadsheet import _MANAGED_REASON
 
     return _MANAGED_REASON["ipam"]
+
+
+# ── owners found in validation: ACME challenges, dynamic-update clients ────
+
+
+async def test_replace_keeps_acme_and_dynamic_update_records(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An ACME challenge TXT is ``auto_generated`` but not IPAM's, and a record
+    an AD domain controller registered through RFC 2136 (mirrored back by the
+    agent as ``import_source="ddns_external"``, #641) carries no owner FK at
+    all. Replace deleted the second one AND queued its delete to the live
+    zone, so the domain's SRV records vanished from the server."""
+    from app.services.dns.ingest import EXTERNAL_IMPORT_SOURCE
+    from app.services.dns_io.spreadsheet import _MANAGED_REASON
+    from app.services.integration_ownership import ACME_RECORD_TAG
+
+    h = await _headers(db_session)
+    grp, zone = await _zone(db_session)
+    acme = _rec(
+        zone,
+        "_acme-challenge",
+        "TXT",
+        '"tok"',
+        auto_generated=True,
+        tags={ACME_RECORD_TAG: True},
+    )
+    srv = _rec(
+        zone,
+        "_ldap._tcp",
+        "SRV",
+        f"dc1.{ZONE}",
+        priority=0,
+        weight=100,
+        port=389,
+        import_source=EXTERNAL_IMPORT_SOURCE,
+    )
+    mine = _rec(zone, "mine", "A", "10.0.0.7")
+    db_session.add_all([acme, srv, mine])
+    await db_session.commit()
+    ids = {"acme": acme.id, "srv": srv.id}
+
+    p = await _post(client, h, grp, zone, "new IN A 10.0.0.3\n", "preview")
+    assert [d["name"] for d in p["to_delete"]] == ["mine"]
+    assert any(
+        s.startswith("_acme-challenge TXT ") and _MANAGED_REASON["acme"] in s for s in p["skipped"]
+    ), p["skipped"]
+    assert any(
+        s.startswith("_ldap._tcp SRV ") and _MANAGED_REASON["ddns"] in s for s in p["skipped"]
+    ), p["skipped"]
+    # The ACME row is not reported as IPAM's: editing an IP address does
+    # nothing to it.
+    assert not any(
+        s.startswith("_acme-challenge") and _MANAGED_REASON["ipam"] in s for s in p["skipped"]
+    )
+
+    c = await _post(client, h, grp, zone, "new IN A 10.0.0.3\n", "commit")
+    assert (c["created"], c["deleted"]) == (1, 1)
+    db_session.expire_all()
+    for label, rid in ids.items():
+        assert await db_session.get(DNSRecord, rid) is not None, label
+
+
+def test_managed_by_names_acme_and_dynamic_update_owners() -> None:
+    from app.services.dns.ingest import EXTERNAL_IMPORT_SOURCE
+    from app.services.dns_io.spreadsheet import managed_by
+    from app.services.integration_ownership import ACME_RECORD_TAG
+
+    acme = _Row(
+        id="1",
+        name="_acme-challenge",
+        record_type="TXT",
+        value='"t"',
+        auto_generated=True,
+        tags={ACME_RECORD_TAG: True},
+    )
+    ddns = _Row(
+        id="2", name="pc1", record_type="A", value="10.0.0.9", import_source=EXTERNAL_IMPORT_SOURCE
+    )
+    imported = _Row(id="3", name="w", record_type="A", value="10.0.0.1", import_source="bind9")
+    assert managed_by(acme) == "acme"  # type: ignore[arg-type]
+    assert managed_by(ddns) == "ddns"  # type: ignore[arg-type]
+    # A record a one-shot importer brought in is the operator's from then on.
+    assert managed_by(imported) is None  # type: ignore[arg-type]
+
+
+def test_an_owned_twin_survives_while_its_operator_twin_goes() -> None:
+    """Twins the file omits are each judged on their own owner."""
+    twins = [
+        _Row(id="1", name="t", record_type="A", value="10.0.0.1"),
+        _Row(id="2", name="t", record_type="A", value="10.0.0.1", auto_generated=True),
+    ]
+    gone = parse_zone_file(f"$ORIGIN {ZONE}\n$TTL 3600\no IN A 10.9.9.9\n", ZONE).records
+    diff = diff_records(gone, twins, replace=True)  # type: ignore[arg-type]
+    assert [c.existing_id for c in diff.to_delete] == ["1"]
+    assert diff.skipped == ["t A 10.0.0.1: not deleted - this record is " + _ipam_reason()]
+
+
+def test_a_named_record_is_never_deleted_whatever_its_scope() -> None:
+    """The file names ``t``: neither the in-scope twin nor the other view's
+    copy is offered for deletion."""
+    view = uuid.uuid4()
+    rows = [
+        _Row(id="1", name="t", record_type="A", value="10.0.0.1"),
+        _Row(id="2", name="t", record_type="A", value="10.0.0.1"),
+        _Row(id="3", name="t", record_type="A", value="10.0.0.1", view_id=view),
+    ]
+    keep = parse_zone_file(f"$ORIGIN {ZONE}\n$TTL 3600\nt IN A 10.0.0.1\n", ZONE).records
+    diff = diff_records(keep, rows, zone_default_ttl=3600, replace=True)  # type: ignore[arg-type]
+    assert diff.to_delete == []
+    assert {c.existing_id for c in diff.unchanged} == {"1", "2"}

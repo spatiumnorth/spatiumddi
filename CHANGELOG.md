@@ -148,9 +148,14 @@ the formatter handles the rest.
   deleted every record the file lacked, including an IP address's host
   record and its aliases (IPAM kept showing records that were gone)
   and the records a DNS pool, Tailscale, NetBird or a Kubernetes
-  cluster maintains; merge also rewrote their TTLs. Those rows are now
+  cluster maintains, ACME challenge records, and the records an AD
+  domain controller or DHCP server registered in the live zone through
+  dynamic updates (#641) — which a replace removed from the server
+  too; merge also rewrote their TTLs. Those rows are now
   left alone and listed under `skipped` with the reason, using the
-  same ownership rule as the spreadsheet import (#2139). The import
+  same ownership rule as the spreadsheet import (#2139), which now
+  protects the dynamic-update records too and no longer calls an ACME
+  record IPAM's. The import
   also honours the `view_id` it already accepted and silently ignored:
   it matches, updates and deletes only records in that view (or, with
   no view, only the shared records), creates new ones there, and never
@@ -161,7 +166,9 @@ the formatter handles the rest.
   are counted per view in `skipped`. Twins with the same name, type
   and value are now all matched, rather than one of them being
   neither kept nor deleted. A `view_id` from another server group is a
-  422.
+  422. The import dialog has no view picker, so in a group with views it
+  now says that it works on the shared records only, and the Replace
+  option no longer promises to make the zone match the file exactly.
 
 - **IPAM now says why a host named `gateway` gets no forward DNS
   record (#2101).** The rule is deliberate (every subnet's placeholder

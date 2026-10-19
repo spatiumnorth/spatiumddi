@@ -83,6 +83,8 @@ class FakeRecord:
     ip_address_id: object = None
     auto_generated: bool = False
     ip_alias: bool = False
+    tags: dict | None = None
+    import_source: str | None = None
 
 
 def test_diff_detects_create_update_delete() -> None:

@@ -8796,13 +8796,15 @@ async def import_zone_commit(
     * ``merge``   — create new, update changed, keep records that are absent
                     from the zone file (additive)
     * ``replace`` — create new, update changed, delete records absent from the
-                    zone file (make the zone match the file exactly)
+                    zone file (the operator-owned records in the import's
+                    scope come to match the file)
     * ``append``  — only create new records; existing records are left alone
 
     The import works on ONE view scope (#2167): ``view_id``, or the shared
     records when it is null. Records in other scopes are never changed or
-    deleted, nor are records IPAM or an integration owns; both are reported
-    in ``skipped``.
+    deleted, nor are records IPAM, an integration, an ACME challenge or a
+    dynamic-update client owns (``managed_by``); both are reported in
+    ``skipped``.
 
     Auditing: one summary ``AuditLog`` entry is written under
     ``resource_type='dns_zone_import'`` tagged with a ``batch_id``.
