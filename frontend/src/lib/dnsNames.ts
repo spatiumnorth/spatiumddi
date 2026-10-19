@@ -163,3 +163,10 @@ export function parseTtlInput(
 
 /** A DNS pool's TTL bounds: the API's `ge=1, le=86400` (`api/v1/dns/pools.py`). */
 export const POOL_TTL_BOUNDS = { min: 1, max: 86400 } as const;
+
+/** Whether a typed confirmation names the zone (trailing dot optional,
+ *  case-insensitive) — the same comparison the server makes. */
+export function confirmsZone(typed: string, zoneName: string): boolean {
+  const norm = (s: string) => s.trim().replace(/\.$/, "").toLowerCase();
+  return typed.trim() !== "" && norm(typed) === norm(zoneName);
+}
