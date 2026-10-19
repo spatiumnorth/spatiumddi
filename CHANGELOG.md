@@ -120,6 +120,19 @@ the formatter handles the rest.
   were internet-class data: each is listed in the preview's warnings
   as skipped, naming its class, and a config with nothing but such
   zones is refused with that reason.
+  Accepting the class also made RHEL's stock
+  `zone "." IN { type hint; … };` readable, and the importer used to map `type hint` to
+  a primary zone: importing it would have made the target group
+  authoritative for the root and broken every recursive lookup it
+  answers. `hint`, `mirror`, `redirect`, `static-stub` and
+  `delegation-only` zones are now skipped with a warning. The
+  importer also no longer drops things without a word: a `zone`
+  block it cannot read (an unquoted name, say) and every `include`
+  it does not follow are named in the preview's warnings, and
+  unbalanced braces refuse the upload instead of silently dropping
+  every zone after the fault. The zone walk is linear now; it
+  re-sliced the config once per zone, which made a 50,000-zone
+  `named.conf` take several seconds.
 
 - **IPAM now says why a host named `gateway` gets no forward DNS
   record (#2101).** The rule is deliberate (every subnet's placeholder

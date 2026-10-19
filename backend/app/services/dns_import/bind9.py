@@ -78,8 +78,8 @@ _COMMENT_LINE_RE = re.compile(r"(//|#)[^\n]*")
 # Match a quoted name + opening brace. Used for both ``zone "name" {``
 # and ``view "name" {``. Whitespace tolerant; the quote is required
 # (BIND accepts unquoted names too but every export tool we've seen
-# emits quoted; if we get an unquoted name the zone is silently
-# skipped — operator quotes it manually and re-uploads).
+# emits quoted; an unquoted name is skipped and named in the preview's
+# warnings — operator quotes it manually and re-uploads).
 #
 # An optional DNS class may sit between the name and the brace
 # (``zone "x" IN { … };``, ``view "v" IN { … };`` — RHEL / Fedora's
@@ -95,6 +95,27 @@ _NAME_BLOCK_RE = re.compile(
 # Spelling as written → canonical class. An empty string (no class
 # given) maps to None-ish and falls back to the enclosing default.
 _CLASS_ALIASES = {"IN": "IN", "CHAOS": "CH", "CH": "CH", "HESIOD": "HS", "HS": "HS"}
+
+_ZONE_VIEW_KW_RE = re.compile(r"\b(zone|view)\b")
+
+# A ``zone`` keyword that opens a block ``_NAME_BLOCK_RE`` cannot read:
+# an unquoted name, a quoted name with an escaped quote, or an
+# unrecognised word where the class goes. Used only to WARN — the
+# walker never imports from it. ``zone-statistics``, ``response-policy
+# { zone "rpz" policy given; }`` and ``catalog-zones { zone "c"
+# default-primaries { … } }`` do not match: no brace follows the
+# name, or a hyphenated word sits between them.
+_UNREADABLE_ZONE_RE = re.compile(r'\s+("(?:[^"\\\n]|\\.)*"|[^\s"{};]+)(?:\s+\w+)?\s*\{')
+
+_INCLUDE_RE = re.compile(r'\binclude\s+"([^"]+)"\s*;')
+
+# Zone types that are not zones SpatiumDDI can serve. ``hint`` is the
+# root-hints file (RHEL's stock named.conf declares ``zone "." IN {
+# type hint; … }``): importing it as a primary would make the target
+# group authoritative for the root and break every recursive lookup it
+# answers. ``mirror`` / ``redirect`` are the same shape of hazard,
+# ``static-stub`` / ``delegation-only`` carry no data of their own.
+_NON_IMPORTABLE_TYPES = {"hint", "mirror", "redirect", "static-stub", "delegation-only"}
 
 
 @dataclass
@@ -159,33 +180,44 @@ def _balanced_block(text: str, brace_open_pos: int) -> tuple[str, int]:
 
 
 def _walk_zones(
-    text: str, view: str | None = None, default_class: str = "IN"
+    text: str,
+    view: str | None = None,
+    default_class: str = "IN",
+    unreadable: list[str] | None = None,
 ) -> Iterable[_NamedConfZone]:
     """Yield every ``zone`` declaration, recursing into ``view``
-    blocks so we capture per-view zones with their view tag."""
+    blocks so we capture per-view zones with their view tag.
+
+    A ``zone`` block the name pattern cannot read is appended to
+    ``unreadable`` (when given) so the preview can say it was left
+    out, rather than dropping it without a word (#2099). Unbalanced
+    braces raise: BIND would refuse the file, and returning early
+    would silently drop every zone after the fault.
+    """
 
     pos = 0
     n = len(text)
     while pos < n:
-        m = re.search(r"\b(zone|view)\b", text[pos:])
+        m = _ZONE_VIEW_KW_RE.search(text, pos)
         if not m:
             return
         kw = m.group(1)
-        after_kw = pos + m.end()
+        after_kw = m.end()
         # Try to match the ``"name" {`` pattern; if it doesn't, this
         # was a stray identifier (e.g. ``allow-zone-transfer``) and
         # we step past it.
         nm = _NAME_BLOCK_RE.match(text, after_kw)
         if not nm:
+            if kw == "zone" and unreadable is not None:
+                um = _UNREADABLE_ZONE_RE.match(text, after_kw)
+                if um:
+                    unreadable.append(um.group(1))
             pos = after_kw
             continue
         name = nm.group(1)
         decl_class = (nm.group(2) or "").upper()
         brace_open = nm.end() - 1
-        try:
-            body, end = _balanced_block(text, brace_open)
-        except ImportSourceError:
-            return
+        body, end = _balanced_block(text, brace_open)
         if kw == "zone":
             yield _NamedConfZone(
                 name=name,
@@ -195,7 +227,10 @@ def _walk_zones(
             )
         else:  # view — its zones inherit the view's class
             yield from _walk_zones(
-                body, view=name, default_class=_CLASS_ALIASES.get(decl_class, default_class)
+                body,
+                view=name,
+                default_class=_CLASS_ALIASES.get(decl_class, default_class),
+                unreadable=unreadable,
             )
         pos = end
 
@@ -422,7 +457,8 @@ def _parse_one_zone(
         "secondary": "secondary",
         "stub": "stub",
         "forward": "forward",
-        "hint": "primary",  # rare — treat as primary so we at least carry the records
+        # ``hint`` / ``mirror`` / ``redirect`` / … never reach here:
+        # ``parse_bind9_archive`` skips ``_NON_IMPORTABLE_TYPES`` first.
     }.get(zone_type_raw, "primary")
 
     fqdn = _normalize_zone_name(decl.name)
@@ -543,17 +579,35 @@ def parse_bind9_archive(payload: bytes) -> ImportPreview:
 
         conf_text = _strip_comments(named_conf.read_text(encoding="utf-8", errors="replace"))
         options_dir = _parse_options_directory(conf_text)
-        decls = list(_walk_zones(conf_text))
+        unreadable: list[str] = []
+        decls = list(_walk_zones(conf_text, unreadable=unreadable))
+
+        warnings: list[str] = []
+        # Nothing the importer silently leaves behind (#2099): a zone it
+        # cannot read, and an ``include`` it does not follow, are both
+        # named so the operator does not find out at cut-over.
+        for token in unreadable:
+            warnings.append(
+                f"A zone declaration ({token}) could not be read and was skipped: "
+                'the importer reads ``zone "<name>" [class] { … };`` with the name '
+                "quoted. Quote the name and re-upload to import it."
+            )
+        for inc in _INCLUDE_RE.findall(conf_text):
+            warnings.append(
+                f"named.conf includes {inc!r}; included files are not read, so any "
+                "zone declared there is not in this preview. Paste those zone "
+                "declarations into named.conf and re-upload to import them."
+            )
 
         if not decls:
             raise ImportSourceError(
                 "named.conf contained no zone declarations. "
                 "Phase 1 imports primary / secondary / stub / forward zones from "
                 "named.conf — make sure your config has at least one ``zone {…}`` block."
+                + (" " + " ".join(warnings) if warnings else "")
             )
 
         zones: list[ImportedZone] = []
-        warnings: list[str] = []
         seen_views: set[str] = set()
         for decl in decls:
             if decl.dns_class != "IN":
@@ -563,6 +617,13 @@ def parse_bind9_archive(payload: bytes) -> ImportPreview:
                 warnings.append(
                     f"Zone {decl.name!r} skipped: it is declared with class "
                     f"{decl.dns_class}, and only class IN zones are imported."
+                )
+                continue
+            decl_type = (_zone_directive(_strip_comments(decl.body), "type") or "").lower()
+            if decl_type in _NON_IMPORTABLE_TYPES:
+                warnings.append(
+                    f"Zone {decl.name!r} skipped: it is a type {decl_type} zone, "
+                    "not zone data SpatiumDDI serves."
                 )
                 continue
             zones.append(_parse_one_zone(decl, root, named_conf.parent, options_dir))
@@ -582,8 +643,7 @@ def parse_bind9_archive(payload: bytes) -> ImportPreview:
 
         if not zones:
             raise ImportSourceError(
-                "named.conf declared zones, but none is class IN, so there is "
-                "nothing to import. " + " ".join(warnings)
+                "named.conf declared zones, but none of them can be imported. " + " ".join(warnings)
             )
 
         total_records = sum(len(z.records) for z in zones)

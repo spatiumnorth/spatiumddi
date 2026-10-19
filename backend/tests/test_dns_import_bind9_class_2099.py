@@ -99,7 +99,7 @@ zone "a.test" IN { type master; file "a.test.db"; };
 
 def test_only_non_in_zones_is_refused_with_the_reason() -> None:
     conf = 'zone "bind" CH { type master; file "bind.db"; };'
-    with pytest.raises(ImportSourceError, match="none is class IN"):
+    with pytest.raises(ImportSourceError, match="none of them can be imported.*class CH"):
         parse_bind9_archive(_archive(conf, []))
 
 
@@ -125,3 +125,110 @@ def test_identifier_ending_in_a_class_word_is_not_a_class() -> None:
     # ``INFO`` must not be read as ``IN`` + ``FO``.
     conf = 'zone "a.test" INFO { type master; };\nzone "b.test" { type master; file "b.test.db"; };'
     assert _names(conf, ["b.test"]) == ["b.test."]
+
+
+# ── validator additions ───────────────────────────────────────────────
+
+
+def test_zone_named_like_a_class_keyword() -> None:
+    # The name is quoted, so ``zone "in"`` / ``zone "ch" IN`` are names,
+    # not classes.
+    conf = 'zone "in" { type master; file "in.db"; };\nzone "ch" IN { type master; file "ch.db"; };'
+    assert _names(conf, ["in", "ch"]) == ["ch.", "in."]
+
+
+def test_one_line_lowercase_class_and_no_space_before_brace() -> None:
+    conf = (
+        'zone "a.test" in { type master; file "a.test.db"; };'
+        'zone "b.test"IN { type master; file "b.test.db"; };'
+    )
+    assert _names(conf, ["a.test", "b.test"]) == ["a.test.", "b.test."]
+
+
+def test_a_zone_naming_its_own_class_beats_the_view() -> None:
+    conf = """
+view "c" CH { zone "a.test" IN { type master; file "a.test.db"; }; };
+view "i" IN { zone "bind" CH { type master; file "bind.db"; }; };
+"""
+    preview = parse_bind9_archive(_archive(conf, ["a.test"]))
+    assert [z.name for z in preview.zones] == ["a.test."]
+    assert any("'bind'" in w and "class CH" in w for w in preview.warnings)
+
+
+def test_rhel_stock_named_conf() -> None:
+    # RHEL / Fedora's shipped named.conf, trimmed: the root hint zone is
+    # declared with its class and the localhost zones live in an include.
+    conf = """
+options {
+    listen-on port 53 { 127.0.0.1; };
+    directory "/var/named";
+    recursion yes;
+};
+logging { channel default_debug { file "data/named.run"; severity dynamic; }; };
+zone "." IN {
+    type hint;
+    file "named.ca";
+};
+include "/etc/named.rfc1912.zones";
+include "/etc/named.root.key";
+zone "a.test" IN { type master; file "a.test.db"; };
+"""
+    preview = parse_bind9_archive(_archive(conf, ["a.test"]))
+    # The root hints must never become an authoritative "." zone.
+    assert [z.name for z in preview.zones] == ["a.test."]
+    assert any("'.'" in w and "type hint" in w for w in preview.warnings)
+    assert sum("/etc/named.rfc1912.zones" in w for w in preview.warnings) == 1
+
+
+def test_only_a_hint_zone_is_refused_with_the_reason() -> None:
+    conf = 'zone "." IN { type hint; file "named.ca"; };'
+    with pytest.raises(ImportSourceError, match="type hint"):
+        parse_bind9_archive(_archive(conf, []))
+
+
+def test_unquoted_zone_is_named_in_the_warnings() -> None:
+    conf = """
+options { zone-statistics yes; };
+response-policy { zone "rpz" policy given; };
+zone b.test IN { type master; file "b.test.db"; };
+zone "a.test" { type master; file "a.test.db"; };
+"""
+    preview = parse_bind9_archive(_archive(conf, ["a.test", "b.test"]))
+    assert [z.name for z in preview.zones] == ["a.test."]
+    unreadable = [w for w in preview.warnings if "could not be read" in w]
+    assert len(unreadable) == 1 and "b.test" in unreadable[0]
+
+
+def test_only_unreadable_zones_refusal_names_them() -> None:
+    conf = "zone b.test { type master; };"
+    with pytest.raises(ImportSourceError, match="b.test"):
+        parse_bind9_archive(_archive(conf, []))
+
+
+def test_unbalanced_braces_refuse_instead_of_truncating() -> None:
+    conf = 'zone "a.test" IN { type master; file "a.test.db"; };\nzone "b.test" IN { type master;\n'
+    with pytest.raises(ImportSourceError, match="Unbalanced"):
+        parse_bind9_archive(_archive(conf, ["a.test"]))
+
+
+def test_nested_view_does_not_hang() -> None:
+    # Not legal BIND, but the walker must terminate.
+    conf = 'view "o" IN { view "i" IN { zone "a.test" { type master; file "a.test.db"; }; }; };'
+    preview = parse_bind9_archive(_archive(conf, ["a.test"]))
+    assert [z.name for z in preview.zones] == ["a.test."]
+
+
+def test_large_config_parses_in_linear_time() -> None:
+    import time
+
+    from app.services.dns_import.bind9 import _walk_zones
+
+    conf = "".join(
+        f'zone "z{i}.test" IN {{ type master; file "z{i}.db"; allow-update {{ none; }}; }};\n'
+        for i in range(50_000)
+    )
+    start = time.monotonic()
+    assert sum(1 for _ in _walk_zones(conf)) == 50_000
+    # Slicing ``text[pos:]`` per zone made this quadratic (minutes);
+    # linear is well under a second. Generous bound for a loaded CI box.
+    assert time.monotonic() - start < 20
