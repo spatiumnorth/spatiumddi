@@ -1260,8 +1260,11 @@ function Field({
 /**
  * A config value made of lines. A secret one is masked until the operator
  * asks to see it — a textarea has no ``type="password"``, so the mask is
- * ``-webkit-text-security``. The value itself is never touched: whatever
- * is typed or pasted, line breaks included, is what the form sends.
+ * ``-webkit-text-security`` (Chromium, Safari, and Firefox since 114).
+ * While masked it also behaves like a password input in the ways CSS
+ * cannot: copy, cut and drag out are refused, and password managers are
+ * told to leave it alone. The value itself is never touched: whatever is
+ * typed or pasted, line breaks included, is what the form sends.
  */
 function MultilineConfigField({
   name,
@@ -1292,6 +1295,12 @@ function MultilineConfigField({
         autoComplete="off"
         wrap="off"
         data-masked={hidden ? "true" : "false"}
+        data-lpignore="true"
+        data-1p-ignore="true"
+        data-bwignore="true"
+        onCopy={hidden ? (e) => e.preventDefault() : undefined}
+        onCut={hidden ? (e) => e.preventDefault() : undefined}
+        onDragStart={hidden ? (e) => e.preventDefault() : undefined}
         style={
           hidden ? ({ WebkitTextSecurity: "disc" } as CSSProperties) : undefined
         }
@@ -1301,6 +1310,7 @@ function MultilineConfigField({
         <button
           type="button"
           onClick={() => setRevealed((r) => !r)}
+          aria-pressed={revealed}
           className="text-[11px] text-muted-foreground underline-offset-2 hover:underline"
         >
           {revealed ? "Hide" : "Show"}

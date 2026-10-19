@@ -188,6 +188,15 @@ describe("backup target form keeps line breaks (#2199)", () => {
     // The secret one is masked, and only the secret one.
     expect(key.dataset.masked).toBe("true");
     expect(hosts.dataset.masked).toBe("false");
+    // Masked like a password input: copying it out is refused, and the
+    // Show toggle reveals it (and copying is then allowed again).
+    expect(fireEvent.copy(key)).toBe(false);
+    expect(fireEvent.copy(hosts)).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Show" }));
+    expect(key.dataset.masked).toBe("false");
+    expect(fireEvent.copy(key)).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Hide" }));
+    expect(key.dataset.masked).toBe("true");
     const body = await submit(container);
     expect(body.config.private_key).toBe(PEM);
     expect(body.config.known_hosts).toBe(KNOWN_HOSTS);
