@@ -446,7 +446,23 @@ kubectl apply -f base/migrate-job.yaml -n spatiumddi
 kubectl wait --for=condition=complete job/spatiumddi-migrate -n spatiumddi --timeout=10m
 ```
 
-Helm chart users: `helm upgrade spatiumddi charts/spatiumddi -n spatiumddi --set image.tag=$NEW_TAG`. The chart's pre-upgrade hook re-runs the migrate job; the `alembic upgrade head` invocation honours the same DATABASE_URL the api uses.
+Helm chart users: `helm upgrade spatiumddi charts/spatiumddi -n spatiumddi --set image.tag=$NEW_TAG`. The chart renders a new migrate Job per Helm revision (`<release>-migrate-r<revision>`, a regular Job, not a hook), and the api / worker / beat pods wait for it in their `wait-for-migrate` init containers.
+
+**GitOps over these manifests.** `base/migrate-job.yaml` has a fixed name, and a Job's pod template is immutable. The `kubectl delete` above is what makes a re-apply work. A controller that only applies (Argo CD, Flux's `Kustomization`) cannot do that step, so the first image bump fails with `spec.template: field is immutable`. Patch the Job into a sync hook in your overlay instead of editing the base, e.g. for Argo CD:
+
+```yaml
+# kustomization.yaml
+patches:
+  - target: { kind: Job, name: spatiumddi-migrate }
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          argocd.argoproj.io/hook: Sync
+          argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+```
+
+The Helm chart exposes the same thing as `migrate.annotations`.
 
 The migrate job needs the api's `SECRET_KEY` (and `CREDENTIAL_ENCRYPTION_KEY`, if you set one on the api): since #1364 a migration can encrypt existing values under the install's credential key, and refuses to start without it. `base/migrate-job.yaml` reads `SECRET_KEY` from `spatiumddi-secrets`; if you keep the migrate job in your own manifests, add it there too.
 

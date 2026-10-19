@@ -446,3 +446,63 @@ def test_the_apex_is_a_pure_function_of_the_zone() -> None:
     (``_changed_zones``) is what keeps an unchanged zone from reloading."""
     zone = _zone("corp.example.test.", [_rec("@", "NS", "a.ns.example.net.")])
     assert _zone_apex(zone) == _zone_apex(dict(zone))
+
+
+# #2075 — the control plane's ``primary_ns_error`` vectors. The same lists
+# are in backend/tests/test_zone_primary_ns_host_name_2075.py and
+# frontend/src/lib/primary-ns.test.ts: change all three together, or the API,
+# the dialog and the renderer disagree about which Primary NS is served.
+PRIMARY_NS_BAD = [
+    "ns_1.example.test.",
+    "a" * 64 + ".example.test.",
+    "ns1",
+    "ns1.",
+    "ns1..example.test.",
+    ".example.test.",
+    "-ns1.example.test.",
+    "ns1-.example.test.",
+    "ns1.example.test..",
+    "b\u00fccher.example.test.",
+    ("a" * 63 + ".") * 4 + "test.",
+]
+PRIMARY_NS_GOOD = [
+    "ns1.example.test.",
+    "ns1.example.test",
+    "NS1.Other-Corp.net.",
+    "a" * 63 + ".test.",
+    "ns1.xn--bcher-kva.example.",
+    "1ns.example.test.",
+]
+
+
+@pytest.mark.parametrize("bad", PRIMARY_NS_BAD)
+def test_a_primary_ns_that_is_not_a_host_name_is_healed_to_the_placeholder(bad: str) -> None:
+    """#2075 — rows stored before the API refused them must not make named
+    reject the zone (check-names) and stop the group applying, nor serve a
+    single label as a name at the root."""
+    zone = _zone("corp.example.test.")
+    zone["primary_ns"] = bad
+    apex = _zone_apex(zone)
+    assert apex.soa_mname == "ns1.corp.example.test."
+    assert apex.ns == ("ns1.corp.example.test.",)
+    assert ("unusable_field", f"primary_ns={bad!r}") in apex.notes
+
+
+@pytest.mark.parametrize("good", PRIMARY_NS_GOOD)
+def test_a_host_name_primary_ns_is_served(good: str) -> None:
+    zone = _zone("corp.example.test.")
+    zone["primary_ns"] = good
+    apex = _zone_apex(zone)
+    want = good if good.endswith(".") else good + "."
+    assert apex.soa_mname == want
+    assert not [n for n in apex.notes if n[0] == "unusable_field"]
+
+
+def test_an_unusable_primary_ns_falls_back_to_the_declared_ns() -> None:
+    """With NS records of its own the zone's SOA names the first of them, so
+    the SOA and the NS set still agree."""
+    zone = _zone("corp.example.test.", [_rec("@", "NS", "a.ns.example.net.")])
+    zone["primary_ns"] = "ns_1.corp.example.test."
+    apex = _zone_apex(zone)
+    assert apex.soa_mname == "a.ns.example.net."
+    assert apex.ns == ()

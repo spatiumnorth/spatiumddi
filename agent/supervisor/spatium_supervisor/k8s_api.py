@@ -26,7 +26,7 @@ import json
 import os
 import socket
 import ssl
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1093,39 +1093,136 @@ def reclaim_stranded_postgres_storage(
 # defaults as the floor.
 
 
-def _helmchartconfig_upsert(
-    name: str, values_yaml: str, *, namespace: str = "kube-system"
+def _merge_owned_overrides(
+    name: str,
+    owned: dict[str, Any] | Callable[[dict], dict[str, Any]],
+    *,
+    namespace: str = "kube-system",
 ) -> tuple[bool, str | None]:
-    """Create-or-update the HelmChartConfig ``name`` so its
-    ``spec.valuesContent`` equals ``values_yaml``. Idempotent — returns
-    ``(False, None)`` when already current. helm-controller merges this
-    on top of the same-named HelmChart's values, and it survives k3s
-    manifest re-apply on restart (unlike a HelmChart CR patch)."""
-    base = f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}/helmchartconfigs"
-    path = f"{base}/{quote(name)}"
-    try:
-        status, resp = _request("GET", path)
-    except RuntimeError as exc:
-        return False, str(exc)
-    if status == 200:
-        try:
-            cur = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
-        except (json.JSONDecodeError, ValueError):
-            cur = None
-        if cur == values_yaml:
-            return False, None
-        patch = json.dumps({"spec": {"valuesContent": values_yaml}}).encode("utf-8")
+    """Merge the supervisor's ``owned`` keys into the HelmChartConfig
+    ``name`` and write it back only if that changes anything.
+
+    The ONE write path for every supervisor-owned HelmChartConfig
+    (``spatium-control``, ``spatium-metallb``, ``spatiumddi-appliance``).
+    Returns ``(True, None)`` on a write, ``(False, None)`` when there was
+    nothing to do, ``(False, error)`` otherwise.
+
+    #2024 — the supervisor OWNS ITS KEYS, not the document. These CRs are
+    also where an operator puts their own overrides (APPLIANCE.md sends
+    them to ``spatiumddi-appliance`` to raise ``dnsBind9.resources``), and
+    the backend's chart bump stamps ``image.tag`` onto ``spatium-control``
+    (#792). This used to replace ``spec.valuesContent`` with the
+    supervisor's keys alone whenever the string differed, so every such
+    key was reverted on the next heartbeat. Now:
+
+    * the live document is read and parsed; an unknown current state
+      (unreachable, unparseable, not a mapping) ABORTS rather than merging
+      onto ``{}`` — see ``_helmchartconfig_doc``;
+    * ``owned`` is deep-merged on top (``owned`` wins on a collision —
+      those keys are the supervisor's by definition), so every other key
+      survives exactly as the operator wrote it;
+    * nothing is written when the merge leaves the document as it is
+      (compared PARSED, so an operator's formatting is not "a change"), nor
+      when it leaves the EFFECTIVE values ``deep_merge(chart, config)``
+      unchanged — #1005's guard against a helm revision for nothing;
+    * the PATCH carries the ``resourceVersion`` of the document it merged
+      into, so an operator edit landing between our read and our write is
+      a 409 (retried next heartbeat against the new document) instead of
+      being overwritten.
+
+    Two consequences worth knowing:
+
+    * **Removal is expressed by value, never by omission.** A merge cannot
+      delete a key, so every owned key must be written explicitly in every
+      state (``useMetalLBVIP: false`` + ``vip: ""`` when the VIP is off,
+      ``enabled: false`` for MetalLB). A key the supervisor stops owning in
+      a later release stays in the CR until someone removes it.
+    * **Comments do not survive a write.** The document is re-dumped with
+      ``yaml.safe_dump(sort_keys=True)`` — the same normalisation the
+      backend's chart bump uses, so two writers converge on identical bytes
+      — which keeps every operator KEY and VALUE but drops YAML comments and
+      reorders keys. A beat that changes nothing does not write, so a
+      comment lasts until the supervisor's own keys next change.
+
+    ``owned`` may be a callable taking the current document, for overrides
+    that depend on it (the slot-image mirror latch, #787)."""
+    path = (
+        f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}"
+        f"/helmchartconfigs/{quote(name)}"
+    )
+    current_doc, exists, resource_version = _values_content_read(
+        path, kind="helmchartconfig", name=name
+    )
+    if current_doc is None:
+        # Unknown current state — writing would merge onto {} and delete
+        # every key we do not own.
+        # The read logged why. A CR an operator left unparseable stays
+        # frozen — the supervisor's own keys included — until it is fixed or
+        # deleted, so say so on every beat rather than once.
+        return False, (
+            f"could not read the current {name} values; nothing written "
+            f"(if this persists, fix or delete the HelmChartConfig {name})"
+        )
+    owned_keys = owned(current_doc) if callable(owned) else owned
+    merged = _deep_merge(current_doc, owned_keys)
+    if exists and merged == current_doc:
+        return False, None
+
+    # #1005 — do not write a HelmChartConfig that changes nothing.
+    #
+    # helm-controller merges the Config on top of the HelmChart, so a
+    # Config whose every key the Chart already carries changes no rendered
+    # object but still records a helm revision and runs a helm-install Job.
+    # The comparison is therefore on the EFFECTIVE values — what helm
+    # actually renders — not on the CR alone.
+    #
+    # Deliberately not restricted to the create case. A create-only guard
+    # would hand the write to the worst possible moment instead of removing
+    # it: ``chart_bump._patch_image_tag`` creates ``spatium-control``
+    # carrying only ``image.tag`` to roll the control plane to a new
+    # version, and from the next heartbeat — at most 30 s later, i.e.
+    # mid-upgrade — a create-only guard is bypassed and every owned key is
+    # PATCHed in while the tag-bump apply is still in flight.
+    #
+    # Skipping is safe with a Config present precisely because it is a
+    # skip: nothing is replaced, so no key we do not own can be dropped.
+    # And it self-heals — a slot upgrade that ships a chart with different
+    # defaults makes the comparison differ, and the next heartbeat writes.
+    # An unreadable Chart falls through to the write: a redundant CR is the
+    # status quo, suppressing a needed one is not.
+    chart_values = _helmchart_values(name, namespace=namespace)
+    if chart_values is not None and _deep_merge(chart_values, merged) == _deep_merge(
+        chart_values, current_doc
+    ):
+        log.info(
+            "supervisor.helmchartconfig.write_skipped",
+            chart=name,
+            reason="the HelmChart already carries every overridden value",
+        )
+        return False, None
+
+    values_yaml = yaml.safe_dump(merged, sort_keys=True, default_flow_style=False)
+    if exists:
+        patch: dict[str, Any] = {"spec": {"valuesContent": values_yaml}}
+        if resource_version:
+            # Optimistic concurrency: kubeapi answers 409 Conflict when the
+            # object has moved on since the read we merged into.
+            patch["metadata"] = {"resourceVersion": resource_version}
         try:
             st, rb = _request(
-                "PATCH", path, body=patch, content_type="application/merge-patch+json"
+                "PATCH",
+                path,
+                body=json.dumps(patch).encode("utf-8"),
+                content_type="application/merge-patch+json",
             )
         except RuntimeError as exc:
             return False, str(exc)
-        return (st in (200, 201)), (
-            None if st in (200, 201) else f"PATCH status {st}: {rb[:200]!r}"
-        )
-    if status != 404:
-        return False, f"kubeapi GET status {status}"
+        if st in (200, 201):
+            return True, None
+        if st == 409:
+            return False, "HelmChartConfig changed under us; retrying next heartbeat"
+        return False, f"PATCH status {st}: {rb[:200]!r}"
+    base = f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}/helmchartconfigs"
     body = json.dumps(
         {
             "apiVersion": "helm.cattle.io/v1",
@@ -1138,9 +1235,12 @@ def _helmchartconfig_upsert(
         st, rb = _request("POST", base, body=body, content_type="application/json")
     except RuntimeError as exc:
         return False, str(exc)
-    return (st in (200, 201)), (
-        None if st in (200, 201) else f"POST status {st}: {rb[:200]!r}"
-    )
+    if st in (200, 201):
+        return True, None
+    # 409 here is AlreadyExists — another node's supervisor (or an
+    # operator) created it between our read and our write. Next heartbeat
+    # merges into theirs.
+    return False, f"POST status {st}: {rb[:200]!r}"
 
 
 # Fast-evict tolerations for the CONTROL-PLANE workloads (api / frontend /
@@ -1181,8 +1281,17 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
     return out
 
 
-def _values_content_doc(path: str, *, kind: str, name: str) -> dict | None:
+def _values_content_read(
+    path: str, *, kind: str, name: str
+) -> tuple[dict | None, bool, str | None]:
     """Shared reader for a helm.cattle.io CR's ``spec.valuesContent``.
+
+    Returns ``(doc, exists, resource_version)``. ``doc`` is ``{}`` when the
+    CR is absent (``exists`` False) or its ``valuesContent`` is empty, and
+    ``None`` when the answer is unknown — see ``_helmchartconfig_doc``.
+    ``resource_version`` is the CR's ``metadata.resourceVersion`` when the
+    body carried one, so a writer can make its PATCH conditional on the
+    document it merged into (#2024).
 
     ``kind`` only names the log event (``helmchart`` / ``helmchartconfig``);
     the semantics below are identical for both and must stay that way — the
@@ -1193,31 +1302,44 @@ def _values_content_doc(path: str, *, kind: str, name: str) -> dict | None:
         st, resp = _request("GET", path)
     except (RuntimeError, OSError) as exc:
         log.warning(f"supervisor.{kind}.read_failed", chart=name, error=str(exc))
-        return None
+        return None, False, None
     if st == 404:
-        return {}
+        return {}, False, None
     if st != 200:
         log.warning(f"supervisor.{kind}.read_failed", chart=name, status=st)
-        return None
+        return None, True, None
     try:
-        raw = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
-    except (json.JSONDecodeError, ValueError):
+        body = json.loads(resp)
+        raw = (body.get("spec") or {}).get("valuesContent") or ""
+        rv = (body.get("metadata") or {}).get("resourceVersion") or None
+    except (json.JSONDecodeError, ValueError, AttributeError):
         log.warning(f"supervisor.{kind}.unparseable_body", chart=name)
-        return None
+        return None, True, None
     if not str(raw).strip():
-        return {}
+        return {}, True, rv
     try:
         doc = yaml.safe_load(raw)
     except yaml.YAMLError as exc:
         log.warning(f"supervisor.{kind}.unparseable_values", chart=name, error=str(exc))
-        return None
+        return None, True, rv
+    if doc is None:
+        # A document of only comments (or ``---`` / ``null``) is a YAML
+        # empty document: helm reads it as no values, so there is nothing to
+        # preserve. Refusing it would freeze every supervisor key in this CR
+        # for good on an operator who commented their override out.
+        return {}, True, rv
     if not isinstance(doc, dict):
         # A list or scalar at the top level is not something we can merge
         # into. Refusing beats replacing it with our own keys and calling
         # the operator's document a typo.
         log.warning(f"supervisor.{kind}.values_not_a_mapping", chart=name)
-        return None
-    return doc
+        return None, True, rv
+    return doc, True, rv
+
+
+def _values_content_doc(path: str, *, kind: str, name: str) -> dict | None:
+    """``_values_content_read`` without the existence / version detail."""
+    return _values_content_read(path, kind=kind, name=name)[0]
 
 
 def _helmchart_values(name: str, *, namespace: str = "kube-system") -> dict | None:
@@ -1246,7 +1368,8 @@ def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict |
     """Current ``spec.valuesContent`` of the HelmChartConfig, parsed.
 
     Returns ``{}`` only when there is genuinely nothing to preserve: the CR
-    does not exist (404), or it exists with an empty ``valuesContent``.
+    does not exist (404), or it exists with an empty ``valuesContent`` (an
+    all-comments document is empty too — YAML parses it to null).
 
     Returns ``None`` for every other non-answer — kubeapi unreachable, an
     unexpected status, a body we cannot parse, or a document that is not a
@@ -1585,39 +1708,39 @@ def apply_control_plane_overrides(
         "podAntiAffinity": "hard",
         "tolerations": _CONTROL_PLANE_FAST_EVICT,
     }
-    current_doc = _helmchartconfig_doc("spatium-control")
-    if current_doc is None:
-        # Unknown current state — see _helmchartconfig_doc. Writing here
-        # would merge onto {} and delete every key we do not own.
-        return False, "could not read the current spatium-control values"
     sized = control_plane_resources(mem_total_mib)
-    owned: dict[str, Any] = {
-        "api": dict(scaled) | sized.get("api", {}),
-        "frontend": dict(scaled)
-        | {
-            "controlPlaneVIP": vip,
-            "loadBalancerSourceRanges": cidrs,
-        },
-        "worker": dict(scaled) | sized.get("worker", {}),
-        "slotImageMirror": {
-            "enabled": _slot_image_mirror_enabled(cp_size, current_doc)
-        },
-        # #1115 — the CNPG instance memory limit and shared_buffers ride along
-        # with the instance count (both live under ``postgresql``; the merge
-        # keeps ``cnpg.instances`` beside ``cnpg.parameters``). #1313 — the
-        # count is the Cluster's own, as the supervisor's patch left it.
-        "postgresql": _deep_merge(
-            {"cnpg": {"instances": cnpg_instances if cnpg_instances else cp_size}},
-            sized.get("postgresql", {}),
-        ),
-        # ``kind`` is stated, not assumed: ``sentinel.replicas`` is only
-        # read by the chart under ``kind: sentinel``, and firstboot is the
-        # only place that ever set it. An appliance whose HelmChart values
-        # came from an older firstboot (or an operator's own override)
-        # would scale a key the chart ignores and keep a standalone redis
-        # on a three-node control plane.
-        "redis": {"kind": "sentinel", "sentinel": {"replicas": cp_size}},
-    }
+
+    def owned(current_doc: dict) -> dict[str, Any]:
+        # The slot-image mirror latch (#787) reads the live document, so
+        # the owned keys are computed from the same read the merge uses.
+        return {
+            "api": dict(scaled) | sized.get("api", {}),
+            "frontend": dict(scaled)
+            | {
+                "controlPlaneVIP": vip,
+                "loadBalancerSourceRanges": cidrs,
+            },
+            "worker": dict(scaled) | sized.get("worker", {}),
+            "slotImageMirror": {
+                "enabled": _slot_image_mirror_enabled(cp_size, current_doc)
+            },
+            # #1115 — the CNPG instance memory limit and shared_buffers ride along
+            # with the instance count (both live under ``postgresql``; the merge
+            # keeps ``cnpg.instances`` beside ``cnpg.parameters``). #1313 — the
+            # count is the Cluster's own, as the supervisor's patch left it.
+            "postgresql": _deep_merge(
+                {"cnpg": {"instances": cnpg_instances if cnpg_instances else cp_size}},
+                sized.get("postgresql", {}),
+            ),
+            # ``kind`` is stated, not assumed: ``sentinel.replicas`` is only
+            # read by the chart under ``kind: sentinel``, and firstboot is the
+            # only place that ever set it. An appliance whose HelmChart values
+            # came from an older firstboot (or an operator's own override)
+            # would scale a key the chart ignores and keep a standalone redis
+            # on a three-node control plane.
+            "redis": {"kind": "sentinel", "sentinel": {"replicas": cp_size}},
+        }
+
     # MERGE onto what is already there rather than replacing the document.
     #
     # This used to be a hand-concatenated string assigned wholesale to
@@ -1633,56 +1756,14 @@ def apply_control_plane_overrides(
     #
     # Merging fixes the deletion; dumping through the SAME normalisation
     # chart_bump uses fixes the churn, because two agents writing the same
-    # logical document now produce byte-identical strings and the upsert's
-    # idempotent compare finally holds.
-    merged = _deep_merge(current_doc, owned)
-
-    # #1005 — do not write a HelmChartConfig that changes nothing.
+    # logical document now produce byte-identical strings.
     #
-    # helm-controller merges the Config on top of the HelmChart, and since
-    # #1003 item 4 firstboot renders the same sizing the supervisor would.
-    # So the first heartbeat of every control-plane install used to create a
-    # CR whose every key the Chart already carried — no Deployment changed,
-    # but helm still recorded revision 2 and ran a second helm-install Job.
-    # ``_helmchartconfig_upsert`` could not catch it: its idempotence is
-    # against the CR's own previous body, and on a fresh boot there is none.
-    #
-    # So the comparison is on the EFFECTIVE values — what helm actually
-    # renders — rather than on the CR alone: skip when merging ``owned`` in
-    # leaves ``deep_merge(chart, config)`` exactly as it already is.
-    #
-    # Deliberately not restricted to the create case. A create-only guard
-    # would hand the write to the worst possible moment instead of removing
-    # it: ``chart_bump._patch_image_tag`` creates this CR carrying only
-    # ``image.tag`` to roll the control plane to a new version, and from the
-    # next heartbeat — at most 30 s later, i.e. mid-upgrade — ``current_doc``
-    # is truthy, so a create-only guard is bypassed and every owned key is
-    # PATCHed in while the tag-bump apply is still in flight. Before #1005
-    # that write did not happen at all, because the CR already carried those
-    # keys and the rendered document was byte-identical.
-    #
-    # Skipping is safe with a Config present precisely because it is a skip:
-    # nothing is replaced, so the keys we do not own (``image.tag``) cannot
-    # be dropped. And it self-heals — a slot upgrade that ships a chart with
-    # different defaults makes the comparison differ, and the next heartbeat
-    # writes. In practice the skip only ever fires on a single-node control
-    # plane, since ``cp_size`` is the one value firstboot cannot know and any
-    # promote puts the Config ahead of the Chart for good.
-    #
-    # An unreadable Chart falls through to the write: writing a redundant CR
-    # is the status quo, suppressing a needed one is not.
-    chart_values = _helmchart_values("spatium-control")
-    if chart_values is not None and _deep_merge(chart_values, merged) == _deep_merge(
-        chart_values, current_doc
-    ):
-        log.info(
-            "supervisor.helmchartconfig.write_skipped",
-            chart="spatium-control",
-            reason="the HelmChart already carries every overridden value",
-        )
-        return False, None
-    values = yaml.safe_dump(merged, sort_keys=True, default_flow_style=False)
-    return _helmchartconfig_upsert("spatium-control", values)
+    # #1005 — and the write is skipped when it would not change the
+    # EFFECTIVE values ``deep_merge(chart, config)``; the full rationale
+    # (including why that guard is not create-only) lives in
+    # ``_merge_owned_overrides``, now the one write path for every
+    # supervisor-owned HelmChartConfig (#2024).
+    return _merge_owned_overrides("spatium-control", owned)
 
 
 def apply_metallb_overrides(
@@ -1717,12 +1798,11 @@ def apply_metallb_overrides(
     frrk8s.enabled; the chart's own template hard-``fail``s if both are
     true).
 
-    MUST render every MetalLB-related key in ONE combined body —
-    ``_helmchartconfig_upsert`` replaces the whole valuesContent string,
-    so calling this (or a sibling function targeting the same
-    HelmChartConfig) twice per tick would have the second call blank
-    out the first's keys."""
-    pool_json = json.dumps([a.strip() for a in pool_addresses if a and a.strip()])
+    Every key is written explicitly in both states (``enabled: false``,
+    empty lists) because the write MERGES into the live document (#2024)
+    and a merge cannot express removal by omission. Keys the supervisor
+    does not own — an operator's own MetalLB tuning — survive."""
+    pool = [a.strip() for a in pool_addresses if a and a.strip()]
 
     def _peer(p: dict) -> dict:
         out: dict = {
@@ -1746,17 +1826,19 @@ def apply_metallb_overrides(
             out["aggregationLength"] = a["aggregation_length"]
         return out
 
-    peers_json = json.dumps([_peer(p) for p in (bgp_peers or [])])
-    adv_json = json.dumps([_adv(a) for a in (bgp_advertisements or [])])
-    values = (
-        f"metallb:\n  enabled: {'true' if metallb_enabled else 'false'}\n"
-        f"  ipPool:\n    addresses: {pool_json}\n"
-        f"  frrk8s:\n    enabled: {'true' if bgp_enabled else 'false'}\n"
-        f"  bgp:\n    enabled: {'true' if bgp_enabled else 'false'}\n"
-        f"    peers: {peers_json}\n"
-        f"    advertisements: {adv_json}\n"
-    )
-    return _helmchartconfig_upsert("spatium-metallb", values)
+    owned = {
+        "metallb": {
+            "enabled": bool(metallb_enabled),
+            "ipPool": {"addresses": pool},
+            "frrk8s": {"enabled": bool(bgp_enabled)},
+            "bgp": {
+                "enabled": bool(bgp_enabled),
+                "peers": [_peer(p) for p in (bgp_peers or [])],
+                "advertisements": [_adv(a) for a in (bgp_advertisements or [])],
+            },
+        }
+    }
+    return _merge_owned_overrides("spatium-metallb", owned)
 
 
 def apply_dataplane_vip_overrides(
@@ -1775,17 +1857,23 @@ def apply_dataplane_vip_overrides(
     Written to the HelmChartConfig (not the HelmChart CR) so it survives
     a k3s restart's manifest re-apply, exactly like the cp-size + VIP
     overrides. helm-controller merges it on top of the role-assignment
-    values the supervisor PATCHes onto the same-named HelmChart, so this
-    overlay only carries the VIP keys and never fights for ownership of
-    the per-role ``enabled`` flags. Idempotent — only writes on change."""
+    values the supervisor PATCHes onto the same-named HelmChart, so it
+    does not touch the per-role ``enabled`` flags.
+
+    #2024 — this Config is ALSO where APPLIANCE.md sends an operator to
+    raise ``dnsBind9.resources``, so the supervisor owns its three keys
+    and nothing else: they are merged into the live document and every
+    other key survives the heartbeat. The VIP keys are written explicitly
+    when off (``useMetalLBVIP: false``, ``vip: ""``, ``relayVIP: ""``)
+    because a merge cannot remove a key by leaving it out. Writes only
+    when the merge changes something."""
     dns_vip = (dns_vip or "").strip()
     relay_vip = (dhcp_relay_vip or "").strip()
-    values = (
-        f"dns:\n  useMetalLBVIP: {'true' if dns_vip else 'false'}\n"
-        f'  vip: "{dns_vip}"\n'
-        f'dhcpKea:\n  relayVIP: "{relay_vip}"\n'
-    )
-    return _helmchartconfig_upsert("spatiumddi-appliance", values)
+    owned = {
+        "dns": {"useMetalLBVIP": bool(dns_vip), "vip": dns_vip},
+        "dhcpKea": {"relayVIP": relay_vip},
+    }
+    return _merge_owned_overrides("spatiumddi-appliance", owned)
 
 
 def patch_node_labels(

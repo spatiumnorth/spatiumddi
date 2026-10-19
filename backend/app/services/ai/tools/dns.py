@@ -290,9 +290,10 @@ class FindDnsServersArgs(BaseModel):
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "List individual DNS servers with the group each belongs to, its "
-        "driver, whether it is the group's primary, and its enabled / "
-        "maintenance / config-apply state. Answers 'which group is this "
-        "server in?', 'which server is primary for that group?' and "
+        "driver, the version its agent runs, whether it is the group's "
+        "primary, and its enabled / maintenance / config-apply state. "
+        "Answers 'which group is this server in?', 'which server is "
+        "primary for that group?' and "
         "'which groups have no primary?' — the last of which silently "
         "drops every record write to that group's zones. Read-only: "
         "moving a server between groups is done over the REST API or the "
@@ -336,6 +337,9 @@ async def find_dns_servers(
             "is_enabled": s.is_enabled,
             "maintenance_mode": s.maintenance_mode,
             "status": s.status,
+            # #2078 — the agent's own release; NULL = never reported (an
+            # older agent, or an agentless driver). UNKNOWN, never "old".
+            "agent_version": s.agent_version,
             # NULL means the agent has never reported a verdict (a pre-#882
             # agent, or an agentless driver with no apply loop). UNKNOWN,
             # never "ok" — a silently reverted config is exactly what would

@@ -651,8 +651,10 @@ class FindInfluxDBTargetsArgs(BaseModel):
         "List configured InfluxDB push-export targets and their delivery "
         "health. Each row carries name, version (v1 / v2 / v3), URL, the "
         "database or bucket written to, measurement prefix, push interval, "
-        "which metric families it carries, and the last push's timestamp, "
-        "point count and error. Use to answer 'is the Grafana export "
+        "which metric families it carries, last_push_at (the last ATTEMPT, "
+        "which moves on failure too), last_success_at (the last push the "
+        "destination accepted; null = never), the point count of that "
+        "success, and the last error. Use to answer 'is the Grafana export "
         "working?' or 'why did metrics stop arriving in InfluxDB?'. "
         "Read-only, superadmin-only, and never returns tokens or passwords "
         "— only whether one is on file."
@@ -712,6 +714,7 @@ async def find_influxdb_targets(
                 ],
                 "credential_on_file": bool(t.password_encrypted or t.token_encrypted),
                 "last_push_at": t.last_push_at.isoformat() if t.last_push_at else None,
+                "last_success_at": t.last_success_at.isoformat() if t.last_success_at else None,
                 "last_push_points": t.last_push_points,
                 "last_push_error": t.last_push_error,
             }

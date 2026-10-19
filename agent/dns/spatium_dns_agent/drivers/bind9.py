@@ -834,6 +834,24 @@ def _absolute_name(value: Any) -> str | None:
     return name if name.endswith(".") else name + "."
 
 
+_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def _is_host_name(absolute: str) -> bool:
+    """Whether absolute ``absolute`` is a usable Primary NS: the control
+    plane's ``primary_ns_error`` rule (backend ``app/core/dns_names.py``, kept
+    in step by shared test vectors). RFC 1123 labels, at most 63 octets each
+    and 253 in all, as BIND's default ``check-names`` requires: a row stored
+    before #2075 with ``ns_1.…`` made named refuse the zone and the agent
+    revert the whole bundle. And at least two labels: a single label such as
+    ``ns1`` is read as absolute and would be served as a name at the root,
+    not the ``ns1.<zone>`` the operator meant."""
+    body = absolute[:-1] if absolute.endswith(".") else absolute
+    if not body or len(body) > 253 or "." not in body:
+        return False
+    return all(_HOST_LABEL_RE.match(label) for label in body.split("."))
+
+
 def _zone_file_name(value: str, origin: str) -> str:
     """How BIND reads ``value`` written into the file of zone ``origin``:
     absolute when it ends in a dot, the apex for ``@`` or nothing, otherwise
@@ -902,6 +920,8 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
             declared_ns.append(_zone_file_name(str(rec.get("value") or ""), origin))
 
     primary_ns = _absolute_name(zone.get("primary_ns"))
+    if primary_ns is not None and not _is_host_name(primary_ns):
+        primary_ns = None  # reported below as an unusable field, then healed
     admin = _absolute_name(zone.get("admin_email"))
     for field, parsed in (("primary_ns", primary_ns), ("admin_email", admin)):
         if parsed is None and str(zone.get(field) or "").strip():
