@@ -123,7 +123,12 @@ export const baseMainNav: NavEntry[] = [
 // IPAM-family children (all route under /ipam/*). Alphabetised, matching the
 // Network/Administration sub-group convention.
 export const coreIpamNav: NavEntry[] = [
-  { label: "NAT Mappings", icon: Shuffle, to: "/ipam/nat" },
+  {
+    label: "NAT Mappings",
+    icon: Shuffle,
+    to: "/ipam/nat",
+    module: "ipam.nat",
+  },
   { label: "Stale IPs", icon: History, to: "/ipam/stale" },
   { label: "Subnet Planner", icon: Workflow, to: "/ipam/plans" },
 ];

@@ -584,6 +584,17 @@ holds a `dns_zone` grant on (GHSA-875w). Reads that belong to no grantable
 resource at all, such as a DNS server's recent events and `rndc status`,
 are refused to a resource-scoped token (GHSA-c4v7).
 
+The same holds over the Operator Copilot and the MCP endpoint
+(`POST /api/v1/ai/mcp`). A tool's permission check sees only the
+resource type, so the tool registry additionally refuses a
+resource-scoped token every tool that does not declare
+`honours_token_binding` — a tool that filters its answer to the bound
+zones / subnets, or gates a by-id read on them. Undeclared tools are
+left out of `tools/list` and refused at dispatch, for in-app chat as well
+as MCP. `backend/tests/test_copilot_tool_token_binding.py` pins the
+declared set and checks each tool against a zone and subnet the token is
+not bound to.
+
 **Wire format.** Raw tokens start with `sddi_` followed by 40 bytes of
 url-safe base64 entropy (`secrets.token_urlsafe(40)`). Operators typically see only the first
 10 characters (`sddi_AbCdE`) in the UI as an identifier — this is

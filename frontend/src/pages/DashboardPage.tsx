@@ -103,6 +103,7 @@ import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 import { HA_V4_ONLY_NOTE } from "@/lib/dhcpHa";
 import { activityTone } from "@/lib/activity-tone";
@@ -1443,10 +1444,14 @@ export function DashboardPage() {
   });
 
   // NAT mapping count — cheap (single page=1, per_page=1 just for total).
+  // Behind the ``ipam.nat`` module (#2100): the route 404s while it is off,
+  // and the card below goes with it.
+  const natOn = useModuleOn("ipam.nat");
   const { data: natTotal } = useQuery({
     queryKey: ["nat-mappings", "count"],
     queryFn: () => natApi.list({ page: 1, per_page: 1 }).then((r) => r.total),
     staleTime: 60_000,
+    enabled: natOn,
   });
 
   // Platform settings drive the utilization filter (excludes /30, /31,
@@ -2178,7 +2183,7 @@ export function DashboardPage() {
         )}
 
         {/* ── DNS query rate (DNS tab only) ──────────────────────────── */}
-        {tab === "dns" && (
+        {tab === "dns" && dnsOn && (
           <WidgetErrorBoundary title="DNS query rate">
             <DNSQueryRateCard dnsServers={allDnsServers} />
           </WidgetErrorBoundary>
@@ -2267,13 +2272,15 @@ export function DashboardPage() {
               </div>
             </div>
 
-            <KpiCard
-              label="NAT mappings"
-              value={natTotal ?? "—"}
-              sub={natTotal === 0 ? "none configured" : "operator-curated"}
-              icon={Plug}
-              to="/ipam/nat"
-            />
+            {natOn && (
+              <KpiCard
+                label="NAT mappings"
+                value={natTotal ?? "—"}
+                sub={natTotal === 0 ? "none configured" : "operator-curated"}
+                icon={Plug}
+                to="/ipam/nat"
+              />
+            )}
 
             <KpiCard
               label="Capacity headroom"
@@ -2466,7 +2473,7 @@ export function DashboardPage() {
         )}
 
         {/* ── DNS tab: Server list ──────────────────────────────────── */}
-        {tab === "dns" && allDnsServers.length > 0 && (
+        {tab === "dns" && dnsOn && allDnsServers.length > 0 && (
           <div className="rounded-lg border bg-card">
             <div className="flex items-center justify-between border-b px-4 py-2.5">
               <div className="flex items-center gap-2">
@@ -2507,7 +2514,7 @@ export function DashboardPage() {
             </div>
           </div>
         )}
-        {tab === "dns" && allDnsServers.length === 0 && (
+        {tab === "dns" && dnsOn && allDnsServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
             <Globe2 className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
             <p className="text-sm font-medium">No DNS servers registered</p>
@@ -4524,11 +4531,20 @@ function ConformityPanel() {
 //     soon (left), circuit alerts + orphan services + overlay
 //     impact (right).
 function NetworkPanel() {
-  const { data, isLoading } = useQuery<NetworkDashboardSummary>({
+  const { data, isLoading, isError } = useQuery<NetworkDashboardSummary>({
     queryKey: ["dashboards", "network"],
     queryFn: () => dashboardsApi.networkSummary(),
     refetchInterval: 60_000,
   });
+
+  if (isError) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        Network signals are unavailable. Your role may not include read access
+        to ASNs, circuits, services or overlays.
+      </div>
+    );
+  }
 
   if (isLoading || !data) {
     return (
@@ -4816,11 +4832,20 @@ function NetworkKpi({
 // Overview tab (the legacy one is per-target chips, this one is the
 // rollup-driven tab body).
 function IntegrationsDashboardTabPanel() {
-  const { data, isLoading } = useQuery<IntegrationsDashboardSummary>({
+  const { data, isLoading, isError } = useQuery<IntegrationsDashboardSummary>({
     queryKey: ["dashboards", "integrations"],
     queryFn: () => dashboardsApi.integrationsSummary(),
     refetchInterval: 30_000,
   });
+
+  if (isError) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        Integration health is unavailable. Your role may not include read access
+        to any integration.
+      </div>
+    );
+  }
 
   if (isLoading || !data) {
     return (
