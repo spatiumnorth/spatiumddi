@@ -107,6 +107,28 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Sync DNS leaves an address in the zone it was put in (#2104).**
+  Allocate, Edit and Bulk edit can put an address in a zone other than
+  its subnet's, and #493 made later edits keep it. Sync DNS still
+  worked each address's zone out from its subnet: the preview listed
+  the address's A and PTR as mismatched (the A with the same name and
+  value on both sides), and committing them, which the dialog does by
+  default and auto-sync does on every run, moved the host back into
+  the subnet's zone and pointed its PTR there. If the subnet had no
+  zone at all, the same records were listed as stale and deleted. The
+  preview and the commit, at subnet, block and space scope and in
+  auto-sync, now use the address's own zone when it has one and the
+  subnet's otherwise, which is what the record write already did for
+  a hostname edit. A forward record that is in the wrong zone now
+  names the zone it is in. Editing a DHCP reservation's row and
+  re-importing an address no longer move it out of its zone either.
+  A side effect: changing or removing a subnet's zone no longer moves
+  or deletes the records of addresses already published in the old
+  one when Sync DNS runs; move them with Bulk edit. Also fixed: a
+  block's Sync DNS commit answered 422 whenever it changed anything,
+  because the audit row was given the block's network object instead
+  of its text.
+
 - **Sync DNS reads an address in every zone it publishes to
   (#2107).** An address with extra zones has its host record in its
   forward zone and in each extra zone IPAM authors, but the drift

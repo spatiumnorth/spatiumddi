@@ -72,6 +72,7 @@ from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
 from app.services.dns.sync_check import (
+    address_own_forward_zone_id,
     forward_zone_ids_in_order,
     ipam_authors_zone,
     resolve_reverse_zone,
@@ -7381,7 +7382,18 @@ async def _apply_dns_sync(
                     # #2072 — strict, so a name too long for its zone is
                     # reported in ``errors`` instead of counted as synced. The
                     # refusal comes before anything is written for this IP.
-                    await _sync_dns_record(db, ip, sn, action="create", strict=True)
+                    # #2104 — the address's own zone (#493), which the drift
+                    # check judged it against. Passing none resolved the
+                    # subnet's zone and moved a host the operator had put in
+                    # another zone back into the subnet's.
+                    await _sync_dns_record(
+                        db,
+                        ip,
+                        sn,
+                        zone_id=await address_own_forward_zone_id(db, ip),
+                        action="create",
+                        strict=True,
+                    )
                     if ip.id in body.create_for_ip_ids:
                         created += 1
                     else:
@@ -7641,7 +7653,10 @@ async def dns_sync_commit_block(
                 "dns-sync",
                 "block",
                 str(block.id),
-                block.network,
+                # The column reads back as an ``IPv4Network``, which the audit
+                # row's text column refused: every block commit that changed
+                # anything answered 422 (found by #2104's tests).
+                str(block.network),
                 new_value={
                     "created": created,
                     "updated": updated,
