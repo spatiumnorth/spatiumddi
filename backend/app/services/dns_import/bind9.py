@@ -80,7 +80,21 @@ _COMMENT_LINE_RE = re.compile(r"(//|#)[^\n]*")
 # (BIND accepts unquoted names too but every export tool we've seen
 # emits quoted; if we get an unquoted name the zone is silently
 # skipped — operator quotes it manually and re-uploads).
-_NAME_BLOCK_RE = re.compile(r'\s+"([^"]+)"\s*\{')
+#
+# An optional DNS class may sit between the name and the brace
+# (``zone "x" IN { … };``, ``view "v" IN { … };`` — RHEL / Fedora's
+# stock named.conf writes every zone that way). Comments are already
+# stripped, so only whitespace (or nothing, after a closing quote) can
+# separate the tokens. Case-insensitive; group 2 is the class.
+_NAME_BLOCK_RE = re.compile(
+    r'\s+"([^"]+)"(?:\s*\b(IN|CHAOS|CH|HESIOD|HS)\b)?\s*\{',
+    re.IGNORECASE,
+)
+
+
+# Spelling as written → canonical class. An empty string (no class
+# given) maps to None-ish and falls back to the enclosing default.
+_CLASS_ALIASES = {"IN": "IN", "CHAOS": "CH", "CH": "CH", "HESIOD": "HS", "HS": "HS"}
 
 
 @dataclass
@@ -92,6 +106,9 @@ class _NamedConfZone:
     name: str  # FQDN, may or may not have trailing dot
     body: str
     view: str | None
+    # DNS class as written, upper-cased; inherited from the enclosing
+    # view when the zone names none. ``IN`` unless stated otherwise.
+    dns_class: str = "IN"
 
 
 def _strip_comments(text: str) -> str:
@@ -141,7 +158,9 @@ def _balanced_block(text: str, brace_open_pos: int) -> tuple[str, int]:
     raise ImportSourceError("Unbalanced braces in named.conf")
 
 
-def _walk_zones(text: str, view: str | None = None) -> Iterable[_NamedConfZone]:
+def _walk_zones(
+    text: str, view: str | None = None, default_class: str = "IN"
+) -> Iterable[_NamedConfZone]:
     """Yield every ``zone`` declaration, recursing into ``view``
     blocks so we capture per-view zones with their view tag."""
 
@@ -161,15 +180,23 @@ def _walk_zones(text: str, view: str | None = None) -> Iterable[_NamedConfZone]:
             pos = after_kw
             continue
         name = nm.group(1)
+        decl_class = (nm.group(2) or "").upper()
         brace_open = nm.end() - 1
         try:
             body, end = _balanced_block(text, brace_open)
         except ImportSourceError:
             return
         if kw == "zone":
-            yield _NamedConfZone(name=name, body=body, view=view)
-        else:  # view
-            yield from _walk_zones(body, view=name)
+            yield _NamedConfZone(
+                name=name,
+                body=body,
+                view=view,
+                dns_class=_CLASS_ALIASES.get(decl_class, default_class),
+            )
+        else:  # view — its zones inherit the view's class
+            yield from _walk_zones(
+                body, view=name, default_class=_CLASS_ALIASES.get(decl_class, default_class)
+            )
         pos = end
 
 
@@ -529,6 +556,15 @@ def parse_bind9_archive(payload: bytes) -> ImportPreview:
         warnings: list[str] = []
         seen_views: set[str] = set()
         for decl in decls:
+            if decl.dns_class != "IN":
+                # CHAOS / Hesiod zones (``version.bind`` style) are not
+                # internet-class data; importing one as IN would publish
+                # a record set the source never served that way.
+                warnings.append(
+                    f"Zone {decl.name!r} skipped: it is declared with class "
+                    f"{decl.dns_class}, and only class IN zones are imported."
+                )
+                continue
             zones.append(_parse_one_zone(decl, root, named_conf.parent, options_dir))
             if decl.view is not None:
                 seen_views.add(decl.view)
@@ -542,6 +578,12 @@ def parse_bind9_archive(payload: bytes) -> ImportPreview:
                 f"Source carries {len(seen_views)} view(s): {sorted(seen_views)}. "
                 "Phase 1 collapses everything to the default view; enable issue #24 (DNS Views) "
                 "to separate them at apply time."
+            )
+
+        if not zones:
+            raise ImportSourceError(
+                "named.conf declared zones, but none is class IN, so there is "
+                "nothing to import. " + " ".join(warnings)
             )
 
         total_records = sum(len(z.records) for z in zones)
