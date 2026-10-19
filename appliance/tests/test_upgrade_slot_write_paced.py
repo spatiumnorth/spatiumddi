@@ -71,6 +71,53 @@ class _Disk(io.BytesIO):
         return n
 
 
+class _Xz:
+    """xz's pipe, ``chunks`` full chunks of zeros long. The read after the
+    first ``stall_after`` chunks returns ``stall`` seconds of the clock late;
+    ``resumed`` is when it returned. Holds one chunk, however long the copy."""
+
+    def __init__(self, clock: _Clock, chunk: int, chunks: int, stall_after: int, stall: float):
+        self.clock = clock
+        self.block = bytes(chunk)
+        self.chunks = chunks
+        self.stall_after = stall_after
+        self.stall = stall
+        self.served = 0
+        self.resumed: float | None = None
+
+    def read(self, n: int) -> bytes:
+        if self.served == self.chunks:
+            return b""
+        if self.served == self.stall_after:
+            self.clock.now += self.stall
+            self.resumed = self.clock.now
+        self.served += 1
+        return self.block[:n]
+
+
+class _Dd:
+    """dd on a disk that takes every write at once, except the write after
+    the first ``stall_after`` chunks, which takes ``stall`` seconds of the
+    clock; ``resumed`` is when it returned. Keeps no bytes; ``marks`` holds
+    (time the write began, bytes written before it), as _Disk's does."""
+
+    def __init__(self, clock: _Clock, stall_after: int, stall: float):
+        self.clock = clock
+        self.stall_after = stall_after
+        self.stall = stall
+        self.marks: list[tuple[float, int]] = []
+        self.written = 0
+        self.resumed: float | None = None
+
+    def write(self, b) -> int:
+        self.marks.append((self.clock.now, self.written))
+        if len(self.marks) == self.stall_after + 1:
+            self.clock.now += self.stall
+            self.resumed = self.clock.now
+        self.written += len(b)
+        return len(b)
+
+
 def test_every_byte_reaches_dd_in_order(slot_cli) -> None:
     # Not a whole number of chunks, so the last read is short.
     data = bytes(range(256)) * (10 * 4096 + 3)
@@ -126,6 +173,36 @@ def test_the_rate_is_well_under_what_lost_the_leases(slot_cli) -> None:
     rate = slot_cli._WRITE_RATE_BYTES_PER_SECOND
     assert 0 < rate <= 48 * 1000 * 1000
     assert slot_cli._WRITE_CHUNK_BYTES == 4 * 1024 * 1024  # dd's bs=4M
+
+
+@pytest.mark.parametrize("held_up", ["xz", "dd"])
+def test_a_stall_is_not_made_up_at_the_disks_full_speed(slot_cli, held_up) -> None:
+    """A stall puts the copy behind the rate: xz decompressing slowly, or dd
+    held up by a busy disk. Once the stall is over, the copy keeps to the
+    rate again. It may catch up by a second at most, with the chunk the
+    stall held up, never by the whole stall: catching up runs at the disk's
+    full speed, the burst #1804 is about."""
+    rate = slot_cli._WRITE_RATE_BYTES_PER_SECOND
+    chunk = slot_cli._WRITE_CHUNK_BYTES
+    stall = 10.0
+    clock = _Clock()
+    # A second at the rate, the stall, then 12 seconds' worth on a fast disk.
+    src = _Xz(clock, chunk, chunks=104, stall_after=8 if held_up == "xz" else -1, stall=stall)
+    dd = _Dd(clock, stall_after=8 if held_up == "dd" else -1, stall=stall)
+    copied = slot_cli._paced_copy(src, dd, clock=clock, sleep=clock.sleep)
+    assert copied == dd.written == 104 * chunk
+
+    resumed = src.resumed if held_up == "xz" else dd.resumed
+    after = [(began, before) for began, before in dd.marks if began >= resumed]
+    first = after[0][1]
+    at_once = sum(1 for began, _ in after if began == resumed)
+    mib_s = (dd.written - first) / (clock.now - resumed) / (1024 * 1024)
+    burst = (
+        f"{at_once} chunks ({at_once * chunk // (1024 * 1024)} MiB) went to dd at once "
+        f"after a {stall:.0f} s stall, and the rest of the copy averaged {mib_s:.0f} MiB/s"
+    )
+    for began, before in after:
+        assert began - resumed >= (before - first) / rate - 1.0 - chunk / rate - 1e-9, burst
 
 
 def _cmd_apply() -> ast.FunctionDef:

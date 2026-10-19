@@ -589,7 +589,9 @@ _WRITE_RATE_BYTES_PER_SECOND = 32 * 1024 * 1024
 def _paced_copy(src, dst, *, clock=None, sleep=None) -> int:
     """Copy ``src`` to ``dst`` in ``_WRITE_CHUNK_BYTES`` reads, never getting
     ahead of ``_WRITE_RATE_BYTES_PER_SECOND`` since the copy began (#1804).
-    A destination slower than that is not slowed further. Returns the bytes
+    A destination slower than that is not slowed further. A copy that falls
+    behind (xz slow, or dd held up by a busy disk) makes up at most a second
+    of it at the disk's full speed, never the whole stall. Returns the bytes
     copied; a ``BrokenPipeError`` from ``dst`` (dd has exited) propagates."""
     clock = clock or time.monotonic
     sleep = sleep or time.sleep
@@ -602,6 +604,9 @@ def _paced_copy(src, dst, *, clock=None, sleep=None) -> int:
             return copied
         dst.write(buf)
         copied += len(buf)
+        # Time spent behind the rate is not banked beyond a second: what is
+        # made up after a stall runs at the disk's full speed.
+        start = max(start, clock() - copied / rate - 1.0)
         ahead = copied / rate - (clock() - start)
         if ahead > 0:
             sleep(ahead)
