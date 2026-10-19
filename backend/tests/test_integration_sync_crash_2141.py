@@ -187,3 +187,30 @@ def test_describe_sync_crash_drops_sql_and_parameters() -> None:
     assert "s3cr3t" not in text and "INSERT" not in text
     assert text.startswith("IntegrityError: ")
     assert len(describe_sync_crash(RuntimeError("x" * 5000))) == 1000
+
+
+def test_describe_sync_crash_redacts_credentials_in_urls() -> None:
+    import httpx  # noqa: PLC0415
+
+    req = httpx.Request("GET", "https://admin:hunter2@ctl.example/api/v1?api_token=TKN123&site=x")
+    resp = httpx.Response(401, request=req)
+    # httpx's raise_for_status() message carries the full URL.
+    exc = httpx.HTTPStatusError(
+        f"Client error '401 Unauthorized' for url '{req.url}'", request=req, response=resp
+    )
+    text = describe_sync_crash(exc)
+    assert "hunter2" not in text and "TKN123" not in text
+    assert "site=x" in text and "ctl.example" in text
+
+
+def test_describe_sync_crash_redacts_a_failing_row_detail() -> None:
+    from sqlalchemy.exc import DBAPIError  # noqa: PLC0415
+
+    orig = Exception(
+        'null value in column "name" of relation "unifi_controller" violates not-null '
+        "constraint\nDETAIL:  Failing row contains (abc, null, gAAAAAsecretcipher, (x))."
+    )
+    exc = DBAPIError("UPDATE unifi_controller SET x=$1", ("gAAAAAparam",), orig)
+    text = describe_sync_crash(exc)
+    assert "gAAAAA" not in text
+    assert "not-null" in text and "Failing row contains (…)" in text

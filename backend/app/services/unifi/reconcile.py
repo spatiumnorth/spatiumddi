@@ -427,6 +427,13 @@ async def _apply_router_and_vlans(
         # Ownership is ``unifi_controller_id`` only: never adopt an
         # operator Router that merely shares the name — the VLAN pass below
         # renames and deletes VLANs on the Router it owns (#2140).
+        #
+        # Check-then-insert can still race a concurrent pass that picks the
+        # same free name. That is left to fail on ``uq_router_name``, not
+        # retried under a new name: ``unifi_controller_id`` is not unique,
+        # so when the racer is a second pass for THIS controller (beat sweep
+        # vs Sync Now) a retry would give one controller two Routers. The
+        # task records the crash and the next pass finds or names the Router.
         router_name = await pick_unique_router_name(db, desired_router_name, tag="UniFi")
         if router_name != desired_router_name:
             logger.info(

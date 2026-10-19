@@ -169,8 +169,10 @@ the formatter handles the rest.
   errors, and the target backs off to its interval. Active block sync
   does the same for `last_block_sync_error`. The recorded text is the
   driver's message only: a database error's SQL and bound parameters,
-  which can include encrypted credential columns, are dropped. One
-  target's crash still never stops the others.
+  which can include encrypted credential columns, are dropped, as are a
+  password or token in a URL an HTTP error echoes and the row Postgres
+  prints for a NOT NULL violation. One target's crash still never stops
+  the others.
 - **A DNS record change made while an agent is replaced reaches the new
   agent at once, not five minutes later (#2042).** When a DNS agent is
   replaced (its pod rolls after a slot upgrade, a container restarts),

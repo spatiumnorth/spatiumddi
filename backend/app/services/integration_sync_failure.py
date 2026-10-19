@@ -19,6 +19,7 @@ record a crash must not abort the rest of the sweep.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -34,6 +35,25 @@ logger = structlog.get_logger(__name__)
 # Long enough for a Postgres DETAIL line, short enough for a card.
 _MAX_ERROR_CHARS = 1000
 
+# ``https://user:secret@host`` — userinfo in a URL an HTTP client echoed.
+_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@'\"]+@")
+# ``?token=…`` / ``&api_key=…`` — a credential an API takes as a query
+# parameter, echoed by httpx in "… for url '<url>'".
+_SECRET_QUERY = re.compile(
+    r"(?i)([?&][a-z0-9_.-]*(?:token|key|secret|passw(?:or)?d|pass|auth|sig|signature|"
+    r"credential|session)[a-z0-9_.-]*=)[^&\s'\"]*"
+)
+# Postgres NOT NULL / CHECK violations print the whole offending row in
+# DETAIL — on an integration row that includes the encrypted credentials.
+# Redacted to the end of its line, since a value may itself contain ")".
+_FAILING_ROW = re.compile(r"(?i)(Failing row contains ).*")
+
+
+def _scrub(text: str) -> str:
+    text = _URL_USERINFO.sub(r"\1***@", text)
+    text = _SECRET_QUERY.sub(r"\1***", text)
+    return _FAILING_ROW.sub(r"\1(…)", text)
+
 
 def describe_sync_crash(exc: BaseException) -> str:
     """The operator-facing text for a reconcile crash.
@@ -42,13 +62,16 @@ def describe_sync_crash(exc: BaseException) -> str:
     bound ``[parameters: …]`` — which on an integration row can include
     encrypted credential columns — so only the driver's own message is
     kept. Anything else is ``<Type>: <message>``, cut at any trailing
-    ``[SQL:`` block for the same reason, and truncated.
+    ``[SQL:`` block for the same reason. URL userinfo, credential-shaped
+    query parameters and a Postgres "Failing row contains (…)" detail are
+    redacted, because the text is persisted on the row and in an audit
+    row that may be forwarded off-box. Then truncated.
     """
     if isinstance(exc, StatementError) and exc.orig is not None:
         text = str(exc.orig)
     else:
         text = str(exc)
-    text = text.split("[SQL:", 1)[0].strip()
+    text = _scrub(text.split("[SQL:", 1)[0].strip())
     text = f"{type(exc).__name__}: {text}" if text else type(exc).__name__
     if len(text) > _MAX_ERROR_CHARS:
         text = text[: _MAX_ERROR_CHARS - 1] + "…"
