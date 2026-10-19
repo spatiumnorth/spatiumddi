@@ -115,8 +115,9 @@ the formatter handles the rest.
   `GET /dns/servers/{id}/pending-ops` reported an applied op with no
   time and no attempt for every record change. It now goes through
   `_mark_applied`, the helper the dispatch path uses, so the op
-  reads `applied_at` and `updated_at` set and one attempt (the
-  render delivered it once).
+  reads `applied_at` and `updated_at` set, has any earlier error and
+  retry time cleared, and counts one more attempt (the render
+  delivered it once).
 
 - **The BIND9 importer reads zones declared with their class
   (#2099).** `zone "x" IN { ... };` is valid BIND, and it is how
