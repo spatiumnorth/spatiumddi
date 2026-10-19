@@ -114,15 +114,19 @@ the formatter handles the rest.
   and off its schedule for up to 2 h, after which the reap stamped a
   run that had succeeded `failed`, and the multi-node "on node" text
   was lost. The archive manifest now records which target wrote it
-  (`run`: target, filename, node), and a restore that brings back the
-  backup-target table settles claims the archive can have produced:
-  the writing target becomes `success` with its filename and node, any
-  other `in_progress` claim becomes `failed` ("outcome not recorded"),
-  and `next_run_at` is recomputed. A claim made after the archive was
-  taken is a live run's and is left alone. Each settled target gets a
-  `backup_target_run_reconciled` audit row, and the restore audit row
-  lists them. No migration. Archives taken before this change carry no
-  `run` record, so their claims settle as `failed`.
+  (`run`: target, filename, node, and the exact time its claim was
+  stamped), and a restore that brings back the backup-target table
+  settles the claims the archive can have produced: the writing
+  target, recognised by that exact claim time, becomes `success` with
+  its filename and node; any other `in_progress` claim stamped at or
+  before the archive's creation becomes `failed` ("outcome not
+  recorded"), which a watched target's backup-failed alert reports
+  until its next run; and `next_run_at` is recomputed. A claim made
+  after the archive was taken is a live run's and is left alone. Each
+  settled target gets a `backup_target_run_reconciled` audit row, and
+  the restore audit row lists them. No migration. Archives taken
+  before this change carry no `run` record, so their claims settle as
+  `failed`.
 
 - **Dashboard rollups and the DNS / DHCP traffic series read with the
   caller's own grants.** `GET /metrics/dns/timeseries` now needs `read` on a

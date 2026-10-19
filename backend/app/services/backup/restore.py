@@ -1362,13 +1362,31 @@ async def _apply_backup_restore_inner(
     reconciled: list[dict[str, Any]] = []
     if restored_tables is None or "backup_target" in restored_tables:
         try:
-            from app.db import AsyncSessionLocal  # noqa: PLC0415
+            from sqlalchemy.ext.asyncio import (  # noqa: PLC0415
+                async_sessionmaker,
+                create_async_engine,
+            )
+            from sqlalchemy.pool import NullPool  # noqa: PLC0415
+
+            from app.db import _json_serializer, task_connect_args  # noqa: PLC0415
             from app.services.backup.runner import (  # noqa: PLC0415
                 reconcile_restored_run_claims,
             )
 
-            async with AsyncSessionLocal() as rdb:
-                reconciled = await reconcile_restored_run_claims(rdb, manifest=manifest)
+            # The database the restore just wrote (``db_url``), as every
+            # other phase uses — not the app's pooled engine, which Phase 4
+            # disposed and which need not point at the same database.
+            reconcile_engine = create_async_engine(
+                db_url,
+                poolclass=NullPool,
+                json_serializer=_json_serializer,
+                connect_args=task_connect_args(),
+            )
+            try:
+                async with async_sessionmaker(reconcile_engine, expire_on_commit=False)() as rdb:
+                    reconciled = await reconcile_restored_run_claims(rdb, manifest=manifest)
+            finally:
+                await reconcile_engine.dispose()
         except Exception as exc:  # noqa: BLE001 — the data is in; the 2 h reap still backstops
             logger.warning("backup_restore_reconcile_failed", error=str(exc))
             post_warnings.append(

@@ -294,7 +294,13 @@ async def reconcile_restored_run_claims(
 
     * the target named by ``manifest["run"]`` wrote this archive, so its
       run succeeded: ``success`` with the archive's filename and node
-      (``last_run_node``, #1838/#1901). Bytes and duration are unknown;
+      (``last_run_node``, #1838/#1901). Bytes and duration are unknown.
+      Its claim is recognised by the exact ``claimed_at`` the manifest
+      records (by the window, for a record without one). ``success`` is
+      honest because every destination writes atomically (temp + rename,
+      or one PUT) and the archive leaves the process only through that
+      write: an intact archive under its name exists only where the
+      write landed;
     * any other (a run in flight when the dump was taken, or an archive
       from before the manifest recorded its run) has an unknown outcome:
       ``failed`` with a message saying so. If its process is in fact
@@ -314,6 +320,18 @@ async def reconcile_restored_run_claims(
     raw_run = manifest.get("run")
     run: dict[str, Any] = raw_run if isinstance(raw_run, dict) else {}
     owner_id = str(run.get("target_id") or "")
+    # The exact ``last_run_at`` the writing run's claim stamped. When
+    # present the owner is recognised by it rather than by the window
+    # below, so a clock stepped between the claim and the dump cannot
+    # turn the archive's own claim into "unknown outcome".
+    claimed_at: datetime | None = None
+    if run.get("claimed_at"):
+        try:
+            claimed_at = datetime.fromisoformat(str(run["claimed_at"]))
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=UTC)
+        except ValueError:
+            claimed_at = None
     rows = (
         (
             await db.execute(
@@ -325,9 +343,26 @@ async def reconcile_restored_run_claims(
     )
     settled: list[dict[str, Any]] = []
     for target in rows:
-        if target.last_run_at is not None and target.last_run_at > created_at:
+        is_owner = (
+            bool(owner_id)
+            and str(target.id) == owner_id
+            and bool(run.get("filename"))
+            and (claimed_at is None or target.last_run_at == claimed_at)
+        )
+        # Anything else must predate the dump to have come from it. A
+        # claim stamped later is a live run's (the restore replaced the
+        # table, so only a run started since can have made it) and is
+        # left alone. Claims are stamped by the clock of whichever node
+        # ran them: an archived claim from a node running ahead reads as
+        # newer and is left for the 2 h reap (the old behaviour, not a
+        # wrong stamp), and a live claim reads as archived only from a
+        # clock lagging by more than the archive's age.
+        if (
+            not (is_owner and claimed_at is not None)
+            and target.last_run_at is not None
+            and target.last_run_at > created_at
+        ):
             continue
-        is_owner = bool(owner_id) and str(target.id) == owner_id and bool(run.get("filename"))
         if is_owner:
             target.last_run_status = "success"
             target.last_run_filename = str(run["filename"])
@@ -577,6 +612,7 @@ async def run_backup_for_target(
             passphrase=passphrase,
             passphrase_hint=target.passphrase_hint or None,
             run_target_id=str(target.id),
+            run_claimed_at=started,
         )
         await driver.write(config=plain_config, filename=filename, archive_bytes=archive_bytes)
         deleted = await _retention_sweep(db, target=target, config=plain_config)

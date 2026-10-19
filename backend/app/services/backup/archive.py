@@ -435,6 +435,7 @@ async def build_backup_archive(
     passphrase_hint: str | None = None,
     exclude_secrets: bool = False,
     run_target_id: str | None = None,
+    run_claimed_at: datetime | None = None,
 ) -> tuple[bytes, str]:
     """Build a complete backup zip in memory and return
     ``(archive_bytes, suggested_filename)``.
@@ -460,6 +461,9 @@ async def build_backup_archive(
     this archive holds its own target in that state; the manifest
     records which target wrote it, and under which filename and node,
     so a restore can tell that claim is this very run's and settle it.
+    ``run_claimed_at`` is the ``last_run_at`` the claim stamped; the
+    restore matches it exactly, so recognising the claim does not
+    depend on two clock readings agreeing.
     """
     if not passphrase:
         raise BackupArchiveError("passphrase is required to build a backup")
@@ -529,6 +533,7 @@ async def build_backup_archive(
             "target_id": str(run_target_id),
             "filename": filename,
             "node": settings.node_name or None,
+            "claimed_at": run_claimed_at.isoformat() if run_claimed_at else None,
         }
 
     # secrets.enc bundles enough metadata for an offline operator to

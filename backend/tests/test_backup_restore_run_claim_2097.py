@@ -88,10 +88,17 @@ async def test_restoring_a_targets_own_archive_leaves_it_runnable(
     db_session.add(target)
     await db_session.flush()
     manifest, filename = await _run_and_capture(db_session, monkeypatch, target)
-    assert manifest["run"] == {"target_id": str(target.id), "filename": filename, "node": NODE}
+    claimed_at = manifest["run"]["claimed_at"]
+    assert manifest["run"] == {
+        "target_id": str(target.id),
+        "filename": filename,
+        "node": NODE,
+        "claimed_at": claimed_at,
+    }
+    assert datetime.fromisoformat(claimed_at) <= datetime.fromisoformat(manifest["created_at"])
 
-    # The restore: the table comes back holding the claim.
-    _as_restored(target, datetime.fromisoformat(manifest["created_at"]) - timedelta(seconds=3))
+    # The restore: the table comes back holding the claim the run stamped.
+    _as_restored(target, datetime.fromisoformat(claimed_at))
     await db_session.flush()
     settled = await runner_mod.reconcile_restored_run_claims(db_session, manifest=manifest)
     await db_session.refresh(target)
@@ -210,3 +217,73 @@ async def test_an_archive_with_no_recorded_run_settles_claims_as_failed(
     await runner_mod.reconcile_restored_run_claims(db_session, manifest=manifest)
     assert target.last_run_status == "failed"
     assert "outcome was not recorded" in target.last_run_error
+
+
+async def test_the_writers_claim_is_recognised_exactly_despite_a_stepped_clock(
+    db_session: AsyncSession,
+) -> None:
+    """The clock stepped back between the claim and the dump, so the claim
+    reads newer than ``created_at``. The exact ``claimed_at`` still names it
+    as the archive's own run."""
+    target = _target("stepped")
+    db_session.add(target)
+    await db_session.flush()
+    started = datetime.now(UTC) - timedelta(minutes=5)
+    _as_restored(target, started)
+    manifest = {
+        "created_at": (started - timedelta(seconds=2)).isoformat(),
+        "run": {
+            "target_id": str(target.id),
+            "filename": "s.zip",
+            "node": NODE,
+            "claimed_at": started.isoformat(),
+        },
+    }
+    settled = await runner_mod.reconcile_restored_run_claims(db_session, manifest=manifest)
+    assert [s["settled_as"] for s in settled] == ["success"]
+    assert (target.last_run_status, target.last_run_filename) == ("success", "s.zip")
+
+
+async def test_a_new_claim_by_the_writing_target_is_not_taken_for_the_archives(
+    db_session: AsyncSession,
+) -> None:
+    """The writing target's archived claim was reaped and a new run claimed
+    it before the reconcile ran: same target, different claim. It is a live
+    run and must not be stamped with the archive's success."""
+    target = _target("reclaimed")
+    db_session.add(target)
+    await db_session.flush()
+    archived_claim = datetime.now(UTC) - timedelta(hours=3)
+    _as_restored(target, datetime.now(UTC) - timedelta(seconds=10))
+    manifest = {
+        "created_at": (archived_claim + timedelta(seconds=5)).isoformat(),
+        "run": {
+            "target_id": str(target.id),
+            "filename": "old.zip",
+            "node": NODE,
+            "claimed_at": archived_claim.isoformat(),
+        },
+    }
+    assert await runner_mod.reconcile_restored_run_claims(db_session, manifest=manifest) == []
+    await db_session.refresh(target)
+    assert target.last_run_status == "in_progress"
+    assert target.last_run_filename is None
+
+
+async def test_an_archive_no_run_wrote_carries_no_run_record(
+    db_session: AsyncSession, monkeypatch
+) -> None:
+    """A manual download (and the pre-restore safety dump) claims no target."""
+
+    async def _dump(path):
+        path.write_bytes(b"dump")
+
+    async def _head(_db):
+        return "headrev"
+
+    monkeypatch.setattr(archive_mod, "_run_pg_dump", _dump)
+    monkeypatch.setattr(archive_mod, "_read_alembic_head", _head)
+    archive_bytes, _ = await archive_mod.build_backup_archive(
+        db_session, passphrase="hunter2hunter2"
+    )
+    assert "run" not in read_backup_manifest(archive_bytes)
