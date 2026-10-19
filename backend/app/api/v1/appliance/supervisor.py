@@ -4540,6 +4540,26 @@ async def update_appliance_roles(
                     "disabled. Enable it under Administration > Features & "
                     "Integrations, or remove the role.",
                 )
+        # #2135 — the same refusal for a DNS role while ``core.dns`` is off.
+        # The DNS *agent* routers are mounted outside the module gate on
+        # purpose (a 404 would make an agent drop its JWT and re-bootstrap),
+        # so nothing else stops the role being accepted and the agent
+        # registering into a subsystem the operator switched off. Only a
+        # newly ADDED engine is refused: an appliance that already holds
+        # one can re-save (firewall, DHCP group, …).
+        new_dns_roles = sorted(
+            r for r in _DNS_ROLES.intersection(body.roles) if r not in prev_dns_roles
+        )
+        if new_dns_roles:
+            from app.services.feature_modules import is_module_enabled
+
+            if not await is_module_enabled(db, "core.dns"):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"Cannot assign the {new_dns_roles[0]!r} role: the DNS module "
+                    "(core.dns) is disabled. Enable it under Administration > "
+                    "Features & Integrations, or remove the role.",
+                )
         # Capability gate. Each requested role must be backed by the
         # supervisor's advertised cap. Skips for ``observer`` / ``custom``
         # which don't have a single-flag capability today.

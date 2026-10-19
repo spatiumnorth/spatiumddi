@@ -1,3 +1,4 @@
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -345,9 +346,13 @@ function InstanceModal({
   const qc = useQueryClient();
   const editing = !!instance;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [name, setName] = useState(instance?.name ?? "");
@@ -579,20 +584,22 @@ function InstanceModal({
           <Field label="IPAM space">
             <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
         </div>
 
         <div className="grid grid-cols-2 gap-3">
