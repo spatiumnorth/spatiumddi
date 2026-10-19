@@ -135,6 +135,30 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DNS record change made while an agent is replaced reaches the new
+  agent at once, not five minutes later (#2042).** When a DNS agent is
+  replaced (its pod rolls after a slot upgrade, a container restarts),
+  the API went on holding the old agent's config long-poll, and nothing
+  noticed its client had gone. A record created in the next few seconds
+  was paged into that poll, marked in flight and written to a
+  connection nobody read, so the new agent never got it and the record
+  was not served until the 5-minute unacknowledged-op reset sent it
+  again. The agent now names its process on every config poll, each
+  shipped op records which process it went to and when its poll
+  started, and a poll from a different process returns any op still in
+  flight to its predecessor to the queue and ships it on that poll. Only
+  a poll that started after the one that shipped the op may take it
+  back, so the departed agent's leftover poll never takes an op from
+  its replacement. A long-poll whose client has
+  disconnected also rolls its page back instead of committing it. An
+  agent that predates this change still recovers through the 5-minute
+  reset. Separately, a zone's server state no longer reads in sync
+  while a server has a change for that zone it has not acknowledged:
+  an agent starting from its cached bundle reports the serial it
+  serves, which can match the target while a record is still
+  undelivered. Both server-state views gain a `pending_ops` count, and
+  the zone sync pill names the unapplied changes.
+
 - **Kea HA peers authenticate to each other with a generated per-group
   credential.** Every DHCP server group now holds its own CA and peer
   certificate for the HA hook's dedicated listener (`:8000`),
@@ -6300,6 +6324,11 @@ the formatter handles the rest.
   `dhcp_server.agent_capabilities` (JSONB, NULL until the agent's first
   heartbeat). Nothing is rendered from the credential until every Kea
   member of a group reports `ha_peer_tls`. Downgrade drops both columns.
+- `e3b7c19f5a42` — #2042: `dns_record_op.dispatched_to`, a nullable
+  string naming the agent process an op was last shipped to, and
+  `dns_record_op.dispatched_poll_at`, when the long-poll that shipped it
+  started. No backfill: NULL means not recorded and is never read as
+  "another agent". Downgrade drops both columns.
 
 ## 2026.10.02-1 — 2026-10-02
 

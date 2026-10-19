@@ -5162,6 +5162,9 @@ export interface DNSPerServerZoneStateEntry {
   current_serial: number | null;
   reported_at: string | null;
   in_sync: boolean;
+  // #2042 — ops for this zone the server has not acknowledged; non-zero
+  // means not in sync whatever the serial says.
+  pending_ops: number;
 }
 
 export interface DNSPerServerZoneStateResponse {
@@ -5732,6 +5735,8 @@ export interface ZoneServerStateEntry {
   // server, or the zone was only just created).
   current_serial: number | null;
   reported_at: string | null;
+  // #2042 — ops for this zone the server has not acknowledged yet.
+  pending_ops: number;
 }
 
 export interface ZoneServerState {
@@ -5739,7 +5744,8 @@ export interface ZoneServerState {
   zone_name: string;
   target_serial: number;
   servers: ZoneServerStateEntry[];
-  // `false` while any server hasn't reported or is on a different serial.
+  // `false` while any server hasn't reported, is on a different serial, or
+  // still has an unacknowledged op for the zone (#2042).
   in_sync: boolean;
 }
 
