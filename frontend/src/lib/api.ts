@@ -5041,6 +5041,10 @@ export interface ZoneMovePreview {
    *  algorithm a target driver cannot use (Technitium has no hmac-sha224).
    *  Non-null means the commit refuses — not waivable by acknowledgement. */
   tsig_algorithm_refusal?: string | null;
+  /** #2121 — the forward zone's own upstream transport is one the target
+   *  group cannot serve (DoH / DoQ on BIND9, TLS on Windows DNS). Non-null
+   *  means the commit refuses — not waivable by acknowledgement. */
+  forward_transport_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */

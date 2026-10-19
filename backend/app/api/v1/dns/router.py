@@ -187,6 +187,7 @@ from app.services.dns.tld_registry import (
 )
 from app.services.dns.tsig import group_key_names, rotate_group_tsig_key
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
+from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
@@ -315,16 +316,6 @@ VALID_FORWARD_TRANSPORTS = {"do53", "tls", "https", "quic"}
 # named.conf that would not load. Technitium does all four (verified
 # live against 15.4.0). Issue #741.
 _TRANSPORT_DRIVER_GATE: dict[str, frozenset[str]] = {
-    "https": frozenset({"technitium"}),
-    "quic": frozenset({"technitium"}),
-}
-# The drivers that can forward a ZONE over each encrypted transport (#2121).
-# Wider than the group gate above in one direction: a forward zone exists only
-# on drivers that render forward zones, and of those only BIND9 and
-# Technitium speak TLS to an upstream. Windows DNS conditional forwarders and
-# the cloud drivers are plain DNS only.
-_ZONE_TRANSPORT_DRIVER_GATE: dict[str, frozenset[str]] = {
-    "tls": frozenset({"bind9", "technitium"}),
     "https": frozenset({"technitium"}),
     "quic": frozenset({"technitium"}),
 }
@@ -4944,8 +4935,6 @@ async def _check_zone_forward_transport(
     changes: dict[str, Any],
     zone: DNSZone | None,
     db: DB,
-    *,
-    recheck: bool = False,
 ) -> None:
     """422 a forward zone's upstream transport the group cannot serve (#2121).
 
@@ -4953,8 +4942,9 @@ async def _check_zone_forward_transport(
     group's drivers and the zone's own forwarders. Only a forward zone is
     checked, since no other type renders forwarders. On update (``zone``
     given) only a change to the type, the forwarders, the transport or the
-    hostname is held to it, so a zone stored before this gate stays editable;
-    ``recheck`` (a move into another group) checks the zone as it stands.
+    hostname is held to it, so a zone stored before this gate stays editable.
+    The check itself is ``zone_forward_transport_refusal``, which the #935
+    zone move plan runs against the target group as the zone stands.
     """
     zone_type = changes.get("zone_type") or (zone.zone_type if zone is not None else "primary")
     if zone_type != "forward":
@@ -4974,7 +4964,6 @@ async def _check_zone_forward_transport(
     )
     if (
         zone is not None
-        and not recheck
         and zone.zone_type == "forward"
         and transport == (zone.forward_transport or "do53")
         and hostname == zone.forward_tls_hostname
@@ -4982,37 +4971,16 @@ async def _check_zone_forward_transport(
     ):
         return
 
-    if transport != "do53" and not hostname:
-        raise HTTPException(
-            422,
-            f"forward_tls_hostname is required when a forward zone uses forward_transport "
-            f"{transport!r}: it is the name the upstream's certificate is checked "
-            "against. Set the upstream's DoT / DoH hostname, or use do53.",
-        )
-    drivers = set(await _group_driver_names(db, group_id))
-    allowed = _ZONE_TRANSPORT_DRIVER_GATE.get(transport)
-    if allowed is not None and (incompatible := drivers - allowed):
-        raise HTTPException(
-            422,
-            f"forward_transport {transport!r} is not supported for a forward zone by "
-            f"{', '.join(sorted(incompatible))} in this group. BIND9 forwards a zone "
-            "over do53 or tls only; https and quic are Technitium-only, and the other "
-            "drivers forward plain DNS.",
-        )
-    # One certificate name per forwarder set, as on the group (#877): the zone
-    # checks every forwarder against its single hostname.
-    if transport != "do53" and (conflict := find_forwarder_conflict(forwarders)):
-        raise HTTPException(422, f"forwarders: {conflict.message}")
-    # An upstream that answers only over an encrypted transport refuses
-    # plain DNS, so a do53 zone pointed at it resolves nothing.
-    if transport == "do53" and (encrypted_only := encrypted_only_presets(forwarders)):
-        names = ", ".join(sorted(p.name for p in encrypted_only))
-        raise HTTPException(
-            422,
-            f"{names} only answers over an encrypted transport and returns REFUSED on "
-            "plaintext port 53, so this forward zone would fail every query. Set the "
-            "zone's forward_transport to tls (with the provider's hostname).",
-        )
+    name = changes.get("name") or (zone.name if zone is not None else "")
+    refusal = zone_forward_transport_refusal(
+        zone_name=name,
+        transport=transport,
+        hostname=hostname,
+        forwarders=forwarders,
+        drivers=await _group_driver_names(db, group_id),
+    )
+    if refusal:
+        raise HTTPException(422, refusal)
 
 
 async def _enforce_technitium_api_zone_scope(
@@ -6904,6 +6872,10 @@ class ZoneMovePreviewResponse(BaseModel):
     #: algorithm a target driver cannot use; non-null means the commit
     #: refuses, not waivable by acknowledgement.
     tsig_algorithm_refusal: str | None = None
+    #: #2121 — the forward zone's own upstream transport is one the target
+    #: group cannot serve; non-null means the commit refuses, not waivable
+    #: by acknowledgement.
+    forward_transport_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -6942,6 +6914,7 @@ class ZoneMovePreviewResponse(BaseModel):
             key_names_lost=plan.key_names_lost,
             technitium_api_refusal=plan.technitium_api_refusal,
             tsig_algorithm_refusal=plan.tsig_algorithm_refusal,
+            forward_transport_refusal=plan.forward_transport_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
@@ -7018,9 +6991,9 @@ async def move_zone_commit(
     # the zone would quietly stop forwarding. Refused, not rewritten.
     if zone.zone_type == "forward":
         await _bind9_zone_forwarders(target_group.id, list(zone.forwarders or []), db)
-        # And the zone's own transport (#2121): a DoH zone cannot land on a
-        # BIND9 group, which would skip it at render.
-        await _check_zone_forward_transport(target_group.id, {}, zone, db, recheck=True)
+        # The zone's own transport (#2121) is checked by the move plan
+        # (``forward_transport_refusal``), so the preview reports the same
+        # refusal commit_zone_move raises below.
     source_group_id = zone.group_id
     try:
         plan = await commit_zone_move(
