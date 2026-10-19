@@ -65,6 +65,7 @@ from app.services.dns.record_ops import (
 )
 from app.services.dns.tsig import ensure_group_tsig_key, group_key_names
 from app.services.dns.tsig_algorithms import key_refusal
+from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 
 logger = structlog.get_logger(__name__)
 
@@ -200,6 +201,12 @@ class ZoneMovePlan:
     #: resolves, by name, to a target key whose algorithm a target driver
     #: cannot use (Technitium has no hmac-sha224). Refused, never waived.
     tsig_algorithm_refusal: str | None = None
+    #: #2121 — the forward zone's own upstream transport (``forward_transport``
+    #: / ``forward_tls_hostname``) is one the target group cannot serve: a DoH
+    #: or DoQ zone landing on BIND9, a TLS zone on Windows DNS. Derived by the
+    #: same check zone create / update run, so the preview reports exactly the
+    #: refusal the commit raises. Refused, never waived.
+    forward_transport_refusal: str | None = None
 
     warnings: list[str] = field(default_factory=list)
     #: Acknowledgement keys the commit will demand.
@@ -487,6 +494,18 @@ async def assemble_move_plan(
         except HTTPException as exc:
             plan.technitium_api_refusal = str(exc.detail)
 
+    # ── The forward zone's own upstream transport (#2121, a refusal) ──
+    if zone.zone_type == "forward":
+        msg = zone_forward_transport_refusal(
+            zone_name=zone.name,
+            transport=zone.forward_transport,
+            hostname=zone.forward_tls_hostname,
+            forwarders=list(zone.forwarders or []),
+            drivers=plan.target_drivers,
+        )
+        if msg:
+            plan.forward_transport_refusal = f"Group {target_group.name!r}: {msg}"
+
     _fill_warnings(plan)
     return plan
 
@@ -728,6 +747,8 @@ async def commit_move(
         )
     if plan.tsig_algorithm_refusal:
         raise ZoneMoveError(plan.tsig_algorithm_refusal, status_code=422)
+    if plan.forward_transport_refusal:
+        raise ZoneMoveError(plan.forward_transport_refusal, status_code=422)
     if plan.technitium_api_refusal:
         # #1784 — refused, not warned: the zone would read as configured on
         # a server that ignores the config. Derived in the plan so the

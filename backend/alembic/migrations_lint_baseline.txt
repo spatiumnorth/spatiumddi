@@ -390,6 +390,8 @@ backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:282
 backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:285
 backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:289
 backend/alembic/versions/c4f7e92d3a18_sdwan_overlay.py:drop_table:297
+backend/alembic/versions/c4f8a2e61d37_dns_zone_forward_transport.py:drop_column:49
+backend/alembic/versions/c4f8a2e61d37_dns_zone_forward_transport.py:drop_column:50
 backend/alembic/versions/c5a7e2f9b1d6_dns_rrl_metrics.py:drop_column:36
 backend/alembic/versions/c5a7e2f9b1d6_dns_rrl_metrics.py:drop_column:37
 backend/alembic/versions/c5e8a1f3d027_agent_ingest_receipt_and_spool_status.py:drop_column:63

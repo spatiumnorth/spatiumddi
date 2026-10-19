@@ -14,6 +14,10 @@ Default-enabled state follows non-negotiable #13:
   WHOIS queries to public registries, so air-gapped / strict-egress
   operators opt in explicitly (mirrors ``tools/whois.py``).
 
+Each tool declares the budget bucket of its ``/api/v1/tools/*`` route
+(``rate_limit=``), so a copilot or MCP call spends the same per-user
+budget a Tools-page call does (see ``app.services.nettools.budgets``).
+
 These are reads, not writes — they don't mutate state. Touching the
 network is read-only here (a ping is observation, not a change), so no
 ``propose_*`` preview/apply contract is needed.
@@ -84,6 +88,7 @@ class NetworkPingArgs(BaseModel):
 
 @register_tool(
     name="network_ping",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
@@ -125,6 +130,7 @@ class NetworkTracerouteArgs(BaseModel):
 
 @register_tool(
     name="network_traceroute",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
@@ -187,6 +193,7 @@ class NetworkDigArgs(BaseModel):
 
 @register_tool(
     name="network_dig",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
@@ -228,6 +235,7 @@ class NetworkPortTestArgs(BaseModel):
 
 @register_tool(
     name="network_port_test",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
@@ -271,6 +279,7 @@ class NetworkTlsCertArgs(BaseModel):
 
 @register_tool(
     name="network_tls_cert",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
@@ -322,6 +331,7 @@ class LookupMacVendorArgs(BaseModel):
 
 @register_tool(
     name="lookup_mac_vendor",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",
@@ -358,6 +368,7 @@ class NetworkWhoisArgs(BaseModel):
 
 @register_tool(
     name="network_whois",
+    rate_limit="offprem",
     permission=("read", "use_network_tools"),
     module=_MODULE,
     category="tools",

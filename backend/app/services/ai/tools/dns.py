@@ -89,13 +89,17 @@ _ZONE_SCOPE_SCAN_CAP = 20_000
 
 @register_tool(
     name="list_dns_zones",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "List DNS zones (authoritative / secondary / stub / forward). "
         "Each summary includes name, type, kind (forward / reverse), "
         "TTL, server group, view binding, and name_scope — whether the "
         "zone name sits on a delegated public TLD, a reserved special-use "
-        "namespace, an undelegated TLD, or is a reverse zone."
+        "namespace, an undelegated TLD, or is a reverse zone. A forward "
+        "zone also carries its forwarders and its OWN upstream transport "
+        "(forward_transport do53 / tls / https / quic + "
+        "forward_tls_hostname), which does not inherit the group's."
     ),
     args_model=ListZonesArgs,
     category="dns",
@@ -126,19 +130,26 @@ async def list_dns_zones(db: AsyncSession, user: User, args: ListZonesArgs) -> l
         scope = classify_zone_name(z.name, tlds=tlds)
         if wanted and scope.scope != wanted:
             continue
-        out.append(
-            {
-                "id": str(z.id),
-                "name": z.name,
-                "zone_type": z.zone_type,
-                "kind": z.kind,
-                "group_id": str(z.group_id),
-                "view_id": str(z.view_id) if z.view_id else None,
-                "ttl": z.ttl,
-                "name_scope": scope.scope,
-                "name_scope_reason": scope.reason,
-            }
-        )
+        row: dict[str, Any] = {
+            "id": str(z.id),
+            "name": z.name,
+            "zone_type": z.zone_type,
+            "kind": z.kind,
+            "group_id": str(z.group_id),
+            "view_id": str(z.view_id) if z.view_id else None,
+            "ttl": z.ttl,
+            "name_scope": scope.scope,
+            "name_scope_reason": scope.reason,
+        }
+        if z.zone_type == "forward":
+            # #2121 — the zone's OWN upstream transport, independent of the
+            # group's forward_transport (which covers the group's resolver
+            # forwarders only).
+            row["forwarders"] = list(z.forwarders or [])
+            row["forward_only"] = bool(z.forward_only)
+            row["forward_transport"] = z.forward_transport or "do53"
+            row["forward_tls_hostname"] = z.forward_tls_hostname
+        out.append(row)
         if len(out) >= args.limit:
             break
     if wanted and len(rows) >= _ZONE_SCOPE_SCAN_CAP and len(out) < args.limit:
@@ -176,6 +187,7 @@ class QueryRecordsArgs(BaseModel):
 
 @register_tool(
     name="query_dns_records",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Search DNS records across zones. Filters: zone, record type, "
@@ -356,7 +368,10 @@ class PreviewZoneMoveArgs(BaseModel):
 
 @register_tool(
     name="preview_dns_zone_move",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    # Matches the REST preview (POST …/zones/{id}/move/preview), which is
+    # superadmin-only: the answer describes the TARGET group too (its views,
+    # drivers, zone names, ACL and key names), not just the caller's zone.
+    permission="superadmin",
     description=(
         "Report what moving a DNS zone to another server group would do, "
         "WITHOUT doing it. Answers 'can this zone move to that group, and "
@@ -424,6 +439,7 @@ async def preview_dns_zone_move(
         "key_names_lost": plan.key_names_lost,
         "technitium_api_refusal": plan.technitium_api_refusal,
         "tsig_algorithm_refusal": plan.tsig_algorithm_refusal,
+        "forward_transport_refusal": plan.forward_transport_refusal,
         "warnings": plan.warnings,
         "required_acknowledgements": plan.required_acknowledgements,
     }
@@ -436,6 +452,10 @@ async def preview_dns_zone_move(
 # without leaving the chat. Configurable resolver lets operators
 # point at a SpatiumDDI-managed BIND9 view they can't easily query
 # from their workstation.
+#
+# Both send live queries to the resolver (or the nameservers the caller
+# names), so they spend the same per-user ``default`` network-tool budget
+# as the Tools page's ``/tools/dig`` route.
 
 
 _DEFAULT_RESOLVE_TIMEOUT = 5.0
@@ -482,6 +502,7 @@ class ForwardDnsArgs(BaseModel):
 
 @register_tool(
     name="forward_dns",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     description=(
         "Live forward DNS lookup ('dig <name> <rdtype>'). Resolves "
@@ -564,6 +585,7 @@ class ReverseDnsArgs(BaseModel):
 
 @register_tool(
     name="reverse_dns",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     description=(
         "Live reverse-DNS lookup. Resolves the appropriate "
@@ -649,6 +671,7 @@ class ListDNSRecordsArgs(BaseModel):
 
 @register_tool(
     name="list_dns_records",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Cross-zone DNS record search. Filterable by relative name "
@@ -946,6 +969,7 @@ class FindZoneDNSSECInfoArgs(BaseModel):
 
 @register_tool(
     name="find_zone_dnssec_info",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Return the DNSSEC posture of one DNS zone: ``dnssec_enabled`` "
@@ -1104,6 +1128,7 @@ class FindZoneDriftArgs(BaseModel):
 
 @register_tool(
     name="find_dns_zone_drift",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Per-server config-drift report for one DNS zone (#61): AXFRs / "
@@ -1395,6 +1420,7 @@ class FindZoneUpdateAclsArgs(BaseModel):
 
 @register_tool(
     name="find_zone_update_acls",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Return a DNS zone's dynamic-update (RFC 2136) ACL (issue #641): "
@@ -1501,7 +1527,9 @@ class FindDNSEncryptedTransportsArgs(BaseModel):
         "(issue #50). Returns per group: the listener toggles + ports + "
         "DoH URL path, whether a usable TLS certificate is actually linked "
         "(a listener without one silently degrades to Do53), and the "
-        "upstream transport with its verification hostname. Use this to "
+        "upstream transport with its verification hostname. That transport "
+        "covers the group's own resolver forwarders only: a conditional "
+        "forward zone carries its own (see list_dns_zones, #2121). Use this to "
         "answer 'is encrypted DNS on?', 'what port is DoH on?', 'are we "
         "still forwarding in cleartext?', or 'why isn't DoT working?'. "
         "Read-only; never returns certificate or key material."

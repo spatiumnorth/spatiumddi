@@ -21,11 +21,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import desc, select
 
-from app.api.deps import DB, CurrentUser  # noqa: F401
+from app.api.deps import DB, CurrentUser
+from app.core.permissions import require_any_permission, user_has_permission
 from app.models.audit import AuditLog
 from app.models.cloud import CloudEndpoint
 from app.models.docker import DockerHost
@@ -181,119 +182,89 @@ def _build_panel(
 # ── Route ───────────────────────────────────────────────────────────
 
 
-@router.get("/integrations/summary", response_model=IntegrationsDashboardSummary)
-async def integrations_summary(
-    db: DB, current_user: CurrentUser  # noqa: ARG001
-) -> IntegrationsDashboardSummary:
-    """Single-shot rollup for the Integrations dashboard tab."""
+# One row per integration: (panel kind, label, settings toggle, target
+# model, the resource_type its own router gates on). A caller sees a panel
+# only when it may read that integration's targets through the integration's
+# own router, so this rollup never shows more than those routes would.
+_PANELS: tuple[tuple[str, str, str, Any, str], ...] = (
+    (
+        "kubernetes",
+        "Kubernetes",
+        "integration_kubernetes_enabled",
+        KubernetesCluster,
+        "kubernetes_cluster",
+    ),
+    ("docker", "Docker", "integration_docker_enabled", DockerHost, "docker_host"),
+    # ProxmoxNode has `name`/`host`, not `hostname` — the panel uses `name` so
+    # the Integrations dashboard shows the same node label as the IPAM panel.
+    ("proxmox", "Proxmox VE", "integration_proxmox_enabled", ProxmoxNode, "proxmox_node"),
+    (
+        "tailscale",
+        "Tailscale",
+        "integration_tailscale_enabled",
+        TailscaleTenant,
+        "tailscale_tenant",
+    ),
+    ("unifi", "UniFi", "integration_unifi_enabled", UnifiController, "unifi_controller"),
+    (
+        "cloud",
+        "Cloud (AWS / Azure / GCP)",
+        "integration_cloud_enabled",
+        CloudEndpoint,
+        "cloud_endpoint",
+    ),
+    ("opnsense", "OPNsense", "integration_opnsense_enabled", OPNsenseRouter, "opnsense_router"),
+    ("netbird", "NetBird", "integration_netbird_enabled", NetbirdInstance, "netbird_instance"),
+    (
+        "paloalto",
+        "Palo Alto (PAN-OS / Panorama)",
+        "integration_panos_enabled",
+        PANOSFirewall,
+        "panos_firewall",
+    ),
+    (
+        "fortinet",
+        "Fortinet (FortiGate)",
+        "integration_fortinet_enabled",
+        FortinetFirewall,
+        "fortinet_firewall",
+    ),
+    ("meraki", "Cisco Meraki (MX)", "integration_meraki_enabled", MerakiOrg, "meraki_org"),
+)
+
+
+@router.get(
+    "/integrations/summary",
+    response_model=IntegrationsDashboardSummary,
+    dependencies=[
+        Depends(require_any_permission(*(("read", rt) for rt in _INTEGRATION_RESOURCE_TYPES)))
+    ],
+)
+async def integrations_summary(db: DB, current_user: CurrentUser) -> IntegrationsDashboardSummary:
+    """Single-shot rollup for the Integrations dashboard tab.
+
+    Holds the caller to the same ``read`` grants as each integration's own
+    router: the route needs one of them, and each panel and each recent
+    error row is included only for an integration the caller may read.
+    """
     now = datetime.now(UTC)
     settings = await db.get(PlatformSettings, 1)
 
-    k8s_targets = list((await db.execute(select(KubernetesCluster))).scalars().all())
-    docker_targets = list((await db.execute(select(DockerHost))).scalars().all())
-    proxmox_targets = list((await db.execute(select(ProxmoxNode))).scalars().all())
-    tailscale_targets = list((await db.execute(select(TailscaleTenant))).scalars().all())
-    unifi_targets = list((await db.execute(select(UnifiController))).scalars().all())
-    cloud_targets = list((await db.execute(select(CloudEndpoint))).scalars().all())
-    opnsense_targets = list((await db.execute(select(OPNsenseRouter))).scalars().all())
-    netbird_targets = list((await db.execute(select(NetbirdInstance))).scalars().all())
-    panos_targets = list((await db.execute(select(PANOSFirewall))).scalars().all())
-    fortinet_targets = list((await db.execute(select(FortinetFirewall))).scalars().all())
-    meraki_targets = list((await db.execute(select(MerakiOrg))).scalars().all())
-
-    panels = [
-        _build_panel(
-            kind="kubernetes",
-            label="Kubernetes",
-            enabled=getattr(settings, "integration_kubernetes_enabled", False),
-            targets=k8s_targets,
-            display_attr="name",
-            now=now,
-        ),
-        _build_panel(
-            kind="docker",
-            label="Docker",
-            enabled=getattr(settings, "integration_docker_enabled", False),
-            targets=docker_targets,
-            display_attr="name",
-            now=now,
-        ),
-        _build_panel(
-            kind="proxmox",
-            label="Proxmox VE",
-            enabled=getattr(settings, "integration_proxmox_enabled", False),
-            targets=proxmox_targets,
-            # ProxmoxNode has `name`/`host`, not `hostname` — use `name` so the
-            # Integrations dashboard shows the same node label as the IPAM panel
-            # (display_attr="hostname" silently resolved to "" for every node).
-            display_attr="name",
-            now=now,
-        ),
-        _build_panel(
-            kind="tailscale",
-            label="Tailscale",
-            enabled=getattr(settings, "integration_tailscale_enabled", False),
-            targets=tailscale_targets,
-            display_attr="name",
-            now=now,
-        ),
-        _build_panel(
-            kind="unifi",
-            label="UniFi",
-            enabled=getattr(settings, "integration_unifi_enabled", False),
-            targets=unifi_targets,
-            display_attr="name",
-            now=now,
-        ),
-        _build_panel(
-            kind="cloud",
-            label="Cloud (AWS / Azure / GCP)",
-            enabled=getattr(settings, "integration_cloud_enabled", False),
-            targets=cloud_targets,
-            display_attr="name",
-            now=now,
-        ),
-        _build_panel(
-            kind="opnsense",
-            label="OPNsense",
-            enabled=getattr(settings, "integration_opnsense_enabled", False),
-            targets=opnsense_targets,
-            display_attr="name",
-            now=now,
-        ),
-        _build_panel(
-            kind="netbird",
-            label="NetBird",
-            enabled=getattr(settings, "integration_netbird_enabled", False),
-            targets=netbird_targets,
-            display_attr="name",
-            now=now,
-        ),
-        _build_panel(
-            kind="paloalto",
-            label="Palo Alto (PAN-OS / Panorama)",
-            enabled=getattr(settings, "integration_panos_enabled", False),
-            targets=panos_targets,
-            display_attr="name",
-            now=now,
-        ),
-        _build_panel(
-            kind="fortinet",
-            label="Fortinet (FortiGate)",
-            enabled=getattr(settings, "integration_fortinet_enabled", False),
-            targets=fortinet_targets,
-            display_attr="name",
-            now=now,
-        ),
-        _build_panel(
-            kind="meraki",
-            label="Cisco Meraki (MX)",
-            enabled=getattr(settings, "integration_meraki_enabled", False),
-            targets=meraki_targets,
-            display_attr="name",
-            now=now,
-        ),
-    ]
+    readable = [row for row in _PANELS if user_has_permission(current_user, "read", row[4])]
+    panels = []
+    for kind, label, toggle, model, _rtype in readable:
+        targets = list((await db.execute(select(model))).scalars().all())
+        panels.append(
+            _build_panel(
+                kind=kind,
+                label=label,
+                enabled=getattr(settings, toggle, False),
+                targets=targets,
+                display_attr="name",
+                now=now,
+            )
+        )
+    readable_types = [row[4] for row in readable]
 
     # Recent reconciler errors — one filtered audit query covers all
     # integrations at once.
@@ -302,7 +273,7 @@ async def integrations_summary(
             await db.execute(
                 select(AuditLog)
                 .where(AuditLog.result == "error")
-                .where(AuditLog.resource_type.in_(_INTEGRATION_RESOURCE_TYPES))
+                .where(AuditLog.resource_type.in_(readable_types))
                 .order_by(desc(AuditLog.timestamp))
                 .limit(_RECENT_ERROR_LIMIT)
             )

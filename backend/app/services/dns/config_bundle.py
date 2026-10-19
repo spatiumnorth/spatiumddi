@@ -285,6 +285,8 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             view_name=view_name,
             forwarders=tuple(z.forwarders or ()),
             forward_only=bool(z.forward_only),
+            forward_transport=z.forward_transport or "do53",
+            forward_tls_hostname=z.forward_tls_hostname,
             masters=tuple(z.masters or ()),
             dnssec_enabled=bool(z.dnssec_enabled),
             dnssec_policy_name=_zone_policy_name(z),
