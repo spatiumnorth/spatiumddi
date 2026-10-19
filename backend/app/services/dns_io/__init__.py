@@ -12,6 +12,7 @@ Public API:
 from app.services.dns_io.diff import (
     RecordChange,
     ZoneDiff,
+    apply_cname_rule,
     diff_records,
 )
 from app.services.dns_io.parser import (
@@ -28,5 +29,6 @@ __all__ = [
     "RecordChange",
     "ZoneDiff",
     "diff_records",
+    "apply_cname_rule",
     "write_zone_file",
 ]

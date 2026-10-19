@@ -14,9 +14,9 @@ from typing import Any, Self
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 
@@ -41,6 +41,7 @@ from app.core.dns_names import (
     bind_check_names_error,
     contains_control_chars,
     contains_zonefile_unsafe,
+    primary_ns_error,
     validate_fqdn,
     validate_record_owner,
 )
@@ -70,11 +71,13 @@ from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.dns import (
     DEFAULT_ALLOW_RECURSION,
+    DNS_TTL_MAX,
     DNSSEC_ALGORITHMS,
     ZONE_DEFAULT_EXPIRE,
     ZONE_DEFAULT_MINIMUM,
     ZONE_DEFAULT_REFRESH,
     ZONE_DEFAULT_RETRY,
+    ZONE_DEFAULT_TTL,
     DNSAcl,
     DNSAclEntry,
     DNSKey,
@@ -117,6 +120,12 @@ from app.services.dns.delegation import (
     preview_to_dict,
 )
 from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
+from app.services.dns.name_targets import (
+    absolute_target_error,
+    dotless_target,
+    dotless_target_error,
+    group_needs_absolute_targets,
+)
 from app.services.dns.named_conf_validation import (
     ADDRESS_MATCH_LIST_OPTIONS,
     AclCycleError,
@@ -192,6 +201,7 @@ from app.services.dns.zone_templates import (
 from app.services.dns_io import (
     RecordChange,
     ZoneParseError,
+    apply_cname_rule,
     diff_records,
     parse_zone_file,
     write_zone_file,
@@ -592,6 +602,8 @@ class ServerResponse(BaseModel):
     agent_id: uuid.UUID | None
     last_seen_at: datetime | None
     last_seen_ip: str | None
+    # #2078 — the agent's own version; NULL = never reported (UNKNOWN).
+    agent_version: str | None = None
     last_config_etag: str | None
     pending_approval: bool
     is_primary: bool
@@ -674,6 +686,7 @@ class ServerResponse(BaseModel):
             agent_id=s.agent_id,
             last_seen_at=s.last_seen_at,
             last_seen_ip=s.last_seen_ip,
+            agent_version=s.agent_version,
             last_config_etag=s.last_config_etag,
             pending_approval=s.pending_approval,
             is_primary=s.is_primary,
@@ -1127,8 +1140,9 @@ def _validate_masters_format(v: list[str] | None) -> list[str]:
 # serves, so it moves the serial (update_zone).
 _ZONE_FILE_TIMER_FIELDS = ("ttl", "refresh", "retry", "expire", "minimum")
 # RFC 2181 section 8 bounds a TTL at 2^31 - 1; it is also the column's (int4).
-# BIND refuses a zone whose SOA carries a negative timer, so one never reaches it.
-_SOA_TIMER_MAX = 2**31 - 1
+# BIND refuses a zone whose SOA carries a negative timer, or a negative $TTL or
+# record TTL (#2073), so one never reaches it.
+_SOA_TIMER_MAX = DNS_TTL_MAX
 
 
 class ZoneCreate(BaseModel):
@@ -1138,7 +1152,7 @@ class ZoneCreate(BaseModel):
     # #1310 — omitted ⇒ ``resolved_zone_kind``: a primary zone's is taken
     # from its name.
     kind: str | None = None
-    ttl: int = 3600
+    ttl: int = Field(ZONE_DEFAULT_TTL, ge=0, le=_SOA_TIMER_MAX)
     refresh: int = Field(ZONE_DEFAULT_REFRESH, ge=0, le=_SOA_TIMER_MAX)
     retry: int = Field(ZONE_DEFAULT_RETRY, ge=0, le=_SOA_TIMER_MAX)
     expire: int = Field(ZONE_DEFAULT_EXPIRE, ge=0, le=_SOA_TIMER_MAX)
@@ -1223,8 +1237,8 @@ class ZoneCreate(BaseModel):
 
     @field_validator("primary_ns", "admin_email")
     @classmethod
-    def validate_soa_fields(cls, v: str) -> str:
-        return _validate_soa_field(v)
+    def validate_soa_fields(cls, v: str, info: ValidationInfo) -> str:
+        return _validate_soa_field(v, field=info.field_name)
 
 
 class ZoneUpdate(BaseModel):
@@ -1232,7 +1246,7 @@ class ZoneUpdate(BaseModel):
     view_id: uuid.UUID | None = None
     zone_type: str | None = None
     kind: str | None = None
-    ttl: int | None = None
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     refresh: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     retry: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     expire: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
@@ -1277,6 +1291,9 @@ class ZoneUpdate(BaseModel):
     @classmethod
     def validate_soa_fields(cls, v: str | None) -> str | None:
         # Optional on update; same injection guard as ZoneCreate (issue #597).
+        # The #2075 host-name rule for primary_ns is applied in update_zone,
+        # to a CHANGED value only: a zone stored before it must stay
+        # editable by a request that re-sends what it holds.
         if v is None:
             return v
         return _validate_soa_field(v)
@@ -1447,7 +1464,8 @@ class RecordCreate(BaseModel):
     name: str
     record_type: str
     value: str
-    ttl: int | None = None
+    # #2073 — null inherits the zone's $TTL.
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     priority: int | None = None
     weight: int | None = None
     port: int | None = None
@@ -1475,7 +1493,8 @@ class RecordCreate(BaseModel):
 class RecordUpdate(BaseModel):
     name: str | None = None
     value: str | None = None
-    ttl: int | None = None
+    # #2073 — null inherits the zone's $TTL.
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     priority: int | None = None
     weight: int | None = None
     port: int | None = None
@@ -1625,7 +1644,7 @@ def _normalize_record_struct_fields(
     return None, None, None
 
 
-def _validate_soa_field(v: str | None) -> str:
+def _validate_soa_field(v: str | None, field: str | None = None) -> str:
     """Reject a zone SOA ``primary_ns`` / ``admin_email`` that could inject.
 
     Both are interpolated raw into the BIND9 SOA line (issue #597 review), so
@@ -1642,6 +1661,12 @@ def _validate_soa_field(v: str | None) -> str:
             "must be a bare domain name — no whitespace, control characters, "
             "or zone-file syntax (e.g. ';' '$' '@')"
         )
+    if field == "primary_ns":
+        # #2075 — a Primary NS BIND's check-names refuses stops the zone
+        # being served at all, so it is a host name or it is not stored.
+        err = primary_ns_error(v)
+        if err is not None:
+            raise ValueError(f"Primary NS (primary_ns) {err}")
     return v
 
 
@@ -1653,6 +1678,19 @@ def _validate_soa_field(v: str | None) -> str:
 # (freeform, quoted at render), the structured types (SVCB / HTTPS / NAPTR /
 # CAA / SSHFP / TLSA / LOC / LUA), and A/AAAA (IP-validated below).
 _HOSTNAME_TARGET_RECORD_TYPES = frozenset({"CNAME", "NS", "PTR", "DNAME", "ALIAS"})
+
+
+async def _enforce_absolute_target(db: DB, zone: DNSZone, record_type: str, value: str) -> None:
+    """422 a name target with no trailing dot on a PowerDNS group (#2060).
+
+    PowerDNS's API refuses the dot-less spelling, and an operator there
+    almost certainly means the absolute name, so the row is refused with both
+    spellings it could have meant rather than stored and served as the
+    relative one. See ``app.services.dns.name_targets``.
+    """
+    err = await absolute_target_error(db, zone.group_id, record_type, value, zone.name)
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
 
 
 def _validate_address_record_value(record_type: str, value: str) -> None:
@@ -5334,24 +5372,31 @@ async def get_server_pending_ops(
     if server is None:
         raise HTTPException(status_code=404, detail="Server not found")
 
-    op_filter = [DNSRecordOp.server_id == server_id]
-    # GHSA-46mq-mpwf-xxwv: a dns_zone-scoped token sees only its bound zones'
-    # ops. An op carries the zone's name, not its id, so map the bound ids to
-    # names within this server's group.
+    op_filter: list[Any] = [DNSRecordOp.server_id == server_id]
+    # A dns_zone-scoped token sees only its bound zones' ops, matched by zone
+    # id. A name is not enough: two views of one group can serve the same
+    # name, and an op for the other view's zone would match it. Ops queued
+    # before ops carried a zone id (``zone_id IS NULL``) fall back to the
+    # name, but only where no zone outside the token's grant in this group
+    # shares it.
     token_zone_ids = _zone_token_id_filter(current_user)
     if token_zone_ids is not None:
-        bound_names = (
-            (
-                await db.execute(
-                    select(DNSZone.name).where(
-                        DNSZone.group_id == server.group_id, DNSZone.id.in_(token_zone_ids)
-                    )
-                )
+        group_zones = (
+            await db.execute(
+                select(DNSZone.id, DNSZone.name).where(DNSZone.group_id == server.group_id)
             )
-            .scalars()
-            .all()
+        ).all()
+        bound_names = {z.name for z in group_zones if z.id in token_zone_ids}
+        other_names = {z.name for z in group_zones if z.id not in token_zone_ids}
+        op_filter.append(
+            or_(
+                DNSRecordOp.zone_id.in_(list(token_zone_ids)),
+                and_(
+                    DNSRecordOp.zone_id.is_(None),
+                    DNSRecordOp.zone_name.in_(sorted(bound_names - other_names)),
+                ),
+            )
         )
-        op_filter.append(DNSRecordOp.zone_name.in_(list(bound_names)))
 
     counts_res = await db.execute(
         select(DNSRecordOp.state, func.count()).where(*op_filter).group_by(DNSRecordOp.state)
@@ -5610,6 +5655,15 @@ async def update_zone(
     # row — so an operator can't flip a zone to secondary without masters,
     # nor empty the masters on an existing secondary.
     _refuse_superadmin_zone_fields(current_user, changes, zone)
+    # #2075 — a Primary NS that is not a host name makes BIND refuse the zone.
+    # Only a changed value is held to it (the #1784 / #1310 rule): the Edit
+    # dialog and a GET-then-PUT client re-send the stored value on every save,
+    # and a row written before this check must not block an edit to its TTL.
+    # The agent renders a fallback for such a row, so keeping it breaks nothing.
+    if "primary_ns" in changes and (changes["primary_ns"] or "") != (zone.primary_ns or ""):
+        ns_err = primary_ns_error(changes["primary_ns"])
+        if ns_err is not None:
+            raise HTTPException(status_code=422, detail=f"Primary NS (primary_ns) {ns_err}")
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
@@ -7120,6 +7174,9 @@ async def get_delegation_preview(
     parent = await find_parent_zone(db, group_id, child.name)
     if parent is None:
         return DelegationPreviewResponse(has_parent=False)
+    # The preview reads the parent's records and the apply writes them: a
+    # zone-bound token must be bound to the parent as well as the child.
+    _enforce_zone_token_scope(current_user, parent.id)
     preview = await compute_delegation(db, parent, child)
     return DelegationPreviewResponse.model_validate(
         {"has_parent": True, **preview_to_dict(preview)}
@@ -7148,6 +7205,7 @@ async def apply_delegation(
             status_code=404,
             detail=f"No parent zone found in this group for {child.name.rstrip('.')}",
         )
+    _enforce_zone_token_scope(current_user, parent.id)
     preview = await compute_delegation(db, parent, child)
     pending = preview.ns_records_to_create + preview.glue_records_to_create
     if not pending:
@@ -7710,6 +7768,7 @@ async def create_record(
         body.record_type, body.priority, body.weight, body.port
     )
     _validate_address_record_value(body.record_type, body.value)
+    await _enforce_absolute_target(db, zone, body.record_type, body.value)
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
     _enforce_bind_check_names(body.record_type, fqdn, body.value, zone.name)
     # #1230 — a client retry (Ansible, a flaky network, a double click) must
@@ -7827,6 +7886,10 @@ async def update_record(
     # blocking edits to legacy data, contrary to the validate-on-write stance.
     if "value" in changes:
         _validate_address_record_value(record.record_type, record.value)
+        # Resubmitting a row's own value (a TTL edit) does not re-judge a row
+        # that predates the rule, as for check-names below.
+        if zone is not None and (record.value or "").strip() != (before_value or "").strip():
+            await _enforce_absolute_target(db, zone, record.record_type, record.value)
     if "name" in changes and zone:
         record.fqdn = f"{record.name}.{zone.name}" if record.name != "@" else zone.name
     # #1378 — what the edit actually changes is checked against BIND's
@@ -8410,8 +8473,15 @@ async def bulk_create_records(
         return BulkCreateRecordsResponse(created=0, skipped=skipped, target_serial=None)
 
     records: list[DNSRecord] = []
+    needs_absolute = any(
+        dotless_target(r.record_type, r.value) is not None for r in accepted
+    ) and await group_needs_absolute_targets(db, zone.group_id)
     for r in accepted:
         _validate_address_record_value(r.record_type, r.value)
+        if needs_absolute:
+            target_err = dotless_target_error(r.record_type, r.value, zone.name)
+            if target_err is not None:
+                raise HTTPException(status_code=422, detail=f"{r.name}: {target_err}")
         fqdn = f"{r.name}.{zone.name}" if r.name != "@" else zone.name
         _enforce_bind_check_names(r.record_type, fqdn, r.value, zone.name)
         records.append(
@@ -8490,9 +8560,8 @@ class ImportPreviewRequest(BaseModel):
     zone_file: str
     zone_name: str | None = None
     view_id: uuid.UUID | None = None
-
-
-class ImportCommitRequest(ImportPreviewRequest):
+    # The preview needs the strategy to know which existing records survive
+    # (a ``replace`` deletes the ones the file lacks), for the CNAME rule (#2089).
     conflict_strategy: str = "merge"
 
     @field_validator("conflict_strategy")
@@ -8503,6 +8572,10 @@ class ImportCommitRequest(ImportPreviewRequest):
                 f"conflict_strategy must be one of {sorted(VALID_CONFLICT_STRATEGIES)}"
             )
         return v
+
+
+class ImportCommitRequest(ImportPreviewRequest):
+    pass
 
 
 class RecordChangeResponse(BaseModel):
@@ -8526,6 +8599,8 @@ class ImportPreviewResponse(BaseModel):
     unchanged: list[RecordChangeResponse]
     soa_detected: bool
     record_count: int
+    # Records the file carries that are not offered, each with its reason (#2089).
+    skipped: list[str] = Field(default_factory=list)
 
 
 class ImportCommitResponse(BaseModel):
@@ -8542,6 +8617,7 @@ class ImportCommitResponse(BaseModel):
     # not hold all of it yet. Always None for an agent-served zone, whose
     # ops apply asynchronously by design.
     provider_warning: str | None = None
+    skipped: list[str] = Field(default_factory=list)
 
 
 def _resolve_zone_name(body: ImportPreviewRequest, existing_zone: DNSZone | None) -> str:
@@ -8599,6 +8675,7 @@ async def import_zone_preview(
 
     existing = await _load_zone_records(zone_id, db)
     diff = diff_records(parsed.records, existing, zone_default_ttl=zone.ttl)
+    apply_cname_rule(diff, existing, replace=body.conflict_strategy == "replace")
 
     return ImportPreviewResponse(
         zone_id=zone.id,
@@ -8609,6 +8686,7 @@ async def import_zone_preview(
         unchanged=[_change_to_response(c) for c in diff.unchanged],
         soa_detected=parsed.soa is not None,
         record_count=len(parsed.records),
+        skipped=diff.skipped,
     )
 
 
@@ -8649,6 +8727,7 @@ async def import_zone_commit(
 
     existing = await _load_zone_records(zone_id, db)
     diff = diff_records(parsed.records, existing, zone_default_ttl=zone.ttl)
+    apply_cname_rule(diff, existing, replace=body.conflict_strategy == "replace")
 
     # #1861 — the route takes ``write`` on ``dns_record``; a ``replace`` that
     # would remove records also takes ``delete``, as the record DELETE does.
@@ -8767,6 +8846,7 @@ async def import_zone_commit(
                 "updated": updated,
                 "deleted": deleted,
                 "unchanged": unchanged_count,
+                "skipped": diff.skipped,
                 "target_serial": target_serial,
                 "changes": {
                     "create": [
@@ -8822,6 +8902,7 @@ async def import_zone_commit(
         unchanged=unchanged_count,
         conflict_strategy=body.conflict_strategy,
         provider_warning=provider_warning,
+        skipped=diff.skipped,
     )
 
 

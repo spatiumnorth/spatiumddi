@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from app.models.dns import DNSRecord
+from app.services.dns.cname_conflict import NameRow, refused_by_cname_rule
 from app.services.dns_io.parser import ParsedRecord
 
 
@@ -171,4 +172,35 @@ def diff_records(
             )
         )
 
+    return diff
+
+
+def apply_cname_rule(diff: ZoneDiff, existing: Iterable[DNSRecord], *, replace: bool) -> ZoneDiff:
+    """Move every ``to_create`` row the CNAME rule refuses into ``diff.skipped``
+    with its reason (#2089), so neither the preview nor the commit offers it.
+
+    Standing rows are the zone's existing records that survive the import: all
+    of them, except the ones a ``replace`` deletes. They win over the file; the
+    file's own rows resolve among themselves as the importers do (non-CNAME
+    data beats a CNAME, first CNAME wins, no apex CNAME). The check shares its
+    rule with the record API through ``services.dns.cname_conflict``.
+    """
+    dropped = {c.existing_id for c in diff.to_delete} if replace else set()
+    standing = [
+        NameRow(r.name, r.record_type, r.value, r.view_id)
+        for r in existing
+        if str(r.id) not in dropped
+    ]
+    # Rows the file leaves in place count too: they are in ``existing`` already.
+    rows = [NameRow(c.name, c.record_type, c.value) for c in diff.to_create]
+    refused = refused_by_cname_rule(rows, standing)
+    if not refused:
+        return diff
+    keep: list[RecordChange] = []
+    for i, c in enumerate(diff.to_create):
+        if i in refused:
+            diff.skipped.append(f"{c.name} {c.record_type} {c.value}: skipped - {refused[i]}")
+        else:
+            keep.append(c)
+    diff.to_create = keep
     return diff
