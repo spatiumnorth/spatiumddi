@@ -40,6 +40,18 @@ vi.mock("@/lib/api", () => ({
   backupApi: { listSections: () => Promise.resolve([]) },
 }));
 
+// BulkAllocateModal gates its DNS zone picker on core.dns (#2135).
+vi.mock("@/hooks/useFeatureModules", () => ({
+  useFeatureModules: () => ({
+    modules: [],
+    ready: true,
+    isLoading: false,
+    isError: false,
+    refetch: () => {},
+    enabled: () => true,
+  }),
+}));
+
 const { FindFreeModal } = await import("@/pages/ipam/SubnetOpsModals");
 const { BulkAllocateModal } = await import("@/pages/ipam/BulkAllocateModal");
 const { BackupTargetsSection } =

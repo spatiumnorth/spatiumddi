@@ -43,6 +43,7 @@ from app.core.dns_names import (
     contains_zonefile_unsafe,
     primary_ns_error,
     validate_fqdn,
+    validate_hostname,
     validate_record_owner,
 )
 from app.core.permissions import (
@@ -314,6 +315,16 @@ VALID_FORWARD_TRANSPORTS = {"do53", "tls", "https", "quic"}
 # named.conf that would not load. Technitium does all four (verified
 # live against 15.4.0). Issue #741.
 _TRANSPORT_DRIVER_GATE: dict[str, frozenset[str]] = {
+    "https": frozenset({"technitium"}),
+    "quic": frozenset({"technitium"}),
+}
+# The drivers that can forward a ZONE over each encrypted transport (#2121).
+# Wider than the group gate above in one direction: a forward zone exists only
+# on drivers that render forward zones, and of those only BIND9 and
+# Technitium speak TLS to an upstream. Windows DNS conditional forwarders and
+# the cloud drivers are plain DNS only.
+_ZONE_TRANSPORT_DRIVER_GATE: dict[str, frozenset[str]] = {
+    "tls": frozenset({"bind9", "technitium"}),
     "https": frozenset({"technitium"}),
     "quic": frozenset({"technitium"}),
 }
@@ -1145,6 +1156,24 @@ _ZONE_FILE_TIMER_FIELDS = ("ttl", "refresh", "retry", "expire", "minimum")
 _SOA_TIMER_MAX = DNS_TTL_MAX
 
 
+def _validate_zone_forward_transport(v: str | None) -> str | None:
+    if v is not None and v not in VALID_FORWARD_TRANSPORTS:
+        raise ValueError(f"forward_transport must be one of {sorted(VALID_FORWARD_TRANSPORTS)}")
+    return v
+
+
+def _validate_zone_forward_tls_hostname(v: str | None) -> str | None:
+    """A forward zone's upstream certificate name (#2121), or None.
+
+    It is interpolated into ``remote-hostname "…";`` by the BIND renderers,
+    so it must be a host name and nothing else. Empty is the UI's "cleared
+    the field" shape and reads as None.
+    """
+    if v is None or not v.strip():
+        return None
+    return validate_hostname(v, field="forward_tls_hostname")
+
+
 class ZoneCreate(BaseModel):
     name: str
     view_id: uuid.UUID | None = None
@@ -1174,6 +1203,11 @@ class ZoneCreate(BaseModel):
     # ignored otherwise.
     forwarders: list[str] = []
     forward_only: bool = True
+    # The forward zone's OWN upstream transport (#2121), default plain DNS.
+    # The group's ``forward_transport`` applies to its resolver forwarders
+    # only. ``forward_tls_hostname`` is required for an encrypted transport.
+    forward_transport: str = "do53"
+    forward_tls_hostname: str | None = Field(default=None, max_length=255)
     # Secondary / stub primaries (issue #336). Required + non-empty when
     # ``zone_type`` in {secondary, stub}; ignored otherwise. Each entry is
     # an ``ip`` or ``ip@port`` string — the IP that this zone AXFRs from.
@@ -1195,6 +1229,16 @@ class ZoneCreate(BaseModel):
     @classmethod
     def validate_masters(cls, v: list[str]) -> list[str]:
         return _validate_masters_format(v)
+
+    @field_validator("forward_transport")
+    @classmethod
+    def validate_forward_transport(cls, v: str) -> str:
+        return _validate_zone_forward_transport(v) or "do53"
+
+    @field_validator("forward_tls_hostname")
+    @classmethod
+    def validate_forward_tls_hostname(cls, v: str | None) -> str | None:
+        return _validate_zone_forward_tls_hostname(v)
 
     @model_validator(mode="after")
     def require_masters_for_secondary(self) -> ZoneCreate:
@@ -1271,6 +1315,9 @@ class ZoneUpdate(BaseModel):
     dynamic_update_enabled: bool | None = None
     forwarders: list[str] | None = None
     forward_only: bool | None = None
+    # #2121 — the forward zone's own upstream transport (see ZoneCreate).
+    forward_transport: str | None = None
+    forward_tls_hostname: str | None = Field(default=None, max_length=255)
     # Secondary / stub primaries (issue #336). Validated against the
     # effective zone_type in the handler (the new value may come from this
     # same payload or stay as-is on the existing row).
@@ -1309,6 +1356,16 @@ class ZoneUpdate(BaseModel):
     @classmethod
     def validate_masters(cls, v: list[str] | None) -> list[str] | None:
         return None if v is None else _validate_masters_format(v)
+
+    @field_validator("forward_transport")
+    @classmethod
+    def validate_forward_transport(cls, v: str | None) -> str | None:
+        return _validate_zone_forward_transport(v)
+
+    @field_validator("forward_tls_hostname")
+    @classmethod
+    def validate_forward_tls_hostname(cls, v: str | None) -> str | None:
+        return _validate_zone_forward_tls_hostname(v)
 
     @field_validator("color")
     @classmethod
@@ -1381,6 +1438,9 @@ class ZoneResponse(BaseModel):
     notify_enabled: str | None
     forwarders: list[str]
     forward_only: bool
+    # #2121 — the forward zone's own upstream transport; not the group's.
+    forward_transport: str = "do53"
+    forward_tls_hostname: str | None = None
     masters: list[str]
     # Non-null when the zone was synthesised by the Tailscale Phase 2
     # reconciler. The UI uses this to render a read-only badge and
@@ -4879,6 +4939,82 @@ async def _assert_forward_zone_serviceable(
         )
 
 
+async def _check_zone_forward_transport(
+    group_id: uuid.UUID,
+    changes: dict[str, Any],
+    zone: DNSZone | None,
+    db: DB,
+    *,
+    recheck: bool = False,
+) -> None:
+    """422 a forward zone's upstream transport the group cannot serve (#2121).
+
+    The transport is the zone's own setting; this checks it against the
+    group's drivers and the zone's own forwarders. Only a forward zone is
+    checked, since no other type renders forwarders. On update (``zone``
+    given) only a change to the type, the forwarders, the transport or the
+    hostname is held to it, so a zone stored before this gate stays editable;
+    ``recheck`` (a move into another group) checks the zone as it stands.
+    """
+    zone_type = changes.get("zone_type") or (zone.zone_type if zone is not None else "primary")
+    if zone_type != "forward":
+        return
+    transport = changes.get("forward_transport") or (
+        zone.forward_transport if zone is not None else "do53"
+    )
+    hostname = (
+        changes["forward_tls_hostname"]
+        if "forward_tls_hostname" in changes
+        else (zone.forward_tls_hostname if zone is not None else None)
+    )
+    forwarders = list(
+        changes["forwarders"]
+        if changes.get("forwarders") is not None
+        else (zone.forwarders if zone is not None else []) or []
+    )
+    if (
+        zone is not None
+        and not recheck
+        and zone.zone_type == "forward"
+        and transport == (zone.forward_transport or "do53")
+        and hostname == zone.forward_tls_hostname
+        and forwarders == list(zone.forwarders or [])
+    ):
+        return
+
+    if transport != "do53" and not hostname:
+        raise HTTPException(
+            422,
+            f"forward_tls_hostname is required when a forward zone uses forward_transport "
+            f"{transport!r}: it is the name the upstream's certificate is checked "
+            "against. Set the upstream's DoT / DoH hostname, or use do53.",
+        )
+    drivers = set(await _group_driver_names(db, group_id))
+    allowed = _ZONE_TRANSPORT_DRIVER_GATE.get(transport)
+    if allowed is not None and (incompatible := drivers - allowed):
+        raise HTTPException(
+            422,
+            f"forward_transport {transport!r} is not supported for a forward zone by "
+            f"{', '.join(sorted(incompatible))} in this group. BIND9 forwards a zone "
+            "over do53 or tls only; https and quic are Technitium-only, and the other "
+            "drivers forward plain DNS.",
+        )
+    # One certificate name per forwarder set, as on the group (#877): the zone
+    # checks every forwarder against its single hostname.
+    if transport != "do53" and (conflict := find_forwarder_conflict(forwarders)):
+        raise HTTPException(422, f"forwarders: {conflict.message}")
+    # An upstream that answers only over an encrypted transport refuses
+    # plain DNS, so a do53 zone pointed at it resolves nothing.
+    if transport == "do53" and (encrypted_only := encrypted_only_presets(forwarders)):
+        names = ", ".join(sorted(p.name for p in encrypted_only))
+        raise HTTPException(
+            422,
+            f"{names} only answers over an encrypted transport and returns REFUSED on "
+            "plaintext port 53, so this forward zone would fail every query. Set the "
+            "zone's forward_transport to tls (with the provider's hostname).",
+        )
+
+
 async def _enforce_technitium_api_zone_scope(
     db: DB, group_id: uuid.UUID, changes: dict[str, Any], current: DNSZone | None
 ) -> None:
@@ -4909,6 +5045,7 @@ async def create_zone(
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
+    await _check_zone_forward_transport(group_id, body.model_dump(), None, db)
     existing = await db.execute(
         select(DNSZone).where(
             DNSZone.group_id == group_id,
@@ -5630,6 +5767,7 @@ async def update_zone(
             "allow_query",
             "allow_transfer",
             "also_notify",
+            "forward_tls_hostname",
         },
         non_nullable={
             "name",
@@ -5646,6 +5784,7 @@ async def update_zone(
             "auto_tls_probe",
             "dynamic_update_enabled",
             "forward_only",
+            "forward_transport",
             "tags",
         },
     )
@@ -5675,6 +5814,7 @@ async def update_zone(
         list(changes.get("forwarders", zone.forwarders) or []),
         db,
     )
+    await _check_zone_forward_transport(zone.group_id, changes, zone, db)
     if effective_zone_type in {"secondary", "stub"}:
         effective_masters = changes.get("masters", zone.masters) or []
         if not effective_masters:
@@ -6878,6 +7018,9 @@ async def move_zone_commit(
     # the zone would quietly stop forwarding. Refused, not rewritten.
     if zone.zone_type == "forward":
         await _bind9_zone_forwarders(target_group.id, list(zone.forwarders or []), db)
+        # And the zone's own transport (#2121): a DoH zone cannot land on a
+        # BIND9 group, which would skip it at render.
+        await _check_zone_forward_transport(target_group.id, {}, zone, db, recheck=True)
     source_group_id = zone.group_id
     try:
         plan = await commit_zone_move(
