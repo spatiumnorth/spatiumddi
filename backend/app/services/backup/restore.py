@@ -124,6 +124,9 @@ class RestoreOutcome:
     # destination agent and produces *new* DS records the operator
     # must re-publish to the parent registrar.
     warnings: list[str] = field(default_factory=list)
+    # Backup targets whose ``in_progress`` claim came back inside the
+    # archive and was settled (#2097). Empty when none.
+    reconciled_backup_targets: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
@@ -1352,6 +1355,27 @@ async def _apply_backup_restore_inner(
         logger.warning("backup_restore_warning_scan_failed", error=str(exc))
         post_warnings = []
 
+    # #2097 — the archive holds its own run's ``in_progress`` claim. Settle
+    # it now, or the target refuses Run now and sits off its schedule until
+    # the 2 h reap marks a run that succeeded as failed. Needs the
+    # backup-target table to have been restored.
+    reconciled: list[dict[str, Any]] = []
+    if restored_tables is None or "backup_target" in restored_tables:
+        try:
+            from app.db import AsyncSessionLocal  # noqa: PLC0415
+            from app.services.backup.runner import (  # noqa: PLC0415
+                reconcile_restored_run_claims,
+            )
+
+            async with AsyncSessionLocal() as rdb:
+                reconciled = await reconcile_restored_run_claims(rdb, manifest=manifest)
+        except Exception as exc:  # noqa: BLE001 — the data is in; the 2 h reap still backstops
+            logger.warning("backup_restore_reconcile_failed", error=str(exc))
+            post_warnings.append(
+                "Could not settle backup targets left 'in progress' by the restored "
+                f"archive ({exc}); they free themselves after 2 hours."
+            )
+
     # The override is the first thing an operator should read back.
     if schema_override_warning:
         post_warnings.insert(0, schema_override_warning)
@@ -1418,4 +1442,5 @@ async def _apply_backup_restore_inner(
         migration=migration_outcome,
         rewrap=rewrap_outcome,
         warnings=post_warnings,
+        reconciled_backup_targets=reconciled,
     )

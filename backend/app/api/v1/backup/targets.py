@@ -1098,6 +1098,7 @@ async def restore_from_archive(
                     "cascade_widened_tables": outcome.cascade_widened_tables,
                     "allow_newer_schema": body.allow_newer_schema,
                     "warnings": outcome.warnings,
+                    "reconciled_backup_targets": outcome.reconciled_backup_targets,
                 },
             )
         )

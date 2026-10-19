@@ -31,7 +31,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -272,6 +272,111 @@ async def reap_stale_backup_run(
     return True
 
 
+async def reconcile_restored_run_claims(
+    db: AsyncSession,
+    *,
+    manifest: dict[str, Any],
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Settle the ``in_progress`` claims a restore brought back (#2097).
+
+    The runner commits its claim BEFORE the dump, so every archive a
+    target's own run writes holds that target ``in_progress``; restoring
+    it put the claim back with no process behind it. The target then
+    refused Run now (409) and was held off its schedule until the 2 h
+    reap stamped a run that had succeeded ``failed``.
+
+    Only claims the archive can have produced are touched: ``in_progress``
+    with ``last_run_at`` at or before the archive's ``created_at``. A
+    claim made after the dump was not restored from it, so it is a live
+    run's and is left alone (a restore that skips the backup-target table
+    never reaches here). Of those:
+
+    * the target named by ``manifest["run"]`` wrote this archive, so its
+      run succeeded: ``success`` with the archive's filename and node
+      (``last_run_node``, #1838/#1901). Bytes and duration are unknown;
+    * any other (a run in flight when the dump was taken, or an archive
+      from before the manifest recorded its run) has an unknown outcome:
+      ``failed`` with a message saying so. If its process is in fact
+      still alive its own terminal stamp overwrites this.
+
+    ``next_run_at`` is recomputed so a scheduled target is not held.
+    Returns one dict per settled target, for the restore's audit.
+    """
+    now = now or datetime.now(UTC)
+    created_raw = manifest.get("created_at")
+    try:
+        created_at = datetime.fromisoformat(str(created_raw))
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+    except ValueError:
+        return []
+    raw_run = manifest.get("run")
+    run: dict[str, Any] = raw_run if isinstance(raw_run, dict) else {}
+    owner_id = str(run.get("target_id") or "")
+    rows = (
+        (
+            await db.execute(
+                select(BackupTarget).where(BackupTarget.last_run_status == "in_progress")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    settled: list[dict[str, Any]] = []
+    for target in rows:
+        if target.last_run_at is not None and target.last_run_at > created_at:
+            continue
+        is_owner = bool(owner_id) and str(target.id) == owner_id and bool(run.get("filename"))
+        if is_owner:
+            target.last_run_status = "success"
+            target.last_run_filename = str(run["filename"])
+            target.last_run_node = run.get("node") or None
+            target.last_run_error = None
+            outcome = "success"
+        else:
+            target.last_run_status = "failed"
+            target.last_run_error = (
+                "this run was in progress when the restored archive was taken; "
+                "its outcome was not recorded in the archive. If it was running "
+                "on another node it will stamp its own result when it ends."
+            )
+            outcome = "failed"
+        if target.schedule_cron:
+            try:
+                target.next_run_at = compute_next_run(target.schedule_cron, after=now)
+            except Exception:  # noqa: BLE001 — a bad cron must not wedge the restore
+                target.next_run_at = None
+        db.add(
+            AuditLog(
+                action="backup_target_run_reconciled",
+                resource_type="backup_target",
+                resource_id=str(target.id),
+                resource_display=target.name,
+                user_id=None,
+                user_display_name="system (restore reconcile)",
+                result="success",
+                new_value={
+                    "reason": "in_progress claim restored from an archive",
+                    "settled_as": outcome,
+                    "filename": target.last_run_filename,
+                    "node": target.last_run_node,
+                },
+            )
+        )
+        settled.append(
+            {
+                "target_id": str(target.id),
+                "name": target.name,
+                "settled_as": outcome,
+                "filename": target.last_run_filename,
+            }
+        )
+    if settled:
+        await db.commit()
+    return settled
+
+
 def _decrypt_passphrase(target: BackupTarget) -> str:
     """Pull the operator's per-target passphrase out of the
     Fernet-encrypted column. Surfaces a clean
@@ -471,6 +576,7 @@ async def run_backup_for_target(
             db,
             passphrase=passphrase,
             passphrase_hint=target.passphrase_hint or None,
+            run_target_id=str(target.id),
         )
         await driver.write(config=plain_config, filename=filename, archive_bytes=archive_bytes)
         deleted = await _retention_sweep(db, target=target, config=plain_config)

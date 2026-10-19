@@ -107,6 +107,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A restored backup no longer brings back its own run's
+  "in progress" claim (#2097).** The runner commits its claim before
+  the dump, so every archive a target's own run wrote held that target
+  `in_progress`. Restoring it left the target refusing Run now (409)
+  and off its schedule for up to 2 h, after which the reap stamped a
+  run that had succeeded `failed`, and the multi-node "on node" text
+  was lost. The archive manifest now records which target wrote it
+  (`run`: target, filename, node), and a restore that brings back the
+  backup-target table settles claims the archive can have produced:
+  the writing target becomes `success` with its filename and node, any
+  other `in_progress` claim becomes `failed` ("outcome not recorded"),
+  and `next_run_at` is recomputed. A claim made after the archive was
+  taken is a live run's and is left alone. Each settled target gets a
+  `backup_target_run_reconciled` audit row, and the restore audit row
+  lists them. No migration. Archives taken before this change carry no
+  `run` record, so their claims settle as `failed`.
+
 - **The BIND9 importer reads zones declared with their class
   (#2099).** `zone "x" IN { ... };` is valid BIND, and it is how
   RHEL's and Fedora's stock `named.conf` writes every zone, but the
