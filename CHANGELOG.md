@@ -107,6 +107,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A record op the split-horizon render retires is stamped like
+  any applied op (#2108).** In a DNS group with views, the bundle
+  render retires a server's queued record ops as `applied`, but
+  `retire_queued_ops` set only the state: `applied_at` stayed NULL,
+  `attempts` 0 and `updated_at` at creation, so
+  `GET /dns/servers/{id}/pending-ops` reported an applied op with no
+  time and no attempt for every record change. It now goes through
+  `_mark_applied`, the helper the dispatch path uses, so the op
+  reads `applied_at` and `updated_at` set, has any earlier error and
+  retry time cleared, and counts one more attempt (the render
+  delivered it once).
+
 - **Turning DNS off hides DNS everywhere and stops the `/dns` calls
   that 404ed (#2135).** The DNS counterpart of #2130: `core.dns` hid
   the DNS sidebar but left DNS pickers, panels and reads elsewhere.
