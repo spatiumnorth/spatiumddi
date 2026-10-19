@@ -107,6 +107,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Sync DNS reads an address in every zone it publishes to
+  (#2107).** An address with extra zones has its host record in its
+  forward zone and in each extra zone IPAM authors, but the drift
+  check compared every forward record with the forward zone alone. A
+  correct record in an extra zone read as mismatched, and one that had
+  gone missing from an extra zone was never reported. Each address is
+  now checked in all of its zones, using the same zone list the sync
+  writes, so a correct record is in sync, a missing one is listed as
+  missing in its zone, and a wrong one as mismatched with that zone
+  named. A zone IPAM does not author still takes no record. In the
+  Sync DNS dialog, an address missing its record in more than one zone
+  now lists one row per zone, each ticked on its own; the rows used to
+  share a key, so they toggled together.
+
 - **IPAM now says why a host named `gateway` gets no forward DNS
   record (#2101).** The rule is deliberate (every subnet's placeholder
   row is named `gateway`, so publishing them would collide on
