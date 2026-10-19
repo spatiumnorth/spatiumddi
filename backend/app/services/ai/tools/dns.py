@@ -451,6 +451,10 @@ async def preview_dns_zone_move(
 # without leaving the chat. Configurable resolver lets operators
 # point at a SpatiumDDI-managed BIND9 view they can't easily query
 # from their workstation.
+#
+# Both send live queries to the resolver (or the nameservers the caller
+# names), so they spend the same per-user ``default`` network-tool budget
+# as the Tools page's ``/tools/dig`` route.
 
 
 _DEFAULT_RESOLVE_TIMEOUT = 5.0
@@ -497,6 +501,7 @@ class ForwardDnsArgs(BaseModel):
 
 @register_tool(
     name="forward_dns",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     description=(
         "Live forward DNS lookup ('dig <name> <rdtype>'). Resolves "
@@ -579,6 +584,7 @@ class ReverseDnsArgs(BaseModel):
 
 @register_tool(
     name="reverse_dns",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     description=(
         "Live reverse-DNS lookup. Resolves the appropriate "
