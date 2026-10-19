@@ -116,7 +116,12 @@ the formatter handles the rest.
   name as satisfied when one of the address's own alias rows of the same
   type already holds it in that zone, compared case-insensitively. A
   different address's alias, or an AAAA alias for an A, does not count,
-  and the PTR is still expected.
+  and the PTR is still expected. The same holds for an AAAA host record
+  and an AAAA alias, and in each extra zone the address publishes to.
+  Applying the sync for an address that also lacks its PTR used to stop
+  at the same refusal, so the PTR was never written; the apply now skips
+  the zone the alias serves and writes the PTR. A CNAME alias at the
+  name is still refused.
 - **Allocate IP no longer drops an alias that another record already
   holds (#2122).** Allocate IP and next-IP skipped, without a word, an
   alias whose zone, name and type another record already held: the

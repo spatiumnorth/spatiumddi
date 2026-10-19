@@ -1931,6 +1931,7 @@ async def _sync_dns_record(
     *,
     backfill_reverse_zone: bool = True,
     strict: bool = False,
+    skip_own_alias: bool = False,
 ) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
@@ -1957,6 +1958,13 @@ async def _sync_dns_record(
     otherwise (DDNS, importers, DHCP statics) the over-long name is skipped
     and logged, because those paths must not fail a lease or a batch over one
     row, and the name must not reach a zone BIND would then refuse whole.
+
+    ``skip_own_alias=True`` keeps ``strict`` but skips, rather than refuses,
+    a zone where one of the address's own A / AAAA aliases already holds the
+    hostname, as a background path does (#2106). Sync DNS passes it (#2118):
+    the alias already serves the name, so refusing there would block the rest
+    of the address's sync (a missing PTR) on every apply. A CNAME alias at
+    the name is still refused.
 
     Returns whether the sync had anything to do: False when the row carries
     no hostname, when there is no primary zone and no extra zone to publish
@@ -2103,15 +2111,25 @@ async def _sync_dns_record(
     if ip.hostname != "gateway":
         alias_clashes = await _own_alias_clashes(db, ip, desired_zone_ids, forward_rtype)
         if alias_clashes:
-            first_zone_id, first_alias = next(iter(alias_clashes.items()))
-            clash_zone = (
-                zone if first_zone_id == effective_zone_id else await db.get(DNSZone, first_zone_id)
+            # #2118 — Sync DNS skips an A / AAAA alias clash like a background
+            # path, and refuses only a CNAME one.
+            refused = (
+                {z: a for z, a in alias_clashes.items() if a.record_type == "CNAME"}
+                if skip_own_alias
+                else alias_clashes
             )
-            if strict and clash_zone is not None:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    _own_alias_clash_detail(ip, clash_zone, first_alias),
+            if strict and refused:
+                first_zone_id, first_alias = next(iter(refused.items()))
+                clash_zone = (
+                    zone
+                    if first_zone_id == effective_zone_id
+                    else await db.get(DNSZone, first_zone_id)
                 )
+                if clash_zone is not None:
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        _own_alias_clash_detail(ip, clash_zone, first_alias),
+                    )
             # A CNAME alias is left to the #1441 skip in Phase 2, which also
             # retracts the PTR (#1493: no PTR may name a CNAME) and reports
             # the skip to the DDNS path. An A / AAAA alias already answers
@@ -7570,7 +7588,12 @@ async def _apply_dns_sync(
                     # #2072 — strict, so a name too long for its zone is
                     # reported in ``errors`` instead of counted as synced. The
                     # refusal comes before anything is written for this IP.
-                    await _sync_dns_record(db, ip, sn, action="create", strict=True)
+                    # #2118 — an address whose own A / AAAA alias already
+                    # serves its name is skipped there, not refused, so its
+                    # missing PTR is still written.
+                    await _sync_dns_record(
+                        db, ip, sn, action="create", strict=True, skip_own_alias=True
+                    )
                     if ip.id in body.create_for_ip_ids:
                         created += 1
                     else:

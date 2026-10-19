@@ -452,10 +452,7 @@ def _own_alias_serves(recs: Sequence[DNSRecord], zone_id: uuid.UUID, name: str, 
     """
     want = name.strip().rstrip(".").lower()
     return any(
-        r.ip_alias
-        and r.zone_id == zone_id
-        and r.record_type == rtype
-        and r.name.strip().rstrip(".").lower() == want
+        r.ip_alias and r.zone_id == zone_id and r.record_type == rtype and r.name.lower() == want
         for r in recs
     )
 
