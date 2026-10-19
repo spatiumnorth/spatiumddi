@@ -18,6 +18,7 @@ matching ``resource_type`` set. Capped at 20 rows.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -39,6 +40,8 @@ from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
+from app.services.integration_credentials import CredentialStatus, credential_status
+from app.services.tailscale.client import is_auth_rejected
 
 router = APIRouter()
 
@@ -59,6 +62,12 @@ class IntegrationTargetRow(BaseModel):
     # ``None`` for integrations that don't compute warnings.
     last_sync_warning: str | None
     is_stale: bool  # last_synced_at older than 2× sync_interval, or never
+    # #2138 — the target's credential: ok | expiring | expired | rejected |
+    # unknown, from app/services/integration_credentials.py. ``None`` for
+    # integrations that don't record a credential expiry (yet).
+    credential_state: str | None = None
+    credential_expires_at: datetime | None = None
+    credential_days_left: int | None = None
 
 
 class IntegrationPanel(BaseModel):
@@ -128,6 +137,7 @@ def _build_panel(
     targets: list[Any],
     display_attr: str,
     now: datetime,
+    credential: Callable[[Any], CredentialStatus] | None = None,
 ) -> IntegrationPanel:
     """Aggregate one integration's targets into the dashboard panel."""
     rows: list[IntegrationTargetRow] = []
@@ -154,6 +164,7 @@ def _build_panel(
             warnings += 1
         else:
             healthy += 1
+        cred = credential(t) if credential is not None else None
         rows.append(
             IntegrationTargetRow(
                 id=str(t.id),
@@ -163,6 +174,9 @@ def _build_panel(
                 last_sync_error=last_err,
                 last_sync_warning=last_warn,
                 is_stale=is_stale,
+                credential_state=cred.state if cred else None,
+                credential_expires_at=cred.expires_at if cred else None,
+                credential_days_left=cred.days_left if cred else None,
             )
         )
     return IntegrationPanel(
@@ -236,6 +250,11 @@ async def integrations_summary(
             targets=tailscale_targets,
             display_attr="name",
             now=now,
+            credential=lambda t: credential_status(
+                expires_at=t.api_key_expires_at,
+                rejected=is_auth_rejected(t.last_sync_error),
+                now=now,
+            ),
         ),
         _build_panel(
             kind="unifi",

@@ -32,6 +32,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { CredentialChip } from "@/components/CredentialChip";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // One-shot snippet operators can paste into the Tailscale admin
@@ -41,9 +42,10 @@ const SETUP_KEY = `# Generate a Tailscale API key:
 #
 # 1. Open https://login.tailscale.com/admin/settings/keys
 # 2. Click "Generate API key…"
-# 3. Set an expiry that matches your operational rotation window
-#    (90 days is the API minimum). Tailscale doesn't support
-#    non-expiring API keys.
+# 3. Set an expiry between 1 and 90 days — 90 is Tailscale's
+#    maximum, and there are no non-expiring API access tokens.
+#    SpatiumDDI reads the expiry back from Tailscale and warns
+#    (alert + chip) 30 days before it lapses.
 # 4. Copy the printed value (starts with "tskey-api-").
 #
 # The key inherits your user's permissions on the tailnet — it can
@@ -175,7 +177,7 @@ export function TailscalePage() {
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1020px] text-xs">
+              <table className="w-full min-w-[1140px] text-xs">
                 <thead>
                   <tr className="border-b bg-muted/30">
                     <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
@@ -192,6 +194,9 @@ export function TailscalePage() {
                     </th>
                     <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
                       Devices
+                    </th>
+                    <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
+                      Token
                     </th>
                     <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
                       Last sync
@@ -237,6 +242,20 @@ export function TailscalePage() {
                         </td>
                         <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
                           {t.device_count ?? "—"}
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2">
+                          <CredentialChip
+                            state={t.credential_state}
+                            daysLeft={t.credential_days_left}
+                            expiresAt={t.api_key_expires_at}
+                            showOk
+                            showUnknown
+                            onClick={
+                              superadminGate.disabled
+                                ? undefined
+                                : () => setEdit(t)
+                            }
+                          />
                         </td>
                         <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
                           {t.last_synced_at
@@ -367,6 +386,15 @@ function TenantModal({
   const [syncInterval, setSyncInterval] = useState(
     String(tenant?.sync_interval_seconds ?? 60),
   );
+  // #2138 — operator-entered token expiry (YYYY-MM-DD). Only the fallback:
+  // a date Tailscale reports always wins on the server.
+  const initialExpiresOn =
+    tenant?.api_key_expires_at && tenant.api_key_expiry_source === "operator"
+      ? tenant.api_key_expires_at.slice(0, 10)
+      : "";
+  const [expiresOn, setExpiresOn] = useState(initialExpiresOn);
+  const expiryReadFromApi =
+    editing && !apiKey && tenant?.api_key_expiry_source === "api";
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
 
@@ -406,7 +434,12 @@ function TenantModal({
           skip_expired: skipExpired,
           sync_interval_seconds: Number(syncInterval.trim()),
         };
-        if (apiKey) update.api_key = apiKey;
+        if (apiKey) {
+          update.api_key = apiKey;
+          update.api_key_expires_at = expiresOnToIso(expiresOn);
+        } else if (!expiryReadFromApi && expiresOn !== initialExpiresOn) {
+          update.api_key_expires_at = expiresOnToIso(expiresOn);
+        }
         return tailscaleApi.updateTenant(tenant!.id, update);
       }
       const create: TailscaleTenantCreate = {
@@ -415,6 +448,7 @@ function TenantModal({
         enabled,
         tailnet,
         api_key: apiKey,
+        api_key_expires_at: expiresOnToIso(expiresOn),
         ipam_space_id: spaceId,
         dns_group_id: dnsGroupId || null,
         cgnat_cidr: cgnatCidr,
@@ -523,7 +557,13 @@ function TenantModal({
               type="password"
               className={`${inputCls} font-mono text-[11px]`}
               value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
+              onChange={(e) => {
+                const v = e.target.value;
+                setApiKey(v);
+                // Tailscale's maximum lifetime; the server replaces it with
+                // the real expiry whenever Tailscale reports one.
+                if (v && !expiresOn) setExpiresOn(dateInDays(90));
+              }}
               placeholder={
                 editing && tenant?.api_key_present
                   ? "••• stored — enter to replace"
@@ -557,6 +597,32 @@ function TenantModal({
             </span>
           )}
         </div>
+
+        {expiryReadFromApi ? (
+          <p className="text-[11px] text-muted-foreground">
+            Token expires{" "}
+            <span className="font-medium text-foreground">
+              {new Date(tenant!.api_key_expires_at!).toLocaleDateString()}
+            </span>{" "}
+            (read from Tailscale). Enter a new API key above to replace it.
+          </p>
+        ) : (
+          <Field
+            label="Token expires on (optional)"
+            hint={
+              testResult?.api_key_expires_at
+                ? `Tailscale reports this token expires ${new Date(testResult.api_key_expires_at).toLocaleDateString()}; that date is used instead.`
+                : "Read from Tailscale when it can be; this date is the fallback. Defaults to 90 days from today, Tailscale's maximum."
+            }
+          >
+            <input
+              type="date"
+              className={inputCls}
+              value={expiresOn}
+              onChange={(e) => setExpiresOn(e.target.value)}
+            />
+          </Field>
+        )}
 
         <div className="grid grid-cols-2 gap-3 border-t pt-3">
           <Field label="IPAM space">
@@ -746,6 +812,19 @@ function CopyablePre({ text, label }: { text: string; label: string }) {
       </button>
     </div>
   );
+}
+
+function dateInDays(days: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+// Start of the chosen day, UTC: erring early means warning early.
+function expiresOnToIso(date: string): string | null {
+  return date ? `${date}T00:00:00Z` : null;
 }
 
 const inputCls =

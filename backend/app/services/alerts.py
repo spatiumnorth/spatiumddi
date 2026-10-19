@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -3204,6 +3205,9 @@ async def _matching_secret_expiring_subjects(
       ``k3s_api_cert_expiring`` rule and is intentionally NOT duplicated.)
     * **API tokens** (``api_token.expires_at``) — active tokens with an
       expiry.
+    * **Tailscale API access tokens** (``tailscale_tenant.api_key_expires_at``,
+      #2138) — plus any tenant whose last sync got HTTP 401, which fires
+      critical regardless of the recorded date.
 
     ``subject_id`` is ``appliance_cert:<id>`` / ``api_token:<id>`` so each
     credential latches its own event; severity escalates per ``threshold/4``
@@ -3337,7 +3341,92 @@ async def _matching_secret_expiring_subjects(
             (f"appliance_cert_tls:{c.id}", f"{c.subject_cn or c.name} (LE)", message, sev)
         )
 
+    # 4. Tailscale API access tokens (#2138) — capped at 90 days by
+    #    Tailscale. Fires on a recorded expiry inside the threshold, AND on a
+    #    sync Tailscale refused with HTTP 401: that token is dead already,
+    #    whatever date we hold (revoked early, or an operator-entered date
+    #    that was wrong), and the mirror has stopped. One subject per tenant
+    #    so "expiring" escalates into "rejected" on the same event.
+    matches.extend(await _tailscale_token_subjects(db, rule, now, threshold_days, _descriptor))
+
     return matches
+
+
+async def _tailscale_token_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+    threshold_days: int,
+    descriptor: Callable[[int], str],
+) -> list[tuple[str, str, str, str]]:
+    """``secret_expiring`` subjects for Tailscale tenant API tokens (#2138).
+
+    Only enabled tenants holding a token, and only while the Tailscale
+    integration is on: a disabled tenant syncs nothing, so a lapsed token
+    breaks nothing. The token itself is never read here.
+    """
+    from app.models.tailscale import TailscaleTenant  # noqa: PLC0415
+    from app.services.tailscale.client import is_auth_rejected  # noqa: PLC0415
+
+    ps = await db.get(PlatformSettings, 1)
+    if ps is None or not ps.integration_tailscale_enabled:
+        return []
+
+    cutoff = now + timedelta(days=threshold_days)
+    tenants = (
+        (
+            await db.execute(
+                select(TailscaleTenant)
+                .where(TailscaleTenant.enabled.is_(True))
+                .where(TailscaleTenant.api_key_encrypted != b"")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out: list[tuple[str, str, str, str]] = []
+    for t in tenants:
+        subject = f"tailscale_tenant:{t.id}"
+        display = f"{t.name} Tailscale API token"
+        if is_auth_rejected(t.last_sync_error):
+            out.append(
+                (
+                    subject,
+                    display,
+                    f"Tailscale rejected the API access token for tenant '{t.name}' "
+                    f"(HTTP 401): it has expired or been revoked, and the tailnet "
+                    f"mirror has stopped updating. Generate a new token at "
+                    f"https://login.tailscale.com/admin/settings/keys and replace it "
+                    f"from Integrations → Tailscale.",
+                    "critical",
+                )
+            )
+            continue
+        expires_at = t.api_key_expires_at
+        if expires_at is None or expires_at > cutoff:
+            continue
+        days = (expires_at - now).days
+        sev = _escalate_severity_for_expiring(
+            rule.severity, threshold_days=threshold_days, days_to_expiry=days
+        )
+        source = (
+            "read from Tailscale"
+            if t.api_key_expiry_source == "api"
+            else "as entered on the tenant"
+        )
+        out.append(
+            (
+                subject,
+                display,
+                f"Tailscale API access token for tenant '{t.name}' "
+                f"{descriptor(days)} ({expires_at.isoformat()}, {source}; threshold "
+                f"{threshold_days} d). Tailscale caps these tokens at 90 days; "
+                f"generate a new one at https://login.tailscale.com/admin/settings/keys "
+                f"and replace it from Integrations → Tailscale.",
+                sev,
+            )
+        )
+    return out
 
 
 async def _served_web_cert_expiry() -> tuple[Any, str | None]:
@@ -5312,6 +5401,65 @@ async def seed_dhcp_scope_uncoordinated_alert_rule() -> None:
             )
         )
         await session.commit()
+
+
+_SECRET_EXPIRING_RULE_NAME = "Credential expiring or rejected"
+
+
+async def seed_secret_expiring_alert_rule(session: AsyncSession | None = None) -> None:
+    """Seed a ``secret_expiring`` rule, ENABLED by default (#2138).
+
+    Until #2138 the rule existed only for an operator who went and created
+    one, so a Tailscale tenant whose 90-day API token lapsed stopped
+    mirroring with nothing said anywhere. Silent on an install whose
+    credentials are all far from expiry. Seeded only when NO
+    ``secret_expiring`` rule exists — an operator who already made their own
+    must not receive every expiry twice — and keyed on ``name`` like the
+    other singletons, so one disabled or renamed is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+
+    async def _seed(db: AsyncSession) -> None:
+        existing = await db.scalar(
+            select(AlertRule.id)
+            .where(
+                or_(
+                    AlertRule.name == _SECRET_EXPIRING_RULE_NAME,
+                    AlertRule.rule_type == RULE_TYPE_SECRET_EXPIRING,
+                )
+            )
+            .limit(1)
+        )
+        if existing is not None:
+            return
+        db.add(
+            AlertRule(
+                name=_SECRET_EXPIRING_RULE_NAME,
+                description=(
+                    "Fires for each credential SpatiumDDI depends on that expires "
+                    "within the threshold: supervisor mTLS certificates, API tokens, "
+                    "the Let's Encrypt Web UI certificate and Tailscale API access "
+                    "tokens. A Tailscale tenant whose sync was refused with HTTP 401 "
+                    "fires critical at once, since its token is already dead. "
+                    "Severity escalates as expiry nears; resolves when the credential "
+                    "is replaced."
+                ),
+                rule_type=RULE_TYPE_SECRET_EXPIRING,
+                severity="warning",
+                threshold_days=_DEFAULT_EXPIRING_THRESHOLD_DAYS,
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await db.commit()
+
+    if session is not None:
+        await _seed(session)
+        return
+    async with AsyncSessionLocal() as db:
+        await _seed(db)
 
 
 async def seed_agent_daemon_degraded_alert_rule() -> None:

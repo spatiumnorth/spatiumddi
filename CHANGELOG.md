@@ -27,6 +27,26 @@ the formatter handles the rest.
 
 ### Added
 
+- **Tailscale warns before its 90-day API token expires, and alerts
+  when it has (#2138).** Tailscale caps an API access token at 90
+  days; when it lapsed, every sync got HTTP 401, the mirror stopped
+  updating and nothing said so. Each tenant now records
+  `api_key_expires_at`, read from Tailscale's keys endpoint
+  (`GET /api/v2/tailnet/{tailnet}/keys/{keyId}`, the key id taken from
+  the `tskey-api-<keyId>-…` token) when the token is tested, saved or
+  replaced, and again once a day. When Tailscale can't say, the tenant
+  form takes a "Token expires on" date instead, pre-filled with 90
+  days from today; a date read from Tailscale always replaces it, and
+  a failed read never clears a stored one. The `secret_expiring` alert
+  rule now covers these tokens (`tailscale_tenant:<id>` subjects, its
+  usual threshold and severity escalation) and fires **critical** for
+  a tenant whose last sync got HTTP 401, whatever date is recorded. A
+  red or amber chip shows the state on the Tailscale page and on both
+  dashboard integration surfaces; on the Tailscale page it opens the
+  tenant form to replace the token. `list_tailscale_targets` returns
+  the expiry and the credential state. The token is never logged or
+  returned.
+
 - **The Helm chart's migrate Job takes annotations, so it works under
   GitOps (#2114).** Under `helm template`, which is how Argo CD and
   similar tools render a chart, the Helm revision is always 1. The
@@ -67,6 +87,19 @@ the formatter handles the rest.
   (superadmin only) shows the same per-target state.
 
 ### Changed
+
+- **A `secret_expiring` rule is now seeded, enabled, on installs that
+  have none (#2138).** It was only ever created by hand, so on a
+  default install no expiring credential alerted at all. The seeded
+  "Credential expiring or rejected" rule (warning, 30 days, escalating
+  to critical) also covers supervisor certificates, API tokens with an
+  expiry and the Let's Encrypt Web UI certificate, so those can start
+  alerting after the upgrade. It is not seeded when any
+  `secret_expiring` rule already exists.
+
+- **Testing a Tailscale tenant with a new, unsaved key no longer
+  clears the stored key's sync error (#2138).** Replacing the key does
+  clear an HTTP 401 error, since it belonged to the old key.
 
 - **Dependency pins current (#1625): GoBGP 4.9.0 → 4.10.0 and the
   vendored Swagger UI bundle 5.33.0 → 5.33.1.** GoBGP 4.10.0's own
@@ -5868,6 +5901,11 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `c8e2a5f71d39` — #2138: `tailscale_tenant.api_key_expires_at`
+  (nullable timestamp) and `api_key_expiry_source` (nullable string,
+  `api` or `operator`, checked by a constraint). No backfill: NULL
+  means unknown until the next test, save or daily refresh reads it.
+  Downgrade drops the constraint and both columns.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column

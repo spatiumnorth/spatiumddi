@@ -565,6 +565,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dhcp_scope_uncoordinated_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dhcp_scope_uncoordinated_alert_rule_seed_skipped", reason=str(exc))
+    # Credential-expiry alert rule (``secret_expiring``) — ENABLED by
+    # default (issue #2138), seeded only when no rule of that type exists.
+    # Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_secret_expiring_alert_rule,
+        )
+
+        await seed_secret_expiring_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("secret_expiring_alert_rule_seed_skipped", reason=str(exc))
     # Agent daemon-not-serving alert rule — singleton, ENABLED by default
     # (issue #1067). Fires when an agent has reported a daemon that is not
     # ``ok`` for longer than a bundle normally takes to arrive. Idempotent.

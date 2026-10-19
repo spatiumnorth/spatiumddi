@@ -112,6 +112,7 @@ import {
   partialApplyDetail,
 } from "@/lib/configApply";
 import { WidgetErrorBoundary } from "@/components/WidgetErrorBoundary";
+import { CredentialChip } from "@/components/CredentialChip";
 
 /**
  * Dashboard — the home page.
@@ -3791,6 +3792,15 @@ function IntegrationsPanel({
                       lastSyncError={t.last_sync_error}
                       intervalSeconds={t.sync_interval_seconds}
                       enabled={t.enabled}
+                      badge={
+                        t.enabled ? (
+                          <CredentialChip
+                            state={t.credential_state}
+                            daysLeft={t.credential_days_left}
+                            expiresAt={t.api_key_expires_at}
+                          />
+                        ) : null
+                      }
                     />
                   ))}
                 </div>
@@ -3902,11 +3912,14 @@ function IntegrationRow({
   lastSyncWarning,
   intervalSeconds,
   enabled,
+  badge,
 }: {
   to: string;
   name: string;
   subtitle: string;
   meta: string;
+  // #2138 — e.g. a credential-expiry chip; rendered after the name.
+  badge?: React.ReactNode;
   lastSyncedAt: string | null;
   lastSyncError: string | null;
   // Optional — only integrations that compute non-fatal findings pass it.
@@ -3932,6 +3945,7 @@ function IntegrationRow({
       <span className="w-28 truncate font-semibold" title={name}>
         {name}
       </span>
+      {badge}
       <span
         className="w-48 truncate font-mono text-muted-foreground"
         title={subtitle}
@@ -4897,10 +4911,21 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
   // #797 — a warned target syncs on time and without error but isn't
   // producing what it was configured to produce, so it must not read as
   // green here while the IPAM-tab panel shows it amber.
+  // #2138 — a credential about to lapse is a warning even while every sync
+  // is still green; an expired / rejected one is as bad as an error.
+  const credentialDead = panel.targets.filter(
+    (t) =>
+      t.credential_state === "expired" || t.credential_state === "rejected",
+  ).length;
+  const credentialExpiring = panel.targets.filter(
+    (t) => t.credential_state === "expiring",
+  ).length;
   const tone: Tone =
-    panel.error_count > 0
+    panel.error_count > 0 || credentialDead > 0
       ? "bad"
-      : panel.stale_count > 0 || panel.warning_count > 0
+      : panel.stale_count > 0 ||
+          panel.warning_count > 0 ||
+          credentialExpiring > 0
         ? "warn"
         : "good";
   const cls = TONE_CLASS[tone];
@@ -4943,6 +4968,22 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
             </span>
           </>
         )}
+        {credentialDead > 0 && (
+          <>
+            {" · "}
+            <span className="text-red-600 dark:text-red-400">
+              {credentialDead} token expired
+            </span>
+          </>
+        )}
+        {credentialExpiring > 0 && (
+          <>
+            {" · "}
+            <span className="text-amber-600 dark:text-amber-400">
+              {credentialExpiring} token expiring
+            </span>
+          </>
+        )}
       </p>
       {panel.targets.length > 0 && (
         <ul className="mt-2 space-y-1 text-[11px]">
@@ -4951,11 +4992,18 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
               key={t.id}
               className="flex items-baseline justify-between gap-2"
             >
-              <span
-                className="truncate"
-                title={t.last_sync_warning ?? t.display}
-              >
-                {t.display}
+              <span className="flex min-w-0 items-baseline gap-1.5">
+                <span
+                  className="truncate"
+                  title={t.last_sync_warning ?? t.display}
+                >
+                  {t.display}
+                </span>
+                <CredentialChip
+                  state={t.credential_state}
+                  daysLeft={t.credential_days_left}
+                  expiresAt={t.credential_expires_at}
+                />
               </span>
               <span
                 className={cn(
