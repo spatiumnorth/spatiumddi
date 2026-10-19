@@ -574,7 +574,8 @@ returns `old_value`, `new_value`, `changed_fields` and `error_detail`
 redacted on read: a key that looks like a credential (password, token,
 secret, `*_key`, `*_encrypted`, ...) comes back as `[redacted]`, and
 secret-shaped strings (JWTs, Fernet tokens, bearer values, chat-webhook
-URLs) are masked wherever they appear; a string carrying a PEM private
+URLs, the signing parameters of a presigned S3 / GCS / Azure SAS URL, a
+storage connection string's `AccountKey`) are masked wherever they appear; a string carrying a PEM private
 key is replaced whole. A boolean or integer under a credential-shaped
 key is kept, so a writer's `smtp_password_set: true` still says whether
 the secret was set. Both endpoints need `read` on `audit_log`.

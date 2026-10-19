@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
@@ -76,6 +77,7 @@ import { ResolverTab } from "./ResolverTab";
 import { SNMPTab } from "./SNMPTab";
 import { SSHTab } from "./SSHTab";
 import { SyslogTab } from "./SyslogTab";
+import { UpgradeDirectionNotice } from "./UpgradeDirectionNotice";
 // #404 — these three moved out of the top-level tab bar into this sidebar.
 import { CertificatesTab } from "./CertificatesTab";
 import { ClusterUpgradeTab } from "./ClusterUpgradeTab";
@@ -4883,10 +4885,14 @@ function ApplianceRoleAssignmentSection({
     queryFn: dnsApi.listGroups,
     staleTime: 60_000,
   });
+  // #2130 — the DHCP role and its group picker exist only while core.dhcp
+  // is on (the server refuses the role otherwise, and the group read 404s).
+  const dhcpOn = useModuleOn("core.dhcp");
   const dhcpGroupsQuery = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
     staleTime: 60_000,
+    enabled: dhcpOn,
   });
 
   const save = useMutation({
@@ -4974,7 +4980,16 @@ function ApplianceRoleAssignmentSection({
         containers.
       </p>
       <div className="mt-2 flex flex-wrap gap-2">
-        {ROLE_OPTIONS.map((opt) => {
+        {ROLE_OPTIONS.filter(
+          // A DHCP role already on the row stays visible so it can be
+          // kept or un-assigned; it is just never offered as a new choice.
+          // Keyed on the SAVED row, not the form, so unticking it by mistake
+          // does not make it vanish before Save.
+          (opt) =>
+            opt.value !== "dhcp" ||
+            dhcpOn ||
+            (row.assigned_roles ?? []).includes("dhcp"),
+        ).map((opt) => {
           const cap = opt.capKey
             ? (caps[opt.capKey as keyof SupervisorCapabilities] as
                 | boolean
@@ -5024,7 +5039,14 @@ function ApplianceRoleAssignmentSection({
           </select>
         </div>
       )}
-      {dhcpRoleActive && (
+      {dhcpRoleActive && !dhcpOn && (
+        <p className="mt-3 text-xs text-amber-600">
+          DHCP is switched off (Features &amp; Integrations). This appliance
+          keeps the DHCP role it already holds, and its DHCP group can be
+          changed once DHCP is back on; untick the role to remove it.
+        </p>
+      )}
+      {dhcpRoleActive && dhcpOn && (
         <div className="mt-3">
           <label className="text-xs text-muted-foreground">DHCP group</label>
           <select
@@ -6044,30 +6066,18 @@ function ApplianceOsUpgradeSection({
               />
             </div>
           )}
-          {(direction === "backward" || direction === "same") && (
-            <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-2 py-1 text-[11px] text-amber-800 dark:text-amber-300">
-              {direction === "backward" ? (
-                <>
-                  <strong>{tag.trim()}</strong> is older than the installed{" "}
-                  <strong>{row.installed_appliance_version}</strong>: this is a
-                  rollback, not an upgrade. The older release boots against a
-                  database the newer one may already have migrated.
-                </>
-              ) : (
-                <>
-                  This node already runs <strong>{tag.trim()}</strong>. It will
-                  re-write the inactive slot with the same release and reboot
-                  into it.
-                </>
-              )}
-            </p>
-          )}
+          <UpgradeDirectionNotice
+            direction={direction}
+            tag={tag}
+            installed={row.installed_appliance_version}
+          />
           <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={() => scheduleUpgrade.mutate(false)}
               disabled={
                 !tag.trim() ||
+                direction === "same" ||
                 scheduleUpgrade.isPending ||
                 (sourceKind === "url" && !imageUrl.trim()) ||
                 (sourceKind === "uploaded" && !slotImageId)

@@ -27,6 +27,29 @@ the formatter handles the rest.
 
 ### Added
 
+- **The Helm chart's migrate Job takes annotations, so it works under
+  GitOps (#2114).** Under `helm template`, which is how Argo CD and
+  similar tools render a chart, the Helm revision is always 1. The
+  migrate Job was therefore always `<release>-migrate-r1`, and since a
+  Job's pod template cannot change, the first sync after an image bump
+  failed with `field is immutable` until the old Job was deleted by
+  hand. New `migrate.annotations` (empty by default) sets annotations on
+  the Job; with Argo CD's `hook: Sync` and
+  `hook-delete-policy: BeforeHookCreation` the Job is recreated and
+  re-run on every sync. The chart README gains a GitOps section, which
+  also covers pre-creating the secrets `helm template` would otherwise
+  regenerate on every render, and no longer describes the migrate Job as
+  a pre-upgrade hook. `k8s/README.md` shows the same fix as a kustomize
+  patch for the plain manifests.
+
+- **Per-server `nodeSelector` and `tolerations` for DNS agents in the
+  Helm chart (#2114).** DNS agents only prefer separate nodes, so after
+  a node drain an agent could reschedule next to another one and stay
+  there. Each `dnsAgents.servers[]` entry now accepts `nodeSelector` and
+  `tolerations`, so a server can be pinned to a node to keep one agent
+  per node behind a shared address. Both are unset by default and the
+  chart renders unchanged.
+
 - **Alerts when a scheduled backup fails or stops running, on by
   default (#1262).** A failed scheduled backup used to write an audit
   row and nothing else, so on a default install a nightly backup could
@@ -101,6 +124,585 @@ the formatter handles the rest.
   permission refuses, or whose arguments fail validation, spends nothing. A
   test walks every function each tool reaches and fails any tool that
   sends traffic without declaring a budget or a recorded exemption.
+
+- **IPAM now says why a host named `gateway` gets no forward DNS
+  record (#2101).** The rule is deliberate (every subnet's placeholder
+  row is named `gateway`, so publishing them would collide on
+  `gateway.<zone>`), but nothing in the GUI said so. The IP row's DNS
+  column shows "forward DNS skipped" with the explanation as its
+  tooltip instead of a bare dash, and the create, edit, allocate and IP
+  detail views show the same note when the hostname is exactly
+  `gateway` (advisory, saving is still allowed; typed input is matched
+  the way the API stores it, so `Gateway` or `gateway.` shows it too). The Sync DNS modal
+  explains each stale reason in plain words instead of the raw code and
+  no longer says a `default-gateway-name` record's address is gone. A
+  row whose records Sync DNS is about to delete no longer reads "in
+  sync" (stale items now carry an optional `ip_id`), and a stale
+  record with no zone no longer renders a dangling dot. The record
+  behaviour is unchanged: no forward record, PTR still published.
+
+- **Turning DHCP off now hides DHCP everywhere, and stops the `/dhcp/*`
+  calls that 404ed (#2130).** `core.dhcp` hid the DHCP sidebar but left
+  DHCP tabs, columns, settings and pickers across IPAM, Logs, Settings,
+  Dashboard and Admin, and several of them still called `/dhcp/*` and
+  failed. With DHCP off: the subnet DHCP Pools tab, the DHCP Pool column,
+  the DHCP and DDNS tabs and device-profiling toggle in the Space / Block /
+  Subnet dialogs, the Logs DHCP Activity and DHCP Audit tabs (a
+  `?tab=dhcp-activity` link lands on DNS Queries), Settings DHCP Defaults /
+  DHCP Lease Sync / Device Profiling, the Subnet Planner, IPAM Templates
+  and Services DHCP pickers, the Fleet DHCP role chip, the Cutover DHCP
+  pickers, and the DHCP rule types in the alert editor are gone, and none of
+  them reads `/dhcp/*`. The agent bootstrap keys stay. `dhcp` and
+  `static_dhcp` are no longer offered as an IP status, but an address that
+  already has one still shows it and keeps it when you edit something else.
+  A hard reload used to fire one `/dhcp` read before the module list had
+  loaded (Dashboard on the DHCP tab, Import defaulting to DHCP); both now
+  wait for it, and a `?tab=dhcp-activity` link on a hard reload waits too
+  rather than flashing DNS Queries first. Adding the `dhcp` role to a Fleet
+  appliance while DHCP is off is refused with a 422 naming `core.dhcp` (it
+  used to be accepted and the agent was then refused at register); an
+  appliance that already holds the role can still be re-saved, and the
+  Copilot's `assign_appliance_role` (preview and apply) follows the same
+  rule. An existing alert rule of a hidden type keeps its stored parameters
+  and says why they cannot be edited. DDNS settings are hidden with it: they
+  only act on DHCP leases (`apply_ddns_for_lease`), never on static
+  allocations. Not done here: the New Devices block action, the `/dhcp`
+  direct-URL notice (#2129), label-only mentions, and the `core.dns` pass.
+
+- **Integration sync-interval fields no longer read `1h` as 1
+  second, or turn a cleared field into the default (#2110).** The
+  sync interval on the PAN-OS, UniFi, Meraki, Cloud, Docker,
+  Tailscale, OPNsense, Kubernetes, NetBird, FortiGate and Proxmox
+  forms, the network device poll interval and SNMP timeout, and
+  the DNS pool health-check interval and timeout all read
+  themselves with `parseInt(...) || N`. They now go through one
+  `parseSecondsInput` (`lib/seconds.ts`, the reader `parseTtlInput`
+  delegates to): a whole number within the API's own bounds, `1e3`
+  is 1000, anything else is refused with the reason and nothing is
+  sent. An empty field is refused as required, because omitting it
+  on an edit means "unchanged" and the default would have silently
+  rewritten it. Bounds are the API's: 30 s (60 s for Cloud), `>= 0`
+  for device polling, 10..3600 and 1..60 for the pool check.
+
+- **Editing an IP no longer renames or deletes its own A aliases, and
+  the alias lists no longer show a host record as an alias (#2084).**
+  An address's A/AAAA aliases and its own host records are both
+  auto-generated rows tied to the address, so the DNS sync loaded the
+  aliases as the host record: an edit or rename could rewrite an alias
+  into the host name (leaving the real host missing or duplicated), an
+  alias in a zone the host does not publish to was deleted, and giving
+  an address the default `gateway` name deleted every alias. The
+  mirror image was in the alias lists (`GET /addresses/{id}/aliases`,
+  `GET /subnets/{id}/aliases`, the per-address alias count): they told
+  an alias from the host only by `ip.dns_record_id`, so a host record
+  published into an extra zone was listed and counted as an alias and
+  could be deleted through the alias endpoint (now 409). A new
+  `dns_record.ip_alias` column says what a row is; every alias writer
+  sets it and the sync, the three lists, alias delete and the DNS
+  drift check read it. The drift check no longer reports an alias as a
+  mismatched host record. The upgrade marks the aliases already stored:
+  an A / AAAA named like the address's hostname in its forward zone or
+  an extra zone stays the host record (extra-zone ids compared as
+  UUIDs, whatever case they were sent in), and where the address's
+  linked record sits in a zone, a second row at the same name, left by
+  renaming an address onto its own alias, stays an alias. A host
+  record left in an extra zone under an old name becomes an alias: it
+  keeps answering and can be deleted from the alias list.
+
+- **Registering a DNS agent no longer deadlocks against the render of
+  its first bundle (#2031).** The worker's bundle store wrote the
+  server row in two UPDATEs, and Postgres re-runs a row's foreign-key
+  checks on a second UPDATE of a version the transaction itself wrote,
+  so the render's second write took `FOR KEY SHARE` on the server's
+  group (and appliance) row. Registration's SOA-timer switch held the
+  group row `FOR UPDATE` and, marking the group's bundles at commit,
+  queued for the server row behind the render's first write: 40P01.
+  The switch lost, logged `dns_group_soa_timers_failed` and only ran
+  again at the agent's first heartbeat. The store now writes the server
+  row in one statement, so the render never waits on a parent row (this
+  also covers a group rename and an appliance role save, which hold
+  those rows `FOR UPDATE` for a reason a lock strength cannot change),
+  and the switch locks the group and its zones `FOR NO KEY UPDATE`, the
+  strength of the write it makes.
+
+- **A zone's Primary NS must be a host name, or it is refused (#2075).**
+  The zone dialog stored `ns_1.<zone>.` or a 64-character label as typed
+  and answered 201; the BIND9 agent then wrote it as the SOA MNAME, named's
+  check-names refused the zone, and the server row went `reverted` with the
+  zone never served. A single label such as `ns1` was stored too, and served
+  as a name at the root rather than under the zone. Zone create (REST and the
+  dialog), the Copilot's `create_dns_zone` and the zone importers now apply
+  the host-name rule: letters, digits and hyphens, at most 63 per label and
+  253 in all, at least two labels, trailing dot optional; empty still means
+  "use the zone's NS". A zone **update** refuses only a changed value, so a
+  zone stored before this stays editable by a save that re-sends it (the
+  dialog shows a warning under the field until it is changed). The importer leaves an
+  unservable source MNAME unset and says so in the commit warnings. On BIND9
+  a stored value of that kind no longer stops the group: the agent serves the
+  zone's first apex NS record, or the `ns1.<zone>` placeholder, as the SOA
+  primary name and logs `unusable_field`. The responsible-person name is
+  unchanged, since a mailbox is not a host.
+
+- **Allocate IP no longer stores a hostname whose name in its zone
+  passes 253 characters (#2072).** A 243-character hostname is valid
+  alone, but IPAM publishes `<hostname>.<zone>`, and the length cap
+  only looked at the hostname. The allocate answered 201, the A record
+  was queued, and BIND refused both the forward zone and the reverse
+  zone holding the PTR ("ran out of space"), so every later change to
+  either waited behind it. The limit is now applied to the whole name
+  (253 characters of dotted form, 255 octets on the wire, each label
+  63 at most) by one shared helper in `core/dns_names.py`. Allocate IP,
+  edit IP, bulk allocate and bulk edit DNS zone answer 422 naming
+  `hostname` and the length it would reach, storing nothing. The DNS
+  record API and the copilot apply it to a record's owner and to a
+  CNAME / MX / NS / SRV / PTR / DNAME target too. A subnet's Sync DNS
+  lists the address under its errors instead of counting it as synced.
+  DDNS, importers and DHCP static reservations never fail a lease or a
+  batch: they publish nothing for the over-long name, retract the A and
+  PTR an earlier name had published, and log `ipam_dns_name_too_long`.
+  The Allocate IP dialog shows the same reason as you type. Nothing is
+  ever truncated. A record already stored too long holds back only its
+  own zones on the agent, as before; shorten the hostname or delete the
+  record to release them.
+
+- **A DNS import no longer stores a CNAME beside other data, or at the
+  zone apex (#2089).** The record API refuses both (#1381); the importers
+  stored them anyway, so the server then refused the zone (BIND's "CNAME
+  and other data", PowerDNS's "Conflicts with pre-existing RRset") while
+  the import reported success. The zone-file import into an existing zone
+  and the BIND9, Windows, PowerDNS, Technitium and cloud importers now
+  apply the same rule, through the shared `cname_conflict` module. The
+  preview lists each record that will not be imported, with its reason
+  (`skipped` on the zone-file preview, a warning on the others), and the
+  commit skips it and says so in its result; the rest of the import still
+  lands. A clash within the imported set keeps the non-CNAME data and drops
+  the CNAME (the first of several CNAMEs is kept); a clash with a record
+  already in the zone keeps the existing record. Records are compared per
+  view, a record with no view counting in every view. The zone-file preview
+  now takes `conflict_strategy` (default `merge`, so an older client is
+  unaffected), since a `replace` frees the names of the records it deletes.
+  Records in the trash do not count; IPAM-generated records do. A record the
+  commit already drops for a control character no longer costs the CNAME at
+  its name its place. The Copilot's import preview says how many records will
+  not be imported, and its commit reports them.
+
+- **Bulk allocate refuses a hostname template whose names are not host
+  names (#2071).** `web{n}-` produced `web1-` / `web2-` and
+  `web{n:_}` produced `web1_000`; preview and commit accepted them, the
+  A records were written and BIND's check-names refused the forward and
+  reverse zones. Preview and commit now check every generated name with
+  the host-label rule the single Allocate IP path uses
+  (`core/dns_names`), store it lower-cased as that path does, and answer
+  422 naming the offending names, creating nothing. Token format specs
+  are limited to the ones the dialog's live preview renders identically —
+  plain, `d`, `x`, `X`, each optionally zero-padded (`{n:03d}`,
+  `{oct4:03d}`) — so `{n:_}`, `{n:,}`, `{n:5d}` and conversions are
+  refused, and the iterator start must be 0 to 999,999,999 (a negative
+  start zero-padded differently in the browser). The dialog now parses
+  and renders templates exactly as the server does and checks every name
+  in the range, and a shared vectors file is run by both a backend test
+  and a vitest so the two cannot drift. `{oct1}`–`{oct4}` now honour a
+  padding spec instead of silently ignoring it (multicast name templates
+  too). Also fixed on the way: Python's `$` matches before a trailing
+  newline, so a label ending in `\n` passed every host and record-owner
+  name check; the label rules now anchor with `\Z`.
+
+- **The DNS server shows the version its agent actually runs
+  (#2078).** The DNS agent registered with a literal
+  `"2026.04.14.1"` that nothing rewrote, and the control plane
+  seeded the operator's `notes` with it (`agent v2026.04.14.1`)
+  and kept no version anywhere else; the heartbeat's
+  `agent_version` was accepted and dropped. The agent now sends
+  its stamped release, the register and heartbeat handlers store
+  it in a new `dns_server.agent_version`, the server response
+  carries it, the server detail dialog shows it (unknown when
+  never reported, n/a for an agentless driver), and the
+  `find_dns_servers` copilot tool reports it. `notes` is no
+  longer seeded by the agent; existing rows keep whatever note
+  they have. An agent of an earlier release still registers with
+  the old literal, which is ignored rather than stored, so it
+  never overwrites the real version that agent's heartbeat
+  reports. Migration `a2078c5e1d90`.
+
+- **Three more TTL fields no longer read `1h` as 1 second (#2086).**
+  The IPAM DDNS TTL override (on a new or edited subnet), the IPAM
+  template's DDNS TTL and the DNS pool TTL read the field with
+  `parseInt`, which keeps the leading digits: `1h` and `1e3` were both
+  saved as 1. They now use the same reading as the zone and record
+  dialogs (#2085): a whole number of seconds, `1e3` is 1000, anything
+  else is refused with the reason and nothing is sent. A blank DDNS
+  override still means inherit. The pool TTL is checked against the
+  API's own 1 to 86400, and a cleared pool field is now refused as
+  required instead of being saved as 30 without a word.
+
+- **A zone or record TTL outside RFC 2181's range is refused with a
+  422 instead of stored (#2073).** Add Zone with Default TTL `-1`
+  answered 201 and saved it, and the BIND9 agent then refused the
+  zone for a bad TTL, so it was never served. The zone `ttl`, a
+  record's `ttl` and the IPAM / IPAM-template `ddns_ttl` (which
+  stamps every DDNS record) are now bounded to 0..2147483647 on
+  create and update, like the SOA timers already were, and the 422
+  names the field. The importers store a servable value rather than
+  what the source said: a record TTL outside the range inherits the
+  zone's, and a zone TTL or SOA timer outside it takes the default
+  (a TTL past 2147483647 would not fit the column and failed the
+  commit). A TTL stored
+  negative before this fix is not rewritten, but no longer reaches a
+  server: the agent bundle ships the zone with a `$TTL` of 3600 and
+  the record inheriting it, and record updates send it as inherit.
+  Edit the row to clear it. The Add/Edit Zone and record dialogs
+  take a number and refuse anything that is not a whole number in
+  range with a reason; they used to send `parseInt` of the text, so
+  `1h` went out as 1 (#2074), and `1e3`, which a number field
+  accepts, would have too.
+
+- **An `A` alias can be added to an IPv6 address again (#2081).**
+  `POST /ipam/addresses/{id}/aliases` with an `A` alias on an IPv6
+  address wrote the AAAA record the alias follows the address family
+  into, then looked the new row up by the requested type `A`, found
+  nothing, answered 409 and rolled the write back, so the alias could
+  never be added there. The lookup now uses the type that was written,
+  from the same helper the writer and the CNAME-rule check use.
+  The alias lists and the per-address alias count matched only
+  CNAME and A, so a stored AAAA alias was missing from them; they
+  match AAAA now. Allocate and next-IP were not affected. `AAAA` is
+  still refused as an alias type (422), so an IPv4 address can never
+  get one.
+
+- **An IP's DNS alias no longer breaks the CNAME-and-other-data rule
+  (#2080).** An alias given when allocating an IP (Allocate IP,
+  Allocate next IP) or added with `POST /ipam/addresses/{id}/aliases`
+  went straight into the zone without the check the DNS record API has
+  run since #1381. A CNAME alias on a name that already held an A (or
+  the IP's own host name, or another alias in the same request), an
+  A / AAAA alias on a name that was already a CNAME, and a CNAME alias
+  at the apex were all stored, and BIND then refused the whole zone,
+  so the agent stayed on its last good config. The alias path now asks
+  the same shared check, before anything is written, in every view:
+  409 for a clash, 422 for a CNAME at the apex, with the DNS API's
+  message. An A alias on an IPv6 address is checked as the AAAA it is
+  written as, and a clash inside one request names both sides (for
+  example the address's own AAAA record). An alias stored before this
+  fix is not removed: BIND holds back only the zone it is in (#1403),
+  the server reports it through the `agent_config_rejected` alert, and
+  deleting the alias (`DELETE /ipam/addresses/{id}/aliases/{record_id}`)
+  releases the zone.
+
+- **The DNS and DHCP server detail modals offered Pause and Resume to
+  a user the API refuses (#2076).** Both routes take a superadmin, and
+  the server rows already showed the buttons disabled with "Requires
+  superadmin"; the detail modal opened from the same row did not, so a
+  DNS or DHCP Editor clicked Pause, typed a reason, and only then got
+  a 403. The modals now use the same gate as the rows.
+
+- **An IPAM alias named `under_score` (type A) is refused, not written
+  into a zone BIND will not load (#2070).** Allocate IP, Allocate next
+  IP and the Add alias endpoint stored the name and wrote the record;
+  the BIND9 agent then refused the whole zone under check-names and held
+  every later change in it. An alias now passes the DNS record API's own
+  owner-name checks (`validate_record_owner` and BIND's check-names rule
+  for its type), so an A or AAAA alias must be a host name and the
+  request answers 422 naming the alias. A CNAME alias keeps the
+  underscore, as in the DNS API. The alias is stored in the form the
+  checks passed (lower-cased, an internationalized name as its `xn--`
+  A-label), and an alias whose name inside its zone passes 253
+  characters is refused before anything is written. An alias stored
+  before this release still holds its zone back:
+  `GET /api/v1/diagnostics/name-conformance` (or the Copilot's
+  `find_nonconforming_names`) lists it, and deleting it from the
+  address's aliases releases the zone.
+
+- **On PowerDNS, a record target with no trailing dot no longer stops
+  its zone converging, and the record API refuses new ones (#2060).**
+  PowerDNS refuses a CNAME / PTR / MX / NS / SRV / SVCB / HTTPS / NAPTR /
+  ALIAS / DNAME target written without its trailing dot (`422 Not in
+  expected format`), and it applies a zone change as one transaction.
+  The record API stored such a value as typed, so one dot-less row made
+  its record op fail on every retry until it was marked `failed`, and
+  made PowerDNS refuse the zone's whole structural update (no other
+  change to that zone was applied, and the server reported a partial
+  apply) or, for a new zone, refuse to create the zone at all. The
+  agent now qualifies a dot-less target against the zone, which is what
+  a BIND9 server serves for the same row, so rows that already exist
+  (an importer's included) are served on upgrade. A zone PowerDNS still
+  refuses for any other reason is retried piecemeal (halved until the
+  refused record sets are isolated, so one bad record in a large zone
+  costs a few dozen requests, not one per record set), so only the
+  refused record set is left out and named in the server's apply
+  status. Such a zone is not reported as in sync by that server even
+  though its serial moved, so the per-server sync status agrees with the
+  apply status. On a PowerDNS group, creating or editing a record with
+  a dot-less target is now a 422 that shows the two names it could
+  mean (`db1.example.com.`, or `db1.example.com.<zone>.`), on the REST
+  create, edit and bulk-create paths and in the Copilot. Other drivers
+  are unchanged.
+
+- **The DNS group's Health line reports what the servers say
+  (#2077).** DNS, a server group, Servers read "all servers assumed
+  consistent (per-server serials arrive in Wave 3)" whatever the
+  servers reported, even while one had refused a zone. It now comes
+  from each server's own zone-state rollup: in sync on N servers, or
+  how many servers are behind, refused zones, or have not reported
+  every zone yet. A server that has not reported is never counted as
+  in sync.
+
+- **A rolling upgrade no longer fails on one kubeapi request its
+  shared-tag hold could not land (#2028).** The hold (#1710) pins the
+  shared charts' image tag before each node and removes the pins at the
+  end, a few kubeapi requests each time, and any one of them refused or
+  unanswered (a k3s server answers 503 `apiserver not ready` while it
+  restarts) failed the whole run: before the first node, with the
+  cluster on two versions at a re-assert, or with every node already on
+  the target at the flip. Such a step is now tried again every 15 s,
+  with Halt, Abort and the Lease read between tries, as #1713 does for
+  the Lease. No node starts and no tag moves until it lands, and the
+  run fails on it, with the same error, only after 300 s of failures.
+  Only an answer a later try can change is retried (no answer, a 5xx,
+  408, 409 or 429); a 403 or 422 still fails the run at once.
+
+- **A demoted member promoted again rejoins instead of sitting
+  `joining` on a full disk (#2049).** Every join and leave set the
+  node's k3s identity aside, and with it containerd's whole image
+  store (4-6 GiB); the newest three backups were kept whole. One
+  demote then promote left a 40 GiB member with three stores in
+  backups beside the one its join was importing, the kubelet went into
+  DiskPressure, the supervisor pod was refused, and nothing reported
+  the join. A backup now keeps its image store only while the join
+  that took it can still roll back onto it: the stores of earlier,
+  settled joins and leaves are dropped before the runner writes
+  anything to /var, a join that registered with the seed's etcd
+  drops its own before its long wait for Ready (that branch never
+  rolls back), and a join or leave that settles drops it before
+  reporting. The identity in every backup is kept for manual
+  recovery. A node already carrying three full backups gets the
+  space back on its first join or leave after the upgrade. Found
+  and first fixed by the QA desk.
+
+- **Fleet no longer reports `ssh: retrying` forever after managed SSH is
+  turned off (#2053).** The supervisor's fire-state reader stripped the
+  leading tab of an empty-hash line (`\t1\t<iso>`, written when a plane
+  is turned off), so the fields shifted left, attempts read as the hash
+  and never matched the runner's empty applied sidecar. It now strips
+  only the line ending and parses the empty hash faithfully; the same
+  reader serves every host-config plane (SNMP, NTP, APT, LLDP, syslog,
+  resolver, firewall, timezone, console mode, removable). The appliance
+  console's own copy of the reader had the same bug and reported the
+  plane `retrying` on the dashboard and the health screen; it is fixed
+  too, and its plane list, which had fallen behind by three planes (APT,
+  console mode, removable), now matches the supervisor's, pinned by a
+  test. Two related cases also no longer stick at `retrying`: a config
+  that failed to apply and was then reverted to what the host already
+  runs, and a failed timezone change followed by clearing the timezone.
+  And an "off" that fails to apply now backs off like any other failed
+  apply, instead of re-firing on every heartbeat.
+
+- **IPAM no longer adopts a PTR whose target lacks the trailing dot
+  where that target is served relative to the zone (#2045).** Since
+  #1890 an allocation adopts an operator's identical record instead of
+  writing its own, and for a PTR it also matched the target with the
+  trailing dot removed. The record API stores a value as typed, and
+  BIND9, both Technitium drivers and Windows over RFC 2136 serve a
+  dot-less target relative to the reverse zone, so `db1.example.com`
+  answered `db1.example.com.<reverse zone>.`: IPAM adopted the wrong
+  record, wrote no PTR, and Sync DNS reported nothing missing. The
+  adoption match and the Sync DNS check now compare a PTR target the way
+  the zone's servers serve it. A dot-less target is still adopted where
+  every server in the group takes it as the absolute name (the cloud
+  providers, Windows over WinRM), because writing a second copy there is
+  a duplicate the provider can refuse. The comparison is now also
+  case-insensitive, so `DB1.Example.com.` is adopted rather than
+  duplicated. When IPAM declines a dot-less operator PTR it logs
+  `ipam_ptr_relative_operator_record`; the operator's record stays, and
+  the reverse lookup answers both names until it is fixed or deleted.
+  A/AAAA adoption is unchanged; CNAME, MX and NS are not adopted by this
+  code.
+
+- **Saving SSH settings now repairs a failed or stopped ssh.service
+  (#2054).** The runner validated the staged config with `sshd -t`
+  before restarting, but `sshd -t` needs `/run/sshd`, which is
+  ssh.service's own runtime directory and is removed when the unit
+  stops or fails. With the unit down the check failed and the restart
+  that would have fixed it was never reached, so only a reboot
+  recovered. The runner now creates the directory (root:root 0755,
+  as the unit does) before validating; an invalid config is still
+  refused. And when ssh.socket is not active, a down ssh.service is
+  now started rather than reloaded, since systemd refuses to reload a
+  unit that is not running.
+
+- **The Fleet upgrade dialog no longer promises a re-write and a
+  reboot for a node already on the chosen release (#2068).** It said
+  the inactive slot would be re-written with the same release and the
+  node rebooted into it. Neither happens: the supervisor fires no
+  slot-upgrade trigger when the installed version equals the goal, the
+  next heartbeat drops the goal, and the runner only stages. The note
+  now says nothing will be written and the node will not reboot, and
+  the Schedule button is disabled for that case.
+
+- **A dialog opened from a right-click menu now keeps focus (#2051).**
+  Choosing Delete…, Edit… or any item that opens a dialog from the IPAM
+  tree's context menu (and the DNS, DHCP and VLAN trees, which share the
+  menu) left focus on the row behind the dialog, because Radix returned
+  focus to the row after the dialog had taken it, so Enter or typing went
+  to the page. The menu now skips that restore when a dialog opened, and
+  puts focus back on the row when the dialog closes. Only a dialog that
+  appeared after the menu opened counts, so a menu inside an open dialog
+  still returns focus to its row.
+
+- **Closing a dialog with an autofocused field returns focus to its
+  opener again (#2050).** The shared focus trap read the opener in
+  an effect, after React had already applied the field's `autoFocus`,
+  so it remembered the dialog's own input and focus fell to the page
+  body on close (New IP Space opened from its button, closed with
+  Esc). The opener is now captured during the first render, and an
+  opener that has left the DOM is skipped instead of focused. A dialog
+  opened from a header-menu item (the item is gone with its menu by
+  the time the dialog closes) returns to the menu's button instead of
+  the body. Under the dev server's StrictMode, the trap no longer
+  takes focus off an autofocused field when React re-runs its effect.
+
+- **A header menu opened with the mouse now closes on Esc (#2047).**
+  After a click open, focus stays on the menu's trigger and the Esc
+  handler lived only on the panel, so the key reached nothing. The
+  shared `HeaderMenu` now listens for Esc on the document while open,
+  closes, returns focus to the trigger and stops the event so a parent
+  dialog does not also close; a closed menu leaves Esc alone. It also
+  closes when focus moves to another control, so two menus can no longer
+  be open at once, and it leaves an Esc alone when focus is in a layer
+  opened over it (the Cmd+K palette, the `?` overlay) or when the key
+  ends an IME composition.
+
+- **The bulk zone delete's Trash warning agrees in number (#2048).**
+  Deleting two zones opened "Move 2 Zones to Trash" with the
+  single-zone sentence "The zone and its records move to Trash"
+  while the rest of the dialog was plural. The warning is now built
+  from the selection count: "The 2 zones and all their records move
+  to Trash", and the single-zone wording is unchanged for one zone.
+
+- **Block, space and report reads honour an API token's resource
+  binding.** The per-request check added for tokens bound to specific
+  subnets or DNS zones read only path parameters named `subnet_id`,
+  `address_id` and `zone_id`. It now reads the same names in the query
+  string, and also checks `block_id` / `space_id`: a bound token reaches a
+  block or space only when it contains one of the token's subnets. Inside
+  one, the routes that answer about several subnets narrow to the token's
+  own: the block and space DNS-sync previews, the block's aggregation
+  suggestions, and the stale-IP, hygiene and vendor reports. The stale-IP
+  bulk deprecate skips rows outside the binding. Free-space answers for a
+  block or space (`free-space`, `available-subnets`, `plan-allocation`,
+  `find-free`) describe every subnet in it and cannot be narrowed, so they
+  are refused to a token bound to subnets. DNS `delegation-preview` and
+  `delegate-from-parent` also require the token to be bound to the parent
+  zone they read and write. A DNS record op now records the id of its
+  zone, and the per-server pending-ops list narrows by that id, so a
+  same-named zone in another view no longer matches. Block and space
+  create / update check a named `dns_zone_id` against the token's zone
+  grants, as subnet and address writes already did. Sessions and unbound
+  tokens are unaffected.
+
+- **A PowerDNS primary zone now serves an apex NS, so a BIND9
+  secondary on another host can transfer it (#1985).** The agent
+  rendered the apex SOA but never an NS, and PowerDNS does not create
+  one, so a BIND9 secondary refused every transfer with "has no NS
+  records". The apex NS now follows the BIND9 renderer's rule: the
+  zone's own apex NS records when it has any (used as they are), else
+  its Primary NS when that can resolve, else the `ns1.<zone>`
+  placeholder. It is rendered on every reconcile, so existing zones
+  gain it on upgrade, and an NS the operator declared is never
+  overwritten. Deleting a zone's last NS record puts the default back
+  in the same change, so the zone is never left without one. The
+  placeholder gets no loopback glue on PowerDNS: BIND needs that glue
+  only to load a zone it is primary for, and a BIND9 secondary accepts
+  a transferred zone whose NS has no address, with a warning.
+
+- **The DNS agent no longer holds a large bundle several times over while it
+  takes it (#2029).** Fetching a 147 MB bundle (five blocklists on two views,
+  about 708k RPZ entries per view) took the agent to 1.70 - 1.74 GB, and since
+  it shares named's 2Gi container, the container could be OOM-killed before
+  named started. The response body, its decoded text, the parsed bundle and
+  the previous bundle (still referenced for the DNSSEC re-read) were all alive
+  at once. The body is now streamed to a spool file in the state directory and
+  parsed from there, short repeated values are shared instead of copied per
+  entry, and the agent keeps only the previous bundle's zone list. On a
+  synthetic bundle of that shape the agent's peak RSS fell from 1,474 MB to
+  598 MB, and nothing bundle-sized stays resident after the apply. The cache,
+  the rendered zone files and their validation are unchanged. A spool left by
+  an agent killed mid-download is removed at start, a full state disk fails the
+  fetch rather than stopping the sync loop, and a torn cache file still reads
+  as "nothing cached" instead of crashing the agent at boot.
+
+- **An operator's override in the `spatiumddi-appliance` HelmChartConfig
+  is no longer reverted by the next heartbeat (#2024).** The documented
+  way to raise named's memory limit (`dnsBind9.resources` in that CR,
+  `APPLIANCE.md`) was undone within a minute: the supervisor rewrote the
+  CR's whole `valuesContent` to its three data-plane VIP keys on every
+  beat, so the DaemonSet went back to 2Gi. The supervisor now merges its
+  own keys into the live document and writes only when that changes
+  something, so every other key survives; the PATCH is conditional on the
+  resourceVersion it read, so an edit landing in between is retried
+  rather than overwritten. `spatium-metallb` had the same replace-the-
+  document write and goes through the same path; `spatium-control`
+  already merged (#792) and now shares it, keeping #1005's guard against
+  a helm revision that changes nothing. YAML comments in these CRs are
+  dropped when the supervisor next has to change one of its keys; the
+  recipe now says to edit the CR in place rather than `kubectl apply`
+  over it, and `APPLIANCE.md` lists which keys in each of the three CRs
+  belong to the supervisor. That list corrects one earlier claim: the api
+  and worker memory limits in `spatium-control` are sized by the
+  supervisor and put back on every heartbeat, so an override there never
+  held. A CR whose `valuesContent` is only comments now counts as empty
+  instead of unreadable, so commenting an override out no longer freezes
+  the supervisor's own keys in it.
+
+- **PowerDNS serves the control plane's serial, never goes
+  backwards, sends NOTIFY, and transfers a secondary
+  ([#1965](https://github.com/spatiumnorth/spatiumddi/issues/1965),
+  [#1967](https://github.com/spatiumnorth/spatiumddi/issues/1967),
+  [#1968](https://github.com/spatiumnorth/spatiumddi/issues/1968)).**
+  Zones were created with PowerDNS's default `SOA-EDIT-API:
+  DEFAULT`, which rewrote the serial of every change, so a zone
+  never served the serial SpatiumDDI stamped, an SOA-only edit
+  could be served under a serial a secondary already held, and the
+  sync status never matched. Zones are now created with it empty
+  (and cleared on existing ones), and a record op carries the zone
+  to the control plane's serial in the same PATCH. The serial is
+  never sent below the one PowerDNS serves (RFC 1982): the first
+  reconcile after the upgrade used to publish a serial below what
+  PowerDNS had served, and so did any later full reconcile after a
+  record add; it now goes forward by one instead, and the control
+  plane moves `last_serial` up to what a PowerDNS server reports
+  ahead of it. `pdns.conf` now sets `primary=yes` and
+  `secondary=yes`, without which PowerDNS sent no NOTIFY and never
+  transferred a secondary zone, which answered REFUSED while
+  reading in sync; PowerDNS restarts once on upgrade. A PowerDNS
+  secondary at serial 0 no longer reads in sync. A secondary on
+  another host can now transfer from a PowerDNS primary: each zone
+  gets `ALLOW-AXFR-FROM` and `TSIG-ALLOW-AXFR` from the same transfer
+  policy and group TSIG keys BIND9 renders `allow-transfer` from,
+  where before it was NOTIFY-ed and then refused. The serial the
+  control plane adopts from an agent is bounded, so a wrong report
+  cannot push the zone to where the next bump overflows. The agent
+  also reports the served serials after the apply it makes at start
+  (the cached bundle after a slot upgrade), so the upgrade's serials
+  are adopted within a poll or two instead of at the group's next
+  structural change. A record op made before that adoption moves the
+  zone past the served serial and NOTIFYs, rather than publishing the
+  change under a serial the secondaries already hold. A PowerDNS
+  secondary that has transferred reads in sync (its serial is the
+  primary's, never compared with ours), and a new zone's first
+  numbering (0 to 1) writes no `dns.zone.serial_adopted` row.
+
+- **Audit details mask presigned-URL signatures and storage connection
+  strings on read.** The read-side redaction of `GET /api/v1/audit/{id}`,
+  the Audit page and the copilot's audit tool now also masks the signing
+  parameters of a presigned S3 / GCS URL (`X-Amz-Signature`,
+  `X-Amz-Credential`, `X-Amz-Security-Token`, `X-Goog-Signature`,
+  `X-Goog-Credential`), the `AccountKey` of an Azure storage connection
+  string, and any value under a `connection_string` key. Backup-target
+  entries recorded by earlier releases could carry these, in an edited
+  target's `config` or a failed `https_put` / WebDAV run's error text.
+  Stored entries are left exactly as written, since each is part of the
+  audit hash chain; only what is returned changes. The support bundle's
+  scrubber uses the same patterns.
 
 - **InfluxDB Export: a stored password or token survives an edit that
   types in its field and clears it again; "Last push" no longer shows a
@@ -478,6 +1080,24 @@ the formatter handles the rest.
   BIND 9.20). And the endpoint answers 409 instead of `queued` when it wrote
   no op at all (no primary, or no enabled agent-based server).
 
+- **A DNS server crash-looping on a bundle too big for its memory
+  limit takes the fixed bundle once the cause is removed
+  ([#2019](https://github.com/spatiumnorth/spatiumddi/issues/2019)).**
+  The agent re-applied its cached bundle at every start, before it
+  synced, so named was OOM-killed on the same config each time and
+  never saw the bundle the operator had fixed. The agent now marks
+  every apply in its state directory and counts a death when the
+  process dies within 5 minutes of one. After one, startup asks the
+  control plane first and falls back to the cache only when it cannot
+  be reached, or when its own bundle fails to apply. Only deaths the
+  agent watched (named exited while the agent lived) can quarantine a
+  bundle: after two, the last-known-good serves if it is a different
+  bundle, and otherwise the cache is retried on the quarantine's
+  backoff. A death the agent did not see (a power cut, a node reboot,
+  or the whole-container OOM kill of #2018) never leaves the server
+  dark while the control plane is unreachable. A revert never goes back
+  to a bundle named was seen dying on. The server row says why it is
+  not on the cached bundle.
 - **`GET /conformity/export.pdf` no longer answers 500 on text that
   looks like markup (#1964).** The `framework` filter, and every stored
   policy name, description, reference, result detail and diagnostic, went
@@ -5369,6 +5989,18 @@ the formatter handles the rest.
 - `d7a2e94b1c60` — #1990: `influxdb_target.last_success_at` (nullable
   `timestamptz`, NULL = never). Backfilled from `last_push_at` for rows
   with a push time and no recorded error.
+- `c7d2e9a41f63` — additive: nullable `dns_record_op.zone_id`, a foreign
+  key to `dns_zone` (`ON DELETE SET NULL`) with an index. Set on every op
+  queued from now on. No backfill: an older op cannot say which view's
+  zone it belonged to, so NULL stays. Downgrade drops the column.
+- `a2078c5e1d90` — #2078, adds nullable `dns_server.agent_version`
+  (String(64)); no backfill, NULL means the agent has not reported one.
+- `b3d7f1a82c54` — #2084, schema + data: adds
+  `dns_record.ip_alias` (NOT NULL, default false) and backfills it.
+  Among auto-generated CNAME / A / AAAA rows tied to an address, an
+  A / AAAA named like the address's hostname in its forward or an extra
+  zone (or the row `ip_address.dns_record_id` names) stays false; the
+  rest are aliases. Downgrade drops the column.
 
 ## 2026.10.02-1 — 2026-10-02
 

@@ -101,6 +101,14 @@ from app.services.feature_modules import is_module_enabled
 from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as QUERY_LOG_RETENTION_HOURS
 
 logger = structlog.get_logger(__name__)
+
+#: How far above the later of the zone's ``last_serial`` and today's
+#: ``YYYYMMDD00`` a PowerDNS-reported serial may be adopted (#1968): one year
+#: in ``YYYYMMDDNN`` terms.
+_SERIAL_ADOPT_HEADROOM = 1_000_000
+#: Never adopt into the last stretch of the signed 32-bit ``last_serial``
+#: column, so the bump that follows cannot overflow it.
+_SERIAL_ADOPT_MAX = 2**31 - 1 - _SERIAL_ADOPT_HEADROOM
 router = APIRouter(prefix="/agents", tags=["dns-agents"])
 
 LONGPOLL_TIMEOUT_SECONDS = int(os.environ.get("DNS_AGENT_LONGPOLL_TIMEOUT", "30"))
@@ -140,6 +148,19 @@ class AgentRegisterRequestV2(BaseModel):
                 f"driver must be one of {sorted(AGENT_CAPABLE_DRIVERS)} " "for agent registration"
             )
         return v
+
+
+# #2078 — every DNS agent released before this fix registered with this
+# literal, whatever build it ran (its heartbeat already sent the real stamp).
+# It names no build, so it is treated as "not reported": stored, it would show
+# a version the agent does not run until the next heartbeat corrected it.
+_UNSTAMPED_REGISTER_VERSION = "2026.04.14.1"
+
+
+def _reported_agent_version(version: str | None) -> str | None:
+    if not version or version == _UNSTAMPED_REGISTER_VERSION:
+        return None
+    return version
 
 
 class AgentRegisterResponseV2(BaseModel):
@@ -428,7 +449,8 @@ async def agent_register(
             agent_fingerprint=body.fingerprint,
             pending_approval=require_approval,
             is_primary=not has_primary,
-            notes=f"agent v{body.version}" if body.version else "auto-registered",
+            # ``notes`` is the operator's field; the agent never writes it.
+            agent_version=_reported_agent_version(body.version),
         )
         pending_approval = require_approval
         db.add(server)
@@ -452,6 +474,12 @@ async def agent_register(
         server.driver = body.driver
         server.roles = body.roles
         server.status = "active"
+        # Only overwrite when the agent actually reported one: an older agent
+        # sends the fixed literal (or nothing) and must not overwrite the real
+        # version its own heartbeat already recorded.
+        reported = _reported_agent_version(body.version)
+        if reported:
+            server.agent_version = reported
         if server.agent_id is None:
             server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
 
@@ -900,6 +928,9 @@ async def agent_heartbeat(
     # reason.
     if body.daemon_version:
         server.daemon_version = body.daemon_version
+    # #2078 — likewise only when reported (an older agent omits it).
+    if body.agent_version:
+        server.agent_version = body.agent_version
     # #1171 — on every heartbeat, from the header: the same server row is run
     # by an older agent until the upgrade replaces its pod, and by an older one
     # again if a node is rolled back.
@@ -1137,6 +1168,75 @@ async def agent_zone_state(
             serial_by_zone[matches[0].id] = entry.serial
         else:
             (ambiguous if matches else unknown).append(entry.zone_name)
+
+    # #1968 — a PowerDNS server never serves a serial below the one it already
+    # held (the agent floors it), so after the upgrade to a build that owns the
+    # serial it can serve one AHEAD of ours. Left as it is, our next bump (a
+    # small step from the lower number) is below what the server holds and the
+    # agent floors it again, so the zone never reads in sync and every change
+    # costs a floor. Move ours up to the one it serves: forward only (RFC 1982),
+    # primary zones only, and only for PowerDNS — BIND9 reports the serial it
+    # was sent, which is ours by construction.
+    if server.driver == "powerdns":
+        adopted: list[dict[str, Any]] = []
+        today_base = int(datetime.now(UTC).strftime("%Y%m%d")) * 100
+        for zone_id, serial in serial_by_zone.items():
+            zone_row = next(
+                (z for zs in zones_by_key.values() for z in zs if z.id == zone_id), None
+            )
+            if zone_row is None or (zone_row.zone_type or "primary") != "primary":
+                continue
+            ours = int(zone_row.last_serial or 0)
+            if not (0 < (serial - ours) % 2**32 < 2**31):
+                continue
+            # Bounded, because the number comes from an agent: one that is
+            # wrong (or compromised) could otherwise push the zone to the top
+            # of the signed 32-bit ``last_serial`` column, where the next bump
+            # (``compute_next_serial`` adds 1) overflows it and every write to
+            # the zone fails. A served serial is at most a few changes past
+            # ours, or past today's ``YYYYMMDD00`` (PowerDNS's own DEFAULT
+            # rewrite before the upgrade), so a year of ``YYYYMMDDNN``
+            # headroom above the later of the two is generous for any real
+            # report and keeps the column a century from its limit.
+            ceiling = max(ours, today_base) + _SERIAL_ADOPT_HEADROOM
+            if serial > min(ceiling, _SERIAL_ADOPT_MAX):
+                logger.warning(
+                    "dns_zone_serial_adoption_refused",
+                    zone=zone_row.name,
+                    server_id=str(server.id),
+                    ours=ours,
+                    reported=serial,
+                    ceiling=min(ceiling, _SERIAL_ADOPT_MAX),
+                )
+                continue
+            zone_row.last_serial = serial
+            if ours == 0 and serial == 1:
+                # A zone we have never numbered (created at 0) that the agent
+                # created at its own placeholder serial 1. Bookkeeping, not a
+                # divergence: adopted without an audit row, or every new zone
+                # on a PowerDNS group would write one.
+                continue
+            adopted.append(
+                {"zone": zone_row.name, "from": ours, "to": serial, "zone_id": str(zone_id)}
+            )
+        for a in adopted:
+            db.add(
+                AuditLog(
+                    user_display_name="system:dns-agent",
+                    auth_source="system",
+                    action="dns.zone.serial_adopted",
+                    resource_type="dns_zone",
+                    resource_id=a["zone_id"],
+                    resource_display=a["zone"],
+                    new_value={
+                        "server_id": str(server.id),
+                        "previous_serial": a["from"],
+                        "serial": a["to"],
+                        "reason": "the PowerDNS server serves a later serial than the control plane",
+                    },
+                    result="success",
+                )
+            )
 
     for zone_id, serial in serial_by_zone.items():
         # Upsert: look up existing row, update or insert.

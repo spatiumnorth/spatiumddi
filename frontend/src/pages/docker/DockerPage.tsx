@@ -31,6 +31,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Shown in the create modal so operators know how to expose their
@@ -397,7 +398,7 @@ function HostModal({
     host?.include_stopped_containers ?? false,
   );
   const [syncInterval, setSyncInterval] = useState(
-    host?.sync_interval_seconds ?? 60,
+    String(host?.sync_interval_seconds ?? 60),
   );
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
@@ -438,7 +439,7 @@ function HostModal({
           mirror_containers: mirrorContainers,
           include_default_networks: includeDefaults,
           include_stopped_containers: includeStopped,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (clientCertPem) update.client_cert_pem = clientCertPem;
@@ -459,7 +460,7 @@ function HostModal({
         mirror_containers: mirrorContainers,
         include_default_networks: includeDefaults,
         include_stopped_containers: includeStopped,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return dockerApi.createHost(create);
     },
@@ -479,6 +480,17 @@ function HostModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -676,7 +688,7 @@ function HostModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
