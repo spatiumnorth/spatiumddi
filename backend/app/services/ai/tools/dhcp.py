@@ -334,6 +334,9 @@ async def list_dhcp_server_groups(
                 "lease_cache_threshold": g.lease_cache_threshold,
                 "lease_cache_max_age": g.lease_cache_max_age,
                 "member_count": int(member_count or 0),
+                # Whether the group holds a Kea HA peer credential. The
+                # credential itself is never returned.
+                "ha_peer_credential_set": bool(g.ha_peer_credential_encrypted),
             }
         )
     return out

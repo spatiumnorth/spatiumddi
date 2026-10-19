@@ -368,6 +368,7 @@ backend/alembic/versions/c3f7a1d9b486_rename_slot_image_to_upgrade_image.py:rena
 backend/alembic/versions/c3f7a1d9b486_rename_slot_image_to_upgrade_image.py:rename_table:45
 backend/alembic/versions/c3f7e5a9b2d1_dns_view_query_overrides.py:drop_column:45
 backend/alembic/versions/c3f7e5a9b2d1_dns_view_query_overrides.py:drop_column:46
+backend/alembic/versions/c4a8e1f26d93_subnet_show_free_ranges.py:drop_column:31
 backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_column:127
 backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_table:129
 backend/alembic/versions/c4d9a1e6f827_add_auth_providers_and_app_base_url.py:drop_column:106
@@ -450,6 +451,8 @@ backend/alembic/versions/c8d5e2a9f736_audit_forward_settings.py:drop_column:107
 backend/alembic/versions/c8d5e2a9f736_audit_forward_settings.py:drop_column:108
 backend/alembic/versions/c8d5e2a9f736_audit_forward_settings.py:drop_column:109
 backend/alembic/versions/c8e1f04a932d_subnet_plan.py:drop_table:56
+backend/alembic/versions/c8e1f5a92d47_dhcp_ha_peer_credential.py:drop_column:67
+backend/alembic/versions/c8e1f5a92d47_dhcp_ha_peer_credential.py:drop_column:68
 backend/alembic/versions/c8e3a7f10b54_ai_usage_observability.py:drop_column:75
 backend/alembic/versions/c8e3a7f10b54_ai_usage_observability.py:drop_column:76
 backend/alembic/versions/c8e3a7f10b54_ai_usage_observability.py:drop_column:77
@@ -640,6 +643,8 @@ backend/alembic/versions/e2c91d5f7a48_appliance_pairing_codes.py:drop_table:126
 backend/alembic/versions/e3a81c5d07f2_appliance_evict_after_demote.py:drop_column:44
 backend/alembic/versions/e3b7a1c25d94_clear_upgrade_command.py:drop_column:58
 backend/alembic/versions/e3b7a1c25d94_clear_upgrade_command.py:drop_column:59
+backend/alembic/versions/e3b7c19f5a42_dns_record_op_dispatched_to.py:drop_column:49
+backend/alembic/versions/e3b7c19f5a42_dns_record_op_dispatched_to.py:drop_column:50
 backend/alembic/versions/e3b9d7412c5a_appliance_removable_mounts.py:drop_column:55
 backend/alembic/versions/e3f1c92a4d68_compliance_change_alerts.py:drop_column:59
 backend/alembic/versions/e3f1c92a4d68_compliance_change_alerts.py:drop_column:60

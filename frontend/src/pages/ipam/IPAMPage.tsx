@@ -120,6 +120,7 @@ import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
+import { resolveShowFreeRanges } from "@/lib/ipam-free-ranges";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
@@ -4910,6 +4911,14 @@ export function SubnetDetail({
     "ipam-hide-reserved",
     false,
   );
+  // "Hide free ranges" (#2137): a per-subnet session override of the subnet's
+  // own setting / default rule. Keyed by subnet id so flipping it on one
+  // subnet does not leak to the next; absent = follow the setting.
+  const [freeRangeOverride, setFreeRangeOverride] = useSessionState<
+    Record<string, boolean>
+  >("ipam-hide-free-ranges", {});
+  const hideFreeRanges =
+    freeRangeOverride[subnet.id] ?? !resolveShowFreeRanges(subnet);
   // Rows the "Hide network/broadcast" toggle removes. Defined once so the
   // Select-all `selectable` set can exclude exactly what the table hides —
   // otherwise Select-all would pick hidden rows and a bulk delete/edit would
@@ -4935,6 +4944,9 @@ export function SubnetDetail({
     "addresses" | "dhcp" | "aliases" | "nat" | "trend" | "address-sets" | "bgp"
   >("addresses");
   const { enabled: featureEnabled } = useFeatureModules();
+  // #2100 — NAT mappings are a feature module; while it is off the subnet's
+  // NAT tab, the per-address NAT badges and the mappings modal all go.
+  const natOn = useModuleOn("ipam.nat");
   const [natModalIp, setNatModalIp] = useState<IPAddress | null>(null);
   const [selectedIpIds, setSelectedIpIds] = useState<Set<string>>(new Set());
   // Shift-click range select. ``onChange`` doesn't carry shiftKey, so we
@@ -5370,7 +5382,12 @@ export function SubnetDetail({
       // *filtered* list, so a filter that hides allocated rows would fabricate
       // a clickable "N free" range over addresses that are actually in use —
       // and the allocate modal it opens would then collide (#501).
-      if (!hasActiveFilter && prevIpInt !== null && ipInt - prevIpInt > 1) {
+      if (
+        !hasActiveFilter &&
+        !hideFreeRanges &&
+        prevIpInt !== null &&
+        ipInt - prevIpInt > 1
+      ) {
         const lastWasPool = rows[rows.length - 1]?.kind === "pool-boundary";
         const gapStart = prevIpInt + 1;
         const gapEnd = ipInt - 1;
@@ -5400,7 +5417,14 @@ export function SubnetDetail({
     if (hideReserved)
       return rows.filter((r) => r.kind !== "ip" || !isPaddingRow(r.addr));
     return rows;
-  }, [sortedAddresses, sortState, allPools, hasActiveFilter, hideReserved]);
+  }, [
+    sortedAddresses,
+    sortState,
+    allPools,
+    hasActiveFilter,
+    hideReserved,
+    hideFreeRanges,
+  ]);
 
   // #517: window the painted rows. Every op that walks the data
   // (select-all, shift-range, filtering) still uses the full ``tableRows``
@@ -5845,18 +5869,20 @@ export function SubnetDetail({
           >
             Address Sets
           </button>
-          <button
-            onClick={() => setActiveSubnetTab("nat")}
-            className={cn(
-              "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
-              activeSubnetTab === "nat"
-                ? "border-primary text-foreground"
-                : "border-transparent text-muted-foreground hover:text-foreground",
-            )}
-            title="NAT mappings whose internal IP falls inside this subnet"
-          >
-            NAT
-          </button>
+          {natOn && (
+            <button
+              onClick={() => setActiveSubnetTab("nat")}
+              className={cn(
+                "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+                activeSubnetTab === "nat"
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground",
+              )}
+              title="NAT mappings whose internal IP falls inside this subnet"
+            >
+              NAT
+            </button>
+          )}
           <button
             onClick={() => setActiveSubnetTab("trend")}
             className={cn(
@@ -5931,7 +5957,7 @@ export function SubnetDetail({
         </div>
       )}
 
-      {activeSubnetTab === "nat" && (
+      {natOn && activeSubnetTab === "nat" && (
         <div className="flex-1 overflow-auto">
           <NatSubnetPanel subnetId={subnet.id} />
         </div>
@@ -5995,6 +6021,20 @@ export function SubnetDetail({
                     onChange={(e) => setHideReserved(e.target.checked)}
                   />
                   Hide network/broadcast
+                </label>
+                <label className="flex flex-shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground hover:text-foreground">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5"
+                    checked={hideFreeRanges}
+                    onChange={(e) =>
+                      setFreeRangeOverride((prev) => ({
+                        ...prev,
+                        [subnet.id]: e.target.checked,
+                      }))
+                    }
+                  />
+                  Hide free ranges
                 </label>
               </div>
               {inlineEditError && (
@@ -6600,19 +6640,20 @@ export function SubnetDetail({
                                         : "aliases"}
                                     </span>
                                   )}
-                                  {(addr.nat_mapping_count ?? 0) > 0 && (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setNatModalIp(addr);
-                                      }}
-                                      className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
-                                      title={`Click to view ${addr.nat_mapping_count} NAT mapping${(addr.nat_mapping_count ?? 0) === 1 ? "" : "s"}`}
-                                    >
-                                      NAT {addr.nat_mapping_count}
-                                    </button>
-                                  )}
+                                  {natOn &&
+                                    (addr.nat_mapping_count ?? 0) > 0 && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setNatModalIp(addr);
+                                        }}
+                                        className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
+                                        title={`Click to view ${addr.nat_mapping_count} NAT mapping${(addr.nat_mapping_count ?? 0) === 1 ? "" : "s"}`}
+                                      >
+                                        NAT {addr.nat_mapping_count}
+                                      </button>
+                                    )}
                                 </span>
                               </td>
                               <td className="px-4 py-2 font-mono text-xs">
@@ -7135,7 +7176,7 @@ export function SubnetDetail({
           onClose={() => setScanFromDetail(null)}
         />
       )}
-      {natModalIp && (
+      {natOn && natModalIp && (
         <NatMappingsForIpModal
           ip={natModalIp}
           onClose={() => setNatModalIp(null)}
@@ -7957,6 +7998,14 @@ export function EditSubnetModal({
   const [doNotProbeReason, setDoNotProbeReason] = useState(
     subnet.do_not_probe_reason ?? "",
   );
+  // Free-range rows (#2137): "" = default rule, otherwise explicit.
+  const [showFreeRanges, setShowFreeRanges] = useState<"" | "show" | "hide">(
+    subnet.show_free_ranges == null
+      ? ""
+      : subnet.show_free_ranges
+        ? "show"
+        : "hide",
+  );
   const probePolicyQ = useQuery({
     queryKey: ["subnet-probe-policy", subnet.id],
     queryFn: () => ipamApi.getSubnetProbePolicy(subnet.id),
@@ -8099,6 +8148,8 @@ export function EditSubnetModal({
         discovery_interval_minutes: discoveryIntervalMinutes,
         do_not_probe: doNotProbe,
         do_not_probe_reason: doNotProbeReason,
+        show_free_ranges:
+          showFreeRanges === "" ? null : showFreeRanges === "show",
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
@@ -8498,6 +8549,30 @@ export function EditSubnetModal({
               inherited={probeInherited}
               inheritedFrom={probeInheritedFrom}
             />
+          </div>
+          <div className="border-t pt-4">
+            <label className="block text-xs font-medium">
+              Free-range rows in the address table
+              <select
+                aria-label="Free-range rows"
+                className="mt-1 block w-full rounded-md border bg-background px-2 py-1 text-sm"
+                value={showFreeRanges}
+                onChange={(e) =>
+                  setShowFreeRanges(e.target.value as "" | "show" | "hide")
+                }
+              >
+                <option value="">
+                  Default (hidden for integration-owned or larger than a /16)
+                </option>
+                <option value="show">Show</option>
+                <option value="hide">Hide</option>
+              </select>
+            </label>
+            <p className="mt-1 text-xs italic text-muted-foreground">
+              Whether the green &quot;N free · click to allocate&quot; rows
+              appear between allocated addresses. Display only — allocation and
+              utilization are unaffected.
+            </p>
           </div>
           <div className="border-t pt-4">
             <ClassificationSection

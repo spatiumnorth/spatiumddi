@@ -88,8 +88,18 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
         re.compile(r"\$argon2[a-z]{1,2}\$[^\s\"']{16,}"),
         f"{_REDACTED}:password-hash",
     ),
-    # PEM private keys (and certificates' private halves).
-    ("pem", re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----"), f"{_REDACTED}:pem"),
+    # PEM private keys (and certificates' private halves). The whole block,
+    # through its END line: the base64 body IS the key, so dropping only the
+    # BEGIN line would leave it in the output. A block with no END (truncated
+    # text) still loses its BEGIN line, as before.
+    (
+        "pem",
+        re.compile(
+            r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----"
+            r"(?:[\s\S]*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----)?"
+        ),
+        f"{_REDACTED}:pem",
+    ),
     # JWTs — session tokens, agent tokens, supervisor tokens.
     (
         "jwt",

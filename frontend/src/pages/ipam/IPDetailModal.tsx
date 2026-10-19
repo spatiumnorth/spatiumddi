@@ -165,6 +165,8 @@ export function IPDetailModal({
   const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
     useModalDialog(onClose);
   const dhcpOn = useModuleOn("core.dhcp");
+  // #2100 — the NAT badge goes with the ``ipam.nat`` module.
+  const natOn = useModuleOn("ipam.nat");
   // #2135 — zones, the DNS linkage and the alias count are DNS state: hidden
   // while core.dns is off (the stored values are untouched).
   const dnsOn = useModuleOn("core.dns");
@@ -511,7 +513,7 @@ export function IPDetailModal({
 
           {/* Counters row */}
           {((dnsOn && (addr.alias_count ?? 0) > 0) ||
-            (addr.nat_mapping_count ?? 0) > 0) && (
+            (natOn && (addr.nat_mapping_count ?? 0) > 0)) && (
             <div className="flex flex-wrap items-center gap-2 text-[11px]">
               {dnsOn && (addr.alias_count ?? 0) > 0 && (
                 <span className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400">
@@ -519,7 +521,7 @@ export function IPDetailModal({
                   {addr.alias_count === 1 ? "" : "es"}
                 </span>
               )}
-              {(addr.nat_mapping_count ?? 0) > 0 && (
+              {natOn && (addr.nat_mapping_count ?? 0) > 0 && (
                 <span className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
                   NAT {addr.nat_mapping_count}
                 </span>

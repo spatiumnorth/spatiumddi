@@ -27,6 +27,34 @@ the formatter handles the rest.
 
 ### Added
 
+- **NAT mappings can be turned off: they are now the `ipam.nat`
+  feature module (#2100).** Settings → Features has a NAT mappings
+  entry. Off, it removes the IPAM → NAT Mappings sidebar entry, the
+  Dashboard's NAT card and its count query, and the NAT tab, NAT
+  badges and mappings dialog on subnet and IP detail, and the
+  `/api/v1/ipam/nat-mappings` routes answer 404. The address list
+  reports `nat_mapping_count` as 0 without querying for it. Turning
+  it back on restores everything: the mappings are hidden, never
+  deleted, and disabling is allowed while they exist. The PAN-OS,
+  Fortinet and Meraki mirrors keep writing their NAT rows while it is
+  off, so turning it on shows a current picture.
+  The module ships **off** on a fresh install, but **an install that
+  already has NAT mappings keeps seeing them after upgrade**. No
+  `feature_module` row is seeded, which #1069 forbids. Instead a module
+  may now declare `default_on_if_rows_in`: with no operator override
+  it resolves on exactly when that table holds a row. An operator's
+  choice in Settings → Features always wins, in either direction. Two
+  consequences follow from "on when there is data". On a fresh install,
+  a firewall mirror's first NAT rule turns the surface on. And deleting
+  the last mapping turns it off again unless it was enabled explicitly.
+  The NAT Mappings page then says the feature is off and links to
+  Settings → Features, rather than leaving a page whose requests 404,
+  and the sidebar follows at once.
+  The check is a one-row probe, run only while no override exists, at
+  most once per worker per 5 s module-cache refresh, and the
+  feature-modules list the UI resolves from uses the same derivation
+  as the route gate, so the sidebar and the API cannot disagree.
+
 - **The Helm chart's migrate Job takes annotations, so it works under
   GitOps (#2114).** Under `helm template`, which is how Argo CD and
   similar tools render a chart, the Helm revision is always 1. The
@@ -122,6 +150,77 @@ the formatter handles the rest.
   at the same refusal, so the PTR was never written; the apply now skips
   the zone the alias serves and writes the PTR. A CNAME alias at the
   name is still refused.
+
+- **The IP table can hide its "N free, click to allocate" rows
+  (#2137).** On a very large or integration-mirrored subnet (a
+  Tailscale `100.64.0.0/10` holding a few dozen nodes) nearly every
+  row was a green gap bar, and "click to allocate" invited a manual
+  allocation the overlay would never honour. Edit Subnet gains
+  "Free-range rows in the address table" (Default / Show / Hide,
+  stored as nullable `subnet.show_free_ranges`) and the table header
+  gains a "Hide free ranges" checkbox beside "Hide network/broadcast",
+  remembered per subnet for the session. Default when the subnet has no
+  setting: hidden for an integration-owned subnet (new read-only
+  `integration_owner` on the subnet response) and for anything larger
+  than a /16 IPv4 (shorter than /48 IPv6, where gap rows are not drawn
+  today); an explicit value always wins. Display only: Total /
+  Allocated / Utilization, the Allocate IP button and Next available
+  are unchanged. The `get_subnet_summary` copilot tool reports
+  `show_free_ranges` and `integration_owner`.
+
+- **A DNS record change made while an agent is replaced reaches the new
+  agent at once, not five minutes later (#2042).** When a DNS agent is
+  replaced (its pod rolls after a slot upgrade, a container restarts),
+  the API went on holding the old agent's config long-poll, and nothing
+  noticed its client had gone. A record created in the next few seconds
+  was paged into that poll, marked in flight and written to a
+  connection nobody read, so the new agent never got it and the record
+  was not served until the 5-minute unacknowledged-op reset sent it
+  again. The agent now names its process on every config poll, each
+  shipped op records which process it went to and when its poll
+  started, and a poll from a different process returns any op still in
+  flight to its predecessor to the queue and ships it on that poll. Only
+  a poll that started after the one that shipped the op may take it
+  back, so the departed agent's leftover poll never takes an op from
+  its replacement. A long-poll whose client has
+  disconnected also rolls its page back instead of committing it. An
+  agent that predates this change still recovers through the 5-minute
+  reset. Separately, a zone's server state no longer reads in sync
+  while a server has a change for that zone it has not acknowledged:
+  an agent starting from its cached bundle reports the serial it
+  serves, which can match the target while a record is still
+  undelivered. Both server-state views gain a `pending_ops` count, and
+  the zone sync pill names the unapplied changes.
+
+- **Kea HA peers authenticate to each other with a generated per-group
+  credential.** Every DHCP server group now holds its own CA and peer
+  certificate for the HA hook's dedicated listener (`:8000`),
+  generated by the control plane, stored Fernet-encrypted and never
+  returned by the API (`ha_peer_credential_set` /
+  `ha_peer_auth_active` on the group say whether one exists and whether
+  it is in use). The agents render it as `trust-anchor` / `cert-file` /
+  `key-file` with `require-client-certs`, so each listener refuses a
+  client without a certificate from its own group, and the peer URLs
+  switch to `https`. Kea's `basic-auth-user` was not used: in Kea 3.0 the
+  HA hook sends it but its own listener never checks it. Rollout is
+  gated: the credential is rendered only once every Kea member of a group
+  reports the new `ha_peer_tls` capability on its heartbeat, so a pair
+  mid-upgrade keeps its current HA config and both members switch
+  together when the last one upgrades; a node rolled back to an older
+  agent closes the gate again. A superadmin replaces it with
+  `POST /dhcp/server-groups/{id}/ha-peer-credential/rotate`. Existing
+  groups get one from migration `c8e1f5a92d47`.
+
+- **Support bundle: a PEM private key is redacted through its END line.**
+  The pattern matched only the `-----BEGIN … PRIVATE KEY-----` line, so a
+  key that reached a bundle section lost its header and kept its base64
+  body. The whole block is now replaced; a block with no END line still
+  loses its BEGIN line, as before.
+
+- **nginx 1.31.6 → 1.31.7-alpine (#2161)** for the frontend image and the
+  appliance landing page, which the bake array and chart values carry as
+  well, so all five copies move together.
+
 - **Allocate IP no longer drops an alias that another record already
   holds (#2122).** Allocate IP and next-IP skipped, without a word, an
   alias whose zone, name and type another record already held: the
@@ -6252,6 +6351,20 @@ the formatter handles the rest.
   (String(255)). The server default is the backfill: every existing
   zone, including a forward zone in a group that forwards over TLS,
   becomes `do53`. Downgrade drops both columns.
+- `c8e1f5a92d47` — `dhcp_server_group.ha_peer_credential_encrypted`
+  (Fernet-encrypted Kea HA peer credential), backfilled with a freshly
+  generated credential for every existing group, and
+  `dhcp_server.agent_capabilities` (JSONB, NULL until the agent's first
+  heartbeat). Nothing is rendered from the credential until every Kea
+  member of a group reports `ha_peer_tls`. Downgrade drops both columns.
+- `e3b7c19f5a42` — #2042: `dns_record_op.dispatched_to`, a nullable
+  string naming the agent process an op was last shipped to, and
+  `dns_record_op.dispatched_poll_at`, when the long-poll that shipped it
+  started. No backfill: NULL means not recorded and is never read as
+  "another agent". Downgrade drops both columns.
+- `c4a8e1f26d93` — #2137: `subnet.show_free_ranges`, a nullable
+  boolean. No backfill: NULL means "use the default rule". Downgrade
+  drops the column.
 
 ## 2026.10.02-1 — 2026-10-02
 
