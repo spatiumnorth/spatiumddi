@@ -107,6 +107,30 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Turning DNS off hides DNS everywhere and stops the `/dns` calls
+  that 404ed (#2135).** The DNS counterpart of #2130: `core.dns` hid
+  the DNS sidebar but left DNS pickers, panels and reads elsewhere.
+  Every one is now gated on `ready && enabled("core.dns")` through
+  the shared `useModuleOn` hook: the IPAM zone pickers (Add, Edit and
+  Bulk-edit IP, Bulk allocate), DNS aliases, the DNS column, the
+  Sync DNS entries and drift banner, the DNS and DDNS tabs of the
+  space / block / subnet dialogs, the IP detail zones and DNS
+  linkage, the DNS server group pickers on all eleven integration
+  forms, the Subnet Planner and IPAM Templates pickers, Services
+  (DNS zone resources), API tokens (zone binding), the Domain
+  detail Linked DNS Zones tab, the Cutover plan DNS half, Fleet's
+  DNS roles and group, the Logs DNS tabs and the four Settings DNS
+  sections. A stored value (a template's DNS group, an
+  integration's `dns_group_id`) is never cleared by saving a form
+  that no longer shows it. The Logs page keeps a valid default tab
+  with DNS off (DHCP Activity) and with both off (Event Log), and a
+  hard reload waits for the module set before mounting a tab that
+  reads `/dns`. Backend: the Fleet role assignment (REST and the
+  Copilot's `assign_appliance_role`) refuses a newly added DNS role
+  with a 422 while `core.dns` is off. An appliance that already
+  holds one can still be re-saved or have it removed, and the DNS
+  agent routers stay outside the module gate on purpose.
+
 - **IPAM now says why a host named `gateway` gets no forward DNS
   record (#2101).** The rule is deliberate (every subnet's placeholder
   row is named `gateway`, so publishing them would collide on

@@ -2178,7 +2178,7 @@ export function DashboardPage() {
         )}
 
         {/* ── DNS query rate (DNS tab only) ──────────────────────────── */}
-        {tab === "dns" && (
+        {tab === "dns" && dnsOn && (
           <WidgetErrorBoundary title="DNS query rate">
             <DNSQueryRateCard dnsServers={allDnsServers} />
           </WidgetErrorBoundary>
@@ -2466,7 +2466,7 @@ export function DashboardPage() {
         )}
 
         {/* ── DNS tab: Server list ──────────────────────────────────── */}
-        {tab === "dns" && allDnsServers.length > 0 && (
+        {tab === "dns" && dnsOn && allDnsServers.length > 0 && (
           <div className="rounded-lg border bg-card">
             <div className="flex items-center justify-between border-b px-4 py-2.5">
               <div className="flex items-center gap-2">
@@ -2507,7 +2507,7 @@ export function DashboardPage() {
             </div>
           </div>
         )}
-        {tab === "dns" && allDnsServers.length === 0 && (
+        {tab === "dns" && dnsOn && allDnsServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
             <Globe2 className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
             <p className="text-sm font-medium">No DNS servers registered</p>

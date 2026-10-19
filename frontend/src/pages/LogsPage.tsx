@@ -78,6 +78,9 @@ const TABS: readonly Tab[] = [
 ] as const;
 
 const DHCP_TABS: ReadonlySet<Tab> = new Set<Tab>(["dhcp-activity", "audit"]);
+// The DNS tabs read the DNS query log / threat scores, so they exist only
+// while core.dns is on (#2135).
+const DNS_TABS: ReadonlySet<Tab> = new Set<Tab>(["dns-queries", "dns-threat"]);
 
 export function LogsPage() {
   // ``?tab=`` entry point so other surfaces can deep-link a specific
@@ -92,16 +95,27 @@ export function LogsPage() {
   // loaded) lands on DNS Queries, not on a tab that is not there.
   const { enabled: moduleEnabled, ready: modulesReady } = useFeatureModules();
   const dhcpOn = modulesReady && moduleEnabled("core.dhcp");
-  // A DHCP deep link on a hard reload waits for the module set rather than
-  // mounting DNS Queries (and firing its query) for a moment first.
-  const awaitingModules =
-    !modulesReady && !!requested && DHCP_TABS.has(requested);
-  const tab: Tab =
-    requested &&
-    TABS.includes(requested) &&
-    (dhcpOn || !DHCP_TABS.has(requested))
-      ? requested
-      : "dns-queries";
+  const dnsOn = modulesReady && moduleEnabled("core.dns");
+  // #2135 — the same for the DNS tabs. Their buttons stay up until the module
+  // set has loaded (DNS Queries is the default and a bar with no tabs in it
+  // blinks); only the tab BODIES, which fire the queries, wait.
+  const dnsTabsShown = !modulesReady || dnsOn;
+  const wanted: Tab | null =
+    requested && TABS.includes(requested) ? requested : null;
+  // Only the Event Log tab is valid with neither module on, so every other
+  // landing (a deep link, or none) waits for the module set rather than
+  // mounting a tab, and firing its query, for a moment first.
+  const awaitingModules = !modulesReady && wanted !== "events";
+  const tabAllowed = (t: Tab) =>
+    (dnsOn || !DNS_TABS.has(t)) && (dhcpOn || !DHCP_TABS.has(t));
+  // With DNS off the default is the first tab that still exists, and with
+  // both off that is the Event Log: a valid tab, never a blank page.
+  const fallbackTab: Tab = dnsOn
+    ? "dns-queries"
+    : dhcpOn
+      ? "dhcp-activity"
+      : "events";
+  const tab: Tab = wanted && tabAllowed(wanted) ? wanted : fallbackTab;
   const setTab = (next: Tab) => {
     const params = new URLSearchParams(searchParams);
     params.set("tab", next);
@@ -194,21 +208,25 @@ export function LogsPage() {
           </button>
         </div>
         <div className="mt-3 flex flex-wrap gap-1 border-b -mb-4">
-          <TabButton
-            active={tab === "dns-queries"}
-            onClick={() => setTab("dns-queries")}
-            icon={Search}
-            label="DNS Queries"
-            hint="BIND9 / PowerDNS query log (client → name → qtype). Requires query_log_enabled on the server group."
-            count={dnsAgentSources.length || undefined}
-          />
-          <TabButton
-            active={tab === "dns-threat"}
-            onClick={() => setTab("dns-threat")}
-            icon={ShieldAlert}
-            label="DNS Threat"
-            hint="Per-client tunneling / exfiltration scoring over the query log. Requires the security.dns_threat module (default off — it reads query content)."
-          />
+          {dnsTabsShown && (
+            <TabButton
+              active={tab === "dns-queries"}
+              onClick={() => setTab("dns-queries")}
+              icon={Search}
+              label="DNS Queries"
+              hint="BIND9 / PowerDNS query log (client → name → qtype). Requires query_log_enabled on the server group."
+              count={dnsAgentSources.length || undefined}
+            />
+          )}
+          {dnsTabsShown && (
+            <TabButton
+              active={tab === "dns-threat"}
+              onClick={() => setTab("dns-threat")}
+              icon={ShieldAlert}
+              label="DNS Threat"
+              hint="Per-client tunneling / exfiltration scoring over the query log. Requires the security.dns_threat module (default off — it reads query content)."
+            />
+          )}
           {dhcpOn && (
             <TabButton
               active={tab === "dhcp-activity"}
@@ -243,15 +261,19 @@ export function LogsPage() {
         </div>
       </div>
 
-      {tab === "dns-queries" && !awaitingModules && (
+      {tab === "dns-queries" && dnsOn && !awaitingModules && (
         <DNSQueriesTab sources={dnsAgentSources} />
       )}
-      {tab === "dns-threat" && <DNSThreatTab />}
-      {tab === "dhcp-activity" && dhcpOn && (
+      {tab === "dns-threat" && dnsOn && !awaitingModules && <DNSThreatTab />}
+      {tab === "dhcp-activity" && dhcpOn && !awaitingModules && (
         <DHCPActivityTab sources={dhcpAgentSources} />
       )}
-      {tab === "events" && <EventLogTab sources={tabSources} />}
-      {tab === "audit" && dhcpOn && <DhcpAuditTab sources={tabSources} />}
+      {tab === "events" && !awaitingModules && (
+        <EventLogTab sources={tabSources} />
+      )}
+      {tab === "audit" && dhcpOn && !awaitingModules && (
+        <DhcpAuditTab sources={tabSources} />
+      )}
     </div>
   );
 }
