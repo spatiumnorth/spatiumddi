@@ -7232,6 +7232,8 @@ class _DnsSyncStaleResp(BaseModel):
     name: str
     value: str
     reason: str
+    # Live IPAM row the record hangs off; null for ``ip-deleted`` (#2101).
+    ip_id: uuid.UUID | None = None
 
 
 class DnsSyncPreviewResponse(BaseModel):
