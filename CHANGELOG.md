@@ -132,6 +132,21 @@ the formatter handles the rest.
   apply after upgrading renders and reloads every RPZ zone once.
   Bundles without a blocklist are byte-identical; `RENDERER_REVISION`
   is 12.
+- **IPAM now says why a host named `gateway` gets no forward DNS
+  record (#2101).** The rule is deliberate (every subnet's placeholder
+  row is named `gateway`, so publishing them would collide on
+  `gateway.<zone>`), but nothing in the GUI said so. The IP row's DNS
+  column shows "forward DNS skipped" with the explanation as its
+  tooltip instead of a bare dash, and the create, edit, allocate and IP
+  detail views show the same note when the hostname is exactly
+  `gateway` (advisory, saving is still allowed; typed input is matched
+  the way the API stores it, so `Gateway` or `gateway.` shows it too). The Sync DNS modal
+  explains each stale reason in plain words instead of the raw code and
+  no longer says a `default-gateway-name` record's address is gone. A
+  row whose records Sync DNS is about to delete no longer reads "in
+  sync" (stale items now carry an optional `ip_id`), and a stale
+  record with no zone no longer renders a dangling dot. The record
+  behaviour is unchanged: no forward record, PTR still published.
 
 - **Turning DHCP off now hides DHCP everywhere, and stops the `/dhcp/*`
   calls that 404ed (#2130).** `core.dhcp` hid the DHCP sidebar but left
