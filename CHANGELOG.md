@@ -171,6 +171,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Backup page and branding title show the API's reason and stop
+  offering what is refused** (#2203, #2204, #2200, #2202, #2205).
+  A refused archive preview, restore or drill schedule now shows the
+  API's `detail` instead of "Request failed with status code N". A
+  non-superadmin sees a permission notice with the backup controls
+  disabled, and Restore Drills / Destinations say a refused read was
+  refused rather than "No backup targets configured". The tab copy no
+  longer names four destination kinds and the empty state no longer
+  says a local volume only. The Manual restore warning follows the
+  chosen mode (selective replaces only the ticked sections). The
+  Application title is capped at 255 characters and a refused
+  settings save shows the API's reason.
+
 - **Tailscale warns before its 90-day API token expires, and alerts
   when it has (#2138).** Tailscale caps an API access token at 90
   days; when it lapsed, every sync got HTTP 401, the mirror stopped

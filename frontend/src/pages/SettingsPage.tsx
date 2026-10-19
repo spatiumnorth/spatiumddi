@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   settingsApi,
   authApi,
+  formatApiError,
   type OUITaskStatus,
   type PlatformSettings,
 } from "@/lib/api";
@@ -1393,7 +1394,10 @@ export function SettingsPage() {
 
           {mutation.isError && (
             <div className="rounded-md border border-destructive/30 bg-destructive/10 px-4 py-2 text-sm text-destructive">
-              Failed to save settings. Please try again.
+              {formatApiError(
+                mutation.error,
+                "Failed to save settings. Please try again.",
+              )}
             </div>
           )}
 
@@ -1406,6 +1410,7 @@ export function SettingsPage() {
                 >
                   <input
                     value={values.app_title ?? ""}
+                    maxLength={255}
                     onChange={(e) => set("app_title", e.target.value)}
                     disabled={!isSuperadmin}
                     className={cn(inputCls, "w-48")}

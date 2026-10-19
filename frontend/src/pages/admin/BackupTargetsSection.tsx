@@ -26,6 +26,7 @@ import {
   type BackupTargetUpdate,
 } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
 
 /**
@@ -90,13 +91,13 @@ export function BackupTargetsSection() {
           Loading…
         </div>
       ) : targetsQ.isError ? (
-        <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-          Failed to load backup targets.
+        <div className="rounded-md border border-dashed px-3 py-2 text-xs">
+          <ListReadError error={targetsQ.error} what="backup targets" />
         </div>
       ) : (targetsQ.data ?? []).length === 0 ? (
         <div className="rounded-md border border-dashed px-3 py-4 text-center text-xs text-muted-foreground">
           No backup targets configured. Click <strong>Add target</strong> to
-          schedule a recurring backup to a local volume.
+          schedule a recurring backup to any of the destination kinds it offers.
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
