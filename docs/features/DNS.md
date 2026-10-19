@@ -2085,9 +2085,10 @@ See the driver table in §20.4.
 
 With `tls`, forwarders default to port 853 unless an entry pins its own
 (`ip@port`), and each renders with the generated `tls spatium-upstream-tls`
-statement. Per-zone forwarders on `type forward` zones inherit the same
-transport — a group forwarding over DoT shouldn't silently fall back to
-plaintext for its zone-scoped upstreams.
+statement. **The group transport applies to the group's resolver forwarders
+only.** A conditional forward zone has its own transport (§20.3.2); before
+#2121 it inherited this one, which broke every forward zone pointing at a
+plain-DNS upstream as soon as the group switched to DoT.
 
 `forward_tls_verify` (default on) adds `ca-file` + `remote-hostname` for
 strict validation, and the API refuses verification-on without a hostname
@@ -2141,6 +2142,62 @@ Two levels of checking sit on top of it:
 
 Unrecognised addresses carry no opinion at either level. An internal
 resolver or an uncatalogued provider must stay configurable.
+
+### 20.3.2 Forward zones carry their own transport (#2121)
+
+A `type forward` zone's upstream transport is **the zone's own setting**,
+`forward_transport` on the zone (`do53` default, `tls`, plus `https` / `quic`
+on a Technitium-only group), with `forward_tls_hostname` as the name the
+upstream's certificate is checked against. It does not follow the group's
+`forward_transport`.
+
+The reason is the common case. A conditional forwarder usually points at
+something internal that speaks plain DNS on port 53 and nothing else —
+Tailscale's MagicDNS at `100.100.100.100`, an Active Directory domain
+controller, a cloud VPC resolver — and its certificate, if it has one, is not
+the group provider's. Inheriting the group's DoT sent the zone's queries to
+`100.100.100.100:853` over TLS, validated against `cloudflare-dns.com`;
+nothing answers there, and with `forward only` every name in the zone
+SERVFAILed.
+
+Rules, enforced by the API (422) and mirrored in the zone form:
+
+* An encrypted transport requires `forward_tls_hostname`, a host name. A zone
+  is always verified: there is no opportunistic per-zone DoT.
+* `tls` needs every server in the group to be BIND9 or Technitium; `https`
+  and `quic` need every server to be Technitium. Windows DNS and the cloud
+  drivers forward plain DNS only.
+* The #877 rule applies per zone: an encrypted zone whose forwarders span two
+  catalogued upstreams with different certificate names is refused, because
+  one hostname cannot validate both.
+* A `do53` zone pointed at an encrypted-only upstream (Mullvad) is refused.
+
+Rendering. Over TLS a zone's forwarders default to port 853. **An entry with
+an explicit `@53` is always plain DNS**, whatever the zone's transport —
+TLS to port 53 is a handshake nothing answers. On BIND9 each distinct
+hostname gets its own top-level statement, named from the hostname
+(`tls spatium-zone-tls-<name>-<hash> { ca-file …; remote-hostname "<name>"; … };`),
+rendered above `options` so it exists before any zone names it; zones that
+share a provider share the statement. The group's `spatium-upstream-tls`
+is used by the group's forwarders only. A zone BIND9 cannot render
+faithfully (`https` / `quic`, or `tls` with no usable hostname) is skipped
+and logged as `bind9_forward_zone_skipped`, never downgraded to plain DNS or
+to unverified TLS. On Technitium a plain-IP zone forwarder becomes
+`tls://<hostname> (<ip>)` (or the DoH / DoQ form); an entry naming its own
+scheme or port is kept as written.
+
+The agent renderer and the control-plane preview template share one helper
+(`app/drivers/dns/_forwarders.py`, copied byte for byte into the agent), so
+the preview shows what the agent renders — including `ip@port`, which the
+template used to emit verbatim as an unloadable `1.1.1.1@53;`.
+
+**Upgrade.** The migration sets every existing zone to `do53`, including
+forward zones in groups that forward over TLS today. A forward zone that
+really did want DoT must be switched back on the zone, with its hostname.
+The fix is in the **agent**: an agent older than #2121 ignores the zone's
+transport and keeps inheriting the group's, so upgrade the DNS agents along
+with the control plane. A new agent talking to an older control plane reads
+a zone with no transport as plain DNS.
 
 ### 20.4 Driver support
 
