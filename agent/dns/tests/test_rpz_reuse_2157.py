@@ -474,6 +474,50 @@ def test_a_missing_sidecar_is_rendered_again(tmp_path: Path, monkeypatch) -> Non
     assert _two_renders(tmp_path, drop, monkeypatch) == [RPZ]
 
 
+def test_a_corrupt_sidecar_is_rendered_again(tmp_path: Path, monkeypatch) -> None:
+    def garble(p: Path) -> None:
+        bind9._rpz_sidecar(p).write_bytes(b"\xff\xfe not a sidecar")
+
+    assert _two_renders(tmp_path, garble, monkeypatch) == [RPZ]
+
+
+def test_the_rpz_file_is_durable_before_its_sidecar_vouches_for_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once a sidecar exists the file is linked forward and never checked
+    again, so its bytes must reach the disk before the sidecar is written."""
+    events: list[str] = []
+    real_fsync = os.fsync
+    real_write = bind9._write_new_inode
+
+    def fsync(fd: int) -> None:
+        events.append("fsync")
+        real_fsync(fd)
+
+    def write_new_inode(path: Path, data: bytes) -> None:
+        if path.name.endswith(".sha256"):
+            events.append("sidecar")
+        real_write(path, data)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(bind9, "_write_new_inode", write_new_inode)
+    Bind9Driver(state_dir=tmp_path).render(_flat([_bl()]))
+    assert "sidecar" in events
+    assert "fsync" in events[: events.index("sidecar")]
+
+
+def test_the_rendered_config_push_skips_the_sidecars(tmp_path: Path) -> None:
+    from spatium_dns_agent.admin_pusher import _walk_rendered
+
+    drv = Bind9Driver(state_dir=tmp_path)
+    drv.render(_flat([_bl()]))
+    drv._swap_in(tmp_path / "rendered.new", tmp_path / "rendered", tmp_path / "rendered.prev")
+    assert bind9._rpz_sidecar(tmp_path / "rendered" / RPZ_FILE).is_file()
+    pushed = dict(_walk_rendered(tmp_path / "rendered"))
+    assert RPZ_FILE in pushed
+    assert not [p for p in pushed if p.endswith((".sha256", ".tmp"))]
+
+
 def test_no_hard_links_falls_back_to_a_copy_not_a_render(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

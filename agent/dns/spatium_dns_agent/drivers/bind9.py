@@ -1394,6 +1394,23 @@ def _rpz_reusable(src: Path, key: str) -> bool:
     )
 
 
+def _fsync_path(path: Path) -> None:
+    """Flush ``path``'s data to disk before anything vouches for it.
+
+    An RPZ file's sidecar is that vouching (#2157): once it exists, the file
+    is linked forward instead of re-rendered, and is never again run through
+    ``named-checkzone``. So the file's bytes must be durable before its
+    sidecar is written. The sidecar itself needs no fsync: losing it only
+    costs one re-render. The size recorded in the sidecar still catches the
+    commonest crash shape (a delayed-allocation file that comes back empty);
+    this closes the rest, at one fsync per RPZ file actually written."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _write_new_inode(path: Path, data: bytes) -> None:
     """Write ``data`` to ``path`` as a NEW inode: a temp file renamed over it.
 
@@ -1409,6 +1426,7 @@ def _copy_new_inode(src: Path, dst: Path) -> None:
     """A private copy of ``src`` at ``dst``, as a new inode."""
     tmp = dst.with_name(dst.name + ".tmp")
     shutil.copyfile(src, tmp)
+    _fsync_path(tmp)
     os.replace(tmp, dst)
 
 
@@ -1423,6 +1441,7 @@ def _link_or_copy(src: Path, dst: Path) -> str:
         how = "link"
     except OSError:
         shutil.copyfile(src, tmp)
+        _fsync_path(tmp)
         how = "copy"
     os.replace(tmp, dst)
     return how
@@ -2328,6 +2347,9 @@ class Bind9Driver(DriverBase):
             for line in self._rpz_zone_lines(bl, seen, collisions, bad_targets):
                 fh.write(line)
                 fh.write("\n")
+            # Durable before the caller's sidecar vouches for it (#2157).
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
         if bad_targets:
             log.warning(

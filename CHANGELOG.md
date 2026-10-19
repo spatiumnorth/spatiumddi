@@ -127,7 +127,10 @@ the formatter handles the rest.
   place that did so, putting the live copy back over a zone
   `named-checkzone` refused, now copies. The RPZ SOA serial derives
   from the content instead of being a constant 1, so a changed zone's
-  load is verified like any other zone's. A bundle from an older control
+  load is verified like any other zone's. A file is flushed to disk
+  before its hash is recorded beside it, since a reused file is never
+  checked again, and the hash files are left out of the rendered-config
+  snapshot the agent uploads. A bundle from an older control
   plane carries no hash and renders every time, as before. The first
   apply after upgrading renders and reloads every RPZ zone once.
   Bundles without a blocklist are byte-identical; `RENDERER_REVISION`
