@@ -762,7 +762,9 @@ def test_migration_adds_the_columns_the_model_declares() -> None:
         / "c8e2a5f71d39_tailscale_api_key_expiry.py"
     )
     src = path.read_text()
-    assert 'down_revision = "b3d7f1a82c54"' in src
+    # The parent revision is re-pointed whenever another migration merges
+    # first, so pin this migration's own id rather than its down_revision.
+    assert 'revision = "c8e2a5f71d39"' in src
     cols = TailscaleTenant.__table__.columns
     for name in ("api_key_expires_at", "api_key_expiry_source"):
         assert f'"{name}"' in src
