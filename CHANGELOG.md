@@ -251,19 +251,22 @@ the formatter handles the rest.
   group that does not use the setting keeps its bundle etag across the
   upgrade and no agent reloads for it.
 
-- **Upgrade note for #2121: a TLS forward zone with a different
-  provider's hostname than its group needs upgraded agents.** Until
-  a DNS agent is upgraded, it renders every forward zone with the
-  group's `tls` statement, so it checks the upstream against the
-  group's certificate name, not the zone's. A zone set to DNS-over-TLS
-  with a `forward_tls_hostname` for a different provider than the group
-  (a group on `cloudflare-dns.com`, a zone forwarding to Quad9 as
-  `dns.quad9.net`) therefore fails certificate verification on an old
-  agent, and every name in the zone SERVFAILs. Upgrade the DNS agents
-  before switching such a zone to its own provider, or keep the zone's
-  hostname equal to the group's until they are upgraded. A zone on
-  plain DNS, or a TLS zone using the group's own hostname, works on old
-  and new agents alike.
+- **Upgrade note for #2121: a forward zone's own transport needs
+  upgraded agents.** An agent from before this release ignores the
+  zone's `forward_transport` and `forward_tls_hostname` and forwards
+  every forward zone the way the group forwards: over the group's
+  transport, checked against the group's certificate name. So until
+  the DNS agents (BIND9 and Technitium) are upgraded, a zone whose
+  transport or hostname differs from the group's does not get it. In a
+  DoT group, a zone on plain DNS still goes out over TLS and fails
+  against a Do53-only upstream, as before this release; a DoT zone
+  with another provider's hostname (a group on `cloudflare-dns.com`, a
+  zone forwarding to Quad9 as `dns.quad9.net`) fails certificate
+  verification, and every name in the zone SERVFAILs. In a plain-DNS
+  group, a zone set to DoT is still forwarded in plaintext. Upgrade
+  the DNS agents before giving a zone a transport or hostname different
+  from its group's. A zone that matches its group works on old and new
+  agents alike.
 
 - **The zone move preview reports a forward transport the target group
   cannot serve (#2121 follow-up).** Moving a forward zone to another
