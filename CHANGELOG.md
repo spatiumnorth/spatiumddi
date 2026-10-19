@@ -107,6 +107,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Allocate IP no longer drops an alias that another record already
+  holds (#2122).** Allocate IP and next-IP skipped, without a word, an
+  alias whose zone, name and type another record already held: the
+  request succeeded and the alias did not exist. Both now answer 409
+  naming the alias and what holds it (an alias or the host record of
+  another address, or an operator record), as adding a single alias
+  from Edit IP does, and nothing is written: no address row, no host
+  record, no other alias. Names compare case-insensitively. Adding an
+  alias the address already has is a no-op that returns it with 200, for
+  a CNAME as well as an A, rather than a 409, and is not audited as a
+  create.
+  The same alias given twice in one request is written once.
+
 - **Upgrade note for #2121: a forward zone's own transport needs
   upgraded agents.** An agent from before this release ignores the
   zone's `forward_transport` and `forward_tls_hostname` and forwards

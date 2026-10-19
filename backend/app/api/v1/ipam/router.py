@@ -1371,6 +1371,52 @@ def _alias_written_type(requested: str, *, is_v6: bool) -> str:
     return "AAAA" if rtype == "A" and is_v6 else rtype
 
 
+async def _alias_record_at(
+    db: AsyncSession, zone_id: uuid.UUID, name: str, rtype: str
+) -> DNSRecord | None:
+    """A live record already at ``(zone, name, type)``, an alias's own slot.
+
+    Names compare case-insensitively, as DNS does. Rows in every view count,
+    since an alias is a no-view row and renders into all of them.
+    """
+    return (
+        (
+            await db.execute(
+                select(DNSRecord)
+                .where(
+                    DNSRecord.zone_id == zone_id,
+                    func.lower(DNSRecord.name) == name.strip().lower(),
+                    DNSRecord.record_type == rtype,
+                )
+                .order_by(DNSRecord.created_at)
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+def _is_own_alias(rec: DNSRecord, ip_id: uuid.UUID) -> bool:
+    """Whether ``rec`` is an alias the address ``ip_id`` already has."""
+    return bool(rec.ip_alias) and rec.ip_address_id == ip_id
+
+
+async def _alias_duplicate_detail(db: AsyncSession, rec: DNSRecord, rtype: str, fqdn: str) -> str:
+    """The 409 detail for an alias whose record something else holds (#2122)."""
+    article = "an" if rtype.startswith("A") else "a"
+    holder = f"{article} {rtype} record"
+    if rec.ip_address_id is not None:
+        other_ip = await db.get(IPAddress, rec.ip_address_id)
+        if other_ip is not None:
+            role = "an alias of" if rec.ip_alias else "the host record of"
+            holder = f"{article} {rtype} record, {role} address {other_ip.address}"
+    return (
+        f"{fqdn} already holds {holder}, so {article} {rtype} alias there would "
+        "not be created. Pick another alias name, or remove that record first."
+    )
+
+
 async def _assert_alias_cname_rules(
     db: AsyncSession,
     subnet: Subnet,
@@ -1379,8 +1425,10 @@ async def _assert_alias_cname_rules(
     hostname: str | None,
     address: Any,
     zone_id: uuid.UUID | None,
+    own_ip_id: uuid.UUID | None = None,
 ) -> None:
-    """Refuse an alias set that would put a CNAME beside other data (#2080).
+    """Refuse an alias set that would put a CNAME beside other data (#2080),
+    or that repeats a record something else already holds (#2122).
 
     A name that holds a CNAME holds nothing else (RFC 1034 section 3.6.2,
     RFC 2181 section 10.1); BIND refuses the whole zone otherwise and the
@@ -1392,6 +1440,13 @@ async def _assert_alias_cname_rules(
     is a CNAME. It also covers the IP's own host name and the aliases of the
     same request, which are not in the database yet. Rows are matched in
     every view, since an alias is a no-view row and renders into all of them.
+
+    #2122 — an alias whose ``(zone, name, type)`` is already held by another
+    record is refused here too (409, naming the alias and its holder), where
+    the writer used to skip it and report success. An alias the address
+    ``own_ip_id`` already has is not a clash: re-adding it is a no-op. The
+    same alias twice in one request is collapsed to one, since both entries
+    ask for the one record the zone can hold.
     """
     from app.services.dns.cname_conflict import (  # noqa: PLC0415
         APEX_CNAME_DETAIL,
@@ -1419,15 +1474,28 @@ async def _assert_alias_cname_rules(
     pending: dict[str, list[tuple[bool, str]]] = {
         hostname.strip().lower(): [(False, f"the address's own {host_rtype} record")]
     }
+    seen: set[tuple[str, str]] = set()
     for al in aliases:
         rtype = (getattr(al, "record_type", None) or al.get("record_type") or "CNAME").upper()
         rtype = _alias_written_type(rtype, is_v6=is_v6)
         name = (getattr(al, "name", None) or al.get("name") or "").strip().rstrip(".")
         if not name or rtype not in {"CNAME", "A", "AAAA"}:
             continue
+        # #2122 — the same alias twice in one request is one record.
+        if (name.lower(), rtype) in seen:
+            continue
+        seen.add((name.lower(), rtype))
         fqdn = f"{name}.{zone_domain}"
         if rtype == "CNAME" and is_apex(name):
             raise HTTPException(status_code=422, detail=APEX_CNAME_DETAIL)
+        held = await _alias_record_at(db, effective_zone_id, name, rtype)
+        if held is not None and own_ip_id is not None and _is_own_alias(held, own_ip_id):
+            # The address already has this alias: nothing to write, nothing
+            # to refuse. It still occupies its name for the rest of the request.
+            pending.setdefault(name.lower(), []).append(
+                (rtype == "CNAME", f"{'an' if rtype.startswith('A') else 'a'} {rtype} alias")
+            )
+            continue
         other = await find_cname_conflict(
             db, effective_zone_id, view_id=None, name=name, record_type=rtype
         )
@@ -1445,6 +1513,11 @@ async def _assert_alias_cname_rules(
                     "name would duplicate it, and deleting the alias later would "
                     "remove the host's record too. Pick another alias name.",
                 )
+        if held is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                await _alias_duplicate_detail(db, held, rtype, fqdn),
+            )
         is_cname = rtype == "CNAME"
         what = f"{'an' if rtype.startswith('A') else 'a'} {rtype} alias"
         siblings = pending.setdefault(name.lower(), [])
@@ -1536,16 +1609,19 @@ async def _create_alias_records(
         name = (getattr(al, "name", None) or al.get("name") or "").strip().rstrip(".")
         if not name or rtype not in {"CNAME", "A", "AAAA"}:
             continue
-        # Skip if a conflicting record already exists for (zone, name, type)
-        dup = await db.execute(
-            select(DNSRecord).where(
-                DNSRecord.zone_id == effective_zone_id,
-                DNSRecord.name == name,
-                DNSRecord.record_type == rtype,
+        # A record already at (zone, name, type): the address's own alias
+        # (re-added, or the same alias twice in one request) is a no-op.
+        # Anything else was refused by ``_assert_alias_cname_rules`` before
+        # any write (#2122); this catches one that appeared since, so the
+        # alias is never dropped while the request reports success.
+        dup = await _alias_record_at(db, effective_zone_id, name, rtype)
+        if dup is not None:
+            if _is_own_alias(dup, ip.id):
+                continue
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                await _alias_duplicate_detail(db, dup, rtype, f"{name}.{zone_domain}"),
             )
-        )
-        if dup.scalar_one_or_none():
-            continue
         value = primary_fqdn if rtype == "CNAME" else str(ip.address)
         rec = DNSRecord(
             zone_id=effective_zone_id,
@@ -8843,9 +8919,19 @@ async def list_aliases(address_id: uuid.UUID, current_user: CurrentUser, db: DB)
     "/addresses/{address_id}/aliases",
     response_model=AliasResponse,
     status_code=status.HTTP_201_CREATED,
+    responses={
+        200: {
+            "model": AliasResponse,
+            "description": "The address already has this alias; it is returned unchanged.",
+        }
+    },
 )
 async def add_alias(
-    address_id: uuid.UUID, body: AliasInput, current_user: CurrentUser, db: DB
+    address_id: uuid.UUID,
+    body: AliasInput,
+    current_user: CurrentUser,
+    db: DB,
+    response: Response,
 ) -> DNSRecord:
     ip = await db.get(IPAddress, address_id)
     if ip is None:
@@ -8873,16 +8959,28 @@ async def add_alias(
     if ip.hostname:
         await _assert_alias_names_fit(db, [body], zone_id)
     await _assert_alias_cname_rules(
-        db, subnet, [body], hostname=ip.hostname, address=ip.address, zone_id=zone_id
+        db,
+        subnet,
+        [body],
+        hostname=ip.hostname,
+        address=ip.address,
+        zone_id=zone_id,
+        own_ip_id=ip.id,
     )
-    await _create_alias_records(db, ip, subnet, [body], zone_id=zone_id)
-    # Find the just-created record by the type that was written: an A alias
-    # on an IPv6 address is stored as AAAA (#2081).
+    # Find the record by the type that is written: an A alias on an IPv6
+    # address is stored as AAAA (#2081).
     try:
         is_v6 = isinstance(ipaddress.ip_address(str(ip.address)), ipaddress.IPv6Address)
     except ValueError:
         is_v6 = False
     written_type = _alias_written_type(body.record_type, is_v6=is_v6)
+    # #2122 — an alias the address already has is returned as it stands,
+    # with 200 rather than 201: nothing is created, so nothing is audited.
+    existing = await _alias_record_at(db, zone_id, body.name, written_type)
+    if existing is not None and _is_own_alias(existing, ip.id):
+        response.status_code = status.HTTP_200_OK
+        return existing
+    await _create_alias_records(db, ip, subnet, [body], zone_id=zone_id)
     res = await db.execute(
         select(DNSRecord).where(
             DNSRecord.zone_id == zone_id,
