@@ -62,6 +62,7 @@ vi.mock("@/hooks/useFeatureModules", () => ({
 const { DashboardPage } = await import("./DashboardPage");
 const { SubnetDetail } = await import("./ipam/IPAMPage");
 const { IPDetailModal } = await import("./ipam/IPDetailModal");
+const { NATPage } = await import("./ipam/NATPage");
 
 function answer(api: string, method: string, fn: Answer) {
   (answers[api] ??= {})[method] = fn;
@@ -218,6 +219,37 @@ describe("IP detail", () => {
     ipDetail();
     await screen.findByText("10.85.20.41");
     expect(screen.queryByText("NAT 2")).toBeNull();
+    expect(natCalls()).toEqual([]);
+  });
+});
+
+// ── NAT Mappings page ────────────────────────────────────────────────────────
+
+describe("NAT Mappings page", () => {
+  it("lists mappings while NAT is on (control)", async () => {
+    answer("natApi", "list", () =>
+      Promise.resolve({ total: 0, page: 1, per_page: 50, items: [] }),
+    );
+    open(<NATPage />);
+    await waitFor(() => expect(natCalls()).toContain("natApi.list"));
+    expect(screen.queryByText(/NAT mappings are turned off/)).toBeNull();
+  });
+
+  it("says it is off, offers no create, and calls nothing while NAT is off", async () => {
+    // Reached by bookmark, or left open after deleting the last mapping on
+    // an install that never set the toggle.
+    natOff();
+    open(<NATPage />);
+    expect(await screen.findByText(/NAT mappings are turned off/)).toBeTruthy();
+    expect(screen.queryByText("New mapping")).toBeNull();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(natCalls()).toEqual([]);
+  });
+
+  it("calls nothing before the module set has loaded", async () => {
+    mods.ready = false;
+    open(<NATPage />);
+    await new Promise((r) => setTimeout(r, 20));
     expect(natCalls()).toEqual([]);
   });
 });

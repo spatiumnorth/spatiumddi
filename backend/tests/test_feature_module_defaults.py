@@ -85,7 +85,7 @@ EXPECTED_DEFAULTS: dict[str, bool] = {
     # #2100 — off on a FRESH install, but ``default_on_if_rows_in`` resolves
     # it on (without seeding a row) wherever ``nat_mapping`` already holds
     # data, so an upgraded install that uses NAT keeps it. This file pins
-    # the fresh-install value; ``test_feature_module_nat.py`` pins the rest.
+    # the fresh-install value; ``test_feature_module_nat_2100.py`` pins the rest.
     "ipam.nat": False,
     # ── Integrations ────────────────────────────────────────────────
     "integrations.kubernetes": False,

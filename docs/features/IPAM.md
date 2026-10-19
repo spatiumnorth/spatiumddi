@@ -2031,7 +2031,12 @@ keep writing them. The module ships off, but with no operator
 override it resolves **on** whenever `nat_mapping` holds a row
 (`ModuleSpec.default_on_if_rows_in`), so an install that already
 uses NAT keeps it after upgrade without a seeded `feature_module`
-row. An operator's choice always wins.
+row. An operator's choice always wins. Two consequences follow
+from "on when there is data": on a fresh install a firewall
+mirror's first NAT rule turns the surface on, and deleting the
+last mapping on an install that never set the toggle turns it
+off. The NAT Mappings page then says the feature is off and links
+to Settings → Features. Turning it on there pins it on.
 
 ### ✅ 15.19 VXLAN ID surface in the UI
 

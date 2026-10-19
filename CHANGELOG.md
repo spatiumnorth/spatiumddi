@@ -47,6 +47,9 @@ the formatter handles the rest.
   consequences follow from "on when there is data". On a fresh install,
   a firewall mirror's first NAT rule turns the surface on. And deleting
   the last mapping turns it off again unless it was enabled explicitly.
+  The NAT Mappings page then says the feature is off and links to
+  Settings → Features, rather than leaving a page whose requests 404,
+  and the sidebar follows at once.
   The check is a one-row probe, run only while no override exists, at
   most once per worker per 5 s module-cache refresh, and the
   feature-modules list the UI resolves from uses the same derivation
