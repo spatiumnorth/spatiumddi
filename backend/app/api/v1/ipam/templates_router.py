@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission
+from app.models.dns import DNS_TTL_MAX
 from app.models.ipam import IPAMTemplate, IPBlock, Subnet
 from app.services.ipam.templates import (
     TemplateError,
@@ -105,7 +106,7 @@ class IPAMTemplateBase(BaseModel):
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: str | None = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     child_layout: dict[str, Any] | None = None
 
     @field_validator("applies_to")
@@ -154,7 +155,7 @@ class IPAMTemplateUpdate(BaseModel):
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
     ddns_domain_override: str | None = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     child_layout: dict[str, Any] | None = None
     # Disambiguates "set to null" (clear_*=True) from "field not
     # supplied" (None default of an optional field) for nullable

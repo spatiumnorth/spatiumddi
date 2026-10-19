@@ -34,6 +34,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, CLOUD_SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 
 // ── Provider metadata ───────────────────────────────────────────────
 
@@ -431,7 +432,7 @@ function EndpointModal({
     endpoint?.mirror_stopped_instances ?? false,
   );
   const [syncInterval, setSyncInterval] = useState(
-    endpoint?.sync_interval_seconds ?? 300,
+    String(endpoint?.sync_interval_seconds ?? 300),
   );
 
   // AWS credentials
@@ -527,7 +528,7 @@ function EndpointModal({
           dns_group_id: dnsGroupId || null,
           mirror_load_balancers: mirrorLoadBalancers,
           mirror_stopped_instances: mirrorStoppedInstances,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (Object.keys(creds).length > 0) update.credentials = creds;
         return cloudApi.updateEndpoint(endpoint!.id, update);
@@ -545,7 +546,7 @@ function EndpointModal({
         dns_group_id: dnsGroupId || null,
         mirror_load_balancers: mirrorLoadBalancers,
         mirror_stopped_instances: mirrorStoppedInstances,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return cloudApi.createEndpoint(create);
     },
@@ -577,6 +578,17 @@ function EndpointModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            CLOUD_SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -845,7 +857,7 @@ function EndpointModal({
             className={inputCls}
             value={syncInterval}
             min={60}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 300)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 

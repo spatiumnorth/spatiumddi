@@ -1,10 +1,12 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { primaryNsError } from "@/lib/primary-ns";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
 import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { ZoneSerialsLine } from "./ZoneSerialsLine";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
   Globe,
@@ -112,7 +114,13 @@ import {
   type ResolverPreset,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
-import { fqdnError, recordOwnerError, zoneKindForName } from "@/lib/dnsNames";
+import {
+  DNS_TTL_MAX,
+  fqdnError,
+  parseTtlInput,
+  recordOwnerError,
+  zoneKindForName,
+} from "@/lib/dnsNames";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -785,6 +793,7 @@ function ImportZoneModal({
       dnsApi.importZonePreview(groupId, zone.id, {
         zone_file: zoneFile,
         zone_name: zone.name,
+        conflict_strategy: strategy,
       }),
     onSuccess: (data) => {
       setPreview(data);
@@ -882,9 +891,10 @@ function ImportZoneModal({
           <select
             className={inputCls}
             value={strategy}
-            onChange={(e) =>
-              setStrategy(e.target.value as "merge" | "replace" | "append")
-            }
+            onChange={(e) => {
+              setStrategy(e.target.value as "merge" | "replace" | "append");
+              setPreview(null);
+            }}
           >
             <option value="merge">
               Merge — add new, update changed, keep existing
@@ -923,6 +933,20 @@ function ImportZoneModal({
               "Unchanged",
               preview.unchanged,
               "text-muted-foreground",
+            )}
+            {preview.skipped.length > 0 && (
+              <details className="rounded border" open>
+                <summary className="cursor-pointer px-2 py-1 text-xs font-medium text-amber-600">
+                  Will not be imported ({preview.skipped.length})
+                </summary>
+                <ul className="max-h-40 overflow-auto px-2 py-1 text-xs">
+                  {preview.skipped.map((s, i) => (
+                    <li key={i} className="break-all">
+                      {s}
+                    </li>
+                  ))}
+                </ul>
+              </details>
             )}
           </div>
         )}
@@ -2603,6 +2627,13 @@ export function ZoneModal({
     staleTime: 60_000,
   });
   const [error, setError] = useState("");
+  // #2075 — a Primary NS that is not a host name is refused, as the API does.
+  // On edit only a changed value is held to it (the API's rule too): a zone
+  // stored before the check re-sends its value on every save, and an edit to
+  // its TTL must still go through. Such a value is flagged, not blocked.
+  const primaryNsErr = technitiumApi ? null : primaryNsError(primaryNs);
+  const primaryNsBlocks =
+    primaryNsErr !== null && (!zone || primaryNs !== (zone.primary_ns ?? ""));
 
   const mut = useMutation({
     mutationFn: (d: Record<string, unknown>) =>
@@ -2619,6 +2650,21 @@ export function ZoneModal({
   function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
+    // Both checks run, so a zone wrong in two ways names both reasons at
+    // once instead of making the operator fix one to discover the other.
+    const problems: string[] = [];
+    // #2075 — a Primary NS that is not a host name stops BIND loading the
+    // zone; a stored legacy value saved unchanged is let through (flagged).
+    if (primaryNsBlocks && primaryNsErr) problems.push(primaryNsErr);
+    // #2073 / #2074 — the hidden field (technitium_api) keeps its default.
+    const zoneTtl = parseTtlInput(ttl);
+    if (zoneTtl === null || typeof zoneTtl === "string") {
+      problems.push(`Default TTL ${zoneTtl ?? "is required"}`);
+    }
+    if (problems.length > 0 || typeof zoneTtl !== "number") {
+      setError(`${problems.join("; ")}.`);
+      return;
+    }
     const payload: Record<string, unknown> = {
       name,
       zone_type: zoneType,
@@ -2626,7 +2672,7 @@ export function ZoneModal({
       view_id: viewId || null,
       primary_ns: primaryNs,
       admin_email: adminEmail,
-      ttl: parseInt(ttl, 10),
+      ttl: zoneTtl,
       color,
       domain_id: domainId,
       customer_id: customerId,
@@ -2815,7 +2861,20 @@ export function ZoneModal({
                 value={primaryNs}
                 onChange={(e) => setPrimaryNs(e.target.value)}
                 placeholder="ns1.example.com."
+                aria-invalid={primaryNsBlocks || undefined}
               />
+              {primaryNsErr &&
+                (primaryNsBlocks ? (
+                  <p className="text-xs text-destructive mt-0.5">
+                    {primaryNsErr}
+                  </p>
+                ) : (
+                  <p className="text-xs text-amber-600 dark:text-amber-400 mt-0.5">
+                    {primaryNsErr}. Stored before this was checked; a BIND9
+                    server serves the zone&apos;s first NS record (or
+                    ns1.&lt;zone&gt;) in its place. Change it to a host name.
+                  </p>
+                ))}
             </Field>
             <Field label="Admin Email">
               <input
@@ -2831,6 +2890,10 @@ export function ZoneModal({
           {!technitiumApi && (
             <Field label="Default TTL (seconds)">
               <input
+                type="number"
+                min={0}
+                max={DNS_TTL_MAX}
+                step={1}
                 className={inputCls}
                 value={ttl}
                 onChange={(e) => setTtl(e.target.value)}
@@ -3018,11 +3081,16 @@ function RecordModal({
       setError("SRV records require priority, weight, and port.");
       return;
     }
+    const recordTtl = parseTtlInput(ttl);
+    if (typeof recordTtl === "string") {
+      setError(`TTL ${recordTtl}.`);
+      return;
+    }
     mut.mutate({
       name,
       record_type: type,
       value,
-      ttl: ttl ? parseInt(ttl, 10) : null,
+      ttl: recordTtl,
       // Only send the structured fields the type actually uses, so the API
       // never sees a stray weight/port on a non-SRV record.
       priority: usesPriority && priority !== "" ? parseInt(priority, 10) : null,
@@ -3186,6 +3254,10 @@ function RecordModal({
         <div className="grid grid-cols-2 gap-3">
           <Field label="TTL (leave blank for zone default)">
             <input
+              type="number"
+              min={0}
+              max={DNS_TTL_MAX}
+              step={1}
               className={inputCls}
               value={ttl}
               onChange={(e) => setTtl(e.target.value)}
@@ -5367,12 +5439,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   </span>
                 ) : null,
             )}
-            <span className="ml-auto text-muted-foreground">
-              Zone serials:{" "}
-              {zones.length === 0
-                ? "no zones"
-                : `${zones.length} zone${zones.length === 1 ? "" : "s"} · all servers assumed consistent (per-server serials arrive in Wave 3)`}
-            </span>
+            <ZoneSerialsLine zoneCount={zones.length} servers={servers} />
           </div>
         </div>
       )}

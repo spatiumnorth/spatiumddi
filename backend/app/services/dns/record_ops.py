@@ -32,7 +32,7 @@ from app.core.agent_wake import collect_wake, dns_group_channel
 from app.drivers.dns import AGENTLESS_DRIVERS, get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
 from app.models.audit import AuditLog
-from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone
+from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone, servable_ttl
 from app.models.ipam import IPAddress
 from app.services.dns.row_locks import ids_in, lock_op_ids, lock_ops
 from app.services.dns.rrset import rrset_key as record_rrset_key
@@ -360,10 +360,12 @@ def queued_zone_ops_where(zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
     ``applied`` on each bundle build instead. A sibling view's op the sweep
     discards was therefore never going to reach ``nsupdate``: the over-sweep
     costs nothing. In a flat group the same name cannot exist twice (the
-    create route 409s it), so the predicate is exact there. A ``zone_id``
-    column would need a migration plus a name-scoped fallback for every
-    pre-upgrade row, i.e. this predicate again, to guard a path that is
-    already bypassed.
+    create route 409s it), so the predicate is exact there. Ops now carry
+    ``zone_id`` too (set on every enqueue path, used where per-view
+    attribution matters: the pending-ops list narrowed to a token's zones),
+    but rows queued before that column existed have it NULL, so keying this
+    predicate on it would need this name-scoped fallback anyway, to guard a
+    path the incremental op flow never takes under split-horizon.
 
     Every zone-scoped sweep and count goes through here so the decision lives
     in one place; ``tests/test_dns_record_ops_sweep.py`` pins both the
@@ -1119,6 +1121,7 @@ async def _apply_agentless(
 
     op_row = DNSRecordOp(
         server_id=server.id,
+        zone_id=zone.id,
         zone_name=zone.name,
         op=op,
         record=record,
@@ -1413,6 +1416,7 @@ async def enqueue_record_op(
     for srv in agent_servers:
         row = DNSRecordOp(
             server_id=srv.id,
+            zone_id=zone.id,
             zone_name=zone.name,
             op=op,
             record=record,
@@ -1453,7 +1457,9 @@ def record_op_payload(record: DNSRecord) -> dict[str, Any]:
         "name": record.name,
         "type": record.record_type,
         "value": record.value,
-        "ttl": record.ttl,
+        # #2073 — a TTL stored negative before the API bounded it is sent as
+        # null (inherit the zone's), never as a value no server accepts.
+        "ttl": servable_ttl(record.ttl),
         "priority": record.priority,
         "weight": record.weight,
         "port": record.port,
@@ -1556,6 +1562,7 @@ async def _fanout_agent_ops(
         for o in ops:
             row = DNSRecordOp(
                 server_id=srv.id,
+                zone_id=zone.id,
                 zone_name=zone.name,
                 op=o["op"],
                 record=o["record"],
@@ -1822,6 +1829,7 @@ async def _apply_agentless_batch(
     for o in ops:
         row = DNSRecordOp(
             server_id=server.id,
+            zone_id=zone.id,
             zone_name=zone.name,
             op=o["op"],
             record=o["record"],

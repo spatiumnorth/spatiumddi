@@ -882,6 +882,12 @@ class _FakePdnsClient:
         return False
 
     def get(self, url: str, headers: Any = None) -> _FakePdnsResponse:
+        if "rrset_type=SOA" in url:
+            # The apex-SOA-only read every op makes first (#1965): PowerDNS no
+            # longer bumps the serial, so the op carries the SOA itself. Not
+            # recorded — these tests are about the rrset's own read/write —
+            # and this zone serves no SOA, so no SOA rides the PATCH.
+            return _FakePdnsResponse(200, {"kind": "Native", "soa_edit_api": "", "rrsets": []})
         self._calls.append(("GET", url, None))
         return _FakePdnsResponse(200, self._zone_doc)
 

@@ -31,6 +31,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // One-shot snippet operators can paste into the Tailscale admin
@@ -364,7 +365,7 @@ function TenantModal({
   );
   const [skipExpired, setSkipExpired] = useState(tenant?.skip_expired ?? true);
   const [syncInterval, setSyncInterval] = useState(
-    tenant?.sync_interval_seconds ?? 60,
+    String(tenant?.sync_interval_seconds ?? 60),
   );
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
@@ -403,7 +404,7 @@ function TenantModal({
           cgnat_cidr: cgnatCidr,
           ipv6_cidr: ipv6Cidr,
           skip_expired: skipExpired,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (apiKey) update.api_key = apiKey;
         return tailscaleApi.updateTenant(tenant!.id, update);
@@ -419,7 +420,7 @@ function TenantModal({
         cgnat_cidr: cgnatCidr,
         ipv6_cidr: ipv6Cidr,
         skip_expired: skipExpired,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return tailscaleApi.createTenant(create);
     },
@@ -439,6 +440,17 @@ function TenantModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -599,7 +611,7 @@ function TenantModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
