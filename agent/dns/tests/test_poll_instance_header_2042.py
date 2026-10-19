@@ -14,6 +14,7 @@ from __future__ import annotations
 import httpx
 
 from spatium_dns_agent import sync
+from spatium_dns_agent.apply_guard import ApplyGuard
 from spatium_dns_agent.config import AgentConfig
 from spatium_dns_agent.sync import SyncLoop
 
@@ -38,6 +39,11 @@ def test_every_poll_of_one_process_carries_the_same_instance_id(
     loop.cfg = agent_cfg
     loop.token_ref = ["t1"]
     loop._quarantine = _NoQuarantine()
+    # #2019 / #1968 — read at the top of every poll: nothing armed, no cache
+    # held back, no startup report outstanding.
+    loop._guard = ApplyGuard(agent_cfg.state_dir)
+    loop._boot_hold = None
+    loop._boot_report_bundle = None
     loop._current_etag = "sha256:abc"
     loop._client = lambda: httpx.Client(  # type: ignore[method-assign]
         base_url="http://cp", transport=httpx.MockTransport(answer)
