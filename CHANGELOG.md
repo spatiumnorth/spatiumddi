@@ -134,6 +134,120 @@ the formatter handles the rest.
   service. The IPAM Templates DDNS tab now needs both DHCP and DNS,
   as the IPAM dialogs' DDNS tab does.
 
+- **An API token bound to specific DNS zones or subnets only reaches
+  the Operator Copilot / MCP tools that narrow their answers to those
+  zones or subnets.** The tools' permission check looks at the resource
+  type, so a token bound to one zone cleared it for every DNS tool, and
+  the tools that list server groups, servers, views or query rates, or
+  count IPAM resources estate-wide, answered as though the token were
+  unbound. The tool registry now refuses an instance-bound token any
+  tool that does not declare `honours_token_binding`, for `tools/list`,
+  MCP `tools/call` and in-app chat alike, the same structural floor the
+  REST routers have. The tools that do declare it (zone and record
+  lists, per-zone DNSSEC / drift / update-ACL reads, the IPAM space /
+  block / subnet / address reads, tag lookup and global search) already
+  filter or gate on the bound instances, and a test pins the list and
+  checks each one against a second zone and subnet. The IPAM tools that
+  accept a space or block by name resolve it only within the binding, so a
+  name outside it reads as not found. Sessions and unbound tokens are
+
+- **Dashboard rollups and the DNS / DHCP traffic series read with the
+  caller's own grants.** `GET /metrics/dns/timeseries` now needs `read` on a
+  DNS type (`dns_group` / `dns_zone` / `dns_record`, as the `/dns` routes do)
+  and `GET /metrics/dhcp/timeseries` needs `read` on `dhcp_server`; both
+  previously answered any signed-in account. The Network and Integrations
+  dashboard tabs need `read` on at least one of the types they summarise and
+  fill only the panels the caller can read — an integration's panel and its
+  recent reconciler errors appear only with `read` on that integration — and
+  say so instead of loading forever when the role covers none of them; the
+  DNS query-rate and DHCP traffic cards likewise say the data is unavailable
+  rather than "No data yet". The tag autocomplete (`GET /tags/keys`,
+  `/tags/values`) offers only tags from tables the caller can read. The
+  built-in Viewer (`read *`) sees everything it saw before. A new guard test
+  walks the route table and fails for any `GET` route with no permission
+  dependency unless it is listed with the reason (pre-sign-in, agent or token
+  authenticated, own rows, static reference data, or checked in the handler);
+  see `docs/PERMISSIONS.md`.
+
+- **The IPAM bulk-delete dialog kept describing what was submitted after
+  an approval policy took it (#2046).** With a `delete:subnet` approval
+  policy, bulk-deleting two subnets showed "2 of 2 submitted for
+  approval." under a dialog that now read "This will move 0 empty blocks
+  to Trash." and "I understand 0 empty Blocks will be moved to Trash.",
+  because the page clears its selection when the requests are filed and
+  the dialog recounted from it. The space and block views now freeze the
+  selection when the dialog opens, and the delete sends that same frozen
+  list, so the confirm describes exactly what goes out. A delete that
+  actually runs still closes the dialog and clears the selection as
+  before. A retry after a partial failure now resends only the items that
+  failed; it used to resend the ones already in Trash too, which came back
+  as fresh failures.
+
+- **A forward zone no longer inherits the group's DNS-over-TLS, so a
+  plain-DNS upstream such as Tailscale's 100.100.100.100 resolves again
+  (#2121).** When a server group forwarded over DoT (#50), every
+  conditional forward zone in it was forced onto DoT too: the zone's
+  queries went to port 853 over TLS, checked against the group
+  provider's certificate name. A forward zone usually points at
+  something internal that answers plain DNS on port 53 only (Tailscale
+  MagicDNS, an AD domain controller, a cloud VPC resolver), so every
+  name in it failed, and an explicit `@53` still got TLS appended. The
+  transport is now the zone's own setting: `forward_transport` on the
+  zone (`do53` by default, `tls`, plus `https` / `quic` on a
+  Technitium-only group) with `forward_tls_hostname`, on the zone API,
+  the add / edit forward-zone form, the zone detail and the
+  `list_dns_zones` Copilot tool. The group's transport now applies to
+  the group's resolver forwarders only. A TLS zone gets its own BIND
+  `tls` statement with its own `remote-hostname`; an entry with an
+  explicit `@53` is always plain DNS, on BIND9 and Technitium. The API
+  refuses an encrypted zone with no hostname, a transport a server in
+  the group cannot speak, an encrypted zone whose forwarders span two
+  certificate names (the #877 rule), and a plain-DNS zone pointed at an
+  encrypted-only upstream. The control-plane config preview renders
+  zone forwarders through the same helper as the agent, which also
+  fixes it emitting `ip@port` verbatim as an unloadable `1.1.1.1@53;`.
+  **Behaviour change:** the upgrade sets every existing forward zone to
+  plain DNS, including zones in groups that forward over TLS today. A
+  zone that really did want DoT must be switched back on the zone, with
+  its TLS hostname. That includes any forward zone pointed at a resolver
+  that answers only over TLS (Mullvad, or an internal DoT-only
+  resolver): it stops resolving at the upgrade until its transport is
+  set back to DNS-over-TLS, and the API now refuses to save a catalogued
+  encrypted-only upstream on plain DNS. **The fix is in the DNS agent:** an agent older than
+  this release ignores the zone's transport and keeps inheriting the
+  group's, so upgrade the DNS agents with the control plane. A new agent
+  talking to an older control plane treats every forward zone as plain
+  DNS. A zone on plain DNS ships no transport in the agent bundle, so a
+  group that does not use the setting keeps its bundle etag across the
+  upgrade and no agent reloads for it.
+
+- **The BIND9 importer reads zones declared with their class
+  (#2099).** `zone "x" IN { ... };` is valid BIND, and it is how
+  RHEL's and Fedora's stock `named.conf` writes every zone, but the
+  parser allowed nothing between the quoted name and the brace, so
+  such a zone was skipped without a word, as was every zone inside
+  `view "v" IN { ... };`. A config written that way was refused as
+  having no zone declarations. An optional class (`IN`, `CHAOS`, `CH`,
+  `HESIOD`, `HS`, any case, with any whitespace or comments around it)
+  is now accepted for zones and views, and a zone inherits its view's
+  class. Zones of a class other than `IN` are not imported as if they
+  were internet-class data: each is listed in the preview's warnings
+  as skipped, naming its class, and a config with nothing but such
+  zones is refused with that reason.
+  Accepting the class also made RHEL's stock
+  `zone "." IN { type hint; … };` readable, and the importer used to map `type hint` to
+  a primary zone: importing it would have made the target group
+  authoritative for the root and broken every recursive lookup it
+  answers. `hint`, `mirror`, `redirect`, `static-stub` and
+  `delegation-only` zones are now skipped with a warning. The
+  importer also no longer drops things without a word: a `zone`
+  block it cannot read (an unquoted name, say) and every `include`
+  it does not follow are named in the preview's warnings, and
+  unbalanced braces refuse the upload instead of silently dropping
+  every zone after the fault. The zone walk is linear now; it
+  re-sliced the config once per zone, which made a 50,000-zone
+  `named.conf` take several seconds.
+
 - **Sync DNS reads an address in every zone it publishes to
   (#2107).** An address with extra zones has its host record in its
   forward zone and in each extra zone IPAM authors, but the drift
@@ -6024,6 +6138,12 @@ the formatter handles the rest.
   A / AAAA named like the address's hostname in its forward or an extra
   zone (or the row `ip_address.dns_record_id` names) stays false; the
   rest are aliases. Downgrade drops the column.
+- `c4f8a2e61d37` — #2121, schema + data: adds
+  `dns_zone.forward_transport` (String(10), NOT NULL, server default
+  `'do53'`) and nullable `dns_zone.forward_tls_hostname`
+  (String(255)). The server default is the backfill: every existing
+  zone, including a forward zone in a group that forwards over TLS,
+  becomes `do53`. Downgrade drops both columns.
 
 ## 2026.10.02-1 — 2026-10-02
 

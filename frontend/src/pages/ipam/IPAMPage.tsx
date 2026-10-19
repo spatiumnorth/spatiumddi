@@ -12881,7 +12881,7 @@ function BlockTreeRow({
 
 // ─── Block Detail View (right panel when block is selected) ──────────────────
 
-function BlockDetailView({
+export function BlockDetailView({
   block: initialBlock,
   spaceName,
   ancestors,
@@ -12932,6 +12932,9 @@ function BlockDetailView({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
+  // #2046 — what the delete dialog describes, frozen when it opens. A filed
+  // approval request clears `selected` while the dialog stays open.
+  const [bulkDeleteKeys, setBulkDeleteKeys] = useState<string[]>([]);
   const [showDnsSync, setShowDnsSync] = useState(false);
   // #2135 — Sync DNS reads and writes the DNS server: hidden with core.dns off.
   const dnsOn = useModuleOn("core.dns");
@@ -12959,10 +12962,12 @@ function BlockDetailView({
     // allSettled on both phases so a single 409 (non-empty subnet/block)
     // doesn't hide the rest. Subnets first — a subnet hanging off a leaf
     // block would otherwise trip the block's RESTRICT FK on cascade.
-    mutationFn: async () => {
+    // #2046 — sends the keys the dialog was opened with (`bulkDeleteKeys`),
+    // not the live selection, so the confirm describes exactly what goes out.
+    mutationFn: async (keys: string[]) => {
       const subnetIds: string[] = [];
       const blockIds: string[] = [];
-      for (const key of selected) {
+      for (const key of keys) {
         if (key.startsWith("subnet:"))
           subnetIds.push(key.slice("subnet:".length));
         else if (key.startsWith("block:"))
@@ -13032,6 +13037,13 @@ function BlockDetailView({
         setShowBulkDelete(false);
         setBlockBulkDeleteNotice(null);
         return;
+      }
+      if (queued === 0) {
+        // #2046 — a retry resends only what failed: the rest are already in
+        // Trash, and resending them would report them as new failures.
+        const failed = failures.map((f) => `${f.kind}:${f.id}`);
+        setBulkDeleteKeys(failed);
+        setSelected(new Set(failed));
       }
       const subnetLookup = new Map(allSubnets.map((s) => [s.id, s.network]));
       const blockLookup = new Map(allBlocks.map((b) => [b.id, b.network]));
@@ -13142,7 +13154,10 @@ function BlockDetailView({
                 <HeaderButton
                   variant="destructive"
                   icon={Trash2}
-                  onClick={() => setShowBulkDelete(true)}
+                  onClick={() => {
+                    setBulkDeleteKeys([...selected]);
+                    setShowBulkDelete(true);
+                  }}
                 >
                   Delete ({selectedCount})
                 </HeaderButton>
@@ -13405,8 +13420,12 @@ function BlockDetailView({
       )}
       {showBulkDelete &&
         (() => {
-          const sCount = selectedSubnetIds.length;
-          const bCount = selectedBlockKeys.length;
+          const sCount = bulkDeleteKeys.filter((k) =>
+            k.startsWith("subnet:"),
+          ).length;
+          const bCount = bulkDeleteKeys.filter((k) =>
+            k.startsWith("block:"),
+          ).length;
           const noun =
             sCount && bCount
               ? `${sCount} subnet${sCount === 1 ? "" : "s"} + ${bCount} block${bCount === 1 ? "" : "s"}`
@@ -13430,6 +13449,7 @@ function BlockDetailView({
               notice={blockBulkDeleteNotice}
               onClose={() => {
                 setShowBulkDelete(false);
+                setBulkDeleteKeys([]);
                 setBlockBulkDeleteError(null);
                 setBlockBulkDeleteNotice(null);
                 blockBulkDeleteMut.reset();
@@ -13437,7 +13457,7 @@ function BlockDetailView({
               onConfirm={() => {
                 setBlockBulkDeleteError(null);
                 setBlockBulkDeleteNotice(null);
-                blockBulkDeleteMut.mutate();
+                blockBulkDeleteMut.mutate(bulkDeleteKeys);
               }}
             />
           );
@@ -14296,7 +14316,7 @@ function MulticastGroupsPanel({
   );
 }
 
-function SpaceTableView({
+export function SpaceTableView({
   space,
   onSelectSubnet,
   onSelectBlock,
@@ -14337,6 +14357,8 @@ function SpaceTableView({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkOpen, setBulkOpen] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
+  // #2046 — what the delete dialog describes, frozen when it opens.
+  const [bulkDeleteKeys, setBulkDeleteKeys] = useState<string[]>([]);
   const [showEditSpace, setShowEditSpace] = useState(false);
   const [showCreateBlock, setShowCreateBlock] = useState(false);
   const [showCreateSubnet, setShowCreateSubnet] = useState(false);
@@ -14369,10 +14391,12 @@ function SpaceTableView({
     // allSettled on both phases so a single 409 (non-empty subnet/block)
     // doesn't hide the rest. Subnets first — a subnet hanging off a leaf
     // block would otherwise trip the block's RESTRICT FK.
-    mutationFn: async () => {
+    // #2046 — sends the keys the dialog was opened with (`bulkDeleteKeys`),
+    // not the live selection, so the confirm describes exactly what goes out.
+    mutationFn: async (keys: string[]) => {
       const subnetIds: string[] = [];
       const blockIds: string[] = [];
-      for (const key of selected) {
+      for (const key of keys) {
         if (key.startsWith("subnet:"))
           subnetIds.push(key.slice("subnet:".length));
         else if (key.startsWith("block:"))
@@ -14445,6 +14469,13 @@ function SpaceTableView({
         setShowBulkDelete(false);
         setSpaceBulkDeleteNotice(null);
         return;
+      }
+      if (queued === 0) {
+        // #2046 — a retry resends only what failed: the rest are already in
+        // Trash, and resending them would report them as new failures.
+        const failed = failures.map((f) => `${f.kind}:${f.id}`);
+        setBulkDeleteKeys(failed);
+        setSelected(new Set(failed));
       }
       const lookup = new Map<string, string>();
       (subnets ?? []).forEach((s) => lookup.set(s.id, s.network));
@@ -14598,7 +14629,10 @@ function SpaceTableView({
                 <HeaderButton
                   variant="destructive"
                   icon={Trash2}
-                  onClick={() => setShowBulkDelete(true)}
+                  onClick={() => {
+                    setBulkDeleteKeys([...selected]);
+                    setShowBulkDelete(true);
+                  }}
                 >
                   Delete ({selectedCount})
                 </HeaderButton>
@@ -15117,10 +15151,10 @@ function SpaceTableView({
         })()}
       {showBulkDelete &&
         (() => {
-          const subnetCount = [...selected].filter((k) =>
+          const subnetCount = bulkDeleteKeys.filter((k) =>
             k.startsWith("subnet:"),
           ).length;
-          const blockCount = [...selected].filter((k) =>
+          const blockCount = bulkDeleteKeys.filter((k) =>
             k.startsWith("block:"),
           ).length;
           const parts: string[] = [];
@@ -15139,6 +15173,7 @@ function SpaceTableView({
               notice={spaceBulkDeleteNotice}
               onClose={() => {
                 setShowBulkDelete(false);
+                setBulkDeleteKeys([]);
                 setSpaceBulkDeleteError(null);
                 setSpaceBulkDeleteNotice(null);
                 bulkDeleteMut.reset();
@@ -15146,7 +15181,7 @@ function SpaceTableView({
               onConfirm={() => {
                 setSpaceBulkDeleteError(null);
                 setSpaceBulkDeleteNotice(null);
-                bulkDeleteMut.mutate();
+                bulkDeleteMut.mutate(bulkDeleteKeys);
               }}
             />
           );
