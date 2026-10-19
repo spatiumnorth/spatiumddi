@@ -547,15 +547,22 @@ async def preview_archive_manifest(
             detail=f"archive exceeds {_MAX_UPLOAD_BYTES} bytes",
         )
     from app.services.backup.archive import (  # noqa: PLC0415
-        read_backup_manifest,
+        preview_backup_archive,
     )
 
     try:
-        manifest = read_backup_manifest(archive_bytes)
+        manifest, dump_format = preview_backup_archive(archive_bytes)
     except BackupArchiveError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "manifest": manifest,
         "archive_bytes": len(archive_bytes),
         "format_recognised": manifest.get("format") == "spatiumddi-backup",
+        # The dump format the restore will act on, resolved by the same
+        # helper the restore uses (#2201). A selective restore needs
+        # ``custom``; the console reads ``selective_restore_supported``
+        # rather than inferring it from ``format_version``, which is 2 for
+        # an Exclude-secrets archive whose dump is plain SQL.
+        "dump_format": dump_format,
+        "selective_restore_supported": dump_format == "custom",
     }
