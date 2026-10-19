@@ -323,7 +323,8 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
 spec:
   type: {{ .Values.api.service.type }}
-  {{- /* #1805: see api.service.trafficDistribution in values.yaml. PreferSameNode
+  {{- /* #1805: see api.service.trafficDistribution in values.yaml (empty by
+         default; the appliance sets PreferSameNode). The PreferSameNode feature
          is on by default from Kubernetes 1.34; older API servers refuse it. */}}
   {{- if and .Values.api.service.trafficDistribution (semverCompare ">=1.34.0-0" .Capabilities.KubeVersion.Version) }}
   trafficDistribution: {{ .Values.api.service.trafficDistribution }}

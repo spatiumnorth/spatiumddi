@@ -1265,6 +1265,24 @@ _CONTROL_PLANE_FAST_EVICT = [
 ]
 
 
+#: #1805 — the api Service's ``trafficDistribution`` on the appliance. The
+#: supervisor's heartbeat, the DNS and DHCP agents and the frontend's ``/api``
+#: proxy reach the api through that Service, and kube-proxy spread their
+#: connections over every api pod, so after a node's hard loss its api pod,
+#: still listed until the node reads NotReady, held a share of every other
+#: node's requests until their own timeout. ``PreferSameNode`` keeps a node's
+#: callers on its own api pod while that pod is ready.
+#:
+#: The appliance's and not the umbrella chart's (whose default is ``""``):
+#: here every control-plane node runs one api pod (``replicas`` = the
+#: control-plane size, hard anti-affinity), while on a BYO-Kubernetes cluster
+#: the field would pin each node's callers to whichever api pod shares their
+#: node. Written at every size, because a merge cannot remove a key and one
+#: api pod makes it inert. firstboot renders the same value, or the first
+#: heartbeat of every install would add a helm revision (#1005).
+_NODE_LOCAL_API = "PreferSameNode"
+
+
 def _deep_merge(base: dict, overlay: dict) -> dict:
     """``overlay`` wins, recursing into dicts so sibling keys survive.
 
@@ -1657,7 +1675,9 @@ def apply_control_plane_overrides(
     replicas + CNPG instances + redis sentinel replicas = ``cp_size``,
     plus the frontend control-plane VIP, plus the api / worker / Postgres
     memory limits, Postgres' shared_buffers and the worker concurrency,
-    sized from ``mem_total_mib`` (see ``control_plane_resources``). Written to the spatium-control
+    sized from ``mem_total_mib`` (see ``control_plane_resources``), plus the
+    api Service's ``trafficDistribution`` (#1805, see ``_NODE_LOCAL_API``).
+    Written to the spatium-control
     HelmChartConfig so it survives a k3s restart (#272).
 
     #1313 — CNPG instances are ``cnpg_instances`` when given: the count
@@ -1714,7 +1734,9 @@ def apply_control_plane_overrides(
         # The slot-image mirror latch (#787) reads the live document, so
         # the owned keys are computed from the same read the merge uses.
         return {
-            "api": dict(scaled) | sized.get("api", {}),
+            "api": dict(scaled)
+            | sized.get("api", {})
+            | {"service": {"trafficDistribution": _NODE_LOCAL_API}},
             "frontend": dict(scaled)
             | {
                 "controlPlaneVIP": vip,

@@ -533,11 +533,15 @@ the formatter handles the rest.
   `/api` proxy. The Service spread their connections over every api pod. A
   lost node's api pod stays listed until the node reads NotReady, about
   40 s, so a heartbeat that landed on it waited out its whole 40 s timeout.
-  Two in a row left a healthy node 97 s without a heartbeat. The api
-  Service now sets `trafficDistribution: PreferSameNode`: each node's
-  callers use the api pod on their own node while it is ready, and every
-  api pod only while it is not. It is rendered on Kubernetes 1.34 and
-  later; `api.service.trafficDistribution: ""` turns it off.
+  Two in a row left a healthy node 97 s without a heartbeat. On the
+  appliance the api Service now sets `trafficDistribution: PreferSameNode`:
+  each node's callers use the api pod on their own node while it is ready,
+  and every api pod only while it is not. firstboot's control-plane values
+  and the supervisor's `spatium-control` HelmChartConfig both set it, so a
+  fresh install, a grown cluster and an upgraded one all carry it. The
+  umbrella chart's new `api.service.trafficDistribution` defaults to `""`,
+  which renders the api Service as before on your own Kubernetes; the field
+  is rendered on Kubernetes 1.34 and later.
 
 - **A node's return no longer rolls CoreDNS out twice (#1753).** k3s
   force re-applies its bundled `coredns.yaml` at every server start. That

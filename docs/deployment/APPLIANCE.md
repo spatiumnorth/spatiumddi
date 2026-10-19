@@ -397,6 +397,23 @@ rollout replaced every CoreDNS pod. With one replica per node, a fast
 eviction has nowhere to put the evicted pod anyway. k3s's re-apply now
 changes nothing.
 
+The api Service gets the same node-local routing as kube-dns (#1805), from the
+appliance's own values rather than the chart's: firstboot renders
+`api.service.trafficDistribution: PreferSameNode` into the `spatium-control`
+HelmChart, and the seed supervisor writes the same key into the
+`spatium-control` HelmChartConfig on every heartbeat, which is what a grown
+or upgraded cluster renders. Every control-plane node runs one api pod, so
+each node's in-cluster callers (its supervisor's heartbeat, the DNS and DHCP
+agents, the frontend's `/api` proxy) use that node's api pod while it is
+ready. A lost node's api pod stays listed until the node reads NotReady, and
+before this a share of every other node's heartbeats waited out their 40 s
+timeout on it, which left a healthy node's heartbeat stale past the demote
+guard's 90 s. The umbrella chart's default is `""`, so an install on your own
+Kubernetes keeps kube-proxy's spread over every api pod. One consequence on
+the appliance: traffic through the control-plane VIP enters through the
+frontend on the node announcing the VIP, and that node's api pod serves it
+alone while it is ready.
+
 **What the Cluster DNS card means** (Cluster → Overview, #985). Until now the
 appliance acted on cluster DNS and showed nothing about it, so a CoreDNS that
 was down, single-replica or co-located read as "everything healthy" until an
@@ -514,7 +531,8 @@ state on its heartbeat:
   `k8s_api.apply_control_plane_overrides()` upserts the `spatium-control`
   override (api/frontend/worker `replicas` + CNPG `instances` + Redis
   `sentinel.replicas` = committed member count, plus
-  `frontend.controlPlaneVIP`). helm-controller *merges* a
+  `frontend.controlPlaneVIP`, plus the api Service's
+  `trafficDistribution: PreferSameNode`). helm-controller *merges* a
   HelmChartConfig on top of its same-named HelmChart on every reconcile.
   Crucially the HelmChartConfig is **not** in the auto-deploy manifests
   dir, so a k3s restart's re-apply of the firstboot HelmChart defaults
@@ -584,7 +602,7 @@ state on its heartbeat:
 
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
-  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
   | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 

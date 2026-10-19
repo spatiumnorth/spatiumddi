@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The api Service keeps each node's callers on that node's api pod (#1805).
+"""The api Service keeps each node's callers on that node's api pod, on the
+appliance and nowhere else (#1805).
 
 The supervisor's heartbeat, the DNS and DHCP agents and the frontend's
 ``/api`` proxy all reach the api through its ClusterIP Service. By default
@@ -11,15 +12,21 @@ and two such waits in a row left a healthy node's heartbeat past the demote
 guard's 90 s. ``trafficDistribution: PreferSameNode`` keeps a node's
 connections on its own api pod while that pod is ready.
 
+The appliance runs one api pod per control-plane node and sets the value in
+its own values (firstboot's HelmChart and the supervisor's HelmChartConfig).
+The umbrella chart's default is ``""``: on a BYO-Kubernetes cluster the field
+would pin each node's callers to whichever api pod shares their node.
+
 Checks every rendered file for Services labelled
-``app.kubernetes.io/component: api``, and fails any whose
-``spec.trafficDistribution`` is not ``PreferSameNode``.
+``app.kubernetes.io/component: api``. By default it fails any whose
+``spec.trafficDistribution`` is not ``PreferSameNode`` (a render with the
+appliance's values). ``--absent`` fails any that carries the field at all
+(the default render, which must stay as it was before #1805, and a render
+below Kubernetes 1.34, where the API server refuses ``PreferSameNode`` and the
+template must omit it).
 
 ``--require`` additionally fails when no api Service was checked at all, so
 a dedicated render cannot silently stop exercising the template.
-``--absent`` inverts the check for the render below Kubernetes 1.34, where
-the API server refuses ``PreferSameNode`` and the template must omit the
-field.
 
 Usage: chart-api-node-local.py [--require] [--absent]
            <manifest.yaml> [<manifest.yaml> ...]
@@ -54,14 +61,17 @@ def check(path: Path, absent: bool) -> tuple[list[str], int]:
         got = (doc.get("spec") or {}).get("trafficDistribution")
         if absent and got is not None:
             problems.append(
-                f"{path}: Service {name!r} renders trafficDistribution {got} "
-                "below Kubernetes 1.34, where the API server refuses it (#1805)"
+                f"{path}: Service {name!r} renders trafficDistribution {got}, "
+                "which this render must omit: the umbrella default leaves it to "
+                "the appliance, and below Kubernetes 1.34 the API server refuses "
+                "it (#1805)"
             )
         if not absent and got != WANT:
             problems.append(
                 f"{path}: Service {name!r} has trafficDistribution "
-                f"{got or 'unset'}, expected {WANT}: a lost node's api pod "
-                "would hold other nodes' requests until their timeout (#1805)"
+                f"{got or 'unset'}, expected {WANT} with the appliance's values: "
+                "a lost node's api pod would hold other nodes' requests until "
+                "their timeout (#1805)"
             )
     return problems, checked
 
