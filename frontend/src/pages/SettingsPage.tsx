@@ -1422,6 +1422,7 @@ export function SettingsPage() {
                 >
                   <input
                     value={values.app_base_url ?? ""}
+                    maxLength={500}
                     onChange={(e) => set("app_base_url", e.target.value)}
                     placeholder="https://ddi.example.com"
                     disabled={!isSuperadmin}

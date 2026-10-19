@@ -64,7 +64,7 @@ export function BackupPage() {
         <p className="mt-1 text-xs text-muted-foreground">
           <strong>Manual</strong> — one-off download + restore-from-file.{" "}
           <strong>Destinations</strong> — configure where scheduled backups go
-          (local volume, network share or object store). Schedule a recurring
+          (Add target lists every destination kind). Schedule a recurring
           backup, view archives at the destination, restore from any archive.{" "}
           <strong>Restore Drills</strong> — prove an archive is actually
           restorable by test-restoring it into a throwaway database.{" "}

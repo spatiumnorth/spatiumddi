@@ -24,6 +24,8 @@ const restore = vi.fn();
 const drillReadiness = vi.fn();
 const listDrills = vi.fn();
 const update = vi.fn();
+const runNow = vi.fn();
+const testTarget = vi.fn();
 
 function refusal(status: number, detail: string) {
   return Object.assign(new Error(`Request failed with status code ${status}`), {
@@ -42,6 +44,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
       drillReadiness,
       listDrills,
       update,
+      runNow,
+      test: testTarget,
     },
   };
 });
@@ -146,10 +150,13 @@ describe("Backup page", () => {
     list.mockResolvedValue([]);
     withClient(<BackupPage />);
     await screen.findByText("Restore from file");
-    expect(document.body.textContent).not.toMatch(/local volumes, S3, SCP/);
+    // Names no kind rather than a subset of the ten the API offers.
+    expect(document.body.textContent).not.toMatch(
+      /local volume|S3|SCP|Azure|network share|object store/i,
+    );
     fireEvent.click(screen.getByRole("button", { name: "Destinations" }));
     await screen.findByText(/No backup targets configured/);
-    expect(document.body.textContent).not.toMatch(/to a local volume\./);
+    expect(document.body.textContent).not.toMatch(/local volume/i);
   });
 
   it("shows the API's reason when a drill schedule is refused (#2203)", async () => {
@@ -174,6 +181,28 @@ describe("Backup page", () => {
       expect(screen.getByText("a drill is already running")).toBeTruthy(),
     );
     expect(screen.queryByText(/status code 409/)).toBeNull();
+  });
+
+  it("shows the API's reason when a target's run-now or test is refused (#2203)", async () => {
+    me.mockResolvedValue({ is_superadmin: true });
+    list.mockResolvedValue([
+      { id: "t1", name: "nas", kind: "smb", enabled: true },
+    ]);
+    runNow.mockRejectedValue(refusal(409, "a run is already in progress"));
+    testTarget.mockRejectedValue(refusal(404, "backup target not found"));
+    withClient(<BackupPage />);
+    await screen.findByText("Restore from file");
+    fireEvent.click(screen.getByRole("button", { name: "Destinations" }));
+    fireEvent.click(await screen.findByTitle("Run now"));
+    await waitFor(() =>
+      expect(screen.getByText("a run is already in progress")).toBeTruthy(),
+    );
+    expect(screen.queryByText(/status code 409/)).toBeNull();
+    fireEvent.click(screen.getByTitle("Test connection"));
+    await waitFor(() =>
+      expect(screen.getByText("backup target not found")).toBeTruthy(),
+    );
+    expect(screen.queryByText(/status code 404/)).toBeNull();
   });
 
   it("offers a Viewer no Add target and does not call a refused read empty (#2204)", async () => {
