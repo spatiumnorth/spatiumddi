@@ -483,6 +483,8 @@ export interface DnsSyncStale {
   name: string;
   value: string;
   reason: string;
+  /** Live IPAM row the record hangs off; null when the address is gone. */
+  ip_id?: string | null;
 }
 
 export interface DnsSyncPreview {
