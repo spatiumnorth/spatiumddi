@@ -64,7 +64,7 @@ def test_heartbeat_404_re_registers_without_stopping(
     monkeypatch.setattr(bootstrap_mod, "register", fake_register)
     token_ref = ["old-token"]
     hb = HeartbeatClient(cfg, token_ref)
-    monkeypatch.setattr(hb, "_client", lambda: _Client())
+    monkeypatch.setattr(hb, "_client", _Client)
     hb.send_once()
     assert calls == [1]
     assert token_ref[0] == "new-token"

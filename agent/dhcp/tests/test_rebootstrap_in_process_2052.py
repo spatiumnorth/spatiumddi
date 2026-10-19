@@ -15,7 +15,6 @@ from typing import Any
 import pytest
 
 from spatium_dhcp_agent import bootstrap as bootstrap_mod
-from spatium_dhcp_agent import sync as sync_mod
 from spatium_dhcp_agent.cache import ensure_layout, load_token, save_token
 from spatium_dhcp_agent.config import AgentConfig
 from spatium_dhcp_agent.config_apply import ApplyStatus
