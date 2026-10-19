@@ -121,6 +121,44 @@ the formatter handles the rest.
   failed; it used to resend the ones already in Trash too, which came back
   as fresh failures.
 
+- **A forward zone no longer inherits the group's DNS-over-TLS, so a
+  plain-DNS upstream such as Tailscale's 100.100.100.100 resolves again
+  (#2121).** When a server group forwarded over DoT (#50), every
+  conditional forward zone in it was forced onto DoT too: the zone's
+  queries went to port 853 over TLS, checked against the group
+  provider's certificate name. A forward zone usually points at
+  something internal that answers plain DNS on port 53 only (Tailscale
+  MagicDNS, an AD domain controller, a cloud VPC resolver), so every
+  name in it failed, and an explicit `@53` still got TLS appended. The
+  transport is now the zone's own setting: `forward_transport` on the
+  zone (`do53` by default, `tls`, plus `https` / `quic` on a
+  Technitium-only group) with `forward_tls_hostname`, on the zone API,
+  the add / edit forward-zone form, the zone detail and the
+  `list_dns_zones` Copilot tool. The group's transport now applies to
+  the group's resolver forwarders only. A TLS zone gets its own BIND
+  `tls` statement with its own `remote-hostname`; an entry with an
+  explicit `@53` is always plain DNS, on BIND9 and Technitium. The API
+  refuses an encrypted zone with no hostname, a transport a server in
+  the group cannot speak, an encrypted zone whose forwarders span two
+  certificate names (the #877 rule), and a plain-DNS zone pointed at an
+  encrypted-only upstream. The control-plane config preview renders
+  zone forwarders through the same helper as the agent, which also
+  fixes it emitting `ip@port` verbatim as an unloadable `1.1.1.1@53;`.
+  **Behaviour change:** the upgrade sets every existing forward zone to
+  plain DNS, including zones in groups that forward over TLS today. A
+  zone that really did want DoT must be switched back on the zone, with
+  its TLS hostname. That includes any forward zone pointed at a resolver
+  that answers only over TLS (Mullvad, or an internal DoT-only
+  resolver): it stops resolving at the upgrade until its transport is
+  set back to DNS-over-TLS, and the API now refuses to save a catalogued
+  encrypted-only upstream on plain DNS. **The fix is in the DNS agent:** an agent older than
+  this release ignores the zone's transport and keeps inheriting the
+  group's, so upgrade the DNS agents with the control plane. A new agent
+  talking to an older control plane treats every forward zone as plain
+  DNS. A zone on plain DNS ships no transport in the agent bundle, so a
+  group that does not use the setting keeps its bundle etag across the
+  upgrade and no agent reloads for it.
+
 - **The BIND9 importer reads zones declared with their class
   (#2099).** `zone "x" IN { ... };` is valid BIND, and it is how
   RHEL's and Fedora's stock `named.conf` writes every zone, but the
@@ -6038,6 +6076,12 @@ the formatter handles the rest.
   A / AAAA named like the address's hostname in its forward or an extra
   zone (or the row `ip_address.dns_record_id` names) stays false; the
   rest are aliases. Downgrade drops the column.
+- `c4f8a2e61d37` — #2121, schema + data: adds
+  `dns_zone.forward_transport` (String(10), NOT NULL, server default
+  `'do53'`) and nullable `dns_zone.forward_tls_hostname`
+  (String(255)). The server default is the backfill: every existing
+  zone, including a forward zone in a group that forwards over TLS,
+  becomes `do53`. Downgrade drops both columns.
 
 ## 2026.10.02-1 — 2026-10-02
 
