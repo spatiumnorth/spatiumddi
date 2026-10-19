@@ -34,6 +34,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
+from app.services.nettools.budgets import BUDGETS as _RATE_LIMIT_BUDGETS
 
 # Each tool's executor: takes the user's DB session, the requesting
 # user (for permission scoping if needed), and a parsed Pydantic args
@@ -194,6 +195,12 @@ class Tool:
     # Defaults to None only so the dataclass field order works; the
     # registry refuses to register a tool without a valid one.
     permission: ToolPermission | None = None
+    # Network-tool budget bucket (``"default"`` / ``"offprem"``, see
+    # ``app.services.nettools.budgets``) for a tool that sends traffic
+    # off the SpatiumDDI host — the same per-user budget the matching
+    # ``/api/v1/tools/*`` route spends, so REST and copilot calls share
+    # it. None for tools that only read the database.
+    rate_limit: str | None = None
     # Whether the tool narrows its output to the instances an API token is
     # bound to (``app.services.ai.tools.scope``). A token bound to specific
     # zones / subnets may only call tools that set this — see
@@ -240,6 +247,11 @@ class ToolRegistry:
 
     def register(self, tool: Tool) -> None:
         validate_tool_permission(tool.name, tool.permission)
+        if tool.rate_limit is not None and tool.rate_limit not in _RATE_LIMIT_BUDGETS:
+            raise ValueError(
+                f"Tool {tool.name!r} declares unknown rate_limit bucket "
+                f"{tool.rate_limit!r}; use one of {sorted(_RATE_LIMIT_BUDGETS)}."
+            )
         if tool.name in self._tools:
             raise ValueError(f"Tool {tool.name!r} is already registered.")
         self._tools[tool.name] = tool
@@ -283,6 +295,12 @@ class ToolRegistry:
         The tool's ``permission`` (and, for an instance-bound API token,
         ``honours_token_binding``) is enforced here for EVERY caller,
         regardless of ``effective`` (GHSA-4wrc-78rq-vgcg).
+
+        A tool declaring ``rate_limit`` spends one call from the caller's
+        network-tool budget before it runs — the same counter the
+        ``/api/v1/tools/*`` routes spend. Once the window is used up the
+        tool does not run and the call returns :func:`rate_limit_refusal`,
+        a result the model can relay, rather than raising.
         """
         tool = self.get(name)
         if tool is None:
@@ -295,7 +313,40 @@ class ToolRegistry:
             args = tool.args_model.model_validate(raw_args or {})
         except Exception as exc:
             raise ToolArgumentError(name, str(exc)) from exc
+        if tool.rate_limit is not None:
+            # Imported here: the throttle module loads the FastAPI auth
+            # deps, which must not load on the tool-registry import path.
+            from app.services.nettools.throttle import consume_budget  # noqa: PLC0415
+
+            if await consume_budget(str(user.id), tool.rate_limit):
+                return rate_limit_refusal(name, tool.rate_limit)
         return await tool.executor(db, user, args)
+
+
+def rate_limit_refusal(name: str, bucket: str) -> dict[str, Any]:
+    """The result a rate-limited tool call returns instead of running."""
+    from app.services.nettools.budgets import (  # noqa: PLC0415
+        WINDOW_SECONDS,
+        budget_exceeded_message,
+    )
+
+    return {
+        "tool": name,
+        "error": budget_exceeded_message(bucket),
+        "rate_limited": True,
+        "retry_after_seconds": WINDOW_SECONDS,
+        "hint": (
+            "This budget is per user and shared with the Tools page. Tell the "
+            f"user to wait about {WINDOW_SECONDS} seconds before trying again; "
+            "do not retry in this turn."
+        ),
+    }
+
+
+def is_rate_limit_refusal(result: Any) -> bool:
+    """Whether ``result`` is a :func:`rate_limit_refusal` — lets the MCP and
+    chat surfaces mark it as a failed call."""
+    return isinstance(result, dict) and result.get("rate_limited") is True
 
 
 # Module-level singleton. Tool modules call ``register_tool(...)`` on
@@ -336,12 +387,15 @@ def register_tool(
     default_enabled: bool = True,
     module: str | None = None,
     permission: ToolPermission,
+    rate_limit: str | None = None,
     honours_token_binding: bool = False,
 ) -> Callable[[ToolExecutor], ToolExecutor]:
     """Decorator. Use on each tool's executor function.
 
-    ``permission`` is mandatory — see ``ToolPermission``.
-    ``honours_token_binding`` — see :func:`tool_callable_by`.
+    ``permission`` is mandatory — see ``ToolPermission``. ``rate_limit``
+    names the network-tool budget bucket for a tool that sends traffic off
+    the host (see ``Tool.rate_limit``). ``honours_token_binding`` — see
+    :func:`tool_callable_by`.
 
     Example::
 
@@ -373,6 +427,7 @@ def register_tool(
                 default_enabled=default_enabled,
                 module=module,
                 permission=permission,
+                rate_limit=rate_limit,
                 honours_token_binding=honours_token_binding,
             )
         )
