@@ -163,8 +163,11 @@ the formatter handles the rest.
   block, and `$domain=`, `$third-party`, `$client=` and similar rules,
   which narrow a block DNS cannot narrow, became unconditional blocks.
   Now `@@` rules become the list's exceptions (marked `source: feed` and
-  re-synced on each refresh; exceptions you add stay yours), `$important`
-  is a plain block, a `$badfilter` rule drops the rule it names, and a
+  re-synced on each refresh; exceptions you add stay yours, and adding
+  or editing one the feed already lists makes it yours). Like any
+  exception, a feed's `@@` applies to every list on the same group or
+  view. `$important` is a plain block that still beats a plain `@@` for
+  the same name, a `$badfilter` rule drops the rule it names, and a
   rule with any other modifier is skipped. Regex rules, path rules and
   other rules that are not `||name^` are skipped too. Each skipped rule is
   counted by category, stored as `feed_parse_skipped` on the list, shown

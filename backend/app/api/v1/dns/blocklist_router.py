@@ -1521,16 +1521,26 @@ async def add_exception(
             DNSBlockListException.domain == domain,
         )
     )
-    if existing.scalar_one_or_none():
+    prior = existing.scalar_one_or_none()
+    if prior is not None and prior.source != "feed":
         raise HTTPException(status_code=409, detail="Exception already exists")
 
-    ex = DNSBlockListException(
-        list_id=list_id,
-        domain=domain,
-        reason=body.reason,
-        created_by_user_id=current_user.id,
-    )
-    db.add(ex)
+    if prior is not None:
+        # The feed already excepts this name (#2123). Adding it by hand makes
+        # it the operator's: a feed row is removed by the next refresh that
+        # no longer lists it, which would silently undo what was just asked.
+        ex = prior
+        ex.source = "manual"
+        ex.reason = body.reason
+        ex.created_by_user_id = current_user.id
+    else:
+        ex = DNSBlockListException(
+            list_id=list_id,
+            domain=domain,
+            reason=body.reason,
+            created_by_user_id=current_user.id,
+        )
+        db.add(ex)
     await db.flush()  # column-default id must exist before the audit row reads it (#2006)
     db.add(
         _audit(
@@ -1586,6 +1596,11 @@ async def update_exception(
         changes["domain"] = domain
     for k, v in changes.items():
         setattr(ex, k, v)
+    if changes:
+        # An edited feed row is the operator's from now on (#2123): a refresh
+        # removes any feed row the feed no longer lists, which would drop
+        # an edit — a renamed row always — at the next sync.
+        ex.source = "manual"
     db.add(
         _audit(
             current_user,

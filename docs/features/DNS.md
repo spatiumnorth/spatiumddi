@@ -833,8 +833,13 @@ DNSBlockListException
   rest of the syntax ([#2123](https://github.com/spatiumnorth/spatiumddi/issues/2123)):
   - `@@||name^` becomes an **exception** on the list (source `feed`),
     re-synced by every refresh. An exception you add by hand is never
-    removed by a refresh.
-  - `$important` is kept as a plain block (it only changes precedence).
+    removed by a refresh, and adding (or editing) one the feed already
+    lists makes it yours. Like every exception, it applies to **every
+    list** assigned to the same group or view, not only the feed's own:
+    a feed's `@@` rule can unblock a name another list blocks.
+  - `$important` is kept as a plain block, and still beats a plain `@@`
+    for the same name in the feed (that is what it means), so that
+    exception is not stored.
   - `$badfilter` disables the rule it names; neither becomes an entry.
   - Any other modifier (`$domain=`, `$third-party`, `$client=`,
     `$dnstype=`, `$denyallow=`, …) **skips the rule**. Most of them narrow

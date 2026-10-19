@@ -258,6 +258,21 @@ def test_adblock_parses_every_rule_shape_for_what_it_says() -> None:
     }
 
 
+def test_an_important_block_overrules_a_plain_exception_for_its_name() -> None:
+    """``$important`` exists to beat ``@@``: kept as a plain block, it must
+    still not lose to an exception the feed lists for the same name, or the
+    exception (applied group-wide) would unblock what the feed insists on."""
+    p = parse_feed_detailed(
+        "||forced.example.com^$important\n"
+        "@@||forced.example.com^\n"
+        "||both.example.com^$important\n"
+        "@@||both.example.com^$important\n",
+        "adblock",
+    )
+    assert p.domains == ["forced.example.com"]
+    assert p.exceptions == ["both.example.com"]
+
+
 def test_adblock_rules_count_as_subdomain_intent_894() -> None:
     """``||name^`` means "and every subdomain"; an apex-only list against an
     adblock feed must log the #894 override as a ``*.`` feed does."""
@@ -373,3 +388,37 @@ async def test_refresh_stores_feed_exceptions_and_skip_counts(
     assert await _exceptions() == {"mine.example": "manual", "both.example": "manual"}
     await db_session.refresh(bl)
     assert bl.feed_parse_skipped == {"regex": 0, "modifier": 0, "badfilter": 0, "malformed": 0}
+
+
+@pytest.mark.asyncio
+async def test_adding_a_feed_exception_by_hand_makes_it_the_operators(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A manual add of a name the feed already excepts adopts the feed row
+    instead of 409ing: otherwise the next refresh that stops listing it
+    deletes the exception the operator just asked for."""
+    headers = await _token(db_session)
+    bl = DNSBlockList(name="adguard-adopt", source_type="url", feed_format="adblock")
+    db_session.add(bl)
+    await db_session.flush()
+    db_session.add(
+        DNSBlockListException(list_id=bl.id, domain="ok.example", reason="feed", source="feed")
+    )
+    db_session.add(DNSBlockListException(list_id=bl.id, domain="mine.example", reason="ours"))
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/dns/blocklists/{bl.id}/exceptions",
+        json={"domain": "OK.example", "reason": "keep it"},
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["source"] == "manual"
+    assert resp.json()["reason"] == "keep it"
+
+    dup = await client.post(
+        f"/api/v1/dns/blocklists/{bl.id}/exceptions",
+        json={"domain": "mine.example", "reason": "again"},
+        headers=headers,
+    )
+    assert dup.status_code == 409, dup.text

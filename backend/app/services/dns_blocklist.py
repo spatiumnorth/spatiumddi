@@ -426,10 +426,20 @@ def _parse_adblock(content: str) -> ParsedFeed:
         key: _RuleKey = (is_exception, pattern, mods)
         (allows if is_exception else blocks).append((key, host))
 
+    # ``$important`` raises a block over every exception that is not itself
+    # ``$important`` — that is the modifier's whole meaning. So a plain
+    # ``@@`` for a name an important block names is overruled, and is not
+    # stored: a stored exception would unblock the name for every list on
+    # the group, inverting the feed's intent.
+    important_blocks = {
+        host for key, host in blocks if key not in cancelled and "important" in key[2]
+    }
     exceptions: list[str] = []
     excepted: set[str] = set()
     for key, host in allows:
         if key in cancelled or host in excepted:
+            continue
+        if host in important_blocks and "important" not in key[2]:
             continue
         excepted.add(host)
         exceptions.append(host)
