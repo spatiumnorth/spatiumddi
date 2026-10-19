@@ -128,9 +128,12 @@ describe("space bulk delete dialog after the approval queue took it", () => {
     queued: boolean,
     respond?: (id: string, force?: boolean) => Promise<unknown>,
   ) {
-    const deleteSubnet = vi.fn(
-      respond ??
-        (() => (queued ? QUEUED : Promise.resolve({ status: 204, data: "" }))),
+    const deleteSubnet = vi.fn<Answer>((...args) =>
+      respond
+        ? respond(args[0] as string, args[1] as boolean | undefined)
+        : queued
+          ? QUEUED
+          : Promise.resolve({ status: 204, data: "" }),
     );
     answers.ipamApi = {
       listBlocks: () => Promise.resolve([block]),
