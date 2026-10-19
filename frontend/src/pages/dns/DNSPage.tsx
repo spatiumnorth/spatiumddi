@@ -794,6 +794,13 @@ function ImportZoneModal({
   );
   const [preview, setPreview] = useState<DNSImportPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // #2167 — the import works on the shared records only (no view picker), so
+  // a group with split-horizon views says so before anything is replaced.
+  const { data: views } = useQuery({
+    queryKey: ["dns-views", groupId],
+    queryFn: () => dnsApi.listViews(groupId),
+  });
+  const hasViews = (views?.length ?? 0) > 0;
 
   const previewMut = useMutation({
     mutationFn: () =>
@@ -907,13 +914,20 @@ function ImportZoneModal({
               Merge — add new, update changed, keep existing
             </option>
             <option value="replace">
-              Replace — make the zone match the file exactly
+              Replace — also delete records the file omits
             </option>
             <option value="append">
               Append — only add records that do not exist
             </option>
           </select>
         </Field>
+
+        <p className="text-xs text-muted-foreground">
+          Records owned by IPAM, a DNS pool, an integration, an ACME challenge
+          or a dynamic-update client are never changed or deleted.
+          {hasViews &&
+            " This group has split-horizon views: the import works on the shared records (those with no view) only, and leaves every view's records alone."}
+        </p>
 
         {error && (
           <div className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
@@ -944,7 +958,7 @@ function ImportZoneModal({
             {preview.skipped.length > 0 && (
               <details className="rounded border" open>
                 <summary className="cursor-pointer px-2 py-1 text-xs font-medium text-amber-600">
-                  Will not be imported ({preview.skipped.length})
+                  Left alone ({preview.skipped.length})
                 </summary>
                 <ul className="max-h-40 overflow-auto px-2 py-1 text-xs">
                   {preview.skipped.map((s, i) => (

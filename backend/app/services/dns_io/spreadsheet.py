@@ -26,7 +26,7 @@ Columns (``RECORD_COLUMNS``), one row per record::
 * ``comment`` — free text, stored as the record's ``comment`` tag. It never
   reaches a DNS server.
 * ``managed`` — export only, ignored on import: why a row is read-only
-  (``ipam``, ``pool``, …). Blank for an operator-owned record.
+  (``ipam``, ``pool``, ``acme``, ``ddns``, …). Blank for an operator-owned record.
 
 Match rule, per row, in this order:
 
@@ -60,6 +60,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSView, DNSZone
 from app.services.dns.cname_conflict import NameRow, refused_by_cname_rule
+from app.services.dns.ingest import EXTERNAL_IMPORT_SOURCE
+from app.services.integration_ownership import ACME_RECORD_TAG
 from app.services.ipam_io.export import FORMULA_TRIGGERS, sanitize_cell
 
 RECORD_COLUMNS: list[str] = [
@@ -104,11 +106,12 @@ class SpreadsheetError(ValueError):
 
 
 def managed_by(record: DNSRecord) -> str | None:
-    """Which integration owns *record*, or None for an operator-owned row.
+    """What owns *record*, or None for an operator-owned row.
 
     The record API refuses edits to a pool's or a synthesising integration's
-    rows; IPAM's are protected here too, so a spreadsheet round trip cannot
-    make DNS and IPAM disagree.
+    rows; IPAM's, ACME's and dynamic-update clients' are protected here too,
+    so an import (spreadsheet or zone file, #2167) cannot make DNS and IPAM
+    disagree or delete a record another writer holds.
     """
     if record.pool_member_id is not None:
         return "pool"
@@ -118,8 +121,18 @@ def managed_by(record: DNSRecord) -> str | None:
         return "netbird"
     if record.kubernetes_cluster_id is not None:
         return "kubernetes"
+    # ACME challenge TXT rows are ``auto_generated`` too, but IPAM did not
+    # write them and editing an IP address does nothing to them (#2167).
+    if (record.tags or {}).get(ACME_RECORD_TAG):
+        return "acme"
     if record.auto_generated or record.ip_alias or record.ip_address_id is not None:
         return "ipam"
+    # A record a dynamic-update client (an AD domain controller, a DHCP
+    # server) wrote straight into the live zone, mirrored back by the agent
+    # (#641). No file the operator imports knows about it, so a replace would
+    # delete a registration the client believes it still holds (#2167).
+    if record.import_source == EXTERNAL_IMPORT_SOURCE:
+        return "ddns"
     return None
 
 
@@ -129,7 +142,20 @@ _MANAGED_REASON = {
     "tailscale": "synthesised by the Tailscale integration",
     "netbird": "synthesised by the NetBird integration",
     "kubernetes": "mirrored from a Kubernetes cluster",
+    "acme": "an ACME challenge record; its certificate order removes it",
+    "ddns": (
+        "registered by a dynamic-update client in the live zone; "
+        "delete it from the record list to remove it"
+    ),
 }
+
+
+def managed_reason(record: DNSRecord) -> str | None:
+    """Why *record* is read-only to an import, or None when the operator owns
+    it. Shared with the zone-file import (#2167), so the two importers protect
+    the same rows with the same words."""
+    owner = managed_by(record)
+    return None if owner is None else _MANAGED_REASON[owner]
 
 
 def record_comment(record: DNSRecord) -> str | None:

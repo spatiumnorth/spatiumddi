@@ -219,7 +219,9 @@ from app.services.dns.zone_templates import (
     validate_params,
 )
 from app.services.dns_io import (
+    ParsedRecord,
     RecordChange,
+    ZoneDiff,
     ZoneParseError,
     apply_cname_rule,
     diff_records,
@@ -8791,6 +8793,38 @@ async def _load_zone_records(zone_id: uuid.UUID, db: DB) -> list[DNSRecord]:
     return list(result.scalars().all())
 
 
+async def _diff_zone_file(
+    db: DB,
+    zone: DNSZone,
+    body: ImportPreviewRequest,
+    parsed: list[ParsedRecord],
+    existing: list[DNSRecord],
+) -> ZoneDiff:
+    """The zone-file import's diff, shared by preview and commit so the two
+    cannot disagree (#2167): scoped to ``body.view_id`` (None = the shared
+    records), with IPAM- and integration-owned rows protected."""
+    views = (
+        (await db.execute(select(DNSView).where(DNSView.group_id == zone.group_id))).scalars().all()
+    )
+    view_names = {v.id: v.name for v in views}
+    if body.view_id is not None and body.view_id not in view_names:
+        raise HTTPException(
+            status_code=422,
+            detail="view_id does not name a view in this zone's server group",
+        )
+    replace = body.conflict_strategy == "replace"
+    diff = diff_records(
+        parsed,
+        existing,
+        zone_default_ttl=zone.ttl,
+        view_id=body.view_id,
+        view_names=view_names,
+        replace=replace,
+    )
+    apply_cname_rule(diff, existing, replace=replace)
+    return diff
+
+
 def _change_to_response(c: RecordChange) -> RecordChangeResponse:
     return RecordChangeResponse(
         op=c.op,
@@ -8865,8 +8899,7 @@ async def import_zone_preview(
         raise HTTPException(status_code=422, detail=str(exc))
 
     existing = await _load_zone_records(zone_id, db)
-    diff = diff_records(parsed.records, existing, zone_default_ttl=zone.ttl)
-    apply_cname_rule(diff, existing, replace=body.conflict_strategy == "replace")
+    diff = await _diff_zone_file(db, zone, body, parsed.records, existing)
 
     return ImportPreviewResponse(
         zone_id=zone.id,
@@ -8900,8 +8933,15 @@ async def import_zone_commit(
     * ``merge``   — create new, update changed, keep records that are absent
                     from the zone file (additive)
     * ``replace`` — create new, update changed, delete records absent from the
-                    zone file (make the zone match the file exactly)
+                    zone file (the operator-owned records in the import's
+                    scope come to match the file)
     * ``append``  — only create new records; existing records are left alone
+
+    The import works on ONE view scope (#2167): ``view_id``, or the shared
+    records when it is null. Records in other scopes are never changed or
+    deleted, nor are records IPAM, an integration, an ACME challenge or a
+    dynamic-update client owns (``managed_by``); both are reported in
+    ``skipped``.
 
     Auditing: one summary ``AuditLog`` entry is written under
     ``resource_type='dns_zone_import'`` tagged with a ``batch_id``.
@@ -8917,8 +8957,7 @@ async def import_zone_commit(
         raise HTTPException(status_code=422, detail=str(exc))
 
     existing = await _load_zone_records(zone_id, db)
-    diff = diff_records(parsed.records, existing, zone_default_ttl=zone.ttl)
-    apply_cname_rule(diff, existing, replace=body.conflict_strategy == "replace")
+    diff = await _diff_zone_file(db, zone, body, parsed.records, existing)
 
     # #1861 — the route takes ``write`` on ``dns_record``; a ``replace`` that
     # would remove records also takes ``delete``, as the record DELETE does.
@@ -8968,6 +9007,7 @@ async def import_zone_commit(
             priority=change.priority,
             weight=change.weight,
             port=change.port,
+            view_id=change.view_id,
             created_by_user_id=current_user.id,
         )
         db.add(row)
