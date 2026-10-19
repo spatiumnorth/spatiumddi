@@ -632,6 +632,12 @@ export interface Subnet {
   // ``ipamApi.probePolicy(subnetId)``.
   do_not_probe?: boolean;
   do_not_probe_reason?: string;
+  // #2137 — show the "N free · click to allocate" gap rows. null / absent
+  // = the default rule (off for integration-owned or larger-than-/16).
+  show_free_ranges?: boolean | null;
+  // Name of the integration mirroring this subnet (kubernetes, tailscale…),
+  // null when operator-owned. Read-only.
+  integration_owner?: string | null;
   // Compliance / classification flags. First-class booleans (rather
   // than freeform tags) so auditor queries — "show me every PCI
   // subnet" — are clean indexed predicates. Default false on every

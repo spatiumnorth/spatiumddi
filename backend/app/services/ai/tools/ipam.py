@@ -430,6 +430,9 @@ async def get_subnet_summary(
         "do_not_probe": probe.blocked,
         "do_not_probe_reason": probe.reason,
         "do_not_probe_source": probe.source or None,
+        # #2137 — the subnet's own display choice; null = the default rule
+        # (hidden for integration-owned / larger-than-/16 subnets).
+        "show_free_ranges": subnet.show_free_ranges,
     }
 
 

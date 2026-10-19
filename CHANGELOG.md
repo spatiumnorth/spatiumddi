@@ -27,6 +27,22 @@ the formatter handles the rest.
 
 ### Added
 
+- **The IP table can hide its "N free, click to allocate" rows
+  (#2137).** On a very large or integration-mirrored subnet (a
+  Tailscale `100.64.0.0/10` holding a few dozen nodes) nearly every
+  row was a green gap bar, and "click to allocate" invited a manual
+  allocation the overlay would never honour. Edit Subnet gains
+  "Free-range rows in the address table" (Default / Show / Hide,
+  stored as nullable `subnet.show_free_ranges`) and the table header
+  gains a "Hide free ranges" checkbox beside "Hide network/broadcast",
+  remembered per subnet for the session. Default when the subnet has no
+  setting: hidden for an integration-owned subnet (new read-only
+  `integration_owner` on the subnet response) and for anything larger
+  than a /16 IPv4 (shorter than /48 IPv6, where gap rows are not drawn
+  today); an explicit value always wins. Display only: Total /
+  Allocated / Utilization, the Allocate IP button and Next available
+  are unchanged. `get_subnet` copilot tool reports the field.
+
 - **The Helm chart's migrate Job takes annotations, so it works under
   GitOps (#2114).** Under `helm template`, which is how Argo CD and
   similar tools render a chart, the Helm revision is always 1. The
@@ -5868,6 +5884,9 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `c4a8e1f26d93` — #2137: `subnet.show_free_ranges`, a nullable
+  boolean. No backfill: NULL means "use the default rule". Downgrade
+  drops the column.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column

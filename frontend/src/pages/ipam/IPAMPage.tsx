@@ -111,6 +111,7 @@ import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
+import { resolveShowFreeRanges } from "@/lib/ipam-free-ranges";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
@@ -4865,6 +4866,14 @@ export function SubnetDetail({
     "ipam-hide-reserved",
     false,
   );
+  // "Hide free ranges" (#2137): a per-subnet session override of the subnet's
+  // own setting / default rule. Keyed by subnet id so flipping it on one
+  // subnet does not leak to the next; absent = follow the setting.
+  const [freeRangeOverride, setFreeRangeOverride] = useSessionState<
+    Record<string, boolean>
+  >("ipam-hide-free-ranges", {});
+  const hideFreeRanges =
+    freeRangeOverride[subnet.id] ?? !resolveShowFreeRanges(subnet);
   // Rows the "Hide network/broadcast" toggle removes. Defined once so the
   // Select-all `selectable` set can exclude exactly what the table hides —
   // otherwise Select-all would pick hidden rows and a bulk delete/edit would
@@ -5318,7 +5327,12 @@ export function SubnetDetail({
       // *filtered* list, so a filter that hides allocated rows would fabricate
       // a clickable "N free" range over addresses that are actually in use —
       // and the allocate modal it opens would then collide (#501).
-      if (!hasActiveFilter && prevIpInt !== null && ipInt - prevIpInt > 1) {
+      if (
+        !hasActiveFilter &&
+        !hideFreeRanges &&
+        prevIpInt !== null &&
+        ipInt - prevIpInt > 1
+      ) {
         const lastWasPool = rows[rows.length - 1]?.kind === "pool-boundary";
         const gapStart = prevIpInt + 1;
         const gapEnd = ipInt - 1;
@@ -5348,7 +5362,14 @@ export function SubnetDetail({
     if (hideReserved)
       return rows.filter((r) => r.kind !== "ip" || !isPaddingRow(r.addr));
     return rows;
-  }, [sortedAddresses, sortState, allPools, hasActiveFilter, hideReserved]);
+  }, [
+    sortedAddresses,
+    sortState,
+    allPools,
+    hasActiveFilter,
+    hideReserved,
+    hideFreeRanges,
+  ]);
 
   // #517: window the painted rows. Every op that walks the data
   // (select-all, shift-range, filtering) still uses the full ``tableRows``
@@ -5940,6 +5961,20 @@ export function SubnetDetail({
                     onChange={(e) => setHideReserved(e.target.checked)}
                   />
                   Hide network/broadcast
+                </label>
+                <label className="flex flex-shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground hover:text-foreground">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5"
+                    checked={hideFreeRanges}
+                    onChange={(e) =>
+                      setFreeRangeOverride((prev) => ({
+                        ...prev,
+                        [subnet.id]: e.target.checked,
+                      }))
+                    }
+                  />
+                  Hide free ranges
                 </label>
               </div>
               {inlineEditError && (
@@ -7877,6 +7912,14 @@ export function EditSubnetModal({
   const [doNotProbeReason, setDoNotProbeReason] = useState(
     subnet.do_not_probe_reason ?? "",
   );
+  // Free-range rows (#2137): "" = default rule, otherwise explicit.
+  const [showFreeRanges, setShowFreeRanges] = useState<"" | "show" | "hide">(
+    subnet.show_free_ranges == null
+      ? ""
+      : subnet.show_free_ranges
+        ? "show"
+        : "hide",
+  );
   const probePolicyQ = useQuery({
     queryKey: ["subnet-probe-policy", subnet.id],
     queryFn: () => ipamApi.getSubnetProbePolicy(subnet.id),
@@ -8014,6 +8057,8 @@ export function EditSubnetModal({
         discovery_interval_minutes: discoveryIntervalMinutes,
         do_not_probe: doNotProbe,
         do_not_probe_reason: doNotProbeReason,
+        show_free_ranges:
+          showFreeRanges === "" ? null : showFreeRanges === "show",
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
@@ -8413,6 +8458,30 @@ export function EditSubnetModal({
               inherited={probeInherited}
               inheritedFrom={probeInheritedFrom}
             />
+          </div>
+          <div className="border-t pt-4">
+            <label className="block text-xs font-medium">
+              Free-range rows in the address table
+              <select
+                aria-label="Free-range rows"
+                className="mt-1 block w-full rounded-md border bg-background px-2 py-1 text-sm"
+                value={showFreeRanges}
+                onChange={(e) =>
+                  setShowFreeRanges(e.target.value as "" | "show" | "hide")
+                }
+              >
+                <option value="">
+                  Default (hidden for integration-owned or larger than a /16)
+                </option>
+                <option value="show">Show</option>
+                <option value="hide">Hide</option>
+              </select>
+            </label>
+            <p className="mt-1 text-xs italic text-muted-foreground">
+              Whether the green &quot;N free · click to allocate&quot; rows
+              appear between allocated addresses. Display only — allocation and
+              utilization are unaffected.
+            </p>
           </div>
           <div className="border-t pt-4">
             <ClassificationSection

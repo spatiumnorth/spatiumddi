@@ -2901,6 +2901,7 @@ class SubnetCreate(BaseModel):
     # still be suppressed by an ancestor, in which case no sweep runs.
     do_not_probe: bool = False
     do_not_probe_reason: str = ""
+    show_free_ranges: bool | None = None  # #2137 — None = default rule
     ipv6_allocation_policy: str = "random"
     # Compliance / classification flags — see Subnet model.
     pci_scope: bool = False
@@ -3060,6 +3061,7 @@ class SubnetUpdate(BaseModel):
     discovery_interval_minutes: int | None = None
     do_not_probe: bool | None = None
     do_not_probe_reason: str | None = None
+    show_free_ranges: bool | None = None  # #2137 — explicit null restores default
     ipv6_allocation_policy: str | None = None
     pci_scope: bool | None = None
     hipaa_scope: bool | None = None
@@ -3224,6 +3226,11 @@ class SubnetResponse(BaseModel):
     # per-row would put a hierarchy walk inside every list page.
     do_not_probe: bool = False
     do_not_probe_reason: str = ""
+    # #2137 — the subnet's own choice; None = use the default rule.
+    show_free_ranges: bool | None = None
+    # #2137 — name of the integration mirroring this subnet (kubernetes,
+    # tailscale, …), derived from the ownership FKs; None when operator-owned.
+    integration_owner: str | None = None
     ipv6_allocation_policy: str = "random"
     pci_scope: bool = False
     hipaa_scope: bool = False
@@ -3258,18 +3265,25 @@ class SubnetResponse(BaseModel):
     def _attach_vlan(cls, data: Any) -> Any:
         # When serializing a Subnet ORM instance, enrich with nested `vlan` from `vlan_ref`.
         if isinstance(data, Subnet):
+            from app.services.integration_ownership import owning_integration
+
             vref = getattr(data, "vlan_ref", None)
-            if vref is not None:
+            if vref is None:
                 return {
                     **{c.name: getattr(data, c.name) for c in data.__table__.columns},
-                    "vlan": {
-                        "id": vref.id,
-                        "router_id": vref.router_id,
-                        "router_name": getattr(getattr(vref, "router", None), "name", None),
-                        "vlan_id": vref.vlan_id,
-                        "name": vref.name,
-                    },
+                    "integration_owner": owning_integration(data),
                 }
+            return {
+                **{c.name: getattr(data, c.name) for c in data.__table__.columns},
+                "integration_owner": owning_integration(data),
+                "vlan": {
+                    "id": vref.id,
+                    "router_id": vref.router_id,
+                    "router_name": getattr(getattr(vref, "router", None), "name", None),
+                    "vlan_id": vref.vlan_id,
+                    "name": vref.name,
+                },
+            }
         return data
 
 
@@ -6171,6 +6185,7 @@ async def update_subnet(
         "site_id",
         "ddns_domain_override",
         "ddns_ttl",
+        "show_free_ranges",  # #2137 — null restores the default
     }
     changes = body.model_dump(exclude_none=True, exclude=exclude_fields)
     changes_for_audit = body.model_dump(mode="json", exclude_none=True, exclude=exclude_fields)
@@ -6214,7 +6229,14 @@ async def update_subnet(
     # Nullable scalars/FKs the operator must be able to clear (#502) — same
     # explicit model_fields_set treatment as decom_date, because exclude_none
     # drops a null and the clear would otherwise be a silent no-op.
-    for _field in ("gateway", "customer_id", "site_id", "ddns_domain_override", "ddns_ttl"):
+    for _field in (
+        "gateway",
+        "customer_id",
+        "site_id",
+        "ddns_domain_override",
+        "ddns_ttl",
+        "show_free_ranges",
+    ):
         if _field in body.model_fields_set:
             _val = getattr(body, _field)
             setattr(subnet, _field, _val)
