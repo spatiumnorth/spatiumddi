@@ -37,6 +37,8 @@ import {
   type Subnet,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { isDefaultGatewayHostname } from "@/lib/gatewayDns";
+import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
 import { OT_PROTOCOL_LABELS, OT_ROLE_LABELS } from "@/lib/otLabels";
 import { CertsCompactTable } from "@/pages/network/CertificatesPage";
 import {
@@ -477,6 +479,12 @@ export function IPDetailModal({
                   dash(null)}
               </span>
             </Field>
+            {isDefaultGatewayHostname(addr.hostname) &&
+              (addr.forward_zone_id || Object.keys(zoneNames).length > 0) && (
+                <div className="sm:col-span-2">
+                  <GatewayHostnameNote />
+                </div>
+              )}
           </div>
 
           {/* Counters row */}
