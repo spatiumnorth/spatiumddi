@@ -9,9 +9,19 @@ Kea runs beside the agent under the entrypoint's shell supervisors, not as a
 child of this process, so there is no exit status to read. The cgroup's own
 ``oom_kill`` counter is the signal instead: the agent samples it on every
 tick of its supervisor loop, and when it moved since the last look something
-in the container was killed by the OOM killer. In this container that is Kea
-(the largest process by a long way); the reason says so while naming the
-caveat. The kill is persisted in the state dir and reported on the heartbeat
+in the container was killed by the OOM killer. That is not always Kea: the
+agent's own ``kea-dhcpX -t`` config preflight loads the whole config and can be
+the victim, as can radvd. So a move is only recorded when Kea did not survive
+it, read from the entrypoint's pid files: a pid that is gone, or that changed
+since the previous tick, is a killed Kea (the supervise loop restarts it two
+seconds later, under a new pid). Both Kea daemons alive under the pids of the
+previous tick means the kill took something else; that is logged and not
+reported, because ``degraded`` here means *not serving* and Kea is serving. A
+pid file that cannot be read proves nothing either way, so the kill is
+recorded, as it would be with no pid check at all. The agent itself being the
+victim is not seen at all: it dies, the entrypoint takes the container down,
+and the restarted container is a new cgroup.
+The kill is persisted in the state dir and reported on the heartbeat
 as ``degraded`` with an ``oom_killed:`` reason, which the control plane reads
 as *not serving* (the default-on ``agent_daemon_degraded`` alert and the red
 server chip, ``backend/app/services/agents/daemon_state.py``).
@@ -66,6 +76,13 @@ CGROUP_MEMORY_LIMIT_FILES: tuple[str, ...] = (
 )
 _CGROUP_UNLIMITED_BYTES = 1 << 55
 
+#: The entrypoint's Kea pid files (``images/kea/entrypoint.sh``). Kea writes
+#: them; the supervise loop deletes them before each restart.
+KEA_PID_FILES: tuple[str, ...] = (
+    "/run/kea/kea-dhcp4.kea-dhcp4.pid",
+    "/run/kea/kea-dhcp6.kea-dhcp6.pid",
+)
+
 #: How long the counter has to stay still before an OOM record is cleared.
 STABLE_SECONDS = 600.0
 
@@ -113,6 +130,17 @@ def read_oom_kill_count(files: tuple[str, ...] = OOM_EVENT_FILES) -> int | None:
     return None
 
 
+def read_kea_pids(files: tuple[str, ...] = KEA_PID_FILES) -> tuple[int | None, ...]:
+    """The pid in each of ``files``; None for one that is absent or unreadable."""
+    out: list[int | None] = []
+    for path in files:
+        try:
+            out.append(int(Path(path).read_text(encoding="utf-8").strip()))
+        except (OSError, ValueError):
+            out.append(None)
+    return tuple(out)
+
+
 def _fmt_limit(limit_bytes: int | None) -> str:
     if not limit_bytes:
         return "the container's memory limit"
@@ -130,11 +158,16 @@ class OomWatch:
         state_dir: Path,
         files: tuple[str, ...] = OOM_EVENT_FILES,
         limit_bytes: int | None = None,
+        pid_files: tuple[str, ...] = KEA_PID_FILES,
+        proc_root: str = "/proc",
     ) -> None:
         self._path = state_dir / "daemon_oom.json"
         self._files = files
         self._limit_bytes = limit_bytes
+        self._pid_files = pid_files
+        self._proc_root = Path(proc_root)
         self.baseline = read_oom_kill_count(files)
+        self._kea_pids = read_kea_pids(pid_files)
         self.record: dict[str, Any] | None = self._load()
 
     def _load(self) -> dict[str, Any] | None:
@@ -156,23 +189,58 @@ class OomWatch:
             self.baseline = now
         return moved
 
+    def kea_survived(self, pids: tuple[int | None, ...]) -> bool:
+        """Whether every Kea daemon is provably the same live process it was
+        at the previous tick. False whenever that cannot be shown (a pid file
+        missing or unreadable, now or then), so an unknown never hides a kill."""
+        if not pids or len(pids) != len(self._kea_pids):
+            return False
+        for pid, before in zip(pids, self._kea_pids, strict=True):
+            if pid is None or pid != before:
+                return False
+            if not (self._proc_root / str(pid)).exists():
+                return False
+        return True
+
     def poll(self, now: float | None = None) -> None:
-        """One look: record a kill the counter shows, clear a record that has
-        outlived :data:`STABLE_SECONDS`. Called from the supervisor's tick."""
+        """One look: record a kill the counter shows (when Kea did not survive
+        it), clear a record that has outlived :data:`STABLE_SECONDS`. Called
+        from the supervisor's tick: three small reads, no process scan."""
         stamp = time.time() if now is None else now
-        if self.fired(consume=True):
-            self.note_daemon_killed(now=stamp)
-            return
+        pids = read_kea_pids(self._pid_files)
+        try:
+            if self.fired(consume=True):
+                if self.kea_survived(pids):
+                    # Something else in the container (the config preflight,
+                    # radvd) was the victim; Kea is serving.
+                    log.warning(
+                        "dhcp_oom_kill_not_kea",
+                        hint="the OOM killer fired in the container but both Kea "
+                        "daemons survived it",
+                        limit_bytes=self._limit_bytes,
+                    )
+                else:
+                    # Confirmed when the pid files were readable and one of
+                    # them showed Kea gone; otherwise the victim is unproven.
+                    self.note_daemon_killed(
+                        now=stamp,
+                        kea_confirmed=all(p is not None for p in self._kea_pids),
+                    )
+                    return
+        finally:
+            self._kea_pids = pids
         if self.record is not None:
             last = float(self.record.get("last_at") or 0)
             if stamp - last >= STABLE_SECONDS:
                 log.info("dhcp_daemon_oom_record_cleared", stable_s=STABLE_SECONDS)
                 self.clear()
 
-    def note_daemon_killed(self, now: float | None = None) -> None:
-        """Persist that the OOM killer fired in the container."""
+    def note_daemon_killed(self, now: float | None = None, kea_confirmed: bool = True) -> None:
+        """Persist that the OOM killer fired in the container. ``kea_confirmed``
+        is False when the pid files could not say whether Kea was the victim."""
         stamp = time.time() if now is None else now
         rec = dict(self.record or {})
+        rec["kea_confirmed"] = kea_confirmed
         rec["count"] = int(rec.get("count") or 0) + 1
         rec.setdefault("first_at", stamp)
         rec["last_at"] = stamp
@@ -203,11 +271,16 @@ class OomWatch:
         count = int(rec.get("count") or 0)
         when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(rec.get("last_at") or 0)))
         times = "once" if count == 1 else f"{count} times"
+        victim = (
+            "Kea was killed by the OOM killer in the DHCP container"
+            if rec.get("kea_confirmed", True)
+            else "the OOM killer fired in the DHCP container (Kea, almost certainly)"
+        )
         return {
             "status": "degraded",
             "reason": (
-                f"{REASON_PREFIX} the OOM killer fired in the DHCP container (Kea, almost "
-                f"certainly) for exceeding {_fmt_limit(rec.get('limit_bytes'))} "
+                f"{REASON_PREFIX} {victim} "
+                f"for exceeding {_fmt_limit(rec.get('limit_bytes'))} "
                 f"({times}, last at {when}) and it restarts into the same config. "
                 "Raise the container's memory limit, or shrink what Kea holds "
                 "(lease table, subnets, reservations); see docs/features/DHCP.md."

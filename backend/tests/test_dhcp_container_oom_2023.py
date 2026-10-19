@@ -311,3 +311,64 @@ async def test_a_supervisor_that_stopped_reporting_does_not_pin_the_row(
     await _agent_hb(client, headers, {"status": "ok"})
     row = await _reload(db_session, server.id)
     assert row.daemon_status == STATUS_OK
+
+
+async def test_an_oom_on_one_ha_node_is_not_stamped_on_its_peer(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A Kea HA pair on two appliances, one group: a kill of node A's
+    dhcp-kea container marks A's row only. Each supervisor reports its own
+    containers, and both paths (A's supervisor heartbeat, each agent's own
+    heartbeat) resolve the row's OWNING appliance, so B's ``ok`` stands. One
+    row is owned by FK and the other by hostname, the two ownership shapes."""
+    node_a, token_a = await _appliance(db_session, "ddi-oomha-a")
+    node_b, token_b = await _appliance(db_session, "ddi-oomha-b")
+    row_a, headers_a = await _kea_server(db_session, host="ddi-oomha-a", appliance_id=node_a.id)
+    row_b, headers_b = await _kea_server(db_session, host="ddi-oomha-b")
+    row_b.server_group_id = row_a.server_group_id
+    await db_session.commit()
+
+    killed_at = datetime.now(UTC) - timedelta(minutes=7)
+    await _supervisor_hb(
+        client, node_a, token_a, _role_health(killed_at=killed_at, running_since=None)
+    )
+    # Node B's supervisor reports a healthy container.
+    await _supervisor_hb(client, node_b, token_b, {})
+
+    assert (await _reload(db_session, row_a.id)).daemon_status == STATUS_DEGRADED
+    assert (await _reload(db_session, row_b.id)).daemon_status == STATUS_OK
+
+    # B's agent heartbeating ``ok`` is not overridden by A's kill...
+    await _agent_hb(client, headers_b, {"status": "ok"})
+    assert (await _reload(db_session, row_b.id)).daemon_status == STATUS_OK
+    # ...and A's restarted agent saying ``ok`` does not clear A's.
+    await _agent_hb(client, headers_a, {"status": "ok"})
+    row = await _reload(db_session, row_a.id)
+    assert row.daemon_status == STATUS_DEGRADED
+    assert (row.daemon_reason or "").startswith("oom_killed:")
+
+    matches = await _matching_agent_daemon_degraded_subjects(db_session, _RULE, datetime.now(UTC))
+    subjects = {m[0] for m in matches}
+    assert f"dhcp_server:{row_a.id}" in subjects
+    assert f"dhcp_server:{row_b.id}" not in subjects
+
+
+async def test_the_agents_config_apply_echo_does_not_hide_a_kill(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A killed Kea that also failed a config apply: the agent's
+    ``dhcp4_config_rejected`` echo is a #882 verdict (not "not serving"), so
+    letting it stand would hide the kill. The kubelet's OOM wins the daemon
+    field; the config verdict keeps its own column."""
+    appliance, _token = await _appliance(db_session, "ddi-oomd-8")
+    server, headers = await _kea_server(db_session, host="ddi-oomd-8", appliance_id=appliance.id)
+    killed_at = datetime.now(UTC) - timedelta(minutes=2)
+    appliance.role_health = _role_health(killed_at=killed_at, running_since=killed_at)
+    await db_session.commit()
+
+    await _agent_hb(
+        client, headers, {"status": "degraded", "reason": "dhcp4_config_rejected: bad subnet"}
+    )
+    row = await _reload(db_session, server.id)
+    assert (row.daemon_reason or "").startswith("oom_killed:")
+    assert is_not_serving(row.daemon_status, row.daemon_reason) is True

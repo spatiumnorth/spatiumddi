@@ -1106,8 +1106,17 @@ How the kill is seen depends on the deployment:
   second, persists a record in its state dir (`daemon_oom.json`) and
   reports it on every heartbeat, over the sync loop's own `ok`. The
   record clears when the counter has been still for 10 minutes. The
-  counter says a process in the container was OOM-killed, not which one;
-  in this container that is Kea.
+  counter says a process in the container was OOM-killed, not which one,
+  and Kea is not the only candidate: the agent's own `kea-dhcpX -t`
+  config preflight loads the whole config, and radvd runs there too. So
+  a move is recorded only when Kea did not survive it, read from Kea's
+  pid files (`/run/kea/kea-dhcp{4,6}.kea-dhcp{4,6}.pid`): a pid gone, or
+  changed since the previous second, is a killed Kea. Both daemons alive
+  under the same pids means something else was killed; the agent logs
+  `dhcp_oom_kill_not_kea` and reports nothing, because Kea is serving.
+  Unreadable pid files prove nothing either way, so the kill is reported,
+  worded as unconfirmed. If the agent itself is the victim nothing is
+  recorded: the entrypoint takes the container down with it.
 - **Plain Helm install (umbrella chart)** group-kills like the
   appliance but has no supervisor, so only the pod's last state
   (`kubectl get pod ... -o jsonpath='{.status.containerStatuses[0].lastState}'`)

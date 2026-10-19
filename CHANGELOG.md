@@ -145,9 +145,11 @@ the formatter handles the rest.
   for `dhcp-kea`; the control plane now maps it onto the live Kea row
   (from the supervisor heartbeat and over the restarted agent's `ok`,
   timed from the kill), as the DNS side does. On Docker Compose the
-  DHCP agent now reads the container cgroup's `oom_kill` counter, keeps
-  a record across restarts and reports it on the heartbeat ahead of the
-  sync loop's own `ok`. Either way the row reads not serving and the
+  DHCP agent now reads the container cgroup's `oom_kill` counter and,
+  when Kea's pid files show Kea did not survive the kill (the config
+  preflight or radvd can be the victim instead, and Kea is then still
+  serving), keeps a record across restarts and reports it on the
+  heartbeat ahead of the sync loop's own `ok`. Either way the row reads not serving and the
   existing default-on Agent daemon not serving alert fires; no new
   column, rule or migration. A plain Helm install has no supervisor and
   is not covered (see DHCP.md 4d).
