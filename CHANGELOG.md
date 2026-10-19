@@ -135,6 +135,42 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A UniFi controller named like an existing Router now syncs (#2140).**
+  Router names are unique, and the UniFi reconciler created its Router
+  under the controller's name without checking. An operator who had
+  already created a Router named after their gateway got a
+  `uq_router_name` violation on every sync, and no network, subnet, VLAN
+  or client was ever mirrored. The reconciler now takes the first free
+  name in `<name> (UniFi)`, `<name> (UniFi 2)`, …, chosen by query rather
+  than by catching the failed insert, logs the choice and records it in
+  the sync's audit row. It still never adopts the operator's Router:
+  ownership stays keyed on the controller id, because the reconciler
+  deletes VLANs on the Router it owns and would delete the operator's.
+  Once created, the Router keeps its name, so later syncs are
+  idempotent. The NetBox importer's synthetic Router had the inverse
+  problem: it adopted any Router of the requested name, including one a
+  UniFi controller owns, whose next sync would delete every imported
+  VLAN. It now skips integration-owned Routers and takes a
+  `(NetBox)`-suffixed name instead. Adopting an operator's Router by
+  name is unchanged, since the operator typed that name into the import.
+  No other integration creates Routers.
+- **An integration sync that crashes now says so on the integration
+  (#2141).** All eleven integration mirrors write `last_sync_error` and
+  `last_synced_at` in the same transaction as the mirror itself, so when
+  a sync raised rather than failing cleanly, the rollback discarded
+  those too. The card, the Integrations dashboard and the IPAM
+  dashboard panel showed a configured integration that had never
+  synced, with no reason. And because the per-target interval keys on
+  `last_synced_at`, the target was retried on every 30 s beat tick
+  instead of on its own interval. The sweeps and the Sync Now tasks now
+  roll the partial sync back as before, then record the error, the
+  attempt time and an error audit row in a transaction of their own,
+  so the error appears on the card and in the dashboard's recent
+  errors, and the target backs off to its interval. Active block sync
+  does the same for `last_block_sync_error`. The recorded text is the
+  driver's message only: a database error's SQL and bound parameters,
+  which can include encrypted credential columns, are dropped. One
+  target's crash still never stops the others.
 - **A DNS record change made while an agent is replaced reaches the new
   agent at once, not five minutes later (#2042).** When a DNS agent is
   replaced (its pod rolls after a slot upgrade, a container restarts),
