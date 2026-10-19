@@ -143,10 +143,14 @@ the formatter handles the rest.
   request reported success. A bulk clear now runs the same clear as
   single Edit with zone None, through one shared helper: it removes the
   address's forward A/AAAA in its zone and any extra zone, its PTR and
-  its aliases, queues a delete for each, and sets `forward_zone_id` to
-  null. An address with nothing published is left as it is. The
-  response gains `dns_cleared`, the addresses whose records were
-  removed.
+  its aliases, queues a delete for each, sets `forward_zone_id` to null
+  and empties `extra_zone_ids`. Leaving the extra zones set (which
+  single Edit used to do) meant the next Sync DNS, the scheduled
+  auto-sync or any later edit published the record there again. An
+  address with nothing published is left as it is. The response gains
+  `dns_cleared`, the addresses whose records were removed. A subnet
+  with a forward zone of its own still claims the host, so Sync DNS
+  offers the record in the subnet's zone after a clear, as before.
 
 - **A DNS record change made while an agent is replaced reaches the new
   agent at once, not five minutes later (#2042).** When a DNS agent is

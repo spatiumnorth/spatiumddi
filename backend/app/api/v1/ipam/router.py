@@ -8668,8 +8668,12 @@ async def _clear_ip_dns_zone(db: AsyncSession, ip: IPAddress, subnet: Subnet) ->
     The one clear path, shared by single Edit and Bulk edit (#2172) so the two
     cannot diverge. It deletes every auto-generated record the row owns — the
     forward A/AAAA in its zone and in any extra zone, the PTR, and its aliases
-    (#2084) — queueing a delete op for each zone IPAM authors, and nulls
-    ``forward_zone_id`` so a later unrelated edit cannot re-create them.
+    (#2084) — queueing a delete op for each zone IPAM authors. It then nulls
+    ``forward_zone_id`` and empties ``extra_zone_ids``: with either left set,
+    the next Sync DNS (and the scheduled auto-sync) lists the record missing
+    there and publishes it again, as does a later unrelated edit. A subnet
+    that has a forward zone of its own still claims the host: the address
+    follows it, so Sync DNS offers the record there.
 
     It must go through ``action="delete"``: an ``"update"`` with
     ``zone_id=None`` means "resolve a zone", which falls back to the subnet's
@@ -8680,6 +8684,7 @@ async def _clear_ip_dns_zone(db: AsyncSession, ip: IPAddress, subnet: Subnet) ->
     """
     removed = await _sync_dns_record(db, ip, subnet, action="delete")
     ip.forward_zone_id = None
+    ip.extra_zone_ids = []
     return removed
 
 
@@ -8866,8 +8871,13 @@ async def update_address(
         # empty hostname), so it would NOT actually remove the records
         # (#502, and the bot review of the #493 fix).
         if zone_cleared:
-            # Also nulls forward_zone_id, so the removal sticks: otherwise a
-            # later unrelated edit would preserve it and re-create the record.
+            # Also nulls forward_zone_id and empties extra_zone_ids, so the
+            # removal sticks: otherwise Sync DNS, or a later unrelated edit,
+            # would publish the records there again (#2172). The clear wins
+            # over extra_zone_ids sent in the same request.
+            if ip.extra_zone_ids:
+                old["extra_zone_ids"] = list(ip.extra_zone_ids)
+                changes_for_audit["extra_zone_ids"] = []
             await _clear_ip_dns_zone(db, ip, subnet)
         else:
             await _sync_dns_record(db, ip, subnet, action="delete")
@@ -11128,6 +11138,8 @@ async def bulk_edit_addresses(
                 if subnet is not None:
                     old["forward_zone_id"] = str(ip.forward_zone_id) if ip.forward_zone_id else None
                     if new_zone_id is None:
+                        if ip.extra_zone_ids:
+                            old["extra_zone_ids"] = list(ip.extra_zone_ids)
                         # ``""`` clears (#2172): the same removal single Edit
                         # runs for zone None. An ``"update"`` with
                         # ``zone_id=None`` would resolve a zone instead, moving

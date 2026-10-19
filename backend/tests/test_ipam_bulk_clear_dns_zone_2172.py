@@ -304,3 +304,101 @@ async def test_bulk_clear_matches_single_edit_clear(
             "CNAME",
             "PTR",
         ]
+
+
+async def _clear(client: AsyncClient, headers: dict[str, str], ip_id: str, how: str) -> None:
+    if how == "bulk":
+        await _bulk_clear(client, headers, [ip_id])
+    else:
+        put = await client.put(
+            f"/api/v1/ipam/addresses/{ip_id}", headers=headers, json={"dns_zone_id": None}
+        )
+        assert put.status_code == 200, put.text
+
+
+async def _sync_dns(client: AsyncClient, headers: dict[str, str], sid: str) -> dict:
+    """Preview the subnet's Sync DNS, then commit everything it offers, as the
+    Sync DNS modal's "select all" and the scheduled auto-sync both do."""
+    prev = await client.get(f"/api/v1/ipam/subnets/{sid}/dns-sync/preview", headers=headers)
+    assert prev.status_code == 200, prev.text
+    report = prev.json()
+    commit = await client.post(
+        f"/api/v1/ipam/subnets/{sid}/dns-sync/commit",
+        headers=headers,
+        json={
+            "create_for_ip_ids": sorted({m["ip_id"] for m in report["missing"]}),
+            "update_record_ids": [m["record_id"] for m in report["mismatched"]],
+            "delete_stale_record_ids": [s["record_id"] for s in report["stale"]],
+        },
+    )
+    assert commit.status_code == 200, commit.text
+    return report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["bulk", "single"])
+async def test_a_cleared_address_is_not_republished_into_its_extra_zones(
+    client: AsyncClient, db_session: AsyncSession, how: str
+) -> None:
+    """A clear empties ``extra_zone_ids`` with the records, or the next Sync
+    DNS (or auto-sync, or any later edit) lists the extra-zone record missing
+    and publishes it again, undoing the clear."""
+    headers, sid, zone, other = await _setup(client, db_session, subnet_zone=False)
+    ip_id = await _alloc(client, headers, sid, "10.97.5.60", "h60", dns_zone_id=str(other.id))
+    put = await client.put(
+        f"/api/v1/ipam/addresses/{ip_id}",
+        headers=headers,
+        json={"extra_zone_ids": [str(zone.id)]},
+    )
+    assert put.status_code == 200, put.text
+    assert await _rows(db_session, ip_id) == [("h60", "A"), ("h60", "A")]
+
+    await _clear(client, headers, ip_id, how)
+    assert await _rows(db_session, ip_id) == []
+
+    report = await _sync_dns(client, headers, sid)
+    assert report["missing"] == []
+    assert await _rows(db_session, ip_id) == []
+
+    # A later unrelated edit does not bring them back either.
+    put = await client.put(
+        f"/api/v1/ipam/addresses/{ip_id}", headers=headers, json={"hostname": "h60b"}
+    )
+    assert put.status_code == 200, put.text
+    assert await _rows(db_session, ip_id) == []
+    row = (
+        await db_session.execute(
+            select(IPAddress)
+            .where(IPAddress.id == uuid.UUID(ip_id))
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert row.extra_zone_ids == []
+    assert row.forward_zone_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["bulk", "single"])
+async def test_sync_dns_never_puts_a_cleared_address_back_in_its_old_zone(
+    client: AsyncClient, db_session: AsyncSession, how: str
+) -> None:
+    """With ``forward_zone_id`` null the address has no zone of its own, so a
+    Sync DNS that judges an address by its own zone (#2104) cannot return it
+    to the one it was cleared from.
+
+    A subnet with a forward zone still claims the host: the address follows
+    it, and Sync DNS offers the record there. That is the subnet's binding, not
+    the cleared zone coming back, and is stated rather than asserted here.
+    """
+    headers, sid, zone, other = await _setup(client, db_session, subnet_zone=True)
+    ip_id = await _alloc(client, headers, sid, "10.97.5.70", "h70", dns_zone_id=str(other.id))
+    await _clear(client, headers, ip_id, how)
+    assert await _rows(db_session, ip_id) == []
+
+    report = await _sync_dns(client, headers, sid)
+
+    assert str(other.id) not in {m["zone_id"] for m in report["missing"]}
+    assert (
+        await db_session.execute(select(DNSRecord).where(DNSRecord.zone_id == other.id))
+    ).first() is None
+    assert await _forward_zone(db_session, ip_id) != other.id
