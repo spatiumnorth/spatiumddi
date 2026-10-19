@@ -131,6 +131,47 @@ the formatter handles the rest.
   undelivered. Both server-state views gain a `pending_ops` count, and
   the zone sync pill names the unapplied changes.
 
+- **The BIND9 importer reads zones declared with their class
+  (#2099).** `zone "x" IN { ... };` is valid BIND, and it is how
+  RHEL's and Fedora's stock `named.conf` writes every zone, but the
+  parser allowed nothing between the quoted name and the brace, so
+  such a zone was skipped without a word, as was every zone inside
+  `view "v" IN { ... };`. A config written that way was refused as
+  having no zone declarations. An optional class (`IN`, `CHAOS`, `CH`,
+  `HESIOD`, `HS`, any case, with any whitespace or comments around it)
+  is now accepted for zones and views, and a zone inherits its view's
+  class. Zones of a class other than `IN` are not imported as if they
+  were internet-class data: each is listed in the preview's warnings
+  as skipped, naming its class, and a config with nothing but such
+  zones is refused with that reason.
+  Accepting the class also made RHEL's stock
+  `zone "." IN { type hint; … };` readable, and the importer used to map `type hint` to
+  a primary zone: importing it would have made the target group
+  authoritative for the root and broken every recursive lookup it
+  answers. `hint`, `mirror`, `redirect`, `static-stub` and
+  `delegation-only` zones are now skipped with a warning. The
+  importer also no longer drops things without a word: a `zone`
+  block it cannot read (an unquoted name, say) and every `include`
+  it does not follow are named in the preview's warnings, and
+  unbalanced braces refuse the upload instead of silently dropping
+  every zone after the fault. The zone walk is linear now; it
+  re-sliced the config once per zone, which made a 50,000-zone
+  `named.conf` take several seconds.
+
+- **Sync DNS reads an address in every zone it publishes to
+  (#2107).** An address with extra zones has its host record in its
+  forward zone and in each extra zone IPAM authors, but the drift
+  check compared every forward record with the forward zone alone. A
+  correct record in an extra zone read as mismatched, and one that had
+  gone missing from an extra zone was never reported. Each address is
+  now checked in all of its zones, using the same zone list the sync
+  writes, so a correct record is in sync, a missing one is listed as
+  missing in its zone, and a wrong one as mismatched with that zone
+  named. A zone IPAM does not author still takes no record. In the
+  Sync DNS dialog, an address missing its record in more than one zone
+  now lists one row per zone, each ticked on its own; the rows used to
+  share a key, so they toggled together.
+
 - **IPAM now says why a host named `gateway` gets no forward DNS
   record (#2101).** The rule is deliberate (every subnet's placeholder
   row is named `gateway`, so publishing them would collide on
@@ -5908,11 +5949,6 @@ the formatter handles the rest.
 
 ### Migrations
 
-- `e3b7c19f5a42` — #2042: `dns_record_op.dispatched_to`, a nullable
-  string naming the agent process an op was last shipped to, and
-  `dns_record_op.dispatched_poll_at`, when the long-poll that shipped it
-  started. No backfill: NULL means not recorded and is never read as
-  "another agent". Downgrade drops both columns.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column
@@ -6012,6 +6048,11 @@ the formatter handles the rest.
   A / AAAA named like the address's hostname in its forward or an extra
   zone (or the row `ip_address.dns_record_id` names) stays false; the
   rest are aliases. Downgrade drops the column.
+- `e3b7c19f5a42` — #2042: `dns_record_op.dispatched_to`, a nullable
+  string naming the agent process an op was last shipped to, and
+  `dns_record_op.dispatched_poll_at`, when the long-poll that shipped it
+  started. No backfill: NULL means not recorded and is never read as
+  "another agent". Downgrade drops both columns.
 
 ## 2026.10.02-1 — 2026-10-02
 
