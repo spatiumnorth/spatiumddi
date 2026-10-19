@@ -566,6 +566,22 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
         server_default=DNS_RECORD_OP_SEQ.next_value(),
         nullable=True,
     )
+    # #2042 — the agent PROCESS the op was last shipped to: the instance id the
+    # agent sends on every config poll (``X-Spatium-Agent-Instance``). A
+    # long-poll the API still holds for an agent that has since been replaced
+    # can page an op into a connection nobody reads; the replacement's polls
+    # carry a different id, which is how the op is recognised as undelivered
+    # and returned to ``pending`` at once instead of after the 5-minute
+    # unacknowledged reset. NULL = shipped to an agent too old to say, or
+    # never shipped; NULL is never treated as "another instance".
+    dispatched_to: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # #2042 — when the long-poll that shipped the op STARTED. Ranks two polls
+    # the API holds at once for one server: only a poll that started after the
+    # one that shipped an op may take it back, so a replaced agent's leftover
+    # poll (the older one) never takes an op from its replacement's poll.
+    dispatched_poll_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class DNSAgentBundle(UUIDPrimaryKeyMixin, Base):
@@ -1132,6 +1148,18 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     forward_only: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
+    # A forward zone's OWN upstream transport (#2121): ``do53`` | ``tls``, plus
+    # ``https`` | ``quic`` on a Technitium group. It does NOT inherit the
+    # group's ``DNSServerOptions.forward_transport`` — that one applies to the
+    # group's resolver forwarders only. A conditional forwarder usually points
+    # at something internal that speaks plain DNS (Tailscale MagicDNS, an AD
+    # DC), and inheriting the group's DoT sent it TLS it never answers.
+    # ``forward_tls_hostname`` is the name the upstream's certificate is
+    # checked against; required for every encrypted transport.
+    forward_transport: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="do53", server_default=sa_text("'do53'")
+    )
+    forward_tls_hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Primary (master) server IPs this zone transfers FROM (issue #336).
     # Required + non-empty for ``zone_type`` in {secondary, stub}: a

@@ -35,6 +35,10 @@ tls spatium-upstream-tls {
     protocols { TLSv1.2; TLSv1.3; };
 };
 {%- endif %}
+{#- A TLS forward zone's own upstream statement (#2121), one per hostname. #}
+{%- if zone_tls_statements %}
+{{ zone_tls_statements }}
+{%- endif %}
 
 options {
     directory "/var/cache/bind";

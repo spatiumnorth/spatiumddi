@@ -5041,6 +5041,10 @@ export interface ZoneMovePreview {
    *  algorithm a target driver cannot use (Technitium has no hmac-sha224).
    *  Non-null means the commit refuses — not waivable by acknowledgement. */
   tsig_algorithm_refusal?: string | null;
+  /** #2121 — the forward zone's own upstream transport is one the target
+   *  group cannot serve (DoH / DoQ on BIND9, TLS on Windows DNS). Non-null
+   *  means the commit refuses — not waivable by acknowledgement. */
+  forward_transport_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -5158,6 +5162,9 @@ export interface DNSPerServerZoneStateEntry {
   current_serial: number | null;
   reported_at: string | null;
   in_sync: boolean;
+  // #2042 — ops for this zone the server has not acknowledged; non-zero
+  // means not in sync whatever the serial says.
+  pending_ops: number;
 }
 
 export interface DNSPerServerZoneStateResponse {
@@ -5694,6 +5701,11 @@ export interface DNSZone {
   // Conditional-forwarder config. Meaningful only when zone_type==="forward".
   forwarders: string[];
   forward_only: boolean;
+  // #2121 — the forward zone's OWN upstream transport (do53 | tls | https |
+  // quic). It does not inherit the group's forward_transport. Optional so a
+  // response from an older control plane still type-checks; absent = do53.
+  forward_transport?: "do53" | "tls" | "https" | "quic";
+  forward_tls_hostname?: string | null;
   // Secondary / stub primaries (issue #336). The master server IPs this
   // zone transfers FROM (ip or ip@port). Required when
   // zone_type==="secondary" | "stub"; empty otherwise.
@@ -5723,6 +5735,8 @@ export interface ZoneServerStateEntry {
   // server, or the zone was only just created).
   current_serial: number | null;
   reported_at: string | null;
+  // #2042 — ops for this zone the server has not acknowledged yet.
+  pending_ops: number;
 }
 
 export interface ZoneServerState {
@@ -5730,7 +5744,8 @@ export interface ZoneServerState {
   zone_name: string;
   target_serial: number;
   servers: ZoneServerStateEntry[];
-  // `false` while any server hasn't reported or is on a different serial.
+  // `false` while any server hasn't reported, is on a different serial, or
+  // still has an unacknowledged op for the zone (#2042).
   in_sync: boolean;
 }
 
