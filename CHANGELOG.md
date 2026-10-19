@@ -114,7 +114,8 @@ the formatter handles the rest.
   column shows "forward DNS skipped" with the explanation as its
   tooltip instead of a bare dash, and the create, edit, allocate and IP
   detail views show the same note when the hostname is exactly
-  `gateway` (advisory, saving is still allowed). The Sync DNS modal
+  `gateway` (advisory, saving is still allowed; typed input is matched
+  the way the API stores it, so `Gateway` or `gateway.` shows it too). The Sync DNS modal
   explains each stale reason in plain words instead of the raw code and
   no longer says a `default-gateway-name` record's address is gone. A
   row whose records Sync DNS is about to delete no longer reads "in

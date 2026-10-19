@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   classifyIpDnsState,
   isDefaultGatewayHostname,
+  isDefaultGatewayHostnameInput,
   staleReasonKeepsAddress,
   staleReasonText,
 } from "./gatewayDns";
@@ -35,8 +36,23 @@ describe("classifyIpDnsState", () => {
     expect(classifyIpDnsState({ ...base, hostname: "gateway2" })).toBe(
       "in-sync",
     );
+    expect(classifyIpDnsState({ ...base, hostname: "my-gateway" })).toBe(
+      "in-sync",
+    );
     expect(isDefaultGatewayHostname("gw")).toBe(false);
-    expect(isDefaultGatewayHostname(" gateway ")).toBe(true);
+  });
+  it("matches a stored hostname exactly, as the backend does", () => {
+    // The backend compares ``ip.hostname == "gateway"``; a row an integration
+    // wrote as "Gateway" is published, so it must not read as skipped.
+    expect(classifyIpDnsState({ ...base, hostname: "Gateway" })).toBe(
+      "in-sync",
+    );
+  });
+  it("normalises typed input the way the API will store it", () => {
+    for (const h of ["gateway", " gateway ", "Gateway", "GATEWAY.", "gateway."])
+      expect(isDefaultGatewayHostnameInput(h)).toBe(true);
+    for (const h of ["gateway2", "my-gateway", "gateway.lab", "gw", "", null])
+      expect(isDefaultGatewayHostnameInput(h)).toBe(false);
   });
   it("counts a stale-pending row as out of sync", () => {
     expect(

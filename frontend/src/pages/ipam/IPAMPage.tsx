@@ -110,7 +110,7 @@ import {
   GATEWAY_FORWARD_SKIPPED_LABEL,
   GATEWAY_FORWARD_SKIPPED_NOTE,
   classifyIpDnsState,
-  isDefaultGatewayHostname,
+  isDefaultGatewayHostnameInput,
   staleReasonText,
   type IpDnsState,
 } from "@/lib/gatewayDns";
@@ -3757,9 +3757,8 @@ export function AddAddressModal({
           {hostnameErr && (
             <p className="mt-1 text-xs text-destructive">{hostnameErr}</p>
           )}
-          {isDefaultGatewayHostname(hostname) && availableZones.length > 0 && (
-            <GatewayHostnameNote />
-          )}
+          {isDefaultGatewayHostnameInput(hostname) &&
+            availableZones.length > 0 && <GatewayHostnameNote />}
         </Field>
         {/* DNS zone selector — only shown when zones are available */}
         {availableZones.length > 0 && (
@@ -7051,6 +7050,7 @@ export function SubnetDetail({
           address={viewingAddress}
           subnet={subnet}
           zoneNameById={zoneNameById}
+          hasForwardZone={!!dnsDrift?.forward_zone_id}
           canEdit={
             !(
               viewingAddress.status === "network" ||
@@ -9204,9 +9204,8 @@ export function EditAddressModal({
           {hostnameErr && (
             <p className="mt-1 text-xs text-destructive">{hostnameErr}</p>
           )}
-          {isDefaultGatewayHostname(hostname) && availableZones.length > 0 && (
-            <GatewayHostnameNote />
-          )}
+          {isDefaultGatewayHostnameInput(hostname) &&
+            availableZones.length > 0 && <GatewayHostnameNote />}
         </Field>
         {/* DNS zone — only shown when zones are available */}
         {availableZones.length > 0 && (

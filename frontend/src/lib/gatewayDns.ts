@@ -16,11 +16,25 @@ export const GATEWAY_FORWARD_SKIPPED_LABEL = "forward DNS skipped";
 export const GATEWAY_FORWARD_SKIPPED_NOTE =
   "Hostnames named exactly 'gateway' get a PTR but no A/AAAA record, so every subnet's gateway doesn't collide on gateway.<zone>. Rename it (e.g. 'gw', 'core-rtr1') or add the A record by hand in the zone.";
 
-/** True for the one hostname the forward-record rule skips (exact, trimmed). */
+/** True for a stored hostname the forward-record rule skips. Exact match,
+ * like the backend's ``ip.hostname == "gateway"``: a row an integration wrote
+ * as "Gateway" bypassed the API's normalisation and does get its A record. */
 export function isDefaultGatewayHostname(
   hostname: string | null | undefined,
 ): boolean {
-  return (hostname ?? "").trim() === GATEWAY_HOSTNAME;
+  return hostname === GATEWAY_HOSTNAME;
+}
+
+/** True for a hostname being TYPED that the API will store as "gateway".
+ * ``validate_hostname`` trims, lower-cases and drops one trailing root dot,
+ * so " Gateway." is saved as "gateway" and skipped all the same. */
+export function isDefaultGatewayHostnameInput(
+  hostname: string | null | undefined,
+): boolean {
+  return (
+    (hostname ?? "").trim().replace(/\.$/, "").toLowerCase() ===
+    GATEWAY_HOSTNAME
+  );
 }
 
 const STALE_REASON_TEXT: Record<string, string> = {

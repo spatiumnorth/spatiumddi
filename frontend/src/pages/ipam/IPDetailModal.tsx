@@ -127,6 +127,9 @@ export interface IPDetailModalProps {
   address: IPAddress;
   subnet?: Subnet | null;
   zoneNameById?: Record<string, string>;
+  /** Whether the subnet resolves to a forward zone, i.e. whether a
+   *  "gateway" host has a forward record to skip (#2101). */
+  hasForwardZone?: boolean;
   canEdit: boolean;
   onClose: () => void;
   onEdit: () => void;
@@ -151,6 +154,7 @@ export function IPDetailModal({
   address: addr,
   subnet,
   zoneNameById,
+  hasForwardZone,
   canEdit,
   onClose,
   onEdit,
@@ -480,7 +484,7 @@ export function IPDetailModal({
               </span>
             </Field>
             {isDefaultGatewayHostname(addr.hostname) &&
-              (addr.forward_zone_id || Object.keys(zoneNames).length > 0) && (
+              (hasForwardZone ?? !!addr.forward_zone_id) && (
                 <div className="sm:col-span-2">
                   <GatewayHostnameNote />
                 </div>
