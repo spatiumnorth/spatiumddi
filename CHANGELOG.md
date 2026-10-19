@@ -135,6 +135,10 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **nginx 1.31.6 → 1.31.7-alpine (#2161)** for the frontend image and the
+  appliance landing page, which the bake array and chart values carry as
+  well, so all five copies move together.
+
 - **Allocate IP no longer drops an alias that another record already
   holds (#2122).** Allocate IP and next-IP skipped, without a word, an
   alias whose zone, name and type another record already held: the
