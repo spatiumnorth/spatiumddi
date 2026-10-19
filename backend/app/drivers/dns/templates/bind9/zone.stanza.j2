@@ -2,7 +2,9 @@
 zone "{{ zone.name }}" {
     type forward;
     forward {{ "only" if zone.forward_only else "first" }};
-    forwarders { {% for f in zone.forwarders %}{{ f }}; {% endfor %}};
+    {#- Tokens built by ``_forwarders.bind_zone_forwarders``, shared with the
+        agent (#2121): the zone's own transport, and ``ip@port`` split. #}
+    forwarders { {% for f in forwarder_tokens %}{{ f }}; {% endfor %}};
 };
 {%- elif zone.zone_type in ("secondary", "slave", "stub") %}
 zone "{{ zone.name }}" {

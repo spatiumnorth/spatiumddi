@@ -739,6 +739,20 @@ An op moves `pending` → `in_flight` when a long-poll ships it, then
   arriving then wins. That also recovers ops already stranded on an
   upgraded install. Re-applying one the agent did apply is harmless:
   every op is a whole-RRset write.
+- **An op shipped to a replaced agent is re-sent at once
+  ([#2042](https://github.com/spatiumnorth/spatiumddi/issues/2042)).** A
+  long-poll the API holds for an agent that has gone (a pod roll, a
+  restart) runs on to its deadline, and could page a new op into a
+  response nobody reads. The agent sends a per-process id on every config
+  poll (`X-Spatium-Agent-Instance`), and the control plane records it on
+  each op it ships (`dns_record_op.dispatched_to`), with the time the
+  shipping poll started. A poll from a different process returns ops
+  still in flight to the old one to `pending` and ships them on that
+  poll, counted as an attempt but with no backoff. Only a poll that
+  started after the shipping one may take an op back, so the old agent's
+  leftover poll, which is always the older of the two, never takes an op
+  from its replacement. A poll whose client has already disconnected rolls its page
+  back. An agent that sends no id falls back to the 5-minute reset above.
 - **A late ack is not charged twice.** Each shipped op carries a
   `dispatch` number (its attempt count), which the agent echoes in its
   ack. An error that answers an earlier dispatch was already counted when

@@ -1,7 +1,7 @@
 """subnet.show_free_ranges — per-subnet toggle for the free-range rows (#2137).
 
 Revision ID: c4a8e1f26d93
-Revises: b3d7f1a82c54
+Revises: e3b7c19f5a42
 Create Date: 2026-10-18 00:00:00
 
 Nullable on purpose: NULL means "use the default" (off for an
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "c4a8e1f26d93"
-down_revision: str | None = "b3d7f1a82c54"
+down_revision: str | None = "e3b7c19f5a42"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

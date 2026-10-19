@@ -3726,6 +3726,9 @@ async def _preview_assign_appliance_role(
     dhcp_module_problem = await _assign_role_dhcp_module_problem(db, row, args)
     if dhcp_module_problem is not None:
         return PreviewResult(ok=False, detail=dhcp_module_problem)
+    dns_module_problem = await _assign_role_dns_module_problem(db, row, args)
+    if dns_module_problem is not None:
+        return PreviewResult(ok=False, detail=dns_module_problem)
     catalog_problem = await _assign_role_catalog_problem(db, row, args)
     if catalog_problem is not None:
         return PreviewResult(ok=False, detail=catalog_problem)
@@ -3856,6 +3859,25 @@ async def _assign_role_dhcp_module_problem(
         return None
     return (
         "Cannot assign the 'dhcp' role: the DHCP module (core.dhcp) is "
+        "disabled. Enable it under Administration > Features & "
+        "Integrations, or remove the role."
+    )
+
+
+async def _assign_role_dns_module_problem(
+    db: AsyncSession, row: Any, args: AssignApplianceRoleArgs
+) -> str | None:
+    """#2135 — same refusal as the REST role-assign route: a DNS role needs
+    ``core.dns``. Only a newly ADDED engine, so an appliance already holding
+    one can still re-save (e.g. to change its DHCP group)."""
+    from app.services.feature_modules import is_module_enabled  # noqa: PLC0415
+
+    held = set(row.assigned_roles or [])
+    added = sorted(r for r in _APPL_DNS_ROLES.intersection(args.roles) if r not in held)
+    if not added or await is_module_enabled(db, "core.dns"):
+        return None
+    return (
+        f"Cannot assign the {added[0]!r} role: the DNS module (core.dns) is "
         "disabled. Enable it under Administration > Features & "
         "Integrations, or remove the role."
     )
@@ -4044,6 +4066,9 @@ async def _apply_assign_appliance_role_locked(
     dhcp_module_problem = await _assign_role_dhcp_module_problem(db, row, args)
     if dhcp_module_problem is not None:
         raise ValueError(dhcp_module_problem)
+    dns_module_problem = await _assign_role_dns_module_problem(db, row, args)
+    if dns_module_problem is not None:
+        raise ValueError(dns_module_problem)
     catalog_problem = await _assign_role_catalog_problem(db, row, args)
     if catalog_problem is not None:
         raise ValueError(catalog_problem)
