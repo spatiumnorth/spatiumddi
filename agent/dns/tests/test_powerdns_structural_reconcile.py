@@ -354,7 +354,9 @@ def test_identical_records_collapse_to_one(tmp_path: Path) -> None:
                 _rec("www", "A", "192.0.2.1", 60),  # the IPAM twin, lower TTL
                 _rec("WWW", "A", "192.0.2.2", None),  # same name, other case
                 _rec("alias", "CNAME", "Target.example.com.", None),
-                _rec("alias", "CNAME", "target.example.com", None),
+                # Case only: one record. (A DOT-LESS ``target.example.com``
+                # is another name — relative to the zone, #2060.)
+                _rec("alias", "CNAME", "target.example.com.", None),
                 _rec("txt", "TXT", "Hello", None),
                 _rec("txt", "TXT", "hello", None),  # free text: case matters
             ],
@@ -466,7 +468,13 @@ def test_a_dynamic_update_zone_is_not_swept(tmp_path: Path, monkeypatch) -> None
 
 def test_a_zone_that_cannot_be_read_back_fails_the_apply(tmp_path: Path, monkeypatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and request.url.path.endswith("/old.test."):
+        # The whole-zone read-back of the absent-rrset sweep, not the
+        # SOA-only read that precedes it (#1965).
+        if (
+            request.method == "GET"
+            and request.url.path.endswith("/old.test.")
+            and "rrset_type" not in request.url.query.decode()
+        ):
             return httpx.Response(500, json={"error": "backend error"})
         return _ok(request)
 

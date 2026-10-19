@@ -21,7 +21,7 @@ has to be exactly what the application reads back, under the install's own
 key, and the generator is the application's.
 
 Revision ID: c8e1f5a92d47
-Revises: d7a2e94b1c60
+Revises: b3d7f1a82c54
 Create Date: 2026-10-17
 """
 
@@ -33,7 +33,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "c8e1f5a92d47"
-down_revision = "d7a2e94b1c60"
+down_revision = "b3d7f1a82c54"
 branch_labels = None
 depends_on = None
 

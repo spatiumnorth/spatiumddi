@@ -22,7 +22,7 @@ import time
 import httpx
 import structlog
 
-from . import features
+from . import __version__, features
 from .cache import load_or_create_agent_id, load_token, save_token
 from .config import AgentConfig
 
@@ -60,7 +60,7 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
         "group_name": cfg.group_name,
         "fingerprint": _fingerprint(agent_id),
         "agent_id": agent_id,
-        "version": "2026.04.14.1",
+        "version": __version__,
     }
     backoff = 2.0
     while True:

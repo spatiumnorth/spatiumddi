@@ -32,6 +32,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 
 // ── Page ─────────────────────────────────────────────────────────────
 
@@ -549,7 +550,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
     org?.mirror_clients ?? false,
   );
   const [syncInterval, setSyncInterval] = useState(
-    org?.sync_interval_seconds ?? 300,
+    String(org?.sync_interval_seconds ?? 300),
   );
   const [error, setError] = useState("");
 
@@ -596,7 +597,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
           mirror_dhcp_reservations: mirrorDhcpReservations,
           mirror_nat_rules: mirrorNatRules,
           mirror_clients: mirrorClients,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (apiKey) update.api_key = apiKey;
         return merakiApi.update(org!.id, update);
@@ -616,7 +617,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
         mirror_dhcp_reservations: mirrorDhcpReservations,
         mirror_nat_rules: mirrorNatRules,
         mirror_clients: mirrorClients,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return merakiApi.create(create);
     },
@@ -636,6 +637,17 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -788,7 +800,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 300)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
