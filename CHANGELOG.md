@@ -121,6 +121,65 @@ the formatter handles the rest.
   now lists one row per zone, each ticked on its own; the rows used to
   share a key, so they toggled together.
 
+- **IPAM now says why a host named `gateway` gets no forward DNS
+  record (#2101).** The rule is deliberate (every subnet's placeholder
+  row is named `gateway`, so publishing them would collide on
+  `gateway.<zone>`), but nothing in the GUI said so. The IP row's DNS
+  column shows "forward DNS skipped" with the explanation as its
+  tooltip instead of a bare dash, and the create, edit, allocate and IP
+  detail views show the same note when the hostname is exactly
+  `gateway` (advisory, saving is still allowed; typed input is matched
+  the way the API stores it, so `Gateway` or `gateway.` shows it too). The Sync DNS modal
+  explains each stale reason in plain words instead of the raw code and
+  no longer says a `default-gateway-name` record's address is gone. A
+  row whose records Sync DNS is about to delete no longer reads "in
+  sync" (stale items now carry an optional `ip_id`), and a stale
+  record with no zone no longer renders a dangling dot. The record
+  behaviour is unchanged: no forward record, PTR still published.
+
+- **Turning DHCP off now hides DHCP everywhere, and stops the `/dhcp/*`
+  calls that 404ed (#2130).** `core.dhcp` hid the DHCP sidebar but left
+  DHCP tabs, columns, settings and pickers across IPAM, Logs, Settings,
+  Dashboard and Admin, and several of them still called `/dhcp/*` and
+  failed. With DHCP off: the subnet DHCP Pools tab, the DHCP Pool column,
+  the DHCP and DDNS tabs and device-profiling toggle in the Space / Block /
+  Subnet dialogs, the Logs DHCP Activity and DHCP Audit tabs (a
+  `?tab=dhcp-activity` link lands on DNS Queries), Settings DHCP Defaults /
+  DHCP Lease Sync / Device Profiling, the Subnet Planner, IPAM Templates
+  and Services DHCP pickers, the Fleet DHCP role chip, the Cutover DHCP
+  pickers, and the DHCP rule types in the alert editor are gone, and none of
+  them reads `/dhcp/*`. The agent bootstrap keys stay. `dhcp` and
+  `static_dhcp` are no longer offered as an IP status, but an address that
+  already has one still shows it and keeps it when you edit something else.
+  A hard reload used to fire one `/dhcp` read before the module list had
+  loaded (Dashboard on the DHCP tab, Import defaulting to DHCP); both now
+  wait for it, and a `?tab=dhcp-activity` link on a hard reload waits too
+  rather than flashing DNS Queries first. Adding the `dhcp` role to a Fleet
+  appliance while DHCP is off is refused with a 422 naming `core.dhcp` (it
+  used to be accepted and the agent was then refused at register); an
+  appliance that already holds the role can still be re-saved, and the
+  Copilot's `assign_appliance_role` (preview and apply) follows the same
+  rule. An existing alert rule of a hidden type keeps its stored parameters
+  and says why they cannot be edited. DDNS settings are hidden with it: they
+  only act on DHCP leases (`apply_ddns_for_lease`), never on static
+  allocations. Not done here: the New Devices block action, the `/dhcp`
+  direct-URL notice (#2129), label-only mentions, and the `core.dns` pass.
+
+- **Integration sync-interval fields no longer read `1h` as 1
+  second, or turn a cleared field into the default (#2110).** The
+  sync interval on the PAN-OS, UniFi, Meraki, Cloud, Docker,
+  Tailscale, OPNsense, Kubernetes, NetBird, FortiGate and Proxmox
+  forms, the network device poll interval and SNMP timeout, and
+  the DNS pool health-check interval and timeout all read
+  themselves with `parseInt(...) || N`. They now go through one
+  `parseSecondsInput` (`lib/seconds.ts`, the reader `parseTtlInput`
+  delegates to): a whole number within the API's own bounds, `1e3`
+  is 1000, anything else is refused with the reason and nothing is
+  sent. An empty field is refused as required, because omitting it
+  on an edit means "unchanged" and the default would have silently
+  rewritten it. Bounds are the API's: 30 s (60 s for Cloud), `>= 0`
+  for device polling, 10..3600 and 1..60 for the pool check.
+
 - **Editing an IP no longer renames or deletes its own A aliases, and
   the alias lists no longer show a host record as an alias (#2084).**
   An address's A/AAAA aliases and its own host records are both

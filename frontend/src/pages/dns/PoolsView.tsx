@@ -28,6 +28,11 @@ import {
 } from "@/hooks/usePermissions";
 import { poolHealthCheckFields } from "@/lib/formPayloads";
 import { parseTtlInput, POOL_TTL_BOUNDS } from "@/lib/dnsNames";
+import {
+  POOL_HC_INTERVAL_BOUNDS,
+  POOL_HC_TIMEOUT_BOUNDS,
+  secondsFieldError,
+} from "@/lib/seconds";
 
 /**
  * Pools view — manages health-checked A / AAAA pools for one zone.
@@ -431,8 +436,12 @@ export function PoolModal({
   const [hcCodes, setHcCodes] = useState<string>(
     (pool?.hc_expected_status_codes ?? [200]).join(","),
   );
-  const [hcInterval, setHcInterval] = useState(pool?.hc_interval_seconds ?? 30);
-  const [hcTimeout, setHcTimeout] = useState(pool?.hc_timeout_seconds ?? 5);
+  const [hcInterval, setHcInterval] = useState(
+    String(pool?.hc_interval_seconds ?? 30),
+  );
+  const [hcTimeout, setHcTimeout] = useState(
+    String(pool?.hc_timeout_seconds ?? 5),
+  );
   const [hcUnhealthy, setHcUnhealthy] = useState(
     pool?.hc_unhealthy_threshold ?? 2,
   );
@@ -478,8 +487,8 @@ export function PoolModal({
         ...poolHealthCheckFields({ hcType, hcPort, hcVerifyTls }, editing),
         hc_expected_status_codes:
           codes.length > 0 ? codes : [200, 201, 202, 204, 301, 302, 304],
-        hc_interval_seconds: hcInterval,
-        hc_timeout_seconds: hcTimeout,
+        hc_interval_seconds: Number(hcInterval.trim()),
+        hc_timeout_seconds: Number(hcTimeout.trim()),
         hc_unhealthy_threshold: hcUnhealthy,
         hc_healthy_threshold: hcHealthy,
       };
@@ -585,6 +594,21 @@ export function PoolModal({
           const parsed = parseTtlInput(ttlText, POOL_TTL_BOUNDS);
           if (parsed === null || typeof parsed === "string") {
             setError(`TTL ${parsed ?? "is required"}.`);
+            return;
+          }
+          const hcError =
+            secondsFieldError(
+              "Health-check interval",
+              hcInterval,
+              POOL_HC_INTERVAL_BOUNDS,
+            ) ??
+            secondsFieldError(
+              "Health-check timeout",
+              hcTimeout,
+              POOL_HC_TIMEOUT_BOUNDS,
+            );
+          if (hcError) {
+            setError(hcError);
             return;
           }
           mut.mutate();
@@ -750,9 +774,7 @@ export function PoolModal({
                 min={10}
                 max={3600}
                 value={hcInterval}
-                onChange={(e) =>
-                  setHcInterval(parseInt(e.target.value, 10) || 30)
-                }
+                onChange={(e) => setHcInterval(e.target.value)}
                 className={inputCls}
               />
             </Field>
@@ -762,9 +784,7 @@ export function PoolModal({
                 min={1}
                 max={60}
                 value={hcTimeout}
-                onChange={(e) =>
-                  setHcTimeout(parseInt(e.target.value, 10) || 5)
-                }
+                onChange={(e) => setHcTimeout(e.target.value)}
                 className={inputCls}
               />
             </Field>

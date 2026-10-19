@@ -78,7 +78,11 @@ class StaleItem:
     zone_name: str
     name: str
     value: str
-    reason: str  # "ip-deleted" | "ip-orphan" | "no-hostname"
+    reason: str  # "ip-deleted" | "ip-orphan" | "no-hostname" | ...
+    # The live IPAM row the record is attached to, when there is one (absent
+    # for ``ip-deleted``). Lets a client mark that row's DNS state as pending
+    # cleanup instead of "in sync" (#2101).
+    ip_id: uuid.UUID | None = None
 
 
 @dataclass
@@ -811,6 +815,7 @@ async def compute_subnet_dns_drift(
                         name=r.name,
                         value=r.value,
                         reason=reason,
+                        ip_id=ip.id,
                     )
                 )
             continue
@@ -915,6 +920,7 @@ async def compute_subnet_dns_drift(
                         name=r.name,
                         value=r.value,
                         reason="default-gateway-name",
+                        ip_id=ip.id,
                     )
                 )
         elif not forward_zone and primary_forward_records:
@@ -934,6 +940,7 @@ async def compute_subnet_dns_drift(
                         name=r.name,
                         value=r.value,
                         reason="no-forward-zone",
+                        ip_id=ip.id,
                     )
                 )
 
@@ -1035,6 +1042,7 @@ async def compute_subnet_dns_drift(
                         name=r.name,
                         value=r.value,
                         reason="no-forward-zone",
+                        ip_id=ip.id,
                     )
                 )
 
