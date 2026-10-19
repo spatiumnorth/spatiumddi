@@ -4890,6 +4890,9 @@ export function SubnetDetail({
     "addresses" | "dhcp" | "aliases" | "nat" | "trend" | "address-sets" | "bgp"
   >("addresses");
   const { enabled: featureEnabled } = useFeatureModules();
+  // #2100 — NAT mappings are a feature module; while it is off the subnet's
+  // NAT tab, the per-address NAT badges and the mappings modal all go.
+  const natOn = useModuleOn("ipam.nat");
   const [natModalIp, setNatModalIp] = useState<IPAddress | null>(null);
   const [selectedIpIds, setSelectedIpIds] = useState<Set<string>>(new Set());
   // Shift-click range select. ``onChange`` doesn't carry shiftKey, so we
@@ -5790,18 +5793,20 @@ export function SubnetDetail({
           >
             Address Sets
           </button>
-          <button
-            onClick={() => setActiveSubnetTab("nat")}
-            className={cn(
-              "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
-              activeSubnetTab === "nat"
-                ? "border-primary text-foreground"
-                : "border-transparent text-muted-foreground hover:text-foreground",
-            )}
-            title="NAT mappings whose internal IP falls inside this subnet"
-          >
-            NAT
-          </button>
+          {natOn && (
+            <button
+              onClick={() => setActiveSubnetTab("nat")}
+              className={cn(
+                "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+                activeSubnetTab === "nat"
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground",
+              )}
+              title="NAT mappings whose internal IP falls inside this subnet"
+            >
+              NAT
+            </button>
+          )}
           <button
             onClick={() => setActiveSubnetTab("trend")}
             className={cn(
@@ -5876,7 +5881,7 @@ export function SubnetDetail({
         </div>
       )}
 
-      {activeSubnetTab === "nat" && (
+      {natOn && activeSubnetTab === "nat" && (
         <div className="flex-1 overflow-auto">
           <NatSubnetPanel subnetId={subnet.id} />
         </div>
@@ -6542,19 +6547,20 @@ export function SubnetDetail({
                                         : "aliases"}
                                     </span>
                                   )}
-                                  {(addr.nat_mapping_count ?? 0) > 0 && (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setNatModalIp(addr);
-                                      }}
-                                      className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
-                                      title={`Click to view ${addr.nat_mapping_count} NAT mapping${(addr.nat_mapping_count ?? 0) === 1 ? "" : "s"}`}
-                                    >
-                                      NAT {addr.nat_mapping_count}
-                                    </button>
-                                  )}
+                                  {natOn &&
+                                    (addr.nat_mapping_count ?? 0) > 0 && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setNatModalIp(addr);
+                                        }}
+                                        className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
+                                        title={`Click to view ${addr.nat_mapping_count} NAT mapping${(addr.nat_mapping_count ?? 0) === 1 ? "" : "s"}`}
+                                      >
+                                        NAT {addr.nat_mapping_count}
+                                      </button>
+                                    )}
                                 </span>
                               </td>
                               <td className="px-4 py-2 font-mono text-xs">
@@ -7066,7 +7072,7 @@ export function SubnetDetail({
           onClose={() => setScanFromDetail(null)}
         />
       )}
-      {natModalIp && (
+      {natOn && natModalIp && (
         <NatMappingsForIpModal
           ip={natModalIp}
           onClose={() => setNatModalIp(null)}

@@ -103,6 +103,7 @@ import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 import { HA_V4_ONLY_NOTE } from "@/lib/dhcpHa";
 import { activityTone } from "@/lib/activity-tone";
@@ -1443,10 +1444,14 @@ export function DashboardPage() {
   });
 
   // NAT mapping count — cheap (single page=1, per_page=1 just for total).
+  // Behind the ``ipam.nat`` module (#2100): the route 404s while it is off,
+  // and the card below goes with it.
+  const natOn = useModuleOn("ipam.nat");
   const { data: natTotal } = useQuery({
     queryKey: ["nat-mappings", "count"],
     queryFn: () => natApi.list({ page: 1, per_page: 1 }).then((r) => r.total),
     staleTime: 60_000,
+    enabled: natOn,
   });
 
   // Platform settings drive the utilization filter (excludes /30, /31,
@@ -2267,13 +2272,15 @@ export function DashboardPage() {
               </div>
             </div>
 
-            <KpiCard
-              label="NAT mappings"
-              value={natTotal ?? "—"}
-              sub={natTotal === 0 ? "none configured" : "operator-curated"}
-              icon={Plug}
-              to="/ipam/nat"
-            />
+            {natOn && (
+              <KpiCard
+                label="NAT mappings"
+                value={natTotal ?? "—"}
+                sub={natTotal === 0 ? "none configured" : "operator-curated"}
+                icon={Plug}
+                to="/ipam/nat"
+              />
+            )}
 
             <KpiCard
               label="Capacity headroom"

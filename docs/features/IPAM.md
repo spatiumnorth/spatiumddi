@@ -2022,6 +2022,17 @@ UI: clicking the NAT badge on an IP row opens a modal listing
 every mapping for that IP; new "NAT" tab on the subnet detail
 shows every mapping touching the subnet's CIDR.
 
+**Feature module `ipam.nat` (#2100).** The whole surface (the
+NAT Mappings page, the routes above, the Dashboard card and the
+subnet / IP detail NAT tab, badges and dialog) can be turned off
+under Settings → Features. While it is off the routes answer 404,
+but the rows are kept, and the PAN-OS / Fortinet / Meraki mirrors
+keep writing them. The module ships off, but with no operator
+override it resolves **on** whenever `nat_mapping` holds a row
+(`ModuleSpec.default_on_if_rows_in`), so an install that already
+uses NAT keeps it after upgrade without a seeded `feature_module`
+row. An operator's choice always wins.
+
 ### ✅ 15.19 VXLAN ID surface in the UI
 
 `subnet.vxlan_id` (Integer, range 1–16 777 214, nullable) existed

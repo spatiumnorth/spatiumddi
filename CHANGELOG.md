@@ -27,6 +27,31 @@ the formatter handles the rest.
 
 ### Added
 
+- **NAT mappings can be turned off: they are now the `ipam.nat`
+  feature module (#2100).** Settings → Features has a NAT mappings
+  entry. Off, it removes the IPAM → NAT Mappings sidebar entry, the
+  Dashboard's NAT card and its count query, and the NAT tab, NAT
+  badges and mappings dialog on subnet and IP detail, and the
+  `/api/v1/ipam/nat-mappings` routes answer 404. The address list
+  reports `nat_mapping_count` as 0 without querying for it. Turning
+  it back on restores everything: the mappings are hidden, never
+  deleted, and disabling is allowed while they exist. The PAN-OS,
+  Fortinet and Meraki mirrors keep writing their NAT rows while it is
+  off, so turning it on shows a current picture.
+  The module ships **off** on a fresh install, but **an install that
+  already has NAT mappings keeps seeing them after upgrade**. No
+  `feature_module` row is seeded, which #1069 forbids. Instead a module
+  may now declare `default_on_if_rows_in`: with no operator override
+  it resolves on exactly when that table holds a row. An operator's
+  choice in Settings → Features always wins, in either direction. Two
+  consequences follow from "on when there is data". On a fresh install,
+  a firewall mirror's first NAT rule turns the surface on. And deleting
+  the last mapping turns it off again unless it was enabled explicitly.
+  The check is a one-row probe, run only while no override exists, at
+  most once per worker per 5 s module-cache refresh, and the
+  feature-modules list the UI resolves from uses the same derivation
+  as the route gate, so the sidebar and the API cannot disagree.
+
 - **The Helm chart's migrate Job takes annotations, so it works under
   GitOps (#2114).** Under `helm template`, which is how Argo CD and
   similar tools render a chart, the Helm revision is always 1. The
