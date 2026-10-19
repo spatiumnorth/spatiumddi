@@ -107,6 +107,38 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Upgrade note for #2121: a forward zone's own transport needs
+  upgraded agents.** An agent from before this release ignores the
+  zone's `forward_transport` and `forward_tls_hostname` and forwards
+  every forward zone the way the group forwards: over the group's
+  transport, checked against the group's certificate name. So until
+  the DNS agents (BIND9 and Technitium) are upgraded, a zone whose
+  transport or hostname differs from the group's does not get it. In a
+  DoT group, a zone on plain DNS still goes out over TLS and fails
+  against a Do53-only upstream, as before this release; a DoT zone
+  with another provider's hostname (a group on `cloudflare-dns.com`, a
+  zone forwarding to Quad9 as `dns.quad9.net`) fails certificate
+  verification, and every name in the zone SERVFAILs. In a plain-DNS
+  group, a zone set to DoT is still forwarded in plaintext. Upgrade
+  the DNS agents before giving a zone a transport or hostname different
+  from its group's. A zone that matches its group works on old and new
+  agents alike.
+
+- **The zone move preview reports a forward transport the target group
+  cannot serve (#2121 follow-up).** Moving a forward zone to another
+  server group (#935) re-checks the zone's own `forward_transport`
+  against the target: a DoH or DoQ zone cannot land on a BIND9 group,
+  and a TLS zone cannot land on Windows DNS. Only the commit refused
+  that; the preview said nothing, so the operator learned of it after
+  filling in the move. The preview now returns the refusal as
+  `forward_transport_refusal`, shown in the move dialog with the move
+  blocked, and in the `preview_dns_zone_move` Copilot tool. The preview
+  and the commit run the same check that zone create and update run, so
+  they cannot disagree. The 422 for a forward zone whose forwarders
+  present two TLS certificate names now names the zone, its forwarders
+  and its `forward_tls_hostname`, rather than repeating the group-level
+  wording that said one hostname applies to "the whole group".
+
 - **Copilot and MCP network tools share the Tools page's per-user rate
   limit.** The `/api/v1/tools/*` routes cap each user at 20 on-prem
   probes and 8 off-prem lookups per minute. The copilot and MCP tools
