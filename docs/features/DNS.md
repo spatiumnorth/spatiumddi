@@ -1278,6 +1278,7 @@ element:
 ### Record Management
 - Bulk import records from zone file (RFC 1035 format)
 - Export zone as standard zone file
+- Export / import records as CSV or XLSX for bulk editing (see below)
 - Record diff view before pushing changes to server
 
 **TTLs on import are compared as effective TTLs (#1727).** A record with no
@@ -1290,6 +1291,115 @@ parser also reports one TTL per RRset (the lowest among its members, which is
 what the RRset is served with), so a member whose file TTL equals its RRset's
 existing lowest effective TTL is unchanged too. Re-importing a zone's own
 export changes nothing.
+
+### Spreadsheet import / export — CSV and XLSX (#2139)
+
+The zone file is right for moving a zone between servers. For editing many
+records at once — renaming twenty hosts, retargeting CNAMEs, loading a new
+zone from an inventory sheet — the zone's **Data ▾** menu also offers
+**Export CSV**, **Export XLSX**, **Download template** and **Import CSV /
+XLSX**. Over REST:
+
+| | |
+|---|---|
+| Export | `GET /api/v1/dns/groups/{gid}/zones/{zid}/export?format=csv\|xlsx` (`format=zone`, the default, is the zone file). File name `dns-zone-<zone>-<YYYYMMDD-HHMMSS>.<ext>`, UTC. Needs read. |
+| Template | `GET …/zones/{zid}/import/template?format=csv\|xlsx` |
+| Import | `POST …/zones/{zid}/import/spreadsheet/preview` then `…/commit`, multipart: `file`, `mode` (`merge` / `replace`), and on a replace commit `confirm_zone`. Needs write on `dns_record`; a replace that deletes also needs delete. |
+
+**Columns.** One row per record. The header row is required; column names are
+case-insensitive and `record_type` is accepted for `type`.
+
+| Column | On export | On import |
+|---|---|---|
+| `id` | The record's UUID | Which record the row edits (see below). Blank: match by content or create. `EXAMPLE`: the row is ignored |
+| `name` | Owner, relative to the zone; `@` is the apex | Required for a new record. Relative to the zone, as on the record API, unless it ends in a dot: then it is absolute, as in a zone file, and must be in this zone (`www.example.com.` is `www`; a name outside the zone is an error) |
+| `type` | `A`, `MX`, … | Required. Cannot change on an existing record |
+| `ttl` | Blank when the record inherits the zone's `$TTL` | Blank = inherit |
+| `value` | The rdata, as the record API stores it | Required |
+| `priority` / `weight` / `port` | The model's structured columns: MX uses `priority`, SRV all three | As the record API: SRV needs all three, MX defaults `priority` to 10, any other type takes none |
+| `view` | The split-horizon view's name; blank renders in every view | A view of the zone's group, by name (case-insensitive) |
+| `comment` | The record's `comment` tag | Stored as the `comment` tag (records have no comment column, so a `comment` tag set in the record form *is* this column; clearing the cell removes it). Never reaches a DNS server, so a comment-only change does not bump the serial or queue a record op |
+| `managed` | Why a row is read-only: `ipam`, `pool`, `tailscale`, `netbird`, `kubernetes` | Ignored |
+
+CAA, TLSA, SSHFP, NAPTR, SVCB / HTTPS and the other structured types have no
+columns of their own because the model stores them as one presentation-format
+rdata string; edit them in `value` exactly as the record form takes them
+(`0 issue "letsencrypt.org"`).
+
+**How a row finds its record.** In this order:
+
+1. **`id` set** — that record. It must be a live record in this zone (an
+   unknown id is an error, not a create: clear the cell to add the row as a
+   new record), and its type must match. Every other column may change, so a
+   rename or a new address is an *update* of that record — for the servers, a
+   rename goes out as delete-at-the-old-name plus create-at-the-new one, as an
+   edit in the record form does (#1773).
+2. **`id` blank** — the record with the same view, name (case-insensitive),
+   type and value; of identical twins, the first not already matched. Anything
+   else that differs (TTL, priority, weight, port, comment) is an update.
+   Matching nothing makes the row a new record.
+
+Two rows that resolve to one record make the second an error, and so does a
+row that would leave the zone holding the same record twice — two identical new
+rows, or an edit that turns one record into a copy of another — as the record
+API refuses it with a 409 (#1230). Twins the zone already holds are not
+re-judged by an edit that keeps them what they are (a TTL or a comment). Matching by
+value rather than by `(name, type)` is deliberate: an RRset has several
+members, and keying on the RRset would turn "add a second A record" into
+"replace the first".
+
+**Modes.** **Merge** (the default) adds and updates and never deletes.
+**Replace** also deletes every record no row matched — the same zone-wide
+scope as the export, every view included — so the commit needs the zone's
+name typed back (`confirm_zone`). Deleted records are hard-deleted, as a
+zone-file replace does.
+
+**Validation.** Every row goes through the record API's own checks: the type
+list, the RFC 2181 owner rule, the TTL bounds (#2073), the structured-field
+rules (#424), the per-type value checks (one IP per A / AAAA row, a valid
+target name for CNAME / NS / PTR / DNAME), absolute targets on PowerDNS
+(#2060), BIND's check-names and the full-name lengths (#1378, #2072), and the
+driver-gated types. A row that fails is reported in the preview's `errors` with
+its spreadsheet row number (the header is row 1), never as a 500. **The commit
+refuses the whole file while any row has an error** — nothing is ever half
+imported. Rows the CNAME rule refuses (#2089: a CNAME beside other data, or at
+the apex) are skipped with the reason, as in the zone-file import.
+
+**Records IPAM or an integration owns are read-only here.** A record generated
+by IPAM (`auto_generated`, an address's alias, or linked to an IP), rendered by
+a DNS pool, or synthesised by Tailscale / NetBird / Kubernetes is never changed
+or deleted by a sheet: an unchanged row for one is reported unchanged and
+`read_only`, a changed row is skipped with the reason, and a replace leaves it
+in place and says so. Edit those at their source, or DNS and IPAM disagree.
+
+**Spreadsheet formulas.** Export prefixes any cell starting with `=`, `+`,
+`-`, `@`, a tab or a carriage return with `'`, so a spreadsheet shows it as
+text instead of running it (#523's rule). Import strips that one apostrophe
+back off, so a round trip is exact, and never evaluates anything: a value
+starting with `=` is stored as text. An XLSX is read with cached values only,
+so a formula cell imports as whatever it last calculated to.
+
+**The template** has one example row per common type (A, AAAA, CNAME, MX,
+TXT, SRV), each with `id` set to `EXAMPLE`. Import ignores those rows and
+reports how many it ignored, so rows can be added beneath them and the sheet
+uploaded as it is.
+
+**Commit.** One transaction, one serial bump, one batch of record ops through
+the same path as the zone-file import (#1683), so agents and agentless
+providers receive the changes and the group's agents are woken. One
+`dns_zone_import` audit row carries the counts and every change. A file is
+bounded at 10 MB and 10,000 rows (100,000 read at all, blank ones included),
+and an XLSX at 100 MB uncompressed, checked before the workbook is opened. A
+CSV is read as UTF-8, with or without a BOM, or as UTF-16 when it starts with
+a UTF-16 BOM (Excel's "Unicode text"); an unreadable file or a corrupt sheet
+is a 422, never a 500.
+
+**A record whose TTL predates the #2073 bounds** (negative, say) re-imports
+with its TTL as it is; a row that sets a TTL out of bounds is a row error.
+
+**Copilot.** `export_dns_zone_records` (read-only, enabled by default) returns
+the same rows as the export. There is no import tool: a bulk write is the
+broad-blast-radius shape that non-negotiable #13 keeps off the copilot.
 
 ### Zone Health Indicators
 - Last successful sync timestamp

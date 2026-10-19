@@ -19,7 +19,7 @@ database, so deleting the rule is final. The downgrade leaves it alone,
 since by then it may carry operator edits and its events.
 
 Revision ID: c8e2a5f71d39
-Revises: b3d7f1a82c54
+Revises: c4a8e1f26d93
 Create Date: 2026-10-18 14:00:00.000000
 """
 
@@ -30,7 +30,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "c8e2a5f71d39"
-down_revision = "b3d7f1a82c54"
+down_revision = "c4a8e1f26d93"
 branch_labels = None
 depends_on = None
 

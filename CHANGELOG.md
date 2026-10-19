@@ -27,26 +27,6 @@ the formatter handles the rest.
 
 ### Added
 
-- **Tailscale warns before its 90-day API token expires, and alerts
-  when it has (#2138).** Tailscale caps an API access token at 90
-  days; when it lapsed, every sync got HTTP 401, the mirror stopped
-  updating and nothing said so. Each tenant now records
-  `api_key_expires_at`, read from Tailscale's keys endpoint
-  (`GET /api/v2/tailnet/{tailnet}/keys/{keyId}`, the key id taken from
-  the `tskey-api-<keyId>-…` token) when the token is tested, saved or
-  replaced, and again once a day. When Tailscale can't say, the tenant
-  form takes a "Token expires on" date instead, pre-filled with 90
-  days from today; a date read from Tailscale always replaces it, and
-  a failed read never clears a stored one. The `secret_expiring` alert
-  rule now covers these tokens (`tailscale_tenant:<id>` subjects, its
-  usual threshold and severity escalation) and fires **critical** for
-  a tenant whose last sync got HTTP 401, whatever date is recorded. A
-  red or amber chip shows the state on the Tailscale page and on both
-  dashboard integration surfaces; on the Tailscale page it opens the
-  tenant form to replace the token. `list_tailscale_targets` returns
-  the expiry and the credential state. The token is never logged or
-  returned.
-
 - **NAT mappings can be turned off: they are now the `ipam.nat`
   feature module (#2100).** Settings → Features has a NAT mappings
   entry. Off, it removes the IPAM → NAT Mappings sidebar entry, the
@@ -116,22 +96,6 @@ the formatter handles the rest.
 
 ### Changed
 
-- **Upgrading adds an enabled `secret_expiring` alert rule, so existing
-  installs may start alerting on credentials that were expiring all
-  along (#2138).** The rule was only ever created by hand, so on a
-  default install no expiring credential alerted at all. The upgrade
-  adds "Credential expiring or rejected" (warning, 30 days, escalating
-  to critical as expiry nears). It covers Tailscale API tokens and also
-  supervisor certificates, API tokens with an expiry and the Let's
-  Encrypt Web UI certificate, so after the upgrade an install may start
-  alerting on any of those that expire within 30 days. It is not added
-  when a `secret_expiring` rule already exists. It is added once, by the
-  migration, so if you delete it, it stays deleted.
-
-- **Testing a Tailscale tenant with a new, unsaved key no longer
-  clears the stored key's sync error (#2138).** Replacing the key does
-  clear an HTTP 401 error, since it belonged to the old key.
-
 - **Dependency pins current (#1625): GoBGP 4.9.0 → 4.10.0 and the
   vendored Swagger UI bundle 5.33.0 → 5.33.1.** GoBGP 4.10.0's own
   go.mod pins the x/net, x/text and grpc versions the Looking Glass
@@ -170,6 +134,78 @@ the formatter handles the rest.
   "Scheduled Trivy scan: fixable CVEs in shipped images".
 
 ### Fixed
+
+- **Tailscale warns before its 90-day API token expires, and alerts
+  when it has (#2138).** Tailscale caps an API access token at 90
+  days; when it lapsed, every sync got HTTP 401, the mirror stopped
+  updating and nothing said so. Each tenant now records
+  `api_key_expires_at`, read from Tailscale's keys endpoint
+  (`GET /api/v2/tailnet/{tailnet}/keys/{keyId}`, the key id taken from
+  the `tskey-api-<keyId>-…` token) when the token is tested, saved or
+  replaced, and again once a day. When Tailscale can't say, the tenant
+  form takes a "Token expires on" date instead, pre-filled with 90
+  days from today; a date read from Tailscale always replaces it, and
+  a failed read never clears a stored one. The `secret_expiring` alert
+  rule now covers these tokens (`tailscale_tenant:<id>` subjects, its
+  usual threshold and severity escalation) and fires **critical** for
+  a tenant whose last sync got HTTP 401, whatever date is recorded. A
+  red or amber chip shows the state on the Tailscale page and on both
+  dashboard integration surfaces; on the Tailscale page it opens the
+  tenant form to replace the token. `list_tailscale_targets` returns
+  the expiry and the credential state. The token is never logged or
+  returned.
+
+- **Upgrading adds an enabled `secret_expiring` alert rule, so existing
+  installs may start alerting on credentials that were expiring all
+  along (#2138).** The rule was only ever created by hand, so on a
+  default install no expiring credential alerted at all. The upgrade
+  adds "Credential expiring or rejected" (warning, 30 days, escalating
+  to critical as expiry nears). It covers Tailscale API tokens and also
+  supervisor certificates, API tokens with an expiry and the Let's
+  Encrypt Web UI certificate, so after the upgrade an install may start
+  alerting on any of those that expire within 30 days. It is not added
+  when a `secret_expiring` rule already exists. It is added once, by the
+  migration, so if you delete it, it stays deleted.
+
+- **Testing a Tailscale tenant with a new, unsaved key no longer
+  clears the stored key's sync error (#2138).** Replacing the key does
+  clear an HTTP 401 error, since it belonged to the old key.
+
+- **A zone's records export and import as CSV / XLSX, for bulk
+  editing in a spreadsheet (#2139).** The zone's Data menu gains
+  Export CSV, Export XLSX, Download template and Import CSV / XLSX,
+  beside the zone file. One row per record, with `priority` / `weight`
+  / `port`, `view` and `comment` as their own columns and the record's
+  `id` so a re-import edits the same record: a row with an `id`
+  updates that record (a rename included), a row without one matches
+  by view, name, type and value, or is added. Merge (default) never
+  deletes; replace deletes what the sheet does not list and needs the
+  zone's name typed back. Every row runs the record API's own checks
+  and a bad one is a per-row error with its row number; the commit
+  refuses the whole file while any remain. Records IPAM or an
+  integration owns are never changed or deleted; CNAME-rule clashes
+  are skipped with the reason, as in the zone-file import. Cells are
+  escaped against formula injection on export and read as text on
+  import. The commit goes out as record ops on one serial bump through
+  the zone-file import's own path, and is audited. The template's
+  example rows carry `id=EXAMPLE` and are ignored on import. REST:
+  `GET …/zones/{id}/export?format=csv|xlsx`,
+  `GET …/zones/{id}/import/template`,
+  `POST …/zones/{id}/import/spreadsheet/{preview,commit}`. New
+  read-only Copilot tool `export_dns_zone_records`, default on; no
+  import tool, by decision (#13). See `docs/features/DNS.md` §9.
+  A sheet cannot store one record twice: two identical new rows, or an
+  edit that turns a record into a copy of another, is a row error, as
+  the record API's 409 (#1230). A name ending in a dot is absolute, as
+  in a zone file (`www.example.com.` is `www`; a name outside the zone
+  is an error), where the record API alone would have stored
+  `www.example.com.example.com.`. A record whose TTL predates the #2073
+  bounds re-imports with its TTL as it is. Uploads are bounded before
+  they are parsed (an XLSX at 100 MB uncompressed, 100,000 rows read
+  at all), a CSV may be UTF-16 (Excel's "Unicode text"), and a corrupt
+  or entity-expanding sheet is a 422 rather than a 500. On an agentless
+  group, a change the provider has not taken yet is shown in the import
+  dialog instead of the dialog closing as if it were clean.
 
 - **Deleting a DNS or DHCP server row no longer takes its daemon down
   with it (#2052).** The agent's woken config poll answers 404 once the
@@ -6307,14 +6343,6 @@ the formatter handles the rest.
 
 ### Migrations
 
-- `c8e2a5f71d39` — #2138: `tailscale_tenant.api_key_expires_at`
-  (nullable timestamp) and `api_key_expiry_source` (nullable string,
-  `api` or `operator`, checked by a constraint). No backfill: NULL
-  means unknown until the next test, save or daily refresh reads it.
-  Also inserts the "Credential expiring or rejected" `secret_expiring`
-  alert rule, enabled, unless a rule of that type or name already
-  exists. Downgrade drops the constraint and both columns and leaves
-  the rule in place.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column
@@ -6434,6 +6462,14 @@ the formatter handles the rest.
 - `c4a8e1f26d93` — #2137: `subnet.show_free_ranges`, a nullable
   boolean. No backfill: NULL means "use the default rule". Downgrade
   drops the column.
+- `c8e2a5f71d39` — #2138: `tailscale_tenant.api_key_expires_at`
+  (nullable timestamp) and `api_key_expiry_source` (nullable string,
+  `api` or `operator`, checked by a constraint). No backfill: NULL
+  means unknown until the next test, save or daily refresh reads it.
+  Also inserts the "Credential expiring or rejected" `secret_expiring`
+  alert rule, enabled, unless a rule of that type or name already
+  exists. Downgrade drops the constraint and both columns and leaves
+  the rule in place.
 
 ## 2026.10.02-1 — 2026-10-02
 
