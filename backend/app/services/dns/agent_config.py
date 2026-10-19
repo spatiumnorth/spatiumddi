@@ -78,6 +78,7 @@ from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_ops import (
     QUEUED_OP_STATES,
     RRSET_KEY_CHUNK,
+    _mark_applied,
     op_rrset_key,
     queued_after,
     rrset_match_where,
@@ -1635,8 +1636,11 @@ async def retire_queued_ops(
     # #1929 — locked in ``row_locks`` order (ascending id) before the write:
     # a row a group move deletes meanwhile is skipped, not a StaleDataError.
     stale_ops = await lock_ops(db, *conds)
+    # #2108 — stamp it the way every other applied op is (one helper, not a
+    # copy of its field list): the render delivered it, once.
+    now = datetime.now(UTC)
     for op in stale_ops:
-        op.state = "applied"
+        _mark_applied(op, now)
     if stale_ops:
         await db.flush()
     return len(stale_ops)
