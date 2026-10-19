@@ -89,6 +89,7 @@ _ZONE_SCOPE_SCAN_CAP = 20_000
 
 @register_tool(
     name="list_dns_zones",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "List DNS zones (authoritative / secondary / stub / forward). "
@@ -186,6 +187,7 @@ class QueryRecordsArgs(BaseModel):
 
 @register_tool(
     name="query_dns_records",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Search DNS records across zones. Filters: zone, record type, "
@@ -366,7 +368,10 @@ class PreviewZoneMoveArgs(BaseModel):
 
 @register_tool(
     name="preview_dns_zone_move",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    # Matches the REST preview (POST …/zones/{id}/move/preview), which is
+    # superadmin-only: the answer describes the TARGET group too (its views,
+    # drivers, zone names, ACL and key names), not just the caller's zone.
+    permission="superadmin",
     description=(
         "Report what moving a DNS zone to another server group would do, "
         "WITHOUT doing it. Answers 'can this zone move to that group, and "
@@ -660,6 +665,7 @@ class ListDNSRecordsArgs(BaseModel):
 
 @register_tool(
     name="list_dns_records",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Cross-zone DNS record search. Filterable by relative name "
@@ -957,6 +963,7 @@ class FindZoneDNSSECInfoArgs(BaseModel):
 
 @register_tool(
     name="find_zone_dnssec_info",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Return the DNSSEC posture of one DNS zone: ``dnssec_enabled`` "
@@ -1115,6 +1122,7 @@ class FindZoneDriftArgs(BaseModel):
 
 @register_tool(
     name="find_dns_zone_drift",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Per-server config-drift report for one DNS zone (#61): AXFRs / "
@@ -1406,6 +1414,7 @@ class FindZoneUpdateAclsArgs(BaseModel):
 
 @register_tool(
     name="find_zone_update_acls",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Return a DNS zone's dynamic-update (RFC 2136) ACL (issue #641): "

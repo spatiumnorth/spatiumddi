@@ -107,6 +107,98 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An address can no longer be named after one of its own aliases
+  (#2106).** Renaming an address onto its own A / AAAA alias left two
+  identical rows at the name, and deleting the alias afterwards queued
+  a delete for an RR the host record still claimed, so the host's own
+  record vanished from the served zone while IPAM still showed it. A
+  CNAME alias there put a CNAME beside the host's address record. The
+  edit, the extra-zone edit and the bulk DNS-zone change now answer
+  409, in the wording of the alias CNAME rule (#2080), naming the
+  alias; nothing is written. Creating an A / AAAA alias at the
+  address's own host name is refused the same way. Background paths
+  (DDNS, lease mirrors, integrations, importers) do not fail and write
+  no duplicate: on an A / AAAA alias they retract the old name and log
+  `ipam_dns_record_skipped_own_alias`, which leaves the zone as a
+  correct rename would (the alias already answers the new name, and the
+  PTR names it); on a CNAME alias they keep the existing CNAME skip,
+  which also retracts the PTR. A duplicate that already exists is left
+  as it is.
+
+- **A record op the split-horizon render retires is stamped like
+  any applied op (#2108).** In a DNS group with views, the bundle
+  render retires a server's queued record ops as `applied`, but
+  `retire_queued_ops` set only the state: `applied_at` stayed NULL,
+  `attempts` 0 and `updated_at` at creation, so
+  `GET /dns/servers/{id}/pending-ops` reported an applied op with no
+  time and no attempt for every record change. It now goes through
+  `_mark_applied`, the helper the dispatch path uses, so the op
+  reads `applied_at` and `updated_at` set, has any earlier error and
+  retry time cleared, and counts one more attempt (the render
+  delivered it once).
+
+- **Turning DNS off hides DNS everywhere and stops the `/dns` calls
+  that 404ed (#2135).** The DNS counterpart of #2130: `core.dns` hid
+  the DNS sidebar but left DNS pickers, panels and reads elsewhere.
+  Every one is now gated on `ready && enabled("core.dns")` through
+  the shared `useModuleOn` hook: the IPAM zone pickers (Add, Edit and
+  Bulk-edit IP, Bulk allocate), DNS aliases, the DNS column, the
+  Sync DNS entries and drift banner, the DNS and DDNS tabs of the
+  space / block / subnet dialogs, the IP detail zones and DNS
+  linkage, the DNS server group pickers on all eleven integration
+  forms, the Subnet Planner and IPAM Templates pickers, Services
+  (DNS zone resources), API tokens (zone binding), the Domain
+  detail Linked DNS Zones tab, the Cutover plan DNS half, Fleet's
+  DNS roles and group, the Logs DNS tabs and the four Settings DNS
+  sections. A stored value (a template's DNS group, an
+  integration's `dns_group_id`) is never cleared by saving a form
+  that no longer shows it. The Logs page keeps a valid default tab
+  with DNS off (DHCP Activity) and with both off (Event Log), and a
+  hard reload waits for the module set before mounting a tab that
+  reads `/dns`. Backend: the Fleet role assignment (REST and the
+  Copilot's `assign_appliance_role`) refuses a newly added DNS role
+  with a 422 while `core.dns` is off. An appliance that already
+  holds one can still be re-saved or have it removed, and the DNS
+  agent routers stay outside the module gate on purpose. Swapping to
+  another DNS engine is refused too, since it brings up a new DNS
+  service. The IPAM Templates DDNS tab now needs both DHCP and DNS,
+  as the IPAM dialogs' DDNS tab does.
+
+- **An API token bound to specific DNS zones or subnets only reaches
+  the Operator Copilot / MCP tools that narrow their answers to those
+  zones or subnets.** The tools' permission check looks at the resource
+  type, so a token bound to one zone cleared it for every DNS tool, and
+  the tools that list server groups, servers, views or query rates, or
+  count IPAM resources estate-wide, answered as though the token were
+  unbound. The tool registry now refuses an instance-bound token any
+  tool that does not declare `honours_token_binding`, for `tools/list`,
+  MCP `tools/call` and in-app chat alike, the same structural floor the
+  REST routers have. The tools that do declare it (zone and record
+  lists, per-zone DNSSEC / drift / update-ACL reads, the IPAM space /
+  block / subnet / address reads, tag lookup and global search) already
+  filter or gate on the bound instances, and a test pins the list and
+  checks each one against a second zone and subnet. The IPAM tools that
+  accept a space or block by name resolve it only within the binding, so a
+  name outside it reads as not found. Sessions and unbound tokens are
+
+- **Dashboard rollups and the DNS / DHCP traffic series read with the
+  caller's own grants.** `GET /metrics/dns/timeseries` now needs `read` on a
+  DNS type (`dns_group` / `dns_zone` / `dns_record`, as the `/dns` routes do)
+  and `GET /metrics/dhcp/timeseries` needs `read` on `dhcp_server`; both
+  previously answered any signed-in account. The Network and Integrations
+  dashboard tabs need `read` on at least one of the types they summarise and
+  fill only the panels the caller can read — an integration's panel and its
+  recent reconciler errors appear only with `read` on that integration — and
+  say so instead of loading forever when the role covers none of them; the
+  DNS query-rate and DHCP traffic cards likewise say the data is unavailable
+  rather than "No data yet". The tag autocomplete (`GET /tags/keys`,
+  `/tags/values`) offers only tags from tables the caller can read. The
+  built-in Viewer (`read *`) sees everything it saw before. A new guard test
+  walks the route table and fails for any `GET` route with no permission
+  dependency unless it is listed with the reason (pre-sign-in, agent or token
+  authenticated, own rows, static reference data, or checked in the handler);
+  see `docs/PERMISSIONS.md`.
+
 - **The IPAM bulk-delete dialog kept describing what was submitted after
   an approval policy took it (#2046).** With a `delete:subnet` approval
   policy, bulk-deleting two subnets showed "2 of 2 submitted for
