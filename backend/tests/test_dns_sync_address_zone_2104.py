@@ -424,3 +424,172 @@ async def test_editing_a_reservation_keeps_its_zone(
         r = await client.put(f"/api/v1/ipam/addresses/{ip_id}", headers=env.headers, json=body)
         assert r.status_code == 200, r.text
     await _assert_in_other_zone(db_session, env, ip_id, "h7b")
+
+
+@pytest.mark.asyncio
+async def test_auto_sync_on_a_subnet_with_no_zone_deletes_nothing(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Auto-sync with delete-stale on, on a subnet whose zone was removed: the
+    address still has its own zone, so its A and PTR are not stale."""
+    from app.tasks.ipam_dns_sync import _run_auto_sync  # noqa: PLC0415
+
+    env = await _setup(client, db_session)
+    ip_id = await _placed(client, db_session, env, "10.104.5.28", "h8")
+    sn = await db_session.get(Subnet, uuid.UUID(env.sid))
+    assert sn is not None
+    sn.dns_zone_id = None
+    sn.dns_inherit_settings = False
+    ps = await db_session.get(PlatformSettings, 1)
+    if ps is None:
+        ps = PlatformSettings(id=1)
+        db_session.add(ps)
+    ps.dns_auto_sync_enabled = True
+    ps.dns_auto_sync_delete_stale = True
+    ps.dns_auto_sync_last_run_at = None
+    await db_session.commit()
+
+    await _run_auto_sync()
+    await _assert_in_other_zone(db_session, env, ip_id, "h8")
+
+
+@pytest.mark.asyncio
+async def test_extra_zones_naming_the_own_or_the_subnet_zone_dedupe(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An address in T whose extra zones list T itself and the subnet's zone Z:
+    one host record in each, all in sync, and the commit keeps both."""
+    env = await _setup(client, db_session)
+    ip_id = await _placed(
+        client,
+        db_session,
+        env,
+        "10.104.5.29",
+        "h9",
+        extra_zone_ids=[str(env.zone.id)],
+        extra_zone=env.zone,
+    )
+    # Bulk edit kept the extras; add T to them as well.
+    r = await client.put(
+        f"/api/v1/ipam/addresses/{ip_id}",
+        headers=env.headers,
+        json={"extra_zone_ids": [str(env.zone.id), str(env.other.id)]},
+    )
+    assert r.status_code == 200, r.text
+    fwd = sorted(str(r.zone_id) for r in await _rows(db_session, ip_id) if r.record_type == "A")
+    assert fwd == sorted([str(env.other.id), str(env.zone.id)])
+
+    rep = await _preview(client, env, "subnet")
+    assert rep["mismatched"] == [] and rep["missing"] == [] and rep["stale"] == []
+    await _commit_default(client, env, "subnet", rep, ip_id)
+    assert (
+        sorted(str(r.zone_id) for r in await _rows(db_session, ip_id) if r.record_type == "A")
+        == fwd
+    )
+    await _assert_in_other_zone(db_session, env, ip_id, "h9", env.zone)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subnet_has_zone", [True, False])
+async def test_a_deleted_own_zone_falls_back_to_the_subnet(
+    client: AsyncClient, db_session: AsyncSession, subnet_has_zone: bool
+) -> None:
+    """The address's zone is soft-deleted (its A goes to the trash with it).
+    With a zone on the subnet the host is published there again and its PTR
+    repointed; with none, the PTR naming the deleted zone is stale and goes.
+    Nothing live in another zone is touched either way."""
+    env = await _setup(client, db_session)
+    ip_id = await _placed(client, db_session, env, "10.104.5.30", "h10")
+    if not subnet_has_zone:
+        sn = await db_session.get(Subnet, uuid.UUID(env.sid))
+        assert sn is not None
+        sn.dns_zone_id = None
+        sn.dns_inherit_settings = False
+        await db_session.commit()
+    d = await client.delete(
+        f"/api/v1/dns/groups/{env.other.group_id}/zones/{env.other.id}", headers=env.headers
+    )
+    assert d.status_code == 204, d.text
+
+    rep = await _preview(client, env, "subnet")
+    if subnet_has_zone:
+        assert [(m["record_type"], m["zone_id"]) for m in _for(rep["missing"], ip_id)] == [
+            ("A", str(env.zone.id))
+        ]
+        assert [m["expected_value"] for m in _for(rep["mismatched"], ip_id)] == [
+            f"h10.{env.zone.name}"
+        ]
+        assert _for(rep["stale"], ip_id) == []
+    else:
+        assert _for(rep["missing"], ip_id) == []
+        assert [(s["record_type"], s["reason"]) for s in _for(rep["stale"], ip_id)] == [
+            ("PTR", "no-forward-zone")
+        ]
+    await _commit_default(client, env, "subnet", rep, ip_id)
+
+    live = [r for r in await _rows(db_session, ip_id) if r.deleted_at is None]
+    if subnet_has_zone:
+        assert sorted(
+            (r.record_type, r.zone_id == env.zone.id) for r in live if r.record_type == "A"
+        ) == [("A", True)]
+        assert [r.value for r in live if r.record_type == "PTR"] == [f"h10.{env.zone.name}"]
+        assert (await _ip(db_session, ip_id)).forward_zone_id == env.zone.id
+    else:
+        assert live == []
+
+
+@pytest.mark.asyncio
+async def test_reimporting_an_address_keeps_its_zone(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The address importer's overwrite re-publishes on a hostname change; it
+    re-synced with no zone and moved the host into the subnet's."""
+    env = await _setup(client, db_session)
+    ip_id = await _placed(client, db_session, env, "10.104.5.31", "h11")
+    r = await client.post(
+        "/api/v1/ipam/import/addresses/commit",
+        headers=env.headers,
+        files={"file": ("a.csv", b"address,hostname\n10.104.5.31,h11b\n", "text/csv")},
+        data={"subnet_id": env.sid, "strategy": "overwrite"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["errors"] == [], r.text
+    await _assert_in_other_zone(db_session, env, ip_id, "h11b")
+
+
+@pytest.mark.asyncio
+async def test_block_sync_commit_is_audited_with_the_block_network(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A block commit that changed something handed the audit row the block's
+    ``IPv4Network`` and answered 422. It answers 200 and names the block."""
+    from app.models.audit import AuditLog  # noqa: PLC0415
+
+    env = await _setup(client, db_session)
+    n = await client.post(
+        f"/api/v1/ipam/subnets/{env.sid}/addresses",
+        headers=env.headers,
+        json={"address": "10.104.5.32", "hostname": "h12"},
+    )
+    assert n.status_code == 201, n.text
+    c = await client.post(
+        f"/api/v1/ipam/blocks/{env.block_id}/dns-sync/commit",
+        headers=env.headers,
+        json={"create_for_ip_ids": [n.json()["id"]]},
+    )
+    assert c.status_code == 200, c.text
+    assert c.json()["created"] == 1, c.text
+    rows = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "dns-sync",
+                    AuditLog.resource_type == "block",
+                    AuditLog.resource_id == env.block_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [a.resource_display for a in rows] == ["10.104.0.0/16"]

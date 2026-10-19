@@ -444,12 +444,17 @@ async def address_own_forward_zone_id(db: AsyncSession, ip: IPAddress) -> uuid.U
     than the subnet's). Every path that re-syncs an address passes this to
     ``_sync_dns_record``, which otherwise resolves the subnet's zone and moves
     the host out of the one it was put in (#493, #2104). None (the subnet's
-    zone applies) when the address has no zone or its zone is gone.
+    zone applies) when the address has no zone or its zone is gone, deleted
+    or in the trash.
     """
     if ip.forward_zone_id is None:
         return None
     zone = await db.get(DNSZone, ip.forward_zone_id)
-    return zone.id if zone is not None else None
+    # ``db.get`` answers from the identity map without the soft-delete filter,
+    # so a zone deleted earlier in this session still comes back: check it.
+    if zone is None or zone.deleted_at is not None:
+        return None
+    return zone.id
 
 
 def _expected_a(hostname: str, addr: str, zone_name: str) -> tuple[str, str]:

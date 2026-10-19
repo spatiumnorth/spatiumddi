@@ -117,17 +117,31 @@ the formatter handles the rest.
   the subnet's zone and pointed its PTR there. If the subnet had no
   zone at all, the same records were listed as stale and deleted. The
   preview and the commit, at subnet, block and space scope and in
-  auto-sync, now use the address's own zone when it has one and the
-  subnet's otherwise, which is what the record write already did for
-  a hostname edit. A forward record that is in the wrong zone now
-  names the zone it is in. Editing a DHCP reservation's row and
-  re-importing an address no longer move it out of its zone either.
-  A side effect: changing or removing a subnet's zone no longer moves
-  or deletes the records of addresses already published in the old
-  one when Sync DNS runs; move them with Bulk edit. Also fixed: a
-  block's Sync DNS commit answered 422 whenever it changed anything,
-  because the audit row was given the block's network object instead
-  of its text.
+  auto-sync, now use the address's own zone when it has one and it is
+  still live, and the subnet's otherwise, which is what the record
+  write already did for a hostname edit. A forward record that is in
+  the wrong zone now names the zone it is in. Editing a DHCP
+  reservation's row and re-importing an address no longer move it out
+  of its zone either.
+
+  **Behaviour change.** IPAM records the zone an address is published
+  in, but not whether an operator chose it or it came from the subnet.
+  So Sync DNS now leaves every published address in its zone:
+  - Changing a subnet's zone from Z to Z2 no longer makes Sync DNS (or
+    auto-sync) move the subnet's existing addresses into Z2. They read
+    as in sync in Z. Move them with Bulk edit → DNS zone. New
+    addresses, and addresses with no zone of their own, use Z2.
+  - Removing a subnet's zone no longer lists its published addresses'
+    A, AAAA and PTR records as stale, so Sync DNS and auto-sync with
+    delete-stale on no longer delete them. Remove them by setting each
+    address's DNS zone to None in Edit.
+  An address whose zone was deleted still follows the subnet.
+
+- **A block's Sync DNS commit answered 422 whenever it changed
+  anything.** The audit row was given the block's network object
+  instead of its text, which the database refused, so nothing the
+  commit had done was kept. It now answers 200 and the audit row names
+  the block's network.
 
 - **Sync DNS reads an address in every zone it publishes to
   (#2107).** An address with extra zones has its host record in its
