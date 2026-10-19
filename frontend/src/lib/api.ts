@@ -10981,6 +10981,10 @@ export interface IntegrationsDashboardTargetRow {
   // #797 — non-fatal findings; null for integrations that don't compute them.
   last_sync_warning: string | null;
   is_stale: boolean;
+  // #2138 — credential health; null for integrations that record no expiry.
+  credential_state: CredentialState | null;
+  credential_expires_at: string | null;
+  credential_days_left: number | null;
 }
 export interface IntegrationsDashboardPanel {
   kind: IntegrationDashboardKind;
@@ -15349,6 +15353,14 @@ export const unifiApi = {
 
 // ── Tailscale integration ──────────────────────────────────────────
 
+// #2138 — see backend app/services/integration_credentials.py.
+export type CredentialState =
+  | "ok"
+  | "expiring"
+  | "expired"
+  | "rejected"
+  | "unknown";
+
 export interface TailscaleTenant {
   id: string;
   name: string;
@@ -15356,6 +15368,11 @@ export interface TailscaleTenant {
   enabled: boolean;
   tailnet: string;
   api_key_present: boolean;
+  // #2138 — null = unknown.
+  api_key_expires_at: string | null;
+  api_key_expiry_source: "api" | "operator" | null;
+  credential_state: CredentialState;
+  credential_days_left: number | null;
   ipam_space_id: string;
   dns_group_id: string | null;
   cgnat_cidr: string;
@@ -15376,6 +15393,7 @@ export interface TailscaleTenantCreate {
   enabled?: boolean;
   tailnet?: string;
   api_key: string;
+  api_key_expires_at?: string | null;
   ipam_space_id: string;
   dns_group_id?: string | null;
   cgnat_cidr?: string;
@@ -15390,6 +15408,7 @@ export interface TailscaleTenantUpdate {
   enabled?: boolean;
   tailnet?: string;
   api_key?: string;
+  api_key_expires_at?: string | null;
   ipam_space_id?: string;
   dns_group_id?: string | null;
   cgnat_cidr?: string;
@@ -15403,6 +15422,9 @@ export interface TailscaleTestResult {
   message: string;
   tailnet_domain: string | null;
   device_count: number | null;
+  // #2138 — the tested token's expiry as Tailscale reports it.
+  api_key_expires_at?: string | null;
+  api_key_expiry_note?: string | null;
 }
 
 export const tailscaleApi = {
