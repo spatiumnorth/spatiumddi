@@ -107,6 +107,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Dashboard rollups and the DNS / DHCP traffic series read with the
+  caller's own grants.** `GET /metrics/dns/timeseries` now needs `read` on a
+  DNS type (`dns_group` / `dns_zone` / `dns_record`, as the `/dns` routes do)
+  and `GET /metrics/dhcp/timeseries` needs `read` on `dhcp_server`; both
+  previously answered any signed-in account. The Network and Integrations
+  dashboard tabs need `read` on at least one of the types they summarise and
+  fill only the panels the caller can read — an integration's panel and its
+  recent reconciler errors appear only with `read` on that integration — and
+  say so instead of loading forever when the role covers none of them; the
+  DNS query-rate and DHCP traffic cards likewise say the data is unavailable
+  rather than "No data yet". The tag autocomplete (`GET /tags/keys`,
+  `/tags/values`) offers only tags from tables the caller can read. The
+  built-in Viewer (`read *`) sees everything it saw before. A new guard test
+  walks the route table and fails for any `GET` route with no permission
+  dependency unless it is listed with the reason (pre-sign-in, agent or token
+  authenticated, own rows, static reference data, or checked in the handler);
+  see `docs/PERMISSIONS.md`.
+
 - **The IPAM bulk-delete dialog kept describing what was submitted after
   an approval policy took it (#2046).** With a `delete:subnet` approval
   policy, bulk-deleting two subnets showed "2 of 2 submitted for
