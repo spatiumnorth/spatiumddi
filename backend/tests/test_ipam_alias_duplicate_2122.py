@@ -214,7 +214,8 @@ async def test_re_adding_an_alias_the_address_has_changes_nothing(
             headers=headers,
             json={"name": name, "record_type": rtype},
         )
-        assert resp.status_code == 201, resp.text
+        # 200, not 201: nothing was created.
+        assert resp.status_code == 200, resp.text
         assert resp.json()["record_type"] == rtype
 
     assert await _records(db_session, zone.id) == before
@@ -257,3 +258,54 @@ async def test_the_same_alias_twice_in_one_request_is_written_once(
     assert nxt.status_code == 201, nxt.text
     names = [n for n, _ in await _records(db_session, zone.id)]
     assert names.count("w2") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_record_differing_only_in_case_is_the_same_name(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """DNS names compare case-insensitively, as the CNAME rule does."""
+    headers, sid, zone = await _setup(client, db_session)
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            name="Mail",
+            fqdn=f"Mail.{zone.name.rstrip('.')}",
+            record_type="A",
+            value="192.0.2.25",
+        )
+    )
+    await db_session.commit()
+    before = await _records(db_session, zone.id)
+
+    resp = await _alloc(
+        client, headers, sid, "10.97.5.60", "box", aliases=[{"name": "mail", "record_type": "A"}]
+    )
+    assert resp.status_code == 409, resp.text
+    assert "an A record" in resp.json()["detail"]
+    assert await _records(db_session, zone.id) == before
+
+
+@pytest.mark.asyncio
+async def test_same_name_other_type_is_not_a_duplicate(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A TXT or AAAA at the name does not block an A alias there."""
+    headers, sid, zone = await _setup(client, db_session)
+    for rtype, value in (("TXT", '"v=spf1 -all"'), ("AAAA", "2001:db8::25")):
+        db_session.add(
+            DNSRecord(
+                zone_id=zone.id,
+                name="mail",
+                fqdn=f"mail.{zone.name.rstrip('.')}",
+                record_type=rtype,
+                value=value,
+            )
+        )
+    await db_session.commit()
+
+    resp = await _alloc(
+        client, headers, sid, "10.97.5.61", "box", aliases=[{"name": "mail", "record_type": "A"}]
+    )
+    assert resp.status_code == 201, resp.text
+    assert ("mail", "A") in await _records(db_session, zone.id)

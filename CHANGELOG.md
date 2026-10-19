@@ -115,8 +115,9 @@ the formatter handles the rest.
   another address, or an operator record), as adding a single alias
   from Edit IP does, and nothing is written: no address row, no host
   record, no other alias. Names compare case-insensitively. Adding an
-  alias the address already has is a no-op that returns it, for a CNAME
-  as well as an A, rather than a 409, and is not audited as a create.
+  alias the address already has is a no-op that returns it with 200, for
+  a CNAME as well as an A, rather than a 409, and is not audited as a
+  create.
   The same alias given twice in one request is written once.
 
 - **An address can no longer be named after one of its own aliases

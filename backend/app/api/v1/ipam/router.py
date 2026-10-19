@@ -1404,13 +1404,13 @@ def _is_own_alias(rec: DNSRecord, ip_id: uuid.UUID) -> bool:
 
 async def _alias_duplicate_detail(db: AsyncSession, rec: DNSRecord, rtype: str, fqdn: str) -> str:
     """The 409 detail for an alias whose record something else holds (#2122)."""
-    holder = f"a {rtype} record"
+    article = "an" if rtype.startswith("A") else "a"
+    holder = f"{article} {rtype} record"
     if rec.ip_address_id is not None:
         other_ip = await db.get(IPAddress, rec.ip_address_id)
         if other_ip is not None:
             role = "an alias of" if rec.ip_alias else "the host record of"
-            holder = f"a {rtype} record, {role} address {other_ip.address}"
-    article = "an" if rtype.startswith("A") else "a"
+            holder = f"{article} {rtype} record, {role} address {other_ip.address}"
     return (
         f"{fqdn} already holds {holder}, so {article} {rtype} alias there would "
         "not be created. Pick another alias name, or remove that record first."
@@ -8919,9 +8919,19 @@ async def list_aliases(address_id: uuid.UUID, current_user: CurrentUser, db: DB)
     "/addresses/{address_id}/aliases",
     response_model=AliasResponse,
     status_code=status.HTTP_201_CREATED,
+    responses={
+        200: {
+            "model": AliasResponse,
+            "description": "The address already has this alias; it is returned unchanged.",
+        }
+    },
 )
 async def add_alias(
-    address_id: uuid.UUID, body: AliasInput, current_user: CurrentUser, db: DB
+    address_id: uuid.UUID,
+    body: AliasInput,
+    current_user: CurrentUser,
+    db: DB,
+    response: Response,
 ) -> DNSRecord:
     ip = await db.get(IPAddress, address_id)
     if ip is None:
@@ -8964,10 +8974,11 @@ async def add_alias(
     except ValueError:
         is_v6 = False
     written_type = _alias_written_type(body.record_type, is_v6=is_v6)
-    # #2122 — an alias the address already has is returned as it stands:
-    # nothing is written, so nothing is audited.
+    # #2122 — an alias the address already has is returned as it stands,
+    # with 200 rather than 201: nothing is created, so nothing is audited.
     existing = await _alias_record_at(db, zone_id, body.name, written_type)
     if existing is not None and _is_own_alias(existing, ip.id):
+        response.status_code = status.HTTP_200_OK
         return existing
     await _create_alias_records(db, ip, subnet, [body], zone_id=zone_id)
     res = await db.execute(
