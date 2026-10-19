@@ -135,6 +135,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Bulk edit's "clear DNS zone" removes the records (#2172).** In Bulk
+  edit IPs, setting the DNS zone to empty (`dns_zone_id: ""`) asked the
+  sync for an update with no zone, which means "work out a zone". So
+  each address's records moved into the subnet's zone, or, with no
+  subnet zone, were published again where they already were, and the
+  request reported success. A bulk clear now runs the same clear as
+  single Edit with zone None, through one shared helper: it removes the
+  address's forward A/AAAA in its zone and any extra zone, its PTR and
+  its aliases, queues a delete for each, and sets `forward_zone_id` to
+  null. An address with nothing published is left as it is. The
+  response gains `dns_cleared`, the addresses whose records were
+  removed.
+
 - **A DNS record change made while an agent is replaced reaches the new
   agent at once, not five minutes later (#2042).** When a DNS agent is
   replaced (its pod rolls after a slot upgrade, a container restarts),
