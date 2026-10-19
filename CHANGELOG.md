@@ -27,6 +27,30 @@ the formatter handles the rest.
 
 ### Added
 
+- **A zone's records export and import as CSV / XLSX, for bulk
+  editing in a spreadsheet (#2139).** The zone's Data menu gains
+  Export CSV, Export XLSX, Download template and Import CSV / XLSX,
+  beside the zone file. One row per record, with `priority` / `weight`
+  / `port`, `view` and `comment` as their own columns and the record's
+  `id` so a re-import edits the same record: a row with an `id`
+  updates that record (a rename included), a row without one matches
+  by view, name, type and value, or is added. Merge (default) never
+  deletes; replace deletes what the sheet does not list and needs the
+  zone's name typed back. Every row runs the record API's own checks
+  and a bad one is a per-row error with its row number; the commit
+  refuses the whole file while any remain. Records IPAM or an
+  integration owns are never changed or deleted; CNAME-rule clashes
+  are skipped with the reason, as in the zone-file import. Cells are
+  escaped against formula injection on export and read as text on
+  import. The commit goes out as record ops on one serial bump through
+  the zone-file import's own path, and is audited. The template's
+  example rows carry `id=EXAMPLE` and are ignored on import. REST:
+  `GET …/zones/{id}/export?format=csv|xlsx`,
+  `GET …/zones/{id}/import/template`,
+  `POST …/zones/{id}/import/spreadsheet/{preview,commit}`. New
+  read-only Copilot tool `export_dns_zone_records`, default on; no
+  import tool, by decision (#13). See `docs/features/DNS.md` §9.
+
 - **The Helm chart's migrate Job takes annotations, so it works under
   GitOps (#2114).** Under `helm template`, which is how Argo CD and
   similar tools render a chart, the Helm revision is always 1. The

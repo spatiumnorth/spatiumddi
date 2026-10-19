@@ -6599,6 +6599,76 @@ export const dnsApi = {
           r.headers["content-disposition"],
         ),
       })),
+  // #2139 — the zone's records as a CSV / XLSX sheet, a blank template, and
+  // the spreadsheet import (preview → commit).
+  exportZoneRecords: (
+    groupId: string,
+    zoneId: string,
+    format: "csv" | "xlsx",
+  ) =>
+    api
+      .get<Blob>(`/dns/groups/${groupId}/zones/${zoneId}/export`, {
+        params: { format },
+        responseType: "blob",
+      })
+      .then((r) => ({
+        data: r.data,
+        filename: _parseContentDispositionFilename(
+          r.headers["content-disposition"],
+        ),
+      })),
+  zoneImportTemplate: (
+    groupId: string,
+    zoneId: string,
+    format: "csv" | "xlsx" = "csv",
+  ) =>
+    api
+      .get<Blob>(`/dns/groups/${groupId}/zones/${zoneId}/import/template`, {
+        params: { format },
+        responseType: "blob",
+      })
+      .then((r) => ({
+        data: r.data,
+        filename: _parseContentDispositionFilename(
+          r.headers["content-disposition"],
+        ),
+      })),
+  importZoneSheetPreview: (
+    groupId: string,
+    zoneId: string,
+    file: File,
+    mode: DNSSheetImportMode,
+  ) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("mode", mode);
+    return api
+      .post<DNSSheetImportPreview>(
+        `/dns/groups/${groupId}/zones/${zoneId}/import/spreadsheet/preview`,
+        form,
+        { headers: { "Content-Type": "multipart/form-data" } },
+      )
+      .then((r) => r.data);
+  },
+  importZoneSheetCommit: (
+    groupId: string,
+    zoneId: string,
+    file: File,
+    mode: DNSSheetImportMode,
+    confirmZone?: string,
+  ) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("mode", mode);
+    if (confirmZone) form.append("confirm_zone", confirmZone);
+    return api
+      .post<DNSSheetImportCommit>(
+        `/dns/groups/${groupId}/zones/${zoneId}/import/spreadsheet/commit`,
+        form,
+        { headers: { "Content-Type": "multipart/form-data" } },
+      )
+      .then((r) => r.data);
+  },
   syncZoneWithServer: (groupId: string, zoneId: string, apply = true) =>
     api
       .post<{
@@ -6669,6 +6739,62 @@ export interface DNSImportPreview {
   soa_detected: boolean;
   record_count: number;
   skipped: string[];
+}
+
+export type DNSSheetImportMode = "merge" | "replace";
+
+export interface DNSSheetRecordChange {
+  row: number | null;
+  op: "create" | "update" | "delete" | "unchanged";
+  name: string;
+  record_type: string;
+  value: string;
+  ttl: number | null;
+  priority: number | null;
+  weight: number | null;
+  port: number | null;
+  view: string | null;
+  comment: string | null;
+  existing_id: string | null;
+  changed_fields: string[];
+  read_only: boolean;
+}
+
+export interface DNSSheetRowIssue {
+  row: number | null;
+  reason: string;
+  name: string | null;
+  record_type: string | null;
+  value: string | null;
+}
+
+export interface DNSSheetImportPreview {
+  zone_id: string;
+  zone_name: string;
+  format: "csv" | "xlsx";
+  mode: DNSSheetImportMode;
+  row_count: number;
+  examples_ignored: number;
+  to_create: DNSSheetRecordChange[];
+  to_update: DNSSheetRecordChange[];
+  to_delete: DNSSheetRecordChange[];
+  unchanged: DNSSheetRecordChange[];
+  errors: DNSSheetRowIssue[];
+  skipped: DNSSheetRowIssue[];
+}
+
+export interface DNSSheetImportCommit {
+  zone_id: string;
+  batch_id: string;
+  format: string;
+  mode: DNSSheetImportMode;
+  created: number;
+  updated: number;
+  deleted: number;
+  unchanged: number;
+  skipped: DNSSheetRowIssue[];
+  target_serial: number | null;
+  provider_warning: string | null;
 }
 
 export interface DNSImportCommit {
