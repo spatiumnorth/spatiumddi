@@ -95,7 +95,10 @@ _ZONE_SCOPE_SCAN_CAP = 20_000
         "Each summary includes name, type, kind (forward / reverse), "
         "TTL, server group, view binding, and name_scope — whether the "
         "zone name sits on a delegated public TLD, a reserved special-use "
-        "namespace, an undelegated TLD, or is a reverse zone."
+        "namespace, an undelegated TLD, or is a reverse zone. A forward "
+        "zone also carries its forwarders and its OWN upstream transport "
+        "(forward_transport do53 / tls / https / quic + "
+        "forward_tls_hostname), which does not inherit the group's."
     ),
     args_model=ListZonesArgs,
     category="dns",
@@ -126,19 +129,26 @@ async def list_dns_zones(db: AsyncSession, user: User, args: ListZonesArgs) -> l
         scope = classify_zone_name(z.name, tlds=tlds)
         if wanted and scope.scope != wanted:
             continue
-        out.append(
-            {
-                "id": str(z.id),
-                "name": z.name,
-                "zone_type": z.zone_type,
-                "kind": z.kind,
-                "group_id": str(z.group_id),
-                "view_id": str(z.view_id) if z.view_id else None,
-                "ttl": z.ttl,
-                "name_scope": scope.scope,
-                "name_scope_reason": scope.reason,
-            }
-        )
+        row: dict[str, Any] = {
+            "id": str(z.id),
+            "name": z.name,
+            "zone_type": z.zone_type,
+            "kind": z.kind,
+            "group_id": str(z.group_id),
+            "view_id": str(z.view_id) if z.view_id else None,
+            "ttl": z.ttl,
+            "name_scope": scope.scope,
+            "name_scope_reason": scope.reason,
+        }
+        if z.zone_type == "forward":
+            # #2121 — the zone's OWN upstream transport, independent of the
+            # group's forward_transport (which covers the group's resolver
+            # forwarders only).
+            row["forwarders"] = list(z.forwarders or [])
+            row["forward_only"] = bool(z.forward_only)
+            row["forward_transport"] = z.forward_transport or "do53"
+            row["forward_tls_hostname"] = z.forward_tls_hostname
+        out.append(row)
         if len(out) >= args.limit:
             break
     if wanted and len(rows) >= _ZONE_SCOPE_SCAN_CAP and len(out) < args.limit:
@@ -1501,7 +1511,9 @@ class FindDNSEncryptedTransportsArgs(BaseModel):
         "(issue #50). Returns per group: the listener toggles + ports + "
         "DoH URL path, whether a usable TLS certificate is actually linked "
         "(a listener without one silently degrades to Do53), and the "
-        "upstream transport with its verification hostname. Use this to "
+        "upstream transport with its verification hostname. That transport "
+        "covers the group's own resolver forwarders only: a conditional "
+        "forward zone carries its own (see list_dns_zones, #2121). Use this to "
         "answer 'is encrypted DNS on?', 'what port is DoH on?', 'are we "
         "still forwarding in cleartext?', or 'why isn't DoT working?'. "
         "Read-only; never returns certificate or key material."
