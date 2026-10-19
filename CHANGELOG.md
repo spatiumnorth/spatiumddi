@@ -135,6 +135,31 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting a DNS or DHCP server row no longer takes its daemon down
+  with it (#2052).** The agent's woken config poll answers 404 once the
+  row is gone, and on a 401 or 404 the DNS, DHCP and looking-glass agents
+  dropped their token and stopped the sync thread. The supervisor's
+  dead-thread watch then exited the container, so named stopped answering
+  for 2-13 s (Kea about 1 s) until the restarted container re-registered,
+  which is the opposite of what non-negotiable #5 and the #1939 note say.
+  The agents now re-register from the PSK in the same thread
+  (`bootstrap.reauthenticate`, serialised so the sync loop and the
+  heartbeat register once) and keep polling; the daemon never stops and
+  serves from its cached config throughout. A control plane that is down
+  or a wrong PSK backs off (jittered, capped at 5 min) instead of
+  spinning or exiting, and a token refused again straight after it was
+  minted (two agents sharing one agent id off a cloned state dir) waits
+  5 s, doubling to 5 min, before each further re-registration — the pacing
+  the orchestrator's restart back-off used to supply. The re-registered
+  agent appears as a new server row, and gets what a restart used to send
+  it at startup: the DNS agent re-reports its zone serials (the highest it
+  has served, not the last structural render's), its DNSSEC state and its
+  rendered config, and the DHCP agent snapshots Kea's lease table to it —
+  without which the new row's leases would stay empty until each client
+  renewed. This happens whichever thread re-registered, since the
+  structural etag carries no server id and the new row's bundle
+  re-renders nothing.
+
 - **Sync DNS no longer lists an address's host A as missing when its
   own A alias already serves the name (#2118).** Since #2117 a rename
   onto an address's own alias skips the host record, because the alias
