@@ -231,7 +231,9 @@ function TemplateEditor({
               ["children", "Child layout"],
             ] as [TabKey, string][]
           )
-            .filter(([k]) => dnsOn || k !== "ddns")
+            // DDNS is DHCP updating DNS: it needs both modules, as the
+            // IPAM dialogs' DDNS tab does (#2135).
+            .filter(([k]) => (dnsOn && dhcpOn) || k !== "ddns")
             .map(([k, label]) => {
               const disabled = k === "children" && form.applies_to !== "block";
               return (

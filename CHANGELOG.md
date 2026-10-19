@@ -129,7 +129,10 @@ the formatter handles the rest.
   Copilot's `assign_appliance_role`) refuses a newly added DNS role
   with a 422 while `core.dns` is off. An appliance that already
   holds one can still be re-saved or have it removed, and the DNS
-  agent routers stay outside the module gate on purpose.
+  agent routers stay outside the module gate on purpose. Swapping to
+  another DNS engine is refused too, since it brings up a new DNS
+  service. The IPAM Templates DDNS tab now needs both DHCP and DNS,
+  as the IPAM dialogs' DDNS tab does.
 
 - **Sync DNS reads an address in every zone it publishes to
   (#2107).** An address with extra zones has its host record in its

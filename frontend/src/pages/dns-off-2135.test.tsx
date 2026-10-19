@@ -73,8 +73,13 @@ const { SettingsPage } = await import("./SettingsPage");
 const { DashboardPage } = await import("./DashboardPage");
 const { IPAMTemplatesPage } = await import("./admin/IPAMTemplatesPage");
 const { ApplianceRoleAssignmentSection } = await import("./appliance/FleetTab");
-const { AddAddressModal, CreateSubnetModal, SubnetDetail } =
-  await import("./ipam/IPAMPage");
+const {
+  AddAddressModal,
+  CreateSubnetModal,
+  EditAddressModal,
+  EditSubnetModal,
+  SubnetDetail,
+} = await import("./ipam/IPAMPage");
 
 function answer(api: string, method: string, fn: Answer) {
   (answers[api] ??= {})[method] = fn;
@@ -230,6 +235,126 @@ describe("Logs tabs", () => {
       expect(dnsCalls()).toEqual([]);
     },
   );
+});
+
+describe("Logs tab highlight on a hard reload", () => {
+  // The bodies wait for the module set; the highlighted tab must not flick
+  // to the Event Log meanwhile and back again once DNS turns out to be on.
+  const isActive = (el: HTMLElement) =>
+    (el.closest("button")?.className ?? "").includes("border-primary");
+
+  it.each([
+    ["/logs", "DNS Queries"],
+    ["/logs?tab=dns-threat", "DNS Threat"],
+  ])(
+    "%s highlights the tab it will land on while loading",
+    async (route, name) => {
+      mods.ready = false;
+      answer("logsApi", "listSources", () => Promise.resolve([]));
+      // At least one source, or the page renders its empty state instead.
+      answer("logsApi", "listAgentSources", () =>
+        Promise.resolve([
+          {
+            server_id: "s1",
+            server_name: "ns1",
+            server_kind: "dns",
+            driver: "bind9",
+            host: "10.0.0.1",
+          },
+        ]),
+      );
+      open(<LogsPage />, route);
+      expect(isActive(await screen.findByText(name))).toBe(true);
+      expect(isActive(screen.getByText("Event Log"))).toBe(false);
+      expect(dnsCalls()).toEqual([]);
+    },
+  );
+});
+
+// ── Stored DNS values survive a save with DNS off ────────────────────────────
+
+describe("Saving with DNS off keeps the stored DNS linkage", () => {
+  it("Edit IP omits dns_zone_id, so the forward / extra zones stay", async () => {
+    dnsOff();
+    let body: Record<string, unknown> | undefined;
+    answer("ipamApi", "updateAddress", (_id, b) => {
+      body = b as Record<string, unknown>;
+      return Promise.resolve({ ...address(), dhcp_static_warning: null });
+    });
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({
+        dns_group_ids: ["g1"],
+        dns_zone_id: "z1",
+        dns_additional_zone_ids: ["z2"],
+      }),
+    );
+    open(
+      <EditAddressModal
+        address={address({
+          forward_zone_id: "z1",
+          extra_zone_ids: ["z2"],
+        } as Partial<IPAddress>)}
+        onClose={() => {}}
+      />,
+    );
+    await screen.findByText("Hostname");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByText("DNS Zone")).toBeNull();
+    expect(screen.queryByText("DNS Aliases")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(body).toBeDefined());
+    // ``undefined`` is dropped on the wire, so the backend keeps the zone.
+    expect(body?.dns_zone_id).toBeUndefined();
+    expect(body).not.toHaveProperty("extra_zone_ids");
+    expect(body).not.toHaveProperty("aliases");
+    expect(dnsCalls()).toEqual([]);
+  });
+
+  it("Edit Subnet sends the stored DNS and DDNS settings back unchanged", async () => {
+    dnsOff();
+    let body: Record<string, unknown> | undefined;
+    answer("ipamApi", "updateSubnet", (_id, b) => {
+      body = b as Record<string, unknown>;
+      return Promise.resolve({});
+    });
+    const subnet = {
+      id: "sub-1",
+      space_id: "sp-1",
+      block_id: "blk-1",
+      network: "10.85.20.0/24",
+      name: "lab",
+      description: "",
+      status: "active",
+      custom_fields: {},
+      dns_inherit_settings: false,
+      dns_group_ids: ["g1"],
+      dns_zone_id: "z1",
+      dns_additional_zone_ids: ["z2"],
+      dns_split_horizon: true,
+      ddns_enabled: true,
+      ddns_hostname_policy: "client_provided",
+      ddns_domain_override: "dyn.example.",
+      ddns_ttl: 300,
+    } as unknown as Subnet;
+    open(<EditSubnetModal subnet={subnet} onClose={() => {}} />);
+    await screen.findByRole("button", { name: "General" });
+    expect(screen.queryByRole("button", { name: "DNS" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "DDNS" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(body).toBeDefined());
+    expect(body).toMatchObject({
+      dns_inherit_settings: false,
+      dns_group_ids: ["g1"],
+      dns_zone_id: "z1",
+      dns_additional_zone_ids: ["z2"],
+      dns_split_horizon: true,
+      ddns_enabled: true,
+      ddns_hostname_policy: "client_provided",
+      ddns_domain_override: "dyn.example.",
+      ddns_ttl: 300,
+    });
+    expect(dnsCalls()).toEqual([]);
+  });
 });
 
 // ── Settings ─────────────────────────────────────────────────────────────────

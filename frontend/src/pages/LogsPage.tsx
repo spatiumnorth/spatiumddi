@@ -115,7 +115,15 @@ export function LogsPage() {
     : dhcpOn
       ? "dhcp-activity"
       : "events";
-  const tab: Tab = wanted && tabAllowed(wanted) ? wanted : fallbackTab;
+  // Until the module set has loaded nothing is known to be off, so the tab
+  // the URL asks for (or DNS Queries, the usual default) stays highlighted
+  // rather than flicking to the Event Log for a moment; the bodies below
+  // still wait, so nothing is read before the answer is in.
+  const tab: Tab = !modulesReady
+    ? (wanted ?? "dns-queries")
+    : wanted && tabAllowed(wanted)
+      ? wanted
+      : fallbackTab;
   const setTab = (next: Tab) => {
     const params = new URLSearchParams(searchParams);
     params.set("tab", next);
