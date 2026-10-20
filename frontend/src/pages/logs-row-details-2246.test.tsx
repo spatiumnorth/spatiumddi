@@ -120,12 +120,39 @@ describe("DNS query row details (#2246)", () => {
       value: { writeText },
       configurable: true,
     });
+    Object.defineProperty(window, "isSecureContext", {
+      value: true,
+      configurable: true,
+    });
     render(<DNSQueryRow row={dnsRow()} />);
     openDetails();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /copy/i }));
     });
     expect(writeText).toHaveBeenCalledWith(LONG_RAW);
+    expect(screen.getByRole("button", { name: /copied/i })).toBeTruthy();
+  });
+
+  it("copies on plain http, where navigator.clipboard is undefined", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: undefined,
+      configurable: true,
+    });
+    Object.defineProperty(window, "isSecureContext", {
+      value: false,
+      configurable: true,
+    });
+    const execCommand = vi.fn().mockReturnValue(true);
+    Object.defineProperty(document, "execCommand", {
+      value: execCommand,
+      configurable: true,
+    });
+    render(<DNSQueryRow row={dnsRow()} />);
+    openDetails();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /copy/i }));
+    });
+    expect(execCommand).toHaveBeenCalledWith("copy");
     expect(screen.getByRole("button", { name: /copied/i })).toBeTruthy();
   });
 
