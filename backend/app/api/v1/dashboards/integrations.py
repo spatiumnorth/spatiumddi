@@ -18,6 +18,7 @@ matching ``resource_type`` set. Capped at 20 rows.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -40,6 +41,8 @@ from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
+from app.services.integration_credentials import CredentialStatus, credential_status
+from app.services.tailscale.client import is_auth_rejected
 
 router = APIRouter()
 
@@ -60,6 +63,12 @@ class IntegrationTargetRow(BaseModel):
     # ``None`` for integrations that don't compute warnings.
     last_sync_warning: str | None
     is_stale: bool  # last_synced_at older than 2× sync_interval, or never
+    # #2138 — the target's credential: ok | expiring | expired | rejected |
+    # unknown, from app/services/integration_credentials.py. ``None`` for
+    # integrations that don't record a credential expiry (yet).
+    credential_state: str | None = None
+    credential_expires_at: datetime | None = None
+    credential_days_left: int | None = None
 
 
 class IntegrationPanel(BaseModel):
@@ -129,6 +138,7 @@ def _build_panel(
     targets: list[Any],
     display_attr: str,
     now: datetime,
+    credential: Callable[[Any], CredentialStatus] | None = None,
 ) -> IntegrationPanel:
     """Aggregate one integration's targets into the dashboard panel."""
     rows: list[IntegrationTargetRow] = []
@@ -155,6 +165,9 @@ def _build_panel(
             warnings += 1
         else:
             healthy += 1
+        # A disabled target syncs nothing, so a lapsed credential breaks
+        # nothing and ``secret_expiring`` skips it; the dashboard does too.
+        cred = credential(t) if credential is not None and getattr(t, "enabled", True) else None
         rows.append(
             IntegrationTargetRow(
                 id=str(t.id),
@@ -164,6 +177,9 @@ def _build_panel(
                 last_sync_error=last_err,
                 last_sync_warning=last_warn,
                 is_stale=is_stale,
+                credential_state=cred.state if cred else None,
+                credential_expires_at=cred.expires_at if cred else None,
+                credential_days_left=cred.days_left if cred else None,
             )
         )
     return IntegrationPanel(
@@ -186,6 +202,19 @@ def _build_panel(
 # model, the resource_type its own router gates on). A caller sees a panel
 # only when it may read that integration's targets through the integration's
 # own router, so this rollup never shows more than those routes would.
+def _tailscale_credential(now: datetime) -> Callable[[Any], CredentialStatus]:
+    """#2138 — a Tailscale tenant's API-key state for its dashboard row."""
+
+    def status(t: Any) -> CredentialStatus:
+        return credential_status(
+            expires_at=t.api_key_expires_at,
+            rejected=is_auth_rejected(t.last_sync_error),
+            now=now,
+        )
+
+    return status
+
+
 _PANELS: tuple[tuple[str, str, str, Any, str], ...] = (
     (
         "kubernetes",
@@ -262,6 +291,7 @@ async def integrations_summary(db: DB, current_user: CurrentUser) -> Integration
                 targets=targets,
                 display_attr="name",
                 now=now,
+                credential=_tailscale_credential(now) if kind == "tailscale" else None,
             )
         )
     readable_types = [row[4] for row in readable]
