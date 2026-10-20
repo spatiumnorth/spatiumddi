@@ -732,6 +732,54 @@ async def list_dns_records(
     ]
 
 
+# ── export_dns_zone_records (#2139) ───────────────────────────────────
+
+
+class ExportDNSZoneRecordsArgs(BaseModel):
+    zone_id: str = Field(description="The zone's UUID.")
+    limit: int = Field(default=500, ge=1, le=2000)
+
+
+@register_tool(
+    name="export_dns_zone_records",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    description=(
+        "One zone's records as the rows of its CSV / XLSX export (Data → "
+        "Export CSV in the zone view): id, name, type, ttl (null = the "
+        "zone's $TTL), value, priority, weight, port, view (split-horizon "
+        "view name, null = every view), comment, and managed (why a row is "
+        "read-only: ipam / pool / tailscale / netbird / kubernetes, null for "
+        "an operator-owned record). Read-only. Use to answer 'what is in "
+        "zone X' in the shape an operator would edit, or to draft a "
+        "spreadsheet for the zone's Import CSV/XLSX — which the operator "
+        "runs themselves; there is no copilot tool that imports."
+    ),
+    args_model=ExportDNSZoneRecordsArgs,
+    category="dns",
+    module="core.dns",
+)
+async def export_dns_zone_records(
+    db: AsyncSession, user: User, args: ExportDNSZoneRecordsArgs
+) -> dict[str, Any]:
+    from app.services.dns_io.spreadsheet import zone_record_rows
+
+    try:
+        zone_uuid = uuid.UUID(args.zone_id)
+    except ValueError:
+        return {"error": f"zone_id {args.zone_id!r} is not a UUID"}
+    zone = await db.get(DNSZone, zone_uuid)
+    if zone is None or not token_allows_zone(user, zone.id):
+        return {"error": "zone not found"}
+    rows = await zone_record_rows(db, zone)
+    return {
+        "zone_id": str(zone.id),
+        "zone_name": zone.name,
+        "total": len(rows),
+        "truncated": len(rows) > args.limit,
+        "rows": rows[: args.limit],
+    }
+
+
 # ── list_dns_blocklists ───────────────────────────────────────────────
 
 

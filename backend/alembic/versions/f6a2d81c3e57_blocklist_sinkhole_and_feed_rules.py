@@ -14,7 +14,7 @@ last adblock refresh could not enforce, by category. Nullable, no backfill:
 NULL means no adblock refresh has run since, never "nothing was lost".
 
 Revision ID: f6a2d81c3e57
-Revises: c4a8e1f26d93
+Revises: c8e2a5f71d39
 Create Date: 2026-10-19
 
 """
@@ -27,7 +27,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "f6a2d81c3e57"
-down_revision = "c4a8e1f26d93"
+down_revision = "c8e2a5f71d39"
 branch_labels = None
 depends_on = None
 

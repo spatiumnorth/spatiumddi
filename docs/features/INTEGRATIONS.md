@@ -170,6 +170,7 @@ Per-tenant config (`TailscaleTenant` rows):
 |---|---|
 | `tailnet` | Tailnet slug from <https://login.tailscale.com/admin/settings/general>, or `-` for the API key's default tailnet (works for solo accounts and any PAT issued without an explicit tailnet override). |
 | `api_key` | Personal-access token (`tskey-api-…`). Generate at <https://login.tailscale.com/admin/settings/keys>. Fernet-encrypted at rest; tokens carry the issuing user's permissions but SpatiumDDI only ever reads. |
+| `api_key_expires_at` | When the API access token expires; null means unknown. Read from Tailscale (see [Token expiry](#token-expiry)) or, failing that, typed into the form. |
 | `ipam_space_id` | Required. The CGNAT IPv4 + IPv6 ULA blocks land here. |
 | `dns_group_id` | Optional. Held for Phase 2 — unused today. |
 | `cgnat_cidr` | Default `100.64.0.0/10` (Tailscale's standard CGNAT slice). Override only if your tailnet was provisioned with a custom slice. |
@@ -201,10 +202,22 @@ Same shape as Proxmox / Docker / Kubernetes:
 The admin page ships a copy-paste guide:
 
 1. Open <https://login.tailscale.com/admin/settings/keys>, click **Generate API key…**.
-2. Pick an expiry window (90 days minimum). Tailscale doesn't support non-expiring API keys.
+2. Pick an expiry between 1 and 90 days. 90 is Tailscale's maximum; there are no non-expiring API access tokens.
 3. Copy the printed value (`tskey-api-…`).
 4. Open <https://login.tailscale.com/admin/settings/general> for the **Organization** slug — paste it into **Tailnet**, or leave the default `-` for solo / single-tailnet accounts.
 5. Hit **Test Connection** to verify before save.
+
+### Token expiry
+
+Tailscale caps an API access token at 90 days, and an expired token turns every sync into an HTTP 401 ([#2138](https://github.com/spatiumnorth/spatiumddi/issues/2138)). SpatiumDDI records when the token expires and warns before it does.
+
+- **Read from Tailscale.** An access token is `tskey-api-<keyId>-<secret>`, and Tailscale's keys endpoint `GET /api/v2/tailnet/{tailnet}/keys/{keyId}` returns that key's `expires`, using the same token. SpatiumDDI reads it on **Test Connection**, when a tenant is created or its key replaced, and once a day (`refresh_tailscale_token_expiry`, 04:40). The call goes to `api.tailscale.com` like the device poll and sends nothing but the token.
+- **Operator fallback.** If the token isn't a `tskey-api-` token, or the keys endpoint refuses (for instance a token whose user can't read keys), the form's **Token expires on** date is used instead. It defaults to 90 days from today. A date read from Tailscale always replaces it, and a failed read never clears a stored one.
+- **Alert.** The `secret_expiring` rule covers each enabled tenant as subject `tailscale_tenant:<id>`, with the rule's threshold and severity escalation, and fires **critical** when the last sync got HTTP 401, whatever date is recorded. The upgrade adds an enabled `secret_expiring` rule ("Credential expiring or rejected", 30 days) unless one already exists. It is added once, by the migration, so a deleted rule stays deleted.
+- **Chip.** The Tailscale page, the IPAM-tab integrations panel and the Integrations dashboard tab show *Token expires in N days* (amber, red within 7), *Token expired* or *Token rejected*. On the Tailscale page it opens the tenant form, where entering a new key replaces the token and clears the 401.
+- **MCP.** `list_tailscale_targets` returns `api_key_expires_at`, `api_key_expiry_source`, `credential_state` and `credential_days_left`.
+
+Tailscale's OAuth clients, whose secrets don't expire, would avoid the rotation altogether; supporting them as an alternative auth mode is a possible follow-up.
 
 ### Phase 2 — synthetic tailnet DNS surface
 

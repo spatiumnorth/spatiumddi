@@ -45,6 +45,8 @@ def test_every_poll_of_one_process_carries_the_same_instance_id(
     loop._boot_hold = None
     loop._boot_report_bundle = None
     loop._current_etag = "sha256:abc"
+    # #2052 — the re-registration generation the poll compares against.
+    loop._reauth_gen = sync.reauth_generation()
     loop._client = lambda: httpx.Client(  # type: ignore[method-assign]
         base_url="http://cp", transport=httpx.MockTransport(answer)
     )
