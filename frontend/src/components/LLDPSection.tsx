@@ -278,7 +278,7 @@ export function LLDPSection({
 
       <Field
         label="SNMP AgentX (LLDP-MIB)"
-        description="Register lldpd as an AgentX subagent of the host snmpd so LLDP-MIB (lldpRemTable) is queryable over SNMP. Only meaningful when SNMP is also enabled. Loopback only — no firewall change."
+        description="Register lldpd as an AgentX subagent of the host snmpd so LLDP-MIB (lldpRemTable) is queryable over SNMP. Only meaningful when SNMP is also enabled. Local socket only — no firewall change."
       >
         <Toggle
           checked={agentx}

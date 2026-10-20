@@ -93,9 +93,32 @@ def test_agentx_appends_x_flag() -> None:
     s.lldp_protocols = ["cdp"]
     assert render_lldpd_daemon_args(s) == "-c"
     s.lldp_snmp_agentx = True
-    assert render_lldpd_daemon_args(s) == "-c -x"  # issue #348
+    # issue #348 (-x) + #2154 (-X pinned to the socket snmpd is master on)
+    assert render_lldpd_daemon_args(s) == "-c -x -X /run/agentx/master"
     s.lldp_protocols = []
-    assert render_lldpd_daemon_args(s) == "-x"
+    assert render_lldpd_daemon_args(s) == "-x -X /run/agentx/master"
+
+
+def test_agentx_socket_matches_the_snmpd_master() -> None:
+    """Issue #2154 — lldpd's ``-X`` and snmpd's ``agentXSocket`` must name
+    the same path, or the subagent dials a socket nobody listens on."""
+    from app.core.crypto import encrypt_str
+    from app.services.appliance.snmp import AGENTX_SOCKET, render_snmpd_conf
+
+    s = _bare_settings()
+    s.lldp_snmp_agentx = True
+    args = render_lldpd_daemon_args(s).split()
+    sock = args[args.index("-X") + 1]
+    assert sock == AGENTX_SOCKET
+
+    s.snmp_enabled = True
+    s.snmp_version = "v2c"
+    s.snmp_community_encrypted = encrypt_str("c")
+    s.snmp_allowed_sources = ["10.0.0.0/8"]
+    s.snmp_v3_users = []
+    s.snmp_sys_contact = ""
+    s.snmp_sys_location = ""
+    assert f"agentXSocket {sock}" in render_snmpd_conf(s).splitlines()
 
 
 def test_med_elin_renders() -> None:

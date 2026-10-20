@@ -32,6 +32,7 @@ import hashlib
 from typing import Any
 
 from app.models.settings import PlatformSettings
+from app.services.appliance.snmp import AGENTX_SOCKET
 
 # lldp_protocols value → lldpd daemon flag enabling RECEPTION of that protocol.
 # (LLDP itself is always on; these add the legacy/vendor neighbour protocols.)
@@ -120,10 +121,13 @@ def render_lldpd_daemon_args(settings: PlatformSettings) -> str:
     flags = [_PROTOCOL_FLAGS[p] for p in ("cdp", "edp", "fdp", "sonmp") if p in protocols]
     # ``-x`` registers lldpd as an AgentX subagent so LLDP-MIB (lldpRemTable)
     # is queryable through the host's snmpd when both are enabled (issue #348).
-    # Loopback AgentX socket — still no firewall change. Harmless if snmpd is
-    # off (lldpd just can't connect to the master and logs a warning).
+    # ``-X`` pins the socket to the one the snmpd renderer makes snmpd master
+    # on (issue #2154) instead of trusting two compiled-in defaults to agree.
+    # Local unix socket — still no firewall change. Harmless if snmpd is off
+    # (lldpd keeps retrying the master and logs a warning; it registers on its
+    # own once snmpd comes up).
     if bool(getattr(settings, "lldp_snmp_agentx", False)):
-        flags.append("-x")
+        flags.extend(["-x", "-X", AGENTX_SOCKET])
     return " ".join(flags)
 
 
