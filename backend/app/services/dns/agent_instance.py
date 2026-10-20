@@ -69,6 +69,23 @@ def duplicate_active(server: DNSServer, now: datetime | None = None) -> bool:
     return now - last <= DUPLICATE_WINDOW and last - first >= DUPLICATE_PERSIST
 
 
+def is_displaced(server: DNSServer, instance: str | None) -> bool:
+    """Whether ``instance`` is a process this server's owner displaced and
+    that is still talking to the control plane — the refused half of a
+    duplicate pair, or a replaced agent's straggler.
+
+    The heartbeat uses this to keep such a process's daemon / config-apply /
+    spool reports off the row: they describe a process that is not being
+    served, and written alternately with the owner's they would flap the
+    row's state and could mask, or invent, an ``agent_config_rejected`` or
+    ``agent_daemon_degraded`` verdict. False for an id never seen (a new
+    process heartbeats before its first poll claims the server) and for an
+    agent that sends no id."""
+    if instance is None or server.agent_instance in (None, instance):
+        return False
+    return instance in (server.agent_instances_displaced or [])
+
+
 async def claim_poll(
     db: AsyncSession,
     server: DNSServer,
@@ -92,7 +109,15 @@ async def claim_poll(
         await db.execute(
             select(DNSServer)
             .where(DNSServer.id == server.id)
-            .with_for_update()
+            # FOR NO KEY UPDATE, the lock a plain UPDATE of this row takes: it
+            # serialises against every other writer of the row (another
+            # replica's claim, the heartbeat, the bundle store, registration,
+            # a server move) without blocking the KEY SHARE an insert of an
+            # FK-referencing row takes (a record write enqueuing this server's
+            # ops). This transaction holds no other lock while it waits — the
+            # request has only read so far — and commits at once, so it can
+            # wait behind a writer but never be part of a deadlock cycle.
+            .with_for_update(key_share=True)
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()

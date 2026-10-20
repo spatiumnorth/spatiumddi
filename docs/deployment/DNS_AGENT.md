@@ -774,9 +774,12 @@ An op moves `pending` → `in_flight` when a long-poll ships it, then
   from, and raise the default-on `dns_agent_duplicate_instance` alert
   ("Two DNS agents on one server"). Both clear 10 minutes after the extra
   agent stops. The 2-minute wait is so an overlapping rollout, where the
-  old pod finishes one last poll before it exits, does not alarm. To fix
-  it, stop the extra agent, or clear its state directory so it registers as
-  a server of its own.
+  old pod finishes one last poll before it exits, does not alarm. The
+  agent also sends its process id on heartbeats: a refused process's
+  heartbeats still count for liveness and op acks, but its daemon,
+  config-apply and spool reports are kept off the server row, which shows
+  the owner's. To fix it, stop the extra agent, or clear its state
+  directory so it registers as a server of its own.
 - **A late ack is not charged twice.** Each shipped op carries a
   `dispatch` number (its attempt count), which the agent echoes in its
   ack. An error that answers an earlier dispatch was already counted when

@@ -5597,49 +5597,6 @@ async def seed_dns_record_op_failed_alert_rule() -> None:
         await session.commit()
 
 
-_DNS_AGENT_DUPLICATE_INSTANCE_RULE_NAME = "Two DNS agents on one server"
-
-
-async def seed_dns_agent_duplicate_instance_alert_rule() -> None:
-    """Seed the #2044 rule, ENABLED by default.
-
-    On for the same reason as ``agent_config_rejected``: it needs no
-    configuration and cannot false-fire — it reads refusals the control plane
-    itself made, and a replacement agent (the old process gone) is never
-    refused. Silent on every correctly deployed install. Keyed on ``name``;
-    an operator who disables or renames it is never overridden.
-    """
-    from app.db import AsyncSessionLocal  # noqa: PLC0415
-    from app.models.alerts import AlertRule  # noqa: PLC0415
-
-    async with AsyncSessionLocal() as session:
-        existing = await session.scalar(
-            select(AlertRule).where(AlertRule.name == _DNS_AGENT_DUPLICATE_INSTANCE_RULE_NAME)
-        )
-        if existing is not None:
-            return
-        session.add(
-            AlertRule(
-                name=_DNS_AGENT_DUPLICATE_INSTANCE_RULE_NAME,
-                description=(
-                    "Fires when two live DNS agent processes share one server "
-                    "identity — usually a cloned VM or a copied agent state "
-                    "directory that kept the same agent_id. Only the most recent "
-                    "agent is served; the other is refused and keeps serving a "
-                    "configuration that no longer changes. Auto-resolves ten "
-                    "minutes after the extra agent stops polling."
-                ),
-                rule_type=RULE_TYPE_DNS_AGENT_DUPLICATE_INSTANCE,
-                severity="warning",
-                enabled=True,
-                notify_syslog=True,
-                notify_webhook=True,
-                notify_smtp=False,
-            )
-        )
-        await session.commit()
-
-
 _DHCP_PACKETS_DROPPED_RULE_NAME = "DHCP packets dropped"
 
 

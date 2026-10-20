@@ -106,3 +106,31 @@ def test_a_duplicate_instance_refusal_backs_off_without_rebootstrapping(
     assert loop.token_ref == ["t1"]
     assert loop._current_etag == "sha256:abc"
     assert waits == [sync.DUPLICATE_INSTANCE_BACKOFF]
+
+
+def test_the_heartbeat_names_the_same_process(agent_cfg: AgentConfig, monkeypatch) -> None:
+    """#2044 — the control plane keeps a displaced process's daemon / config
+    reports off the server row, which it can only do if the heartbeat says
+    which process it is: the same id the config poll sends."""
+    from typing import Any, Self
+
+    from spatium_dns_agent.heartbeat import HeartbeatClient
+
+    seen: list[dict[str, str]] = []
+
+    class _Client:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def post(self, url: str, json: dict[str, Any], headers: dict[str, str]) -> httpx.Response:
+            seen.append(headers)
+            return httpx.Response(200, json={}, request=httpx.Request("POST", url))
+
+    hb = HeartbeatClient(agent_cfg, ["tok"])
+    monkeypatch.setattr(hb, "_client", lambda: _Client())
+    hb.send_once()
+    assert seen and seen[0][sync.AGENT_INSTANCE_HEADER] == sync.AGENT_INSTANCE
+    assert seen[0]["Authorization"] == "Bearer tok"

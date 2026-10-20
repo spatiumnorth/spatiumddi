@@ -194,8 +194,14 @@ the formatter handles the rest.
   server"); both clear 10 minutes after the extra agent stops. The
   2-minute wait keeps an overlapping rollout, whose old pod polls
   once more before it exits, from alarming. The `find_dns_servers`
-  copilot tool reports `duplicate_agent`. Agents too old to send an
-  instance id are never refused.
+  copilot tool reports `duplicate_agent`. The refused agent's
+  heartbeats still count for liveness and op acks, but its daemon,
+  config-apply and spool reports no longer reach the server row, so
+  they cannot flap it against the owner's or raise (or hide) an
+  `agent_config_rejected` alert; the agent now names its process on
+  heartbeats too. The rule is seeded once, by the migration, so
+  deleting it is final. Agents too old to send an instance id are
+  never refused.
 
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
@@ -6510,8 +6516,11 @@ the formatter handles the rest.
   `agent_instances_displaced` (JSONB) lists the processes it replaced;
   `duplicate_agent_first_at`, `duplicate_agent_last_at` and
   `duplicate_agent_ip` describe the current duplicate-agent episode. No
-  backfill: the first agent to poll becomes the owner. Downgrade drops
-  all six.
+  backfill: the first agent to poll becomes the owner. Also inserts the
+  `dns_agent_duplicate_instance` alert rule ("Two DNS agents on one
+  server", enabled) when no rule of that type or name exists; it is
+  not seeded at startup, so an operator who deletes it keeps it
+  deleted. Downgrade drops the six columns and leaves the rule.
 - `d3a7f19c52e8` — #2112, data only: `dns_server.notes` equal to exactly
   `agent v2026.04.14.1` becomes empty. Downgrade does nothing.
 - `b8e41c7a2d95` — #1817, data + server default:
