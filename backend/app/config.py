@@ -216,6 +216,19 @@ class Settings(BaseSettings):
     # ``finally``) frees both within one lease, instead of holding every
     # server's render for as long as a render may take.
     dns_agent_bundle_render_lease_seconds: int = 60
+    # #2240 — how many renders may run at once across the fleet. Every
+    # server needs its own full bundle, so with one slot a group's servers
+    # render one after another: at ~2M records each render takes most of an
+    # hour, and seven servers queued for hours. A render's peak memory grows
+    # with its group's record count (~5.5 GiB at 2M records), so raise this
+    # only together with worker memory. 1 is the single slot every release
+    # before this one had (same Redis key, same behaviour).
+    dns_agent_bundle_render_slots: int = 1
+    # #2240 — with more than one slot, at most this many renders run on one
+    # worker (one pod or container, so one memory limit) at a time; the
+    # worker's other processes leave further renders to other workers.
+    # 0 = no per-worker cap. Ignored with one slot.
+    dns_agent_bundle_renders_per_worker: int = 1
     # The long-poll serves stored bundles only. While this is on — the
     # migration release, whose worker may still be one release behind — a
     # missing or stale bundle is built inline in the request exactly as

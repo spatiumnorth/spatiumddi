@@ -140,9 +140,12 @@ def test_exempt_engines_still_exist():
     "module,needle",
     [
         # The 1.09 M-row records query (#1111) runs past 120 s on big groups.
+        # The long bound, or the render's own soft limit once that is longer
+        # (#2240): ``_render_command_timeout``; the behavioural test below
+        # and tests/test_agent_bundles_render_limits_2240.py pin the values.
         (
             "app.tasks.agent_bundles",
-            "task_session(command_timeout=settings.task_db_long_command_timeout)",
+            "task_session(command_timeout=_render_command_timeout(",
         ),
         (
             "app.tasks.dns_threat",

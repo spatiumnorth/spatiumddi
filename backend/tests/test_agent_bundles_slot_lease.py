@@ -171,10 +171,10 @@ async def test_a_render_never_releases_a_slot_it_no_longer_holds(
     entered = {s1.id: asyncio.Event(), s2.id: asyncio.Event()}
     gate = {s1.id: asyncio.Event(), s2.id: asyncio.Event()}
 
-    async def _gated(server_id):  # noqa: ANN001
+    async def _gated(server_id, *rest):  # noqa: ANN001
         entered[server_id].set()
         await gate[server_id].wait()
-        return await real(server_id)
+        return await real(server_id, *rest)
 
     monkeypatch.setattr(agent_bundles, "_render_once", _gated)
     r1 = asyncio.create_task(agent_bundles._run(str(s1.id)))
@@ -210,13 +210,13 @@ async def test_a_render_never_releases_a_server_lock_it_no_longer_holds(
     calls: list[asyncio.Event] = []
     gates: list[asyncio.Event] = []
 
-    async def _gated(server_id):  # noqa: ANN001
+    async def _gated(server_id, *rest):  # noqa: ANN001
         entered, gate = asyncio.Event(), asyncio.Event()
         calls.append(entered)
         gates.append(gate)
         entered.set()
         await gate.wait()
-        return await real(server_id)
+        return await real(server_id, *rest)
 
     monkeypatch.setattr(agent_bundles, "_render_once", _gated)
     r1 = asyncio.create_task(agent_bundles._run(str(server.id)))
@@ -250,7 +250,7 @@ _KILLED_HOLDER = r"""
 import asyncio, os, sys
 from app.tasks import agent_bundles
 
-async def _hang(server_id):
+async def _hang(server_id, *rest):
     await asyncio.sleep(300)
 
 agent_bundles._render_once = _hang
@@ -338,10 +338,10 @@ async def test_a_render_longer_than_its_lease_keeps_the_slot(
     await db_session.commit()
     real = agent_bundles._render_once
 
-    async def _slow(server_id):  # noqa: ANN001
+    async def _slow(server_id, *rest):  # noqa: ANN001
         if server_id == slow.id:
             await asyncio.sleep(3.5 * lease)
-        return await real(server_id)
+        return await real(server_id, *rest)
 
     monkeypatch.setattr(agent_bundles, "_render_once", _slow)
     task = asyncio.create_task(agent_bundles._run(str(slow.id)))

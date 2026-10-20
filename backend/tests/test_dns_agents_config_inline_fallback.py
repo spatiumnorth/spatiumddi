@@ -109,7 +109,7 @@ async def test_a_failed_inline_render_does_not_hold_the_sweep_off_the_worker_ren
 
     captured: list[str] = []
     monkeypatch.setattr(
-        agent_bundles, "enqueue_render", lambda sid: (captured.append(sid), True)[1]
+        agent_bundles, "enqueue_render", lambda sid, **_kw: (captured.append(sid), True)[1]
     )
     await agent_bundles._sweep()
     assert server_id in captured, (
