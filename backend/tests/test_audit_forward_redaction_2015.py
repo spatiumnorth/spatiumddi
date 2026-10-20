@@ -369,3 +369,104 @@ async def test_backup_audit_history_tool_redacts(db_session: AsyncSession) -> No
     rows = await find_backup_audit_history(db_session, user, FindBackupAuditHistoryArgs())
     _assert_redacted(json.dumps(rows, default=str))
     assert rows[0]["new_value"]["description"] == _KEEP
+
+
+# ── Validator additions (#2015) ───────────────────────────────────────
+
+
+def _deep_secret_payload() -> dict[str, Any]:
+    """Secrets two and three levels down, and in a list of dicts."""
+    return {
+        **_payload(),
+        "old_value": None,
+        "new_value": {
+            "name": _KEEP,
+            "config": {
+                "credentials": {"password": _PASSWORD, "region": "eu-1"},
+                "nested": {"deeper": {"api_token": _API_TOKEN}},
+                "targets": [
+                    {"host": "a", "token": _JWT},
+                    {"host": "b", "notes": f"key is {_FERNET}"},
+                ],
+            },
+            "auth_pass_enc": "opaque-ciphertext-2015",
+            "service_account_json": '{"project_id": "p", "type": "service_account"}',
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", sorted(_TRANSPORT))
+async def test_nested_secrets_are_redacted_and_original_is_not_mutated(kind: str) -> None:
+    """``redact_audit_payload`` copies only the top level, so the nested
+    redaction must build new containers rather than edit the caller's: the
+    payload is serialized from the stored row and must leave it untouched."""
+    payload = _deep_secret_payload()
+    before = copy.deepcopy(payload)
+    wire = await _deliver(_target(kind), payload)
+    assert payload == before, "redaction mutated the caller's nested objects"
+    for secret in (_PASSWORD, _API_TOKEN, _JWT, _FERNET):
+        assert secret not in wire
+    assert "opaque-ciphertext-2015" not in wire
+    assert "service_account" not in wire or REDACTED in wire
+
+
+def test_redact_payload_returns_fresh_nested_containers() -> None:
+    from app.services.audit_redact import redact_audit_payload
+
+    payload = _deep_secret_payload()
+    out = redact_audit_payload(payload)
+    cfg_in = payload["new_value"]["config"]
+    cfg_out = out["new_value"]["config"]
+    assert cfg_out is not cfg_in
+    assert cfg_out["targets"] is not cfg_in["targets"]
+    assert cfg_out["credentials"] == REDACTED
+    assert cfg_out["nested"]["deeper"]["api_token"] == REDACTED
+    assert cfg_out["targets"][0] == {"host": "a", "token": REDACTED}
+    assert _FERNET not in cfg_out["targets"][1]["notes"]
+    assert out["new_value"]["auth_pass_enc"] == REDACTED
+    assert out["new_value"]["service_account_json"] == REDACTED
+    assert out["new_value"]["name"] == _KEEP
+    # The input still carries its secrets.
+    assert cfg_in["credentials"]["password"] == _PASSWORD
+    assert cfg_in["targets"][0]["token"] == _JWT
+    # Idempotent.
+    assert redact_audit_payload(out) == out
+
+
+@pytest.mark.asyncio
+async def test_event_outbox_signature_covers_the_redacted_body_sent() -> None:
+    """A subscriber verifies the HMAC over the bytes it receives, so the
+    signature must be computed over the redacted body, not the stored one."""
+    import hashlib
+    import hmac as _hmac
+
+    import httpx
+
+    from app.models.event_subscription import EventOutbox, EventSubscription
+    from app.services import event_delivery
+
+    row = EventOutbox(
+        event_type="dns_server.updated",
+        payload={"event_id": "e-sig", "old_value": _secret_old(), "new_value": _secret_new()},
+    )
+    sub = EventSubscription(url="https://example.com/hook", timeout_seconds=5)
+    captured: list[tuple[bytes, dict[str, str]]] = []
+
+    async def _post(url: str, content: bytes, headers: dict[str, str], **_: Any) -> httpx.Response:
+        captured.append((content, headers))
+        return httpx.Response(204)
+
+    client = AsyncMock()
+    client.post = _post
+    secret = "sub-signing-secret-2015"
+    with patch.object(event_delivery, "subscription_headers", return_value={}):
+        status, err = await event_delivery._deliver_one(  # noqa: SLF001
+            client, sub, row, secret, "test"
+        )
+    assert (status, err) == (204, None)
+    body, headers = captured[0]
+    _assert_redacted(body.decode())
+    ts = headers["X-SpatiumDDI-Timestamp"]
+    expected = _hmac.new(secret.encode(), ts.encode() + b"." + body, hashlib.sha256).hexdigest()
+    assert headers["X-SpatiumDDI-Signature"] == f"sha256={expected}"

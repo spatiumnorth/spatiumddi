@@ -5997,7 +5997,10 @@ the formatter handles the rest.
   credential-shaped key now arrives as `[redacted]`, as it already
   does on the Audit page. That includes names a collector may have
   indexed, such as `tsig_key_name`. Booleans and integers are kept,
-  so `smtp_password_set: true` still arrives as is.
+  so `smtp_password_set: true` still arrives as is. Two field names
+  join the credential-name rules on every surface: `*_enc` (SNMP v3
+  pass-phrase ciphertext) and `service_account_json` (the Google
+  Cloud DNS key file). Both were already caught by value shape.
 
 - **The Looking Glass image is rebuilt past three Go CVEs (#1729).**
   GoBGP is built from source, so its binaries carry the Go standard

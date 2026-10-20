@@ -40,9 +40,14 @@ _MAX_DEPTH = 12
 
 # Credential field names in this codebase that ``SECRET_KEY_NAME_RE`` does not
 # match. Anchored so ``communities`` (BGP route attributes) and
-# ``header_names`` stay readable.
+# ``header_names`` stay readable. ``*_enc`` is the SNMP v3 user's
+# ``auth_pass_enc`` / ``priv_pass_enc`` ciphertext, and
+# ``service_account_json`` the Google Cloud DNS key file — both are also
+# caught by value shape today (a Fernet token, a PEM private key), but the
+# name is the defence that does not depend on the value's encoding (#2015).
 _EXTRA_SECRET_KEY_RE = re.compile(
-    r"((^|_)community$|(^|_)pass$|key_pem$|otpauth|(^|_)creds?$|(^|_)headers?$)",
+    r"((^|_)community$|(^|_)pass$|key_pem$|otpauth|(^|_)creds?$|(^|_)headers?$"
+    r"|(^|_)enc$|service_account_json)",
     re.IGNORECASE,
 )
 _PEM_PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
