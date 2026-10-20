@@ -404,3 +404,213 @@ def test_the_real_checkers_agree(
     assert sorted(h.zone for h in drv.held_back) == sorted(
         z for z, (_b, ok) in _CASES.items() if not ok
     )
+
+
+# ── validator additions (#2180): cgroup reads, lost freezes, batch bounds ──────
+@pytest.mark.parametrize(
+    ("files", "want"),
+    [
+        ({"cpu.max": "50000 100000\n"}, 0.5),  # v2, half a CPU
+        ({"cpu.max": "250000 100000\n"}, 2.5),
+        ({"cpu.max": "max 100000\n"}, None),  # v2, unbounded
+        ({"cpu.max": "garbage\n"}, None),
+        ({"cpu/cpu.cfs_quota_us": "150000\n", "cpu/cpu.cfs_period_us": "100000\n"}, 1.5),
+        ({"cpu/cpu.cfs_quota_us": "-1\n", "cpu/cpu.cfs_period_us": "100000\n"}, None),
+        ({"cpu/cpu.cfs_quota_us": "x\n", "cpu/cpu.cfs_period_us": "100000\n"}, None),
+        ({}, None),  # no cgroup files at all
+    ],
+)
+def test_cgroup_quota_reads_v1_and_v2(
+    tmp_path: Path, files: dict[str, str], want: float | None
+) -> None:
+    for rel, body in files.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(body)
+    assert bind9._cgroup_cpu_quota(tmp_path) == want
+
+
+@pytest.mark.parametrize("quota", [None, 64.0, 1e9])
+def test_the_pool_never_exceeds_its_cap(monkeypatch: pytest.MonkeyPatch, quota: float | None) -> None:
+    """A 64-CPU host with no quota (or a nonsense one) still gets at most the cap."""
+    monkeypatch.setattr(bind9.os, "sched_getaffinity", lambda _pid: set(range(64)))
+    monkeypatch.setattr(bind9, "_cgroup_cpu_quota", lambda: quota)
+    assert bind9._apply_workers() == bind9._APPLY_WORKERS_MAX == 8
+
+
+def test_rndc_that_cannot_start_is_a_non_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_a: Any, **_kw: Any) -> None:
+        raise BlockingIOError(11, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    rc, _out, err = bind9._rndc_run(["rndc"], "freeze", "a.test")
+    assert rc != 0 and "could not run" in err
+
+
+def test_a_freeze_pass_that_raises_thaws_every_zone_it_froze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zone frozen and then forgotten refuses every RFC 2136 update until
+    named restarts. One failure on the pool must not strand the others."""
+    new, live = tmp_path / "rendered.new", tmp_path / "rendered"
+    names = _many(new, 40)
+    _many(live, 40)
+    monkeypatch.setattr(bind9, "_apply_workers", lambda: 6)
+
+    def answer(cmd: list[str]) -> tuple[int, str, str]:
+        if cmd[1] == "zonestatus" and cmd[-1] == "z017.test":
+            raise RuntimeError("something unforeseen")
+        return 0, "serial: 1\n", ""
+
+    run = Script(answer)
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="unforeseen"):
+        Bind9Driver(tmp_path)._freeze_before_swap(["rndc"], new, live, None)
+    froze = {c[-1] for c in run.calls if c[1] == "freeze"}
+    thawed = {c[-1] for c in run.calls if c[1] == "thaw"}
+    assert froze == set(names)
+    assert thawed == froze
+
+
+def test_a_reload_that_raises_after_its_freeze_thaws_that_zone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live = tmp_path / "rendered"
+    _many(live, 20)
+    monkeypatch.setattr(bind9, "_apply_workers", lambda: 4)
+
+    def answer(cmd: list[str]) -> tuple[int, str, str]:
+        if cmd[1] == "reload" and cmd[-1] == "z005.test":
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+        return 0, "", ""
+
+    run = Script(answer)
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(BlockingIOError):
+        Bind9Driver(tmp_path)._reload_rendered_zones(["rndc"], already_frozen=set())
+    assert [c[1] for c in run.calls if c[-1] == "z005.test"] == ["freeze", "reload", "thaw"]
+    # every other zone still ran its own freeze/reload/thaw
+    for z in (f"z{i:03d}.test" for i in range(20) if i != 5):
+        assert [c[1] for c in run.calls if c[-1] == z] == ["freeze", "reload", "thaw"]
+
+
+def test_a_batch_is_cut_at_its_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    new = _stage(tmp_path)
+    _many(new, 40)
+    size = (new / "zones" / "z000.test.db").stat().st_size
+    monkeypatch.setattr(bind9, "_CHECK_BATCH_MAX_BYTES", size * 10)
+    _all_tools(monkeypatch)
+    sizes: list[int] = []
+    honest = _checker(set())
+
+    def answer(cmd: list[str]) -> tuple[int, str, str]:
+        if Path(cmd[0]).name == "named-checkconf":
+            sizes.append(len(_scratch_zones(cmd[2])))
+        return honest(cmd)
+
+    monkeypatch.setattr(subprocess, "run", Script(answer))
+    Bind9Driver(tmp_path)._check_zone_files(new)
+    assert sizes == [10, 10, 10, 10]
+
+
+def test_no_scratch_config_means_the_per_zone_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    new = _stage(tmp_path)
+    _many(new, 20)
+    _all_tools(monkeypatch)
+
+    def no_tmp(*_a: Any, **_kw: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(bind9.tempfile, "mkstemp", no_tmp)
+    run = Script(_checker({"z004.test"}))
+    monkeypatch.setattr(subprocess, "run", run)
+    drv = Bind9Driver(tmp_path)
+    drv._check_zone_files(new)
+    assert not run.tool("named-checkconf")
+    assert len(run.tool("named-checkzone")) == 20
+    assert [h.zone for h in drv.held_back] == ["z004.test"]
+
+
+# Every one verified against BIND 9.20.29: the batch and named-checkzone give
+# the same verdict, alone and in a batch with good zones, with and without a
+# view. The dangerous direction is a batch clearing what named-checkzone refuses.
+_NEGATIVE = {
+    "mx-to-ip": ("@ IN MX 10 192.0.2.5\n", True),
+    "mx-to-cname": ("c IN CNAME ns1\n@ IN MX 10 c\n", True),
+    "mx-bad-syntax": ("@ IN MX ten mail\n", False),
+    "cname-and-a": ("c IN CNAME a.\nc IN A 10.0.0.1\n", False),
+    "cname-at-apex": ("@ IN CNAME other.example.\n", False),
+    "two-cnames": ("c IN CNAME a.\nc IN CNAME b.\n", False),
+    "out-of-zone-glue": (
+        "sub IN NS ns.other.example.\nns.other.example. IN A 192.0.2.9\n",
+        True,
+    ),
+    "wrong-origin": ("$ORIGIN wrong.example.\nwww IN A 192.0.2.9\n", True),
+    "ttl-huge": ("big 4294967295 IN A 10.0.0.1\n", True),
+    "ttl-overflow": ("big 99999999999 IN A 10.0.0.1\n", False),
+    "dup-diff-ttl": ("d 100 IN A 10.0.0.1\nd 200 IN A 10.0.0.1\n", True),
+    "two-soa": ("@ IN SOA ns1 h ( 2 3600 600 86400 300 )\n", False),
+    "soa-not-apex": ("sub IN SOA ns1 h ( 2 3600 600 86400 300 )\n", False),
+    "underscore-ns-target": ("sub IN NS un_der.example.\n", False),
+    "svcb-dns-noalpn": ("_dns IN SVCB 1 ns1 port=853\n", False),
+    "ds-at-apex": (
+        "@ IN DS 12345 8 2 49FD46E6C4B45C55D4AC69CBD3CD34AC1AFE51DE55E0CA8B6F1E5F1E3A4B6C7D\n",
+        False,
+    ),
+    "ns-and-cname-sub": ("sub IN NS ns1\nsub IN CNAME x.\n", False),
+    "include-missing": ("$INCLUDE /nonexistent/x.db\n", False),
+    "generate-bad": ("$GENERATE 1-10 h$ A 999.0.0.$\n", False),
+    "class-ch": ('c CH TXT "x"\n', False),
+    "label-too-long": ("x" * 64 + " IN A 10.0.0.1\n", False),
+    "unbalanced-paren": ('n IN TXT ( "x"\n', False),
+}
+
+
+@pytest.mark.skipif(not _REAL, reason="needs BIND's named-checkconf and named-checkzone")
+@pytest.mark.parametrize("view", [None, "internal"])
+@pytest.mark.parametrize("min_zones", [10**9, 2])
+def test_the_real_checkers_agree_on_negative_cases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, view: str | None, min_zones: int
+) -> None:
+    monkeypatch.setattr(bind9, "_CHECK_BATCH_MIN_ZONES", min_zones)
+    new = _stage(tmp_path)
+    for i in range(7):
+        _zone(new, f"good{i}.test", view=view)
+    for case, (body, _ok) in _NEGATIVE.items():
+        _zone(new, f"{case}.test", view=view, extra=body)
+    drv = Bind9Driver(tmp_path)
+    drv._check_zone_files(new)
+    assert sorted(h.zone for h in drv.held_back) == sorted(
+        f"{c}.test" for c, (_b, ok) in _NEGATIVE.items() if not ok
+    )
+    # and each refused zone is refused by the batch screen itself, alone
+    goods = [(f"good{i}.test", view) for i in range(7)]
+    for case, (_b, ok) in _NEGATIVE.items():
+        verdict = drv._screen_chunk(new, [*goods, (f"{case}.test", view)])
+        assert verdict is ok, case
+
+
+def test_one_failed_thaw_does_not_cancel_the_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Executor.map`` cancels queued calls once one raises; a thaw pass must
+    still reach every zone."""
+    monkeypatch.setattr(bind9, "_apply_workers", lambda: 2)
+    zones = [(f"z{i:03d}.test", None) for i in range(30)]
+    seen: list[str] = []
+    lock = threading.Lock()
+
+    def rndc(_base: list[str], *args: str) -> tuple[int, str, str]:
+        with lock:
+            seen.append(args[1])
+        if args[1] == "z001.test":
+            raise RuntimeError("unforeseen")
+        return 0, "", ""
+
+    monkeypatch.setattr(bind9, "_rndc_run", rndc)
+    with pytest.raises(RuntimeError):
+        Bind9Driver(tmp_path)._thaw(["rndc"], zones)
+    assert sorted(seen) == [z for z, _v in zones]

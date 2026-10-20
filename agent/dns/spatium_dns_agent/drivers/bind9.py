@@ -1326,21 +1326,33 @@ _APPLY_WORKERS_MAX = 8
 _CHECK_BATCH_MIN_ZONES = 8
 _CHECK_BATCH_ZONES = 500
 _CHECK_BATCH_MAX_FILE_BYTES = 4 * 1024 * 1024
+# And a batch is cut at this many bytes of zone file, so one run stays far inside
+# ``_CHECK_TIMEOUT_S`` (named-checkconf loads ~6-7 MiB/s of zone file on one
+# core; 500 files near the size bound would be ~300 s, and a timed-out batch is
+# all wasted time before the per-zone fallback). Memory does not grow with the
+# batch: -z loads and frees one zone at a time.
+_CHECK_BATCH_MAX_BYTES = 256 * 1024 * 1024
 _CHECK_TIMEOUT_S = 300
 _LOADED_LINE = re.compile(r"^zone \S+: loaded serial \d+", re.MULTILINE)
 
-def _cgroup_cpu_quota() -> float | None:
-    """CPUs this container may use per its cgroup quota, or None if unbounded."""
+def _cgroup_cpu_quota(root: Path = Path("/sys/fs/cgroup")) -> float | None:
+    """CPUs this container may use per its cgroup quota, or None if unbounded.
+
+    cgroup v2 (``cpu.max``: ``<quota|max> <period>``) first, then v1
+    (``cpu.cfs_quota_us``, -1 when unbounded). Anything unreadable or
+    malformed reads as unbounded; ``_apply_workers`` still caps the pool at
+    ``_APPLY_WORKERS_MAX``, so a wrong read can never size it past that.
+    """
     try:
-        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        quota, period = (root / "cpu.max").read_text().split()[:2]
         if quota != "max" and int(period) > 0:
             return int(quota) / int(period)
         return None
     except (OSError, ValueError):
         pass
     try:
-        quota_us = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
-        period_us = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+        quota_us = int((root / "cpu" / "cpu.cfs_quota_us").read_text())
+        period_us = int((root / "cpu" / "cpu.cfs_period_us").read_text())
         if quota_us > 0 and period_us > 0:
             return quota_us / period_us
     except (OSError, ValueError):
@@ -1363,14 +1375,20 @@ def _apply_workers() -> int:
 def _parallel_map[T, R](fn: Callable[[T], R], items: Iterable[T]) -> list[R]:
     """``[fn(i) for i in items]``, on the bounded apply pool, in input order.
 
-    An exception from any call is raised here, as the serial loop would.
+    An exception from any call is raised here, as the serial loop would, but
+    only once EVERY call has run. ``Executor.map`` cancels the calls still
+    queued when one raises; for a thaw pass that strands the zones whose
+    thaw never ran frozen, refusing every RFC 2136 update until named
+    restarts, so nothing here is cancelled.
     """
     seq = list(items)
     workers = min(_apply_workers(), len(seq))
     if workers <= 1:
         return [fn(i) for i in seq]
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bind9-apply") as ex:
-        return list(ex.map(fn, seq))
+        futures = [ex.submit(fn, i) for i in seq]
+    # The ``with`` waited for every call (shutdown without cancel_futures).
+    return [f.result() for f in futures]
 
 
 def _file_size(path: Path) -> int:
@@ -1546,6 +1564,12 @@ def _rndc_run(base: list[str], *args: str) -> tuple[int, str, str]:
         )
     except subprocess.TimeoutExpired:
         return 1, "", f"rndc {args[0]} timed out after {_RNDC_QUERY_TIMEOUT_S:g}s"
+    except OSError as e:
+        # Could not even start it (EAGAIN from fork under load, a binary gone):
+        # also a non-answer. Raised instead, from a worker of the apply pool
+        # (#2180), it would abort a freeze pass that has already frozen other
+        # zones, and nothing would thaw them.
+        return 1, "", f"rndc {args[0]} could not run: {e}"
     return res.returncode, res.stdout or "", res.stderr or ""
 
 
@@ -2575,10 +2599,18 @@ class Bind9Driver(DriverBase):
         ]
         if len(eligible) < _CHECK_BATCH_MIN_ZONES or not shutil.which("named-checkconf"):
             return set()
-        chunks = [
-            eligible[i : i + _CHECK_BATCH_ZONES]
-            for i in range(0, len(eligible), _CHECK_BATCH_ZONES)
-        ]
+        chunks: list[list[tuple[str, str | None]]] = [[]]
+        chunk_bytes = 0
+        for zv in eligible:
+            size = _file_size(new_dir / _zone_rel(*zv))
+            if chunks[-1] and (
+                len(chunks[-1]) >= _CHECK_BATCH_ZONES
+                or chunk_bytes + size > _CHECK_BATCH_MAX_BYTES
+            ):
+                chunks.append([])
+                chunk_bytes = 0
+            chunks[-1].append(zv)
+            chunk_bytes += size
         passed: set[tuple[str, str | None]] = set()
         pending = chunks
         runs = 0
@@ -2635,10 +2667,18 @@ class Bind9Driver(DriverBase):
             lines.append("};")
         if not _conf_safe(str(self.state_dir)):
             return None
-        fd, conf = tempfile.mkstemp(prefix=".zone-check-", suffix=".conf", dir=self.state_dir)
         try:
-            with os.fdopen(fd, "w") as fh:
-                fh.write("\n".join(lines) + "\n")
+            fd, conf = tempfile.mkstemp(
+                prefix=".zone-check-", suffix=".conf", dir=self.state_dir
+            )
+        except OSError:
+            return None  # no scratch config, no verdict: the per-zone check decides
+        try:
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    fh.write("\n".join(lines) + "\n")
+            except OSError:
+                return None
             try:
                 res = subprocess.run(
                     ["named-checkconf", "-z", conf],
@@ -2910,6 +2950,28 @@ class Bind9Driver(DriverBase):
         land again. ``_verify_zones_loaded`` still fails the apply if named
         then serves anything but the render.
         """
+        # A zone frozen here and then lost track of refuses every RFC 2136
+        # update until named restarts. ``swap_and_reload`` thaws what this
+        # returns; if it raises instead, after some zones froze (a worker of
+        # the pool, #2180, or the wait below), it thaws them itself.
+        froze: list[tuple[str, str | None]] = []
+        try:
+            return self._freeze_and_wait(base, new_dir, live, changed, froze)
+        except BaseException:
+            if froze:
+                self._thaw(base, list(froze))
+            raise
+
+    def _freeze_and_wait(
+        self,
+        base: list[str],
+        new_dir: Path,
+        live: Path,
+        changed: set[tuple[str, str | None]] | None,
+        froze: list[tuple[str, str | None]],
+    ) -> dict[tuple[str, str | None], int | None]:
+        """``_freeze_before_swap``'s body; appends each zone to ``froze`` the
+        moment named confirms the freeze."""
         candidates = [
             (zname, view)
             for zname, view in _zone_views_under(new_dir)
@@ -2924,6 +2986,7 @@ class Bind9Driver(DriverBase):
             rc, _out, _err = _rndc_run(base, "freeze", *scope)
             if rc != 0:
                 return False, None
+            froze.append(zv)  # list.append is atomic under the GIL
             rc, out, err = _rndc_run(base, "zonestatus", *scope)
             serving = _zonestatus_serial(out) if rc == 0 else None
             if serving is None:
@@ -3228,20 +3291,33 @@ class Bind9Driver(DriverBase):
                 if (zname, view) in already_frozen
                 else ("freeze", "reload", "thaw")
             )
-            for verb in verbs:
-                res = subprocess.run(
-                    [*base, verb, *scope],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if res.returncode != 0 and verb == "reload":
-                    log.warning(
-                        "bind9_zone_reload_failed",
-                        zone=zname,
-                        view=view,
-                        stderr=res.stderr.strip()[:200],
+            froze_here = False
+            try:
+                for verb in verbs:
+                    res = subprocess.run(
+                        [*base, verb, *scope],
+                        capture_output=True,
+                        text=True,
+                        check=False,
                     )
+                    if verb == "freeze":
+                        froze_here = res.returncode == 0
+                    elif verb == "thaw":
+                        froze_here = False
+                    if res.returncode != 0 and verb == "reload":
+                        log.warning(
+                            "bind9_zone_reload_failed",
+                            zone=zname,
+                            view=view,
+                            stderr=res.stderr.strip()[:200],
+                        )
+            except BaseException:
+                # A zone this call froze must not stay frozen because a later
+                # verb could not run; zones frozen before the swap are thawed
+                # by ``swap_and_reload``'s own ``finally``.
+                if froze_here:
+                    _rndc_run(base, "thaw", *scope)
+                raise
 
         # One zone's verbs stay in order; zones run on the bounded pool (#2180).
         _parallel_map(reload, targets)
