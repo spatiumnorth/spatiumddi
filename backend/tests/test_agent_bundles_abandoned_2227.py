@@ -29,6 +29,7 @@ import uuid
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -236,6 +237,39 @@ async def test_after_a_hold_one_more_death_holds_again(
 
     await _kill_mid_render(client, keys, sid)
     assert (await agent_bundles._run(sid))["status"] == "abandoned"
+
+
+@pytest.mark.asyncio
+async def test_a_held_server_that_then_renders_is_healthy_again(
+    db_session: AsyncSession, redis_keys
+) -> None:
+    """The render let through after a hold succeeds: the count is cleared and
+    the row reads ok, so a later single death is retried like any other — a
+    server that recovered is not left one death from the next hold."""
+    client, keys = redis_keys
+    server = await _agent(db_session)
+    await db_session.commit()
+    sid = str(server.id)
+    for _ in range(agent_bundles.ABANDONED_RENDER_LIMIT):
+        await _kill_mid_render(client, keys, sid)
+    assert (await agent_bundles._run(sid))["status"] == "abandoned"
+    assert (await agent_bundles._run(sid))["status"] == "on_hold"
+    await client.delete(keys["hold"] + sid)  # the hold lapses
+
+    outcome = await agent_bundles._run(sid)
+    assert outcome["status"] == "stored", outcome
+    assert await client.get(keys["attempts"] + sid) is None
+    assert (await _row(db_session, server.id)).bundle_render_status == RENDER_STATUS_OK
+
+    await _kill_mid_render(client, keys, sid)
+    await db_session.execute(
+        update(DNSServer)
+        .where(DNSServer.id == server.id)
+        .values(bundle_dirty_seq=DNSServer.bundle_dirty_seq + 1)
+    )
+    await db_session.commit()
+    outcome = await agent_bundles._run(sid)
+    assert outcome["status"] == "stored", outcome
 
 
 @pytest.mark.asyncio

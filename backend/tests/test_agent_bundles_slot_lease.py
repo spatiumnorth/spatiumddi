@@ -457,9 +457,13 @@ async def test_a_holder_with_more_to_render_hands_its_slot_to_a_waiting_server(
     assert await client.get(busy_lock) is None
 
 
-def test_a_handed_on_render_is_re_enqueued_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The task re-enqueues a render that handed its slot on with no
-    countdown (it queues for a slot again), carrying its lock token."""
+def test_a_handed_on_render_comes_back_after_the_waiters_next_try(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The task re-enqueues a render that handed its slot on, carrying its
+    lock token, LATER than a deferred render's retry: re-enqueued at once it
+    took back the slot it had just freed before the waiter (retrying every
+    ``SLOT_RETRY_SECONDS``) came round, so nothing was handed to anyone."""
     sid = str(uuid.uuid4())
 
     async def _handed(server_id, lock_token=None):  # noqa: ANN001
@@ -475,11 +479,12 @@ def test_a_handed_on_render_is_re_enqueued_at_once(monkeypatch: pytest.MonkeyPat
         {
             "args": [sid],
             "kwargs": {"lock_token": "tok"},
-            "countdown": 0,
+            "countdown": agent_bundles.HANDED_ON_RETRY_SECONDS,
             "retry": False,
             "queue": "bundles",
         }
     ], requeued
+    assert agent_bundles.HANDED_ON_RETRY_SECONDS > agent_bundles.SLOT_RETRY_SECONDS
 
 
 @pytest.mark.asyncio

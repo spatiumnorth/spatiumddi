@@ -32,7 +32,8 @@ out):
   the whole group from. A task that finds every slot taken re-enqueues
   itself a couple of seconds later and says that it waits; a holder whose
   server changed again while it rendered then hands its slot on (re-enqueues
-  itself, keeping its server's lock) instead of rendering again, so one
+  itself just after a waiter's next try, keeping its server's lock) instead
+  of rendering again, so one
   server under a write storm no longer keeps every other server waiting.
 
 Both are a short lease (``dns_agent_bundle_render_lease_seconds``) that a
@@ -115,6 +116,9 @@ ABANDONED_HOLD = timedelta(minutes=5)
 ATTEMPTS_TTL_SECONDS = 3600
 # A task that found the fleet-wide slot taken comes back this much later.
 SLOT_RETRY_SECONDS = 2
+# A holder that handed its slot on comes back this much later: after every
+# waiter's next try, so a waiter takes the freed slot first (#2227).
+HANDED_ON_RETRY_SECONDS = SLOT_RETRY_SECONDS + 1
 # A server whose last render failed this recently is left to the explicit
 # enqueue (a change bumps it immediately); the sweep does not spin on it.
 SWEEP_FAILED_BACKOFF = timedelta(minutes=5)
@@ -507,9 +511,14 @@ def render_dns_bundle(  # type: ignore[type-arg]
         render_dns_bundle.apply_async(
             args=[server_id],
             kwargs={"lock_token": token},
-            # A render that handed its slot on comes straight back to queue
-            # for one; a deferred one waits for one to free.
-            countdown=SLOT_RETRY_SECONDS if result["status"] == "deferred" else 0,
+            # A deferred render tries again in SLOT_RETRY_SECONDS. One that
+            # handed its slot on comes back a second LATER than that: back at
+            # once, it found the slot it had just freed before the waiter's
+            # next try came round, and took it again — so the hand-on handed
+            # nothing to anyone under exactly the storm it exists for.
+            countdown=(
+                SLOT_RETRY_SECONDS if result["status"] == "deferred" else HANDED_ON_RETRY_SECONDS
+            ),
             retry=False,
             queue="bundles",
         )

@@ -196,9 +196,15 @@ the formatter handles the rest.
   changed again while it rendered hands its slot to a waiting render
   instead of re-rendering in place, up to 50 times, while every other
   server waited. A full pass over seven servers of a 2M-record group
-  took 283 s one at a time and 170 s two at a time. The pending op
-  backlog (one op per record per server) was measured and is not the
-  cause: it cannot ship until a render covering it is stored. Sizing
+  took 283 s one at a time and 170 s two at a time. In a group with
+  split-horizon views (the scale lab's group has one) the render also
+  retires the server's queued ops, and it loaded them as rows to do it:
+  with 813,000 queued for one server that alone reached 3.7 GB, twice
+  the render. It now stamps them a chunk of ids at a time and loads
+  none, so the same render and retire peaked at 231 MB, and the retire
+  took 31 s instead of 132 s. A server that hands its slot on now comes
+  back after a waiting render's next try rather than at once, which had
+  let it take the slot straight back. Sizing
   per zone and per record is in `DNS.md`, "Control-plane memory for
   large groups", and in the worker's `values.yaml` comment.
 

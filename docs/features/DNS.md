@@ -311,6 +311,7 @@ process (about 127 MB before the render starts):
 | 1,000,000 | 1,016 MB | 227 MB |
 | 2,000,000 | 1,799 MB | 231 MB |
 | 2,000,000, two views (4M record copies) | 2,810 MB | 244 MB |
+| 2,000,000, one view, 813,000 queued ops for the server | 3,768 MB | 231 MB |
 
 Before, that was about **850 MB per million records** on top of the process,
 for every render (most of it the fetched rows, about 700 B each). After, a
@@ -354,13 +355,27 @@ full pass took 283 s one at a time and 170 s two at a time (on a 6-core
 host; renders are CPU-bound in the worker, so more slots buy little past the
 worker's cores).
 
-**Not the cause: the op backlog.** Each record change queues one op per
-server in the group (#170), so 2M records on seven servers is about 14M op
-rows. Measured with 5.7M of them pending (813k per server), a render took
-the same time as with none (it never reads the ops in a group without
-views), and the long-poll's page of 5,000 ops took about 1.4 s. The backlog
-stays pending because ops only ship against a stored bundle that covers
-them: with no render finishing, nothing ships.
+**The op backlog, under split-horizon views.** Each record change queues one
+op per server in the group (#170), so 2M records on seven servers is about
+14M op rows, and they pile up while no render finishes. A group *without*
+views never reads them in a render: they ship a page at a time (5,000 ops,
+about 1.4 s) against the stored bundle that covers them. A group *with* views
+cannot apply a record op incrementally, so its render retires every queued op
+its body covers. That retire used to load the ops as ORM rows, about 4 kB
+each, and after a load it was the larger half of the render: measured on the
+2,000,000-record group with one view (the scale lab's shape) and 813,000
+queued ops for the server, the render peaked at 1,797 MB and the retire at
+3,768 MB, taking 132 s. It now locks and stamps them a chunk of ids at a time
+(`RETIRE_CHUNK`, 5,000) with one UPDATE each and loads none: the same render
+and retire peaked at 231 MB and the retire took 31 s.
+
+Bounded is not the same as keeping up. Under views every record change
+re-renders every server of the group in full, where a group without views
+ships the change as an op. With two views and the same backlog a
+2,000,000-record render took about four minutes here, so a seven-server
+group under a sustained write storm re-renders continuously and never sits
+settled; it converges once the writes stop. View-aware incremental ops is
+the follow-up that changes this (#2240).
 
 This is the control plane's side. The agent and its daemon have their own
 memory to size for the same group (#2223), and

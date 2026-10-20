@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import structlog
 from sqlalchemy import Boolean, Text, and_, cast, func, literal, not_, or_, select
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.types import UserDefinedType
@@ -79,7 +80,7 @@ from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_ops import (
     QUEUED_OP_STATES,
     RRSET_KEY_CHUNK,
-    _mark_applied,
+    mark_ops_applied,
     op_rrset_key,
     queued_after,
     rrset_match_where,
@@ -1930,6 +1931,9 @@ def _covered_by(up_to: datetime | None, visible_xacts: str | None) -> Any | None
 # definition, so a new record op kind cannot be retired by one and not the other.
 RECORD_OP_KINDS: frozenset[str] = RRSET_OPS
 
+# Queued ops a split-horizon render retires per statement (#2227).
+RETIRE_CHUNK = 5000
+
 
 async def retire_queued_ops(
     db: AsyncSession,
@@ -1966,17 +1970,51 @@ async def retire_queued_ops(
     covered = _covered_by(up_to, visible_xacts)
     if covered is not None:
         conds.append(covered)
-    # #1929 — locked in ``row_locks`` order (ascending id) before the write:
-    # a row a group move deletes meanwhile is skipped, not a StaleDataError.
-    stale_ops = await lock_ops(db, *conds)
-    # #2108 — stamp it the way every other applied op is (one helper, not a
-    # copy of its field list): the render delivered it, once.
+    # #2227 — a chunk of ids at a time, never the rows: a group that went
+    # unrendered while it was being loaded has a queue the size of its
+    # records (813k per server on the scale lab), and loading them as ORM
+    # objects to stamp them held about 4 kB each — 3.7 GB in one worker
+    # process, more than the render itself ever did.
+    # #1929 — locked in ``row_locks`` order (ascending id) before the write;
+    # each chunk takes ids above the last, so the whole retire still locks in
+    # one ascending order. A row a group move deletes meanwhile is skipped,
+    # not a StaleDataError.
+    # #2108 — stamped by ``mark_ops_applied``, which shares its field list with
+    # the helper every other applied op goes through: the render delivered
+    # it, once.
     now = datetime.now(UTC)
-    for op in stale_ops:
-        _mark_applied(op, now)
-    if stale_ops:
-        await db.flush()
-    return len(stale_ops)
+    # Rows of this server already in the session (read through the identity
+    # key: an expired ``id`` would be a lazy load, which async cannot do).
+    loaded = {
+        sa_inspect(obj).identity[0]: obj
+        for obj in list(db.identity_map.values())
+        if isinstance(obj, DNSRecordOp) and obj.__dict__.get("server_id") == server.id
+    }
+    retired = 0
+    after: Any = None
+    while True:
+        chunk = list(
+            (
+                await db.execute(
+                    select(DNSRecordOp.id)
+                    .where(*conds, *([DNSRecordOp.id > after] if after is not None else []))
+                    .order_by(DNSRecordOp.id)
+                    .limit(RETIRE_CHUNK)
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not chunk:
+            break
+        await mark_ops_applied(db, chunk, now, loaded)
+        retired += len(chunk)
+        after = chunk[-1]
+        if len(chunk) < RETIRE_CHUNK:
+            # LIMIT counts rows after the lock re-check, so short is last.
+            break
+    return retired
 
 
 async def page_pending_ops(
