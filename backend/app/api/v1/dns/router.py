@@ -3895,6 +3895,40 @@ async def _refuse_if_alias_records_lose_resolver(group_id: uuid.UUID, db: DB) ->
         )
 
 
+def _forwarder_port(entry: str) -> str:
+    return entry.partition("@")[2].strip()
+
+
+def _refuse_plain_port_forwarders_on_encrypted(
+    opts: DNSServerOptions, forwarders_before: list[str], transport_before: str | None
+) -> None:
+    """422 a group forwarder pinned to port 53 when the group forwards encrypted (#2128).
+
+    ``1.2.3.4@53`` rendered as ``port 53 tls …``: a TLS handshake against a
+    plaintext port, which can never work. Refused rather than silently
+    rendered plain, because a group that asked for DoT must not quietly send
+    cleartext. Only entries the request introduces are checked (all of them
+    when it switches the group to an encrypted transport), so a value stored
+    before this check does not block an unrelated save.
+    """
+    if opts.forward_transport == "do53":
+        return
+    now = list(opts.forwarders or [])
+    if transport_before == opts.forward_transport:
+        candidates = [f for f in now if f not in forwarders_before]
+    else:
+        candidates = now
+    bad = [f for f in candidates if _forwarder_port(f) == "53"]
+    if bad:
+        raise HTTPException(
+            422,
+            f"forwarders {', '.join(repr(f) for f in bad)} pin port 53, which is plain "
+            f"DNS, but this group forwards over {opts.forward_transport}: the TLS "
+            "handshake would go to a port that cannot answer it. Drop the "
+            "port (encrypted upstreams default to 853) or set forward_transport to do53.",
+        )
+
+
 @router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
 async def update_options(
     group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB, current_user: SuperAdmin
@@ -3953,9 +3987,12 @@ async def update_options(
                 "their defaults.",
             )
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
+    forwarders_before = list(opts.forwarders or [])
+    transport_before = opts.forward_transport
     for k, v in changes.items():
         setattr(opts, k, v)
 
+    _refuse_plain_port_forwarders_on_encrypted(opts, forwarders_before, transport_before)
     await _assert_encrypted_transport_sane(opts, db)
     if resolver_before and not alias_resolver(opts.forwarders, opts.forward_transport):
         await _refuse_if_alias_records_lose_resolver(group_id, db)

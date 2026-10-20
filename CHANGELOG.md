@@ -171,6 +171,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DoT group's forwarder pinned to port 53 is refused, and the
+  DNS docs lose two unused variables (#2128, #2125).** In a group
+  forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,
+  a TLS handshake against a plaintext port that can never work. The
+  group options save now answers 422 naming the entry. Only entries
+  the request adds are checked (all of them when it switches the
+  group to an encrypted transport), so a value stored earlier does
+  not block an unrelated save; a do53 group is unaffected, and a
+  forward zone's explicit `@53` still renders plain. `DNS.md` no
+  longer lists `BLOCKLIST_UPDATE_INTERVAL_HOURS` and
+  `BLOCKLIST_SINKHOLE_IP`, which nothing reads (refresh interval and
+  sinkhole IP are per list), and section 8.0 gains a worked example:
+  one catalog feed (AdGuard DNS filter, ~186k entries) needs about
+  1 GB, double the `512Mi` in the chart's example, which now points
+  there.
+
+
 - **Backup page and branding title show the API's reason and stop
   offering what is refused** (#2203, #2204, #2200, #2202, #2205).
   A refused archive preview, restore or drill schedule now shows the
