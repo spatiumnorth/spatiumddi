@@ -149,10 +149,12 @@ case "$MARKER" in
         # throwaway path instead — the directive is still parsed, which
         # is what the probe is for.
         PROBE_DIR=$(mktemp -d /tmp/spatium-snmpd-probe.XXXXXX)
+        # Armed before anything can fail under ``set -e``, so the copy
+        # (it carries the community / USM secrets) never outlives us.
+        trap 'rm -f "$TMP_BODY"; rm -rf "$PROBE_DIR"' EXIT
         PROBE_BODY="$PROBE_DIR/snmpd.conf"
         sed "s|^agentXSocket .*|agentXSocket $PROBE_DIR/agentx-master|" \
             "$TMP_BODY" > "$PROBE_BODY"
-        trap 'rm -f "$TMP_BODY"; rm -rf "$PROBE_DIR"' EXIT
         snmpd -f -C -c "$PROBE_BODY" -Lf "$SNMP_VALIDATE_LOG" \
             udp:127.0.0.1:16199 >"$SNMP_VALIDATE_LOG" 2>&1 &
         probe_pid=$!

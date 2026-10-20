@@ -7,9 +7,10 @@ against it (net-snmp has no config-test flag, #550).  Started against the
 staged file as-is, that probe would be a second master on the SAME path: a
 master unlinks and rebinds its socket on start, so the probe steals the
 live daemon's socket — and lldpd's registration with it — and, when the
-runner kills it, leaves the path pointing at nothing.  On every apply where
-the probe ends inconclusive and the live snmpd is left running, LLDP-MIB
-would go dark until the next snmpd restart.
+runner kills it, leaves the path pointing at nothing.  A successful apply
+restarts snmpd straight after and recreates the socket, but an apply whose
+staged config is REJECTED exits with the old snmpd still running and its
+socket gone: LLDP-MIB stays dark until something next restarts snmpd.
 
 These tests run the runner's real probe block (extracted from the shipped
 script) under bash with a stub ``snmpd`` on ``PATH`` that records the config
