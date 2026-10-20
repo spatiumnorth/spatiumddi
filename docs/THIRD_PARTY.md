@@ -102,7 +102,9 @@ Notes worth carrying:
 | [Traefik](https://traefik.io/) | in k3s bundle, **disabled** | MIT | Appliance OS | `config.yaml` `disable:` list |
 | [metrics-server](https://github.com/kubernetes-sigs/metrics-server) | in k3s bundle, **disabled** | Apache 2.0 | Appliance OS | `config.yaml` `disable:` list |
 | [MetalLB](https://metallb.io/) | chart + images 0.15.3 | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-metallb/Chart.yaml` |
-| [FRRouting](https://frrouting.org/) | via MetalLB frr-k8s | GPL v2 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
+| [FRRouting](https://frrouting.org/) | 10.4.5, via MetalLB frr-k8s | GPL v2 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
+| [frr-k8s](https://github.com/metallb/frr-k8s) | v0.0.21, MetalLB's BGP backend | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
+| [kube-rbac-proxy](https://github.com/brancz/kube-rbac-proxy) | v0.23.0, frr-k8s metrics sidecar | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
 | [CloudNativePG](https://cloudnative-pg.io/) | chart 0.29.1 (operator 1.30.1) | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-appliance/Chart.yaml` |
 | [Patroni](https://github.com/patroni/patroni) | `k8s/ha/` overlay | MIT | Compose HA overlay (non-functional, unsupported in 1.0, #1236) | `k8s/ha/` |
 | [HAProxy](https://www.haproxy.org/) | 3.4-alpine | GPL v2 (+ LGPL libs) | Compose Patroni overlay (non-functional, #1236) | `k8s/ha/` |
@@ -122,6 +124,11 @@ assume from their presence:
   older binary does not serve.
 - **FRRouting is GPL v2** and only enters the picture when an operator opts into
   BGP-mode MetalLB. Both `bgp.enabled` and `frrk8s.enabled` default to false.
+  FRRouting and kube-rbac-proxy run newer images than the MetalLB 0.15.3 chart
+  ships with, to clear CRITICAL CVEs
+  ([#2239](https://github.com/spatiumnorth/spatiumddi/issues/2239)). frr-k8s
+  stays on the chart's own version, because from v0.0.23 its binary needs
+  templates the 0.15.3 chart does not have.
 
 ## Data services
 

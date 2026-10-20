@@ -161,7 +161,7 @@
       ],
       "upstream": { "kind": "github-release", "repo": "metallb/metallb" },
       "hold": "v0.16.x regressed the speaker's ServiceL2Status reconciler into an apiserver-flooding create-fail/not-found loop -- metallb/metallb#3063, still OPEN as of 2026-09-08. An image-only pin on the 0.16 chart does not work either: its speaker probe hits /healthz:17472, which 0.15.3 does not serve, so the pod crashloops. The chart is therefore pinned end-to-end. Re-check #3063 before bumping.",
-      "note": "frr-k8s, frr and kube-rbac-proxy below are this chart's vendored sub-pins, not independent choices -- they move when this moves, and the baked image refs must equal what the pod spec pulls or an air-gapped appliance gets ImagePullBackOff."
+      "note": "frr-k8s, frr and kube-rbac-proxy below are the images the vendored frr-k8s 0.0.21 subchart (inside this 0.15.3 chart) runs in BGP mode. Since #2239 frr and kube-rbac-proxy are pinned PAST that subchart's defaults as a security override, image-only, while this chart stays held; frr-k8s cannot follow them (see its hold). Whatever they are set to, the baked image refs must equal what the pod spec pulls or an air-gapped appliance gets ImagePullBackOff."
     },
 
     "frr-k8s": {
@@ -172,38 +172,41 @@
           "path": "appliance/scripts/bake-images.sh",
           "match": "quay.io/metallb/frr-k8s:{version}",
           "count": 1
-        }
+        },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version}, MetalLB's BGP backend |", "count": 1 }
       ],
       "upstream": { "kind": "github-release", "repo": "metallb/frr-k8s" },
-      "hold": "MetalLB sub-pin -- the default inside the vendored metallb-0.15.3 chart. Moves with metallb, which is held."
+      "hold": "Held at the vendored metallb-0.15.3 chart's own subchart version, deliberately NOT image-bumped with frr and kube-rbac-proxy in #2239. v0.0.23 replaced the kube-rbac-proxy sidecars with native HTTPS metrics, and the 0.0.21 subchart's templates cannot run that binary: its liveness/readiness/startup probes are plain-HTTP GETs on what is now a TLS listener, the --metrics-bind-address it passes (127.0.0.1:7572) collides with the new --health-probe-bind-address default (also 127.0.0.1:7572), and v0.0.23+ watches an FRRK8sConfiguration CRD that neither frrk8s-crds.yaml nor the subchart's ClusterRole carries. v0.0.22 is the newest image the 0.0.21 templates can run and scans identically to v0.0.21 (same Go toolchain and base), so it buys nothing. Clearing this image's CVEs needs a CHART change -- frr-k8s >= 0.0.23 as its own dependency with frrk8s.external, regenerated CRDs, and no kube-rbac-proxy at all -- not an image bump. MetalLB 0.16.x vendors frr-k8s 0.0.25."
     },
 
     "frr": {
-      "version": "10.4.1",
+      "version": "10.4.5",
       "pinned_in": [
         { "path": "charts/spatiumddi-metallb/values.yaml", "match": "tag: {version}", "count": 1 },
         {
           "path": "appliance/scripts/bake-images.sh",
           "match": "quay.io/frrouting/frr:{version}",
           "count": 1
-        }
+        },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version}, via MetalLB frr-k8s |", "count": 1 }
       ],
       "upstream": { "kind": "github-release", "repo": "FRRouting/frr" },
-      "hold": "MetalLB sub-pin -- the frr-k8s 0.0.21 default. Moves with metallb, which is held. GPL-2.0, and only pulled when BGP mode is enabled (default off); flagged distinctly in NOTICE."
+      "hold": "Security override (#2239): pinned past the frr-k8s 0.0.21 subchart's default (10.4.1) to the newest patch on the SAME 10.4 line, which clears the OpenSSL CRITICAL. Not 10.5+/10.6: frr-k8s 0.0.21 is what renders this daemon's config and was built against 10.4 (frr-k8s 0.0.24-0.0.26 still default 10.4.3; only 0.0.27 moves to 10.6.2). Bump within 10.4.x freely; a minor bump waits for the frr-k8s chart change described under frr-k8s. GPL-2.0, and only pulled when BGP mode is enabled (default off); flagged distinctly in NOTICE."
     },
 
     "kube-rbac-proxy": {
-      "version": "v0.12.0",
+      "version": "v0.23.0",
       "pinned_in": [
         { "path": "charts/spatiumddi-metallb/values.yaml", "match": "tag: {version}", "count": 1 },
         {
           "path": "appliance/scripts/bake-images.sh",
           "match": "quay.io/brancz/kube-rbac-proxy:{version}",
           "count": 1
-        }
+        },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version}, frr-k8s metrics sidecar |", "count": 1 }
       ],
       "upstream": { "kind": "github-release", "repo": "brancz/kube-rbac-proxy" },
-      "hold": "MetalLB sub-pin -- the vendored frr-k8s chart's default, inherited rather than chosen. Moves with metallb, which is held. Only reachable on the default-off BGP path. #575 moved it off the sunset gcr.io/kubebuilder mirror; the chart override and the bake entry must stay byte-identical or the baked image is not the one the pod pulls."
+      "note": "Security override (#2239): pinned independently of the frr-k8s 0.0.21 subchart's default (v0.12.0, a 2022 build with an auth-bypass CVE) because it is the one BGP-mode image running an authenticated listener. The subchart's args were checked against v0.23's flags: --logtostderr is accepted and ignored with a warning, and --secure-listen-address / --upstream / --tls-cipher-suites are unchanged. Free to follow upstream. Only reachable on the default-off BGP path, and goes away entirely once frr-k8s moves to >= 0.0.23 (native TLS metrics). #575 moved it off the sunset gcr.io/kubebuilder mirror; the chart override and the bake entry must stay byte-identical or the baked image is not the one the pod pulls."
     },
 
     "cloudnative-pg-chart": {
