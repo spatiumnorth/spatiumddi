@@ -300,6 +300,51 @@ async def test_dashboard_panels_follow_the_module(
     assert enabled["meraki"] is False
 
 
+# ── Behaviour: the startup reconcile of the derived copy ────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_mirror_reconcile_heals_drift_and_is_idempotent(
+    db_session: AsyncSession,
+) -> None:
+    """The state an upgraded #2196 / #2197 install is in: modules on, columns
+    false. The reconcile API startup runs must correct it, and a second run
+    (every later boot, or a second replica) must change nothing — it writes
+    no audit row, so ``False`` is what keeps it from committing every boot."""
+    db_session.add(PlatformSettings(id=1))
+    for mid in _INTEGRATION_MODULES:
+        await _set_module(db_session, mid, False)
+    await _set_module(db_session, "integrations.fortinet", True)
+    await _set_module(db_session, "integrations.meraki", True)
+    await _commit(db_session)
+
+    assert await fm_svc.sync_integration_settings_mirror(db_session) is True
+    await _commit(db_session)
+    db_session.expire_all()
+    ps = await db_session.get(PlatformSettings, 1)
+    assert ps is not None
+    on = {col for col in fm_svc.INTEGRATION_SETTINGS_MIRROR.values() if getattr(ps, col) is True}
+    assert on == {"integration_fortinet_enabled", "integration_meraki_enabled"}
+
+    assert await fm_svc.sync_integration_settings_mirror(db_session) is False
+
+
+@pytest.mark.asyncio
+async def test_the_mirror_reconcile_leaves_a_fresh_install_without_a_row(
+    db_session: AsyncSession,
+) -> None:
+    """Every integration off and no settings row: nothing to copy, so the
+    reconcile reports no change and API startup does not commit a row into
+    existence."""
+    for mid in _INTEGRATION_MODULES:
+        await _set_module(db_session, mid, False)
+    await _commit(db_session)
+
+    assert await fm_svc.sync_integration_settings_mirror(db_session) is False
+    await db_session.rollback()
+    assert await db_session.get(PlatformSettings, 1) is None
+
+
 # ── Structure: a twelfth integration cannot miss a wire ─────────────────
 
 

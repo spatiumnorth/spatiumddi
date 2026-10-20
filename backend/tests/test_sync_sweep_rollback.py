@@ -31,21 +31,23 @@ from app.core.crypto import encrypt_dict
 from app.models.cloud import CloudEndpoint
 from app.models.ipam import IPSpace
 from app.models.proxmox import ProxmoxNode
-from app.models.settings import PlatformSettings
+from app.services import feature_modules as fm_svc
 from app.services.cloud.reconcile import ReconcileSummary as CloudSummary
 from app.services.proxmox.reconcile import ReconcileSummary as ProxmoxSummary
 from app.tasks import cloud_sync, proxmox_sync
 
-_PLATFORM_SINGLETON_ID = 1
-
 
 async def _platform_settings(db: AsyncSession, **flags: bool) -> None:
-    ps = await db.get(PlatformSettings, _PLATFORM_SINGLETON_ID)
-    if ps is None:
-        ps = PlatformSettings(id=_PLATFORM_SINGLETON_ID)
-        db.add(ps)
+    """Switch each named integration on or off.
+
+    Keyed by the settings-API field for readability, but what it writes is
+    the integration's feature module: that is what the sweep gates on
+    (#2196), and the ``PlatformSettings`` column is only a derived copy.
+    """
     for key, value in flags.items():
-        setattr(ps, key, value)
+        module_id = fm_svc.INTEGRATION_FIELD_TO_MODULE[key]
+        await fm_svc.set_module_enabled(db, module_id, value, user_id=None)
+    fm_svc.invalidate_cache()
 
 
 async def _make_space(db: AsyncSession) -> IPSpace:
