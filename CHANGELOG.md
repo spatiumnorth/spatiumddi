@@ -313,6 +313,20 @@ the formatter handles the rest.
   structural etag carries no server id and the new row's bundle
   re-renders nothing.
 
+- **A DNS agent holding its cached config at startup now serves it
+  while it re-registers (#2182).** During a #2019 boot hold (the daemon
+  died on the cached bundle, so the agent asks the control plane before
+  starting it), a 401 or 404 re-registers in process, and that can back
+  off for up to 5 minutes with named not running at all. The held cache
+  now serves meanwhile, under the same rules as an unreachable control
+  plane: a bundle the daemon was watched dying on twice is still not
+  re-applied, except on the quarantine's backoff. Nothing is fetched,
+  so the cache is applied as it is offline, and once the agent is
+  registered the control plane's bundle takes over through the normal
+  path, re-rendering only if it differs. The DHCP and looking-glass
+  agents have no boot hold (they apply their cache at startup), so the
+  gap was DNS-only.
+
 - **Sync DNS no longer lists an address's host A as missing when its
   own A alias already serves the name (#2118).** Since #2117 a rename
   onto an address's own alias skips the host record, because the alias
