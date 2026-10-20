@@ -26,6 +26,7 @@ from fastapi import HTTPException, Request, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.agent_wake import collecting_wakes
 from app.core.permissions import is_effective_superadmin
 from app.core.request_meta import clean_user_agent, client_ip
 from app.models.audit import AuditLog
@@ -791,7 +792,12 @@ async def approve_change_request(
     #    mutation + audit + commit; on success mark_executed writes the
     #    change_request.executed audit row carrying both ids.
     try:
-        result = await op.apply(db, approver, args)
+        # #2040 — neither /change-requests nor /requests mounts
+        # ``wake_publishing``, so open the collector here: an approved op's
+        # ``collect_wake`` publishes after apply() commits (dropped on raise)
+        # instead of being a silent no-op.
+        async with collecting_wakes():
+            result = await op.apply(db, approver, args)
     except OperationPermissionError as exc:
         await _safe_rollback(db)
         raise DecisionForbidden(str(exc)) from exc

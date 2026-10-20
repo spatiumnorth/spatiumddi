@@ -51,6 +51,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
+from app.core.agent_wake import collect_wake
 from app.core.content_disposition import content_disposition
 from app.core.mac import canonicalize_mac
 from app.core.permissions import require_resource_permission
@@ -65,6 +66,7 @@ from app.models.e911 import (
     ERLBinding,
 )
 from app.models.network import NetworkDevice, NetworkInterface
+from app.services.dhcp.agent_wake_targets import dhcp_group_channels_with_scopes
 from app.services.e911.exports import render_csv, render_ios_snippets
 from app.services.e911.resolver import Resolution, resolve_location
 from app.services.search.ranking import escape_like
@@ -680,6 +682,8 @@ async def update_erl(erl_id: uuid.UUID, body: ERLUpdate, db: DB, user: CurrentUs
         old_value={k: str(v) for k, v in old.items()},
         new_value={k: str(v) for k, v in changes.items()},
     )
+    # #2040 — the DHCP bundle renders options 99 / 123 from these rows.
+    collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
     await db.refresh(row)
     return _erl_read(row)
@@ -729,6 +733,8 @@ async def delete_erl(erl_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     # Bindings CASCADE. That fails safe: the resolver then degrades to the
     # next-coarser rule rather than pointing at a location that is gone.
     await db.delete(row)
+    # #2040 — the DHCP bundle renders options 99 / 123 from these rows.
+    collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
 
 
@@ -823,6 +829,8 @@ async def create_binding(body: BindingCreate, db: DB, user: CurrentUser) -> Bind
         resource_display=f"{body.rule_kind} → {erl.name}",
         new_value={"rule_kind": body.rule_kind, "erl": erl.name},
     )
+    # #2040 — the DHCP bundle renders options 99 / 123 from these rows.
+    collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
     await db.refresh(row)
     return _binding_read(row, erl.name)
@@ -856,6 +864,8 @@ async def update_binding(
         old_value={k: str(v) for k, v in old.items()},
         new_value={k: str(v) for k, v in changes.items()},
     )
+    # #2040 — the DHCP bundle renders options 99 / 123 from these rows.
+    collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
     await db.refresh(row)
     return _binding_read(row, erl.name)
@@ -878,6 +888,8 @@ async def delete_binding(binding_id: uuid.UUID, db: DB, user: CurrentUser) -> No
         old_value={"rule_kind": row.rule_kind, "erl_id": str(row.erl_id)},
     )
     await db.delete(row)
+    # #2040 — the DHCP bundle renders options 99 / 123 from these rows.
+    collect_wake(*await dhcp_group_channels_with_scopes(db))
     await db.commit()
 
 

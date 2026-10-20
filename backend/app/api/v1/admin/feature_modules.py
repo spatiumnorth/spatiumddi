@@ -29,6 +29,7 @@ from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.stepup import refuse_if_stepup_blocked
+from app.core.agent_wake import publish_wake
 from app.core.auth_throttle import login_rate_limited, record_stepup_password_failure
 from app.core.demo_mode import DEMO_RESTRICTED_MODULES, is_demo_mode
 from app.core.permissions import is_effective_superadmin
@@ -49,6 +50,7 @@ from app.services.ai.operations_control import (
     is_controls_protected,
     maybe_gate_control,
 )
+from app.services.dhcp.agent_wake_targets import dhcp_group_channels_with_scopes
 from app.services.reauth import ReauthOutcome, reverify_operator
 
 logger = structlog.get_logger(__name__)
@@ -281,6 +283,15 @@ async def toggle_feature_module(
 
     await db.commit()
     fm_svc.invalidate_cache()
+    # #2040 — the DHCP bundle is gated on modules (``network.e911`` emits
+    # options 99 / 123, ``ipv6.router_advertisements`` the radvd config), and a
+    # toggle of a parent re-resolves its children, so wake every DHCP group
+    # that serves a scope on any toggle. This router carries no
+    # ``wake_publishing`` collector, so publish after the commit directly. A
+    # poll parked on another api replica reads that replica's module cache
+    # (``_CACHE_TTL_S``); if the wake beats its expiry the poll parks again and
+    # converges on the next tick, which is the behaviour before the wake.
+    await publish_wake(*await dhcp_group_channels_with_scopes(db))
 
     states = await fm_svc.load_module_states(db, probe_overridden=True)
     return FeatureModuleEntry(
