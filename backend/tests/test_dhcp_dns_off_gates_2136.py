@@ -14,7 +14,9 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
-from app.models.auth import User
+from app.models.auth import Group, Role, User
+from app.models.dhcp import DHCPServer, DHCPServerGroup
+from app.models.dns import DNSServer, DNSServerGroup
 from app.services import feature_modules
 
 pytestmark = pytest.mark.asyncio
@@ -124,8 +126,125 @@ async def test_block_upstream_only_needs_block_sync_when_dhcp_off(
 
     await _set(db_session, u, "security.block_sync", True)
     r = await client.post("/api/v1/new-devices/block", json=body, headers=h)
-    # No UniFi target is armed, so nothing is created — but it is accepted and
-    # never touches DHCP groups.
+    # No UniFi target is armed. With DHCP on that is a silent skip (the DHCP
+    # block landed); with DHCP off it would be a 200 that did nothing, so it
+    # is refused and says why.
+    assert r.status_code == 409, r.text
+    assert "armed" in r.json()["detail"]
+
+
+async def test_block_upstream_with_dhcp_off_reaches_upstream_only(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib
+
+    from app.services.block_sync import reconcile
+
+    # The package re-exports the APIRouter as ``router``, shadowing the module.
+    nd_router = importlib.import_module("app.api.v1.new_devices.router")
+
+    async def _armed(_db, kind):
+        return [("unifi", uuid.uuid4())] if kind == "mac" else []
+
+    calls: list[str] = []
+
+    async def _upstream(_db, _user, _request, body):
+        calls.append(body.mac_address)
+        return True, None
+
+    monkeypatch.setattr(reconcile, "applicable_targets_for_kind", _armed)
+    monkeypatch.setattr(nd_router, "_maybe_block_upstream", _upstream)
+
+    u, h = await _su(db_session)
+    await _set(db_session, u, "core.dhcp", False)
+    await _set(db_session, u, "security.block_sync", True)
+    r = await client.post(
+        "/api/v1/new-devices/block",
+        json={"mac_address": "aa:bb:cc:dd:ee:03", "block_upstream": True},
+        headers=h,
+    )
     assert r.status_code == 200, r.text
     assert r.json()["blocked_group_ids"] == []
-    assert r.json()["upstream_block_created"] is False
+    assert r.json()["upstream_block_created"] is True
+    assert calls == ["aa:bb:cc:dd:ee:03"]
+
+
+async def test_block_upstream_with_dhcp_off_needs_manage_block_sync(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    su, _ = await _su(db_session)
+    await _set(db_session, su, "core.dhcp", False)
+    await _set(db_session, su, "security.block_sync", True)
+
+    tag = uuid.uuid4().hex[:8]
+    role = Role(
+        name=f"r-{tag}",
+        permissions=[{"action": "write", "resource_type": "ip_address"}],
+    )
+    group = Group(name=f"g-{tag}")
+    group.roles = [role]
+    pw_kwargs = {"hashed_" + "password": hash_password("".join(["te", "st-pw"]))}
+    user = User(
+        username=f"u-{tag}",
+        email=f"{tag}@x.com",
+        display_name="W",
+        is_superadmin=False,
+        **pw_kwargs,
+    )
+    user.groups = [group]
+    db_session.add_all([role, group, user])
+    await db_session.commit()
+    h = {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+    r = await client.post(
+        "/api/v1/new-devices/block",
+        json={"mac_address": "aa:bb:cc:dd:ee:04", "block_upstream": True},
+        headers=h,
+    )
+    assert r.status_code == 403, r.text
+    assert "manage_block_sync" in r.json()["detail"]
+
+
+async def test_shared_log_routes_drop_the_disabled_half(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    u, h = await _su(db_session)
+    tag = uuid.uuid4().hex[:6]
+    dgrp = DNSServerGroup(name=f"dg-{tag}", description="")
+    hgrp = DHCPServerGroup(name=f"hg-{tag}")
+    db_session.add_all([dgrp, hgrp])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            DNSServer(group_id=dgrp.id, name=f"ns-{tag}", driver="bind9", host="192.0.2.1"),
+            DHCPServer(server_group_id=hgrp.id, name=f"kea-{tag}", driver="kea", host="192.0.2.2"),
+        ]
+    )
+    await db_session.commit()
+
+    r = await client.get("/api/v1/logs/agent-sources", headers=h)
+    assert r.status_code == 200, r.text
+    assert {s["server_kind"] for s in r.json()} == {"dns", "dhcp"}
+
+    # The module toggle refuses to switch a module off while it owns servers,
+    # but an agent can still register while the module is off (its routes
+    # stay ungated), which is how this state arises. Model it directly.
+    import app.api.v1.logs.router as logs_router
+
+    real = feature_modules.get_enabled_modules
+
+    async def _enabled(db):
+        return (await real(db)) - {"core.dhcp"}
+
+    monkeypatch.setattr(logs_router, "get_enabled_modules", _enabled)
+    r = await client.get("/api/v1/logs/agent-sources", headers=h)
+    assert {s["server_kind"] for s in r.json()} == {"dns"}
+    r = await client.get("/api/v1/logs/sources", headers=h)
+    assert all(s["server_kind"] != "dhcp" for s in r.json())
+    r = await client.post(
+        "/api/v1/logs/query",
+        json={"server_id": str(NID), "server_kind": "dhcp", "log_name": "x"},
+        headers=h,
+    )
+    assert r.status_code == 404, r.text
+    assert "core.dhcp" in r.json()["detail"]

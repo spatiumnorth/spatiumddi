@@ -178,15 +178,19 @@ the formatter handles the rest.
   (space, block, subnet) answer 404 like `/dhcp/*`; with `core.dns`
   off, `POST /logs/dns-queries`, `POST /logs/dns-queries/analytics`
   and `GET /metrics/dns/timeseries` do. The agent routers stay
-  ungated. `POST /new-devices/block` with DHCP off is refused (422)
-  when it would only write DHCP blocks, and otherwise skips the DHCP
-  half and does the upstream quarantine; on New Devices the action is
-  hidden when neither DHCP nor active block sync is on, and reads
+  ungated, and the shared `/logs/sources` and `/logs/agent-sources`
+  lists leave out the servers of a module that is off (`/logs/query`
+  answers 404 for them). `POST /new-devices/block` with DHCP off is
+  refused (422) when it would only write DHCP blocks, and otherwise
+  skips the DHCP half and does the upstream quarantine, refusing with
+  the reason (403 without `manage_block_sync`, 409 with no armed
+  target) rather than answering 200 having done nothing; on New
+  Devices the action is hidden when neither DHCP nor active block
+  sync is on, and reads
   "Quarantine upstream" when only block sync is. The DNS Threat
   module-off notice now names Features & Integrations and links it
   (superadmin only; others are told to ask an administrator), and says
   where per-group query logging is turned on.
-
 
 - **Backup page and branding title show the API's reason and stop
   offering what is refused** (#2203, #2204, #2200, #2202, #2205).

@@ -474,6 +474,29 @@ async def block_mac(body: BlockBody, db: DB, user: WriteUser, request: Request) 
                     "module (security.block_sync) is off too; nothing to block with."
                 ),
             )
+        # With DHCP on, the upstream half is best-effort because the DHCP
+        # block has already landed. Here it is the whole action, so the
+        # helper's silent skips would answer 200 having done nothing; say
+        # why instead.
+        from app.core.permissions import user_has_permission
+        from app.services.block_sync.reconcile import applicable_targets_for_kind
+
+        if not user_has_permission(user, "admin", "manage_block_sync"):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "DHCP is turned off (core.dhcp), so blocking is an upstream "
+                    "quarantine only, which needs the manage_block_sync permission."
+                ),
+            )
+        if not await applicable_targets_for_kind(db, "mac"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "DHCP is turned off (core.dhcp) and no armed block-sync target "
+                    "accepts MAC blocks; nothing to quarantine the device with."
+                ),
+            )
         upstream_created, upstream_cr = await _maybe_block_upstream(db, user, request, body)
         return BlockResult(
             mac_address=body.mac_address,

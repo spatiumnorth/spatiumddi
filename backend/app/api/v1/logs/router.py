@@ -39,7 +39,7 @@ from app.drivers.dns import get_driver as get_dns_driver
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
-from app.services.feature_modules import require_module
+from app.services.feature_modules import get_enabled_modules, require_module
 
 # Drivers backed by an in-container agent (BIND9, Kea). Distinct from
 # ``AGENTLESS_DRIVERS`` (Windows over WinRM) because the log-pull
@@ -162,13 +162,18 @@ async def list_sources(db: DB) -> list[LogSource]:
     they get a ``server_kind`` of their own.
     """
     out: list[LogSource] = []
+    kinds = await _enabled_kinds(db)
 
     # DNS — iterate all servers using an agentless driver with creds.
     dns_rows = (
-        await db.execute(
-            DNSServer.__table__.select().where(DNSServer.credentials_encrypted.is_not(None))
-        )
-    ).all()
+        (
+            await db.execute(
+                DNSServer.__table__.select().where(DNSServer.credentials_encrypted.is_not(None))
+            )
+        ).all()
+        if "dns" in kinds
+        else []
+    )
     for row in dns_rows:
         s = row._mapping
         if s["driver"] not in DNS_AGENTLESS:
@@ -194,10 +199,14 @@ async def list_sources(db: DB) -> list[LogSource]:
 
     # DHCP — same pattern.
     dhcp_rows = (
-        await db.execute(
-            DHCPServer.__table__.select().where(DHCPServer.credentials_encrypted.is_not(None))
-        )
-    ).all()
+        (
+            await db.execute(
+                DHCPServer.__table__.select().where(DHCPServer.credentials_encrypted.is_not(None))
+            )
+        ).all()
+        if "dhcp" in kinds
+        else []
+    )
     for row in dhcp_rows:
         s = row._mapping
         if s["driver"] not in DHCP_AGENTLESS:
@@ -225,11 +234,32 @@ async def list_sources(db: DB) -> list[LogSource]:
     return out
 
 
+_KIND_MODULE = {"dns": "core.dns", "dhcp": "core.dhcp"}
+
+
+async def _enabled_kinds(db: DB) -> set[str]:
+    """Server kinds whose core module is on (#2136).
+
+    The shared ``/logs/*`` routes serve both DNS and DHCP, so they cannot
+    take a router-level ``require_module``; instead they drop the half
+    whose module is off, so the Logs page is never offered a server that
+    every DNS- or DHCP-specific route would then 404 on.
+    """
+    enabled = await get_enabled_modules(db)
+    return {kind for kind, module_id in _KIND_MODULE.items() if module_id in enabled}
+
+
 async def _resolve_server(db: DB, server_kind: str, server_id: uuid.UUID) -> tuple[Any, str]:
     """Load the right server row for the requested kind, or 404.
 
-    Returns ``(server, driver_name)``.
+    Returns ``(server, driver_name)``. A kind whose core module is off
+    answers 404, the same as the module's own routes (#2136).
     """
+    if server_kind not in await _enabled_kinds(db):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Feature '{_KIND_MODULE[server_kind]}' is disabled.",
+        )
     server: Any
     allowed: frozenset[str]
     if server_kind == "dns":
@@ -431,11 +461,14 @@ async def list_agent_sources(db: DB) -> list[AgentLogSource]:
     query logging yet" and "the server doesn't exist".
     """
     out: list[AgentLogSource] = []
+    kinds = await _enabled_kinds(db)
 
     dns_rows = (
         (await db.execute(select(DNSServer).where(DNSServer.driver.in_(DNS_AGENT_DRIVERS))))
         .scalars()
         .all()
+        if "dns" in kinds
+        else []
     )
     for s in dns_rows:
         out.append(
@@ -452,6 +485,8 @@ async def list_agent_sources(db: DB) -> list[AgentLogSource]:
         (await db.execute(select(DHCPServer).where(DHCPServer.driver.in_(DHCP_AGENT_DRIVERS))))
         .scalars()
         .all()
+        if "dhcp" in kinds
+        else []
     )
     for s in dhcp_rows:
         out.append(

@@ -899,9 +899,18 @@ function BlockSelectedModal({
           }),
         ),
       );
-      const failed = results.filter((r) => r.status === "rejected").length;
-      if (failed > 0)
-        throw new Error(`${failed} of ${sightings.length} failed to block`);
+      const rejected = results.filter(
+        (r): r is PromiseRejectedResult => r.status === "rejected",
+      );
+      if (rejected.length > 0)
+        // Carry the server's reason: with DHCP off a refusal (no permission,
+        // no armed target) is the whole answer, not a partial failure.
+        throw new Error(
+          `${rejected.length} of ${sightings.length} failed to block: ${errMsg(
+            rejected[0].reason,
+            "unknown error",
+          )}`,
+        );
       // Summarise the upstream outcome so the operator knows whether the
       // L2 quarantine landed or is waiting on a second approver.
       let upstreamCreated = 0;
