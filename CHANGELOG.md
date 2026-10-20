@@ -171,6 +171,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DoT group's forwarder pinned to port 53 is refused, and the
+  DNS docs lose two unused variables (#2128, #2125).** In a group
+  forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,
+  a TLS handshake against a plaintext port that can never work. The
+  group options save now answers 422 naming the entry. Only entries
+  the request adds are checked (all of them when it switches the
+  group to an encrypted transport), so a value stored earlier does
+  not block an unrelated save. Such a stored entry still renders as
+  before (it fails closed: no cleartext leaves a DoT group, and BIND
+  tries the other forwarders), and the options page now lists it in
+  a warning (`forwarder_warnings` on the options GET). `053` counts
+  as 53. A do53 group is unaffected, and a forward zone's explicit
+  `@53` still renders plain. `DNS.md` no
+  longer lists `BLOCKLIST_UPDATE_INTERVAL_HOURS` and
+  `BLOCKLIST_SINKHOLE_IP`, which nothing reads (refresh interval and
+  sinkhole IP are per list), and section 8.0 gains a worked example:
+  by its rule of thumb, one catalog feed (AdGuard DNS filter, ~186k
+  entries) needs roughly 1 GB, about double the `512Mi` in the
+  chart's example, whose comment now points there.
+
 - **DHCP and DNS off now also stop the API routes that live outside
   `/dhcp` and `/dns` (#2136, #2134, #2129).** With `core.dhcp` off,
   `POST /logs/dhcp-activity`, `POST /logs/dhcp-audit`,
