@@ -1936,6 +1936,7 @@ async def _sync_dns_record(
     *,
     backfill_reverse_zone: bool = True,
     strict: bool = False,
+    skip_own_alias: bool = False,
 ) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
@@ -1962,6 +1963,13 @@ async def _sync_dns_record(
     otherwise (DDNS, importers, DHCP statics) the over-long name is skipped
     and logged, because those paths must not fail a lease or a batch over one
     row, and the name must not reach a zone BIND would then refuse whole.
+
+    ``skip_own_alias=True`` keeps ``strict`` but skips, rather than refuses,
+    a zone where one of the address's own A / AAAA aliases already holds the
+    hostname, as a background path does (#2106). Sync DNS passes it (#2118):
+    the alias already serves the name, so refusing there would block the rest
+    of the address's sync (a missing PTR) on every apply. A CNAME alias at
+    the name is still refused.
 
     Returns whether the sync had anything to do: False when the row carries
     no hostname, when there is no primary zone and no extra zone to publish
@@ -2108,15 +2116,25 @@ async def _sync_dns_record(
     if ip.hostname != "gateway":
         alias_clashes = await _own_alias_clashes(db, ip, desired_zone_ids, forward_rtype)
         if alias_clashes:
-            first_zone_id, first_alias = next(iter(alias_clashes.items()))
-            clash_zone = (
-                zone if first_zone_id == effective_zone_id else await db.get(DNSZone, first_zone_id)
+            # #2118 — Sync DNS skips an A / AAAA alias clash like a background
+            # path, and refuses only a CNAME one.
+            refused = (
+                {z: a for z, a in alias_clashes.items() if a.record_type == "CNAME"}
+                if skip_own_alias
+                else alias_clashes
             )
-            if strict and clash_zone is not None:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    _own_alias_clash_detail(ip, clash_zone, first_alias),
+            if strict and refused:
+                first_zone_id, first_alias = next(iter(refused.items()))
+                clash_zone = (
+                    zone
+                    if first_zone_id == effective_zone_id
+                    else await db.get(DNSZone, first_zone_id)
                 )
+                if clash_zone is not None:
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        _own_alias_clash_detail(ip, clash_zone, first_alias),
+                    )
             # A CNAME alias is left to the #1441 skip in Phase 2, which also
             # retracts the PTR (#1493: no PTR may name a CNAME) and reports
             # the skip to the DDNS path. An A / AAAA alias already answers
@@ -3087,6 +3105,7 @@ class SubnetCreate(BaseModel):
     # still be suppressed by an ancestor, in which case no sweep runs.
     do_not_probe: bool = False
     do_not_probe_reason: str = ""
+    show_free_ranges: bool | None = None  # #2137 — None = default rule
     ipv6_allocation_policy: str = "random"
     # Compliance / classification flags — see Subnet model.
     pci_scope: bool = False
@@ -3246,6 +3265,7 @@ class SubnetUpdate(BaseModel):
     discovery_interval_minutes: int | None = None
     do_not_probe: bool | None = None
     do_not_probe_reason: str | None = None
+    show_free_ranges: bool | None = None  # #2137 — explicit null restores default
     ipv6_allocation_policy: str | None = None
     pci_scope: bool | None = None
     hipaa_scope: bool | None = None
@@ -3410,6 +3430,11 @@ class SubnetResponse(BaseModel):
     # per-row would put a hierarchy walk inside every list page.
     do_not_probe: bool = False
     do_not_probe_reason: str = ""
+    # #2137 — the subnet's own choice; None = use the default rule.
+    show_free_ranges: bool | None = None
+    # #2137 — name of the integration mirroring this subnet (kubernetes,
+    # tailscale, …), derived from the ownership FKs; None when operator-owned.
+    integration_owner: str | None = None
     ipv6_allocation_policy: str = "random"
     pci_scope: bool = False
     hipaa_scope: bool = False
@@ -3444,18 +3469,25 @@ class SubnetResponse(BaseModel):
     def _attach_vlan(cls, data: Any) -> Any:
         # When serializing a Subnet ORM instance, enrich with nested `vlan` from `vlan_ref`.
         if isinstance(data, Subnet):
+            from app.services.integration_ownership import owning_integration
+
             vref = getattr(data, "vlan_ref", None)
-            if vref is not None:
+            if vref is None:
                 return {
                     **{c.name: getattr(data, c.name) for c in data.__table__.columns},
-                    "vlan": {
-                        "id": vref.id,
-                        "router_id": vref.router_id,
-                        "router_name": getattr(getattr(vref, "router", None), "name", None),
-                        "vlan_id": vref.vlan_id,
-                        "name": vref.name,
-                    },
+                    "integration_owner": owning_integration(data),
                 }
+            return {
+                **{c.name: getattr(data, c.name) for c in data.__table__.columns},
+                "integration_owner": owning_integration(data),
+                "vlan": {
+                    "id": vref.id,
+                    "router_id": vref.router_id,
+                    "router_name": getattr(getattr(vref, "router", None), "name", None),
+                    "vlan_id": vref.vlan_id,
+                    "name": vref.name,
+                },
+            }
         return data
 
 
@@ -6357,6 +6389,7 @@ async def update_subnet(
         "site_id",
         "ddns_domain_override",
         "ddns_ttl",
+        "show_free_ranges",  # #2137 — null restores the default
     }
     changes = body.model_dump(exclude_none=True, exclude=exclude_fields)
     changes_for_audit = body.model_dump(mode="json", exclude_none=True, exclude=exclude_fields)
@@ -6400,7 +6433,14 @@ async def update_subnet(
     # Nullable scalars/FKs the operator must be able to clear (#502) — same
     # explicit model_fields_set treatment as decom_date, because exclude_none
     # drops a null and the clear would otherwise be a silent no-op.
-    for _field in ("gateway", "customer_id", "site_id", "ddns_domain_override", "ddns_ttl"):
+    for _field in (
+        "gateway",
+        "customer_id",
+        "site_id",
+        "ddns_domain_override",
+        "ddns_ttl",
+        "show_free_ranges",
+    ):
         if _field in body.model_fields_set:
             _val = getattr(body, _field)
             setattr(subnet, _field, _val)
@@ -7575,7 +7615,12 @@ async def _apply_dns_sync(
                     # #2072 — strict, so a name too long for its zone is
                     # reported in ``errors`` instead of counted as synced. The
                     # refusal comes before anything is written for this IP.
-                    await _sync_dns_record(db, ip, sn, action="create", strict=True)
+                    # #2118 — an address whose own A / AAAA alias already
+                    # serves its name is skipped there, not refused, so its
+                    # missing PTR is still written.
+                    await _sync_dns_record(
+                        db, ip, sn, action="create", strict=True, skip_own_alias=True
+                    )
                     if ip.id in body.create_for_ip_ids:
                         created += 1
                     else:

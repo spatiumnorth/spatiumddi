@@ -1346,6 +1346,24 @@ class SettingsUpdate(BaseModel):
             raise ValueError("colour must be a 6-digit hex value such as #b91c1c")
         return s
 
+    @field_validator("app_title")
+    @classmethod
+    def _valid_app_title(cls, v: str | None) -> str | None:
+        # Mirrors the column width (VARCHAR(255)). Without it an overlong
+        # title reached the database and came back as the catch-all 422
+        # that names no field (#2205).
+        if v is not None and len(v) > 255:
+            raise ValueError("app_title must be 255 characters or fewer")
+        return v
+
+    @field_validator("app_base_url")
+    @classmethod
+    def _valid_app_base_url(cls, v: str | None) -> str | None:
+        # Mirrors the column width (VARCHAR(500)) (#2205).
+        if v is not None and len(v) > 500:
+            raise ValueError("app_base_url must be 500 characters or fewer")
+        return v
+
     @field_validator("env_banner_text")
     @classmethod
     def _valid_env_banner_text(cls, v: str | None) -> str | None:
