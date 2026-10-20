@@ -171,6 +171,20 @@ spec:
                  dns-bind9 / dns-powerdns / dns-technitium: 30 s initial
                  delay covers a slow first bundle, 3 × 30 s to a restart
                  with the reason in the agent's log. */}}
+          {{- /* #2223 — liveness and readiness do not run until this has
+                 passed once. Without it, liveness ran from 30 s after the
+                 container started, so a cold start at scale (20,000 zones:
+                 render, named-checkzone every zone, then named loading them —
+                 tens of minutes) was killed before the daemon listened, every
+                 time, and never came back. Same check as liveness, so a
+                 daemon that never listens is still restarted once the budget
+                 (10 s x 360 = 60 min by default) is spent. */}}
+          {{- $startup := mergeOverwrite (dict "periodSeconds" 10 "failureThreshold" 360 "timeoutSeconds" 1) (deepCopy ($root.Values.dnsAgents.startupProbe | default dict)) (deepCopy ($server.startupProbe | default dict)) }}
+          startupProbe:
+            tcpSocket: { port: 53 }
+            periodSeconds: {{ $startup.periodSeconds }}
+            failureThreshold: {{ $startup.failureThreshold }}
+            timeoutSeconds: {{ $startup.timeoutSeconds }}
           livenessProbe:
             tcpSocket: { port: 53 }
             initialDelaySeconds: 30

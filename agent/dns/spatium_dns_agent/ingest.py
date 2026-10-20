@@ -275,7 +275,11 @@ class IngestWorker:
         key = (st.st_mtime_ns, st.st_size, etag) if st is not None else None
         if key is not None and key == self._cache_key:
             return self._cache_val
-        bundle, _etag = load_config(self.cfg.state_dir)
+        # #2223 — the zone list only. This runs in its own thread, so a full
+        # parse here (the cache changes on every record edit) could coincide
+        # with the sync loop's parse of the next bundle: two bundles in memory
+        # at once, ~1 GB at a million records.
+        bundle, _etag = load_config(self.cfg.state_dir, records=False)
         if not bundle:
             return None
         # Loopback key = the group key the control plane appends first.

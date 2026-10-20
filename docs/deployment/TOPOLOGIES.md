@@ -33,6 +33,17 @@ For the per-platform install steps, see:
 | **DHCP agents** (Kea + sidecar) | Per DHCP server | One agent per DHCP server. Group-centric Kea HA across 2+ peers |
 | **Backup destinations** | External (S3/SCP/Azure/SMB/FTP/GCS/WebDAV) | Out-of-band — operator's responsibility. SpatiumDDI just writes archives there |
 
+**DNS serving pod memory.** Each DNS server's container (agent and daemon
+under one limit, 2Gi by default) grows with the records its group holds:
+measured at 20,000 zones and 1,000,000 records, named held 868 MB and the
+agent peaked at 480 MB while taking a bundle, so a group that size fits
+the default only while its resolver cache stays small, and wants 3Gi if it
+also recurses for clients. A cold start at that size spends tens of minutes
+checking zones before named listens, which the containers' 60-minute
+startup probe allows for. See
+[`DNS.md` §8.0](../features/DNS.md#80-memory-sizing-for-large-blocklists-issue-1725)
+for the measurements and where to raise each limit.
+
 The control plane's blast radius is roughly **the API container's writable
 layer** (which is empty when scheduled targets push to a remote
 destination). The agents survive control-plane outages because they

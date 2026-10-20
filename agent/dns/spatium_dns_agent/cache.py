@@ -9,6 +9,7 @@ Layout under /var/lib/spatium-dns-agent/:
     config/previous.etag
     config/quarantine.json         # etag of a bundle that failed to apply (#882)
     config/apply_guard.json        # bundle being applied/settling + deaths (#2019)
+    config/held.json               # the bundle a startup hold set aside (#2223)
     rendered/                      # managed by driver
     ops/{inflight,failed}/
 
@@ -21,7 +22,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,10 @@ log = structlog.get_logger(__name__)
 # as ``current`` or ``previous``.
 FETCH_SPOOL = "config/fetch.json.part"
 
+# The cached bundle a startup hold (#2019) sets aside, kept on disk rather than
+# in memory (#2223). Only meaningful to the process that wrote it.
+HELD_BUNDLE = "config/held.json"
+
 
 def ensure_layout(state_dir: Path) -> None:
     for sub in ("config", "rendered", "tsig", "ops/inflight", "ops/failed"):
@@ -46,6 +50,8 @@ def ensure_layout(state_dir: Path) -> None:
     # next fetch would truncate it anyway; dropping it at start means a
     # crash-looping agent does not sit on it in the meantime.
     (state_dir / FETCH_SPOOL).unlink(missing_ok=True)
+    # A hold is decided afresh by every start, from ``current.json``.
+    (state_dir / HELD_BUNDLE).unlink(missing_ok=True)
 
 
 def load_or_create_agent_id(state_dir: Path) -> str:
@@ -73,49 +79,202 @@ def save_token(state_dir: Path, token: str) -> None:
     tmp.replace(path)
 
 
-# Value strings at most this long are interned while a bundle is parsed (#2029).
+# Value strings at most this long are shared while a bundle is parsed (#2029).
 # A blocklist entry carries ``"action": "block"`` and ``"block_mode":
 # "nxdomain"`` and ``json`` builds a fresh str for every occurrence — 1.4M
 # entries spend ~135 MB of a ~520 MB parse on copies of a handful of words.
-# Keys are already shared by the decoder's own memo. Domain names are left
-# alone: they are long, nearly all distinct, and interning them would only
-# grow the intern table.
+# Domain names are left alone: they are long, nearly all distinct, and
+# sharing them would only grow the memo.
 _INTERN_MAX_LEN = 16
 
+# How much of the file the streaming parse reads at a time (#2223).
+_PARSE_CHUNK = 1 << 18
 
-def _share_short_values(obj: dict[str, Any]) -> dict[str, Any]:
-    """``object_hook`` that swaps short str values for one shared copy.
+_JSON_WS = " \t\n\r"
 
-    Equal strings are interchangeable, so the parsed bundle is ``==`` to the
-    one ``json.loads`` alone would give — only its size changes.
+# Per top-level array, the member of each element ``records=False`` drops.
+_RECORD_LEVEL = {"zones": "records", "blocklists": "entries"}
+
+
+def _sharing_decoder(values: bool = True) -> tuple[json.JSONDecoder, dict[str, str]]:
+    """A decoder sharing keys and short values across one whole parse.
+
+    ``json`` shares the keys of one document through a memo it clears after
+    every ``raw_decode``; the streaming parse decodes a bundle a zone at a
+    time, so it keeps its own, for keys and for the short values #2029
+    shares. Without it every zone would carry its own copies of ~37 key
+    strings, ~40 MB at 20,000 zones. A memo rather than ``sys.intern``: a
+    million records carry a million distinct short names and addresses, and
+    the interpreter's intern table keeps its size after they are freed (~14
+    MB at that scale); the memo goes with the parse.
+
+    ``values=False`` shares keys only: a parse that drops the records must
+    not keep every short value they carried alive in the memo meanwhile.
     """
-    for key, value in obj.items():
-        if value.__class__ is str and len(value) <= _INTERN_MAX_LEN:
-            obj[key] = sys.intern(value)
-    return obj
+    memo: dict[str, str] = {}
+    share = memo.setdefault
+
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        obj: dict[str, Any] = {}
+        for key, value in items:
+            if values and value.__class__ is str and len(value) <= _INTERN_MAX_LEN:
+                value = share(value, value)
+            obj[share(key, key)] = value
+        return obj
+
+    return json.JSONDecoder(object_pairs_hook=pairs), memo
 
 
-def parse_bundle_file(path: Path) -> Any:
-    """Parse a bundle from disk without holding its bytes during the parse.
+class _TextStream:
+    """A text file read a chunk at a time and decoded one JSON value at a time.
 
-    The decoder needs the whole document as one str, so the file is read and
-    decoded first and the raw bytes dropped before ``json`` starts building
-    objects: a bundle is then in memory once as text and once as objects,
-    never also as bytes.
+    Only what has not been consumed yet stays buffered, so the bundle's text
+    is never in memory whole: at most the largest single value (one zone, one
+    blocklist) plus a chunk.
     """
-    data = path.read_bytes()
-    text = data.decode(json.detect_encoding(data), "surrogatepass")
-    del data
-    return json.loads(text, object_hook=_share_short_values)
+
+    def __init__(self, fh: Any, decoder: json.JSONDecoder) -> None:
+        self._fh = fh
+        self._decoder = decoder
+        self.buf = ""
+        self.pos = 0
+        self._want = _PARSE_CHUNK
+        self._eof = False
+
+    def _read(self) -> bool:
+        if self._eof:
+            return False
+        if self.pos > len(self.buf) // 2:
+            self.buf = self.buf[self.pos :]
+            self.pos = 0
+        got = self._fh.read(self._want)
+        if not got:
+            self._eof = True
+            return False
+        self.buf += got
+        return True
+
+    def _grow(self) -> bool:
+        # At least as much again as is buffered: a value larger than the buffer
+        # costs a doubling series of attempts, not one per chunk.
+        self._want = max(_PARSE_CHUNK, len(self.buf) - self.pos)
+        return self._read()
+
+    def peek(self) -> str:
+        """The next non-whitespace character, ``""`` at the end of the file."""
+        while True:
+            buf, pos, n = self.buf, self.pos, len(self.buf)
+            while pos < n and buf[pos] in _JSON_WS:
+                pos += 1
+            self.pos = pos
+            if pos < n or not self._read():
+                return buf[pos] if pos < n else ""
+
+    def take(self, expected: str) -> str:
+        """Consume the next character, which must be one of ``expected``."""
+        ch = self.peek()
+        if not ch or ch not in expected:
+            raise json.JSONDecodeError(f"Expecting one of {expected!r}", self.buf, self.pos)
+        self.pos += 1
+        return ch
+
+    def value(self) -> Any:
+        self.peek()
+        while True:
+            try:
+                value, end = self._decoder.raw_decode(self.buf, self.pos)
+            except json.JSONDecodeError:
+                if self._grow():
+                    continue
+                raise
+            # A number cut off by the end of the buffer decodes as a shorter
+            # one, so a value that reaches the end is decoded again with more.
+            if end < len(self.buf) or not self._grow():
+                self.pos = end
+                return value
+
+    def rest(self) -> str:
+        while self._read():
+            pass
+        return self.buf[self.pos :]
 
 
-def load_config(state_dir: Path) -> tuple[dict[str, Any] | None, str | None]:
+def parse_bundle_file(path: Path, *, records: bool = True) -> Any:
+    """Parse a bundle from disk without holding its text whole (#2029, #2223).
+
+    The result is ``==`` to ``json.loads`` of the file. A bundle is an object
+    whose large members are arrays (``zones``, ``blocklists``); each top-level
+    array is decoded an element at a time, so the text in memory is one zone
+    or one blocklist rather than the whole document. Measured at 20,000 zones
+    and a million records (a 126 MB file), peak RSS went from ~525 MB reading
+    it whole to ~410 MB streamed. Shared keys and short values
+    (``_sharing_decoder``) keep the parsed form as small as one ``json.loads``
+    gives.
+
+    ``records=False`` leaves out the record-level data — each zone's
+    ``records``, each blocklist's ``entries`` — for a reader that needs only
+    the zone list: each element's are freed as soon as it is read, so that
+    reader holds one zone's or one blocklist's at a time, never the bundle's.
+    """
+    with path.open("rb") as raw:
+        encoding = json.detect_encoding(raw.read(4))
+    with path.open("r", encoding=encoding, errors="surrogatepass", newline="") as fh:
+        decoder, memo = _sharing_decoder(values=records)
+        stream = _TextStream(fh, decoder)
+        if stream.peek() != "{":
+            # Not an object (never a bundle): ``json`` decides, as before.
+            return json.loads(stream.rest())
+        stream.pos += 1
+        bundle: dict[str, Any] = {}
+        if stream.peek() == "}":
+            stream.pos += 1
+        else:
+            while True:
+                key = stream.value()
+                if not isinstance(key, str):
+                    raise json.JSONDecodeError(
+                        "Expecting property name enclosed in double quotes",
+                        stream.buf,
+                        stream.pos,
+                    )
+                stream.take(":")
+                if stream.peek() == "[":
+                    stream.pos += 1
+                    items: list[Any] = []
+                    if stream.peek() == "]":
+                        stream.pos += 1
+                    else:
+                        while True:
+                            item = stream.value()
+                            if not records and isinstance(item, dict):
+                                item.pop(_RECORD_LEVEL.get(key, ""), None)
+                            items.append(item)
+                            if stream.take(",]") == "]":
+                                break
+                    value: Any = items
+                else:
+                    value = stream.value()
+                if value.__class__ is str and len(value) <= _INTERN_MAX_LEN:
+                    value = memo.setdefault(value, value)
+                bundle[memo.setdefault(key, key)] = value
+                if stream.take(",}") == "}":
+                    break
+        if stream.peek():
+            raise json.JSONDecodeError("Extra data", stream.buf, stream.pos)
+        return bundle
+
+
+def load_config(
+    state_dir: Path, *, records: bool = True
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The cached bundle. ``records=False``: without its record-level data
+    (see ``parse_bundle_file``), for a reader that needs only the zone list."""
     cfg_path = state_dir / "config" / "current.json"
     etag_path = state_dir / "config" / "current.etag"
     if not cfg_path.exists():
         return None, None
     try:
-        cfg = parse_bundle_file(cfg_path)
+        cfg = parse_bundle_file(cfg_path, records=records)
     except ValueError:
         # JSONDecodeError, and UnicodeDecodeError: the encoding is sniffed
         # from the first bytes (#2029), so a torn, NUL-filled file reads as
@@ -253,3 +412,47 @@ def load_previous_config(state_dir: Path) -> tuple[dict[str, Any] | None, str | 
     etag_path = cfg_dir / "previous.etag"
     etag = etag_path.read_text().strip() if etag_path.exists() else None
     return cfg, etag
+
+
+def hold_bundle(state_dir: Path, etag: str) -> Path | None:
+    """Keep the cached bundle on disk for a startup hold (#2019, #2223).
+
+    The hold may have to serve this bundle later, after a fetch has replaced
+    ``current.json``. Holding the parsed bundle for that meant the agent took
+    its first bundle from the control plane with a second one already in
+    memory: ~420 MB at 20,000 zones and a million records, on top of the
+    ~500 MB the new one costs while it is parsed.
+
+    A hard link, so it costs no disk: ``save_config`` replaces
+    ``current.json`` by rename, which leaves this name on the old file. A
+    copy where the filesystem refuses links. ``None`` — the caller keeps the
+    parsed bundle instead — when ``current`` is not the bundle being held or
+    neither could be written.
+    """
+    cfg_dir = state_dir / "config"
+    current = cfg_dir / "current.json"
+    held = state_dir / HELD_BUNDLE
+    try:
+        if (cfg_dir / "current.etag").read_text().strip() != etag:
+            return None
+        held.unlink(missing_ok=True)
+        try:
+            os.link(current, held)
+        except OSError:
+            shutil.copyfile(current, held)
+    except OSError:
+        log.warning("bootstrap_hold_copy_failed", path=str(held))
+        held.unlink(missing_ok=True)
+        return None
+    return held
+
+
+def load_held_bundle(path: Path) -> dict[str, Any] | None:
+    try:
+        return parse_bundle_file(path)  # type: ignore[no-any-return]
+    except (OSError, ValueError):
+        return None
+
+
+def drop_held_bundle(state_dir: Path) -> None:
+    (state_dir / HELD_BUNDLE).unlink(missing_ok=True)

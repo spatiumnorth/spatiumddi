@@ -128,7 +128,11 @@ dnsBind9:
   # shared and must render the same on every node (#1137), and a DaemonSet
   # takes one limit for all its pods. 2Gi holds the common lists; a list in
   # the hundreds of thousands of entries needs more, see the sizing table in
-  # docs/features/DNS.md (8.x). Raise it with a HelmChartConfig on this chart
+  # docs/features/DNS.md (8.x). Zone data (#2223), measured at 20,000 zones
+  # and 1,000,000 records: named 868 MB resident, the agent at most 480 MB
+  # while it takes a bundle (~110 MB between polls). That fits 2Gi only
+  # while the resolver cache (a quarter of the limit) stays small; a group
+  # that size which also recurses for clients wants 3Gi. Raise it with a HelmChartConfig on this chart
   # (docs/deployment/APPLIANCE.md). The agent also derives named's
   # ``max-cache-size`` from this limit (a quarter of it) so the resolver
   # cache cannot eat the RPZ's share.
@@ -365,6 +369,17 @@ dns:
   useMetalLBVIP: false
   vip: ""
   vipPool: spatium-control-plane
+  # #2223 — how long a DNS serving container (bind9 / powerdns / technitium)
+  # may take to start listening on :53 before it is restarted. The liveness
+  # probe (:53, 3 x 30 s) only starts once this has passed. A cold start
+  # renders and checks every zone before the daemon starts: measured with
+  # BIND 9.20, named-checkzone costs ~70 ms a zone, so 20,000 zones take
+  # ~23 minutes on a release without #2180's batched checks, and the agent
+  # first waits up to a long-poll for its bundle. 10 s x 360 = 60 minutes.
+  # Raise failureThreshold for a group much larger than that.
+  startupProbe:
+    periodSeconds: 10
+    failureThreshold: 360
 
 # Observer — placeholder for future metrics / log shipper role. No
 # service container in Phase 2; this just lets the supervisor pre-

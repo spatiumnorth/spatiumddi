@@ -66,6 +66,11 @@
 #                      itself do not (#1826).
 #                      The appliance's APPLIANCE_MODE reached only the api, so
 #                      the worker that runs alert evaluation saw it unset.
+#   dns-startup-probe — every render, plus a --require pass over the umbrella
+#                      and appliance DNS renders and a negative control: a DNS
+#                      container whose liveness probe checks :53 carries a
+#                      startup probe of at least 30 min (#2223), or a cold
+#                      start at scale is killed before the daemon listens.
 #
 # Runs anywhere helm + kubeconform + python3 (with PyYAML) are on PATH; the
 # CI job and ``make charts-lint`` both call it. Rendered manifests are left
@@ -148,6 +153,9 @@ render() { # name chart [helm --set args...]
         || failures=$((failures + 1))
     # #1725 — a BIND9 agent container must carry a memory limit.
     python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" "$file" \
+        || failures=$((failures + 1))
+    # #2223 — a DNS container's liveness probe must wait for a startup probe.
+    python3 "$ROOT/.github/scripts/chart-dns-startup-probe.py" "$file" \
         || failures=$((failures + 1))
     # #1510 — no two Services may ask MetalLB for the same address; only the
     # one created first would get it.
@@ -374,6 +382,26 @@ python3 "$ROOT/.github/scripts/chart-dns-agent-service.py" --require \
 echo "── BIND9 memory limit (umbrella, #1725)"
 python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
     "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
+echo "── DNS startup probe (umbrella, #2223)"
+python3 "$ROOT/.github/scripts/chart-dns-startup-probe.py" --require \
+    "$OUT/umbrella-dns-agent-lb.yaml" || failures=$((failures + 1))
+echo "── negative control: a DNS container with liveness and no startup probe must fail"
+if python3 "$ROOT/.github/scripts/chart-dns-startup-probe.py" \
+    <(python3 - "$OUT/umbrella-dns-agent-lb.yaml" <<'PYEOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+for d in docs:
+    if d.get("kind") == "StatefulSet":
+        for c in d["spec"]["template"]["spec"]["containers"]:
+            c.pop("startupProbe", None)
+print(yaml.safe_dump_all(docs))
+PYEOF
+) >/dev/null 2>&1; then
+    echo "   FAIL: chart-dns-startup-probe.py passed a DNS container with no startup probe" >&2
+    failures=$((failures + 1))
+else
+    echo "   ok: DNS container with no startup probe refused"
+fi
 
 # ── Appliance chart ─────────────────────────────────────────────────────────
 # Every role + every feature on at once. This is not a valid appliance (one
@@ -417,6 +445,9 @@ python3 "$ROOT/.github/scripts/chart-lb-address-single-owner.py" --require \
     --dns-vip 10.0.0.53 "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
 echo "── BIND9 memory limit (appliance, #1725)"
 python3 "$ROOT/.github/scripts/chart-dns-memory-limit.py" --require \
+    "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
+echo "── DNS startup probe (appliance, #2223)"
+python3 "$ROOT/.github/scripts/chart-dns-startup-probe.py" --require \
     "$OUT/appliance-all-on.yaml" || failures=$((failures + 1))
 # The single-node default install shape: one DNS driver + DHCP + supervisor.
 render appliance-full-stack "$APPLIANCE" \

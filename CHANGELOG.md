@@ -171,6 +171,36 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DNS server holding a million records no longer OOM-kills
+  itself, and a restarted one comes back (#2223).** ddi-pg's scale
+  lab ran 1,000,000 records in 20,000 zones on 7 nodes: 5
+  `dns-bind9` containers were OOM-killed at their 2Gi limit with
+  the agent at 1.1 GB, and none recovered, because the `:53`
+  liveness probe started 30 s after the container did and killed it
+  before named listened. Two fixes. The DNS containers in both
+  charts (bind9, PowerDNS, Technitium) gain a startup probe on the
+  same `:53` check with a 60-minute budget, which liveness and
+  readiness wait for: a cold start at that size checks every zone
+  file first (~70 ms each, measured), so it takes tens of minutes.
+  A daemon that never listens is still restarted, after the budget;
+  `dns.startupProbe` / `dnsAgents.startupProbe` raise it. And the
+  agent's memory: measured on a synthetic bundle of that shape (126
+  MB), its peak while taking a bundle fell from ~700 MB to ~480 MB,
+  from 884 MB to 461 MB during a startup hold, and what it keeps
+  between polls from ~450 MB to ~110 MB. The bundle is parsed
+  a zone at a time instead of from its whole text; the zone list
+  kept for the DNSSEC re-read, the per-zone serial map and the
+  startup report are kept as compact JSON, because as parsed objects
+  they held most of the freed bundle resident (CPython returns
+  memory an arena at a time); a startup hold (#2019) keeps the held
+  bundle as a hard link on disk rather than parsed; and the ingest
+  thread reads the zone list without the records, where it re-parsed
+  the whole cache every 180 s after a change, beside the sync
+  loop's own parse. The 2Gi default is unchanged: named holds ~870
+  MB at that size, so it fits while the resolver cache stays small;
+  a group that large which also recurses for clients wants 3Gi.
+  Sizing in `docs/features/DNS.md` §8.0.
+
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
   forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,
