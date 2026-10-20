@@ -32,6 +32,7 @@ import {
   type LogSource,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { copyToClipboard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import { DNSThreatTab } from "./logs/DNSThreatTab";
 
@@ -1909,17 +1910,14 @@ function RawLineBlock({ raw }: { raw: string }) {
         <button
           type="button"
           onClick={() => {
-            navigator.clipboard
-              .writeText(raw)
-              .then(() => {
-                setCopied(true);
-                window.setTimeout(() => setCopied(false), 1500);
-              })
-              .catch(() => {
-                // Clipboard refused (insecure context or denied
-                // permission) — the line stays selectable in the block.
-                setCopied(false);
-              });
+            // Shared helper: falls back to execCommand on plain-http
+            // origins, where navigator.clipboard is undefined. On
+            // failure the line stays selectable in the block below.
+            void copyToClipboard(raw).then((ok) => {
+              if (!ok) return;
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1500);
+            });
           }}
           className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
         >
