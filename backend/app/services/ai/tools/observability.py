@@ -35,6 +35,7 @@ surface of its own (non-negotiable #14).
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -48,6 +49,13 @@ from app.models.influxdb import InfluxDBTarget
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.services.ai.tools.base import register_tool, tool_permission_allows
+from app.services.logs.agent_logs import (
+    LogScopeError,
+    resolve_dhcp_log_servers,
+    resolve_dns_log_servers,
+    search_dhcp_activity,
+    search_dns_queries,
+)
 
 # The agent fleet-health tools span three resource families; each kind is
 # shown only to a caller who can read that family on its own REST surface.
@@ -77,6 +85,11 @@ class QueryDNSQueryLogArgs(BaseModel):
     )
     client_ip: str | None = Field(default=None, description="Filter by client IP (exact match).")
     view: str | None = Field(default=None, description="Filter by DNS view (split-horizon name).")
+    server_id: uuid.UUID | None = Field(default=None, description="Only this DNS server.")
+    group_id: uuid.UUID | None = Field(
+        default=None,
+        description="Only the servers in this DNS server group. Omit both for every server.",
+    )
     since_hours: float | None = Field(
         default=24,
         description="Only include rows newer than N hours ago. None = no lower bound.",
@@ -105,26 +118,30 @@ class QueryDNSQueryLogArgs(BaseModel):
 async def query_dns_query_log(
     db: AsyncSession, user: User, args: QueryDNSQueryLogArgs
 ) -> list[dict[str, Any]]:
-    stmt = select(DNSQueryLogEntry)
-    if args.qname_contains:
-        stmt = stmt.where(
-            func.lower(DNSQueryLogEntry.qname).like(f"%{args.qname_contains.lower()}%")
+    # One server resolution + row query for this tool, find_dns_queries and
+    # POST /logs/dns-queries (#2120), narrowed to what the caller may read.
+    try:
+        servers = await resolve_dns_log_servers(
+            db, user, server_id=args.server_id, group_id=args.group_id
         )
-    if args.qtype:
-        stmt = stmt.where(DNSQueryLogEntry.qtype == args.qtype.upper())
-    if args.client_ip:
-        stmt = stmt.where(DNSQueryLogEntry.client_ip == args.client_ip)
-    if args.view:
-        stmt = stmt.where(DNSQueryLogEntry.view == args.view)
-    cutoff = _since_default(args.since_hours)
-    if cutoff is not None:
-        stmt = stmt.where(DNSQueryLogEntry.ts >= cutoff)
-    stmt = stmt.order_by(desc(DNSQueryLogEntry.ts)).limit(args.limit)
-    rows = (await db.execute(stmt)).scalars().all()
+    except LogScopeError as exc:
+        return [{"result": exc.detail}]
+    names = {s.id: s.name for s in servers}
+    rows = await search_dns_queries(
+        db,
+        list(names),
+        since=_since_default(args.since_hours),
+        qname_contains=args.qname_contains,
+        qtype=args.qtype,
+        client_ip=args.client_ip,
+        view=args.view,
+        limit=args.limit,
+    )
     return [
         {
             "ts": r.ts.isoformat() if r.ts else None,
             "server_id": str(r.server_id) if r.server_id else None,
+            "server_name": names.get(r.server_id),
             "client_ip": str(r.client_ip) if r.client_ip else None,
             "client_port": r.client_port,
             "qname": r.qname,
@@ -152,6 +169,11 @@ class QueryDHCPActivityLogArgs(BaseModel):
         default=None, description="Filter by MAC address (exact match)."
     )
     ip_address: str | None = Field(default=None, description="Filter by IP address (exact match).")
+    server_id: uuid.UUID | None = Field(default=None, description="Only this DHCP server.")
+    group_id: uuid.UUID | None = Field(
+        default=None,
+        description="Only the servers in this DHCP server group. Omit both for every server.",
+    )
     since_hours: float | None = Field(
         default=24,
         description="Only include rows newer than N hours ago. None = no lower bound.",
@@ -177,24 +199,28 @@ class QueryDHCPActivityLogArgs(BaseModel):
 async def query_dhcp_activity_log(
     db: AsyncSession, user: User, args: QueryDHCPActivityLogArgs
 ) -> list[dict[str, Any]]:
-    stmt = select(DHCPLogEntry)
-    if args.severity:
-        stmt = stmt.where(DHCPLogEntry.severity == args.severity.upper())
-    if args.code:
-        stmt = stmt.where(DHCPLogEntry.code == args.code)
-    if args.mac_address:
-        stmt = stmt.where(DHCPLogEntry.mac_address == args.mac_address)
-    if args.ip_address:
-        stmt = stmt.where(DHCPLogEntry.ip_address == args.ip_address)
-    cutoff = _since_default(args.since_hours)
-    if cutoff is not None:
-        stmt = stmt.where(DHCPLogEntry.ts >= cutoff)
-    stmt = stmt.order_by(desc(DHCPLogEntry.ts)).limit(args.limit)
-    rows = (await db.execute(stmt)).scalars().all()
+    try:
+        servers = await resolve_dhcp_log_servers(
+            db, user, server_id=args.server_id, group_id=args.group_id
+        )
+    except LogScopeError as exc:
+        return [{"result": exc.detail}]
+    names = {s.id: s.name for s in servers}
+    rows = await search_dhcp_activity(
+        db,
+        list(names),
+        since=_since_default(args.since_hours),
+        severity=args.severity,
+        code=args.code,
+        mac_address=args.mac_address,
+        ip_address=args.ip_address,
+        limit=args.limit,
+    )
     return [
         {
             "ts": r.ts.isoformat() if r.ts else None,
             "server_id": str(r.server_id) if r.server_id else None,
+            "server_name": names.get(r.server_id),
             "severity": r.severity,
             "code": r.code,
             "mac_address": str(r.mac_address) if r.mac_address else None,
