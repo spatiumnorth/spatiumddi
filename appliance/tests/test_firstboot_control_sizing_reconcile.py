@@ -173,6 +173,31 @@ def test_old_sizing_in_the_config_is_brought_up_to_the_charts(tmp_path: Path) ->
     assert new["frontend"] == {"controlPlaneVIP": ""}
 
 
+def test_cpu_limits_in_the_config_follow_the_chart_2240(tmp_path: Path) -> None:
+    """#2240's CPU limits are reconciled like the memory: a Config that carries
+    them (a supervisor sized them under an older formula) takes the HelmChart's;
+    one that does not carry them gets none added (the HelmChart's own then apply,
+    and the supervisor's #1005 guard finds them already rendered)."""
+    chart = yaml.safe_load(CHART_VALUES)
+    chart["api"]["resources"]["limits"]["cpu"] = "2000m"
+    chart["postgresql"]["resources"]["limits"]["cpu"] = "4000m"
+    values = yaml.safe_dump(chart, sort_keys=False)
+    cfg = yaml.safe_load(CHART_VALUES)
+    cfg.pop("image")
+    cfg["api"]["resources"]["limits"]["cpu"] = "1000m"
+    cfg["postgresql"]["resources"]["limits"]["cpu"] = "1000m"
+    proc, patched, new = _run(tmp_path / "a", cfg, manifest=_manifest(values))
+    assert proc.returncode == 0, proc.stderr
+    assert patched is not None
+    assert new["api"]["resources"]["limits"] == {"memory": "3072Mi", "cpu": "2000m"}
+    assert new["postgresql"]["resources"]["limits"] == {"memory": "1536Mi", "cpu": "4000m"}
+
+    without = yaml.safe_load(CHART_VALUES)
+    without.pop("image")
+    _, patched, _ = _run(tmp_path / "b", without, manifest=_manifest(values))
+    assert patched is None
+
+
 def test_an_up_to_date_config_is_not_written(tmp_path: Path) -> None:
     cfg = yaml.safe_load(CHART_VALUES)
     cfg.pop("image")
