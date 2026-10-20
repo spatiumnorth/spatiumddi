@@ -206,10 +206,16 @@ the formatter handles the rest.
   bundle as a hard link on disk rather than parsed; and the ingest
   thread reads the zone list without the records, where it re-parsed
   the whole cache every 180 s after a change, beside the sync
-  loop's own parse. The 2Gi default is unchanged: named holds ~870
-  MB at that size, so it fits while the resolver cache stays small;
-  a group that large which also recurses for clients wants 3Gi.
-  Sizing in `docs/features/DNS.md` §8.0.
+  loop's own parse. And on the appliance the `dns-bind9` memory
+  limit is no longer a fixed 2Gi, which the lab hit at about 2M
+  records: the supervisor sizes it from node RAM, a quarter of the
+  smallest node labelled for dns-bind9, rounded to whole GiB, floor
+  2Gi, cap 8Gi, with the request an eighth of it as before (so 4 GB
+  → 2Gi / 256Mi, 16 GB → 4Gi / 512Mi, 64 GB → 8Gi / 1Gi). One
+  value for the cluster, because the role chart must render the same
+  on every node (#1137). A memory value in `dnsBind9.resources` in
+  the `spatiumddi-appliance` HelmChartConfig still wins. Sizing in
+  `docs/features/DNS.md` §8.0 and `docs/deployment/APPLIANCE.md`.
 
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group

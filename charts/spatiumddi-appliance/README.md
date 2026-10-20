@@ -61,7 +61,7 @@ bursts the data plane exists to serve, so none is set.
 | Values key | Default request |
 |---|---|
 | `dhcpKea.resources` | `500m` CPU / `128Mi` |
-| `dnsBind9.resources` / `dnsTechnitium.resources` | `250m` CPU / `256Mi` (BIND also carries a `2Gi` limit, #1725) |
+| `dnsBind9.resources` / `dnsTechnitium.resources` | `250m` CPU / `256Mi` (BIND's memory limit + request come from `dnsBind9.memory`, which the supervisor sizes from node RAM: a quarter of the smallest DNS node, 2Gi to 8Gi, request an eighth of it, #1725 / #2223; a memory value in `dnsBind9.resources` overrides it) |
 | `dnsPowerdns.resources` | `250m` CPU / `128Mi` |
 | `supervisor.resources` | `50m` CPU / `128Mi` |
 | `lookingGlass.resources` | `50m` CPU / `128Mi` |

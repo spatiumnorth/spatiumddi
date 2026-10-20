@@ -978,7 +978,9 @@ The spool file needs free disk in the state directory for one bundle.
 
 Before #1725 the pod had no memory limit, so that peak was the node's: the
 kubelet evicted the worker, Postgres and the api, then the kernel killed
-named. The pod now carries a memory request (256Mi) and a limit (2Gi), so an
+named. The pod now carries a memory request and a limit (on the appliance
+sized from node RAM since #2223: a quarter of the smallest DNS node, 2Gi to
+8Gi, request an eighth of it; 2Gi / 256Mi on the other paths), so an
 overload kills named inside its own cgroup and leaves the control plane
 alone. That is a DNS outage on that node, not a platform outage, but it is
 still an outage: **size the limit for the lists you subscribe to.**
@@ -1006,10 +1008,11 @@ Entry counts are on each list after its first sync.
 
 Where to change it:
 
-- Appliance: `dnsBind9.resources` on the role chart, as a HelmChartConfig
+- Appliance: sized for you from node RAM (#2223); to pin it, set
+  `dnsBind9.resources.limits.memory` on the role chart, as a HelmChartConfig
   (see `docs/deployment/APPLIANCE.md`, "Memory sizing for named"). The limit
-  is one value for the whole cluster; the role chart renders the same on
-  every node.
+  is one value for the whole cluster, from its smallest DNS node; the role
+  chart renders the same on every node.
 - Umbrella chart: `dnsAgents.servers[].resources`.
 - Docker Compose: `DNS_BIND9_MEM_LIMIT` in `.env` (default `2g`).
 - Raw manifests: edit `k8s/dns/bind9-statefulset.yaml`.
@@ -1093,10 +1096,12 @@ it could overlap the sync loop's own parse (about 530 MB of its own).
 Rule of thumb for zone data, from those numbers: about 1 kB of named memory
 per record, plus about 0.5 kB per record for the agent while it takes a
 bundle, plus the resolver cache below if the group recurses. A million
-records is therefore about 1.35 GB before the cache, which fits the 2Gi
-default only while the resolver cache stays well under its `512m` share; a
+records is therefore about 1.35 GB before the cache, which fits a 2Gi
+limit only while the resolver cache stays well under its `512m` share; a
 group that serves that many records and also recurses for clients wants
-3Gi. These are measurements of one bundle shape (short names, A and PTR
+3Gi. On the appliance the limit is sized from node RAM (#2223: a quarter of
+the smallest DNS node, 2Gi to 8Gi), so a node of 12 GB or more gets 3Gi
+without any override, and 2M records want about 4Gi, a 16 GB node. These are measurements of one bundle shape (short names, A and PTR
 records), so treat them as a starting point rather than a guarantee.
 
 **A cold start takes a while, and the probes allow for it.** A restarted

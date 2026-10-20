@@ -71,6 +71,10 @@
 #                      container whose liveness probe checks :53 carries a
 #                      startup probe of at least 30 min (#2223), or a cold
 #                      start at scale is killed before the daemon listens.
+#   bind9 memory     — the appliance dns-bind9 container takes its memory from
+#                      ``dnsBind9.memory`` (sized from node RAM by the
+#                      supervisor, #2223) and an explicit memory in
+#                      ``dnsBind9.resources`` wins over it.
 #
 # Runs anywhere helm + kubeconform + python3 (with PyYAML) are on PATH; the
 # CI job and ``make charts-lint`` both call it. Rendered manifests are left
@@ -457,6 +461,40 @@ render appliance-full-stack "$APPLIANCE" \
 render appliance-offcluster-skip "$APPLIANCE" \
     --set dnsBind9.enabled=true --set dnsBind9.controlPlaneUrl=https://cp.example \
     --set controlPlaneTls.insecureSkipVerify=true
+
+# #2223 — the dns-bind9 memory limit is sized from node RAM: the supervisor
+# writes ``dnsBind9.memory``, and an explicit memory in ``dnsBind9.resources``
+# (an operator's HelmChartConfig) must still win over it.
+bind9_mem() { # file want-limit want-request
+    python3 - "$@" <<'PYEOF'
+import sys, yaml
+path, want_limit, want_request = sys.argv[1:4]
+for d in yaml.safe_load_all(open(path)):
+    if d and d.get("kind") == "DaemonSet":
+        for c in d["spec"]["template"]["spec"]["containers"]:
+            if c["name"] == "dns-bind9":
+                r = c.get("resources") or {}
+                got = ((r.get("limits") or {}).get("memory"), (r.get("requests") or {}).get("memory"))
+                if got != (want_limit, want_request):
+                    sys.exit(f"   FAIL: {path}: dns-bind9 memory {got}, want {(want_limit, want_request)}")
+                if (r.get("requests") or {}).get("cpu") != "250m":
+                    sys.exit(f"   FAIL: {path}: dns-bind9 lost its CPU request")
+                print(f"   ok: dns-bind9 memory {got}")
+                sys.exit(0)
+sys.exit(f"   FAIL: {path}: no dns-bind9 container")
+PYEOF
+}
+echo "── dns-bind9 memory sizing (appliance, #2223)"
+bind9_mem "$OUT/appliance-full-stack.yaml" 2Gi 256Mi || failures=$((failures + 1))
+render appliance-bind9-sized "$APPLIANCE" \
+    --set dnsBind9.enabled=true \
+    --set dnsBind9.memory.limit=8Gi --set dnsBind9.memory.request=1024Mi
+bind9_mem "$OUT/appliance-bind9-sized.yaml" 8Gi 1024Mi || failures=$((failures + 1))
+render appliance-bind9-override "$APPLIANCE" \
+    --set dnsBind9.enabled=true \
+    --set dnsBind9.memory.limit=8Gi --set dnsBind9.memory.request=1024Mi \
+    --set dnsBind9.resources.limits.memory=6Gi
+bind9_mem "$OUT/appliance-bind9-override.yaml" 6Gi 1024Mi || failures=$((failures + 1))
 
 # #992 — the two release shapes this chart is ACTUALLY installed as, on every
 # appliance. Rendering the chart once (as everything above does) can never see
