@@ -156,6 +156,11 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
             timeoutSeconds: 3
+          # #2240 — startupProbe before liveness, same as dns-bind9.yaml
+          # (``dnsTechnitium.startupProbe``).
+          {{- with include "spatiumddi-appliance.dnsStartupProbe" .Values.dnsTechnitium.startupProbe }}
+          {{- . | nindent 10 }}
+          {{- end }}
           livenessProbe:
             tcpSocket:
               port: 53
