@@ -162,7 +162,7 @@ packages: they are vendored in `backend/app/static/api-docs/` and pinned in
 |---|---|---|
 | [Python](https://www.python.org/) 3.12 | PSF | Runtime |
 | [FastAPI](https://fastapi.tiangolo.com/) / [Starlette](https://www.starlette.io/) | MIT / BSD 3-Clause | HTTP framework |
-| [Swagger UI](https://github.com/swagger-api/swagger-ui) 5.33.1, vendored | Apache 2.0 | The interactive API docs at `/api/docs`, served by the api with no CDN |
+| [Swagger UI](https://github.com/swagger-api/swagger-ui) 5.34.0, vendored | Apache 2.0 | The interactive API docs at `/api/docs`, served by the api with no CDN |
 | [ReDoc](https://github.com/Redocly/redoc) 2.5.4, vendored | MIT | The reference API docs at `/api/redoc`, served by the api with no CDN |
 | [Uvicorn](https://www.uvicorn.org/) | BSD 3-Clause | ASGI server |
 | [SQLAlchemy](https://www.sqlalchemy.org/) / [Alembic](https://alembic.sqlalchemy.org/) | MIT | ORM + migrations |
