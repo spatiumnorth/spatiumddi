@@ -192,6 +192,19 @@ the formatter handles the rest.
   (superadmin only; others are told to ask an administrator), and says
   where per-group query logging is turned on.
 
+- **A nightly reports one version string everywhere** (#2111).
+  `GET /api/v1/version` read `nightly-YYYYMMDD` (the image tag) while
+  the agents, supervisor and appliance said
+  `0.0.0-nightly-YYYYMMDD+<sha>`. The api now reports the latter, taking
+  the sha from the build's own `APP_VERSION` stamp (new build arg on the
+  api image, already passed by nightly.yml), so the two compare equal.
+  Releases are untouched; `settings.version` stays the image tag, which
+  upgrades still use to pull images.
+
+- **Upgraded installs no longer show the stale `agent v2026.04.14.1`
+  note on DNS servers** (#2112). A data migration clears `notes` only
+  where it is exactly that literal, so operator text is never touched.
+
 - **Backup page and branding title show the API's reason and stop
   offering what is refused** (#2203, #2204, #2200, #2202, #2205).
   A refused archive preview, restore or drill schedule now shows the
@@ -6445,6 +6458,8 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `d3a7f19c52e8` — #2112, data only: `dns_server.notes` equal to exactly
+  `agent v2026.04.14.1` becomes empty. Downgrade does nothing.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column
