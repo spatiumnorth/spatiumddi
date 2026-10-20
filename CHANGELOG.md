@@ -171,6 +171,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DHCP and DNS off now also stop the API routes that live outside
+  `/dhcp` and `/dns` (#2136, #2134, #2129).** With `core.dhcp` off,
+  `POST /logs/dhcp-activity`, `POST /logs/dhcp-audit`,
+  `GET /metrics/dhcp/timeseries` and the IPAM `effective-dhcp` reads
+  (space, block, subnet) answer 404 like `/dhcp/*`; with `core.dns`
+  off, `POST /logs/dns-queries`, `POST /logs/dns-queries/analytics`
+  and `GET /metrics/dns/timeseries` do. The agent routers stay
+  ungated. `POST /new-devices/block` with DHCP off is refused (422)
+  when it would only write DHCP blocks, and otherwise skips the DHCP
+  half and does the upstream quarantine; on New Devices the action is
+  hidden when neither DHCP nor active block sync is on, and reads
+  "Quarantine upstream" when only block sync is. The DNS Threat
+  module-off notice now names Features & Integrations and links it
+  (superadmin only; others are told to ask an administrator), and says
+  where per-group query logging is turned on.
+
+
 - **Backup page and branding title show the API's reason and stop
   offering what is refused** (#2203, #2204, #2200, #2202, #2205).
   A refused archive preview, restore or drill schedule now shows the

@@ -39,6 +39,7 @@ from app.drivers.dns import get_driver as get_dns_driver
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
+from app.services.feature_modules import require_module
 
 # Drivers backed by an in-container agent (BIND9, Kea). Distinct from
 # ``AGENTLESS_DRIVERS`` (Windows over WinRM) because the log-pull
@@ -321,7 +322,11 @@ async def query_logs(body: LogQueryRequest, db: DB) -> LogQueryResponse:
     )
 
 
-@router.post("/dhcp-audit", response_model=DhcpAuditResponse)
+@router.post(
+    "/dhcp-audit",
+    response_model=DhcpAuditResponse,
+    dependencies=[Depends(require_module("core.dhcp"))],
+)
 async def query_dhcp_audit(body: DhcpAuditRequest, db: DB) -> DhcpAuditResponse:
     """Read + parse a Windows DHCP server's audit log for the given day.
 
@@ -506,7 +511,11 @@ class DNSQueryLogResponse(BaseModel):
     truncated: bool
 
 
-@router.post("/dns-queries", response_model=DNSQueryLogResponse)
+@router.post(
+    "/dns-queries",
+    response_model=DNSQueryLogResponse,
+    dependencies=[Depends(require_module("core.dns"))],
+)
 async def query_dns_queries(body: DNSQueryLogRequest, db: DB) -> DNSQueryLogResponse:
     """Read parsed BIND9 query log entries for a server.
 
@@ -621,7 +630,11 @@ class DNSQueryAnalyticsResponse(BaseModel):
     rcode_distribution: list[DNSQueryAnalyticsRow]
 
 
-@router.post("/dns-queries/analytics", response_model=DNSQueryAnalyticsResponse)
+@router.post(
+    "/dns-queries/analytics",
+    response_model=DNSQueryAnalyticsResponse,
+    dependencies=[Depends(require_module("core.dns"))],
+)
 async def query_dns_analytics(body: DNSQueryAnalyticsRequest, db: DB) -> DNSQueryAnalyticsResponse:
     """Top-N rollups over the parsed BIND9 query log.
 
@@ -732,7 +745,11 @@ class DHCPActivityLogResponse(BaseModel):
     truncated: bool
 
 
-@router.post("/dhcp-activity", response_model=DHCPActivityLogResponse)
+@router.post(
+    "/dhcp-activity",
+    response_model=DHCPActivityLogResponse,
+    dependencies=[Depends(require_module("core.dhcp"))],
+)
 async def query_dhcp_activity(body: DHCPActivityLogRequest, db: DB) -> DHCPActivityLogResponse:
     """Read parsed Kea DHCPv4 log entries for a server. Newest first."""
     server = await db.get(DHCPServer, body.server_id)
