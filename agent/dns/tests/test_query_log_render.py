@@ -137,6 +137,23 @@ def test_responselog_is_not_mistaken_for_querylog(tmp_path, monkeypatch) -> None
     assert ["rndc", "responselog", "on"] in calls
 
 
+def test_markers_only_match_a_statement(tmp_path, monkeypatch) -> None:
+    """A commented-out statement, or a zone whose name happens to be
+    ``querylog``, is not the switch: only a real statement turns it on."""
+    calls = _fake_rndc(monkeypatch)
+    conf = (
+        "options {\n"
+        "    // querylog yes;\n"
+        "    # responselog yes;\n"
+        "};\n"
+        'zone "querylog" { type primary; file "querylog yes;"; };\n'
+        'zone "responselog.example" { type primary; file "x.db"; };\n'
+    )
+    driver = _driver(tmp_path, conf)
+    driver._sync_logging_runtime(["rndc"])
+    assert calls == [["rndc", "querylog", "off"], ["rndc", "responselog", "off"]]
+
+
 def test_reconfig_asserts_response_logging_on(tmp_path, monkeypatch) -> None:
     """``rndc reconfig`` does not apply ``responselog``.
 
