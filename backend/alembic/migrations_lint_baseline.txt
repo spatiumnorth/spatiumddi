@@ -808,6 +808,12 @@ backend/alembic/versions/f4a6c8b2e571_bgp_communities.py:drop_table:83
 backend/alembic/versions/f4a8c2e71d09_user_auth_provider_id.py:drop_column:138
 backend/alembic/versions/f4a8c2e71d09_user_auth_provider_id.py:drop_constraint_fk:137
 backend/alembic/versions/f4a9c1b2d6e7_dns_zone_color.py:drop_column:33
+backend/alembic/versions/f4c2a8e61b93_dns_server_agent_instance.py:drop_column:66
+backend/alembic/versions/f4c2a8e61b93_dns_server_agent_instance.py:drop_column:67
+backend/alembic/versions/f4c2a8e61b93_dns_server_agent_instance.py:drop_column:68
+backend/alembic/versions/f4c2a8e61b93_dns_server_agent_instance.py:drop_column:69
+backend/alembic/versions/f4c2a8e61b93_dns_server_agent_instance.py:drop_column:70
+backend/alembic/versions/f4c2a8e61b93_dns_server_agent_instance.py:drop_column:71
 backend/alembic/versions/f4c81a37e0b2_opnsense_last_sync_warning.py:drop_column:36
 backend/alembic/versions/f4c8a2d61b37_dhcpv6_lease_identity.py:drop_column:57
 backend/alembic/versions/f4c8a2d61b37_dhcpv6_lease_identity.py:drop_column:58

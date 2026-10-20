@@ -57,6 +57,14 @@ log = structlog.get_logger(__name__)
 AGENT_INSTANCE_HEADER = "X-Spatium-Agent-Instance"
 AGENT_INSTANCE = uuid.uuid4().hex
 
+# #2044 — set on the 409 the control plane answers when ANOTHER live agent
+# process owns this server identity (a cloned VM or a copied state dir keeps
+# the agent_id). Only the most recent process is served; this one keeps
+# serving its cached config and asks again on a slow backoff, taking the
+# server back by itself once the other one stops polling.
+DUPLICATE_INSTANCE_HEADER = "X-Spatium-Duplicate-Agent-Instance"
+DUPLICATE_INSTANCE_BACKOFF = 30.0
+
 
 def _touch_ready_marker(state_dir: Path) -> None:
     """Stamp ``<state_dir>/.ready`` after the first successful sync (#296 A2).
@@ -849,6 +857,24 @@ class SyncLoop:
             # and resends the startup reports to the new row
             # (``_on_reregistered``), whichever thread registered.
             self._current_etag = None
+            return
+        if resp.status_code == 409 and resp.headers.get(DUPLICATE_INSTANCE_HEADER):
+            # #2044 — not a re-registration case: a new token would not change
+            # which process owns the row. Loud, because this agent now serves
+            # a configuration that no longer changes.
+            try:
+                detail = resp.json().get("detail")
+            except ValueError:
+                detail = None
+            log.error(
+                "sync_duplicate_agent_instance",
+                instance=AGENT_INSTANCE,
+                detail=detail,
+                retry_in_seconds=DUPLICATE_INSTANCE_BACKOFF,
+            )
+            self._boot_hold_fallback()
+            # An Event wait, not a sleep: a stop request ends it at once.
+            self._stop.wait(DUPLICATE_INSTANCE_BACKOFF)
             return
         if resp.status_code != 200:
             log.warning("sync_unexpected_status", status=resp.status_code)

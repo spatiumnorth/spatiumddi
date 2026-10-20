@@ -171,6 +171,32 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Two DNS agents running as one server no longer pass record
+  changes back and forth until they fail (#2044).** Since #2042 a
+  DNS agent's config poll takes back a record change still in flight
+  to a different agent process, which is right when that process is
+  gone. With two processes live on one server identity at once (a
+  cloned VM that kept its `agent_id`, two containers given one state
+  directory), each one's polls took the change back from the other,
+  and it bounced between them, one retry each time, until its eight
+  attempts were spent. The control plane now records which agent
+  process owns each server. A process it has never seen takes over at
+  once, so replacing an agent works as before. The process it
+  replaced is refused with 409 if it polls again while the owner is
+  still polling: it logs `sync_duplicate_agent_instance`, keeps
+  serving its cached config, does not re-register, and retries every
+  30 s, taking the server back by itself once the owner has been
+  silent for 5 minutes. A long-poll whose process lost ownership
+  while it waited ships nothing. Refusals that last over 2 minutes
+  show a **Duplicate agent** chip on the server, with the address the
+  refused agent polled from, and raise the new default-on
+  `dns_agent_duplicate_instance` alert ("Two DNS agents on one
+  server"); both clear 10 minutes after the extra agent stops. The
+  2-minute wait keeps an overlapping rollout, whose old pod polls
+  once more before it exits, from alarming. The `find_dns_servers`
+  copilot tool reports `duplicate_agent`. Agents too old to send an
+  instance id are never refused.
+
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
   forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,
@@ -6478,6 +6504,14 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `f4c2a8e61b93` — #2044: six nullable `dns_server` columns.
+  `agent_instance` and `agent_instance_seen_at` name the agent process
+  that owns the server and when it last polled;
+  `agent_instances_displaced` (JSONB) lists the processes it replaced;
+  `duplicate_agent_first_at`, `duplicate_agent_last_at` and
+  `duplicate_agent_ip` describe the current duplicate-agent episode. No
+  backfill: the first agent to poll becomes the owner. Downgrade drops
+  all six.
 - `d3a7f19c52e8` — #2112, data only: `dns_server.notes` equal to exactly
   `agent v2026.04.14.1` becomes empty. Downgrade does nothing.
 - `b8e41c7a2d95` — #1817, data + server default:

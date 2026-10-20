@@ -18,7 +18,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete as sa_delete
@@ -71,6 +71,7 @@ from app.services.dns import dnssec_signers
 from app.services.dns.agent_bundle_render import render_and_store
 from app.services.dns.agent_bundle_store import RENDERED_BY_API, encode_body
 from app.services.dns.agent_config import page_pending_ops
+from app.services.dns.agent_instance import claim_poll
 from app.services.dns.agent_token import (
     hash_token,
     mint_agent_token,
@@ -765,6 +766,33 @@ def _agent_instance(raw: str | None) -> str | None:
     return value
 
 
+#: #2044 — set on the 409 a refused duplicate agent receives, so it can tell
+#: this refusal from any other 409 without parsing the body.
+DUPLICATE_INSTANCE_HEADER = "X-Spatium-Duplicate-Agent-Instance"
+
+
+def _duplicate_instance_response(server: DNSServer) -> JSONResponse:
+    """409 for a poll from an agent process that does not own ``server`` (#2044).
+
+    Not 401 / 404: those make the agent drop its token and re-register
+    (#2052), which would not change which process owns the row. The agent logs
+    the refusal and keeps serving its cached config, polling again on a slow
+    backoff; it takes the server back by itself if the owner stops polling."""
+    return JSONResponse(
+        status_code=409,
+        headers={DUPLICATE_INSTANCE_HEADER: "1"},
+        content={
+            "detail": (
+                f"Another agent process is polling as DNS server '{server.name}'. "
+                "Two live agents share one server identity (a cloned VM or a "
+                "copied agent state directory keeps the same agent_id); only the "
+                "most recent one is served. Stop the other agent, or give it its "
+                "own identity by clearing its state directory."
+            )
+        },
+    )
+
+
 @router.get("/config")
 async def agent_config_longpoll(
     request: Request,
@@ -839,6 +867,14 @@ async def agent_config_longpoll(
     them. And a handler whose client has disconnected rolls its page back
     instead of committing it; that check is advisory (TCP may not have
     noticed yet), the instance id is what makes the recovery certain.
+
+    #2044 — that recovery assumes the other instance is GONE. Two processes
+    live on one server identity took each op back from each other on every
+    poll until its retries ran out. So one instance owns the server
+    (``agent_instance.claim_poll``): a new one takes over at once, the one it
+    displaced is refused with 409 if it polls again while the owner is live,
+    and a poll whose instance lost ownership while it waited stops before it
+    pages anything.
     """
     server, _payload = auth
     instance = _agent_instance(agent_instance)
@@ -848,6 +884,17 @@ async def agent_config_longpoll(
     if server.pending_approval:
         response.headers["X-Spatium-Pending-Approval"] = "1"
         return {"pending_approval": True, "etag": None}
+    # #2044 — one agent process owns the server at a time. A second live one
+    # on the same identity is refused here rather than served ops, or the two
+    # take each op back from each other until its retries are spent.
+    if instance is not None and not await claim_poll(
+        db,
+        server,
+        instance,
+        now=poll_started_at,
+        client_ip=request.client.host if request.client is not None else None,
+    ):
+        return _duplicate_instance_response(server)
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     enqueued = False
@@ -864,6 +911,12 @@ async def agent_config_longpoll(
             # any replica, or the worker's store, is seen here
             # (expire_on_commit=False, no in-loop commit).
             await refresh_agent_server(db, server)
+            if instance is not None and server.agent_instance not in (None, instance):
+                # #2044 — another agent process took the server over while this
+                # poll waited: a replacement (this poll is the departed agent's
+                # leftover, read by nobody) or a second live agent. Either way
+                # it must not page ops; the new owner's polls ship them.
+                return _duplicate_instance_response(server)
             # The newest bundle this release stored, current or not: under a
             # write storm no render is current until the writes stop, and
             # each one that lands is served as it lands (docstring).
