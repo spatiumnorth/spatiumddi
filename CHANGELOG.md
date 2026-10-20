@@ -191,7 +191,13 @@ the formatter handles the rest.
   was dropped). All now wake the affected DHCP groups. A new guard
   test fails a handler that collects a wake with no collector, and a
   mutating `/dhcp` or `/e911` route that neither wakes nor says why
-  it need not.
+  it need not. The Looking Glass long-poll had the same defect: it
+  never re-read the collector row, so disabling a collector reached
+  it only at the timeout (and a collector edit published no wake at
+  all); it now expires its session each pass too. The DNS long-poll
+  serves stored bundle rows, so it was exposed in one narrow case: a
+  newer renderer revision re-rendering a bundle in place during a
+  rolling upgrade; that read now refreshes the row it returns.
 
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group

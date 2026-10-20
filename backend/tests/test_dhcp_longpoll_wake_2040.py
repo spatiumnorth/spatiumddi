@@ -249,6 +249,77 @@ async def test_a_parked_long_poll_sees_the_edit_on_the_first_wake(
     assert read(body["bundle"]) == expected
 
 
+_MULTI_PASS = {"group-thread-pool", "peer-ha-url", "scope-lease-time"}
+
+
+class _IdleThenFire(_FakeWake):
+    """``idle`` wakes that change nothing, then the one the test fires."""
+
+    def __init__(self, idle: int) -> None:
+        super().__init__()
+        self.idle = idle
+
+    async def wait(self, timeout: float) -> WakeResult:
+        self.waits += 1
+        if self.waits <= self.idle:
+            return WakeResult.WAKE
+        if self.waits == self.idle + 1:
+            self.parked.set()
+            await asyncio.wait_for(self.fire.wait(), timeout=timeout)
+            return WakeResult.WAKE
+        await asyncio.sleep(timeout)
+        return WakeResult.TIMEOUT
+
+
+@pytest.mark.parametrize(
+    ("edit", "read", "expected"),
+    [pytest.param(e, r, x, id=name) for name, e, r, x in EDITS if name in _MULTI_PASS],
+)
+async def test_several_idle_wakes_then_the_edit(
+    db_session: AsyncSession,
+    fresh_session_per_request: None,
+    monkeypatch: pytest.MonkeyPatch,
+    edit: Callable[..., Awaitable[None]],
+    read: Callable[[dict[str, Any]], Any],
+    expected: Any,
+) -> None:
+    """Each pass expires the session. Several in a row must neither trip a lazy
+    load on an expired instance (``MissingGreenlet``, a 500 that stops the group
+    converging) nor stop the pass after them seeing the change."""
+    ids = await _estate(db_session)
+    headers = {"Authorization": f"Bearer {ids['token']}"}
+    fake = _IdleThenFire(idle=4)
+
+    @asynccontextmanager
+    async def _subscription(_channels: Any) -> AsyncIterator[_FakeWake]:
+        yield fake
+
+    monkeypatch.setattr(dhcp_agents, "wake_subscription", _subscription)
+    monkeypatch.setattr(dhcp_agents, "LONGPOLL_TIMEOUT_SECONDS", 6)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        first = await ac.get("/api/v1/dhcp/agents/config", headers=headers)
+        assert first.status_code == 200, first.text
+        etag = first.json()["etag"]
+        fake.waits = 0
+        poll = asyncio.create_task(
+            ac.get(
+                "/api/v1/dhcp/agents/config",
+                headers={**headers, "If-None-Match": f'"{etag}"'},
+            )
+        )
+        await asyncio.wait_for(fake.parked.wait(), timeout=5)
+        async with _TestSessionLocal() as other:
+            await edit(other, ids)
+            await other.commit()
+        fake.fire.set()
+        resp = await asyncio.wait_for(poll, timeout=15)
+
+    assert resp.status_code == 200, resp.text
+    assert fake.waits == 5
+    assert read(resp.json()["bundle"]) == expected
+
+
 # ── handlers publish the wake ────────────────────────────────────────────────
 
 
