@@ -5980,6 +5980,25 @@ the formatter handles the rest.
 
 ### Security
 
+- **Forwarded audit events are redacted the way the audit API
+  redacts them (#2015).** #2014 redacted an audit entry's
+  `old_value`, `new_value` and `error_detail` on read, for the API,
+  the Audit page and the copilot, but the forwarding path still sent
+  them verbatim. Every syslog, webhook and SMTP target now gets the
+  same redaction, applied in the one function every forwarded event
+  passes through, so a new target kind cannot skip it. The typed-event
+  webhooks get it too, both when an event is queued and when it is
+  sent, so events queued before the upgrade are covered. So does the
+  copilot's backup-history tool, which returned those fields raw.
+  Redaction works on a copy: the stored audit row is unchanged. The
+  audit PDF and the support bundle never carried these fields and are
+  unchanged.
+  **Behaviour change for collectors:** a forwarded value under a
+  credential-shaped key now arrives as `[redacted]`, as it already
+  does on the Audit page. That includes names a collector may have
+  indexed, such as `tsig_key_name`. Booleans and integers are kept,
+  so `smtp_password_set: true` still arrives as is.
+
 - **The Looking Glass image is rebuilt past three Go CVEs (#1729).**
   GoBGP is built from source, so its binaries carry the Go standard
   library and `golang.org/x/net` statically. The builder moves from Go

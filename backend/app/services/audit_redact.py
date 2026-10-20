@@ -79,3 +79,26 @@ def redact_audit_value(value: Any, _depth: int = 0) -> Any:
     if isinstance(value, str):
         return _redact_string(value)
     return value
+
+
+# The audit-row fields that carry writer-supplied content. Everything else on
+# a serialized audit row (action, resource_type, user display name, ...) is a
+# column the platform fills itself, and is shipped as is.
+AUDIT_CONTENT_FIELDS = ("old_value", "new_value", "error_detail")
+
+
+def redact_audit_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """A shallow copy of a serialized audit payload with its content redacted.
+
+    For every surface that ships an audit row OUT of the box — the audit
+    forwarders (syslog / webhook / SMTP), the typed-event outbox, and the
+    copilot tools — so they show what the audit API shows (#2015). It returns
+    a copy: the stored ``audit_log`` row is append-only and hash-chained, and
+    is never touched. Idempotent, so a payload redacted upstream can pass
+    through again unchanged.
+    """
+    out = dict(payload)
+    for field in AUDIT_CONTENT_FIELDS:
+        if field in out and out[field] is not None:
+            out[field] = redact_audit_value(out[field])
+    return out
