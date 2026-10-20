@@ -416,8 +416,11 @@ the formatter handles the rest.
   control plane's bundle is applied normally when it arrives, as a
   reload of the daemon the fallback started. A bundle named was seen
   dying on twice is never re-applied by this timer, not even on its
-  quarantine backoff: only a different last-known-good may serve, and
-  with none the server stays down. The server row shows the wait in
+  quarantine backoff: only a different last-known-good may serve (one
+  with no recorded etag does not count, since nothing says it is not
+  the same bundle), and with none the server stays down. A held cache
+  that fails to apply hands over to the last-known-good once, not on
+  every poll. The server row shows the wait in
   the hold's `no_previous` reason, then `ok` once the cache serves.
 
 - **A DNS record change made while an agent is replaced reaches the new

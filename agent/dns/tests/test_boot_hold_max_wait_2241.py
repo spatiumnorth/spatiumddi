@@ -321,6 +321,86 @@ def test_a_condemned_bundle_with_an_unreadable_last_known_good_stays_down(
     assert driver.applied == []
 
 
+@pytest.mark.parametrize("etag_file", [None, "", "  \n"])
+def test_a_condemned_bundle_with_a_last_known_good_of_unknown_etag_stays_down(
+    tmp_path: Path, clock, monkeypatch, etag_file: str | None
+) -> None:
+    """A ``previous.json`` with no etag (agents upgraded in the field carry
+    one) cannot be told apart from the condemned bundle, and
+    ``_boot_hold_fallback`` would not serve it either: it would fall through to
+    retrying the condemned bundle on its backoff. So it does not serve."""
+    now = [1_000_000.0]
+    monkeypatch.setattr(config_apply.time, "time", lambda: now[0])
+    _crashed_on_cached_bundle(tmp_path, "big", watched=True)
+    _die_again_offline(tmp_path, watched=True)
+    etag_path = tmp_path / "config" / "previous.etag"
+    if etag_file is None:
+        etag_path.unlink()
+    else:
+        etag_path.write_text(etag_file)
+
+    driver = _Daemon(tmp_path)
+    loop = _held(tmp_path, driver, _Reachable())
+    assert loop._guard.condemned("big")
+    now[0] += 3600
+    clock[0] += MAX_WAIT + 1
+    with capture_logs() as logs:
+        for _ in range(3):
+            loop._poll_once()
+    assert driver.applied == []
+    assert driver.starts == 0
+    assert loop.apply_status.status == STATUS_NO_PREVIOUS
+    events = [e for e in logs if e["event"] == LOG_EVENT]
+    assert [e["serving"][:7] for e in events] == ["nothing"]
+
+
+class _FailsOn(_Daemon):
+    """Fails to render one bundle, as a cache that no longer applies does."""
+
+    def __init__(self, state_dir: Path, bad: str) -> None:
+        super().__init__(state_dir)
+        self.bad = bad
+
+    def render(self, bundle: dict[str, Any]) -> None:
+        if bundle.get("etag") == self.bad:
+            raise RuntimeError("render boom")
+        super().render(bundle)
+
+
+def test_a_cache_that_fails_to_apply_serves_the_last_known_good_once(tmp_path: Path, clock) -> None:
+    """The held cache raises on apply, and ``_bootstrap_fallback`` puts the
+    last-known-good live in its place. Later polls must not apply (and reload)
+    it again on every pass."""
+    _crashed_on_cached_bundle(tmp_path, "big")
+    (tmp_path / "config" / "previous.json").write_text(
+        '{"etag": "small", "structural_etag": "s-small", "zones": []}'
+    )
+    (tmp_path / "config" / "previous.etag").write_text("small")
+    driver = _FailsOn(tmp_path, "big")
+    cp = _Reachable()
+    loop = _held(tmp_path, driver, cp)
+
+    clock[0] += MAX_WAIT + 1
+    for _ in range(4):
+        loop._poll_once()
+    assert driver.applied == ["small"]
+    assert driver.starts == 1
+    assert driver.reloads == 0
+    assert loop.apply_status.status == STATUS_REVERTED
+    assert loop.apply_status.etag == "small"
+    assert loop.apply_status.failed_etag == "big"
+
+    # The control plane's bundle ends the hold, as a reload.
+    cp.bundles.append(_bundle("fixed"))
+    loop._current_etag = None
+    loop._poll_once()
+    assert driver.applied == ["small", "fixed"]
+    assert driver.starts == 1
+    assert driver.reloads == 1
+    assert loop._boot_hold is None
+    assert loop.apply_status.status == STATUS_OK
+
+
 def test_an_unreachable_control_plane_still_serves_at_once(tmp_path: Path, clock) -> None:
     """The max wait is a backstop, not a delay added to #2019's offline path."""
     _crashed_on_cached_bundle(tmp_path)

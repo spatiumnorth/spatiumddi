@@ -497,8 +497,10 @@ that bundle. A SIGTERM or a re-bootstrap disarms it first and is not counted.
   a reload (or not at all, if its structure is the cache's). A bundle the
   daemon was *seen* dying on twice (below) is never re-applied by this
   timer, not even on its quarantine backoff: only a different
-  last-known-good may serve, and with none named stays down until the
-  control plane sends a bundle or becomes unreachable.
+  last-known-good may serve (one with no recorded etag, as agents upgraded
+  in the field can carry, does not count: nothing says it is not the same
+  bundle), and with none named stays down until the control plane sends a
+  bundle or becomes unreachable.
 - **Two watched deaths:** the bundle is also quarantined. A death is
   *watched* when named exited while the agent stayed alive to see it (the
   agent's `dns_daemon_exited`). A marker left armed by a process that simply

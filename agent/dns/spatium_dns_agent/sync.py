@@ -659,6 +659,12 @@ class SyncLoop:
         if not usable_previous:
             return
         self._boot_hold_fallback()
+        if self._boot_hold is not None and self.apply_status.status == STATUS_REVERTED:
+            # The held cache failed to apply and ``_bootstrap_fallback`` put the
+            # last-known-good live instead: the hold is now served by it, as
+            # after the fallback's own last-known-good branch. Without this the
+            # next poll would apply (and reload) the same bundle again.
+            self._boot_hold_on_previous = True
 
     def _previous_serves_hold(self, held_etag: str) -> bool:
         """Whether the last-known-good could serve in place of a condemned hold.
@@ -666,14 +672,20 @@ class SyncLoop:
         Checked before ``_boot_hold_fallback`` is asked, because when it cannot
         that method retries the condemned bundle itself once its backoff is
         due, which the max-wait path must never do. The etag is read first so
-        an unusable ``previous`` is not parsed on every poll."""
+        an unusable ``previous`` is not parsed on every poll.
+
+        A ``previous`` with no etag (a missing or empty ``previous.etag``, as
+        agents upgraded in the field can carry) does not serve: nothing says it
+        is not the condemned bundle itself, and ``_boot_hold_fallback`` would
+        not use it either (it compares the etag with ``failed_etag``, None
+        here) but fall through to retrying the condemned bundle."""
         cfg_dir = self.cfg.state_dir / "config"
         etag_path = cfg_dir / "previous.etag"
         try:
             prev_etag = etag_path.read_text().strip() if etag_path.exists() else None
         except OSError:
             return False
-        if not self._previous_usable(prev_etag, held_etag):
+        if not prev_etag or not self._previous_usable(prev_etag, held_etag):
             return False
         prev_bundle, _ = load_previous_config(self.cfg.state_dir)
         return prev_bundle is not None
