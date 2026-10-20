@@ -423,7 +423,7 @@ ci-frontend-build:
 # Charts — Lint & Template (#966): the same script CI's job runs, inside a
 # helm container so a dev box with no helm / kubeconform can run it. Renders
 # land in ./.charts-render/ (gitignored) for inspection.
-HELM_IMAGE ?= alpine/helm:4.3.0
+HELM_IMAGE ?= alpine/helm:4.3.1
 charts-lint:
 	@echo "→ Charts — Lint & Template (matches .github/workflows/ci.yml)"
 	@mkdir -p .charts-render
