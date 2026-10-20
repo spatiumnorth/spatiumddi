@@ -21,6 +21,7 @@ import structlog
 from . import features
 from .admin_pusher import push_rendered_config
 from .apply_guard import (
+    BOOT_HOLD_MAX_WAIT_SECONDS,
     SETTLE_SECONDS,
     SYNC_FIRST_AFTER_DEATHS,
     ApplyGuard,
@@ -101,6 +102,11 @@ BOOT_REPORT_MAX_ATTEMPTS = 10
 # answers at once; waiting the long-poll's minute would leave the server dark
 # for a minute longer when it is unreachable.
 BOOT_FETCH_TIMEOUT = 20.0
+
+# #2241 — the clock a startup hold is timed on (``BOOT_HOLD_MAX_WAIT_SECONDS``).
+# Its own name so a test can move it without moving every other monotonic
+# reading in the process (the apply guard's settle window among them).
+_hold_clock = time.monotonic
 
 
 def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[str, Any]:
@@ -253,6 +259,10 @@ class SyncLoop:
         # Whether the last ``_handle_apply_failure`` re-applied the previous
         # bundle (so something is live again), for the hold to read.
         self._revert_landed = False
+        # #2241 — when the hold began (``_hold_clock``), and whether the
+        # max-wait fallback has been announced. See ``_boot_hold_max_wait``.
+        self._boot_hold_since: float | None = None
+        self._boot_hold_max_wait_logged = False
 
         # Preload cached bundle (offline-operation guarantee)
         bundle, etag = load_config(self.cfg.state_dir)
@@ -267,6 +277,7 @@ class SyncLoop:
             if self._guard.condemned(etag) and (died == etag or self._quarantine.etag != etag):
                 self._quarantine.record(etag, self._death_reason(etag, deaths))
             self._begin_boot_hold(bundle, etag, deaths)
+            self._boot_hold_since = _hold_clock()
             return
 
         # #882 — a restart must not re-break the daemon with the same bundle
@@ -471,7 +482,8 @@ class SyncLoop:
                         " (it is quarantined: re-applied only on the backoff)"
                         if self._guard.condemned(etag)
                         else " (re-applied from the cache if the control plane "
-                        "cannot be reached)"
+                        "cannot be reached, or sends no bundle within "
+                        f"{int(BOOT_HOLD_MAX_WAIT_SECONDS)} s)"
                     )
                 ),
             )
@@ -594,6 +606,77 @@ class SyncLoop:
             )
             if self._bootstrap_apply(bundle, etag, booting_from_previous=False, before_sync=False):
                 self._end_boot_hold()
+
+    def _boot_hold_max_wait(self) -> None:
+        """Serve the held cache once the control plane has had long enough (#2241).
+
+        The hold asks the control plane first and serves the cache only when it
+        cannot be reached. A control plane that answers but cannot produce a
+        bundle (the renders OOM-killed or timed out at scale, a long-poll that
+        only ever ends in 304, a re-registration backing off) never reads as
+        unreachable, and kept the #2240 scale lab's servers dark for hours on a
+        valid cache. Past ``BOOT_HOLD_MAX_WAIT_SECONDS`` it counts as
+        unreachable: every poll from then on goes through the offline fallback,
+        until something is live. Nothing is started here: the apply launches
+        the deferred daemon (#1056), and a bundle that arrives later is applied
+        by the normal path as a reload.
+
+        A bundle the daemon was SEEN to die on twice is never re-applied by
+        this path, not even on the quarantine's backoff: the control plane is
+        reachable, so the operator's fix can still arrive, and a timer must not
+        start a crash loop on the bundle that caused it. Only a different
+        last-known-good may serve; with none the server stays down, and the
+        backoff retry stays where #882 / #2019 put it (an unreachable control
+        plane).
+        """
+        hold = self._boot_hold
+        if hold is None or self._boot_hold_on_previous:
+            return
+        since = self._boot_hold_since
+        if since is None:
+            return
+        waited = _hold_clock() - since
+        if waited < BOOT_HOLD_MAX_WAIT_SECONDS:
+            return
+        etag = hold[1]
+        condemned = self._guard.condemned(etag)
+        usable_previous = not condemned or self._previous_serves_hold(etag)
+        if not condemned:
+            serving = "cache"
+        elif usable_previous:
+            serving = "last_known_good"
+        else:
+            serving = "nothing: the cache is condemned and there is no other last-known-good"
+        if not self._boot_hold_max_wait_logged:
+            self._boot_hold_max_wait_logged = True
+            log.warning(
+                "bootstrap_hold_max_wait_elapsed_applying_cache",
+                etag=etag,
+                waited_s=int(waited),
+                max_wait_s=int(BOOT_HOLD_MAX_WAIT_SECONDS),
+                serving=serving,
+            )
+        if not usable_previous:
+            return
+        self._boot_hold_fallback()
+
+    def _previous_serves_hold(self, held_etag: str) -> bool:
+        """Whether the last-known-good could serve in place of a condemned hold.
+
+        Checked before ``_boot_hold_fallback`` is asked, because when it cannot
+        that method retries the condemned bundle itself once its backoff is
+        due, which the max-wait path must never do. The etag is read first so
+        an unusable ``previous`` is not parsed on every poll."""
+        cfg_dir = self.cfg.state_dir / "config"
+        etag_path = cfg_dir / "previous.etag"
+        try:
+            prev_etag = etag_path.read_text().strip() if etag_path.exists() else None
+        except OSError:
+            return False
+        if not self._previous_usable(prev_etag, held_etag):
+            return False
+        prev_bundle, _ = load_previous_config(self.cfg.state_dir)
+        return prev_bundle is not None
 
     def _bootstrap_fallback(
         self, failed_etag: str | None, exc: BaseException, *, before_sync: bool = True
@@ -788,6 +871,7 @@ class SyncLoop:
             self._on_reregistered()
         self._maybe_settle()
         self._flush_boot_report()
+        self._boot_hold_max_wait()
         headers = {
             "Authorization": f"Bearer {self.token_ref[0]}",
             AGENT_INSTANCE_HEADER: AGENT_INSTANCE,
