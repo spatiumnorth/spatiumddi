@@ -532,7 +532,13 @@ classify_join_failure() {
         # unreachable seed — k3s wraps the /cacerts fetch as a token failure
         # (pkg/cluster/bootstrap.go), so a DROP reads as a token error it never
         # got to judge. Reserve "rejected" for a bare token failure or a CA
-        # hash mismatch: a seed that answered.
+        # hash mismatch: a seed that answered. From k3s v1.36.5 (k3s-io/k3s
+        # #14706) a joiner whose token hash does not match the seed's CA never
+        # reaches the "token CA hash does not match" message: it trusts only
+        # the CA its hash names, so the /cacerts re-fetch fails "CA cert
+        # validation failed: ... x509: certificate signed by unknown authority"
+        # under "failed to validate token". No transport marker, so it lands
+        # here as rejected, which is what it is.
         *"failed to validate token"*)
             if [ "$transport" = 1 ]; then kind=unreachable; else kind=rejected; fi ;;
         *"token CA hash does not match"*) kind=rejected ;;

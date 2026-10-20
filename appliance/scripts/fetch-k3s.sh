@@ -38,7 +38,7 @@ set -euo pipefail
 # this script directly (without ``make``); CI + the Makefile always
 # override it. Keep this in sync with the Makefile pin so a direct
 # invocation never silently pulls a stale release tag.
-K3S_VERSION="${K3S_VERSION:-v1.36.4+k3s1}"
+K3S_VERSION="${K3S_VERSION:-v1.36.5+k3s1}"
 
 # Target architecture. Defaults to the build host's arch; release CI
 # overrides per matrix entry so each arch carries its own k3s + airgap

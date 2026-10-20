@@ -230,6 +230,25 @@ def test_a_bare_token_failure_is_still_a_rejection() -> None:
     assert "rejected the join token" in _classify('msg="token CA hash does not match"')
 
 
+def test_a_ca_hash_mismatch_on_k3s_1_36_5_is_still_a_rejection() -> None:
+    """#2224 — k3s v1.36.5 (k3s-io/k3s#14706) trusts only the CA the token's
+    hash names, so a mismatched seed now fails the /cacerts re-fetch with an
+    x509 error instead of logging "token CA hash does not match". The seed
+    answered; that must stay a rejection, not read as an unreachable seed.
+    Shape built from the v1.36.5 pkg/clientaccess/token.go error wrapping, not
+    captured from a live join."""
+    log = (
+        'level=fatal msg="Error: preparing server: failed to bootstrap cluster '
+        "data: failed to check if bootstrap data has been initialized: failed to "
+        "validate token: CA cert validation failed: Get "
+        '\\"https://192.168.122.89:6443/cacerts\\": tls: failed to verify '
+        'certificate: x509: certificate signed by unknown authority"'
+    )
+    reason = _classify(log)
+    assert "rejected the join token" in reason
+    assert "could not reach the seed" not in reason
+
+
 def test_a_refused_member_add_names_the_refusal_not_the_network() -> None:
     """#1285 — the seed's etcd refused the member add (a dead voter still held a
     seat). k3s retried once a second and gave up with "failed to wait for API
