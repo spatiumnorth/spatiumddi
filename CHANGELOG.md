@@ -171,6 +171,27 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DHCP and DNS off now also stop the API routes that live outside
+  `/dhcp` and `/dns` (#2136, #2134, #2129).** With `core.dhcp` off,
+  `POST /logs/dhcp-activity`, `POST /logs/dhcp-audit`,
+  `GET /metrics/dhcp/timeseries` and the IPAM `effective-dhcp` reads
+  (space, block, subnet) answer 404 like `/dhcp/*`; with `core.dns`
+  off, `POST /logs/dns-queries`, `POST /logs/dns-queries/analytics`
+  and `GET /metrics/dns/timeseries` do. The agent routers stay
+  ungated, and the shared `/logs/sources` and `/logs/agent-sources`
+  lists leave out the servers of a module that is off (`/logs/query`
+  answers 404 for them). `POST /new-devices/block` with DHCP off is
+  refused (422) when it would only write DHCP blocks, and otherwise
+  skips the DHCP half and does the upstream quarantine, refusing with
+  the reason (403 without `manage_block_sync`, 409 with no armed
+  target) rather than answering 200 having done nothing; on New
+  Devices the action is hidden when neither DHCP nor active block
+  sync is on, and reads
+  "Quarantine upstream" when only block sync is. The DNS Threat
+  module-off notice now names Features & Integrations and links it
+  (superadmin only; others are told to ask an administrator), and says
+  where per-group query logging is turned on.
+
 - **A nightly reports one version string everywhere** (#2111).
   `GET /api/v1/version` read `nightly-YYYYMMDD` (the image tag) while
   the agents, supervisor and appliance said
