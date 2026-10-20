@@ -328,7 +328,7 @@ Two additional tabs on the same Logs page, sourced from in-container agents inst
 
 **One server, a group, or all of them (#2120).** Both tabs read a merged,
 newest-first list across a set of servers. The picker offers **All servers**,
-then per server group a **<Group> (all N servers)** entry followed by that
+then per server group a **`<Group> (all N servers)`** entry followed by that
 group's servers. The three reads behind the tabs —
 `POST /logs/dns-queries`, `POST /logs/dns-queries/analytics` and
 `POST /logs/dhcp-activity` — take an optional `server_id` and an optional

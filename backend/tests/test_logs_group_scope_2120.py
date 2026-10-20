@@ -304,3 +304,135 @@ async def test_find_dns_queries_tool_takes_a_group(db_session: AsyncSession) -> 
     )
     assert {r["qname"] for r in rows} == {"one.a.test", "two.a.test"}
     assert {r["server_name"] for r in rows} == {e["a1"].name, e["a2"].name}
+
+
+async def test_dns_group_grant_does_not_reach_dhcp_or_windows_routes(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A grant scoped to a DNS group reads that group's DNS logs only: no
+    DHCP server, and the WinRM routes still need the grant unscoped."""
+    e = await _dns_estate(db_session)
+    h = await _dhcp_estate(db_session)
+    token = await _user(
+        db_session,
+        [{"action": "read", "resource_type": "server", "resource_id": str(e["ga"].id)}],
+    )
+    await db_session.commit()
+
+    r = await client.post("/api/v1/logs/dhcp-activity", json={}, headers=_h(token))
+    assert r.status_code == 200, r.text
+    assert r.json()["events"] == [] and r.json()["server_ids"] == []
+    r = await client.post(
+        "/api/v1/logs/dhcp-activity", json={"server_id": str(h["a1"].id)}, headers=_h(token)
+    )
+    assert r.status_code == 403, r.text
+    r = await client.get("/api/v1/logs/agent-sources", headers=_h(token))
+    assert all(s["server_kind"] == "dns" for s in r.json())
+
+    # WinRM surfaces keep the unscoped gate.
+    r = await client.get("/api/v1/logs/sources", headers=_h(token))
+    assert r.status_code == 403, r.text
+    r = await client.post(
+        "/api/v1/logs/query",
+        json={"server_kind": "dns", "server_id": str(e["a1"].id), "log_name": "DNS Server"},
+        headers=_h(token),
+    )
+    assert r.status_code == 403, r.text
+
+
+async def test_server_bound_api_token_is_narrowed(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An API token bound to one server reads that server even when its
+    owner may read everything, and cannot name another server's id."""
+    from app.core.security import generate_api_token
+    from app.models.auth import APIToken
+
+    e = await _dns_estate(db_session)
+    owner = User(
+        username=f"o-{_tag()}",
+        email=f"{_tag()}@example.test",
+        display_name="o",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(owner)
+    await db_session.flush()
+    raw, _prefix, token_hash = generate_api_token()
+    db_session.add(
+        APIToken(
+            name=f"t-{_tag()}",
+            token_hash=token_hash,
+            prefix=raw[:10],
+            scope="user",
+            scopes=[],
+            resource_grants=[
+                {"action": "read", "resource_type": "server", "resource_id": str(e["a1"].id)}
+            ],
+            user_id=owner.id,
+            created_by_user_id=owner.id,
+            is_active=True,
+        )
+    )
+    await db_session.commit()
+
+    r = await client.post("/api/v1/logs/dns-queries", json={}, headers=_h(raw))
+    assert r.status_code == 200, r.text
+    assert [ev["qname"] for ev in r.json()["events"]] == ["one.a.test"]
+    r = await client.post(
+        "/api/v1/logs/dns-queries", json={"server_id": str(e["b1"].id)}, headers=_h(raw)
+    )
+    assert r.status_code == 403, r.text
+
+
+async def test_scoped_time_bound_grant_admits_its_group(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A time-bound grant (#65) scoped to a group works like a role grant."""
+    from app.models.time_bound_grant import TimeBoundGrant
+
+    e = await _dns_estate(db_session)
+    u = User(
+        username=f"tb-{_tag()}",
+        email=f"{_tag()}@example.test",
+        display_name="tb",
+        hashed_password=hash_password("x"),
+    )
+    db_session.add(u)
+    await db_session.flush()
+    grp = Group(name=f"tbg-{_tag()}", description="")
+    grp.users = [u]
+    db_session.add(grp)
+    await db_session.flush()
+    db_session.add(
+        TimeBoundGrant(
+            group_id=grp.id,
+            action="read",
+            resource_type="server",
+            resource_id=str(e["ga"].id),
+            expires_at=_NOW + timedelta(hours=2),
+            reason="2120",
+            granted_by_user_id=u.id,
+        )
+    )
+    await db_session.commit()
+    token = create_access_token(str(u.id))
+
+    r = await client.post("/api/v1/logs/dns-queries", json={}, headers=_h(token))
+    assert r.status_code == 200, r.text
+    assert {ev["qname"] for ev in r.json()["events"]} == {"one.a.test", "two.a.test"}
+
+
+async def test_search_box_matches_like_metacharacters_literally(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _dns_estate(db_session)
+    token = await _user(db_session, None)
+    await db_session.commit()
+    r = await client.post("/api/v1/logs/dns-queries", json={"q": "%"}, headers=_h(token))
+    assert r.status_code == 200, r.text
+    assert r.json()["events"] == []
+    r = await client.post("/api/v1/logs/dns-queries", json={"q": "one_a"}, headers=_h(token))
+    assert r.json()["events"] == []
+    r = await client.post("/api/v1/logs/dns-queries", json={"q": "one.a"}, headers=_h(token))
+    assert [ev["qname"] for ev in r.json()["events"]] == ["one.a.test"]
