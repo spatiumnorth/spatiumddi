@@ -287,10 +287,8 @@ export function Sidebar({
   // Integrations live in their own sidebar section, rendered between
   // the main nav and the admin nav, but only when at least one
   // integration is enabled. Each integration's visibility is gated
-  // by its feature_module id (Settings → Features → Integrations);
-  // the matching ``PlatformSettings.integration_*_enabled`` columns
-  // are kept in lock-step by the toggle endpoint so reconciler tasks
-  // don't need to migrate.
+  // by its feature_module id (Settings → Features → Integrations),
+  // the same switch its reconciler gates on (#2196).
   // Sorted alphabetically by label so the order is stable regardless
   // of the order we added integrations here — adding a new one later
   // shouldn't re-shuffle the sidebar for operators already using it.

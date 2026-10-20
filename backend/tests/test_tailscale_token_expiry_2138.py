@@ -33,7 +33,6 @@ from app.models.alerts import AlertRule
 from app.models.auth import User
 from app.models.feature_module import FeatureModule
 from app.models.ipam import IPSpace
-from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
 from app.services import alerts
 from app.services.integration_credentials import credential_status
@@ -271,11 +270,16 @@ def test_auth_rejected_matches_both_401_messages() -> None:
 
 
 async def _settings(db: AsyncSession, *, tailscale: bool = True) -> None:
-    ps = await db.get(PlatformSettings, 1)
-    if ps is None:
-        ps = PlatformSettings(id=1)
-        db.add(ps)
-    ps.integration_tailscale_enabled = tailscale
+    """Turn the Tailscale integration on or off.
+
+    The feature module is the switch (#2196); the ``PlatformSettings``
+    column is only a derived copy nothing reads, so these tests drive the
+    module and leave the settings row absent.
+    """
+    from app.services import feature_modules as fm_svc  # noqa: PLC0415
+
+    await fm_svc.set_module_enabled(db, "integrations.tailscale", tailscale, user_id=None)
+    fm_svc.invalidate_cache()
     await db.flush()
 
 

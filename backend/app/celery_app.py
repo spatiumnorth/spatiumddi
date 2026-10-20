@@ -584,7 +584,7 @@ celery_app.conf.update(
         # cluster ``sync_interval_seconds`` (min 30) gates the actual
         # reconciler pass, so a cluster configured with a 5-minute
         # interval sees 10 beat ticks between passes. Gated overall by
-        # ``PlatformSettings.integration_kubernetes_enabled`` — turn
+        # the ``integrations.kubernetes`` module — turn
         # the master toggle off and no cluster is polled.
         "kubernetes-sync-sweep": {
             "task": "app.tasks.kubernetes_sync.sweep_kubernetes_clusters",
@@ -592,39 +592,39 @@ celery_app.conf.update(
         },
         # Same pattern for Docker — 30 s beat, per-host interval gates
         # the actual reconcile pass. Gated overall by
-        # ``PlatformSettings.integration_docker_enabled``.
+        # the ``integrations.docker`` module.
         "docker-sync-sweep": {
             "task": "app.tasks.docker_sync.sweep_docker_hosts",
             "schedule": schedule(run_every=30.0),
         },
         # Proxmox VE — same 30 s beat, per-endpoint interval gate.
-        # Gated overall by ``PlatformSettings.integration_proxmox_enabled``.
+        # Gated overall by the ``integrations.proxmox`` module.
         "proxmox-sync-sweep": {
             "task": "app.tasks.proxmox_sync.sweep_proxmox_nodes",
             "schedule": schedule(run_every=30.0),
         },
         # OPNsense — same 30 s beat, per-firewall interval gate.
-        # Gated overall by ``PlatformSettings.integration_opnsense_enabled``.
+        # Gated overall by the ``integrations.opnsense`` module.
         "opnsense-sync-sweep": {
             "task": "app.tasks.opnsense_sync.sweep_opnsense_routers",
             "schedule": schedule(run_every=30.0),
         },
         # Palo Alto PAN-OS / Panorama (#605) — same 30 s beat, per-firewall
         # interval gate. Gated overall by
-        # ``PlatformSettings.integration_panos_enabled``.
+        # the ``integrations.paloalto`` module.
         "panos-sync-sweep": {
             "task": "app.tasks.panos_sync.sweep_panos_firewalls",
             "schedule": schedule(run_every=30.0),
         },
         # Fortinet FortiGate (#606) — same 30 s beat, per-firewall interval
-        # gate. Gated overall by ``PlatformSettings.integration_fortinet_enabled``.
+        # gate. Gated overall by the ``integrations.fortinet`` module.
         "fortinet-sync-sweep": {
             "task": "app.tasks.fortinet_sync.sweep_fortinet_firewalls",
             "schedule": schedule(run_every=30.0),
         },
         # Cisco Meraki (#606) — same 30 s beat, per-org interval gate (Meraki's
         # slower cloud rate limit defaults to a 300 s per-org interval). Gated
-        # overall by ``PlatformSettings.integration_meraki_enabled``.
+        # overall by the ``integrations.meraki`` module.
         "meraki-sync-sweep": {
             "task": "app.tasks.meraki_sync.sweep_meraki_orgs",
             "schedule": schedule(run_every=30.0),
@@ -639,7 +639,7 @@ celery_app.conf.update(
             "schedule": schedule(run_every=60.0),
         },
         # Tailscale — same 30 s beat, per-tenant interval gate.
-        # Gated overall by ``PlatformSettings.integration_tailscale_enabled``.
+        # Gated overall by the ``integrations.tailscale`` module.
         "tailscale-sync-sweep": {
             "task": "app.tasks.tailscale_sync.sweep_tailscale_tenants",
             "schedule": schedule(run_every=30.0),
@@ -651,13 +651,13 @@ celery_app.conf.update(
             "schedule": crontab(hour=4, minute=40),
         },
         # NetBird — same 30 s beat, per-instance interval gate.
-        # Gated overall by ``PlatformSettings.integration_netbird_enabled``.
+        # Gated overall by the ``integrations.netbird`` module.
         "netbird-sync-sweep": {
             "task": "app.tasks.netbird_sync.sweep_netbird_instances",
             "schedule": schedule(run_every=30.0),
         },
         # UniFi — same 30 s beat, per-controller interval gate.
-        # Gated overall by ``PlatformSettings.integration_unifi_enabled``.
+        # Gated overall by the ``integrations.unifi`` module.
         # Cloud-mode controllers floor at 60 s inside the task.
         "unifi-sync-sweep": {
             "task": "app.tasks.unifi_sync.sweep_unifi_controllers",
@@ -665,7 +665,7 @@ celery_app.conf.update(
         },
         # Cloud (AWS/Azure/GCP) — same 30 s beat, per-endpoint interval
         # gate (300 s default, cloud APIs are rate-limited). Gated overall
-        # by ``PlatformSettings.integration_cloud_enabled``.
+        # by the ``integrations.cloud`` module.
         "cloud-sync-sweep": {
             "task": "app.tasks.cloud_sync.sweep_cloud_endpoints",
             "schedule": schedule(run_every=30.0),
