@@ -548,7 +548,17 @@ function ZoneRow({ z }: { z: DNSPerServerZoneStateEntry }) {
         {fmtRelative(z.reported_at)}
       </td>
       <td className="px-3 py-1.5">
-        <div className="flex items-center justify-center">{indicator}</div>
+        <div
+          className="flex items-center justify-center"
+          title={
+            // #2042 — the serials can match while a change is still queued.
+            z.pending_ops
+              ? `${z.pending_ops} change${z.pending_ops === 1 ? "" : "s"} not yet applied`
+              : undefined
+          }
+        >
+          {indicator}
+        </div>
       </td>
     </tr>
   );

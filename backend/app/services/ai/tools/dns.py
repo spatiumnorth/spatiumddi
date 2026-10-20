@@ -89,6 +89,7 @@ _ZONE_SCOPE_SCAN_CAP = 20_000
 
 @register_tool(
     name="list_dns_zones",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "List DNS zones (authoritative / secondary / stub / forward). "
@@ -186,6 +187,7 @@ class QueryRecordsArgs(BaseModel):
 
 @register_tool(
     name="query_dns_records",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Search DNS records across zones. Filters: zone, record type, "
@@ -366,7 +368,10 @@ class PreviewZoneMoveArgs(BaseModel):
 
 @register_tool(
     name="preview_dns_zone_move",
-    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    # Matches the REST preview (POST …/zones/{id}/move/preview), which is
+    # superadmin-only: the answer describes the TARGET group too (its views,
+    # drivers, zone names, ACL and key names), not just the caller's zone.
+    permission="superadmin",
     description=(
         "Report what moving a DNS zone to another server group would do, "
         "WITHOUT doing it. Answers 'can this zone move to that group, and "
@@ -434,6 +439,7 @@ async def preview_dns_zone_move(
         "key_names_lost": plan.key_names_lost,
         "technitium_api_refusal": plan.technitium_api_refusal,
         "tsig_algorithm_refusal": plan.tsig_algorithm_refusal,
+        "forward_transport_refusal": plan.forward_transport_refusal,
         "warnings": plan.warnings,
         "required_acknowledgements": plan.required_acknowledgements,
     }
@@ -446,6 +452,10 @@ async def preview_dns_zone_move(
 # without leaving the chat. Configurable resolver lets operators
 # point at a SpatiumDDI-managed BIND9 view they can't easily query
 # from their workstation.
+#
+# Both send live queries to the resolver (or the nameservers the caller
+# names), so they spend the same per-user ``default`` network-tool budget
+# as the Tools page's ``/tools/dig`` route.
 
 
 _DEFAULT_RESOLVE_TIMEOUT = 5.0
@@ -492,6 +502,7 @@ class ForwardDnsArgs(BaseModel):
 
 @register_tool(
     name="forward_dns",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     description=(
         "Live forward DNS lookup ('dig <name> <rdtype>'). Resolves "
@@ -574,6 +585,7 @@ class ReverseDnsArgs(BaseModel):
 
 @register_tool(
     name="reverse_dns",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     description=(
         "Live reverse-DNS lookup. Resolves the appropriate "
@@ -659,6 +671,7 @@ class ListDNSRecordsArgs(BaseModel):
 
 @register_tool(
     name="list_dns_records",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Cross-zone DNS record search. Filterable by relative name "
@@ -717,6 +730,54 @@ async def list_dns_records(
         }
         for r in rows
     ]
+
+
+# ── export_dns_zone_records (#2139) ───────────────────────────────────
+
+
+class ExportDNSZoneRecordsArgs(BaseModel):
+    zone_id: str = Field(description="The zone's UUID.")
+    limit: int = Field(default=500, ge=1, le=2000)
+
+
+@register_tool(
+    name="export_dns_zone_records",
+    permission=("read", ("dns_group", "dns_zone", "dns_record")),
+    description=(
+        "One zone's records as the rows of its CSV / XLSX export (Data → "
+        "Export CSV in the zone view): id, name, type, ttl (null = the "
+        "zone's $TTL), value, priority, weight, port, view (split-horizon "
+        "view name, null = every view), comment, and managed (why a row is "
+        "read-only: ipam / pool / tailscale / netbird / kubernetes, null for "
+        "an operator-owned record). Read-only. Use to answer 'what is in "
+        "zone X' in the shape an operator would edit, or to draft a "
+        "spreadsheet for the zone's Import CSV/XLSX — which the operator "
+        "runs themselves; there is no copilot tool that imports."
+    ),
+    args_model=ExportDNSZoneRecordsArgs,
+    category="dns",
+    module="core.dns",
+)
+async def export_dns_zone_records(
+    db: AsyncSession, user: User, args: ExportDNSZoneRecordsArgs
+) -> dict[str, Any]:
+    from app.services.dns_io.spreadsheet import zone_record_rows
+
+    try:
+        zone_uuid = uuid.UUID(args.zone_id)
+    except ValueError:
+        return {"error": f"zone_id {args.zone_id!r} is not a UUID"}
+    zone = await db.get(DNSZone, zone_uuid)
+    if zone is None or not token_allows_zone(user, zone.id):
+        return {"error": "zone not found"}
+    rows = await zone_record_rows(db, zone)
+    return {
+        "zone_id": str(zone.id),
+        "zone_name": zone.name,
+        "total": len(rows),
+        "truncated": len(rows) > args.limit,
+        "rows": rows[: args.limit],
+    }
 
 
 # ── list_dns_blocklists ───────────────────────────────────────────────
@@ -956,6 +1017,7 @@ class FindZoneDNSSECInfoArgs(BaseModel):
 
 @register_tool(
     name="find_zone_dnssec_info",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Return the DNSSEC posture of one DNS zone: ``dnssec_enabled`` "
@@ -1114,6 +1176,7 @@ class FindZoneDriftArgs(BaseModel):
 
 @register_tool(
     name="find_dns_zone_drift",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Per-server config-drift report for one DNS zone (#61): AXFRs / "
@@ -1405,6 +1468,7 @@ class FindZoneUpdateAclsArgs(BaseModel):
 
 @register_tool(
     name="find_zone_update_acls",
+    honours_token_binding=True,
     permission=("read", ("dns_group", "dns_zone", "dns_record")),
     description=(
         "Return a DNS zone's dynamic-update (RFC 2136) ACL (issue #641): "

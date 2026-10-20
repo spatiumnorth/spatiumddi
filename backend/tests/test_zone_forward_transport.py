@@ -289,7 +289,13 @@ async def test_tls_zone_spanning_two_certificate_names_is_refused(
         headers=headers,
     )
     assert r.status_code == 422, r.text
-    assert "forwarders:" in r.text
+    detail = r.json()["detail"]
+    # Per-zone wording: the zone, its forwarders and its hostname, not the
+    # group-level "one hostname applies to the whole group".
+    assert "Forward zone 'corp.example.'" in detail
+    assert "1.1.1.1" in detail and "8.8.8.8" in detail
+    assert "forward_tls_hostname 'cloudflare-dns.com'" in detail
+    assert "whole group" not in detail
 
 
 async def test_do53_zone_to_an_encrypted_only_upstream_is_refused(
@@ -410,6 +416,94 @@ async def test_move_refuses_a_doh_zone_into_a_bind9_group(
     )
     assert r.status_code == 422, r.text
     assert "not supported for a forward zone by bind9" in r.text
+
+
+async def _stored_forward_zone(
+    db: AsyncSession, group: DNSServerGroup, transport: str, forwarders: list[str]
+) -> DNSZone:
+    zone = DNSZone(
+        group_id=group.id,
+        name="corp.example.",
+        zone_type="forward",
+        forwarders=forwarders,
+        forward_transport=transport,
+        forward_tls_hostname=None if transport == "do53" else "dns.quad9.net",
+    )
+    db.add(zone)
+    await db.commit()
+    return zone
+
+
+async def test_move_preview_reports_the_refusal_the_commit_raises(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The preview shows a transport the target cannot serve; before this
+    follow-up only the commit 422'd, after the operator had filled the
+    move in."""
+    headers = await _headers(db_session)
+    source = await _group(db_session, driver="technitium")
+    target = await _group(db_session)
+    zone = await _stored_forward_zone(db_session, source, "https", ["9.9.9.9"])
+    r = await client.post(
+        f"/api/v1/dns/groups/{source.id}/zones/{zone.id}/move/preview",
+        json={"target_group_id": str(target.id)},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    refusal = r.json().get("forward_transport_refusal")
+    assert refusal, r.text
+    assert "not supported for a forward zone by bind9" in refusal
+    assert target.name in refusal
+
+
+@pytest.mark.parametrize(
+    "source_driver,target_driver,transport,forwarders,refused",
+    [
+        ("technitium", "bind9", "https", ["9.9.9.9"], True),
+        ("technitium", "bind9", "quic", ["9.9.9.9"], True),
+        ("bind9", "windows_dns", "tls", ["9.9.9.9"], True),
+        # A stored plain-DNS zone to an encrypted-only upstream (the #2121
+        # backfill can produce one): refused on arrival, in both.
+        ("technitium", "bind9", "do53", ["194.242.2.4"], True),
+        ("technitium", "bind9", "tls", ["9.9.9.9"], False),
+        ("bind9", "technitium", "do53", ["100.100.100.100"], False),
+    ],
+)
+async def test_move_preview_and_commit_agree_on_the_forward_transport(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    source_driver: str,
+    target_driver: str,
+    transport: str,
+    forwarders: list[str],
+    refused: bool,
+) -> None:
+    headers = await _headers(db_session)
+    source = await _group(db_session, driver=source_driver)
+    target = await _group(db_session, driver=target_driver)
+    zone = await _stored_forward_zone(db_session, source, transport, forwarders)
+    base = f"/api/v1/dns/groups/{source.id}/zones/{zone.id}/move"
+    preview = await client.post(
+        f"{base}/preview", json={"target_group_id": str(target.id)}, headers=headers
+    )
+    assert preview.status_code == 200, preview.text
+    refusal = preview.json().get("forward_transport_refusal")
+    assert bool(refusal) is refused, preview.text
+
+    commit = await client.post(
+        f"{base}/commit",
+        json={
+            "target_group_id": str(target.id),
+            "confirmation_zone_name": zone.name,
+            "acknowledgements": preview.json()["required_acknowledgements"],
+        },
+        headers=headers,
+    )
+    if refused:
+        assert commit.status_code == 422, commit.text
+        assert commit.json()["detail"] == refusal
+    else:
+        assert commit.status_code == 200, commit.text
 
 
 # ── Config bundle ───────────────────────────────────────────────────────────

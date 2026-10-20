@@ -393,6 +393,10 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
   `{action, resource_type, resource_id}` triple (issue #374). At
   mint time the issuer must already hold the grant ("a token cannot
   grant more than its creator"), and the bound resource must exist.
+  Over the Operator Copilot and MCP endpoint, a bound token reaches only
+  the tools that narrow their answers to the bound zones / subnets
+  (`honours_token_binding` in `app/services/ai/tools/base.py`); the rest
+  are not listed and are refused if called.
 
 A token can never exceed its owner's RBAC: the scope / grant check is
 an *additional* gate, applied on top of the owning user's permissions.

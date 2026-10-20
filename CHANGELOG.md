@@ -27,6 +27,70 @@ the formatter handles the rest.
 
 ### Added
 
+- **A zone's records export and import as CSV / XLSX, for bulk
+  editing in a spreadsheet (#2139).** The zone's Data menu gains
+  Export CSV, Export XLSX, Download template and Import CSV / XLSX,
+  beside the zone file. One row per record, with `priority` / `weight`
+  / `port`, `view` and `comment` as their own columns and the record's
+  `id` so a re-import edits the same record: a row with an `id`
+  updates that record (a rename included), a row without one matches
+  by view, name, type and value, or is added. Merge (default) never
+  deletes; replace deletes what the sheet does not list and needs the
+  zone's name typed back. Every row runs the record API's own checks
+  and a bad one is a per-row error with its row number; the commit
+  refuses the whole file while any remain. Records IPAM or an
+  integration owns are never changed or deleted; CNAME-rule clashes
+  are skipped with the reason, as in the zone-file import. Cells are
+  escaped against formula injection on export and read as text on
+  import. The commit goes out as record ops on one serial bump through
+  the zone-file import's own path, and is audited. The template's
+  example rows carry `id=EXAMPLE` and are ignored on import. REST:
+  `GET …/zones/{id}/export?format=csv|xlsx`,
+  `GET …/zones/{id}/import/template`,
+  `POST …/zones/{id}/import/spreadsheet/{preview,commit}`. New
+  read-only Copilot tool `export_dns_zone_records`, default on; no
+  import tool, by decision (#13). See `docs/features/DNS.md` §9.
+  A sheet cannot store one record twice: two identical new rows, or an
+  edit that turns a record into a copy of another, is a row error, as
+  the record API's 409 (#1230). A name ending in a dot is absolute, as
+  in a zone file (`www.example.com.` is `www`; a name outside the zone
+  is an error), where the record API alone would have stored
+  `www.example.com.example.com.`. A record whose TTL predates the #2073
+  bounds re-imports with its TTL as it is. Uploads are bounded before
+  they are parsed (an XLSX at 100 MB uncompressed, 100,000 rows read
+  at all), a CSV may be UTF-16 (Excel's "Unicode text"), and a corrupt
+  or entity-expanding sheet is a 422 rather than a 500. On an agentless
+  group, a change the provider has not taken yet is shown in the import
+  dialog instead of the dialog closing as if it were clean.
+
+- **NAT mappings can be turned off: they are now the `ipam.nat`
+  feature module (#2100).** Settings → Features has a NAT mappings
+  entry. Off, it removes the IPAM → NAT Mappings sidebar entry, the
+  Dashboard's NAT card and its count query, and the NAT tab, NAT
+  badges and mappings dialog on subnet and IP detail, and the
+  `/api/v1/ipam/nat-mappings` routes answer 404. The address list
+  reports `nat_mapping_count` as 0 without querying for it. Turning
+  it back on restores everything: the mappings are hidden, never
+  deleted, and disabling is allowed while they exist. The PAN-OS,
+  Fortinet and Meraki mirrors keep writing their NAT rows while it is
+  off, so turning it on shows a current picture.
+  The module ships **off** on a fresh install, but **an install that
+  already has NAT mappings keeps seeing them after upgrade**. No
+  `feature_module` row is seeded, which #1069 forbids. Instead a module
+  may now declare `default_on_if_rows_in`: with no operator override
+  it resolves on exactly when that table holds a row. An operator's
+  choice in Settings → Features always wins, in either direction. Two
+  consequences follow from "on when there is data". On a fresh install,
+  a firewall mirror's first NAT rule turns the surface on. And deleting
+  the last mapping turns it off again unless it was enabled explicitly.
+  The NAT Mappings page then says the feature is off and links to
+  Settings → Features, rather than leaving a page whose requests 404,
+  and the sidebar follows at once.
+  The check is a one-row probe, run only while no override exists, at
+  most once per worker per 5 s module-cache refresh, and the
+  feature-modules list the UI resolves from uses the same derivation
+  as the route gate, so the sidebar and the API cannot disagree.
+
 - **The Helm chart's migrate Job takes annotations, so it works under
   GitOps (#2114).** Under `helm template`, which is how Argo CD and
   similar tools render a chart, the Helm revision is always 1. The
@@ -127,6 +191,371 @@ the formatter handles the rest.
   the restore audit row lists them. No migration. Archives taken
   before this change carry no `run` record, so their claims settle as
   `failed`.
+
+- **Backup page and branding title show the API's reason and stop
+  offering what is refused** (#2203, #2204, #2200, #2202, #2205).
+  A refused archive preview, restore or drill schedule now shows the
+  API's `detail` instead of "Request failed with status code N", and a
+  target's Run now / Test connection / Delete, which showed nothing at
+  all when refused, now show it too. A non-superadmin (every backup,
+  drill and factory-reset route is superadmin-only) sees a permission
+  notice with the backup controls disabled, and Restore Drills /
+  Destinations say a refused read was refused rather than "No backup
+  targets configured". The page's copy names no destination kind
+  instead of four of the ten (or one); Add target's Kind list is the
+  authority. The Manual restore warning follows the chosen mode
+  (selective replaces only the ticked sections). The API now refuses an
+  Application title over 255 characters or an External URL over 500
+  with a 422 naming the field (it used to reach the database and come
+  back as the catch-all "cannot be stored as sent"), the inputs stop at
+  those lengths, and a refused settings save shows the API's reason.
+
+- **Tailscale warns before its 90-day API token expires, and alerts
+  when it has (#2138).** Tailscale caps an API access token at 90
+  days; when it lapsed, every sync got HTTP 401, the mirror stopped
+  updating and nothing said so. Each tenant now records
+  `api_key_expires_at`, read from Tailscale's keys endpoint
+  (`GET /api/v2/tailnet/{tailnet}/keys/{keyId}`, the key id taken from
+  the `tskey-api-<keyId>-…` token) when the token is tested, saved or
+  replaced, and again once a day. When Tailscale can't say, the tenant
+  form takes a "Token expires on" date instead, pre-filled with 90
+  days from today; a date read from Tailscale always replaces it, and
+  a failed read never clears a stored one. The `secret_expiring` alert
+  rule now covers these tokens (`tailscale_tenant:<id>` subjects, its
+  usual threshold and severity escalation) and fires **critical** for
+  a tenant whose last sync got HTTP 401, whatever date is recorded. A
+  red or amber chip shows the state on the Tailscale page and on both
+  dashboard integration surfaces; on the Tailscale page it opens the
+  tenant form to replace the token. `list_tailscale_targets` returns
+  the expiry and the credential state. The token is never logged or
+  returned.
+
+- **Upgrading adds an enabled `secret_expiring` alert rule, so existing
+  installs may start alerting on credentials that were expiring all
+  along (#2138).** The rule was only ever created by hand, so on a
+  default install no expiring credential alerted at all. The upgrade
+  adds "Credential expiring or rejected" (warning, 30 days, escalating
+  to critical as expiry nears). It covers Tailscale API tokens and also
+  supervisor certificates, API tokens with an expiry and the Let's
+  Encrypt Web UI certificate, so after the upgrade an install may start
+  alerting on any of those that expire within 30 days. It is not added
+  when a `secret_expiring` rule already exists. It is added once, by the
+  migration, so if you delete it, it stays deleted.
+
+- **Testing a Tailscale tenant with a new, unsaved key no longer
+  clears the stored key's sync error (#2138).** Replacing the key does
+  clear an HTTP 401 error, since it belonged to the old key.
+
+- **A zone-file import in replace mode no longer deletes records IPAM
+  or an integration owns, and works on one view (#2167).** Replace
+  deleted every record the file lacked, including an IP address's host
+  record and its aliases (IPAM kept showing records that were gone)
+  and the records a DNS pool, Tailscale, NetBird or a Kubernetes
+  cluster maintains, ACME challenge records, and the records an AD
+  domain controller or DHCP server registered in the live zone through
+  dynamic updates (#641) — which a replace removed from the server
+  too; merge also rewrote their TTLs. Those rows are now
+  left alone and listed under `skipped` with the reason, using the
+  same ownership rule as the spreadsheet import (#2139), which now
+  protects the dynamic-update records too and no longer calls an ACME
+  record IPAM's. The import
+  also honours the `view_id` it already accepted and silently ignored:
+  it matches, updates and deletes only records in that view (or, with
+  no view, only the shared records), creates new ones there, and never
+  touches another scope. A view-scoped replace keeps the shared
+  records, which serve every view; a shared import does not create a
+  shared copy of a record that exists only in views, since it would
+  appear in views that deliberately lack it. Records left out of scope
+  are counted per view in `skipped`. Twins with the same name, type
+  and value are now all matched, rather than one of them being
+  neither kept nor deleted. A `view_id` from another server group is a
+  422. The import dialog has no view picker, so in a group with views it
+  now says that it works on the shared records only, and the Replace
+  option no longer promises to make the zone match the file exactly.
+
+- **A zone's records export and import as CSV / XLSX, for bulk
+  editing in a spreadsheet (#2139).** The zone's Data menu gains
+  Export CSV, Export XLSX, Download template and Import CSV / XLSX,
+  beside the zone file. One row per record, with `priority` / `weight`
+  / `port`, `view` and `comment` as their own columns and the record's
+  `id` so a re-import edits the same record: a row with an `id`
+  updates that record (a rename included), a row without one matches
+  by view, name, type and value, or is added. Merge (default) never
+  deletes; replace deletes what the sheet does not list and needs the
+  zone's name typed back. Every row runs the record API's own checks
+  and a bad one is a per-row error with its row number; the commit
+  refuses the whole file while any remain. Records IPAM or an
+  integration owns are never changed or deleted; CNAME-rule clashes
+  are skipped with the reason, as in the zone-file import. Cells are
+  escaped against formula injection on export and read as text on
+  import. The commit goes out as record ops on one serial bump through
+  the zone-file import's own path, and is audited. The template's
+  example rows carry `id=EXAMPLE` and are ignored on import. REST:
+  `GET …/zones/{id}/export?format=csv|xlsx`,
+  `GET …/zones/{id}/import/template`,
+  `POST …/zones/{id}/import/spreadsheet/{preview,commit}`. New
+  read-only Copilot tool `export_dns_zone_records`, default on; no
+  import tool, by decision (#13). See `docs/features/DNS.md` §9.
+  A sheet cannot store one record twice: two identical new rows, or an
+  edit that turns a record into a copy of another, is a row error, as
+  the record API's 409 (#1230). A name ending in a dot is absolute, as
+  in a zone file (`www.example.com.` is `www`; a name outside the zone
+  is an error), where the record API alone would have stored
+  `www.example.com.example.com.`. A record whose TTL predates the #2073
+  bounds re-imports with its TTL as it is. Uploads are bounded before
+  they are parsed (an XLSX at 100 MB uncompressed, 100,000 rows read
+  at all), a CSV may be UTF-16 (Excel's "Unicode text"), and a corrupt
+  or entity-expanding sheet is a 422 rather than a 500. On an agentless
+  group, a change the provider has not taken yet is shown in the import
+  dialog instead of the dialog closing as if it were clean.
+
+- **Deleting a DNS or DHCP server row no longer takes its daemon down
+  with it (#2052).** The agent's woken config poll answers 404 once the
+  row is gone, and on a 401 or 404 the DNS, DHCP and looking-glass agents
+  dropped their token and stopped the sync thread. The supervisor's
+  dead-thread watch then exited the container, so named stopped answering
+  for 2-13 s (Kea about 1 s) until the restarted container re-registered,
+  which is the opposite of what non-negotiable #5 and the #1939 note say.
+  The agents now re-register from the PSK in the same thread
+  (`bootstrap.reauthenticate`, serialised so the sync loop and the
+  heartbeat register once) and keep polling; the daemon never stops and
+  serves from its cached config throughout. A control plane that is down
+  or a wrong PSK backs off (jittered, capped at 5 min) instead of
+  spinning or exiting, and a token refused again straight after it was
+  minted (two agents sharing one agent id off a cloned state dir) waits
+  5 s, doubling to 5 min, before each further re-registration — the pacing
+  the orchestrator's restart back-off used to supply. The re-registered
+  agent appears as a new server row, and gets what a restart used to send
+  it at startup: the DNS agent re-reports its zone serials (the highest it
+  has served, not the last structural render's), its DNSSEC state and its
+  rendered config, and the DHCP agent snapshots Kea's lease table to it —
+  without which the new row's leases would stay empty until each client
+  renewed. This happens whichever thread re-registered, since the
+  structural etag carries no server id and the new row's bundle
+  re-renders nothing.
+
+- **Sync DNS no longer lists an address's host A as missing when its
+  own A alias already serves the name (#2118).** Since #2117 a rename
+  onto an address's own alias skips the host record, because the alias
+  answers for the name. Drift ignored alias rows, so it still listed
+  that A as missing, and applying the sync (or auto-sync, every
+  interval) reported the refusal in its errors. Drift now treats the
+  name as satisfied when one of the address's own alias rows of the same
+  type already holds it in that zone, compared case-insensitively. A
+  different address's alias, or an AAAA alias for an A, does not count,
+  and the PTR is still expected. The same holds for an AAAA host record
+  and an AAAA alias, and in each extra zone the address publishes to.
+  Applying the sync for an address that also lacks its PTR used to stop
+  at the same refusal, so the PTR was never written; the apply now skips
+  the zone the alias serves and writes the PTR. A CNAME alias at the
+  name is still refused.
+
+- **The IP table can hide its "N free, click to allocate" rows
+  (#2137).** On a very large or integration-mirrored subnet (a
+  Tailscale `100.64.0.0/10` holding a few dozen nodes) nearly every
+  row was a green gap bar, and "click to allocate" invited a manual
+  allocation the overlay would never honour. Edit Subnet gains
+  "Free-range rows in the address table" (Default / Show / Hide,
+  stored as nullable `subnet.show_free_ranges`) and the table header
+  gains a "Hide free ranges" checkbox beside "Hide network/broadcast",
+  remembered per subnet for the session. Default when the subnet has no
+  setting: hidden for an integration-owned subnet (new read-only
+  `integration_owner` on the subnet response) and for anything larger
+  than a /16 IPv4 (shorter than /48 IPv6, where gap rows are not drawn
+  today); an explicit value always wins. Display only: Total /
+  Allocated / Utilization, the Allocate IP button and Next available
+  are unchanged. The `get_subnet_summary` copilot tool reports
+  `show_free_ranges` and `integration_owner`.
+
+- **A DNS record change made while an agent is replaced reaches the new
+  agent at once, not five minutes later (#2042).** When a DNS agent is
+  replaced (its pod rolls after a slot upgrade, a container restarts),
+  the API went on holding the old agent's config long-poll, and nothing
+  noticed its client had gone. A record created in the next few seconds
+  was paged into that poll, marked in flight and written to a
+  connection nobody read, so the new agent never got it and the record
+  was not served until the 5-minute unacknowledged-op reset sent it
+  again. The agent now names its process on every config poll, each
+  shipped op records which process it went to and when its poll
+  started, and a poll from a different process returns any op still in
+  flight to its predecessor to the queue and ships it on that poll. Only
+  a poll that started after the one that shipped the op may take it
+  back, so the departed agent's leftover poll never takes an op from
+  its replacement. A long-poll whose client has
+  disconnected also rolls its page back instead of committing it. An
+  agent that predates this change still recovers through the 5-minute
+  reset. Separately, a zone's server state no longer reads in sync
+  while a server has a change for that zone it has not acknowledged:
+  an agent starting from its cached bundle reports the serial it
+  serves, which can match the target while a record is still
+  undelivered. Both server-state views gain a `pending_ops` count, and
+  the zone sync pill names the unapplied changes.
+
+- **Kea HA peers authenticate to each other with a generated per-group
+  credential.** Every DHCP server group now holds its own CA and peer
+  certificate for the HA hook's dedicated listener (`:8000`),
+  generated by the control plane, stored Fernet-encrypted and never
+  returned by the API (`ha_peer_credential_set` /
+  `ha_peer_auth_active` on the group say whether one exists and whether
+  it is in use). The agents render it as `trust-anchor` / `cert-file` /
+  `key-file` with `require-client-certs`, so each listener refuses a
+  client without a certificate from its own group, and the peer URLs
+  switch to `https`. Kea's `basic-auth-user` was not used: in Kea 3.0 the
+  HA hook sends it but its own listener never checks it. Rollout is
+  gated: the credential is rendered only once every Kea member of a group
+  reports the new `ha_peer_tls` capability on its heartbeat, so a pair
+  mid-upgrade keeps its current HA config and both members switch
+  together when the last one upgrades; a node rolled back to an older
+  agent closes the gate again. A superadmin replaces it with
+  `POST /dhcp/server-groups/{id}/ha-peer-credential/rotate`. Existing
+  groups get one from migration `c8e1f5a92d47`.
+
+- **Support bundle: a PEM private key is redacted through its END line.**
+  The pattern matched only the `-----BEGIN … PRIVATE KEY-----` line, so a
+  key that reached a bundle section lost its header and kept its base64
+  body. The whole block is now replaced; a block with no END line still
+  loses its BEGIN line, as before.
+
+- **nginx 1.31.6 → 1.31.7-alpine (#2161)** for the frontend image and the
+  appliance landing page, which the bake array and chart values carry as
+  well, so all five copies move together.
+
+- **Allocate IP no longer drops an alias that another record already
+  holds (#2122).** Allocate IP and next-IP skipped, without a word, an
+  alias whose zone, name and type another record already held: the
+  request succeeded and the alias did not exist. Both now answer 409
+  naming the alias and what holds it (an alias or the host record of
+  another address, or an operator record), as adding a single alias
+  from Edit IP does, and nothing is written: no address row, no host
+  record, no other alias. Names compare case-insensitively. Adding an
+  alias the address already has is a no-op that returns it with 200, for
+  a CNAME as well as an A, rather than a 409, and is not audited as a
+  create.
+  The same alias given twice in one request is written once.
+
+- **Upgrade note for #2121: a forward zone's own transport needs
+  upgraded agents.** An agent from before this release ignores the
+  zone's `forward_transport` and `forward_tls_hostname` and forwards
+  every forward zone the way the group forwards: over the group's
+  transport, checked against the group's certificate name. So until
+  the DNS agents (BIND9 and Technitium) are upgraded, a zone whose
+  transport or hostname differs from the group's does not get it. In a
+  DoT group, a zone on plain DNS still goes out over TLS and fails
+  against a Do53-only upstream, as before this release; a DoT zone
+  with another provider's hostname (a group on `cloudflare-dns.com`, a
+  zone forwarding to Quad9 as `dns.quad9.net`) fails certificate
+  verification, and every name in the zone SERVFAILs. In a plain-DNS
+  group, a zone set to DoT is still forwarded in plaintext. Upgrade
+  the DNS agents before giving a zone a transport or hostname different
+  from its group's. A zone that matches its group works on old and new
+  agents alike.
+
+- **The zone move preview reports a forward transport the target group
+  cannot serve (#2121 follow-up).** Moving a forward zone to another
+  server group (#935) re-checks the zone's own `forward_transport`
+  against the target: a DoH or DoQ zone cannot land on a BIND9 group,
+  and a TLS zone cannot land on Windows DNS. Only the commit refused
+  that; the preview said nothing, so the operator learned of it after
+  filling in the move. The preview now returns the refusal as
+  `forward_transport_refusal`, shown in the move dialog with the move
+  blocked, and in the `preview_dns_zone_move` Copilot tool. The preview
+  and the commit run the same check that zone create and update run, so
+  they cannot disagree. The 422 for a forward zone whose forwarders
+  present two TLS certificate names now names the zone, its forwarders
+  and its `forward_tls_hostname`, rather than repeating the group-level
+  wording that said one hostname applies to "the whole group".
+
+- **Copilot and MCP network tools share the Tools page's per-user rate
+  limit.** The `/api/v1/tools/*` routes cap each user at 20 on-prem
+  probes and 8 off-prem lookups per minute. The copilot and MCP tools
+  that run the same probes (`network_ping`, `network_traceroute`,
+  `network_dig`, `forward_dns`, `reverse_dns`, `network_port_test`,
+  `network_tls_cert`, `lookup_mac_vendor`, `ping_host`, `tls_cert_check`)
+  and off-prem lookups (`network_whois`, `lookup_whois_ip` / `_asn` /
+  `_domain`, `find_ct_log_entries`) had no limit.
+  Each now declares its budget with `rate_limit=` on `register_tool`, and
+  `ToolRegistry.call` spends it from the same per-user Redis counter the
+  REST route uses, so a user has one budget whichever surface they use.
+  A call past the budget does not run; it returns a refusal naming the
+  limit and the wait, which MCP marks `isError`. As on the REST routes,
+  the limit is not enforced while Redis is unreachable. A call the tool's
+  permission refuses, or whose arguments fail validation, spends nothing. A
+  test walks every function each tool reaches and fails any tool that
+  sends traffic without declaring a budget or a recorded exemption.
+
+- **An address can no longer be named after one of its own aliases
+  (#2106).** Renaming an address onto its own A / AAAA alias left two
+  identical rows at the name, and deleting the alias afterwards queued
+  a delete for an RR the host record still claimed, so the host's own
+  record vanished from the served zone while IPAM still showed it. A
+  CNAME alias there put a CNAME beside the host's address record. The
+  edit, the extra-zone edit and the bulk DNS-zone change now answer
+  409, in the wording of the alias CNAME rule (#2080), naming the
+  alias; nothing is written. Creating an A / AAAA alias at the
+  address's own host name is refused the same way. Background paths
+  (DDNS, lease mirrors, integrations, importers) do not fail and write
+  no duplicate: on an A / AAAA alias they retract the old name and log
+  `ipam_dns_record_skipped_own_alias`, which leaves the zone as a
+  correct rename would (the alias already answers the new name, and the
+  PTR names it); on a CNAME alias they keep the existing CNAME skip,
+  which also retracts the PTR. A duplicate that already exists is left
+  as it is.
+
+- **A record op the split-horizon render retires is stamped like
+  any applied op (#2108).** In a DNS group with views, the bundle
+  render retires a server's queued record ops as `applied`, but
+  `retire_queued_ops` set only the state: `applied_at` stayed NULL,
+  `attempts` 0 and `updated_at` at creation, so
+  `GET /dns/servers/{id}/pending-ops` reported an applied op with no
+  time and no attempt for every record change. It now goes through
+  `_mark_applied`, the helper the dispatch path uses, so the op
+  reads `applied_at` and `updated_at` set, has any earlier error and
+  retry time cleared, and counts one more attempt (the render
+  delivered it once).
+
+- **Turning DNS off hides DNS everywhere and stops the `/dns` calls
+  that 404ed (#2135).** The DNS counterpart of #2130: `core.dns` hid
+  the DNS sidebar but left DNS pickers, panels and reads elsewhere.
+  Every one is now gated on `ready && enabled("core.dns")` through
+  the shared `useModuleOn` hook: the IPAM zone pickers (Add, Edit and
+  Bulk-edit IP, Bulk allocate), DNS aliases, the DNS column, the
+  Sync DNS entries and drift banner, the DNS and DDNS tabs of the
+  space / block / subnet dialogs, the IP detail zones and DNS
+  linkage, the DNS server group pickers on all eleven integration
+  forms, the Subnet Planner and IPAM Templates pickers, Services
+  (DNS zone resources), API tokens (zone binding), the Domain
+  detail Linked DNS Zones tab, the Cutover plan DNS half, Fleet's
+  DNS roles and group, the Logs DNS tabs and the four Settings DNS
+  sections. A stored value (a template's DNS group, an
+  integration's `dns_group_id`) is never cleared by saving a form
+  that no longer shows it. The Logs page keeps a valid default tab
+  with DNS off (DHCP Activity) and with both off (Event Log), and a
+  hard reload waits for the module set before mounting a tab that
+  reads `/dns`. Backend: the Fleet role assignment (REST and the
+  Copilot's `assign_appliance_role`) refuses a newly added DNS role
+  with a 422 while `core.dns` is off. An appliance that already
+  holds one can still be re-saved or have it removed, and the DNS
+  agent routers stay outside the module gate on purpose. Swapping to
+  another DNS engine is refused too, since it brings up a new DNS
+  service. The IPAM Templates DDNS tab now needs both DHCP and DNS,
+  as the IPAM dialogs' DDNS tab does.
+
+- **An API token bound to specific DNS zones or subnets only reaches
+  the Operator Copilot / MCP tools that narrow their answers to those
+  zones or subnets.** The tools' permission check looks at the resource
+  type, so a token bound to one zone cleared it for every DNS tool, and
+  the tools that list server groups, servers, views or query rates, or
+  count IPAM resources estate-wide, answered as though the token were
+  unbound. The tool registry now refuses an instance-bound token any
+  tool that does not declare `honours_token_binding`, for `tools/list`,
+  MCP `tools/call` and in-app chat alike, the same structural floor the
+  REST routers have. The tools that do declare it (zone and record
+  lists, per-zone DNSSEC / drift / update-ACL reads, the IPAM space /
+  block / subnet / address reads, tag lookup and global search) already
+  filter or gate on the bound instances, and a test pins the list and
+  checks each one against a second zone and subnet. The IPAM tools that
+  accept a space or block by name resolve it only within the binding, so a
+  name outside it reads as not found. Sessions and unbound tokens are
 
 - **Dashboard rollups and the DNS / DHCP traffic series read with the
   caller's own grants.** `GET /metrics/dns/timeseries` now needs `read` on a
@@ -6121,6 +6550,28 @@ the formatter handles the rest.
   (String(255)). The server default is the backfill: every existing
   zone, including a forward zone in a group that forwards over TLS,
   becomes `do53`. Downgrade drops both columns.
+- `c8e1f5a92d47` — `dhcp_server_group.ha_peer_credential_encrypted`
+  (Fernet-encrypted Kea HA peer credential), backfilled with a freshly
+  generated credential for every existing group, and
+  `dhcp_server.agent_capabilities` (JSONB, NULL until the agent's first
+  heartbeat). Nothing is rendered from the credential until every Kea
+  member of a group reports `ha_peer_tls`. Downgrade drops both columns.
+- `e3b7c19f5a42` — #2042: `dns_record_op.dispatched_to`, a nullable
+  string naming the agent process an op was last shipped to, and
+  `dns_record_op.dispatched_poll_at`, when the long-poll that shipped it
+  started. No backfill: NULL means not recorded and is never read as
+  "another agent". Downgrade drops both columns.
+- `c4a8e1f26d93` — #2137: `subnet.show_free_ranges`, a nullable
+  boolean. No backfill: NULL means "use the default rule". Downgrade
+  drops the column.
+- `c8e2a5f71d39` — #2138: `tailscale_tenant.api_key_expires_at`
+  (nullable timestamp) and `api_key_expiry_source` (nullable string,
+  `api` or `operator`, checked by a constraint). No backfill: NULL
+  means unknown until the next test, save or daily refresh reads it.
+  Also inserts the "Credential expiring or rejected" `secret_expiring`
+  alert rule, enabled, unless a rule of that type or name already
+  exists. Downgrade drops the constraint and both columns and leaves
+  the rule in place.
 
 ## 2026.10.02-1 — 2026-10-02
 

@@ -56,6 +56,7 @@ import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
 import { DelegationModal } from "./DelegationModal";
 import { DynamicUpdateAclModal } from "./DynamicUpdateAclModal";
 import { ZoneTemplateModal } from "./ZoneTemplateModal";
+import { ZoneSpreadsheetImportModal } from "./ZoneSpreadsheetImportModal";
 import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { PoolsView } from "./PoolsView";
@@ -793,6 +794,13 @@ function ImportZoneModal({
   );
   const [preview, setPreview] = useState<DNSImportPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // #2167 — the import works on the shared records only (no view picker), so
+  // a group with split-horizon views says so before anything is replaced.
+  const { data: views } = useQuery({
+    queryKey: ["dns-views", groupId],
+    queryFn: () => dnsApi.listViews(groupId),
+  });
+  const hasViews = (views?.length ?? 0) > 0;
 
   const previewMut = useMutation({
     mutationFn: () =>
@@ -906,13 +914,20 @@ function ImportZoneModal({
               Merge — add new, update changed, keep existing
             </option>
             <option value="replace">
-              Replace — make the zone match the file exactly
+              Replace — also delete records the file omits
             </option>
             <option value="append">
               Append — only add records that do not exist
             </option>
           </select>
         </Field>
+
+        <p className="text-xs text-muted-foreground">
+          Records owned by IPAM, a DNS pool, an integration, an ACME challenge
+          or a dynamic-update client are never changed or deleted.
+          {hasViews &&
+            " This group has split-horizon views: the import works on the shared records (those with no view) only, and leaves every view's records alone."}
+        </p>
 
         {error && (
           <div className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
@@ -943,7 +958,7 @@ function ImportZoneModal({
             {preview.skipped.length > 0 && (
               <details className="rounded border" open>
                 <summary className="cursor-pointer px-2 py-1 text-xs font-medium text-amber-600">
-                  Will not be imported ({preview.skipped.length})
+                  Left alone ({preview.skipped.length})
                 </summary>
                 <ul className="max-h-40 overflow-auto px-2 py-1 text-xs">
                   {preview.skipped.map((s, i) => (
@@ -3433,15 +3448,20 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   const total = state.servers.length;
   if (total === 0) return null;
   const reported = state.servers.filter((s) => s.current_serial !== null);
+  // #2042 — a server with an unacknowledged op for the zone is not in sync,
+  // even when the serial it reported matches.
   const inSync = state.servers.filter(
-    (s) => s.current_serial === state.target_serial,
+    (s) => s.current_serial === state.target_serial && !s.pending_ops,
   );
   const tooltip = state.servers
     .map((s) =>
       s.current_serial === null
         ? `${s.server_name}: not reported`
         : `${s.server_name}: serial ${s.current_serial}` +
-          (s.current_serial !== state.target_serial ? " (drift)" : ""),
+          (s.current_serial !== state.target_serial ? " (drift)" : "") +
+          (s.pending_ops
+            ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
+            : ""),
     )
     .join("\n");
 
@@ -3544,7 +3564,8 @@ function MoveZoneModal({
       preview.acl_names_lost.length > 0 ||
       preview.key_names_lost.length > 0 ||
       !!preview.technitium_api_refusal ||
-      !!preview.tsig_algorithm_refusal);
+      !!preview.tsig_algorithm_refusal ||
+      !!preview.forward_transport_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -3608,6 +3629,11 @@ function MoveZoneModal({
             {preview.tsig_algorithm_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.tsig_algorithm_refusal}
+              </div>
+            )}
+            {preview.forward_transport_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.forward_transport_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
@@ -3772,6 +3798,7 @@ function ZoneDetailView({
   const [showMoveZone, setShowMoveZone] = useState(false);
   const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
+  const [showSheetImport, setShowSheetImport] = useState(false);
   const [showRecFilters, setShowRecFilters] = useState(false);
   const [recFilter, setRecFilter] = useState({ name: "", type: "", value: "" });
   // Server-side pagination + search (#455): a large zone (20k+ records) no
@@ -3794,6 +3821,32 @@ function ZoneDetailView({
       filename ??
       `${zone.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.zone`;
     downloadBlob(data, name, "text/dns");
+  };
+
+  // #2139 — the records as a spreadsheet, and a blank template.
+  const handleSheetExport = async (format: "csv" | "xlsx") => {
+    const { data, filename } = await dnsApi.exportZoneRecords(
+      group.id,
+      zone.id,
+      format,
+    );
+    downloadBlob(
+      data,
+      filename ??
+        `dns-zone-${zone.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.${format}`,
+    );
+  };
+  const handleSheetTemplate = async () => {
+    const { data, filename } = await dnsApi.zoneImportTemplate(
+      group.id,
+      zone.id,
+      "csv",
+    );
+    downloadBlob(
+      data,
+      filename ??
+        `dns-zone-template-${zone.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.csv`,
+    );
   };
 
   // Per-server zone-serial drift pill — agents POST their loaded serial
@@ -4233,7 +4286,7 @@ function ZoneDetailView({
                     },
                     {
                       key: "import",
-                      label: "Import",
+                      label: "Import zone file",
                       icon: Upload,
                       onSelect: () => setShowImport(true),
                       ...permissionGate(
@@ -4243,9 +4296,41 @@ function ZoneDetailView({
                     },
                     {
                       key: "export",
-                      label: "Export",
+                      label: "Export zone file",
                       icon: Download,
                       onSelect: handleExport,
+                    },
+                    {
+                      key: "import-sheet",
+                      label: "Import CSV / XLSX",
+                      icon: Upload,
+                      onSelect: () => setShowSheetImport(true),
+                      title:
+                        "Bulk-edit records from a spreadsheet: preview the adds, changes and deletes, then import",
+                      ...permissionGate(
+                        can("write", "dns_record"),
+                        NEEDS_RECORD_WRITE,
+                      ),
+                    },
+                    {
+                      key: "export-csv",
+                      label: "Export CSV",
+                      icon: Download,
+                      onSelect: () => handleSheetExport("csv"),
+                    },
+                    {
+                      key: "export-xlsx",
+                      label: "Export XLSX",
+                      icon: Download,
+                      onSelect: () => handleSheetExport("xlsx"),
+                    },
+                    {
+                      key: "sheet-template",
+                      label: "Download template",
+                      icon: FileText,
+                      onSelect: handleSheetTemplate,
+                      title:
+                        "A blank CSV with the columns and one example per common record type (example rows are ignored on import)",
                     },
                   ]
             }
@@ -5147,6 +5232,13 @@ function ZoneDetailView({
           groupId={group.id}
           zone={zone}
           onClose={() => setShowImport(false)}
+        />
+      )}
+      {showSheetImport && (
+        <ZoneSpreadsheetImportModal
+          groupId={group.id}
+          zone={zone}
+          onClose={() => setShowSheetImport(false)}
         />
       )}
       {confirmDelete && (

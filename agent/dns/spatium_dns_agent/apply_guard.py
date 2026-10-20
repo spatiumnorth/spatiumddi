@@ -17,7 +17,9 @@ stayed up for :data:`SETTLE_SECONDS` after it. A process that dies while the
 marker is armed, however it died (named OOM-killed and the agent exiting with
 it, the whole container killed, a node lost), leaves it behind, and the next
 start counts that as one death of that bundle. Exits the agent chooses (a
-SIGTERM, a re-bootstrap) disarm it first and are not counted.
+SIGTERM, a critical thread ending) disarm it first and are not counted. A
+re-registration after a 401 or 404 is not an exit at all (#2052): the daemon
+keeps running, and a bundle still settling goes on settling.
 
 What a count means is decided in ``sync.SyncLoop``:
 

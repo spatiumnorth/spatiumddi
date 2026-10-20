@@ -201,6 +201,34 @@ async def test_rejects_overlong_banner_text(db_session: AsyncSession, client: As
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "limit"),
+    [("app_title", 255), ("app_base_url", 500)],
+)
+async def test_rejects_overlong_title_and_base_url_naming_the_field(
+    db_session: AsyncSession, client: AsyncClient, field: str, limit: int
+) -> None:
+    # #2205 — the column limit is enforced at the API with a reason that
+    # names the field, not the catch-all "cannot be stored as sent".
+    _, token = await _make_superadmin(db_session)
+    await db_session.commit()
+    resp = await client.put(
+        "/api/v1/settings",
+        headers={"Authorization": f"Bearer {token}"},
+        json={field: "a" * (limit + 1)},
+    )
+    assert resp.status_code == 422, resp.text
+    assert f"{field} must be {limit} characters or fewer" in resp.text
+    ok = await client.put(
+        "/api/v1/settings",
+        headers={"Authorization": f"Bearer {token}"},
+        json={field: "a" * limit},
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()[field] == "a" * limit
+
+
+@pytest.mark.asyncio
 async def test_logo_upload_serve_and_delete(db_session: AsyncSession, client: AsyncClient) -> None:
     _, token = await _make_superadmin(db_session)
     await db_session.commit()

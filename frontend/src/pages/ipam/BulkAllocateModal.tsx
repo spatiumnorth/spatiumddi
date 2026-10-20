@@ -14,6 +14,7 @@
  * operator types so they see the rendered hostnames before posting.
  */
 
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useEffect, useMemo, useState } from "react";
 import {
   useMutation,
@@ -200,7 +201,11 @@ export function BulkAllocateModal({
   const [statusValue, setStatusValue] = useState("allocated");
   const [description, setDescription] = useState("");
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
-  const [createDnsRecords, setCreateDnsRecords] = useState(true);
+  const [createDnsRecordsChoice, setCreateDnsRecords] = useState(true);
+  // #2135 — with core.dns off there is no zone to read and no record to
+  // create: the choice is hidden and the request asks for none.
+  const dnsOn = useModuleOn("core.dns");
+  const createDnsRecords = dnsOn && createDnsRecordsChoice;
   const [onCollision, setOnCollision] = useState<"skip" | "abort">("skip");
 
   const [serverError, setServerError] = useState<string | null>(null);
@@ -223,6 +228,7 @@ export function BulkAllocateModal({
       queryKey: ["dns-zones", gId],
       queryFn: () => dnsApi.listZones(gId),
       staleTime: 60_000,
+      enabled: dnsOn,
     })),
   });
   const allGroupZones: DNSZone[] = zoneQueries
@@ -539,40 +545,42 @@ export function BulkAllocateModal({
             />
           </div>
 
-          <div className="rounded-md border bg-muted/30 p-3">
-            <label className="flex cursor-pointer items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={createDnsRecords}
-                onChange={(e) => setCreateDnsRecords(e.target.checked)}
-              />
-              <span>Create DNS records (forward A/AAAA + reverse PTR)</span>
-            </label>
-            {createDnsRecords && availableZones.length > 0 && (
-              <div className="mt-2">
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  Forward zone
-                </label>
-                <select
-                  className={inputCls}
-                  value={dnsZoneId}
-                  onChange={(e) => setDnsZoneId(e.target.value)}
-                >
-                  {availableZones.map((z) => (
-                    <option key={z.id} value={z.id}>
-                      {z.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-            {createDnsRecords && availableZones.length === 0 && (
-              <p className="mt-1 text-xs text-muted-foreground">
-                No DNS zones are pinned to this subnet — A records will fall
-                through to the effective default zone if one exists.
-              </p>
-            )}
-          </div>
+          {dnsOn && (
+            <div className="rounded-md border bg-muted/30 p-3">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={createDnsRecords}
+                  onChange={(e) => setCreateDnsRecords(e.target.checked)}
+                />
+                <span>Create DNS records (forward A/AAAA + reverse PTR)</span>
+              </label>
+              {createDnsRecords && availableZones.length > 0 && (
+                <div className="mt-2">
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    Forward zone
+                  </label>
+                  <select
+                    className={inputCls}
+                    value={dnsZoneId}
+                    onChange={(e) => setDnsZoneId(e.target.value)}
+                  >
+                    {availableZones.map((z) => (
+                      <option key={z.id} value={z.id}>
+                        {z.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {createDnsRecords && availableZones.length === 0 && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  No DNS zones are pinned to this subnet — A records will fall
+                  through to the effective default zone if one exists.
+                </p>
+              )}
+            </div>
+          )}
 
           {livePreview && (
             <div className="rounded-md border bg-muted/20 p-3">

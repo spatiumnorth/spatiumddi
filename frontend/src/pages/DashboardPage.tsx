@@ -103,6 +103,7 @@ import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 import { HA_V4_ONLY_NOTE } from "@/lib/dhcpHa";
 import { activityTone } from "@/lib/activity-tone";
@@ -112,6 +113,7 @@ import {
   partialApplyDetail,
 } from "@/lib/configApply";
 import { WidgetErrorBoundary } from "@/components/WidgetErrorBoundary";
+import { CredentialChip } from "@/components/CredentialChip";
 
 /**
  * Dashboard — the home page.
@@ -1443,10 +1445,14 @@ export function DashboardPage() {
   });
 
   // NAT mapping count — cheap (single page=1, per_page=1 just for total).
+  // Behind the ``ipam.nat`` module (#2100): the route 404s while it is off,
+  // and the card below goes with it.
+  const natOn = useModuleOn("ipam.nat");
   const { data: natTotal } = useQuery({
     queryKey: ["nat-mappings", "count"],
     queryFn: () => natApi.list({ page: 1, per_page: 1 }).then((r) => r.total),
     staleTime: 60_000,
+    enabled: natOn,
   });
 
   // Platform settings drive the utilization filter (excludes /30, /31,
@@ -2178,7 +2184,7 @@ export function DashboardPage() {
         )}
 
         {/* ── DNS query rate (DNS tab only) ──────────────────────────── */}
-        {tab === "dns" && (
+        {tab === "dns" && dnsOn && (
           <WidgetErrorBoundary title="DNS query rate">
             <DNSQueryRateCard dnsServers={allDnsServers} />
           </WidgetErrorBoundary>
@@ -2267,13 +2273,15 @@ export function DashboardPage() {
               </div>
             </div>
 
-            <KpiCard
-              label="NAT mappings"
-              value={natTotal ?? "—"}
-              sub={natTotal === 0 ? "none configured" : "operator-curated"}
-              icon={Plug}
-              to="/ipam/nat"
-            />
+            {natOn && (
+              <KpiCard
+                label="NAT mappings"
+                value={natTotal ?? "—"}
+                sub={natTotal === 0 ? "none configured" : "operator-curated"}
+                icon={Plug}
+                to="/ipam/nat"
+              />
+            )}
 
             <KpiCard
               label="Capacity headroom"
@@ -2466,7 +2474,7 @@ export function DashboardPage() {
         )}
 
         {/* ── DNS tab: Server list ──────────────────────────────────── */}
-        {tab === "dns" && allDnsServers.length > 0 && (
+        {tab === "dns" && dnsOn && allDnsServers.length > 0 && (
           <div className="rounded-lg border bg-card">
             <div className="flex items-center justify-between border-b px-4 py-2.5">
               <div className="flex items-center gap-2">
@@ -2507,7 +2515,7 @@ export function DashboardPage() {
             </div>
           </div>
         )}
-        {tab === "dns" && allDnsServers.length === 0 && (
+        {tab === "dns" && dnsOn && allDnsServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
             <Globe2 className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
             <p className="text-sm font-medium">No DNS servers registered</p>
@@ -3791,6 +3799,15 @@ function IntegrationsPanel({
                       lastSyncError={t.last_sync_error}
                       intervalSeconds={t.sync_interval_seconds}
                       enabled={t.enabled}
+                      badge={
+                        t.enabled ? (
+                          <CredentialChip
+                            state={t.credential_state}
+                            daysLeft={t.credential_days_left}
+                            expiresAt={t.api_key_expires_at}
+                          />
+                        ) : null
+                      }
                     />
                   ))}
                 </div>
@@ -3902,11 +3919,14 @@ function IntegrationRow({
   lastSyncWarning,
   intervalSeconds,
   enabled,
+  badge,
 }: {
   to: string;
   name: string;
   subtitle: string;
   meta: string;
+  // #2138 — e.g. a credential-expiry chip; rendered after the name.
+  badge?: React.ReactNode;
   lastSyncedAt: string | null;
   lastSyncError: string | null;
   // Optional — only integrations that compute non-fatal findings pass it.
@@ -3932,6 +3952,7 @@ function IntegrationRow({
       <span className="w-28 truncate font-semibold" title={name}>
         {name}
       </span>
+      {badge}
       <span
         className="w-48 truncate font-mono text-muted-foreground"
         title={subtitle}
@@ -4915,10 +4936,21 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
   // #797 — a warned target syncs on time and without error but isn't
   // producing what it was configured to produce, so it must not read as
   // green here while the IPAM-tab panel shows it amber.
+  // #2138 — a credential about to lapse is a warning even while every sync
+  // is still green; an expired / rejected one is as bad as an error.
+  const credentialDead = panel.targets.filter(
+    (t) =>
+      t.credential_state === "expired" || t.credential_state === "rejected",
+  ).length;
+  const credentialExpiring = panel.targets.filter(
+    (t) => t.credential_state === "expiring",
+  ).length;
   const tone: Tone =
-    panel.error_count > 0
+    panel.error_count > 0 || credentialDead > 0
       ? "bad"
-      : panel.stale_count > 0 || panel.warning_count > 0
+      : panel.stale_count > 0 ||
+          panel.warning_count > 0 ||
+          credentialExpiring > 0
         ? "warn"
         : "good";
   const cls = TONE_CLASS[tone];
@@ -4961,6 +4993,22 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
             </span>
           </>
         )}
+        {credentialDead > 0 && (
+          <>
+            {" · "}
+            <span className="text-red-600 dark:text-red-400">
+              {credentialDead} token expired
+            </span>
+          </>
+        )}
+        {credentialExpiring > 0 && (
+          <>
+            {" · "}
+            <span className="text-amber-600 dark:text-amber-400">
+              {credentialExpiring} token expiring
+            </span>
+          </>
+        )}
       </p>
       {panel.targets.length > 0 && (
         <ul className="mt-2 space-y-1 text-[11px]">
@@ -4969,11 +5017,18 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
               key={t.id}
               className="flex items-baseline justify-between gap-2"
             >
-              <span
-                className="truncate"
-                title={t.last_sync_warning ?? t.display}
-              >
-                {t.display}
+              <span className="flex min-w-0 items-baseline gap-1.5">
+                <span
+                  className="truncate"
+                  title={t.last_sync_warning ?? t.display}
+                >
+                  {t.display}
+                </span>
+                <CredentialChip
+                  state={t.credential_state}
+                  daysLeft={t.credential_days_left}
+                  expiresAt={t.credential_expires_at}
+                />
               </span>
               <span
                 className={cn(
