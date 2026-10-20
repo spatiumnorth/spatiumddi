@@ -644,6 +644,12 @@ celery_app.conf.update(
             "task": "app.tasks.tailscale_sync.sweep_tailscale_tenants",
             "schedule": schedule(run_every=30.0),
         },
+        # #2138 — re-read each tenant's API access token expiry once a day
+        # so ``secret_expiring`` warns before the 90-day token lapses.
+        "tailscale-token-expiry-refresh": {
+            "task": "app.tasks.tailscale_sync.refresh_tailscale_token_expiry",
+            "schedule": crontab(hour=4, minute=40),
+        },
         # NetBird — same 30 s beat, per-instance interval gate.
         # Gated overall by ``PlatformSettings.integration_netbird_enabled``.
         "netbird-sync-sweep": {

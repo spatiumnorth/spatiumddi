@@ -565,6 +565,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dhcp_scope_uncoordinated_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dhcp_scope_uncoordinated_alert_rule_seed_skipped", reason=str(exc))
+    # The ``secret_expiring`` rule (#2138) is NOT seeded here: it is inserted
+    # once by migration c8e2a5f71d39, so an operator who deletes it keeps it
+    # deleted. A startup seed would re-create it on every restart.
     # Agent daemon-not-serving alert rule — singleton, ENABLED by default
     # (issue #1067). Fires when an agent has reported a daemon that is not
     # ``ok`` for longer than a bundle normally takes to arrive. Idempotent.
