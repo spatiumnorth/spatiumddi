@@ -132,6 +132,16 @@ the formatter handles the rest.
 
 ### Changed
 
+- **Helm 4.3.0 -> 4.3.1 and Swagger UI 5.33.1 -> 5.34.0.** Both
+  are within-major bumps of build/docs tooling. Helm 4.3.1 is a
+  patch (a CRD-establishment wait under `HookOnlyStrategy`, a linter
+  update); it is the CLI CI and `make charts-lint` use, and nothing
+  ships it. The vendored `/api/docs` bundle is re-vendored
+  byte-for-byte from the 5.34.0 `swagger-ui-dist` npm tarball
+  (integrity checked); 5.34.0 adds searching operations by path and
+  OpenAPI 3.2 `additionalOperations`, with no change to the
+  initializer API.
+
 - **Dependency pins current (#1625): GoBGP 4.9.0 → 4.10.0 and the
   vendored Swagger UI bundle 5.33.0 → 5.33.1.** GoBGP 4.10.0's own
   go.mod pins the x/net, x/text and grpc versions the Looking Glass
