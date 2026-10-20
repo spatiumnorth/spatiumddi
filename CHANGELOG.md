@@ -191,6 +191,40 @@ the formatter handles the rest.
   entries) needs roughly 1 GB, about double the `512Mi` in the
   chart's example, whose comment now points there.
 
+- **DHCP and DNS off now also stop the API routes that live outside
+  `/dhcp` and `/dns` (#2136, #2134, #2129).** With `core.dhcp` off,
+  `POST /logs/dhcp-activity`, `POST /logs/dhcp-audit`,
+  `GET /metrics/dhcp/timeseries` and the IPAM `effective-dhcp` reads
+  (space, block, subnet) answer 404 like `/dhcp/*`; with `core.dns`
+  off, `POST /logs/dns-queries`, `POST /logs/dns-queries/analytics`
+  and `GET /metrics/dns/timeseries` do. The agent routers stay
+  ungated, and the shared `/logs/sources` and `/logs/agent-sources`
+  lists leave out the servers of a module that is off (`/logs/query`
+  answers 404 for them). `POST /new-devices/block` with DHCP off is
+  refused (422) when it would only write DHCP blocks, and otherwise
+  skips the DHCP half and does the upstream quarantine, refusing with
+  the reason (403 without `manage_block_sync`, 409 with no armed
+  target) rather than answering 200 having done nothing; on New
+  Devices the action is hidden when neither DHCP nor active block
+  sync is on, and reads
+  "Quarantine upstream" when only block sync is. The DNS Threat
+  module-off notice now names Features & Integrations and links it
+  (superadmin only; others are told to ask an administrator), and says
+  where per-group query logging is turned on.
+
+- **A nightly reports one version string everywhere** (#2111).
+  `GET /api/v1/version` read `nightly-YYYYMMDD` (the image tag) while
+  the agents, supervisor and appliance said
+  `0.0.0-nightly-YYYYMMDD+<sha>`. The api now reports the latter, taking
+  the sha from the build's own `APP_VERSION` stamp (new build arg on the
+  api image, already passed by nightly.yml), so the two compare equal.
+  Releases are untouched; `settings.version` stays the image tag, which
+  upgrades still use to pull images.
+
+- **Upgraded installs no longer show the stale `agent v2026.04.14.1`
+  note on DNS servers** (#2112). A data migration clears `notes` only
+  where it is exactly that literal, so operator text is never touched.
+
 - **Backup page and branding title show the API's reason and stop
   offering what is refused** (#2203, #2204, #2200, #2202, #2205).
   A refused archive preview, restore or drill schedule now shows the
@@ -6444,6 +6478,8 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `d3a7f19c52e8` — #2112, data only: `dns_server.notes` equal to exactly
+  `agent v2026.04.14.1` becomes empty. Downgrade does nothing.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column
