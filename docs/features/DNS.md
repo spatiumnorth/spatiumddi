@@ -992,14 +992,17 @@ needs a node with 8 GiB or more; one list on a group with no views is about
 half that.
 
 **Worked example: one popular catalog feed.** The catalog's AdGuard DNS
-filter is about 186k entries. On a group with no views that is one RPZ zone,
-so 400 MB + 186,000 x 3 kB is about 1 GB while an apply is in flight; with
-one view it is two zones and about 1.5 GB. Either way it is over the `512Mi`
-in the chart's `dnsAgents.servers[].resources` example, so
-copying that example and subscribing to a single well-known list gets the
-agent OOM-killed mid-apply. Treat `512Mi` as the idle figure for a group
-with no blocklists, and size the limit from the rule above before you
-subscribe. Entry counts are on each list after its first sync.
+filter was about 186k entries when this was written; the count moves with
+every upstream update. On a group with no views that is one RPZ zone, so by
+the rule of thumb above it needs about 400 MB + 186,000 x 3 kB, roughly
+1 GB, while an apply is in flight; with one view it is two zones and roughly
+1.5 GB. These are estimates from the rule, not a measurement of that list.
+Either way they are well over the `512Mi` in the chart's
+`dnsAgents.servers[].resources` example, so copying that example and
+subscribing to a single well-known list is likely to get the agent
+OOM-killed mid-apply. Treat `512Mi` as a figure for a group with no
+blocklists, and size the limit from the rule above before you subscribe.
+Entry counts are on each list after its first sync.
 
 Where to change it:
 

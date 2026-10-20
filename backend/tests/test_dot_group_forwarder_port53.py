@@ -83,3 +83,38 @@ async def test_stored_port53_does_not_block_an_unrelated_save(
     # adding another is checked
     r = await client.put(url, json={**TLS, "forwarders": ["10.0.0.1@53", "10.0.0.9@53"]}, headers=h)
     assert r.status_code == 422, r.text
+
+
+@pytest.mark.asyncio
+async def test_port53_spellings_and_other_ports(client: AsyncClient, db_session: AsyncSession):
+    url, h = await _setup(db_session)
+    # A leading zero is still port 53 to BIND; the validator accepts it.
+    for bad in ("10.0.0.1@053", "2001:db8::1@53", "10.0.0.1 @ 53"):
+        r = await client.put(url, json={**TLS, "forwarders": [bad]}, headers=h)
+        assert r.status_code == 422, (bad, r.text)
+    # Other explicit ports are the operator's call, and v6 without a port is fine.
+    r = await client.put(
+        url,
+        json={**TLS, "forwarders": ["10.0.0.1@5353", "2001:db8::1", "2001:db8::2@853"]},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["forwarder_warnings"] == []
+
+
+@pytest.mark.asyncio
+async def test_stored_port53_is_reported_on_get(client: AsyncClient, db_session: AsyncSession):
+    url, h = await _setup(db_session, forwarders=["10.0.0.1@53", "10.0.0.2"], **TLS)
+    r = await client.get(url, headers=h)
+    assert r.status_code == 200, r.text
+    warnings = r.json()["forwarder_warnings"]
+    assert len(warnings) == 1 and "10.0.0.1@53" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_do53_group_reports_no_forwarder_warning(
+    client: AsyncClient, db_session: AsyncSession
+):
+    url, h = await _setup(db_session, forwarders=["10.0.0.1@53"], forward_transport="do53")
+    r = await client.get(url, headers=h)
+    assert r.json()["forwarder_warnings"] == []

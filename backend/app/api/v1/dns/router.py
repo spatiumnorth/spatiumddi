@@ -993,6 +993,9 @@ class ServerOptionsResponse(BaseModel):
     # Stored values a Technitium server in this group will not apply (#1763).
     # Empty for a group with no agent-managed Technitium server.
     technitium_warnings: list[str] = Field(default_factory=list)
+    # Stored group forwarders that cannot work with the group's transport,
+    # saved before the #2128 refusal. Advisory: the save is not refused.
+    forwarder_warnings: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -3687,6 +3690,7 @@ async def _options_response(
     db: DB, group_id: uuid.UUID, opts: DNSServerOptions
 ) -> ServerOptionsResponse:
     out = ServerOptionsResponse.model_validate(opts)
+    out.forwarder_warnings = _stored_forwarder_warnings(opts)
     if "technitium" in await _group_driver_names(db, group_id):
         acls = await _group_acl_definitions(db, group_id)
         out.technitium_warnings = technitium_stored_warnings(opts, acls)
@@ -3895,8 +3899,38 @@ async def _refuse_if_alias_records_lose_resolver(group_id: uuid.UUID, db: DB) ->
         )
 
 
-def _forwarder_port(entry: str) -> str:
-    return entry.partition("@")[2].strip()
+def _plain_port_forwarders(entries: list[str] | None) -> list[str]:
+    """The entries of ``entries`` that pin port 53 (#2128).
+
+    Compared as a number, not a string: the validator takes any digits, so
+    ``1.2.3.4@053`` is stored as written and BIND reads it as port 53.
+    """
+    out = []
+    for entry in entries or []:
+        port = str(entry).partition("@")[2].strip()
+        if port.isdigit() and int(port) == 53:
+            out.append(entry)
+    return out
+
+
+def _stored_forwarder_warnings(opts: DNSServerOptions) -> list[str]:
+    """Stored group forwarders pinned to port 53 in an encrypted group (#2128).
+
+    A value saved before the refusal below still renders as TLS to port 53,
+    so that forwarder never answers. The renderer is left as it is on
+    purpose: rendering it plain would send cleartext from a group the
+    operator set to an encrypted transport, and dropping it could leave the
+    group with no forwarders. It fails closed (BIND tries the other
+    forwarders), and this makes it visible on the options GET.
+    """
+    if (opts.forward_transport or "do53") == "do53":
+        return []
+    return [
+        f"forwarder {f!r} pins port 53 (plain DNS), but this group forwards over "
+        f"{opts.forward_transport}: it is sent TLS on port 53 and never answers. "
+        "Remove the port or change it to the upstream's encrypted port."
+        for f in _plain_port_forwarders(opts.forwarders)
+    ]
 
 
 def _refuse_plain_port_forwarders_on_encrypted(
@@ -3918,14 +3952,15 @@ def _refuse_plain_port_forwarders_on_encrypted(
         candidates = [f for f in now if f not in forwarders_before]
     else:
         candidates = now
-    bad = [f for f in candidates if _forwarder_port(f) == "53"]
+    bad = _plain_port_forwarders(candidates)
     if bad:
         raise HTTPException(
             422,
             f"forwarders {', '.join(repr(f) for f in bad)} pin port 53, which is plain "
             f"DNS, but this group forwards over {opts.forward_transport}: the TLS "
             "handshake would go to a port that cannot answer it. Drop the "
-            "port (encrypted upstreams default to 853) or set forward_transport to do53.",
+            "port (the transport's own default is used, 853 for tls) or set "
+            "forward_transport to do53.",
         )
 
 

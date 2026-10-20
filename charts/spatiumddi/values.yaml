@@ -938,8 +938,9 @@ dnsAgents:
     #   #   loadBalancerSourceRanges: [192.0.2.0/24]
     #   #   ipFamilyPolicy: PreferDualStack  # + ipFamilies: [IPv4, IPv6]
     #   # 512Mi is for a group with NO blocklists. One catalog feed (AdGuard DNS
-    #   # filter, ~186k entries) needs ~1 GB while an apply is in flight: size the
-    #   # limit from docs/features/DNS.md section 8.0 before subscribing.
+    #   # filter, ~186k entries) needs roughly 1 GB while an apply is in flight
+    #   # (estimate): size the limit from docs/features/DNS.md section 8.0
+    #   # before subscribing.
     #   resources:
     #     requests: { cpu: 100m, memory: 128Mi }
     #     limits:   { cpu: 500m, memory: 512Mi }
