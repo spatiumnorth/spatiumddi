@@ -23,6 +23,7 @@ from .admin_pusher import push_rendered_config
 from .apply_guard import (
     SETTLE_SECONDS,
     SYNC_FIRST_AFTER_DEATHS,
+    SYNC_FIRST_FALLBACK_SECONDS,
     ApplyGuard,
 )
 from .bootstrap import reauth_generation, reauthenticate
@@ -253,6 +254,19 @@ class SyncLoop:
         # Whether the last ``_handle_apply_failure`` re-applied the previous
         # bundle (so something is live again), for the hold to read.
         self._revert_landed = False
+        # #2240 — the hold's wait for the control plane is bounded: past
+        # ``_hold_wait_s`` from ``_hold_since`` (monotonic) the cache serves as
+        # if the control plane were unreachable. ``getattr``: a duck-typed
+        # config without the field gets the default.
+        self._hold_wait_s = float(
+            getattr(cfg, "sync_first_fallback_seconds", SYNC_FIRST_FALLBACK_SECONDS)
+        )
+        self._hold_since: float | None = None
+        # Set once the wait has run out and been acted on (it acts once).
+        self._hold_wait_over = False
+        # Whether this poll already ran ``_boot_hold_fallback``, so the wait
+        # running out in the same poll does not run it a second time.
+        self._hold_fallback_ran = False
 
         # Preload cached bundle (offline-operation guarantee)
         bundle, etag = load_config(self.cfg.state_dir)
@@ -454,8 +468,12 @@ class SyncLoop:
 
         The daemon must not come up on it either: ``start_daemon`` launches
         from the live rendered tree, which is that bundle's. It is set aside,
-        so the start defers (#1056) until a bundle applies and launches it."""
+        so the start defers (#1056) until a bundle applies and launches it.
+
+        #2240 — the wait for that bundle starts here and is bounded by
+        ``_hold_wait_s`` (``_release_hold_after_wait``)."""
         self._boot_hold = (bundle, etag, deaths)
+        self._hold_since = time.monotonic()
         self._set_aside_live_tree()
         reason = self._death_reason(etag, deaths)
         self._report_boot_hold(
@@ -471,7 +489,8 @@ class SyncLoop:
                         " (it is quarantined: re-applied only on the backoff)"
                         if self._guard.condemned(etag)
                         else " (re-applied from the cache if the control plane "
-                        "cannot be reached)"
+                        "cannot be reached or sends none within "
+                        f"{int(self._hold_wait_s)} s)"
                     )
                 ),
             )
@@ -481,6 +500,7 @@ class SyncLoop:
             etag=etag,
             deaths=deaths,
             quarantined=self._guard.condemned(etag),
+            wait_s=self._hold_wait_s,
         )
 
     def _set_aside_live_tree(self) -> None:
@@ -507,15 +527,20 @@ class SyncLoop:
         self._boot_hold_on_previous = False
         shutil.rmtree(self.cfg.state_dir / "rendered.held", ignore_errors=True)
 
-    def _boot_hold_fallback(self, failed_etag: str | None = None) -> None:
+    def _boot_hold_fallback(
+        self, failed_etag: str | None = None, *, retry_condemned: bool = True
+    ) -> None:
         """No usable bundle from the control plane while the cache is held.
 
         Reached offline (unreachable, or not answering 200), when the control
         plane is serving the held bundle itself and that bundle is
-        quarantined, and (``failed_etag``) when the control plane's own bundle
+        quarantined, (``failed_etag``) when the control plane's own bundle
         failed to apply: the hold set the live tree aside, so without this the
-        server would sit dark on a failure the cache would have survived.
-        Non-negotiable #5 decides what serves meanwhile:
+        server would sit dark on a failure the cache would have survived, and
+        (#2240) when the wait for a bundle runs out, which passes
+        ``retry_condemned=False``: the wait never applies a condemned bundle,
+        the quarantine's backoff alone decides that. Non-negotiable #5 decides
+        what serves meanwhile:
 
         * not condemned (fewer than two deaths the agent watched, however many
           unexplained ones): the cached bundle. An unexplained death can be a
@@ -530,6 +555,7 @@ class SyncLoop:
         hold = self._boot_hold
         if hold is None or self._boot_hold_on_previous:
             return
+        self._hold_fallback_ran = True
         bundle, etag, deaths = hold
         # Condemned by watched deaths, or quarantined by an apply of it that
         # failed and was caught since (not to be retried on every offline poll).
@@ -586,7 +612,7 @@ class SyncLoop:
                     live_etag=prev_etag,
                 )
             return
-        if self._quarantine.retry_due():
+        if retry_condemned and self._quarantine.retry_due():
             log.warning(
                 "bootstrap_hold_retrying_quarantined_cache",
                 etag=etag,
@@ -594,6 +620,87 @@ class SyncLoop:
             )
             if self._bootstrap_apply(bundle, etag, booting_from_previous=False, before_sync=False):
                 self._end_boot_hold()
+
+    def _hold_blocked(self, etag: str) -> bool:
+        """The held bundle may not be applied outside the quarantine's backoff:
+        condemned by watched deaths, or quarantined by a caught failure since."""
+        return self._guard.condemned(etag) or self._quarantine.etag == etag
+
+    def _hold_waited(self) -> float | None:
+        """How long the hold has waited for the control plane (#2240), or
+        ``None`` when there is no wait left to act on: no hold, the
+        last-known-good already serving, or the wait already acted on."""
+        if (
+            self._boot_hold is None
+            or self._boot_hold_on_previous
+            or self._hold_wait_over
+            or self._hold_since is None
+        ):
+            return None
+        return time.monotonic() - self._hold_since
+
+    def _hold_fetch_deadline(self) -> float | None:
+        """When a held fetch's body must have arrived by (#2240), else it is
+        abandoned as if the control plane were unreachable: the end of the
+        wait, and never sooner than ``BOOT_FETCH_TIMEOUT`` from now, so every
+        fetch gets its chance. ``None`` (no bound) once the wait was acted on,
+        and while the held bundle is condemned or quarantined: the wait would
+        not apply it, so the bundle in flight is the only way out."""
+        if self._hold_waited() is None or self._hold_since is None or self._boot_hold is None:
+            return None
+        if self._hold_blocked(self._boot_hold[1]):
+            return None
+        return max(self._hold_since + self._hold_wait_s, time.monotonic() + BOOT_FETCH_TIMEOUT)
+
+    def _release_hold_after_wait(self) -> bool:
+        """Serve as if the control plane were unreachable once the hold has
+        waited ``_hold_wait_s`` for its bundle (#2240). True when it acted.
+
+        It acts once. The cached bundle is applied, under the #2019 marker like
+        any other apply, so a death on it still counts. A condemned or
+        quarantined one is not: only the last-known-good can serve then, under
+        the usual rules, and the quarantine's backoff alone decides when the
+        cache is retried. The sync loop goes on polling either way, so a fresh
+        bundle replaces whatever serves when the control plane sends one."""
+        waited = self._hold_waited()
+        hold = self._boot_hold
+        if waited is None or hold is None or waited < self._hold_wait_s:
+            return False
+        self._hold_wait_over = True
+        _bundle, etag, deaths = hold
+        fields = {
+            "etag": etag,
+            "deaths": deaths,
+            "waited_s": round(waited, 1),
+            "wait_s": self._hold_wait_s,
+        }
+        blocked = self._hold_blocked(etag)
+        if self._hold_fallback_ran or blocked:
+            # This poll already ran the fallback rules (a quarantined or
+            # failed bundle from the control plane), or the cache is barred.
+            log.warning(
+                "bootstrap_hold_wait_over_cache_not_applied",
+                reason="quarantined" if blocked else "fallback_already_tried",
+                **fields,
+            )
+            if not self._hold_fallback_ran:
+                self._boot_hold_fallback(retry_condemned=False)
+            return True
+        log.warning(
+            "bootstrap_cache_released_after_wait",
+            note="no bundle from the control plane within the wait: the cache "
+            "serves as if it were unreachable, and the agent keeps asking",
+            **fields,
+        )
+        self._boot_hold_fallback(retry_condemned=False)
+        return True
+
+    def _boot_hold_offline(self) -> None:
+        """This poll got no bundle out of the control plane: an error, a
+        timeout, an unexpected status. Past the wait (#2240) that is the
+        wait's release, logged as such; before it, the offline fallback."""
+        if not self._release_hold_after_wait():
+            self._boot_hold_fallback()
 
     def _bootstrap_fallback(
         self, failed_etag: str | None, exc: BaseException, *, before_sync: bool = True
@@ -781,6 +888,15 @@ class SyncLoop:
         self._guard.disarm()
 
     def _poll_once(self) -> None:
+        self._hold_fallback_ran = False
+        self._poll_control_plane()
+        # #2240 — a hold that has outlived its wait serves the cache now,
+        # whatever the control plane answered (a 304 with nothing stored for
+        # this server, a pending approval): reachable is not the same as able
+        # to send a bundle.
+        self._release_hold_after_wait()
+
+    def _poll_control_plane(self) -> None:
         gen = reauth_generation()
         if gen != self._reauth_gen:
             self._reauth_gen = gen
@@ -815,8 +931,12 @@ class SyncLoop:
                 # no If-None-Match the control plane answers at once rather
                 # than holding the long-poll, so a short timeout decides
                 # "unreachable" quickly and the fallback below can serve.
+                # #2240 — and a body still streaming in when the wait runs out
+                # is abandoned the same way (``_hold_fetch_deadline``).
                 with self._client(timeout=BOOT_FETCH_TIMEOUT) as c:
-                    resp = get_config(c, headers, self.cfg.state_dir)
+                    resp = get_config(
+                        c, headers, self.cfg.state_dir, deadline=self._hold_fetch_deadline()
+                    )
             else:
                 with self._client() as c:
                     resp = get_config(c, headers, self.cfg.state_dir)
@@ -826,7 +946,7 @@ class SyncLoop:
         # rather than ending the sync thread.
         except (httpx.HTTPError, OSError) as e:
             log.warning("sync_http_error", error=str(e))
-            self._boot_hold_fallback()
+            self._boot_hold_offline()
             time.sleep(5.0)
             return
 
@@ -852,7 +972,7 @@ class SyncLoop:
             return
         if resp.status_code != 200:
             log.warning("sync_unexpected_status", status=resp.status_code)
-            self._boot_hold_fallback()
+            self._boot_hold_offline()
             time.sleep(5.0)
             return
 

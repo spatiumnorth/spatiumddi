@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import ssl
 import threading
@@ -10,7 +11,29 @@ from pathlib import Path
 
 import structlog
 
+from .apply_guard import SYNC_FIRST_FALLBACK_SECONDS
+
 log = structlog.get_logger(__name__)
+
+
+def seconds_from_env(name: str, default: float) -> float:
+    """A non-negative number of seconds from ``name``, else ``default``.
+
+    Unset or empty is the default. A value that is not a finite number of
+    seconds at least 0 is logged and ignored rather than failing the start:
+    a typo in a tuning knob must not keep a DNS server from serving."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        log.warning("agent_config_seconds_invalid", variable=name, value=raw, using=default)
+        return default
+    return value
+
 
 # Whether the last pinned-trust read failed, so a missing pin is logged
 # once when it goes missing and once when it arrives, not on every request.
@@ -93,6 +116,10 @@ class AgentConfig:
     # #1281 — pinned trust (the supervisor's pin, on an appliance). Wins over
     # tls_ca_path and the skip; see ``pinned_context``.
     tls_pinned_certs_path: str | None = None
+    # #2240 — how long a startup that holds the cached bundle back after a
+    # death (#2019) waits for the control plane's bundle before serving the
+    # cache anyway. ``SPATIUM_DNS_SYNC_FIRST_FALLBACK_S``; see ``apply_guard``.
+    sync_first_fallback_seconds: float = SYNC_FIRST_FALLBACK_SECONDS
 
     def httpx_verify(self) -> bool | str | ssl.SSLContext:
         """Resolve the ``verify=`` argument for every control-plane client.
@@ -188,5 +215,8 @@ class AgentConfig:
             == "1",
             state_dir=Path(
                 os.environ.get("AGENT_STATE_DIR", "/var/lib/spatium-dns-agent")
+            ),
+            sync_first_fallback_seconds=seconds_from_env(
+                "SPATIUM_DNS_SYNC_FIRST_FALLBACK_S", SYNC_FIRST_FALLBACK_SECONDS
             ),
         )

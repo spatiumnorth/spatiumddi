@@ -19,5 +19,6 @@ the protocol specification.
 | `TLS_CA_PATH` | CA bundle to verify the control plane against (private CA or self-signed). Wins over the skip flag |
 | `TLS_PINNED_CERTS_PATH` | Trust exactly the certificates in this file, with no hostname check (#1281). Read on every connection; fails closed while the file is missing. The appliance chart sets it to the supervisor's pinned certificate. Wins over `TLS_CA_PATH` and the skip flag |
 | `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` | Turns verification off. Lab only: the agent key is readable on the network path. Logged as a warning on every start |
+| `SPATIUM_DNS_SYNC_FIRST_FALLBACK_S` | Seconds (default `600`) a start after the daemon died on the cached bundle waits for the control plane's bundle before serving the cache anyway (#2240). The agent keeps asking afterwards, so a fresh bundle replaces the cache when it lands; a quarantined cache is never applied by the wait. Invalid values are logged and the default is kept |
 
 State directory: `/var/lib/spatium-dns-agent` (must be a volume).
