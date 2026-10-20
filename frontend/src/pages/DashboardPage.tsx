@@ -3785,10 +3785,9 @@ function IntegrationsPanel({
             ) : (
               <div className="overflow-x-auto">
                 <div className="min-w-[520px] divide-y">
-                  {cardTargets(
-                    tailscaleTenants,
-                    tailscaleTenants.length,
-                  ).shown.map((t) => (
+                  {cardTargets(tailscaleTenants, tailscaleTenants.length, {
+                    maxProblems: tailscaleTenants.length,
+                  }).shown.map((t) => (
                     <IntegrationRow
                       key={t.id}
                       to={`/tailscale`}
@@ -4942,13 +4941,16 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
   // green here while the IPAM-tab panel shows it amber.
   // #2138 — a credential about to lapse is a warning even while every sync
   // is still green; an expired / rejected one is as bad as an error.
-  const credentialDead = panel.targets.filter(
-    (t) =>
-      t.credential_state === "expired" || t.credential_state === "rejected",
-  ).length;
-  const credentialExpiring = panel.targets.filter(
-    (t) => t.credential_state === "expiring",
-  ).length;
+  // #2192 — prefer the server's counts: `panel.targets` is a capped list.
+  const credentialDead =
+    panel.credential_dead_count ??
+    panel.targets.filter(
+      (t) =>
+        t.credential_state === "expired" || t.credential_state === "rejected",
+    ).length;
+  const credentialExpiring =
+    panel.credential_expiring_count ??
+    panel.targets.filter((t) => t.credential_state === "expiring").length;
   const tone: Tone =
     panel.error_count > 0 || credentialDead > 0
       ? "bad"
@@ -4959,7 +4961,10 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
         : "good";
   const cls = TONE_CLASS[tone];
   // #2192 — problem targets are always named, ahead of healthy ones.
-  const cardRows = cardTargets(panel.targets);
+  const cardRows = cardTargets(panel.targets, 3, {
+    total: panel.target_count,
+    problemTotal: panel.problem_count,
+  });
   return (
     <div className="rounded-lg border bg-card p-3">
       <div className="flex items-center justify-between">
@@ -5051,6 +5056,11 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
               </span>
             </li>
           ))}
+          {cardRows.hiddenProblems > 0 && (
+            <li className="text-[10px] text-red-600 dark:text-red-400">
+              + {cardRows.hiddenProblems} more with problems
+            </li>
+          )}
           {cardRows.hidden > 0 && (
             <li className="text-[10px] text-muted-foreground">
               + {cardRows.hidden} more

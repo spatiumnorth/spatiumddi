@@ -77,6 +77,29 @@ describe("cardTargets (#2192)", () => {
     expect(hidden).toBe(1);
   });
 
+  it("caps problem rows and reports the rest as problems, not healthy", () => {
+    const rows = Array.from({ length: 200 }, (_, i) => t(`p${i}`, "rejected"));
+    const out = cardTargets([...rows, t("ok", "ok")], 3, {
+      maxProblems: 8,
+      total: 260,
+      problemTotal: 230,
+    });
+    expect(out.shown).toHaveLength(8);
+    expect(out.hiddenProblems).toBe(222);
+    expect(out.hidden).toBe(30);
+  });
+
+  it("takes hidden counts against the true total of a trimmed list", () => {
+    const { shown, hidden, hiddenProblems } = cardTargets(
+      [t("a", "ok"), t("b", "ok"), t("c", "ok"), t("d", "ok")],
+      3,
+      { total: 25, problemTotal: 0 },
+    );
+    expect(shown).toHaveLength(3);
+    expect(hidden).toBe(22);
+    expect(hiddenProblems).toBe(0);
+  });
+
   it("draws no chip for a disabled tenant", () => {
     expect(
       credentialChipView("disabled", null, null, { showOk: true }),

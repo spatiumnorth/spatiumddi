@@ -74,28 +74,54 @@ export function credentialChipView(
   }
 }
 
+/** A target that needs an operator: a credential problem or a sync error. */
+export function hasTargetProblem(t: {
+  credential_state?: CredentialState | null;
+  last_sync_error?: string | null;
+}): boolean {
+  return (
+    t.credential_state === "rejected" ||
+    t.credential_state === "expired" ||
+    t.credential_state === "expiring" ||
+    !!t.last_sync_error
+  );
+}
+
 /**
  * Order the rows of a capped integration card (#2192): targets with a
  * credential problem or a sync error first, so the cap can never hide the
- * tenant that needs a new key. Every problem row is kept even when that
- * exceeds `base`; healthy rows only fill what is left. Stable within groups.
+ * tenant that needs a new key ahead of a healthy one. Problem rows are kept
+ * past `base`, up to `maxProblems` (so 200 failing nodes do not become a
+ * 200-row card); healthy rows only fill what `base` leaves. Stable within
+ * groups.
+ *
+ * `total` / `problemTotal` are the true counts when `targets` is itself a
+ * capped list (the dashboard API trims it); the hidden counts are taken
+ * against them. `hiddenProblems` is how many problem targets are not named,
+ * `hidden` how many healthy ones.
  */
 export function cardTargets<
   T extends {
     credential_state?: CredentialState | null;
     last_sync_error?: string | null;
   },
->(targets: T[], base = 3): { shown: T[]; hidden: number } {
-  const bad = (t: T) =>
-    t.credential_state === "rejected" ||
-    t.credential_state === "expired" ||
-    t.credential_state === "expiring" ||
-    !!t.last_sync_error;
-  const problems = targets.filter(bad);
-  const rest = targets.filter((t) => !bad(t));
-  const shown = [...problems, ...rest].slice(
-    0,
-    Math.max(base, problems.length),
+>(
+  targets: T[],
+  base = 3,
+  opts: { maxProblems?: number; total?: number; problemTotal?: number } = {},
+): { shown: T[]; hidden: number; hiddenProblems: number } {
+  const maxProblems = opts.maxProblems ?? 8;
+  const problems = targets.filter(hasTargetProblem);
+  const rest = targets.filter((t) => !hasTargetProblem(t));
+  const shownProblems = problems.slice(0, Math.max(0, maxProblems));
+  const shownRest = rest.slice(0, Math.max(0, base - shownProblems.length));
+  const shown = [...shownProblems, ...shownRest];
+  const problemTotal = Math.max(
+    opts.problemTotal ?? problems.length,
+    problems.length,
   );
-  return { shown, hidden: targets.length - shown.length };
+  const total = Math.max(opts.total ?? targets.length, targets.length);
+  const hiddenProblems = problemTotal - shownProblems.length;
+  const hidden = Math.max(0, total - problemTotal - shownRest.length);
+  return { shown, hidden, hiddenProblems };
 }

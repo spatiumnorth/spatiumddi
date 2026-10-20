@@ -182,9 +182,14 @@ the formatter handles the rest.
   (disabled)". The Integrations dashboard cards used to name only
   their first three targets, so a rejected tenant beyond them was
   counted and never named. Targets with a credential problem or a sync
-  error are now listed first and always shown, even past three; this
-  covers every integration card, and the IPAM-tab panel orders the
-  same way.
+  error are now listed first, ahead of healthy ones, even past three;
+  this covers every integration card, and the IPAM-tab panel orders
+  the same way. The list stays bounded: a card names up to eight
+  problem targets and says "+N more with problems" for the rest, and
+  the dashboard API returns at most 50 problem rows per integration.
+  Its counts ("N token expired", the new `problem_count`) are now
+  taken over every target rather than the trimmed row list, which
+  used to undercount past 20 targets.
 - **Backup page and branding title show the API's reason and stop
   offering what is refused** (#2203, #2204, #2200, #2202, #2205).
   A refused archive preview, restore or drill schedule now shows the

@@ -89,3 +89,49 @@ def test_cap_names_problem_rows_first_even_past_the_cap(monkeypatch) -> None:
     out = [r.id for r in _cap_rows(rows)]
     assert out == ["10", "11", "13", "14"]  # all problems, none healthy, no disabled
     assert [r.id for r in _cap_rows(rows[:4] + [_row(10, "rejected")])] == ["10", "0", "1"]
+
+
+def test_problem_rows_are_hard_capped_and_counted_in_full(monkeypatch) -> None:
+    """200 failing targets must not become a 200-row card (#2192): the rows
+    stop at ``_PROBLEM_TARGET_LIMIT`` and the panel counts carry the truth."""
+    import app.api.v1.dashboards.integrations as mod  # noqa: PLC0415
+
+    now = datetime(2026, 10, 18, tzinfo=UTC)
+
+    class _T:
+        def __init__(self, i: int, err: str | None) -> None:
+            self.id = i
+            self.name = f"n{i}"
+            self.last_synced_at = now
+            self.sync_interval_seconds = 60
+            self.last_sync_error = err
+            self.enabled = True
+            self.api_key_expires_at = None
+
+    targets = [_T(i, "boom") for i in range(200)] + [_T(1000 + i, None) for i in range(5)]
+    panel = mod._build_panel(
+        kind="proxmox",
+        label="Proxmox VE",
+        enabled=True,
+        targets=targets,
+        display_attr="name",
+        now=now,
+    )
+    assert len(panel.targets) == mod._PROBLEM_TARGET_LIMIT
+    assert all(r.last_sync_error for r in panel.targets)
+    assert panel.problem_count == 200
+    assert panel.error_count == 200
+
+    rejected = [_T(i, REJECTED) for i in range(60)]
+    ts = mod._build_panel(
+        kind="tailscale",
+        label="Tailscale",
+        enabled=True,
+        targets=rejected,
+        display_attr="name",
+        now=now,
+        credential=mod._tailscale_credential(now),
+    )
+    assert len(ts.targets) == mod._PROBLEM_TARGET_LIMIT
+    assert ts.credential_dead_count == 60  # not 50: counted before the cap
+    assert ts.problem_count == 60
