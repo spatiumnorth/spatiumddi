@@ -92,6 +92,14 @@ _PARSE_CHUNK = 1 << 18
 
 _JSON_WS = " \t\n\r"
 
+# What a number cut off inside its fraction or exponent leaves undecoded.
+_NUMBER_TAIL = ".eE+-"
+
+# How many levels below a top-level member a value too large for the buffer is
+# decoded a member at a time: a blocklist, its ``entries``, one entry (a zone,
+# its ``records``, one record), and one level to spare.
+_DESCEND_DEPTH = 3
+
 # Per top-level array, the member of each element ``records=False`` drops.
 _RECORD_LEVEL = {"zones": "records", "blocklists": "entries"}
 
@@ -129,8 +137,8 @@ class _TextStream:
     """A text file read a chunk at a time and decoded one JSON value at a time.
 
     Only what has not been consumed yet stays buffered, so the bundle's text
-    is never in memory whole: at most the largest single value (one zone, one
-    blocklist) plus a chunk.
+    is never in memory whole: about a chunk, more only for a single string or
+    number longer than one.
     """
 
     def __init__(self, fh: Any, decoder: json.JSONDecoder) -> None:
@@ -178,20 +186,74 @@ class _TextStream:
         self.pos += 1
         return ch
 
-    def value(self) -> Any:
-        self.peek()
+    def value(self, depth: int = 0) -> Any:
+        """The next value.
+
+        One that does not fit in what is buffered and is an array or object
+        is decoded a member at a time, ``depth`` levels down, so its text is
+        never held whole either: a single blocklist of 1.4M entries is one
+        element of ``blocklists``, ~130 MB of text, and growing the buffer to
+        hold it cost more than reading the file whole. Anything else is read
+        further and decoded again.
+        """
+        ch = self.peek()
         while True:
             try:
                 value, end = self._decoder.raw_decode(self.buf, self.pos)
             except json.JSONDecodeError:
+                if depth > 0 and ch in "{[" and not self._eof:
+                    return self._container(ch, depth - 1)
                 if self._grow():
                     continue
                 raise
             # A number cut off by the end of the buffer decodes as a shorter
-            # one, so a value that reaches the end is decoded again with more.
-            if end < len(self.buf) or not self._grow():
+            # one, so a number that may go on past the buffer is decoded again
+            # with more. That includes one cut inside its fraction or
+            # exponent: ``1.`` or ``1e+`` decodes as ``1`` and leaves ``.`` /
+            # ``e+`` behind, which would then fail the parse of a valid bundle.
+            if not self._cut_off(value, end) or not self._grow():
                 self.pos = end
                 return value
+
+    def _cut_off(self, value: Any, end: int) -> bool:
+        """Whether the number decoded up to ``end`` may continue past the buffer.
+
+        Only a number can: a string, an array and an object end with their own
+        delimiter, and ``true`` / ``false`` / ``null`` with their last letter.
+        """
+        if value.__class__ not in (int, float):
+            return False
+        tail = self.buf[end:]
+        return len(tail) <= 2 and not tail.strip(_NUMBER_TAIL)
+
+    def _container(self, ch: str, depth: int) -> Any:
+        """An array or object decoded a member at a time; what ``raw_decode``
+        would give, the object through the same pairs hook."""
+        self.pos += 1
+        if ch == "[":
+            items: list[Any] = []
+            if self.peek() == "]":
+                self.pos += 1
+                return items
+            while True:
+                items.append(self.value(depth))
+                if self.take(",]") == "]":
+                    return items
+        pairs: list[tuple[str, Any]] = []
+        if self.peek() != "}":
+            while True:
+                if self.peek() != '"':
+                    raise json.JSONDecodeError(
+                        "Expecting property name enclosed in double quotes", self.buf, self.pos
+                    )
+                key = self.value()
+                self.take(":")
+                pairs.append((key, self.value(depth)))
+                if self.take(",}") == "}":
+                    break
+        else:
+            self.pos += 1
+        return self._decoder.object_pairs_hook(pairs)  # type: ignore[misc]
 
     def rest(self) -> str:
         while self._read():
@@ -204,8 +266,9 @@ def parse_bundle_file(path: Path, *, records: bool = True) -> Any:
 
     The result is ``==`` to ``json.loads`` of the file. A bundle is an object
     whose large members are arrays (``zones``, ``blocklists``); each top-level
-    array is decoded an element at a time, so the text in memory is one zone
-    or one blocklist rather than the whole document. Measured at 20,000 zones
+    array is decoded an element at a time, and an element too large for the
+    buffer (a catalogue blocklist) a member at a time, so the text in memory
+    is about one chunk rather than the whole document. Measured at 20,000 zones
     and a million records (a 126 MB file), peak RSS went from ~525 MB reading
     it whole to ~410 MB streamed. Shared keys and short values
     (``_sharing_decoder``) keep the parsed form as small as one ``json.loads``
@@ -245,15 +308,15 @@ def parse_bundle_file(path: Path, *, records: bool = True) -> Any:
                         stream.pos += 1
                     else:
                         while True:
-                            item = stream.value()
-                            if not records and isinstance(item, dict):
-                                item.pop(_RECORD_LEVEL.get(key, ""), None)
+                            item = stream.value(_DESCEND_DEPTH)
+                            if not records and key in _RECORD_LEVEL and isinstance(item, dict):
+                                item.pop(_RECORD_LEVEL[key], None)
                             items.append(item)
                             if stream.take(",]") == "]":
                                 break
                     value: Any = items
                 else:
-                    value = stream.value()
+                    value = stream.value(_DESCEND_DEPTH)
                 if value.__class__ is str and len(value) <= _INTERN_MAX_LEN:
                     value = memo.setdefault(value, value)
                 bundle[memo.setdefault(key, key)] = value
