@@ -21,7 +21,9 @@ from app.services import feature_modules
 
 pytestmark = pytest.mark.asyncio
 
-NID = uuid.uuid4()
+# Fixed, not uuid4(): it is baked into parametrize ids, and xdist workers must
+# collect identical ids (a random one failed CI with "Different tests were collected").
+NID = uuid.UUID("00000000-0000-4000-8000-000000002136")
 GATED = [
     # (module, method, path, json)
     ("core.dhcp", "POST", "/api/v1/logs/dhcp-activity", {"server_id": str(NID)}),
