@@ -120,6 +120,7 @@ import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
+import { resolveShowFreeRanges } from "@/lib/ipam-free-ranges";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
@@ -1003,7 +1004,16 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   const [asnId, setAsnId] = useState<string | null>(null);
   const [customerId, setCustomerId] = useState<string | null>(null);
   const dhcpOn = useModuleOn("core.dhcp");
-  const [tab, setTab] = useState<"dns" | "dhcp" | "networking">("dns");
+  // #2135 — the DNS tab is hidden while core.dns is off; a tab left
+  // selected (the default, for a space) falls back to one that exists.
+  const dnsOn = useModuleOn("core.dns");
+  const [tabChoice, setTab] = useState<"dns" | "dhcp" | "networking">("dns");
+  const tab =
+    tabChoice === "dns" && !dnsOn
+      ? dhcpOn
+        ? "dhcp"
+        : "networking"
+      : tabChoice;
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -1056,7 +1066,7 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
 
       <ModalTabs
         tabs={[
-          { key: "dns", label: "DNS" },
+          ...(dnsOn ? [{ key: "dns" as const, label: "DNS" }] : []),
           ...(dhcpOn ? [{ key: "dhcp" as const, label: "DHCP" }] : []),
           { key: "networking", label: "Networking" },
         ]}
@@ -2583,9 +2593,13 @@ export function CreateSubnetModal({
   // Optional template pre-fill (issue #26).
   const [templateId, setTemplateId] = useState<string>("");
   const dhcpOn = useModuleOn("core.dhcp");
-  const [tab, setTab] = useState<
+  // #2135 — the DNS tab is hidden while core.dns is off; a tab left
+  // selected (the default, for a space) falls back to one that exists.
+  const dnsOn = useModuleOn("core.dns");
+  const [tabChoice, setTab] = useState<
     "general" | "dns" | "dhcp" | "ddns" | "advanced"
   >("general");
+  const tab = tabChoice === "dns" && !dnsOn ? "general" : tabChoice;
 
   const { data: blocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -2913,9 +2927,9 @@ export function CreateSubnetModal({
       <ModalTabs
         tabs={[
           { key: "general", label: "General" },
-          { key: "dns", label: "DNS" },
+          ...(dnsOn ? [{ key: "dns" as const, label: "DNS" }] : []),
           ...(dhcpOn ? [{ key: "dhcp" as const, label: "DHCP" }] : []),
-          ...(dhcpOn ? [{ key: "ddns" as const, label: "DDNS" }] : []),
+          ...(dhcpOn && dnsOn ? [{ key: "ddns" as const, label: "DDNS" }] : []),
           { key: "advanced", label: "Advanced" },
         ]}
         active={tab}
@@ -3456,12 +3470,15 @@ export function AddAddressModal({
   const splitHorizon = subnetDetailForSplit?.dns_split_horizon ?? false;
 
   // Load zones from all effective group IDs
+  // #2135 — no zone reads while core.dns is off, so no zone picker either.
+  const dnsOn = useModuleOn("core.dns");
   const zoneGroupIds: string[] = effectiveDns?.dns_group_ids ?? [];
   const zoneQueries = useQueries({
     queries: (zoneGroupIds as string[]).map((gId: string) => ({
       queryKey: ["dns-zones", gId],
       queryFn: () => dnsApi.listZones(gId),
       staleTime: 60_000,
+      enabled: dnsOn,
     })),
   });
   const allGroupZones: DNSZone[] = zoneQueries
@@ -3932,79 +3949,81 @@ export function AddAddressModal({
             placeholder="Optional"
           />
         </Field>
-        <Field label="DNS Aliases">
-          <div className="space-y-1.5">
-            <p className="text-[11px] text-muted-foreground -mt-0.5">
-              Extra records pointing to this IP. CNAMEs point to{" "}
-              <span className="font-mono">{hostname || "<hostname>"}</span>; A
-              records point to the IP. Deleted automatically when the IP is
-              purged.
-              {!dnsZoneId && (
-                <span className="ml-1 text-amber-600">
-                  Requires a DNS zone on this subnet.
-                </span>
-              )}
-            </p>
-            {aliases.map((a, idx) => (
-              <div key={idx} className="flex items-center gap-2">
-                <select
-                  className={cn(inputCls, "w-24")}
-                  value={a.record_type}
-                  onChange={(e) =>
-                    setAliases((prev) =>
-                      prev.map((x, i) =>
-                        i === idx
-                          ? {
-                              ...x,
-                              record_type: e.target.value as "CNAME" | "A",
-                            }
-                          : x,
-                      ),
-                    )
-                  }
-                >
-                  <option value="CNAME">CNAME</option>
-                  <option value="A">A</option>
-                </select>
-                <input
-                  className={cn(inputCls, "flex-1 min-w-0")}
-                  placeholder="alias (e.g. www, mail)"
-                  value={a.name}
-                  onChange={(e) =>
-                    setAliases((prev) =>
-                      prev.map((x, i) =>
-                        i === idx ? { ...x, name: e.target.value } : x,
-                      ),
-                    )
-                  }
-                />
-                <button
-                  type="button"
-                  onClick={() =>
-                    setAliases((prev) => prev.filter((_, i) => i !== idx))
-                  }
-                  className="flex-shrink-0 rounded p-1 text-muted-foreground hover:text-destructive"
-                  title="Remove alias"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-            ))}
-            <button
-              type="button"
-              onClick={() =>
-                setAliases((prev) => [
-                  ...prev,
-                  { name: "", record_type: "CNAME" },
-                ])
-              }
-              disabled={!hostname || !dnsZoneId}
-              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
-            >
-              <Plus className="h-3 w-3" /> Add alias
-            </button>
-          </div>
-        </Field>
+        {dnsOn && (
+          <Field label="DNS Aliases">
+            <div className="space-y-1.5">
+              <p className="text-[11px] text-muted-foreground -mt-0.5">
+                Extra records pointing to this IP. CNAMEs point to{" "}
+                <span className="font-mono">{hostname || "<hostname>"}</span>; A
+                records point to the IP. Deleted automatically when the IP is
+                purged.
+                {!dnsZoneId && (
+                  <span className="ml-1 text-amber-600">
+                    Requires a DNS zone on this subnet.
+                  </span>
+                )}
+              </p>
+              {aliases.map((a, idx) => (
+                <div key={idx} className="flex items-center gap-2">
+                  <select
+                    className={cn(inputCls, "w-24")}
+                    value={a.record_type}
+                    onChange={(e) =>
+                      setAliases((prev) =>
+                        prev.map((x, i) =>
+                          i === idx
+                            ? {
+                                ...x,
+                                record_type: e.target.value as "CNAME" | "A",
+                              }
+                            : x,
+                        ),
+                      )
+                    }
+                  >
+                    <option value="CNAME">CNAME</option>
+                    <option value="A">A</option>
+                  </select>
+                  <input
+                    className={cn(inputCls, "flex-1 min-w-0")}
+                    placeholder="alias (e.g. www, mail)"
+                    value={a.name}
+                    onChange={(e) =>
+                      setAliases((prev) =>
+                        prev.map((x, i) =>
+                          i === idx ? { ...x, name: e.target.value } : x,
+                        ),
+                      )
+                    }
+                  />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setAliases((prev) => prev.filter((_, i) => i !== idx))
+                    }
+                    className="flex-shrink-0 rounded p-1 text-muted-foreground hover:text-destructive"
+                    title="Remove alias"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={() =>
+                  setAliases((prev) => [
+                    ...prev,
+                    { name: "", record_type: "CNAME" },
+                  ])
+                }
+                disabled={!hostname || !dnsZoneId}
+                className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+              >
+                <Plus className="h-3 w-3" /> Add alias
+              </button>
+            </div>
+          </Field>
+        )}
         <CustomFieldsSection
           definitions={cfDefs}
           values={shownCustomFields}
@@ -4138,8 +4157,11 @@ const ADDRESS_COLUMNS = [
   "pool",
   "dns",
 ] as const;
-function addressColumns(dhcpOn: boolean) {
-  return ADDRESS_COLUMNS.filter((c) => dhcpOn || c !== "pool");
+// ``dns`` reads the DNS sync state, so it goes with ``core.dns`` (#2135).
+function addressColumns(dhcpOn: boolean, dnsOn: boolean) {
+  return ADDRESS_COLUMNS.filter(
+    (c) => (dhcpOn || c !== "pool") && (dnsOn || c !== "dns"),
+  );
 }
 
 function SyncMenu({
@@ -4147,11 +4169,13 @@ function SyncMenu({
   onSyncDhcp,
   onSyncAll,
   hasDhcp,
+  hasDns,
 }: {
   onSyncDns: () => void;
   onSyncDhcp: () => void;
   onSyncAll: () => void;
   hasDhcp: boolean;
+  hasDns: boolean;
 }) {
   return (
     <HeaderMenu
@@ -4159,7 +4183,9 @@ function SyncMenu({
       icon={RefreshCw}
       title="Sync IPAM with DNS and/or DHCP servers"
       items={[
-        { key: "dns", label: "DNS", icon: Globe2, onSelect: onSyncDns },
+        ...(hasDns
+          ? [{ key: "dns", label: "DNS", icon: Globe2, onSelect: onSyncDns }]
+          : []),
         ...(hasDhcp
           ? [
               {
@@ -4168,13 +4194,18 @@ function SyncMenu({
                 icon: Server,
                 onSelect: onSyncDhcp,
               },
-              {
-                key: "all",
-                label: "All",
-                icon: RefreshCw,
-                separatorBefore: true,
-                onSelect: onSyncAll,
-              },
+              // "All" is DHCP + the DNS drift: with DNS off it is just DHCP.
+              ...(hasDns
+                ? [
+                    {
+                      key: "all",
+                      label: "All",
+                      icon: RefreshCw,
+                      separatorBefore: true,
+                      onSelect: onSyncAll,
+                    },
+                  ]
+                : []),
             ]
           : []),
       ]}
@@ -4695,6 +4726,9 @@ export function SubnetDetail({
   onSubnetDeleted?: () => void;
 }) {
   const qc = useQueryClient();
+  // #2135 — everything DNS on this panel (zone-name reads, the DNS column,
+  // the Sync DNS entries, the Aliases tab) goes with core.dns.
+  const dnsOn = useModuleOn("core.dns");
   // #516 — id→name map for the subnet's DNS zones so IPDetailModal can show
   // real zone names instead of "—" (its zoneNameById prop was never passed).
   const subnetDnsGroupIds = useMemo(
@@ -4709,7 +4743,7 @@ export function SubnetDetail({
       );
       return lists.flat();
     },
-    enabled: subnetDnsGroupIds.length > 0,
+    enabled: dnsOn && subnetDnsGroupIds.length > 0,
   });
   const zoneNameById = useMemo(() => {
     const m: Record<string, string> = {};
@@ -4763,6 +4797,7 @@ export function SubnetDetail({
     queryKey: ["dns-sync-summary", subnet.id],
     queryFn: () => ipamApi.dnsSyncSummary(subnet.id),
     refetchOnMount: "always",
+    enabled: dnsOn,
   });
   // Effective-permission self-introspection (#449). Drives gray-out of
   // edit affordances on addresses the operator can't write — the server
@@ -4876,6 +4911,14 @@ export function SubnetDetail({
     "ipam-hide-reserved",
     false,
   );
+  // "Hide free ranges" (#2137): a per-subnet session override of the subnet's
+  // own setting / default rule. Keyed by subnet id so flipping it on one
+  // subnet does not leak to the next; absent = follow the setting.
+  const [freeRangeOverride, setFreeRangeOverride] = useSessionState<
+    Record<string, boolean>
+  >("ipam-hide-free-ranges", {});
+  const hideFreeRanges =
+    freeRangeOverride[subnet.id] ?? !resolveShowFreeRanges(subnet);
   // Rows the "Hide network/broadcast" toggle removes. Defined once so the
   // Select-all `selectable` set can exclude exactly what the table hides —
   // otherwise Select-all would pick hidden rows and a bulk delete/edit would
@@ -4901,6 +4944,9 @@ export function SubnetDetail({
     "addresses" | "dhcp" | "aliases" | "nat" | "trend" | "address-sets" | "bgp"
   >("addresses");
   const { enabled: featureEnabled } = useFeatureModules();
+  // #2100 — NAT mappings are a feature module; while it is off the subnet's
+  // NAT tab, the per-address NAT badges and the mappings modal all go.
+  const natOn = useModuleOn("ipam.nat");
   const [natModalIp, setNatModalIp] = useState<IPAddress | null>(null);
   const [selectedIpIds, setSelectedIpIds] = useState<Set<string>>(new Set());
   // Shift-click range select. ``onChange`` doesn't carry shiftKey, so we
@@ -5000,6 +5046,11 @@ export function SubnetDetail({
     if (dhcpFeatureReady && !dhcpOn && activeSubnetTab === "dhcp")
       setActiveSubnetTab("addresses");
   }, [dhcpFeatureReady, dhcpOn, activeSubnetTab]);
+  // Same for the Aliases tab (#2135): its records are DNS records.
+  useEffect(() => {
+    if (dhcpFeatureReady && !dnsOn && activeSubnetTab === "aliases")
+      setActiveSubnetTab("addresses");
+  }, [dhcpFeatureReady, dnsOn, activeSubnetTab]);
   const { data: dhcpScopes = [] } = useQuery({
     queryKey: ["dhcp-scopes-subnet", subnet.id],
     queryFn: () => dhcpApi.listScopesBySubnet(subnet.id),
@@ -5063,6 +5114,7 @@ export function SubnetDetail({
     queryKey: ["dns-sync-preview", "subnet", subnet.id],
     queryFn: () => ipamApi.dnsSyncPreview(subnet.id),
     staleTime: 30_000,
+    enabled: dnsOn,
   });
   const outOfSyncIpIds = new Set<string>([
     ...(dnsDrift?.missing.map((m) => m.ip_id) ?? []),
@@ -5330,7 +5382,12 @@ export function SubnetDetail({
       // *filtered* list, so a filter that hides allocated rows would fabricate
       // a clickable "N free" range over addresses that are actually in use —
       // and the allocate modal it opens would then collide (#501).
-      if (!hasActiveFilter && prevIpInt !== null && ipInt - prevIpInt > 1) {
+      if (
+        !hasActiveFilter &&
+        !hideFreeRanges &&
+        prevIpInt !== null &&
+        ipInt - prevIpInt > 1
+      ) {
         const lastWasPool = rows[rows.length - 1]?.kind === "pool-boundary";
         const gapStart = prevIpInt + 1;
         const gapEnd = ipInt - 1;
@@ -5360,7 +5417,14 @@ export function SubnetDetail({
     if (hideReserved)
       return rows.filter((r) => r.kind !== "ip" || !isPaddingRow(r.addr));
     return rows;
-  }, [sortedAddresses, sortState, allPools, hasActiveFilter, hideReserved]);
+  }, [
+    sortedAddresses,
+    sortState,
+    allPools,
+    hasActiveFilter,
+    hideReserved,
+    hideFreeRanges,
+  ]);
 
   // #517: window the painted rows. Every op that walks the data
   // (select-all, shift-range, filtering) still uses the full ``tableRows``
@@ -5505,6 +5569,7 @@ export function SubnetDetail({
             </HeaderButton>
             <SyncMenu
               hasDhcp={dhcpOn && dhcpScopes.length > 0}
+              hasDns={dnsOn}
               onSyncDns={() => setShowDnsSync(true)}
               onSyncDhcp={() => setShowDhcpSync(true)}
               onSyncAll={() => setShowSyncAll(true)}
@@ -5724,7 +5789,7 @@ export function SubnetDetail({
         {/* DNS drift banner — only shows when records exist out-of-sync
             with IPAM's expected state. Clicking opens the Sync DNS modal.
             The banner clears on its own once the user applies a sync. */}
-        {dnsDriftSummary && dnsDriftSummary.has_drift && (
+        {dnsOn && dnsDriftSummary && dnsDriftSummary.has_drift && (
           <div className="border-t border-amber-500/40 bg-amber-500/10 px-6 py-2 text-xs">
             <div className="flex items-center justify-between gap-3">
               <div className="flex items-center gap-2 text-amber-900 dark:text-amber-200">
@@ -5779,17 +5844,19 @@ export function SubnetDetail({
               DHCP Pools
             </button>
           )}
-          <button
-            onClick={() => setActiveSubnetTab("aliases")}
-            className={cn(
-              "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
-              activeSubnetTab === "aliases"
-                ? "border-primary text-foreground"
-                : "border-transparent text-muted-foreground hover:text-foreground",
-            )}
-          >
-            Aliases
-          </button>
+          {dnsOn && (
+            <button
+              onClick={() => setActiveSubnetTab("aliases")}
+              className={cn(
+                "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+                activeSubnetTab === "aliases"
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground",
+              )}
+            >
+              Aliases
+            </button>
+          )}
           <button
             onClick={() => setActiveSubnetTab("address-sets")}
             className={cn(
@@ -5802,18 +5869,20 @@ export function SubnetDetail({
           >
             Address Sets
           </button>
-          <button
-            onClick={() => setActiveSubnetTab("nat")}
-            className={cn(
-              "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
-              activeSubnetTab === "nat"
-                ? "border-primary text-foreground"
-                : "border-transparent text-muted-foreground hover:text-foreground",
-            )}
-            title="NAT mappings whose internal IP falls inside this subnet"
-          >
-            NAT
-          </button>
+          {natOn && (
+            <button
+              onClick={() => setActiveSubnetTab("nat")}
+              className={cn(
+                "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+                activeSubnetTab === "nat"
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground",
+              )}
+              title="NAT mappings whose internal IP falls inside this subnet"
+            >
+              NAT
+            </button>
+          )}
           <button
             onClick={() => setActiveSubnetTab("trend")}
             className={cn(
@@ -5882,13 +5951,13 @@ export function SubnetDetail({
         </div>
       )}
 
-      {activeSubnetTab === "aliases" && (
+      {activeSubnetTab === "aliases" && dnsOn && (
         <div className="flex-1 overflow-auto">
           <AliasesSubnetPanel subnetId={subnet.id} />
         </div>
       )}
 
-      {activeSubnetTab === "nat" && (
+      {natOn && activeSubnetTab === "nat" && (
         <div className="flex-1 overflow-auto">
           <NatSubnetPanel subnetId={subnet.id} />
         </div>
@@ -5952,6 +6021,20 @@ export function SubnetDetail({
                     onChange={(e) => setHideReserved(e.target.checked)}
                   />
                   Hide network/broadcast
+                </label>
+                <label className="flex flex-shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground hover:text-foreground">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5"
+                    checked={hideFreeRanges}
+                    onChange={(e) =>
+                      setFreeRangeOverride((prev) => ({
+                        ...prev,
+                        [subnet.id]: e.target.checked,
+                      }))
+                    }
+                  />
+                  Hide free ranges
                 </label>
               </div>
               {inlineEditError && (
@@ -6083,7 +6166,7 @@ export function SubnetDetail({
                           );
                         })()}
                       </th>
-                      {addressColumns(dhcpOn).map((col) => {
+                      {addressColumns(dhcpOn, dnsOn).map((col) => {
                         const label =
                           col === "mac"
                             ? "MAC"
@@ -6180,7 +6263,7 @@ export function SubnetDetail({
                     {showFilters && (
                       <tr className="border-b bg-muted/10 text-xs">
                         <td />
-                        {addressColumns(dhcpOn).map((col) => (
+                        {addressColumns(dhcpOn, dnsOn).map((col) => (
                           <td key={col} className="px-2 py-1">
                             {col === "status" ? (
                               <select
@@ -6557,19 +6640,20 @@ export function SubnetDetail({
                                         : "aliases"}
                                     </span>
                                   )}
-                                  {(addr.nat_mapping_count ?? 0) > 0 && (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setNatModalIp(addr);
-                                      }}
-                                      className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
-                                      title={`Click to view ${addr.nat_mapping_count} NAT mapping${(addr.nat_mapping_count ?? 0) === 1 ? "" : "s"}`}
-                                    >
-                                      NAT {addr.nat_mapping_count}
-                                    </button>
-                                  )}
+                                  {natOn &&
+                                    (addr.nat_mapping_count ?? 0) > 0 && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setNatModalIp(addr);
+                                        }}
+                                        className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
+                                        title={`Click to view ${addr.nat_mapping_count} NAT mapping${(addr.nat_mapping_count ?? 0) === 1 ? "" : "s"}`}
+                                      >
+                                        NAT {addr.nat_mapping_count}
+                                      </button>
+                                    )}
                                 </span>
                               </td>
                               <td className="px-4 py-2 font-mono text-xs">
@@ -6720,37 +6804,39 @@ export function SubnetDetail({
                                   })()}
                                 </td>
                               )}
-                              <td className="px-4 py-2">
-                                {dnsState === "in-sync" ? (
-                                  <span
-                                    className="inline-flex items-center gap-1 text-xs text-emerald-600"
-                                    title="DNS records match IPAM"
-                                  >
-                                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                                    in sync
-                                  </span>
-                                ) : dnsState === "out-of-sync" ? (
-                                  <span
-                                    className="inline-flex items-center gap-1 text-xs text-amber-600"
-                                    title="DNS records are missing or differ — open Sync DNS to reconcile"
-                                  >
-                                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
-                                    out of sync
-                                  </span>
-                                ) : dnsState === "forward-skipped" ? (
-                                  <span
-                                    className="inline-flex items-center gap-1 text-xs text-muted-foreground"
-                                    title={GATEWAY_FORWARD_SKIPPED_NOTE}
-                                  >
-                                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/50" />
-                                    {GATEWAY_FORWARD_SKIPPED_LABEL}
-                                  </span>
-                                ) : (
-                                  <span className="text-muted-foreground/40">
-                                    —
-                                  </span>
-                                )}
-                              </td>
+                              {dnsOn && (
+                                <td className="px-4 py-2">
+                                  {dnsState === "in-sync" ? (
+                                    <span
+                                      className="inline-flex items-center gap-1 text-xs text-emerald-600"
+                                      title="DNS records match IPAM"
+                                    >
+                                      <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                                      in sync
+                                    </span>
+                                  ) : dnsState === "out-of-sync" ? (
+                                    <span
+                                      className="inline-flex items-center gap-1 text-xs text-amber-600"
+                                      title="DNS records are missing or differ — open Sync DNS to reconcile"
+                                    >
+                                      <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
+                                      out of sync
+                                    </span>
+                                  ) : dnsState === "forward-skipped" ? (
+                                    <span
+                                      className="inline-flex items-center gap-1 text-xs text-muted-foreground"
+                                      title={GATEWAY_FORWARD_SKIPPED_NOTE}
+                                    >
+                                      <span className="inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/50" />
+                                      {GATEWAY_FORWARD_SKIPPED_LABEL}
+                                    </span>
+                                  ) : (
+                                    <span className="text-muted-foreground/40">
+                                      —
+                                    </span>
+                                  )}
+                                </td>
+                              )}
                               {/* Seen — recency dot derived from
                                   ``last_seen_at``. Orthogonal to status:
                                   an ``allocated`` row can still be cold,
@@ -7090,7 +7176,7 @@ export function SubnetDetail({
           onClose={() => setScanFromDetail(null)}
         />
       )}
-      {natModalIp && (
+      {natOn && natModalIp && (
         <NatMappingsForIpModal
           ip={natModalIp}
           onClose={() => setNatModalIp(null)}
@@ -7152,6 +7238,17 @@ const SUBNET_STATUSES = [
 ] as const;
 
 // ─── DNS Sync Modal ──────────────────────────────────────────────────────────
+
+// One missing row per IP, record type AND zone: an address with extra zones
+// (#2107) can be missing its A in more than one zone, and a key without the
+// zone collapsed those rows into one selection and one React key.
+function missingKey(m: {
+  ip_id: string;
+  record_type: string;
+  zone_id: string;
+}): string {
+  return `${m.ip_id}:${m.record_type}:${m.zone_id}`;
+}
 
 type DnsSyncScope =
   | { kind: "subnet"; id: string; label: string }
@@ -7232,9 +7329,7 @@ function DnsSyncModal({
   // individual rows to skip suspected manual edits.
   useEffect(() => {
     if (!data) return;
-    setSelMissing(
-      new Set(data.missing.map((m) => m.ip_id + ":" + m.record_type)),
-    );
+    setSelMissing(new Set(data.missing.map((m) => missingKey(m))));
     setSelMismatched(new Set(data.mismatched.map((m) => m.record_id)));
     setSelStale(new Set(data.stale.map((s) => s.record_id)));
   }, [data]);
@@ -7253,12 +7348,13 @@ function DnsSyncModal({
       } catch (e) {
         setBackfillError((e as Error).message || "Backfill failed");
       }
-      // missing items keyed as `ip_id:record_type` so a single IP can have
-      // both A and PTR ticked or unticked independently. Backend just needs
-      // unique IP IDs to re-sync — sync_dns_record handles both records.
+      // missing items keyed as `ip_id:record_type:zone_id` so a single IP can
+      // have its A, its PTR and each extra-zone A (#2107) ticked or unticked
+      // independently. Backend just needs unique IP IDs to re-sync —
+      // sync_dns_record handles every record.
       const ipIds = new Set<string>();
       for (const m of data.missing) {
-        if (selMissing.has(m.ip_id + ":" + m.record_type)) ipIds.add(m.ip_id);
+        if (selMissing.has(missingKey(m))) ipIds.add(m.ip_id);
       }
       return commitFn({
         create_for_ip_ids: Array.from(ipIds),
@@ -7441,14 +7537,14 @@ function DnsSyncModal({
                   selected={selMissing.size}
                   onToggleAll={() =>
                     toggleAll(
-                      data.missing.map((m) => m.ip_id + ":" + m.record_type),
+                      data.missing.map((m) => missingKey(m)),
                       selMissing,
                       setSelMissing,
                     )
                   }
                 >
                   {data.missing.map((m) => {
-                    const key = m.ip_id + ":" + m.record_type;
+                    const key = missingKey(m);
                     return (
                       <DriftRow
                         key={key}
@@ -7902,6 +7998,14 @@ export function EditSubnetModal({
   const [doNotProbeReason, setDoNotProbeReason] = useState(
     subnet.do_not_probe_reason ?? "",
   );
+  // Free-range rows (#2137): "" = default rule, otherwise explicit.
+  const [showFreeRanges, setShowFreeRanges] = useState<"" | "show" | "hide">(
+    subnet.show_free_ranges == null
+      ? ""
+      : subnet.show_free_ranges
+        ? "show"
+        : "hide",
+  );
   const probePolicyQ = useQuery({
     queryKey: ["subnet-probe-policy", subnet.id],
     queryFn: () => ipamApi.getSubnetProbePolicy(subnet.id),
@@ -7937,7 +8041,12 @@ export function EditSubnetModal({
     | "advanced"
     | "danger";
   const dhcpOn = useModuleOn("core.dhcp");
-  const [tab, setTab] = useState<SubnetEditTab>("general");
+  // #2135 — the DNS tab is hidden while core.dns is off; a tab left
+  // selected (the default, for a space) falls back to one that exists.
+  const dnsOn = useModuleOn("core.dns");
+  const [tabChoice, setTab] = useState<SubnetEditTab>("general");
+  const tab: SubnetEditTab =
+    tabChoice === "dns" && !dnsOn ? "general" : tabChoice;
 
   // Detect whether network/broadcast records currently exist
   const { data: addresses } = useQuery({
@@ -8039,6 +8148,8 @@ export function EditSubnetModal({
         discovery_interval_minutes: discoveryIntervalMinutes,
         do_not_probe: doNotProbe,
         do_not_probe_reason: doNotProbeReason,
+        show_free_ranges:
+          showFreeRanges === "" ? null : showFreeRanges === "show",
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
@@ -8225,9 +8336,9 @@ export function EditSubnetModal({
 
   const tabsList: { key: SubnetEditTab; label: string }[] = [
     { key: "general", label: "General" },
-    { key: "dns", label: "DNS" },
+    ...(dnsOn ? [{ key: "dns" as const, label: "DNS" }] : []),
     ...(dhcpOn ? [{ key: "dhcp" as const, label: "DHCP" }] : []),
-    ...(dhcpOn ? [{ key: "ddns" as const, label: "DDNS" }] : []),
+    ...(dhcpOn && dnsOn ? [{ key: "ddns" as const, label: "DDNS" }] : []),
     { key: "advanced", label: "Advanced" },
   ];
   if (onDeleted) {
@@ -8438,6 +8549,30 @@ export function EditSubnetModal({
               inherited={probeInherited}
               inheritedFrom={probeInheritedFrom}
             />
+          </div>
+          <div className="border-t pt-4">
+            <label className="block text-xs font-medium">
+              Free-range rows in the address table
+              <select
+                aria-label="Free-range rows"
+                className="mt-1 block w-full rounded-md border bg-background px-2 py-1 text-sm"
+                value={showFreeRanges}
+                onChange={(e) =>
+                  setShowFreeRanges(e.target.value as "" | "show" | "hide")
+                }
+              >
+                <option value="">
+                  Default (hidden for integration-owned or larger than a /16)
+                </option>
+                <option value="show">Show</option>
+                <option value="hide">Hide</option>
+              </select>
+            </label>
+            <p className="mt-1 text-xs italic text-muted-foreground">
+              Whether the green &quot;N free · click to allocate&quot; rows
+              appear between allocated addresses. Display only — allocation and
+              utilization are unaffected.
+            </p>
           </div>
           <div className="border-t pt-4">
             <ClassificationSection
@@ -8999,12 +9134,15 @@ export function EditAddressModal({
     },
   });
 
+  // #2135 — no zone reads while core.dns is off, so no zone picker either.
+  const dnsOn = useModuleOn("core.dns");
   const zoneGroupIds: string[] = effectiveDns?.dns_group_ids ?? [];
   const zoneQueries = useQueries({
     queries: (zoneGroupIds as string[]).map((gId: string) => ({
       queryKey: ["dns-zones", gId],
       queryFn: () => dnsApi.listZones(gId),
       staleTime: 60_000,
+      enabled: dnsOn,
     })),
   });
   const allGroupZones: DNSZone[] = zoneQueries
@@ -9370,82 +9508,84 @@ export function EditAddressModal({
           </div>
         ) : null}
 
-        <Field label="DNS Aliases">
-          <div className="space-y-1.5">
-            <p className="text-[11px] text-muted-foreground -mt-0.5">
-              Extra records pointing to this IP. Added records are removed
-              automatically when the IP is purged.
-            </p>
-            {existingAliases.length === 0 ? (
-              <p className="text-xs text-muted-foreground/60 italic">
-                No aliases.
+        {dnsOn && (
+          <Field label="DNS Aliases">
+            <div className="space-y-1.5">
+              <p className="text-[11px] text-muted-foreground -mt-0.5">
+                Extra records pointing to this IP. Added records are removed
+                automatically when the IP is purged.
               </p>
-            ) : (
-              <div className="space-y-1">
-                {existingAliases.map((a) => (
-                  <div
-                    key={a.id}
-                    className="flex items-center gap-2 rounded-md border bg-muted/30 px-2 py-1"
-                  >
-                    <span className="rounded bg-background px-1.5 py-0.5 text-[10px] font-medium">
-                      {a.record_type}
-                    </span>
-                    <span className="flex-1 truncate font-mono text-xs">
-                      {a.fqdn}
-                    </span>
-                    <span className="text-[11px] text-muted-foreground truncate">
-                      → {a.value}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => delAliasMut.mutate(a.id)}
-                      className="flex-shrink-0 rounded p-0.5 text-muted-foreground hover:text-destructive"
-                      title="Delete alias"
+              {existingAliases.length === 0 ? (
+                <p className="text-xs text-muted-foreground/60 italic">
+                  No aliases.
+                </p>
+              ) : (
+                <div className="space-y-1">
+                  {existingAliases.map((a) => (
+                    <div
+                      key={a.id}
+                      className="flex items-center gap-2 rounded-md border bg-muted/30 px-2 py-1"
                     >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="flex items-center gap-2 pt-1">
-              <select
-                className={cn(inputCls, "w-24")}
-                value={newAliasType}
-                onChange={(e) =>
-                  setNewAliasType(e.target.value as "CNAME" | "A")
-                }
-              >
-                <option value="CNAME">CNAME</option>
-                <option value="A">A</option>
-              </select>
-              <input
-                className={cn(inputCls, "flex-1 min-w-0")}
-                placeholder="alias name (e.g. www, mail)"
-                value={newAliasName}
-                onChange={(e) => setNewAliasName(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && newAliasName.trim()) {
-                    e.preventDefault();
-                    addAliasMut.mutate();
+                      <span className="rounded bg-background px-1.5 py-0.5 text-[10px] font-medium">
+                        {a.record_type}
+                      </span>
+                      <span className="flex-1 truncate font-mono text-xs">
+                        {a.fqdn}
+                      </span>
+                      <span className="text-[11px] text-muted-foreground truncate">
+                        → {a.value}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => delAliasMut.mutate(a.id)}
+                        className="flex-shrink-0 rounded p-0.5 text-muted-foreground hover:text-destructive"
+                        title="Delete alias"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="flex items-center gap-2 pt-1">
+                <select
+                  className={cn(inputCls, "w-24")}
+                  value={newAliasType}
+                  onChange={(e) =>
+                    setNewAliasType(e.target.value as "CNAME" | "A")
                   }
-                }}
-              />
-              <button
-                type="button"
-                onClick={() => addAliasMut.mutate()}
-                disabled={
-                  !newAliasName.trim() ||
-                  addAliasMut.isPending ||
-                  !(address.forward_zone_id || effectiveDns?.dns_zone_id)
-                }
-                className="flex-shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
-              >
-                <Plus className="h-3 w-3 inline" /> Add
-              </button>
+                >
+                  <option value="CNAME">CNAME</option>
+                  <option value="A">A</option>
+                </select>
+                <input
+                  className={cn(inputCls, "flex-1 min-w-0")}
+                  placeholder="alias name (e.g. www, mail)"
+                  value={newAliasName}
+                  onChange={(e) => setNewAliasName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && newAliasName.trim()) {
+                      e.preventDefault();
+                      addAliasMut.mutate();
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => addAliasMut.mutate()}
+                  disabled={
+                    !newAliasName.trim() ||
+                    addAliasMut.isPending ||
+                    !(address.forward_zone_id || effectiveDns?.dns_zone_id)
+                  }
+                  className="flex-shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+                >
+                  <Plus className="h-3 w-3 inline" /> Add
+                </button>
+              </div>
             </div>
-          </div>
-        </Field>
+          </Field>
+        )}
 
         <CustomFieldsSection
           definitions={cfDefs}
@@ -10288,12 +10428,15 @@ function BulkEditAddressesModal({
     enabled: !!subnetId,
     staleTime: 30_000,
   });
+  // #2135 — no zone reads while core.dns is off, so no zone picker either.
+  const dnsOn = useModuleOn("core.dns");
   const zoneGroupIds: string[] = effectiveDns?.dns_group_ids ?? [];
   const zoneQueries = useQueries({
     queries: zoneGroupIds.map((gId: string) => ({
       queryKey: ["dns-zones", gId],
       queryFn: () => dnsApi.listZones(gId),
       staleTime: 60_000,
+      enabled: dnsOn,
     })),
   });
   const allGroupZones: DNSZone[] = zoneQueries
@@ -11426,9 +11569,18 @@ export function EditSpaceModal({
     space.do_not_probe_reason ?? "",
   );
   const dhcpOn = useModuleOn("core.dhcp");
-  const [tab, setTab] = useState<"dns" | "dhcp" | "networking" | "danger">(
-    "dns",
-  );
+  // #2135 — the DNS tab is hidden while core.dns is off; a tab left
+  // selected (the default, for a space) falls back to one that exists.
+  const dnsOn = useModuleOn("core.dns");
+  const [tabChoice, setTab] = useState<
+    "dns" | "dhcp" | "networking" | "danger"
+  >("dns");
+  const tab =
+    tabChoice === "dns" && !dnsOn
+      ? dhcpOn
+        ? "dhcp"
+        : "networking"
+      : tabChoice;
 
   const saveMutation = useMutation({
     mutationFn: () => {
@@ -11625,7 +11777,7 @@ export function EditSpaceModal({
 
       <ModalTabs
         tabs={[
-          { key: "dns", label: "DNS" },
+          ...(dnsOn ? [{ key: "dns" as const, label: "DNS" }] : []),
           ...(dhcpOn ? [{ key: "dhcp" as const, label: "DHCP" }] : []),
           { key: "networking", label: "Networking" },
           { key: "danger", label: "Danger zone" },
@@ -11881,9 +12033,13 @@ export function CreateBlockModal({
   // Optional template pre-fill (issue #26).
   const [templateId, setTemplateId] = useState<string>("");
   const dhcpOn = useModuleOn("core.dhcp");
-  const [tab, setTab] = useState<"general" | "dns" | "dhcp" | "networking">(
-    "general",
-  );
+  // #2135 — the DNS tab is hidden while core.dns is off; a tab left
+  // selected (the default, for a space) falls back to one that exists.
+  const dnsOn = useModuleOn("core.dns");
+  const [tabChoice, setTab] = useState<
+    "general" | "dns" | "dhcp" | "networking"
+  >("general");
+  const tab = tabChoice === "dns" && !dnsOn ? "general" : tabChoice;
 
   const { data: existingBlocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -12006,7 +12162,7 @@ export function CreateBlockModal({
       <ModalTabs
         tabs={[
           { key: "general", label: "General" },
-          { key: "dns", label: "DNS" },
+          ...(dnsOn ? [{ key: "dns" as const, label: "DNS" }] : []),
           ...(dhcpOn ? [{ key: "dhcp" as const, label: "DHCP" }] : []),
           { key: "networking", label: "Networking" },
         ]}
@@ -12201,9 +12357,13 @@ export function EditBlockModal({
     block.do_not_probe_reason ?? "",
   );
   const dhcpOn = useModuleOn("core.dhcp");
-  const [tab, setTab] = useState<
+  // #2135 — the DNS tab is hidden while core.dns is off; a tab left
+  // selected (the default, for a space) falls back to one that exists.
+  const dnsOn = useModuleOn("core.dns");
+  const [tabChoice, setTab] = useState<
     "general" | "dns" | "dhcp" | "networking" | "danger"
   >("general");
+  const tab = tabChoice === "dns" && !dnsOn ? "general" : tabChoice;
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_block"],
@@ -12447,7 +12607,7 @@ export function EditBlockModal({
       <ModalTabs
         tabs={[
           { key: "general", label: "General" },
-          { key: "dns", label: "DNS" },
+          ...(dnsOn ? [{ key: "dns" as const, label: "DNS" }] : []),
           ...(dhcpOn ? [{ key: "dhcp" as const, label: "DHCP" }] : []),
           { key: "networking", label: "Networking" },
           { key: "danger", label: "Danger zone" },
@@ -12796,7 +12956,7 @@ function BlockTreeRow({
 
 // ─── Block Detail View (right panel when block is selected) ──────────────────
 
-function BlockDetailView({
+export function BlockDetailView({
   block: initialBlock,
   spaceName,
   ancestors,
@@ -12847,7 +13007,12 @@ function BlockDetailView({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
+  // #2046 — what the delete dialog describes, frozen when it opens. A filed
+  // approval request clears `selected` while the dialog stays open.
+  const [bulkDeleteKeys, setBulkDeleteKeys] = useState<string[]>([]);
   const [showDnsSync, setShowDnsSync] = useState(false);
+  // #2135 — Sync DNS reads and writes the DNS server: hidden with core.dns off.
+  const dnsOn = useModuleOn("core.dns");
   const [showFindFree, setShowFindFree] = useState(false);
   const [showSplitSubnet, setShowSplitSubnet] = useState(false);
   const [showMergeSubnet, setShowMergeSubnet] = useState(false);
@@ -12872,10 +13037,12 @@ function BlockDetailView({
     // allSettled on both phases so a single 409 (non-empty subnet/block)
     // doesn't hide the rest. Subnets first — a subnet hanging off a leaf
     // block would otherwise trip the block's RESTRICT FK on cascade.
-    mutationFn: async () => {
+    // #2046 — sends the keys the dialog was opened with (`bulkDeleteKeys`),
+    // not the live selection, so the confirm describes exactly what goes out.
+    mutationFn: async (keys: string[]) => {
       const subnetIds: string[] = [];
       const blockIds: string[] = [];
-      for (const key of selected) {
+      for (const key of keys) {
         if (key.startsWith("subnet:"))
           subnetIds.push(key.slice("subnet:".length));
         else if (key.startsWith("block:"))
@@ -12945,6 +13112,13 @@ function BlockDetailView({
         setShowBulkDelete(false);
         setBlockBulkDeleteNotice(null);
         return;
+      }
+      if (queued === 0) {
+        // #2046 — a retry resends only what failed: the rest are already in
+        // Trash, and resending them would report them as new failures.
+        const failed = failures.map((f) => `${f.kind}:${f.id}`);
+        setBulkDeleteKeys(failed);
+        setSelected(new Set(failed));
       }
       const subnetLookup = new Map(allSubnets.map((s) => [s.id, s.network]));
       const blockLookup = new Map(allBlocks.map((b) => [b.id, b.network]));
@@ -13055,7 +13229,10 @@ function BlockDetailView({
                 <HeaderButton
                   variant="destructive"
                   icon={Trash2}
-                  onClick={() => setShowBulkDelete(true)}
+                  onClick={() => {
+                    setBulkDeleteKeys([...selected]);
+                    setShowBulkDelete(true);
+                  }}
                 >
                   Delete ({selectedCount})
                 </HeaderButton>
@@ -13066,13 +13243,15 @@ function BlockDetailView({
             ) : (
               <>
                 <AggregationCandidatesBadge blockId={block.id} />
-                <HeaderButton
-                  icon={Globe2}
-                  onClick={() => setShowDnsSync(true)}
-                  title="Reconcile IPAM-managed DNS records across every subnet under this block"
-                >
-                  Sync DNS
-                </HeaderButton>
+                {dnsOn && (
+                  <HeaderButton
+                    icon={Globe2}
+                    onClick={() => setShowDnsSync(true)}
+                    title="Reconcile IPAM-managed DNS records across every subnet under this block"
+                  >
+                    Sync DNS
+                  </HeaderButton>
+                )}
                 <ExportButton scope={{ block_id: block.id }} label="Export" />
                 <ServicesUsingButton
                   kind="ip_block"
@@ -13316,8 +13495,12 @@ function BlockDetailView({
       )}
       {showBulkDelete &&
         (() => {
-          const sCount = selectedSubnetIds.length;
-          const bCount = selectedBlockKeys.length;
+          const sCount = bulkDeleteKeys.filter((k) =>
+            k.startsWith("subnet:"),
+          ).length;
+          const bCount = bulkDeleteKeys.filter((k) =>
+            k.startsWith("block:"),
+          ).length;
           const noun =
             sCount && bCount
               ? `${sCount} subnet${sCount === 1 ? "" : "s"} + ${bCount} block${bCount === 1 ? "" : "s"}`
@@ -13341,6 +13524,7 @@ function BlockDetailView({
               notice={blockBulkDeleteNotice}
               onClose={() => {
                 setShowBulkDelete(false);
+                setBulkDeleteKeys([]);
                 setBlockBulkDeleteError(null);
                 setBlockBulkDeleteNotice(null);
                 blockBulkDeleteMut.reset();
@@ -13348,7 +13532,7 @@ function BlockDetailView({
               onConfirm={() => {
                 setBlockBulkDeleteError(null);
                 setBlockBulkDeleteNotice(null);
-                blockBulkDeleteMut.mutate();
+                blockBulkDeleteMut.mutate(bulkDeleteKeys);
               }}
             />
           );
@@ -14207,7 +14391,7 @@ function MulticastGroupsPanel({
   );
 }
 
-function SpaceTableView({
+export function SpaceTableView({
   space,
   onSelectSubnet,
   onSelectBlock,
@@ -14248,6 +14432,8 @@ function SpaceTableView({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkOpen, setBulkOpen] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
+  // #2046 — what the delete dialog describes, frozen when it opens.
+  const [bulkDeleteKeys, setBulkDeleteKeys] = useState<string[]>([]);
   const [showEditSpace, setShowEditSpace] = useState(false);
   const [showCreateBlock, setShowCreateBlock] = useState(false);
   const [showCreateSubnet, setShowCreateSubnet] = useState(false);
@@ -14267,6 +14453,8 @@ function SpaceTableView({
     status: "",
   });
   const [showDnsSync, setShowDnsSync] = useState(false);
+  // #2135 — Sync DNS reads and writes the DNS server: hidden with core.dns off.
+  const dnsOn = useModuleOn("core.dns");
 
   const [spaceBulkDeleteError, setSpaceBulkDeleteError] = useState<
     string | null
@@ -14278,10 +14466,12 @@ function SpaceTableView({
     // allSettled on both phases so a single 409 (non-empty subnet/block)
     // doesn't hide the rest. Subnets first — a subnet hanging off a leaf
     // block would otherwise trip the block's RESTRICT FK.
-    mutationFn: async () => {
+    // #2046 — sends the keys the dialog was opened with (`bulkDeleteKeys`),
+    // not the live selection, so the confirm describes exactly what goes out.
+    mutationFn: async (keys: string[]) => {
       const subnetIds: string[] = [];
       const blockIds: string[] = [];
-      for (const key of selected) {
+      for (const key of keys) {
         if (key.startsWith("subnet:"))
           subnetIds.push(key.slice("subnet:".length));
         else if (key.startsWith("block:"))
@@ -14354,6 +14544,13 @@ function SpaceTableView({
         setShowBulkDelete(false);
         setSpaceBulkDeleteNotice(null);
         return;
+      }
+      if (queued === 0) {
+        // #2046 — a retry resends only what failed: the rest are already in
+        // Trash, and resending them would report them as new failures.
+        const failed = failures.map((f) => `${f.kind}:${f.id}`);
+        setBulkDeleteKeys(failed);
+        setSelected(new Set(failed));
       }
       const lookup = new Map<string, string>();
       (subnets ?? []).forEach((s) => lookup.set(s.id, s.network));
@@ -14507,19 +14704,24 @@ function SpaceTableView({
                 <HeaderButton
                   variant="destructive"
                   icon={Trash2}
-                  onClick={() => setShowBulkDelete(true)}
+                  onClick={() => {
+                    setBulkDeleteKeys([...selected]);
+                    setShowBulkDelete(true);
+                  }}
                 >
                   Delete ({selectedCount})
                 </HeaderButton>
               </>
             )}
-            <HeaderButton
-              icon={Globe2}
-              onClick={() => setShowDnsSync(true)}
-              title="Reconcile IPAM-managed DNS records across every subnet in this space"
-            >
-              Sync DNS
-            </HeaderButton>
+            {dnsOn && (
+              <HeaderButton
+                icon={Globe2}
+                onClick={() => setShowDnsSync(true)}
+                title="Reconcile IPAM-managed DNS records across every subnet in this space"
+              >
+                Sync DNS
+              </HeaderButton>
+            )}
             <ExportButton scope={{ space_id: space.id }} label="Export" />
             {/* Add block is a primary space-level structural action (blocks are
                 the top-level child of a space), so it sits as a visible button
@@ -15024,10 +15226,10 @@ function SpaceTableView({
         })()}
       {showBulkDelete &&
         (() => {
-          const subnetCount = [...selected].filter((k) =>
+          const subnetCount = bulkDeleteKeys.filter((k) =>
             k.startsWith("subnet:"),
           ).length;
-          const blockCount = [...selected].filter((k) =>
+          const blockCount = bulkDeleteKeys.filter((k) =>
             k.startsWith("block:"),
           ).length;
           const parts: string[] = [];
@@ -15046,6 +15248,7 @@ function SpaceTableView({
               notice={spaceBulkDeleteNotice}
               onClose={() => {
                 setShowBulkDelete(false);
+                setBulkDeleteKeys([]);
                 setSpaceBulkDeleteError(null);
                 setSpaceBulkDeleteNotice(null);
                 bulkDeleteMut.reset();
@@ -15053,7 +15256,7 @@ function SpaceTableView({
               onConfirm={() => {
                 setSpaceBulkDeleteError(null);
                 setSpaceBulkDeleteNotice(null);
-                bulkDeleteMut.mutate();
+                bulkDeleteMut.mutate(bulkDeleteKeys);
               }}
             />
           );

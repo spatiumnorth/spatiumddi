@@ -55,6 +55,8 @@ from urllib.parse import urlparse, urlunparse
 
 import structlog
 
+from .ha_tls import credential_from_failover, tls_paths
+
 _log = structlog.get_logger(__name__)
 
 # Well-known DHCPv4 option codes we emit by name when present in the bundle.
@@ -907,12 +909,33 @@ def _resolve_peer_url(url: str) -> str:
         return url
 
 
+# Where ``sync`` writes the HA peer credential (``<state_dir>/ha-tls``) when
+# the caller does not say otherwise.
+DEFAULT_HA_TLS_DIR = "/var/lib/spatium-dhcp-agent/ha-tls"
+
+
 # #980 — see the ``multi-threading`` block in _ha_hook for why the HA hook's
 # HTTP pools are pinned rather than left to follow the packet-worker pool.
 _HA_HTTP_THREADS = 4
 
 
-def _ha_hook(failover: dict[str, Any]) -> dict[str, Any]:
+def _https(url: str) -> str:
+    """``url`` with an ``https`` scheme (the peer listener speaks TLS).
+
+    The port is kept: a URL with none meant 80 under ``http``, and Kea would
+    read the same URL under ``https`` as 443 — moving the listener off the
+    port the appliance firewall opened from the stored ``ha_peer_url``.
+    """
+    p = urlparse(url)
+    if p.scheme.lower() != "http":
+        return url
+    netloc = p.netloc
+    if p.port is None:
+        netloc = f"{netloc}:80"
+    return urlunparse(("https", netloc, p.path or "/", p.params, p.query, p.fragment))
+
+
+def _ha_hook(failover: dict[str, Any], ha_tls_dir: str = DEFAULT_HA_TLS_DIR) -> dict[str, Any]:
     """Render the ``libdhcp_ha.so`` hook entry from a failover payload.
 
     Shape mirrors Kea's HA hook reference (ARM §14.3): the hook takes
@@ -920,16 +943,31 @@ def _ha_hook(failover: dict[str, Any]) -> dict[str, Any]:
     list with one entry per relationship. Each entry has
     ``this-server-name``, ``mode``, a ``peers`` array, and heartbeat
     tuning.
+
+    When the payload carries the group's peer credential (``failover.tls``),
+    the relationship is rendered with ``trust-anchor`` / ``cert-file`` /
+    ``key-file`` (written to ``ha_tls_dir`` by ``ha_tls.materialise``) and
+    ``require-client-certs``. Kea then runs its dedicated listener as a TLS
+    server that refuses any client without a certificate issued by the
+    group's CA, and verifies its partner the same way when it is the client.
+    That — not ``basic-auth-user`` — is what the listener enforces: in Kea
+    3.0 the HA hook only ever SENDS basic-auth, it never checks it on its own
+    listener (``CmdResponseCreator::http_auth_config_`` is left unset).
     """
-    peers = [
-        {
-            "name": p["name"],
-            "url": _resolve_peer_url(p["url"]),
-            "role": p["role"],
-            "auto-failover": bool(p.get("auto-failover", True)),
-        }
-        for p in failover["peers"]
-    ]
+    use_tls = credential_from_failover(failover) is not None
+    peers = []
+    for p in failover["peers"]:
+        url = _resolve_peer_url(p["url"])
+        peers.append(
+            {
+                "name": p["name"],
+                # Kea refuses an ``https`` URL without TLS and the listener
+                # speaks only TLS once it is configured, so the scheme follows.
+                "url": _https(url) if use_tls else url,
+                "role": p["role"],
+                "auto-failover": bool(p.get("auto-failover", True)),
+            }
+        )
     relationship = {
         # #980 — pin the HA hook's OWN thread pools.
         #
@@ -962,8 +1000,14 @@ def _ha_hook(failover: dict[str, Any]) -> dict[str, Any]:
         "max-response-delay": int(failover.get("max_response_delay_ms", 60000)),
         "max-ack-delay": int(failover.get("max_ack_delay_ms", 10000)),
         "max-unacked-clients": int(failover.get("max_unacked_clients", 5)),
+        # Kea 3.0's default, stated explicitly: the dedicated listener accepts
+        # only the commands the HA hook itself sends.
+        "restrict-commands": True,
         "peers": peers,
     }
+    if use_tls:
+        relationship.update(tls_paths(ha_tls_dir))
+        relationship["require-client-certs"] = True
     return {
         "library": "/usr/lib/kea/hooks/libdhcp_ha.so",
         "parameters": {"high-availability": [relationship]},
@@ -1169,6 +1213,7 @@ def render(
     control_socket_v6: str | None = None,
     lease_file_v6: str | None = None,
     v6_unicast: list[tuple[str, str]] | None = None,
+    ha_tls_dir: str = DEFAULT_HA_TLS_DIR,
 ) -> dict[str, Any]:
     """Render a ConfigBundle into a Kea config document.
 
@@ -1272,7 +1317,7 @@ def render(
     # the lease_cmds hook above is load-bearing here too.
     failover = bundle.get("failover")
     if isinstance(failover, dict) and failover.get("peers"):
-        dhcp4["hooks-libraries"].append(_ha_hook(failover))
+        dhcp4["hooks-libraries"].append(_ha_hook(failover, ha_tls_dir))
 
     opts = _options_from_mapping(bundle.get("global_options"))
     if opts:

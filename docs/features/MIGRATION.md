@@ -78,9 +78,12 @@ Five sources, all reducing to canonical `ImportedZone` + `ImportedRecord`:
 
 - **BIND9 archive** — upload a `.zip` / `.tar(.gz|.bz2|.xz)` containing
   `named.conf` + the referenced master files. The parser walks every
-  `zone "…" { … }` declaration (including those nested in `view {}`
-  blocks), resolves the `file "…"` directive inside the archive, and
-  parses each master file. ACL / controls / logging / key declarations
+  `zone "…" [class] { … }` declaration (including those nested in
+  `view {}` blocks), resolves the `file "…"` directive inside the
+  archive, and parses each master file. Only class `IN` zones import;
+  `hint` / `mirror` / `redirect` / `static-stub` / `delegation-only`
+  zones, unquoted zone names and `include`d files are not read, and
+  each is named in the preview's warnings. ACL / controls / logging / key declarations
   stay out of scope; DNSSEC records (DNSKEY / RRSIG / NSEC* / DS) are
   stripped with a warning — re-sign post-import via the zone DNSSEC tab.
 - **Windows DNS live-pull** — pick a registered `windows_dns` server

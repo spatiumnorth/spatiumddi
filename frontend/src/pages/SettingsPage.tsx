@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   settingsApi,
   authApi,
+  formatApiError,
   type OUITaskStatus,
   type PlatformSettings,
 } from "@/lib/api";
@@ -896,6 +897,7 @@ const SECTIONS: SectionDef[] = [
     id: "dns",
     title: "DNS Defaults",
     group: "DNS",
+    module: "core.dns",
     description: "Default values applied to new zones and server groups.",
     keywords: ["zone", "ttl", "dnssec", "recursion", "agent", "key"],
   },
@@ -903,6 +905,7 @@ const SECTIONS: SectionDef[] = [
     id: "dns-auto-sync",
     title: "IPAM → DNS Reconciliation",
     group: "DNS",
+    module: "core.dns",
     description:
       "Catches drift between IPAM's expected records (hostname + IP) and SpatiumDDI's DNS DB. Fills in missing A/AAAA/PTR when the live sync missed one — e.g. bulk imports or a previously failed push.",
     keywords: [
@@ -938,6 +941,7 @@ const SECTIONS: SectionDef[] = [
     id: "dns-pull-from-server",
     title: "Zone ↔ Server Reconciliation",
     group: "DNS",
+    module: "core.dns",
     description:
       "Catches drift between SpatiumDDI's DNS DB and the authoritative server's wire (Windows DNS today). AXFR imports out-of-band edits; any DB-only records get pushed back via RFC 2136. Additive only — never deletes.",
     keywords: [
@@ -961,6 +965,7 @@ const SECTIONS: SectionDef[] = [
     id: "dns-tld-registry",
     title: "TLD Registry",
     group: "DNS",
+    module: "core.dns",
     description:
       "IANA's root-zone list, which decides whether a zone name reads as Public, Private, Undelegated or Reverse. A copy ships with every release; refresh on demand to pick up TLDs delegated since. No scheduled fetch.",
     keywords: [
@@ -1389,7 +1394,10 @@ export function SettingsPage() {
 
           {mutation.isError && (
             <div className="rounded-md border border-destructive/30 bg-destructive/10 px-4 py-2 text-sm text-destructive">
-              Failed to save settings. Please try again.
+              {formatApiError(
+                mutation.error,
+                "Failed to save settings. Please try again.",
+              )}
             </div>
           )}
 
@@ -1402,6 +1410,7 @@ export function SettingsPage() {
                 >
                   <input
                     value={values.app_title ?? ""}
+                    maxLength={255}
                     onChange={(e) => set("app_title", e.target.value)}
                     disabled={!isSuperadmin}
                     className={cn(inputCls, "w-48")}
@@ -1413,6 +1422,7 @@ export function SettingsPage() {
                 >
                   <input
                     value={values.app_base_url ?? ""}
+                    maxLength={500}
                     onChange={(e) => set("app_base_url", e.target.value)}
                     placeholder="https://ddi.example.com"
                     disabled={!isSuperadmin}

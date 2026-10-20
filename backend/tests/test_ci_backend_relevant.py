@@ -90,6 +90,9 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_txt_helper_parity.py": ("agent/dns/spatium_dns_agent/drivers/_txt.py"),
     # #1765 — the BIND address-match translator is duplicated in the agent.
     "test_technitium_acl_parity.py": ("agent/dns/spatium_dns_agent/drivers/technitium.py"),
+    # #2121 — the forward-zone transport helper is duplicated, whole, in the
+    # agent; covered by the agent/dns/spatium_dns_agent/ carve-out.
+    "test_zone_forward_transport.py": ("agent/dns/spatium_dns_agent/drivers/_forwarders.py"),
     "test_ntp_initial_seed.py": ("appliance/mkosi.extra/usr/local/bin/spatiumddi-firstboot"),
     # #972 — the HELD endpoint is mounted at the application root, so it needs
     # its own nginx location block in BOTH shipped templates or it falls
