@@ -41,7 +41,11 @@ from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
-from app.services.integration_credentials import CredentialStatus, credential_status
+from app.services.integration_credentials import (
+    CREDENTIAL_PROBLEM_STATES,
+    CredentialStatus,
+    credential_status,
+)
 from app.services.tailscale.client import is_auth_rejected
 
 router = APIRouter()
@@ -130,6 +134,21 @@ def _is_stale(last: datetime | None, interval_seconds: int, now: datetime) -> bo
     return (now - last) > timedelta(seconds=threshold)
 
 
+def _cap_rows(rows: list[IntegrationTargetRow]) -> list[IntegrationTargetRow]:
+    """Cap the row list, but never let the cap hide a problem (#2192).
+
+    Targets with a credential problem or a sync error come first (stable
+    within each group), and they are all kept even past the cap.
+    """
+
+    def has_problem(r: IntegrationTargetRow) -> bool:
+        return r.credential_state in CREDENTIAL_PROBLEM_STATES or bool(r.last_sync_error)
+
+    problems = [r for r in rows if has_problem(r)]
+    rest = [r for r in rows if not has_problem(r)]
+    return (problems + rest)[: max(_TARGET_LIMIT, len(problems))]
+
+
 def _build_panel(
     *,
     kind: str,
@@ -165,9 +184,9 @@ def _build_panel(
             warnings += 1
         else:
             healthy += 1
-        # A disabled target syncs nothing, so a lapsed credential breaks
-        # nothing and ``secret_expiring`` skips it; the dashboard does too.
-        cred = credential(t) if credential is not None and getattr(t, "enabled", True) else None
+        # A disabled target reads ``disabled`` (#2191): the rule lives in
+        # integration_credentials.credential_status.
+        cred = credential(t) if credential is not None else None
         rows.append(
             IntegrationTargetRow(
                 id=str(t.id),
@@ -191,7 +210,7 @@ def _build_panel(
         stale_count=stale,
         error_count=errors,
         warning_count=warnings,
-        targets=rows[:_TARGET_LIMIT],
+        targets=_cap_rows(rows),
     )
 
 
@@ -210,6 +229,7 @@ def _tailscale_credential(now: datetime) -> Callable[[Any], CredentialStatus]:
             expires_at=t.api_key_expires_at,
             rejected=is_auth_rejected(t.last_sync_error),
             now=now,
+            enabled=bool(getattr(t, "enabled", True)),
         )
 
     return status

@@ -171,6 +171,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A disabled Tailscale tenant no longer reads "Token rejected", and
+  the Integrations card always names tenants with a credential problem
+  (#2191, #2192).** A tenant whose last sync got a 401 and was then
+  disabled kept its red chip on the Tailscale page, in
+  `GET /tailscale/tenants` and in `list_tailscale_targets`, while its
+  alert and the dashboard chips had cleared. One shared rule in
+  `credential_status` now gives such a tenant the state `disabled` on
+  all of them; the page greys its last error as "Last error
+  (disabled)". The Integrations dashboard cards used to name only
+  their first three targets, so a rejected tenant beyond them was
+  counted and never named. Targets with a credential problem or a sync
+  error are now listed first and always shown, even past three; this
+  covers every integration card, and the IPAM-tab panel orders the
+  same way.
 - **Backup page and branding title show the API's reason and stop
   offering what is refused** (#2203, #2204, #2200, #2202, #2205).
   A refused archive preview, restore or drill schedule now shows the

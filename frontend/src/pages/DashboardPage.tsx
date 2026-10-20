@@ -114,6 +114,7 @@ import {
 } from "@/lib/configApply";
 import { WidgetErrorBoundary } from "@/components/WidgetErrorBoundary";
 import { CredentialChip } from "@/components/CredentialChip";
+import { cardTargets } from "@/lib/credential-chip";
 
 /**
  * Dashboard — the home page.
@@ -3784,7 +3785,10 @@ function IntegrationsPanel({
             ) : (
               <div className="overflow-x-auto">
                 <div className="min-w-[520px] divide-y">
-                  {tailscaleTenants.map((t) => (
+                  {cardTargets(
+                    tailscaleTenants,
+                    tailscaleTenants.length,
+                  ).shown.map((t) => (
                     <IntegrationRow
                       key={t.id}
                       to={`/tailscale`}
@@ -4954,6 +4958,8 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
         ? "warn"
         : "good";
   const cls = TONE_CLASS[tone];
+  // #2192 — problem targets are always named, ahead of healthy ones.
+  const cardRows = cardTargets(panel.targets);
   return (
     <div className="rounded-lg border bg-card p-3">
       <div className="flex items-center justify-between">
@@ -5012,7 +5018,7 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
       </p>
       {panel.targets.length > 0 && (
         <ul className="mt-2 space-y-1 text-[11px]">
-          {panel.targets.slice(0, 3).map((t) => (
+          {cardRows.shown.map((t) => (
             <li
               key={t.id}
               className="flex items-baseline justify-between gap-2"
@@ -5045,9 +5051,9 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
               </span>
             </li>
           ))}
-          {panel.targets.length > 3 && (
+          {cardRows.hidden > 0 && (
             <li className="text-[10px] text-muted-foreground">
-              + {panel.targets.length - 3} more
+              + {cardRows.hidden} more
             </li>
           )}
         </ul>

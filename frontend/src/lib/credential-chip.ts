@@ -65,7 +65,37 @@ export function credentialChipView(
         title:
           "SpatiumDDI could not read when this token expires. Enter the date in the tenant form so it can warn you before it lapses.",
       };
+    case "disabled":
+      // The tenant is off: nothing syncs, so there is no live credential
+      // problem. The page's own enabled/disabled badge says so (#2191).
+      return null;
     default:
       return null;
   }
+}
+
+/**
+ * Order the rows of a capped integration card (#2192): targets with a
+ * credential problem or a sync error first, so the cap can never hide the
+ * tenant that needs a new key. Every problem row is kept even when that
+ * exceeds `base`; healthy rows only fill what is left. Stable within groups.
+ */
+export function cardTargets<
+  T extends {
+    credential_state?: CredentialState | null;
+    last_sync_error?: string | null;
+  },
+>(targets: T[], base = 3): { shown: T[]; hidden: number } {
+  const bad = (t: T) =>
+    t.credential_state === "rejected" ||
+    t.credential_state === "expired" ||
+    t.credential_state === "expiring" ||
+    !!t.last_sync_error;
+  const problems = targets.filter(bad);
+  const rest = targets.filter((t) => !bad(t));
+  const shown = [...problems, ...rest].slice(
+    0,
+    Math.max(base, problems.length),
+  );
+  return { shown, hidden: targets.length - shown.length };
 }
