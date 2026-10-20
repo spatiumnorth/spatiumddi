@@ -233,6 +233,28 @@ if not user_has_permission(current_user, "write", "subnet", subnet.id):
 
 See `backend/app/core/permissions.py` for the full API.
 
+### Every read route declares its permission
+
+A `GET` route that takes only `CurrentUser` answers every signed-in account,
+whatever its role grants. So every `GET` route carries a permission
+dependency — a `require_*permission` factory or `SuperAdmin` — unless it is
+listed in `NO_PERMISSION_DEPENDENCY` in
+`backend/tests/test_get_routes_declare_permission.py` with the reason: it is
+reachable before sign-in, it is authenticated by something other than a user
+session (an agent JWT, a signed download URL, a feed token), it returns only
+the caller's own rows, it serves static reference data or settings the UI
+shell needs, or the handler checks the permission itself. That test walks the
+served route table and fails for a new unlisted route, and for a listed route
+that has since gained a dependency.
+
+A rollup over several resource types (the Network and Integrations dashboard
+tabs, the DNS / DHCP traffic series) needs `read` on at least one of the types
+it summarises, and fills only the panels whose type the caller can read, so it
+never shows more than the resources' own routes would. The tag autocomplete
+(`GET /tags/keys`, `/tags/values`) follows the same rule per table: it offers
+tags only from the tables whose rows the caller can read, and an empty list
+when there are none.
+
 ## The console mirrors the server, it does not enforce
 
 The API is the enforcement point (non-negotiable #3). The console reads the

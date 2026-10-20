@@ -11,7 +11,9 @@ import {
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { Link } from "react-router-dom";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 
 const KIND_LABEL: Record<NATKind, string> = {
   "1to1": "1:1 NAT",
@@ -336,6 +338,14 @@ export function NATPage() {
     "Requires delete permission on NAT mappings",
   );
   const qc = useQueryClient();
+  // #2100 — NAT mappings are the ``ipam.nat`` feature module. Reached by a
+  // bookmark while it is off, or left open after deleting the LAST mapping
+  // on an install that never set the toggle (with no override the module is
+  // on only while ``nat_mapping`` holds a row), the page says so instead of
+  // firing requests the router answers 404.
+  const modules = useFeatureModules();
+  const natOn = modules.ready && modules.enabled("ipam.nat");
+  const natOff = modules.ready && !modules.enabled("ipam.nat");
   const [kindFilter, setKindFilter] = useState<NATKind | "">("");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
@@ -358,12 +368,16 @@ export function NATPage() {
     queryKey: ["nat-mappings", params],
     queryFn: () => natApi.list(params),
     placeholderData: (prev) => prev,
+    enabled: natOn,
   });
 
   const deleteMut = useMutation({
     mutationFn: (id: string) => natApi.delete(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["nat-mappings"] });
+      // Deleting the last mapping can turn the module off (#2100); re-read
+      // the module set so the sidebar and this page follow the router.
+      qc.invalidateQueries({ queryKey: ["feature-modules"] });
       setConfirmDelete(null);
     },
   });
@@ -375,6 +389,25 @@ export function NATPage() {
   const items = data?.items ?? [];
   const total = data?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / perPage));
+
+  if (natOff) {
+    return (
+      <div className="h-full overflow-auto p-6">
+        <h1 className="text-2xl font-bold tracking-tight">NAT mappings</h1>
+        <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
+          NAT mappings are turned off. Any existing mappings are kept, and the
+          firewall mirrors keep recording NAT rules while the feature is off.
+          With no explicit setting, NAT mappings are on only while at least one
+          mapping exists, so deleting the last one turns them off. An
+          administrator can turn them on under{" "}
+          <Link to="/admin/features" className="text-primary hover:underline">
+            Features & Integrations
+          </Link>
+          .
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="h-full overflow-auto p-6">

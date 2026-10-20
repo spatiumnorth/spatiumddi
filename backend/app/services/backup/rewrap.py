@@ -84,6 +84,7 @@ ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("bgp_lg_peer", "id", "md5_password_encrypted"),
     ("cloud_endpoint", "id", "credentials_encrypted"),
     ("dhcp_server", "id", "credentials_encrypted"),
+    ("dhcp_server_group", "id", "ha_peer_credential_encrypted"),
     ("dns_server", "id", "api_key_encrypted"),
     ("dns_server", "id", "credentials_encrypted"),
     ("dns_server_group", "id", "tsig_key_secret_encrypted"),

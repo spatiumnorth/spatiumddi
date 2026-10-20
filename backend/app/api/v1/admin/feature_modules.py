@@ -36,7 +36,6 @@ from app.core.request_meta import get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPScope, DHCPServer
 from app.models.dns import DNSServer, DNSZone
-from app.models.feature_module import FeatureModule
 from app.models.settings import PlatformSettings
 from app.services import feature_modules as fm_svc
 from app.services.account_lockout import LockoutPolicy, is_locked, register_failure
@@ -117,7 +116,10 @@ class FeatureModuleEntry(BaseModel):
     """Catalog entry + current state. ``label`` / ``group`` /
     ``description`` come from the in-process catalog so the UI doesn't
     need to know about it separately. ``default_enabled`` lets the
-    Settings page show a "default" badge for transparency."""
+    Settings page show a "default" badge for transparency. It is the
+    EFFECTIVE default on this install: a module with
+    ``default_on_if_rows_in`` reports true once its table holds data
+    (#2100), so "overridden" keeps meaning "an operator chose this"."""
 
     id: str
     label: str
@@ -144,8 +146,9 @@ class FeatureModuleToggleBody(BaseModel):
 
 @router.get("/feature-modules", response_model=list[FeatureModuleEntry])
 async def list_feature_modules(db: DB, current_user: CurrentUser) -> list[FeatureModuleEntry]:
-    rows = (await db.execute(select(FeatureModule))).scalars().all()
-    overrides: dict[str, bool] = {row.id: row.enabled for row in rows}
+    # The same derivation the route gate uses (#2100), so the frontend's
+    # ``resolveEnabled`` resolves exactly what ``require_module`` enforces.
+    states = await fm_svc.load_module_states(db, probe_overridden=True)
 
     return [
         FeatureModuleEntry(
@@ -153,8 +156,8 @@ async def list_feature_modules(db: DB, current_user: CurrentUser) -> list[Featur
             label=spec.label,
             group=spec.group,
             description=spec.description,
-            default_enabled=spec.default_enabled,
-            enabled=overrides.get(spec.id, spec.default_enabled),
+            default_enabled=states.defaults[spec.id],
+            enabled=states.own[spec.id],
             requires=list(spec.requires),
         )
         for spec in fm_svc.MODULES
@@ -279,12 +282,13 @@ async def toggle_feature_module(
     await db.commit()
     fm_svc.invalidate_cache()
 
+    states = await fm_svc.load_module_states(db, probe_overridden=True)
     return FeatureModuleEntry(
         id=spec.id,
         label=spec.label,
         group=spec.group,
         description=spec.description,
-        default_enabled=spec.default_enabled,
+        default_enabled=states.defaults[spec.id],
         enabled=row.enabled,
         requires=list(spec.requires),
     )

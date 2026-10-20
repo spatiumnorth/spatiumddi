@@ -52,6 +52,7 @@ from app.services.ai.tools import (
     ToolNotFound,
     ToolPermissionDenied,
     effective_tool_names,
+    is_rate_limit_refusal,
 )
 
 logger = structlog.get_logger(__name__)
@@ -298,7 +299,9 @@ async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
                             "text": json.dumps(result, default=str),
                         }
                     ],
-                    "isError": False,
+                    # A network tool past the caller's per-user budget did
+                    # not run; report it in-band as a failed call.
+                    "isError": is_rate_limit_refusal(result),
                 },
             )
 

@@ -441,6 +441,22 @@ def _expected_a(hostname: str, addr: str, zone_name: str) -> tuple[str, str]:
     return hostname, addr
 
 
+def _own_alias_serves(recs: Sequence[DNSRecord], zone_id: uuid.UUID, name: str, rtype: str) -> bool:
+    """True when one of the address's own aliases already holds ``(zone, name)`` (#2118).
+
+    The same rule ``_own_alias_clashes`` applies on write (#2106): an
+    ``ip_alias`` row of the address, same type, same zone, same name compared
+    case-insensitively. ``_sync_dns_record`` skips the host record there, so
+    drift must not expect it. ``recs`` are the address's own rows only, so
+    another address's alias at the name never satisfies it.
+    """
+    want = name.strip().rstrip(".").lower()
+    return any(
+        r.ip_alias and r.zone_id == zone_id and r.record_type == rtype and r.name.lower() == want
+        for r in recs
+    )
+
+
 def _expected_ptr(addr: str, hostname: str, zone_name: str) -> tuple[str, str]:
     """Returns (ptr_label, ptr_target_fqdn). ``ptr_label`` is "@" when the
     address's reverse_pointer equals the zone, otherwise the labels stripped
@@ -865,7 +881,9 @@ async def compute_subnet_dns_drift(
         # the next time IPAM syncs the address.
         if forward_zone and ipam_authors_zone(forward_zone) and not is_default_gateway:
             exp_name, exp_value = _expected_a(ip.hostname, str(ip.address), forward_zone.name)
-            if not primary_forward_records:
+            if not primary_forward_records and not _own_alias_serves(
+                recs_by_ip.get(ip.id, []), forward_zone.id, exp_name, forward_rtype
+            ):
                 report.missing.append(
                     MissingItem(
                         ip_id=ip.id,
@@ -948,7 +966,9 @@ async def compute_subnet_dns_drift(
             for xz in extra_zones:
                 x_name, x_value = _expected_a(ip.hostname, str(ip.address), xz.name)
                 x_recs = [r for r in ip_forward_records if r.zone_id == xz.id]
-                if not x_recs:
+                if not x_recs and not _own_alias_serves(
+                    recs_by_ip.get(ip.id, []), xz.id, x_name, forward_rtype
+                ):
                     report.missing.append(
                         MissingItem(
                             ip_id=ip.id,
