@@ -214,3 +214,20 @@ def test_no_hold_means_no_apply_on_a_401(tmp_path: Path, registering: _Registry)
 
     assert registering.seen == [["good"]]
     assert driver.applied == ["good"]
+
+
+def test_a_second_401_does_not_apply_the_held_cache_again(
+    tmp_path: Path, registering: _Registry
+) -> None:
+    """The fallback ends the hold once the cache is live, so a further 401 (the
+    new token rejected too, or the heartbeat thread's token racing this one)
+    finds no hold and leaves the running daemon alone: no second apply."""
+    loop, driver = _held_loop(tmp_path, registering)
+    loop._client = lambda **kw: _Rejects(401)  # type: ignore[method-assign]
+    loop._poll_once()
+    bootstrap_mod._reset_reauth_state()
+    loop._poll_once()
+
+    assert driver.applied == ["big"]
+    assert registering.seen == [["big"], ["big"]]
+    assert loop._boot_hold is None
