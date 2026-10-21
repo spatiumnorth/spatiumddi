@@ -215,6 +215,7 @@ class ListDomainsArgs(BaseModel):
     ),
     args_model=ListDomainsArgs,
     category="network",
+    module="network.domains",
 )
 async def list_domains(db: AsyncSession, user: User, args: ListDomainsArgs) -> list[dict[str, Any]]:
     stmt = select(Domain)

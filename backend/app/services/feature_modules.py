@@ -140,6 +140,20 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Autonomous-system records with RDAP holder + RPKI ROA enrichment.",
         default_enabled=False,
     ),
+    # Default-ON, deliberately unlike ``network.asn`` (#2325). A Domain row
+    # triggers off-prem RDAP lookups, which #1069 would normally ship OFF —
+    # but the Domains page and API were ungated before this module existed,
+    # so installs already tracking registrations have rows and no
+    # ``feature_module`` row (a migration may not seed one). Default-off would
+    # 404 their pages and silently stop expiry tracking on upgrade. Default-on
+    # arms nothing by itself: a fresh install has no Domain rows, so no
+    # lookup is ever made until an operator creates one (docs/PRIVACY.md §3.3).
+    ModuleSpec(
+        id="network.domains",
+        label="Domains",
+        group="Network",
+        description="Domain registration records — registrar, expiry, DNSSEC and nameserver drift. Each row is refreshed from public RDAP registries (an off-prem lookup of the domain name) on creation and every 24 h; turn this off to stop all of that traffic and hide the Domains pages and API.",
+    ),
     ModuleSpec(
         id="network.circuit",
         label="Circuits",

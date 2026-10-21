@@ -128,6 +128,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Domains had no feature module, so the daily off-prem RDAP refresh
+  could not be switched off (#2325).** The Domains router was mounted
+  ungated and the hourly `refresh_due_domains` sweep ran regardless; the
+  only way to stop the lookups of each domain name against the IANA
+  bootstrap and the TLD registries was to delete every Domain. There is
+  now a `network.domains` module (Settings → Features, group Network).
+  Off, the Domains pages, API, sidebar entry, dashboard card and
+  `list_domains` tool disappear, and neither the sweep nor the lookup
+  queued at create time makes any RDAP call. It ships **on**, unlike
+  `network.asn`: installs that already track domains have rows but no
+  module row, so default-off would have 404'd their pages and silently
+  stopped expiry tracking on upgrade. A fresh install has no Domain rows,
+  so it still makes no such call. `docs/PRIVACY.md` §3.3 names the switch.
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so

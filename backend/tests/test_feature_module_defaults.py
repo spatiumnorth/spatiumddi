@@ -49,6 +49,7 @@ EXPECTED_DEFAULTS: dict[str, bool] = {
     "network.site": True,
     "network.service": False,
     "network.asn": False,
+    "network.domains": True,
     "network.circuit": False,
     "network.device": False,
     "network.overlay": False,
