@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Sync DNS commit counted an address as created when nothing was
+  written (#2352).** Every address named in `create_for_ip_ids` (and
+  every record-linked address in `update_record_ids`) was counted as
+  created / updated, and written to the `dns-sync` audit row, even when
+  its A and PTR already existed and no DNS op was queued. The commit
+  now counts only addresses it queued ops for, so an address already in
+  sync reads as unchanged and writes no audit row, at subnet, block and
+  space scope alike. Also fixed on the way: a block-scope commit that
+  did write something answered 422 ("cannot be stored as sent"), because
+  its audit row was handed the CIDR as an object rather than a string.
+
 - **Timezone shifts in MAC-block expiry, the lease-history Since picker
   and date-only terms (#2260).** Editing a DHCP MAC block fed its UTC
   `expires_at` to a local `datetime-local` input and re-parsed it as
