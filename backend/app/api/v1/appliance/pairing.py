@@ -53,12 +53,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, SuperAdmin
 from app.api.stepup import require_operator_stepup
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.permissions import require_permission
 from app.models.appliance import PairingClaim, PairingCode
 from app.models.audit import AuditLog
+from app.models.auth import User
 
 logger = structlog.get_logger(__name__)
 
@@ -432,7 +433,7 @@ async def _toggle_persistent_code(
     code_id: uuid.UUID,
     *,
     enable: bool,
-    current_user: SuperAdmin,
+    current_user: User,
     db: DB,
 ) -> None:
     row = await db.get(PairingCode, code_id)
@@ -479,7 +480,7 @@ async def _toggle_persistent_code(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Re-enable a paused persistent pairing code (superadmin)",
 )
-async def enable_pairing_code(code_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def enable_pairing_code(code_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
     await _toggle_persistent_code(code_id, enable=True, current_user=current_user, db=db)
 
 
@@ -489,7 +490,7 @@ async def enable_pairing_code(code_id: uuid.UUID, current_user: CurrentUser, db:
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Pause a persistent pairing code (superadmin)",
 )
-async def disable_pairing_code(code_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def disable_pairing_code(code_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
     await _toggle_persistent_code(code_id, enable=False, current_user=current_user, db=db)
 
 

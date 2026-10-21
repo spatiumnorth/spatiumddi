@@ -139,7 +139,9 @@ the formatter handles the rest.
   forwarding. They now share one dependency that records the refusal the
   same way (`action` access on `superadmin`). The status code stays 403;
   the refusal text of those routes is now the generic "Superadmin
-  required".
+  required". The imperative checks on `?permanent=true` deletes and in the
+  approval engine's risky operations, which cannot take a dependency, use
+  a separate synchronous `ensure_superadmin` and are not audited.
 
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense

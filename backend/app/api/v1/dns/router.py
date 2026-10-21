@@ -37,7 +37,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import DB, CurrentUser, SuperAdmin, require_superadmin
+from app.api.deps import DB, CurrentUser, SuperAdmin, ensure_superadmin
 from app.api.pagination import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE,
@@ -7204,7 +7204,7 @@ async def delete_zone(
     await _require_zone(group_id, zone_id, db, current_user)
     if permanent:
         # Refused before a change request could be queued for it.
-        require_superadmin(current_user)
+        ensure_superadmin(current_user)
     op = get_operation("delete_zone")
     assert op is not None  # registered at import
     args = DeleteZoneArgs(group_id=group_id, zone_id=zone_id, permanent=permanent)
@@ -8296,7 +8296,7 @@ async def delete_record(
         await db.commit()
         return
 
-    require_superadmin(current_user)
+    ensure_superadmin(current_user)
 
     db.add(
         AuditLog(
@@ -8403,7 +8403,7 @@ async def bulk_delete_records(
     if permanent:
         # Gate BEFORE any wire op is enqueued: a 403 must leave nothing queued
         # for the agent.
-        require_superadmin(current_user)
+        ensure_superadmin(current_user)
 
     res = await db.execute(select(DNSRecord).where(DNSRecord.id.in_(body.record_ids)))
     records = list(res.scalars().all())

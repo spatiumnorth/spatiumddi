@@ -332,6 +332,22 @@ async def require_superadmin(
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superadmin required")
 
 
+def ensure_superadmin(user: User) -> None:
+    """Imperative superadmin check for code that cannot take ``SuperAdmin``.
+
+    For a check that only applies on one branch of a handler (``?permanent=true``)
+    or inside an operation the approval engine applies outside any route. It
+    raises the same 403 as :func:`require_superadmin` but writes no audit row,
+    because it has no request to attribute one to. Never call
+    ``require_superadmin`` directly: it is an async dependency, so a bare call
+    returns an un-awaited coroutine and checks nothing.
+    """
+    from app.core.permissions import is_effective_superadmin
+
+    if not is_effective_superadmin(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superadmin required")
+
+
 # Type aliases for injection
 CurrentUser = Annotated[User, Depends(get_current_user)]
 SuperAdmin = Annotated[User, Depends(require_superadmin)]

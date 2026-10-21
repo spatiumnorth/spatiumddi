@@ -84,3 +84,51 @@ async def test_superadmin_is_not_audited_as_denied(
         select(func.count()).select_from(AuditLog).where(AuditLog.result == "denied")
     )
     assert n == 0
+
+
+def test_require_superadmin_is_never_called_directly() -> None:
+    """``require_superadmin`` is an async dependency since #2304.
+
+    A bare ``require_superadmin(user)`` (the pre-#2304 imperative use, on the
+    ``?permanent=true`` branches and in the approval engine's operations)
+    returns an un-awaited coroutine and checks nothing. Imperative callers use
+    ``ensure_superadmin``.
+    """
+    import ast
+    from pathlib import Path
+
+    app_dir = Path(__file__).resolve().parent.parent / "app"
+    offenders = []
+    for path in app_dir.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name == "require_superadmin":
+                offenders.append(f"{path.relative_to(app_dir)}:{node.lineno}")
+    assert offenders == []
+
+
+def test_converted_helper_callers_keep_the_superadmin_dependency() -> None:
+    """Routes whose superadmin check lived in a shared helper on origin/main.
+
+    The #2304 conversion deleted the helper's check; these handlers must carry
+    ``SuperAdmin`` themselves or they fall back to their weaker permission.
+    """
+    from app.api.deps import require_superadmin
+    from app.main import app
+    from tests.test_builtin_roles_match_routes import _dependency_calls, _iter_routes
+
+    must = {
+        ("POST", "/api/v1/appliance/pairing-codes/{code_id}/enable"),
+        ("POST", "/api/v1/appliance/pairing-codes/{code_id}/disable"),
+    }
+    found = set()
+    for r in _iter_routes(app.routes):
+        for m in r.methods:
+            if (m, r.path) in must and any(
+                c is require_superadmin for c in _dependency_calls(r.dependant)
+            ):
+                found.add((m, r.path))
+    assert found == must
