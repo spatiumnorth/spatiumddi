@@ -1545,6 +1545,50 @@ def _render_allow_recursion(
     return f"    allow-recursion {{ {'; '.join(kept)}; }};\n"
 
 
+_TRUST_ANCHOR_LABEL = r"[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+_TRUST_ANCHOR_NAME_RE = re.compile(rf"^(\.|{_TRUST_ANCHOR_LABEL}(\.{_TRUST_ANCHOR_LABEL})*\.?)$")
+_TRUST_ANCHOR_KEY_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+
+def _render_trust_anchors(anchors: Any) -> str:
+    """Top-level ``trust-anchors { ... };`` statement (#2266), or ``""``.
+
+    DNSKEY anchors only, which is all the control plane stores: ``static-key``
+    for a fixed key, ``initial-key`` for one BIND then maintains by RFC 5011.
+    Flags are always 257 (a KSK; the only kind an anchor is) and protocol 3.
+    ``key_tag`` is not part of BIND's syntax. Without this the options API's
+    anchors were stored and never reached named, so ``dnssec-validation yes``
+    validated nothing.
+
+    An entry that would not parse is skipped with a warning rather than
+    rendered: one bad line makes ``named-checkconf`` reject the whole file and
+    the group stops converging. Empty input renders nothing, so a group with
+    no anchors keeps a byte-identical named.conf.
+    """
+    lines: list[str] = []
+    for ta in anchors or []:
+        if not isinstance(ta, dict):
+            continue
+        name = str(ta.get("zone_name") or "").strip()
+        key = "".join(str(ta.get("public_key") or "").split())
+        try:
+            alg = int(ta.get("algorithm"))
+        except (TypeError, ValueError):
+            alg = 0
+        if not (
+            _TRUST_ANCHOR_NAME_RE.match(name)
+            and _TRUST_ANCHOR_KEY_RE.match(key)
+            and 1 <= alg <= 255
+        ):
+            log.warning("bind9_trust_anchor_skipped_invalid", zone=name)
+            continue
+        kind = "initial-key" if ta.get("is_initial_key", True) else "static-key"
+        lines.append(f'    "{name}" {kind} 257 3 {alg} "{key}";\n')
+    if not lines:
+        return ""
+    return "trust-anchors {\n" + "".join(lines) + "};\n"
+
+
 class Bind9Driver(DriverBase):
     rendered_dir_name = "rendered"
 
@@ -1710,6 +1754,7 @@ class Bind9Driver(DriverBase):
         # BIND's built-in "default" needs none. The key-directory above is
         # where BIND auto-generates + rotates the private keys.
         conf += _render_dnssec_policies(bundle.get("dnssec_policies") or [])
+        conf += _render_trust_anchors(opts.get("trust_anchors"))
 
         # ``(zone, kind, detail)`` from every zone file written below — logged
         # once, aggregated, after the loop (issue #1153).

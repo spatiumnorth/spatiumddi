@@ -776,6 +776,40 @@ class TrustAnchorCreate(BaseModel):
     public_key: str
     is_initial_key: bool = True
 
+    # All four land verbatim inside a ``trust-anchors { ... };`` statement in
+    # named.conf (#2266), so each is held to what BIND can parse: a malformed
+    # value would not break one anchor, it would make ``named-checkconf``
+    # reject the file and stop the whole group converging (#876 / #899).
+    @field_validator("zone_name")
+    @classmethod
+    def validate_anchor_zone(cls, v: str) -> str:
+        v = v.strip()
+        if v in (".", ""):
+            return "."
+        return validate_fqdn(v, field="zone_name")
+
+    @field_validator("algorithm")
+    @classmethod
+    def validate_anchor_algorithm(cls, v: int) -> int:
+        if not 1 <= v <= 255:
+            raise ValueError("algorithm must be a DNSSEC algorithm number (1-255)")
+        return v
+
+    @field_validator("key_tag")
+    @classmethod
+    def validate_anchor_key_tag(cls, v: int) -> int:
+        if not 0 <= v <= 65535:
+            raise ValueError("key_tag must be between 0 and 65535")
+        return v
+
+    @field_validator("public_key")
+    @classmethod
+    def validate_anchor_public_key(cls, v: str) -> str:
+        compact = "".join(v.split())
+        if not compact or not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", compact):
+            raise ValueError("public_key must be the base64 DNSKEY public key")
+        return compact
+
 
 class TrustAnchorResponse(BaseModel):
     id: uuid.UUID
@@ -996,6 +1030,9 @@ class ServerOptionsResponse(BaseModel):
     # Stored group forwarders that cannot work with the group's transport,
     # saved before the #2128 refusal. Advisory: the save is not refused.
     forwarder_warnings: list[str] = Field(default_factory=list)
+    # DNSSEC validation that cannot work as configured (#2266): ``yes`` with
+    # no trust anchor on a BIND9 group validates nothing. Advisory only.
+    dnssec_warnings: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -3691,7 +3728,14 @@ async def _options_response(
 ) -> ServerOptionsResponse:
     out = ServerOptionsResponse.model_validate(opts)
     out.forwarder_warnings = _stored_forwarder_warnings(opts)
-    if "technitium" in await _group_driver_names(db, group_id):
+    drivers = await _group_driver_names(db, group_id)
+    if opts.dnssec_validation == "yes" and not opts.trust_anchors and "bind9" in drivers:
+        out.dnssec_warnings.append(
+            "dnssec_validation is 'yes' but no trust anchor is configured: BIND validates "
+            "nothing without one. Add the root (or another) trust anchor, or use 'auto' to "
+            "validate against BIND's built-in root anchor."
+        )
+    if "technitium" in drivers:
         acls = await _group_acl_definitions(db, group_id)
         out.technitium_warnings = technitium_stored_warnings(opts, acls)
         # Zone-level overrides saved before the gate (#1765).
@@ -4105,6 +4149,16 @@ async def add_trust_anchor(
     group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
 ) -> DNSTrustAnchor:
     await _require_group(group_id, db)
+    # Only the BIND9 agent renders ``trust-anchors`` (#2266). Storing one for a
+    # group another driver serves would be accepted and ignored.
+    others = sorted(d for d in await _group_driver_names(db, group_id) if d != "bind9")
+    if others:
+        raise HTTPException(
+            422,
+            "Trust anchors are only applied by BIND9; this group has a "
+            + ", ".join(others)
+            + " server, which would ignore them. Use a group of BIND9 servers.",
+        )
     result = await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
     opts = result.scalar_one_or_none()
     if not opts:
