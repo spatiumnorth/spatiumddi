@@ -16,6 +16,11 @@ from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPClientClass, DHCPPool, DHCPScope, DHCPServerGroup
+from app.services.dhcp.class_refs import (
+    classes_testing_membership,
+    describe_pools,
+    pools_restricted_to,
+)
 from app.services.dhcp.option_validation import normalize_options, validate_class_test
 
 # Which Kea daemons the class renders into (#1229). ``dual`` sends each option
@@ -100,6 +105,35 @@ async def _refuse_orphaned_pools(db: DB, cc: DHCPClientClass, family: str) -> No
         )
 
 
+async def refuse_if_name_referenced(
+    db: DB, group_id: uuid.UUID, name: str, verb: str, *, exclude_class_id: uuid.UUID | None = None
+) -> None:
+    """409 while a pool (or another class's ``member()`` test) still names ``name`` (#2285).
+
+    Refuse rather than cascade the rename: a pool's ``class_restriction`` is
+    an operator decision (often a quarantine boundary), and silently
+    rewriting it, or leaving it dangling, changes who a pool serves. Same
+    posture as the DNS ACL reference guard and the family-change guard above.
+    """
+    pools = await pools_restricted_to(db, group_id, name)
+    members = await classes_testing_membership(db, group_id, name, exclude_class_id)
+    if not pools and not members:
+        return
+    parts = []
+    if pools:
+        parts.append(f"{len(pools)} pool(s) ({describe_pools(pools)})")
+    if members:
+        parts.append(f"the test of client class(es) {', '.join(members[:5])}")
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Cannot {verb} '{name}': it is still referenced by {' and '.join(parts)}. "
+            "Kea accepts a reference to an undefined class and the pool would "
+            "silently match no client. Clear or change those references first."
+        ),
+    )
+
+
 @router.get("/server-groups/{group_id}/client-classes", response_model=list[ClientClassResponse])
 async def list_classes(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCPClientClass]:
     res = await db.execute(select(DHCPClientClass).where(DHCPClientClass.group_id == group_id))
@@ -156,6 +190,18 @@ async def update_class(
     changes = body.model_dump(exclude_none=True)
     family = changes.get("address_family", cc.address_family)
     family_changed = family != cc.address_family
+    new_name = changes.get("name")
+    if new_name is not None and new_name != cc.name:
+        dupe = await db.execute(
+            select(DHCPClientClass.id).where(
+                DHCPClientClass.group_id == cc.group_id, DHCPClientClass.name == new_name
+            )
+        )
+        if dupe.first() is not None:
+            raise HTTPException(status_code=409, detail="A client class with that name exists")
+        await refuse_if_name_referenced(
+            db, cc.group_id, cc.name, "rename client class", exclude_class_id=cc.id
+        )
     if family_changed:
         await _refuse_orphaned_pools(db, cc, family)
     if family_changed or "match_expression" in changes:
@@ -198,6 +244,9 @@ async def delete_class(class_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     cc = await db.get(DHCPClientClass, class_id)
     if cc is None:
         raise HTTPException(status_code=404, detail="Client class not found")
+    await refuse_if_name_referenced(
+        db, cc.group_id, cc.name, "delete client class", exclude_class_id=cc.id
+    )
     write_audit(
         db,
         user=user,
