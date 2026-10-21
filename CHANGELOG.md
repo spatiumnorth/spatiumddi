@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **IPAM to DNS auto-sync at a 1-minute interval ran every 2 minutes
+  (#2346).** Beat fires every 60 s, but the task stamps its last run from
+  a clock read a variable fraction of a second into the run, so two
+  consecutive beats were often a hair under the interval apart and the
+  gate answered `interval_not_elapsed` with `wait_seconds: 0`, pushing the
+  run out a whole tick. The gate now treats a run as due once the interval
+  is within a few seconds of elapsed (5 s on the 60 s beat, 2 s on the 10 s
+  DHCP lease-pull beat), in one shared helper. The same gate in the DNS
+  pull-from-server, DHCP lease pull, reverse-DNS sweep and OUI refresh
+  tasks gets the same fix. A run well inside the interval still skips.
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
