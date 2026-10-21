@@ -141,8 +141,6 @@ async def build_scope_def(
         options=dict(scope.options or {}),
         pools=pools,
         statics=statics,
-        ddns_enabled=scope.ddns_enabled,
-        ddns_hostname_policy=scope.ddns_hostname_policy,
         is_active=scope.is_active,
         address_family=getattr(scope, "address_family", "ipv4") or "ipv4",
     )
