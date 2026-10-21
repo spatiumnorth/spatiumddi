@@ -387,10 +387,23 @@ async def update_firewall(
 
 
 @router.delete("/firewalls/{firewall_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_firewall(firewall_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_firewall(
+    firewall_id: uuid.UUID, db: DB, user: SuperAdmin, force: bool = False
+) -> None:
     f = await db.get(PANOSFirewall, firewall_id)
     if f is None:
         raise HTTPException(status_code=404, detail="Palo Alto firewall not found")
+    from app.services.block_sync.delete_guard import (  # noqa: PLC0415
+        assert_block_sync_deletable,
+    )
+
+    await assert_block_sync_deletable(
+        db,
+        target_kind="paloalto",
+        target_id=f.id,
+        armed=f.block_sync_enabled,
+        force=force,
+    )
     # #601 — sweep any active block-sync push rows for this target (polymorphic
     # target_id, so nothing cascades). Does NOT lift the tags off the firewall
     # — disarm the target first if it should stop enforcing them.
