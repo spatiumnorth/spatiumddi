@@ -7036,6 +7036,10 @@ class ZoneMovePreviewResponse(BaseModel):
     #: group cannot serve; non-null means the commit refuses, not waivable
     #: by acknowledgement.
     forward_transport_refusal: str | None = None
+    #: #2263 — the zone's own allow_query / allow_transfer cannot be applied
+    #: by a Technitium server in the target; non-null means the commit
+    #: refuses, not waivable by acknowledgement.
+    technitium_acl_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -7075,6 +7079,7 @@ class ZoneMovePreviewResponse(BaseModel):
             technitium_api_refusal=plan.technitium_api_refusal,
             tsig_algorithm_refusal=plan.tsig_algorithm_refusal,
             forward_transport_refusal=plan.forward_transport_refusal,
+            technitium_acl_refusal=plan.technitium_acl_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )

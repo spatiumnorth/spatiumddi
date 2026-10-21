@@ -1763,6 +1763,17 @@ def _zone_options_payload(
                     "reason": "allow_query has an element Technitium cannot express",
                 }
             )
+            if own:
+                # A Primary this pass creates is held at ``Deny`` and then
+                # released (#1758); with no query access to release it to,
+                # the release falls back to ``Allow``. For a zone whose own
+                # list is meant to restrict it, that is wider than the group's
+                # list, which a zone without the override would have got. So
+                # the release uses the group's list when it is expressible
+                # (#2263). An existing zone is still left as the daemon has it.
+                group_qa = _query_access((bundle.get("options") or {}).get("allow_query"), acls)
+                if group_qa is not None:
+                    payload["_release_query_access"] = group_qa
         else:
             payload["queryAccess"] = qa[0]
             payload["queryAccessNetworkACL"] = qa[1]
@@ -3850,14 +3861,19 @@ class TechnitiumDriver(DriverBase):
         No query access in the bundle (an ``allow_query`` Technitium cannot
         express, which a normal pass leaves as the daemon has it) means
         ``Allow``: what the zone had before the hold (``ApexZone`` ctor,
-        15.4.0), not a translation of the operator's list. If the options
+        15.4.0), not a translation of the operator's list. The exception is
+        a zone whose OWN list cannot be expressed (#2263): it is released
+        to the group's list (``_release_query_access``) when that one can
+        be, so it is never opened wider than a zone without the override.
+        If the options
         call is refused or not sent (a bad ``zoneTransfer`` is never sent),
         the query access still goes out on its own: a zone left at ``Deny``
         is not served at all.
         """
         params = dict(options)
         if "queryAccess" not in params:
-            params.update(queryAccess="Allow", queryAccessNetworkACL=[])
+            access, acl = params.get("_release_query_access") or ("Allow", [])
+            params.update(queryAccess=access, queryAccessNetworkACL=list(acl))
         try:
             if self._apply_zone_options(token, zone, params):
                 return True
@@ -4603,6 +4619,8 @@ class TechnitiumDriver(DriverBase):
         True when there was nothing to send or the daemon took it.
         """
         options = dict(options)
+        # Only the hold release reads it (#2263); never a daemon parameter.
+        options.pop("_release_query_access", None)
         for item in options.pop("_unapplied", None) or []:
             # Left as the daemon has it rather than guessed at (see
             # ``_query_access`` / ``_transfer_access``); the API refuses to

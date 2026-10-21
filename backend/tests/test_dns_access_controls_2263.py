@@ -185,3 +185,75 @@ def test_control_plane_template_renders_blackhole_like_the_agent() -> None:
     )
     assert "    blackhole { 198.51.100.0/24; !192.0.2.7; };" in out
     assert "blackhole" not in driver.render_server_config(None, ServerOptions())
+
+
+# ── zone move into a Technitium group ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ztype", "field", "value"),
+    [
+        ("primary", "allow_query", ["localnets"]),
+        ("secondary", "allow_query", ["localnets"]),
+        ("primary", "allow_transfer", ["localnets"]),
+    ],
+)
+async def test_move_into_technitium_refuses_a_zone_list_it_cannot_apply(
+    client: AsyncClient, db_session: AsyncSession, ztype: str, field: str, value: list[str]
+) -> None:
+    """A move is another way into the group, and on a zone Technitium
+    creates fresh an unapplied list means open. Same refusal as create."""
+    headers = await _superadmin(db_session)
+    src, _ = await _group(db_session, "bind9")
+    dst, _ = await _group(db_session, "technitium")
+    zone = DNSZone(
+        group_id=src.id,
+        name=f"m-{uuid.uuid4().hex[:6]}.test.",
+        zone_type=ztype,
+        kind="forward",
+        **{field: value},
+    )
+    db_session.add(zone)
+    await db_session.commit()
+    base = f"/api/v1/dns/groups/{src.id}/zones/{zone.id}/move"
+    r = await client.post(f"{base}/preview", json={"target_group_id": str(dst.id)}, headers=headers)
+    assert r.status_code == 200, r.text
+    refusal = r.json()["technitium_acl_refusal"]
+    assert refusal and field in refusal, refusal
+    r = await client.post(
+        f"{base}/commit",
+        json={
+            "target_group_id": str(dst.id),
+            "confirmation_zone_name": zone.name,
+            "acknowledgements": [],
+        },
+        headers=headers,
+    )
+    assert r.status_code == 422, r.text
+    assert field in str(r.json()["detail"])
+
+
+@pytest.mark.asyncio
+async def test_move_into_technitium_allows_an_expressible_zone_list(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    src, _ = await _group(db_session, "bind9")
+    dst, _ = await _group(db_session, "technitium")
+    zone = DNSZone(
+        group_id=src.id,
+        name=f"m-{uuid.uuid4().hex[:6]}.test.",
+        zone_type="primary",
+        kind="forward",
+        allow_query=["10.0.0.0/8", "!10.9.0.0/16"],
+    )
+    db_session.add(zone)
+    await db_session.commit()
+    r = await client.post(
+        f"/api/v1/dns/groups/{src.id}/zones/{zone.id}/move/preview",
+        json={"target_group_id": str(dst.id)},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["technitium_acl_refusal"] is None

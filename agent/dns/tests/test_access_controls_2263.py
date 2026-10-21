@@ -131,6 +131,28 @@ def test_untranslatable_zone_allow_query_never_falls_back_to_the_group(
     assert "1 zone(s)" in refused[0]
 
 
+def test_new_primary_with_untranslatable_zone_list_is_released_to_the_group_list(
+    tmp_path: Path,
+) -> None:
+    """A Primary this pass creates is held at ``Deny`` and then released
+    (#1758). With its own list inexpressible, the release must not fall back
+    to ``Allow`` — wider than the group's list, which the zone would have
+    got without the override (a zone moved in, or a row stored before the
+    gate)."""
+    d, calls = _apply(
+        tmp_path,
+        {
+            "zones": [_tzone("a.test", allow_query=["localnets"])],
+            "options": {"allow_query": ["10.0.0.0/8"]},
+        },
+    )
+    assert _final_query_access(calls)["a.test"] == ("UseSpecifiedNetworkACL", "10.0.0.0/8")
+    assert not any(
+        c[2] == "zones/options/set" and "_release_query_access" in c[3] for c in calls
+    )
+    assert [r for r in d._refused_zones if "zone's own list" in r]
+
+
 # ── BIND9: the group blackhole ──────────────────────────────────────────
 
 
