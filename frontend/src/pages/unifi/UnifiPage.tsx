@@ -347,9 +347,13 @@ export function UnifiPage() {
       {del && (
         <DeleteControllerModal
           controller={del}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           onConfirm={() => delMut.mutate(del.id)}
           isPending={delMut.isPending}
+          error={delMut.isError ? errMsg(delMut.error, "Delete failed") : null}
         />
       )}
     </div>
@@ -900,11 +904,13 @@ function DeleteControllerModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   controller: UnifiController;
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  error?: string | null;
 }) {
   const [checked, setChecked] = useState(false);
   return (
@@ -928,6 +934,11 @@ function DeleteControllerModal({
           />
           <span>I understand.</span>
         </label>
+        {error && (
+          <p className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
