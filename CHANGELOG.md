@@ -128,6 +128,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Renaming or deleting a client class, or deleting a device policy,
+  left pools restricted to a class that no longer existed (#2285).**
+  A pool's `class_restriction` is a plain name, Kea accepts a name it
+  does not define, and the pool then matches nobody, with the config
+  applying cleanly and nothing reporting an error. Renaming or deleting
+  a client class, or deleting a device policy, is now a 409 naming the
+  pools (and any other class whose `member()` test uses the name) that
+  still reference it. A pool create or update naming a class that does
+  not exist in the group is a 422 instead of being stored; Kea's
+  built-ins (`KNOWN`, `UNKNOWN`, ...) and generated PXE / phone classes
+  still pass. If a dangling reference reaches the config anyway (a
+  disabled or empty device policy, an import), the restriction is kept
+  rather than dropped, so a quarantine pool never opens to every
+  client, and the bundle build logs (once per change, not per long-poll)
+  `dhcp_pool_restricted_to_undefined_class`.
+
 - **The PCI "no admin ports" conformity check fails a host with an
   admin port open, instead of passing every scanned host (#2257).** The
   `no_open_ports` check read `open_ports` from the nmap scan summary, a
