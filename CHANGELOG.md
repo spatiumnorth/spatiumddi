@@ -139,8 +139,8 @@ the formatter handles the rest.
   enabled policy's most recent evaluation pass, selected in SQL on the
   existing `(policy_id, evaluated_at)` index, so a target leaves at
   the policy's next pass and the read is bounded by policies × current
-  targets. Editing what a policy checks clears its last pass until it
-  runs again (the beat task then runs it on its next tick, unless it
+  targets. Editing what a policy checks, from the API or the Copilot,
+  clears its last pass until it runs again (the beat task then runs it on its next tick, unless it
   is on-demand only). The PDF states this scope, prints when each
   policy's pass ran and how many disabled policies it leaves out, and
   a framework filter that matches no policy now gives an empty report

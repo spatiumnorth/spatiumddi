@@ -25,8 +25,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
-from app.models.conformity import ConformityPolicy
+from app.models.conformity import ConformityPolicy, ConformityResult
 from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.services.ai.operations_writes import (
+    UpdateConformityPolicyArgs,
+    _apply_update_conformity_policy,
+)
 from app.services.ai.tools.conformity import GetConformitySummaryArgs, get_conformity_summary
 from app.services.conformity import evaluate_policy
 
@@ -242,3 +246,58 @@ async def test_copilot_rollup_counts_current_state_once(db_session: AsyncSession
     rows = await get_conformity_summary(db_session, user, GetConformitySummaryArgs())
     pci = next(r for r in rows if r["framework"] == "PCI-DSS 4.0")
     assert pci["fail_count"] == 1
+
+
+async def test_copilot_rescope_retires_its_last_pass(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The Copilot's ``update_conformity_policy`` operation is a second
+    way to change a policy's scope, and must follow the same rule."""
+    user, h = await _superadmin(db_session)
+    await _pci_subnets(db_session, 2)
+    policy = await _failing_policy(db_session)
+    await evaluate_policy(db_session, policy, now=T1)
+    await db_session.commit()
+
+    await _apply_update_conformity_policy(
+        db_session,
+        user,
+        UpdateConformityPolicyArgs(policy_id=policy.id, check_args={"field": "vlan_id"}),
+    )
+    assert policy.last_evaluated_at is None
+    assert (await _summary(client, h))["overall_fail"] == 0
+
+    await evaluate_policy(db_session, policy, now=T2)
+    await db_session.commit()
+    await _apply_update_conformity_policy(
+        db_session,
+        user,
+        UpdateConformityPolicyArgs(policy_id=policy.id, severity="critical"),
+    )
+    assert policy.last_evaluated_at == T2
+
+
+async def test_unstamped_pass_never_becomes_current(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Rows from a pass that died before stamping ``last_evaluated_at``
+    carry an instant no policy points at, so the previous complete pass
+    keeps reporting."""
+    _, h = await _superadmin(db_session)
+    (subnet,) = await _pci_subnets(db_session, 1)
+    policy = await _failing_policy(db_session)
+    await evaluate_policy(db_session, policy, now=T1)
+    db_session.add(
+        ConformityResult(
+            policy_id=policy.id,
+            resource_kind="subnet",
+            resource_id=str(subnet.id),
+            resource_display="orphan",
+            evaluated_at=T2,
+            status="pass",
+        )
+    )
+    await db_session.commit()
+
+    s = await _summary(client, h)
+    assert s["overall_fail"] == 1 and s["overall_pass"] == 0

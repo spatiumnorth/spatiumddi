@@ -40,7 +40,10 @@ from app.services.conformity.checks import (
     CHECK_CATALOG,
     CHECK_REGISTRY,
 )
-from app.services.conformity.current import current_status_counts
+from app.services.conformity.current import (
+    current_status_counts,
+    retire_pass_if_rescoped,
+)
 from app.services.conformity.pdf import generate_conformity_pdf
 
 router = APIRouter()
@@ -60,14 +63,6 @@ _STATUSES = frozenset({"pass", "fail", "warn", "not_applicable"})
 _BUILTIN_MUTABLE_FIELDS = frozenset(
     {"enabled", "eval_interval_hours", "severity", "fail_alert_rule_id", "description"}
 )
-
-# Fields that change WHAT a policy checks or which targets it covers.
-# Editing one makes the last pass's results answer a different question,
-# so the update clears ``last_evaluated_at``: the summary and PDF stop
-# reporting that pass as current state (#2278), and the beat task sees
-# the policy as due on its next tick.
-_SCOPE_FIELDS = frozenset({"target_kind", "target_filter", "check_kind", "check_args"})
-
 
 # ── Schemas ─────────────────────────────────────────────────────────
 
@@ -347,8 +342,8 @@ async def update_policy(
         if old != value:
             changed[key] = {"old": str(old)[:200], "new": str(value)[:200]}
             setattr(p, key, value)
-    if _SCOPE_FIELDS.intersection(changed):
-        p.last_evaluated_at = None
+    # #2278 — a re-scoped policy's last pass answers a different question.
+    retire_pass_if_rescoped(p, changed)
     if changed:
         db.add(
             AuditLog(

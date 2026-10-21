@@ -45,10 +45,29 @@ policy ever stamped the same instant.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from sqlalchemy import Select, and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.conformity import ConformityPolicy, ConformityResult
+
+# Fields that change WHAT a policy checks or which targets it covers.
+# Editing one makes the last pass answer a different question, so every
+# policy-update path (REST PATCH and the Copilot's update operation)
+# goes through :func:`retire_pass_if_rescoped`.
+SCOPE_FIELDS = frozenset({"target_kind", "target_filter", "check_kind", "check_args"})
+
+
+def retire_pass_if_rescoped(policy: ConformityPolicy, changed: Iterable[str]) -> bool:
+    """Clear ``policy.last_evaluated_at`` when ``changed`` touches a
+    scope field. The summary and PDF then stop reporting that pass as
+    current state, and the beat task sees the policy as due on its next
+    tick. Returns whether it cleared."""
+    if SCOPE_FIELDS.isdisjoint(changed):
+        return False
+    policy.last_evaluated_at = None
+    return True
 
 
 def _current(stmt: Select, *, framework: str | None) -> Select:
@@ -112,4 +131,9 @@ async def current_status_counts(
     return out
 
 
-__all__ = ["current_results", "current_status_counts"]
+__all__ = [
+    "SCOPE_FIELDS",
+    "current_results",
+    "current_status_counts",
+    "retire_pass_if_rescoped",
+]
