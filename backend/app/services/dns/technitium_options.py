@@ -30,6 +30,10 @@ UNSUPPORTED_OPTIONS: dict[str, tuple[Any, str]] = {
     "tcp_clients": (None, "Technitium has no TCP client limit setting"),
     "clients_per_query": (None, "Technitium has no clients-per-query setting"),
     "max_clients_per_query": (None, "Technitium has no clients-per-query setting"),
+    # #2263: BIND's ``blackhole`` drops a client's queries unanswered. Technitium
+    # has no server setting that refuses a client by address (its access
+    # controls are per zone, and answer REFUSED rather than nothing).
+    "blackhole": ([], "Technitium has no setting to drop queries from a client address"),
     "forward_tls_verify": (
         True,
         "Technitium always validates an encrypted upstream's certificate and has no "

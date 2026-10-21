@@ -181,6 +181,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A zone's own `allow_query` is enforced on Technitium, and the group
+  `blackhole` list is rendered (#2263).** Both restrict who may use the
+  server, and both were accepted, stored and enforced nothing. The
+  Technitium agent applied only the group's `allow_query`, so a primary,
+  secondary or stub zone restricted to internal clients stayed open on a
+  Technitium group; it now sets the zone's own list as that zone's query
+  access, as BIND does with a zone-level `allow-query` (an empty or unset
+  list inherits the group's, and a forward zone keeps the group's, as on
+  BIND). A zone list Technitium cannot express (`localnets`, a key, an
+  undefined ACL) is refused with a 422 naming `allow_query`, like
+  `allow_transfer`; one stored before this is listed in the options
+  page's Technitium warnings and left as the daemon has it, never
+  widened to the group's list. `blackhole` is now shipped in the agent
+  bundle and rendered as `blackhole { … };` in BIND9's `options`, so a
+  listed client gets no answer at all. Technitium and PowerDNS have no
+  way to drop a client by address, so setting it on a group with either
+  is a 422 naming `blackhole`. A group with no blackhole keeps a
+  byte-identical `named.conf` and an unchanged bundle.
+
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
   forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,

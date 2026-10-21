@@ -1358,6 +1358,11 @@ _UNAPPLIED_ACL_MESSAGES = {
         "express (localnets, an undefined ACL name or a key), so query "
         "access was left as the daemon has it on {zones} zone(s)"
     ),
+    "zone_allow_query": (
+        "allow_query: the zone's own list has an element Technitium cannot "
+        "express (localnets, an undefined ACL name or a key), so query "
+        "access was left as the daemon has it on {zones} zone(s)"
+    ),
     "allow_transfer": (
         "allow_transfer: the list has an element Technitium cannot express "
         "(localnets, a key beside an address, a negated key or ACL, an "
@@ -1676,6 +1681,35 @@ def _transfer_access(
     return "UseSpecifiedNetworkACL", acl, names, missing
 
 
+#: Zone types whose OWN ``allow_query`` overrides the group's (#2263). BIND
+#: accepts a zone-level ``allow-query`` on master / slave / stub zones only,
+#: and the BIND9 agent renders it there and nowhere else, so a Forwarder zone
+#: keeps the group's list here too.
+_ZONE_QUERY_OVERRIDE_TYPES = frozenset({"Primary", "Secondary", "Stub"})
+
+
+def _effective_allow_query(
+    ztype: str, bundle: dict[str, Any], zone: dict[str, Any] | None
+) -> tuple[Any, bool]:
+    """The ``allow_query`` list in force for one zone, and whether it is the
+    zone's own (#2263).
+
+    The zone's value shadows the group's, as a zone-level ``allow-query``
+    does in BIND. ``None`` inherits; so does an empty list, because the
+    BIND9 agent renders nothing for one and the zone then falls back to the
+    options-level list. Reading ``[]`` as ``Allow`` here would open a zone
+    the group restricts.
+    """
+    own = (zone or {}).get("allow_query")
+    if (
+        ztype in _ZONE_QUERY_OVERRIDE_TYPES
+        and own is not None
+        and any(str(e).strip() for e in own)
+    ):
+        return own, True
+    return (bundle.get("options") or {}).get("allow_query"), False
+
+
 def _zone_options_payload(
     ztype: str, bundle: dict[str, Any], zone: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -1716,14 +1750,16 @@ def _zone_options_payload(
     unapplied: list[dict[str, str]] = []
     acls = _bundle_acls(bundle)
     if ztype in _QUERY_ACCESS_ZONE_TYPES:
-        # The group's ``allow_query`` (#1763). Always sent, ``Allow`` included,
-        # so widening the list back to ``any`` un-restricts a zone an earlier
-        # bundle restricted; an empty ACL clears the stored one.
-        qa = _query_access((bundle.get("options") or {}).get("allow_query"), acls)
+        # The group's ``allow_query`` (#1763), or the zone's own (#2263).
+        # Always sent, ``Allow`` included, so widening the list back to
+        # ``any`` un-restricts a zone an earlier bundle restricted; an empty
+        # ACL clears the stored one.
+        source, own = _effective_allow_query(ztype, bundle, zone)
+        qa = _query_access(source, acls)
         if qa is None:
             unapplied.append(
                 {
-                    "kind": "allow_query",
+                    "kind": "zone_allow_query" if own else "allow_query",
                     "reason": "allow_query has an element Technitium cannot express",
                 }
             )
