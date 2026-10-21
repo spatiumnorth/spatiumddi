@@ -712,7 +712,7 @@ def cmd_apply(args) -> int:
         try:
             dd.stdin.close()
         except BrokenPipeError:
-            pass
+            pass  # dd has exited, so the close's flush has no reader; dd.wait() says why
     if dd.wait() != 0:
         xz.kill()
         xz.wait()
