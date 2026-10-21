@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from app.drivers.dns._txt import quote_txt
 from app.models.dns import DNSRecord, DNSZone
 
 
@@ -21,21 +22,25 @@ def _format_record(zone_name: str, r: DNSRecord) -> str:
     rtype = r.record_type.upper()
     if rtype == "MX":
         pri = r.priority if r.priority is not None else 10
-        rdata = f"{pri} {_fqdn(r.value)}"
+        rdata = f"{pri} {r.value}"
     elif rtype == "SRV":
         pri = r.priority if r.priority is not None else 0
         wgt = r.weight if r.weight is not None else 0
         prt = r.port if r.port is not None else 0
-        rdata = f"{pri} {wgt} {prt} {_fqdn(r.value)}"
+        rdata = f"{pri} {wgt} {prt} {r.value}"
     elif rtype in {"CNAME", "NS", "PTR", "DNAME"}:
-        # DNAME (RFC 6672) rdata is a single redirection target — normalise
-        # to an FQDN like the other name-valued types. SVCB/HTTPS rdata
-        # (priority + target + SvcParams) falls through to verbatim passthrough.
-        rdata = _fqdn(r.value)
+        # #2187: a name target is written exactly as stored. A stored
+        # target without a trailing dot is relative to the zone (that is how
+        # BIND and the record API read it), and ``$ORIGIN`` makes the file
+        # read it the same way; forcing a dot on it turned ``mail`` into the
+        # absolute ``mail.`` (a different name, outside the zone). DNAME
+        # (RFC 6672) is a single redirection target like the others.
+        # SVCB/HTTPS rdata falls through to verbatim passthrough.
+        rdata = r.value
     elif rtype == "TXT":
-        v = r.value
-        # Quote only if not already quoted.
-        rdata = v if v.startswith('"') else f'"{v}"'
+        # Quoted, escaped and split into <=255-octet strings as the drivers
+        # do; an already-quoted value is kept as is.
+        rdata = quote_txt(r.value)
     else:
         rdata = r.value
 
