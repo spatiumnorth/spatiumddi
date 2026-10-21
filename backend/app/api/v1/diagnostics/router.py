@@ -19,6 +19,7 @@ from sqlalchemy import desc, func, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import is_effective_superadmin
+from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.diagnostics import InternalError
 from app.services.dns_names_report import scan_name_conformance
@@ -174,6 +175,28 @@ async def get_error(
     return row
 
 
+def _audit_error(
+    action: str, row: InternalError, user: User, *, extra: dict[str, Any] | None = None
+) -> AuditLog:
+    """One audit row for a mutation of a captured error (#2301). Carries
+    the fingerprint and exception class; never the traceback."""
+    return AuditLog(
+        action=action,
+        resource_type="internal_error",
+        resource_id=str(row.id),
+        resource_display=f"{row.exception_class} ({row.fingerprint[:12]})",
+        user_id=user.id,
+        user_display_name=user.username,
+        result="success",
+        new_value={
+            "fingerprint": row.fingerprint,
+            "exception_class": row.exception_class,
+            "service": row.service,
+            **(extra or {}),
+        },
+    )
+
+
 class AcknowledgeRequest(BaseModel):
     note: str | None = Field(None, max_length=500)
 
@@ -191,6 +214,7 @@ async def acknowledge_error(
     if row.acknowledged_by is None:
         row.acknowledged_by = current_user.id
         row.acknowledged_at = datetime.now(UTC)
+        db.add(_audit_error("acknowledge", row, current_user))
         await db.commit()
         await db.refresh(row)
     return row
@@ -218,6 +242,14 @@ async def suppress_error(
     if row is None:
         raise HTTPException(status_code=404, detail="error not found")
     row.suppressed_until = datetime.now(UTC) + timedelta(hours=body.hours)
+    db.add(
+        _audit_error(
+            "suppress",
+            row,
+            current_user,
+            extra={"hours": body.hours, "suppressed_until": row.suppressed_until.isoformat()},
+        )
+    )
     await db.commit()
     await db.refresh(row)
     return row
@@ -233,6 +265,9 @@ async def delete_error(
     row = await db.get(InternalError, error_id)
     if row is None:
         raise HTTPException(status_code=404, detail="error not found")
+    db.add(
+        _audit_error("delete", row, current_user, extra={"occurrence_count": row.occurrence_count})
+    )
     await db.delete(row)
     await db.commit()
 
