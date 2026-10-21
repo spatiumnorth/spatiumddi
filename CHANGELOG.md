@@ -128,6 +128,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Audit page "Chain verified" badge now checks the newest audit
+  rows, not the oldest (#2297).** It verified the first 1,000 rows ever
+  written, so once an install passed 1,000 rows, tampering with recent
+  history still showed green. `GET /audit/integrity` takes
+  `newest=true` with `max_rows` to verify the latest window, anchored
+  on the row before it, and reports `first_seq` / `last_seq` /
+  `partial`; the badge tooltip states the range it covered and that the
+  nightly verify walks the whole chain.
+
 - **Sync DNS commit counted an address as created when nothing was
   written (#2352).** Every address named in `create_for_ip_ids` (and
   every record-linked address in `update_record_ids`) was counted as
