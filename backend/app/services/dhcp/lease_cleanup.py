@@ -26,12 +26,13 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import or_, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer
 from app.models.ipam import IPAddress, Subnet
@@ -306,7 +307,134 @@ async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tupl
     return leases_removed, mirrors_removed
 
 
+# Leases torn down per round trip by ``delete_leases_for_server``. Each
+# batch is flushed and its ORM rows expunged so a server holding 100k
+# leases never has them all in the identity map at once.
+SERVER_DELETE_BATCH = 500
+
+
+async def delete_leases_for_server(db: AsyncSession, server_id: uuid.UUID) -> tuple[int, int]:
+    """Purge every lease held by ``server_id`` before the server row goes (#2290).
+
+    ``dhcp_lease.server_id`` cascades on delete, so removing a server used to
+    silently drop its leases — and with them the only handle the expiry sweep
+    has on the ``auto_from_lease`` IPAM mirrors and the DDNS A/PTR records
+    they published. Those were then stranded permanently.
+
+    This is the same per-lease teardown the expiry / absence-delete paths use
+    (:func:`purge_lease`), *with* ``spare_if_peer_holds=True``: an HA / failover
+    partner (#1110) or another client on the server that still holds an active
+    lease on the address keeps the shared mirror and its DNS.
+
+    DDNS retraction is a ``DNSRecordOp`` enqueue (agent-based) or a post-commit
+    apply (agentless), not an inline server call, so it is safe to run in the
+    request; batching bounds memory and flushes so the per-lease peer checks
+    see earlier batches' deletes. The caller owns the transaction.
+
+    Returns ``(leases_removed, mirrors_removed)``.
+    """
+    now = datetime.now(UTC)
+    subnet_cache = await _load_subnet_cache(db)
+    leases_removed = 0
+    mirrors_removed = 0
+    while True:
+        batch = list(
+            (
+                await db.execute(
+                    select(DHCPLease)
+                    .where(DHCPLease.server_id == server_id)
+                    .order_by(DHCPLease.id)
+                    .limit(SERVER_DELETE_BATCH)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not batch:
+            break
+        for lease in batch:
+            sid = await _resolve_lease_subnet_id(db, lease, subnet_cache)
+            if await purge_lease(db, lease, subnet_id=sid, now=now):
+                mirrors_removed += 1
+            leases_removed += 1
+        await db.flush()
+        for lease in batch:
+            db.expunge(lease)
+    return leases_removed, mirrors_removed
+
+
+# Integration reconcilers also write ``status="dhcp"`` / ``auto_from_lease``
+# rows, with no ``dhcp_lease`` behind them at all — they are told apart by
+# their owner FK, which the orphan sweep must leave alone.
+_INTEGRATION_OWNER_COLUMNS = (
+    "kubernetes_cluster_id",
+    "docker_host_id",
+    "proxmox_node_id",
+    "tailscale_tenant_id",
+    "unifi_controller_id",
+    "cloud_endpoint_id",
+    "opnsense_router_id",
+    "netbird_instance_id",
+    "panos_firewall_id",
+    "fortinet_firewall_id",
+    "meraki_org_id",
+)
+
+ORPHAN_MIRROR_GRACE = timedelta(hours=1)
+
+
+async def sweep_orphaned_lease_mirrors(db: AsyncSession, *, limit: int = 500) -> int:
+    """Free ``status="dhcp"`` / ``auto_from_lease`` mirrors no lease backs (#2290).
+
+    Heals installs already stranded by a server delete (and any other path that
+    drops lease rows without their mirror). A mirror is residue only when NO
+    ``dhcp_lease`` row, on any server and in any state, carries its address —
+    so an HA peer's lease, or an expired-but-not-yet-pruned one, keeps it
+    (the expiry sweep owns those). Rows owned by an integration reconciler are
+    skipped, and so is anything seen within ``ORPHAN_MIRROR_GRACE`` so a mirror
+    mid-flight with its lease write is never raced.
+
+    Returns the number of mirror rows freed. Does not commit.
+    """
+    from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
+
+    cutoff = datetime.now(UTC) - ORPHAN_MIRROR_GRACE
+    conds = [getattr(IPAddress, c).is_(None) for c in _INTEGRATION_OWNER_COLUMNS]
+    rows = (
+        (
+            await db.execute(
+                select(IPAddress)
+                .where(
+                    IPAddress.status == "dhcp",
+                    IPAddress.auto_from_lease.is_(True),
+                    or_(IPAddress.last_seen_at.is_(None), IPAddress.last_seen_at < cutoff),
+                    ~exists().where(DHCPLease.ip_address == IPAddress.address),
+                    *conds,
+                )
+                .options(selectinload(IPAddress.subnet))
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        if row.subnet is not None:
+            try:
+                await revoke_ddns_for_lease(db, subnet=row.subnet, ipam_row=row)
+            except Exception as exc:  # noqa: BLE001 — DDNS revoke is best-effort
+                logger.warning(
+                    "dhcp_orphan_mirror_ddns_revoke_failed",
+                    ip=str(row.address),
+                    error=str(exc),
+                )
+        await db.delete(row)
+    return len(rows)
+
+
 __all__ = [
+    "delete_leases_for_server",
+    "sweep_orphaned_lease_mirrors",
     "address_still_held",
     "another_client_holds_address",
     "delete_leases_for_scope",

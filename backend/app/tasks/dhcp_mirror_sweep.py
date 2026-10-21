@@ -32,6 +32,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.celery_app import celery_app
 from app.db import task_session
 from app.models.audit import AuditLog
+from app.services.dhcp.lease_cleanup import sweep_orphaned_lease_mirrors
 from app.services.dhcp.static_ipam import sweep_orphaned_static_mirrors
 from app.services.feature_modules import is_module_enabled
 
@@ -50,6 +51,8 @@ async def _sweep() -> int:
         if not await is_module_enabled(db, "core.dhcp"):
             return 0
         freed = await sweep_orphaned_static_mirrors(db, limit=_MAX_PER_RUN)
+        # #2290 — dynamic-lease mirrors whose lease rows are gone (server delete).
+        freed += await sweep_orphaned_lease_mirrors(db, limit=_MAX_PER_RUN)
         if freed:
             # Only audit when we actually changed something — a row per hour
             # saying "found nothing" would bury the one that matters. Freeing an
