@@ -294,9 +294,19 @@ def user_has_permission(
     return True
 
 
-def _user_rbac_allows(user: User, action: str, resource_type: str, req_rid: str | None) -> bool:
+def _user_rbac_allows(
+    user: User,
+    action: str,
+    resource_type: str,
+    req_rid: str | None,
+    *,
+    include_time_bound: bool = True,
+) -> bool:
     """The owning user's static-role + time-bound-grant verdict (no token
-    narrowing — that's layered on in :func:`user_has_permission`)."""
+    narrowing — that's layered on in :func:`user_has_permission`).
+
+    ``include_time_bound=False`` answers from static roles (and the legacy
+    flag) alone, for :func:`caller_can_grant`."""
     if user.is_superadmin:
         return True
 
@@ -320,6 +330,8 @@ def _user_rbac_allows(user: User, action: str, resource_type: str, req_rid: str 
     # never removes a static role grant. The same _action_/_resource_type_/
     # _resource_id_ predicates apply so a grant evaluates identically to a
     # role permission with the same triple.
+    if not include_time_bound:
+        return False
     for grant in getattr(user, "_active_time_bound_grants", None) or []:
         if not _action_matches(getattr(grant, "action", ""), action):
             continue
@@ -492,6 +504,10 @@ def caller_can_grant(user: User, perms: object) -> bool:
       :func:`user_has_permission` with the same triple). A caller cannot grant
       a permission they don't possess, so the resulting role can never widen
       the caller's own effective access.
+    * ...and holds through a static role, not only through a live time-bound
+      grant. Granting is durable (a role, a membership, a fresh grant with its
+      own expiry), so a permission held until a deadline must not be turnable
+      into one held after it.
 
     A malformed / unrecognised entry is treated as un-grantable (``False``) so
     a bad shape can't sneak past the ceiling.
@@ -507,8 +523,12 @@ def caller_can_grant(user: User, perms: object) -> bool:
         # grant access beyond what the caller can express via concrete holds.
         if action == "*" or resource_type == "*":
             return False
-        # The caller must already hold this exact (action, resource_type[, id]).
+        # The caller must already hold this exact (action, resource_type[, id]),
+        # and hold it through a static role: a time-bound grant is not a
+        # ceiling to grant from, or it would outlive its own expiry.
         if not user_has_permission(user, action, resource_type, rid):
+            return False
+        if not _user_rbac_allows(user, action, resource_type, rid, include_time_bound=False):
             return False
     return True
 

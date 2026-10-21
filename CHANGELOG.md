@@ -977,7 +977,10 @@ the formatter handles the rest.
   time-bound grants, are what its members hold, so adding a member,
   removing one and deleting the group now need the caller to be able
   to grant those permissions themselves, exactly as attaching a role
-  already did. Only a superadmin can change the membership of a group
+  already did. A permission held only through a live time-bound grant
+  no longer counts towards that ceiling anywhere (roles, groups or new
+  grants), so it cannot be turned into access that outlives the grant.
+  Only a superadmin can change the membership of a group
   carrying a wildcard (`*`) permission. The same ceiling now bounds
   detaching a role from a group, changing or deleting an existing
   role, and revoking a wildcard time-bound grant. Resending a group's unchanged
@@ -987,13 +990,13 @@ the formatter handles the rest.
   **No change may leave the install without an active superadmin.**
   Disabling, un-flagging or deleting a user, removing the last
   superadmin from a group, detaching or editing the wildcard role,
-  deleting that group or role, and revoking the last wildcard
-  time-bound grant now answer 409 when nobody active would be left.
+  and deleting that group or role now answer 409 when nobody active
+  would be left. A superadmin through a time-bound grant alone does
+  not count, since the grant expires.
   Refusals from both checks write a `denied` audit row, as a
   permission refusal does. External sign-in (LDAP / OIDC / SAML /
   RADIUS / TACACS+) still syncs group membership from the identity
   provider's group mappings, which only a superadmin can configure.
-
 
 - **Forwarded audit events are redacted the way the audit API
   redacts them (#2015).** #2014 redacted an audit entry's

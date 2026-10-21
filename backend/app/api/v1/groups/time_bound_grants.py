@@ -37,11 +37,7 @@ from app.core.permissions import caller_can_grant, refuse_and_audit, require_per
 from app.models.audit import AuditLog
 from app.models.auth import Group
 from app.models.time_bound_grant import TimeBoundGrant
-from app.services.superadmin_grant import (
-    SuperadminModel,
-    leaves_no_active_superadmin,
-    permissions_grant_superadmin,
-)
+from app.services.superadmin_grant import SuperadminModel, permissions_grant_superadmin
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -311,52 +307,9 @@ async def revoke_time_bound_grant(
             reason="above the caller's privilege ceiling",
             detail=("Only a superadmin can revoke a grant carrying wildcard ('*') " "permissions."),
         )
-    if permissions_grant_superadmin(
-        [
-            {
-                "action": grant.action,
-                "resource_type": grant.resource_type,
-                "resource_id": grant.resource_id,
-            }
-        ]
-    ):
-        group_id = grant.group_id
-
-        def _change(model: SuperadminModel) -> None:
-            model.granted_groups.discard(group_id)
-
-        # ``granted_groups`` holds one entry per group; this is the only
-        # ``*`` / ``*`` grant on the group unless another live one exists.
-        others = await db.scalar(
-            select(TimeBoundGrant.id)
-            .where(
-                TimeBoundGrant.group_id == group_id,
-                TimeBoundGrant.id != grant.id,
-                TimeBoundGrant.revoked_at.is_(None),
-                TimeBoundGrant.expires_at > datetime.now(UTC),
-                TimeBoundGrant.action == "*",
-                TimeBoundGrant.resource_type == "*",
-                TimeBoundGrant.resource_id.is_(None),
-            )
-            .limit(1)
-        )
-        if others is None and await leaves_no_active_superadmin(db, _change):
-            await refuse_and_audit(
-                db,
-                current_user,
-                request,
-                action="permission_change",
-                resource_type="time_bound_grant",
-                resource_id=str(grant.id),
-                resource_display=display,
-                reason="would leave no active superadmin",
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "This change would leave no active superadmin. Make another "
-                    "account a superadmin first."
-                ),
-            )
-
+    # No last-superadmin check here: a ``*`` / ``*`` grant lapses on its own,
+    # so a superadmin who holds only one is never counted as the one that
+    # keeps the install administrable (``leaves_no_active_superadmin``).
     grant.revoked_at = datetime.now(UTC)
     db.add(
         AuditLog(

@@ -135,7 +135,11 @@ on inactive.
    creates or edits a role's permission set (or assigns roles to a group), every
    permission they add must be one they *themselves* effectively hold —
    `user_has_permission(editor, entry)` must pass for each entry in the new set,
-   and no entry may carry a wildcard (`*`). This stops, say, an IPAM editor from
+   and no entry may carry a wildcard (`*`). The editor must hold each entry
+   through a static role: a permission held only through a live time-bound
+   grant is not one they can grant onward, or a grant meant to lapse could be
+   turned into a role, a membership or a longer grant that does not. This
+   stops, say, an IPAM editor from
    minting a `{*, *}` role and assigning it to their own group to escalate.
    Superadmins (either path in the section above) are exempt by rule 1.
 
@@ -156,10 +160,14 @@ on inactive.
    by this: it follows the provider group mappings, which only a superadmin
    configures.
 6. **At least one active superadmin.** Any change that would leave no active
-   effective superadmin is refused with 409 and a `denied` audit row:
-   disabling, un-flagging or deleting a user; removing a member from, detaching
-   a role from, or deleting a group; changing or deleting a role; revoking a
-   time-bound grant.
+   superadmin — through the `is_superadmin` flag or a `{*, *}` role — is refused
+   with 409 and a `denied` audit row: disabling, un-flagging or deleting a user;
+   removing a member from, detaching a role from, or deleting a group; changing
+   or deleting a role. A superadmin who holds `{*, *}` only through a time-bound
+   grant does not count, since the grant lapses on its own; so revoking such a
+   grant is never refused by this rule. The check and the change it guards run
+   under one advisory lock, so two concurrent changes cannot each remove one of
+   the last two superadmins.
 
 ### Bulk deletes need `delete`
 

@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import Role, User, group_role, user_group
@@ -57,7 +57,7 @@ class SuperadminModel:
     group_roles: dict[uuid.UUID, set[uuid.UUID]] = field(default_factory=lambda: defaultdict(set))
     role_wildcard: dict[uuid.UUID, bool] = field(default_factory=dict)
     granted_groups: set[uuid.UUID] = field(default_factory=set)
-    # Accounts with ``is_active`` set. Only :meth:`active_superadmins` reads
+    # Accounts with ``is_active`` set. Only :meth:`durable_active_superadmins` reads
     # it: "who would become a superadmin" deliberately ignores it (see the
     # module docstring), but "is anyone left who can administer the install"
     # cannot.
@@ -75,8 +75,17 @@ class SuperadminModel:
                 out |= members
         return out
 
-    def active_superadmins(self) -> set[uuid.UUID]:
-        return self.superadmins() & self.active
+    def durable_active_superadmins(self) -> set[uuid.UUID]:
+        """Active superadmins through the flag or a ``*`` / ``*`` role.
+
+        A live ``*`` / ``*`` time-bound grant does not count: it lapses on
+        its own, so an install whose only remaining superadmin holds one is
+        locked out the moment it expires."""
+        out = self.flagged & self.active
+        for group_id, members in self.group_members.items():
+            if any(self.role_wildcard.get(r, False) for r in self.group_roles.get(group_id, ())):
+                out |= members & self.active
+        return out
 
 
 async def load_model(db: AsyncSession) -> SuperadminModel:
@@ -122,23 +131,35 @@ async def newly_superadmin(
     return after.superadmins() - before.superadmins()
 
 
+# Serialises the "would this leave no superadmin" decision with the write it
+# guards. Without it, two concurrent requests (each removing a different one
+# of the last two superadmins) both see the other one remaining and both
+# commit. A transaction-scoped advisory lock, held until the caller commits
+# or rolls back; only the handlers that can shrink the set take it.
+_LAST_SUPERADMIN_LOCK_KEY = 0x5D_D1_5A_01
+
+
 async def leaves_no_active_superadmin(
     db: AsyncSession, change: Callable[[SuperadminModel], None]
 ) -> bool:
-    """Whether ``change`` would take the install from at least one active
-    superadmin to none.
+    """Whether ``change`` would take the install from at least one active,
+    durable superadmin (the flag, or a ``*`` / ``*`` role) to none.
 
     With none left, only the CLI password-reset recipe can administer the
     install again. Like :func:`newly_superadmin`, ``change`` mutates an
     in-memory copy, so call this before writing anything. An install that
     already has none is not made worse by the change, so it is not refused
-    here."""
+    here.
+
+    Takes a transaction-scoped advisory lock first, so the caller must
+    commit (or roll back) the change it guards in the same transaction."""
+    await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _LAST_SUPERADMIN_LOCK_KEY})
     before = await load_model(db)
-    if not before.active_superadmins():
+    if not before.durable_active_superadmins():
         return False
     after = copy.deepcopy(before)
     change(after)
-    return not after.active_superadmins()
+    return not after.durable_active_superadmins()
 
 
 def loaded_user_holds_superadmin(user: User) -> bool:

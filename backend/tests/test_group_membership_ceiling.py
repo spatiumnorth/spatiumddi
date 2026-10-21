@@ -489,27 +489,130 @@ async def test_group_admin_cannot_revoke_a_wildcard_grant(
     assert grant.revoked_at is None
 
 
-@pytest.mark.asyncio
-async def test_last_superadmin_grant_cannot_be_revoked(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    """The only superadmin holds it through a live ``*`` / ``*`` time-bound
-    grant: revoking that grant would leave none."""
+async def _grant(
+    db: AsyncSession, group: Group, action: str, resource_type: str, hours: int = 1
+) -> Any:
     from datetime import UTC, datetime, timedelta
 
     from app.models.time_bound_grant import TimeBoundGrant
 
-    user = await _user(db_session)
-    group = await _group(db_session, roles=[], users=[user])
     grant = TimeBoundGrant(
         group_id=group.id,
-        action="*",
-        resource_type="*",
+        action=action,
+        resource_type=resource_type,
         resource_id=None,
-        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        expires_at=datetime.now(UTC) + timedelta(hours=hours),
         reason="test",
     )
-    db_session.add(grant)
-    await db_session.commit()
-    r = await client.delete(f"/api/v1/groups/time-bound-grants/{grant.id}", headers=_headers(user))
+    db.add(grant)
+    await db.commit()
+    return grant
+
+
+@pytest.mark.asyncio
+async def test_a_time_bound_superadmin_does_not_count_as_the_last_one(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A ``*`` / ``*`` time-bound grant lapses on its own, so the account it
+    makes a superadmin is not the one that keeps the install administrable:
+    the last durable superadmin still cannot disable themselves, and revoking
+    the grant is never refused as "the last superadmin"."""
+    admin = await _user(db_session, superadmin=True)
+    temp = await _user(db_session)
+    group = await _group(db_session, roles=[], users=[temp])
+    grant = await _grant(db_session, group, "*", "*")
+
+    r = await client.put(
+        f"/api/v1/users/{admin.id}", headers=_headers(admin), json={"is_active": False}
+    )
     assert r.status_code == 409, r.text
+    await db_session.refresh(admin)
+    assert admin.is_active is True
+
+    r = await client.delete(f"/api/v1/groups/time-bound-grants/{grant.id}", headers=_headers(admin))
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_a_time_bound_permission_is_not_a_ceiling_to_grant_from(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A delegate holding ``admin:dns_zone`` only until a grant expires cannot
+    turn it into access that outlives the grant: not by joining a group that
+    carries it, nor by minting a fresh grant, nor by authoring a role."""
+    await _user(db_session, superadmin=True)
+    zone_admin = [{"action": "admin", "resource_type": "dns_zone"}]
+    delegate = await _user(db_session)
+    own = await _group(
+        db_session,
+        roles=[
+            await _role(
+                db_session,
+                [*_GROUP_ADMIN, {"action": "admin", "resource_type": "role"}],
+            )
+        ],
+        users=[delegate],
+    )
+    await _grant(db_session, own, "admin", "dns_zone")
+    # The grant is live: the delegate does hold the permission right now.
+    r = await client.get("/api/v1/dns/groups", headers=_headers(delegate))
+    assert r.status_code == 200, r.text
+
+    target = await _group(db_session, roles=[await _role(db_session, zone_admin)], users=[])
+    r = await client.put(
+        f"/api/v1/groups/{target.id}",
+        headers=_headers(delegate),
+        json={"user_ids": [str(delegate.id)]},
+    )
+    assert r.status_code == 403, r.text
+    assert delegate.id not in await _member_ids(db_session, target.id)
+
+    r = await client.post(
+        "/api/v1/groups/time-bound-grants",
+        headers=_headers(delegate),
+        json={
+            "group_id": str(own.id),
+            "action": "admin",
+            "resource_type": "dns_zone",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "reason": "extend",
+        },
+    )
+    assert r.status_code == 403, r.text
+
+    r = await client.post(
+        "/api/v1/roles",
+        headers=_headers(delegate),
+        json={"name": _name("r"), "description": "", "permissions": zone_admin},
+    )
+    assert r.status_code == 403, r.text
+
+
+@pytest.mark.asyncio
+async def test_last_superadmin_check_holds_a_lock_until_commit(
+    db_session: AsyncSession,
+) -> None:
+    """Two concurrent changes must not each remove one of the last two
+    superadmins: the check holds a transaction-scoped lock that a second
+    transaction cannot take until the first commits."""
+    from sqlalchemy import text
+
+    from app.services.superadmin_grant import (
+        _LAST_SUPERADMIN_LOCK_KEY,
+        leaves_no_active_superadmin,
+    )
+
+    await _user(db_session, superadmin=True)
+    assert await leaves_no_active_superadmin(db_session, lambda m: None) is False
+
+    probe = "SELECT pg_try_advisory_xact_lock(:k)"
+    async with AsyncSession(db_session.bind) as other:
+        taken = await other.scalar(text(probe), {"k": _LAST_SUPERADMIN_LOCK_KEY})
+        assert taken is False
+        await other.rollback()
+
+    await db_session.commit()
+    async with AsyncSession(db_session.bind) as other:
+        taken = await other.scalar(text(probe), {"k": _LAST_SUPERADMIN_LOCK_KEY})
+        assert taken is True
+        await other.rollback()
