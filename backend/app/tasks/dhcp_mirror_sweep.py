@@ -24,6 +24,7 @@ healthy install it finds nothing and writes nothing (not even an audit row).
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import structlog
@@ -42,6 +43,7 @@ logger = structlog.get_logger(__name__)
 # can't turn one tick into an hour-long transaction holding locks on ip_address.
 # Whatever is left over is picked up on the next tick — the sweep is idempotent.
 _MAX_PER_RUN = 500
+_LEASE_SWEEP_BUDGET_S = 240.0
 
 
 async def _sweep() -> int:
@@ -52,7 +54,15 @@ async def _sweep() -> int:
             return 0
         freed = await sweep_orphaned_static_mirrors(db, limit=_MAX_PER_RUN)
         # #2290 — dynamic-lease mirrors whose lease rows are gone (server delete).
-        freed += await sweep_orphaned_lease_mirrors(db, limit=_MAX_PER_RUN)
+        # Loop in committed batches under a time budget: a deleted server can
+        # strand 100k mirrors and one batch per hour would take a week.
+        deadline = time.monotonic() + _LEASE_SWEEP_BUDGET_S
+        while True:
+            n = await sweep_orphaned_lease_mirrors(db, limit=_MAX_PER_RUN)
+            freed += n
+            if n < _MAX_PER_RUN or time.monotonic() > deadline:
+                break
+            await db.commit()
         if freed:
             # Only audit when we actually changed something — a row per hour
             # saying "found nothing" would bury the one that matters. Freeing an

@@ -192,3 +192,32 @@ async def test_orphan_sweep_heals_already_stranded_mirrors(
     assert freed == 1
     assert revoked == ["10.77.1.30"]
     assert await _addrs(db_session, sid) == {"10.77.1.31", "10.77.1.32", "10.77.1.33"}
+
+
+@pytest.mark.asyncio
+async def test_inline_teardown_is_capped_and_sweep_heals_the_rest(
+    db_session: AsyncSession, revoked: list[str]
+) -> None:
+    """Request time is bounded: past the cap the sweep finishes the job."""
+    from app.services.dhcp.lease_cleanup import (
+        delete_leases_for_server,
+        sweep_orphaned_lease_mirrors,
+    )
+
+    subnet, scope, (srv,) = await _world(db_session)
+    sid, subid = srv.id, subnet.id
+    for i in range(5):
+        await _lease(db_session, srv, scope, f"10.77.1.{10 + i}", subnet=subnet)
+    removed, _ = await delete_leases_for_server(db_session, sid, max_leases=2)
+    assert removed == 2
+    assert len(await _addrs(db_session, subid)) == 3
+    # Cascade drops the remaining lease rows; backdate sightings past the grace.
+    old = datetime.now(UTC) - timedelta(hours=3)
+    for row in (
+        await db_session.execute(select(IPAddress).where(IPAddress.subnet_id == subid))
+    ).scalars():
+        row.last_seen_at = old
+    await db_session.delete(await db_session.get(DHCPServer, sid))
+    await db_session.flush()
+    assert await sweep_orphaned_lease_mirrors(db_session) == 3
+    assert await _addrs(db_session, subid) == set()

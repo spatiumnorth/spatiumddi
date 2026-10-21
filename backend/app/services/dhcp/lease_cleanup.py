@@ -312,8 +312,17 @@ async def delete_leases_for_scope(db: AsyncSession, scope_id: uuid.UUID) -> tupl
 # leases never has them all in the identity map at once.
 SERVER_DELETE_BATCH = 500
 
+# Hard cap on leases torn down inline by a server delete. The per-lease
+# teardown measures ~15 ms (20k leases took 274 s on a dev box), so an
+# unbounded loop would run a 100k-lease delete for ~25 min inside the HTTP
+# request. Past the cap the rest cascade away with the server and their
+# mirrors are healed by the hourly ``sweep_orphaned_lease_mirrors``.
+SERVER_DELETE_INLINE_MAX = 1000
 
-async def delete_leases_for_server(db: AsyncSession, server_id: uuid.UUID) -> tuple[int, int]:
+
+async def delete_leases_for_server(
+    db: AsyncSession, server_id: uuid.UUID, *, max_leases: int = SERVER_DELETE_INLINE_MAX
+) -> tuple[int, int]:
     """Purge every lease held by ``server_id`` before the server row goes (#2290).
 
     ``dhcp_lease.server_id`` cascades on delete, so removing a server used to
@@ -331,20 +340,23 @@ async def delete_leases_for_server(db: AsyncSession, server_id: uuid.UUID) -> tu
     request; batching bounds memory and flushes so the per-lease peer checks
     see earlier batches' deletes. The caller owns the transaction.
 
+    At most ``max_leases`` are torn down here (bounded request time); the
+    remainder is left for the orphan sweep once the cascade removes them.
+
     Returns ``(leases_removed, mirrors_removed)``.
     """
     now = datetime.now(UTC)
     subnet_cache = await _load_subnet_cache(db)
     leases_removed = 0
     mirrors_removed = 0
-    while True:
+    while leases_removed < max_leases:
         batch = list(
             (
                 await db.execute(
                     select(DHCPLease)
                     .where(DHCPLease.server_id == server_id)
                     .order_by(DHCPLease.id)
-                    .limit(SERVER_DELETE_BATCH)
+                    .limit(min(SERVER_DELETE_BATCH, max_leases - leases_removed))
                 )
             )
             .scalars()
@@ -360,6 +372,12 @@ async def delete_leases_for_server(db: AsyncSession, server_id: uuid.UUID) -> tu
         await db.flush()
         for lease in batch:
             db.expunge(lease)
+    else:
+        logger.warning(
+            "dhcp_server_delete_lease_teardown_capped",
+            server=str(server_id),
+            torn_down=leases_removed,
+        )
     return leases_removed, mirrors_removed
 
 
