@@ -200,6 +200,15 @@ class AlertEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Other rule types may write None.
     last_observed_value: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
+    # #2261 — set when an evaluator pass queues this event's delivery to run
+    # after its commit; cleared the moment a sender claims it. Still set long
+    # after the pass means the worker died between the commit and the send,
+    # and ``alerts.redeliver_stranded`` sends it. NULL for every event
+    # delivered inline, which the sweep ignores.
+    delivery_pending_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     __table_args__ = (
         # #2261 — UNIQUE: at most one open event per (rule, subject). Two
         # overlapping evaluator passes used to open a pair, and only one of
@@ -213,4 +222,9 @@ class AlertEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             postgresql_where=sa_text("resolved_at IS NULL"),
         ),
         Index("ix_alert_event_fired_at", "fired_at"),
+        Index(
+            "ix_alert_event_delivery_pending",
+            "delivery_pending_since",
+            postgresql_where=sa_text("delivery_pending_since IS NOT NULL"),
+        ),
     )

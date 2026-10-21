@@ -231,6 +231,7 @@ backend/alembic/versions/b3e7d21c9f04_dhcp_scope_cascade_soft_delete.py:drop_col
 backend/alembic/versions/b3e7d21c9f04_dhcp_scope_cascade_soft_delete.py:drop_column:150
 backend/alembic/versions/b4d1c9e2f3a7_add_reason_to_blocklist_entry.py:drop_column:28
 backend/alembic/versions/b4d291a6c7e8_dns_server_zone_state.py:drop_table:93
+backend/alembic/versions/b4d81f2e6a93_alert_event_unique_open_subject.py:drop_column:74
 backend/alembic/versions/b4f2a9c17e63_wake_scheduler_verify.py:drop_column:147
 backend/alembic/versions/b4f2a9c17e63_wake_scheduler_verify.py:drop_column:148
 backend/alembic/versions/b4f2a9c17e63_wake_scheduler_verify.py:drop_column:149

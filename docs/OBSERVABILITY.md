@@ -1027,9 +1027,13 @@ savepoint, so a rule whose query errors or times out is logged as
 `alert_rule_eval_failed` and skipped while the rest of the pass
 completes. Events are delivered only **after** the pass commits them,
 so a failed or retried pass never pages for an event that is not in
-the database. Delivery is at-most-once: a worker killed between the
-commit and the send leaves the event open in the UI with its
-`delivered_*` receipts false, and it is not re-sent. Passes are
+the database. A queued delivery is stamped on the event
+(`delivery_pending_since`) and claimed by a committed conditional
+update before it is sent, so no two senders ever send it. A worker
+killed between the commit and the send leaves the stamp set; every
+pass ends by re-sending any delivery stamped more than 10 minutes
+earlier (`alert_redelivering_stranded`), unless the event has since
+resolved or its rule was disabled. Passes are
 serialised by an advisory lock; a pass that starts while another is
 running (a slow tick, a Celery retry, or **Evaluate now**) logs
 `alert_evaluate_skipped_locked` and returns zero counts. The

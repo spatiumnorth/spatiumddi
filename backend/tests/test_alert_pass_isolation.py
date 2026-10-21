@@ -13,7 +13,7 @@ which events are stored, which results are stored.
 from __future__ import annotations
 
 import importlib.util
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -295,6 +295,7 @@ def _migration_statements(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr(alembic_op, "execute", statements.append, raising=False)
     monkeypatch.setattr(alembic_op, "drop_index", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(alembic_op, "create_index", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(alembic_op, "add_column", lambda *a, **k: None, raising=False)
     mig.upgrade()
     return statements
 
@@ -482,3 +483,202 @@ async def test_conformity_crashing_check_keeps_other_policies_and_pages_once(
     for p in (failing, crashing):
         await db.refresh(p)
         assert p.last_evaluated_at is not None
+
+
+async def test_rule_failing_at_savepoint_release_rolls_back_only_itself(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rule that ``continue``s out of the dispatch with a change the flush
+    rejects fails at its savepoint's release, not at the pass's commit."""
+    db = db_session
+    await _two_rules(db)
+    _patch_matchers(monkeypatch, bad_fails=False)
+    broken = AlertRule(
+        name="c-broken",
+        description="",
+        rule_type=alerts.RULE_TYPE_COMPLIANCE_CHANGE,
+        severity="warning",
+        enabled=True,
+    )
+    db.add(broken)
+    await db.commit()
+    broken_id = broken.id
+
+    async def bad_transition(_db, rule, _now):  # type: ignore[no-untyped-def]
+        rule.name = None  # NOT NULL — rejected only when the savepoint flushes
+        return 0, 0, 0, 0, 0
+
+    monkeypatch.setattr(alerts, "_evaluate_compliance_change_rule", bad_transition)
+
+    deliveries: list[str] = []
+
+    async def fake_deliver(rule, event, targets):  # type: ignore[no-untyped-def]
+        deliveries.append(event.subject_id)
+        return (False, True, False)
+
+    monkeypatch.setattr(alerts, "_deliver", fake_deliver)
+
+    outcomes = await _run_ticks(db, 2)
+
+    assert outcomes == ["ok", "ok"]
+    assert deliveries == ["subj-1"]
+    await db.rollback()
+    assert [e.subject_id for e in await _open_events(db)] == ["subj-1"]
+    name = (await db.execute(select(AlertRule.name).where(AlertRule.id == broken_id))).scalar_one()
+    assert name == "c-broken"
+
+
+# ── Stranded deliveries (#2261) ─────────────────────────────────────
+
+
+async def _backdate_pending(db: AsyncSession, minutes: int) -> None:
+    await db.execute(
+        text(
+            "UPDATE alert_event SET delivery_pending_since = delivery_pending_since "
+            f"- interval '{minutes} minutes' WHERE delivery_pending_since IS NOT NULL"
+        )
+    )
+    await db.commit()
+
+
+async def test_delivery_stranded_by_a_dead_worker_is_sent_once(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker dies after the pass commits and before it sends. A later
+    pass sends the event once, and only once it is clearly stranded."""
+    db = db_session
+    await _two_rules(db)
+    _patch_matchers(monkeypatch, bad_fails=False)
+
+    deliveries: list[str] = []
+
+    async def fake_deliver(rule, event, targets):  # type: ignore[no-untyped-def]
+        deliveries.append(event.subject_id)
+        return (False, True, False)
+
+    monkeypatch.setattr(alerts, "_deliver", fake_deliver)
+
+    real_deliver_deferred = alerts.deliver_deferred
+
+    async def killed(_db, _pending, _targets=None):  # type: ignore[no-untyped-def]
+        return 0, 0, 0
+
+    monkeypatch.setattr(alerts, "deliver_deferred", killed)
+    await alerts.evaluate_all(db)
+    monkeypatch.setattr(alerts, "deliver_deferred", real_deliver_deferred)
+
+    await db.rollback()
+    [event] = await _open_events(db)
+    assert event.delivery_pending_since is not None
+    assert event.delivered_webhook is False
+    assert deliveries == []
+
+    # A pass right after does not race the (possibly just slow) sender.
+    await alerts.evaluate_all(db)
+    assert deliveries == []
+
+    await _backdate_pending(db, 11)
+    result = await alerts.evaluate_all(db)
+    assert deliveries == ["subj-1"]
+    assert result["delivered_webhook"] == 1
+
+    # Nothing left to claim: later passes send nothing more.
+    await alerts.evaluate_all(db)
+    await alerts.redeliver_stranded(db)
+    assert deliveries == ["subj-1"]
+    await db.rollback()
+    [event] = await _open_events(db)
+    await db.refresh(event)
+    assert event.delivery_pending_since is None
+    assert event.delivered_webhook is True
+
+
+async def test_sweep_and_slow_sender_never_both_send(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass so slow that the sweep took its event first: the claim makes
+    the original sender skip it."""
+    db = db_session
+    await _two_rules(db)
+    _patch_matchers(monkeypatch, bad_fails=False)
+
+    deliveries: list[str] = []
+
+    async def fake_deliver(rule, event, targets):  # type: ignore[no-untyped-def]
+        deliveries.append(event.subject_id)
+        return (True, False, False)
+
+    monkeypatch.setattr(alerts, "_deliver", fake_deliver)
+
+    captured: list[list[tuple[AlertRule, AlertEvent]]] = []
+
+    async def slow(_db, pending, _targets=None):  # type: ignore[no-untyped-def]
+        captured.append(list(pending))
+        return 0, 0, 0
+
+    real_deliver_deferred = alerts.deliver_deferred
+    monkeypatch.setattr(alerts, "deliver_deferred", slow)
+    await alerts.evaluate_all(db)
+    monkeypatch.setattr(alerts, "deliver_deferred", real_deliver_deferred)
+
+    await _backdate_pending(db, 11)
+    await alerts.redeliver_stranded(db)
+    assert deliveries == ["subj-1"]
+
+    # The slow sender finally gets round to it.
+    sent = await alerts.deliver_deferred(db, captured[0], [])
+    assert sent == (0, 0, 0)
+    assert deliveries == ["subj-1"]
+
+
+async def test_stranded_delivery_for_a_resolved_event_is_dropped(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = db_session
+    good, _ = await _two_rules(db)
+    old = datetime.now(UTC) - timedelta(hours=1)
+    db.add_all(
+        [
+            AlertEvent(
+                rule_id=good.id,
+                subject_type="subnet",
+                subject_id="gone",
+                subject_display="x",
+                severity="warning",
+                message="m",
+                fired_at=old,
+                resolved_at=datetime.now(UTC),
+                delivery_pending_since=old,
+            ),
+            # Delivered inline (no stamp): never the sweep's business.
+            AlertEvent(
+                rule_id=good.id,
+                subject_type="subnet",
+                subject_id="inline",
+                subject_display="x",
+                severity="warning",
+                message="m",
+                fired_at=old,
+            ),
+        ]
+    )
+    await db.commit()
+
+    deliveries: list[str] = []
+
+    async def fake_deliver(rule, event, targets):  # type: ignore[no-untyped-def]
+        deliveries.append(event.subject_id)
+        return (True, False, False)
+
+    monkeypatch.setattr(alerts, "_deliver", fake_deliver)
+
+    assert await alerts.redeliver_stranded(db, []) == (0, 0, 0)
+    assert deliveries == []
+    pending = (
+        await db.execute(
+            select(func.count())
+            .select_from(AlertEvent)
+            .where(AlertEvent.delivery_pending_since.is_not(None))
+        )
+    ).scalar_one()
+    assert pending == 0

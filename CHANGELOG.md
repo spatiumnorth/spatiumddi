@@ -193,9 +193,10 @@ the formatter handles the rest.
   rule rolls back only itself, and nothing is delivered until the
   events are committed; a pass that fails before its commit has sent
   nothing, and one that fails after it finds its events already open
-  and does not re-send them. The trade is at-most-once: a worker killed
-  between the commit and the send leaves the event open in the UI with
-  its delivery receipts unset, rather than paging twice. Passes are
+  and does not re-send them. Each queued delivery is claimed before it
+  is sent, so it is never sent twice, and one a worker died before
+  sending is re-sent by a later pass once it is ten minutes old, unless
+  the event has resolved or its rule is disabled. Passes are
   serialised by an advisory lock (an overlapping pass, including
   "Evaluate now", returns zero counts), and at most one event per
   rule and subject can be open: the index is now unique, and the
@@ -6541,8 +6542,11 @@ the formatter handles the rest.
 - `b4d81f2e6a93` — #2261: `ix_alert_event_rule_subject_open` becomes a
   UNIQUE partial index (one open `alert_event` per rule, subject type
   and subject). Duplicate open events are resolved first, keeping the
-  earliest-fired. Downgrade restores the non-unique index; the resolved
-  duplicates stay resolved.
+  earliest-fired. Also adds the nullable
+  `alert_event.delivery_pending_since` with a partial index on its
+  non-NULL rows; existing rows stay NULL. Downgrade restores the
+  non-unique index and drops the column; the resolved duplicates stay
+  resolved.
 - `d3a7f19c52e8` — #2112, data only: `dns_server.notes` equal to exactly
   `agent v2026.04.14.1` becomes empty. Downgrade does nothing.
 - `b8e41c7a2d95` — #1817, data + server default:
