@@ -733,6 +733,8 @@ DHCPClientClass
 
 Classes are referenced by pool `class_restriction` field. The DHCP driver translates these to server-native syntax.
 
+The reference is by name, and Kea accepts a name it does not define (the pool then matches nobody), so the API guards it (#2285): renaming or deleting a class, or deleting a device policy, is refused with a 409 while a pool in the group (or another class's `member()` test) still names it; a pool naming a class that does not exist is a 422. A dangling restriction that still reaches a bundle is rendered as stored (fail closed, never opened to every client) and logged as `dhcp_pool_restricted_to_undefined_class` when the set of dangling references changes.
+
 ### Address family (#1229, #1295)
 
 Kea runs one daemon per family, and a class goes only into the daemons its
