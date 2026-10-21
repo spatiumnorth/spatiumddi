@@ -75,7 +75,10 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.models.ipam import IPAddress, Subnet
-from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
+from app.services.dhcp.ipam_mirror import (
+    insert_ipam_mirror_row,
+    lease_hostname_suppressed_subnets,
+)
 from app.services.dhcp.lease_cleanup import purge_lease
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.dhcp.normalize import norm_ip, norm_mac
@@ -93,11 +96,20 @@ from app.services.dhcp.windows_failover import (
 
 
 def _refresh_lease_owned_row(
-    row: IPAddress, lease: dict[str, Any], mac: str, now: datetime
+    row: IPAddress,
+    lease: dict[str, Any],
+    mac: str,
+    now: datetime,
+    *,
+    write_hostname: bool = True,
 ) -> None:
-    """Refresh an auto-from-lease mirror row from the wire lease."""
+    """Refresh an auto-from-lease mirror row from the wire lease.
+
+    ``write_hostname=False`` (scope not set to ``on_lease``, #2269) leaves the
+    row's hostname alone.
+    """
     row.mac_address = mac
-    if lease.get("hostname"):
+    if write_hostname and lease.get("hostname"):
         row.hostname = lease.get("hostname")
     row.last_seen_at = now
     row.last_seen_method = "dhcp"
@@ -253,6 +265,10 @@ async def pull_leases_from_server(
     # #844 — subnet ids this server's group actually serves; hoisted out of
     # the per-lease loops (rebuilding the set per lease is O(scopes) each).
     preferred_subnet_ids = set(scope_cache)
+    # #2269 — scopes not set to ``on_lease`` keep the lease hostname out of IPAM.
+    no_hostname_subnets = await lease_hostname_suppressed_subnets(
+        db, group_id=server.server_group_id
+    )
 
     now = datetime.now(UTC)
 
@@ -320,6 +336,7 @@ async def pull_leases_from_server(
             result.out_of_scope += 1
             continue
 
+        hostname_suppressed = containing.id in no_hostname_subnets
         ipam_row = (
             await db.execute(
                 select(IPAddress).where(
@@ -335,7 +352,7 @@ async def pull_leases_from_server(
                     subnet_id=containing.id,
                     address=ip,
                     status="dhcp",
-                    hostname=lease.get("hostname"),
+                    hostname=None if hostname_suppressed else lease.get("hostname"),
                     mac_address=mac,
                     last_seen_at=now,
                     last_seen_method="dhcp",
@@ -353,7 +370,9 @@ async def pull_leases_from_server(
                 elif ipam_row.auto_from_lease:
                     # Lost the race to a lease-owned row — refresh it
                     # like the elif path below.
-                    _refresh_lease_owned_row(ipam_row, lease, mac, now)
+                    _refresh_lease_owned_row(
+                        ipam_row, lease, mac, now, write_hostname=not hostname_suppressed
+                    )
                     result.ipam_refreshed += 1
                 else:
                     # Lost the race to a manual/static row — leave it
@@ -365,7 +384,9 @@ async def pull_leases_from_server(
             # Only refresh rows we own. Manually-allocated rows are left
             # alone — the lease + IPAM coexist.
             if apply:
-                _refresh_lease_owned_row(ipam_row, lease, mac, now)
+                _refresh_lease_owned_row(
+                    ipam_row, lease, mac, now, write_hostname=not hostname_suppressed
+                )
             result.ipam_refreshed += 1
         else:
             # Manual allocation — skip DDNS entirely. Whatever hostname
