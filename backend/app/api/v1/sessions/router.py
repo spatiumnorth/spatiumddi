@@ -25,14 +25,17 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, field_validator
-from sqlalchemy import select
+from sqlalchemy import Select, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import user_has_permission
+from app.core.session_idle import get_session_timeout_minutes, idle_cutoff
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
 
@@ -82,6 +85,15 @@ def _row(
     )
 
 
+async def _exclude_idle(stmt: Select[Any], db: AsyncSession, now: datetime) -> Select[Any]:
+    """Leave out sessions idle past the configured Session Timeout. The auth
+    layer already refuses them, so listing them as live would be wrong."""
+    cutoff = idle_cutoff(await get_session_timeout_minutes(db), now)
+    if cutoff is None:
+        return stmt
+    return stmt.where(func.coalesce(UserSession.last_seen_at, UserSession.created_at) > cutoff)
+
+
 def _is_superadmin(user: User) -> bool:
     return bool(user.is_superadmin) or user_has_permission(user, "*", "*")
 
@@ -92,13 +104,14 @@ async def list_my_sessions(
     db: DB,
     include_expired: bool = Query(default=False),
 ) -> list[SessionRow]:
-    """Sessions the current user owns. Excludes expired + revoked rows
-    by default — operator can pass ``include_expired=true`` for the
-    full audit history."""
+    """Sessions the current user owns. Excludes expired, revoked and
+    idle-timed-out rows by default — operator can pass
+    ``include_expired=true`` for the full audit history."""
     now = datetime.now(UTC)
     stmt = select(UserSession).where(UserSession.user_id == current_user.id)
     if not include_expired:
         stmt = stmt.where(UserSession.revoked.is_(False)).where(UserSession.expires_at > now)
+        stmt = await _exclude_idle(stmt, db, now)
     stmt = stmt.order_by(UserSession.created_at.desc())
     rows = (await db.execute(stmt)).scalars().all()
     return [
@@ -128,6 +141,7 @@ async def list_all_sessions(
     stmt = select(UserSession, User).join(User, UserSession.user_id == User.id)
     if not include_expired:
         stmt = stmt.where(UserSession.revoked.is_(False)).where(UserSession.expires_at > now)
+        stmt = await _exclude_idle(stmt, db, now)
     stmt = stmt.order_by(UserSession.created_at.desc())
     rows = (await db.execute(stmt)).all()
     return [
