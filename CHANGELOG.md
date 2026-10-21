@@ -128,6 +128,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Appliance SNMP could not be turned on (#2376).** The image's own
+  snmpd came up enabled at boot and held UDP 161, and the reload's
+  config check kept the staged `agentAddress udp:161` and so always
+  collided with it, reporting a valid config as rejected (retried
+  forever). snmpd and lldpd are now disabled by a systemd preset as
+  well as in the postinst, so nothing listens until the operator opts
+  in; and the check parses a copy of the config with its listener and
+  AgentX-socket directives removed, so it binds nothing and cannot
+  collide with a running snmpd. A genuinely bad config is still
+  rejected.
 - **Webhook subscriptions could be created, repointed, deleted and
   have deliveries retried with no audit row (#2293).** All four routes
   now write one `audit_log` row in the mutation's transaction. The row

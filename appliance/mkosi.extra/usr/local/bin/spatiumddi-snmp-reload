@@ -127,13 +127,28 @@ case "$MARKER" in
         # *timeout* argument, not a "test" flag — it prints "invalid
         # option -- 't'" and exits 1 unconditionally, which is why
         # every SNMP apply silently failed (#550). Validate instead by
-        # starting snmpd in the foreground against ONLY the staged file
-        # (``-C -c``), bound to a throwaway loopback transport so it
-        # can't collide with the live instance's :161, then killing it.
-        # A config parse/read error makes snmpd exit before it settles;
-        # a clean parse keeps it alive until we kill it.
+        # starting snmpd in the foreground against ONLY a copy of the
+        # staged file (``-C -c``), then killing it. A config parse/read
+        # error makes snmpd exit before it settles; a clean parse keeps
+        # it alive until we kill it.
+        #
+        # The probe must bind NOTHING the live snmpd (or anything else)
+        # could hold (#2376). The staged body carries its own
+        # ``agentAddress udp:161,...`` and snmpd opens it IN ADDITION to
+        # the command-line transport, so a throwaway port alone never
+        # kept the probe off :161 — it died on "Error opening specified
+        # endpoint udp:161" and the apply called that a rejected config.
+        # So the probe copy drops every listener directive and the
+        # AgentX socket (``master agentx`` would otherwise claim
+        # /var/agentx/master) and gets private ones instead. Parsing of
+        # every other line is untouched.
         SNMP_VALIDATE_LOG=/tmp/spatium-snmpd-validate.log
-        snmpd -f -C -c "$TMP_BODY" -Lf "$SNMP_VALIDATE_LOG" \
+        PROBE_DIR=$(mktemp -d /tmp/spatium-snmpd-probe.XXXXXX)
+        PROBE_CONF="$PROBE_DIR/snmpd.conf"
+        grep -viE '^[[:space:]]*(agentaddress|agentxsocket)([[:space:]]|$)' \
+            "$TMP_BODY" > "$PROBE_CONF" || true
+        echo "agentXSocket unix:$PROBE_DIR/agentx" >> "$PROBE_CONF"
+        snmpd -f -C -c "$PROBE_CONF" -Lf "$SNMP_VALIDATE_LOG" \
             udp:127.0.0.1:16199 >"$SNMP_VALIDATE_LOG" 2>&1 &
         probe_pid=$!
         sleep 1
@@ -142,7 +157,9 @@ case "$MARKER" in
             kill "$probe_pid" 2>/dev/null || true
             wait "$probe_pid" 2>/dev/null || true
             echo "  ✓ snmpd config parse OK"
+            rm -rf "$PROBE_DIR"
         else
+            rm -rf "$PROBE_DIR"
             wait "$probe_pid" 2>/dev/null || true
             # The probe exited early. Distinguish a genuine config
             # rejection from an infrastructure hiccup (e.g. the
@@ -150,10 +167,13 @@ case "$MARKER" in
             # snmpd actually complained about reading/parsing the
             # config. Otherwise let the real ``systemctl`` start below
             # be the arbiter so we don't false-reject a valid config.
-            if grep -qiE 'error|cannot|unknown|parse|read_config|line [0-9]' \
+            # A "<file>: line N: Error: ..." line is always the config's
+            # own fault, even when a bind failure is logged beside it.
+            if grep -qE ': line [0-9]+: Error' "$SNMP_VALIDATE_LOG" 2>/dev/null \
+                    || { grep -qiE 'error|cannot|unknown|parse|read_config|line [0-9]' \
                     "$SNMP_VALIDATE_LOG" 2>/dev/null \
-                    && ! grep -qiE 'address already in use|bind' \
-                    "$SNMP_VALIDATE_LOG" 2>/dev/null; then
+                    && ! grep -qiE 'address already in use|bind|opening specified endpoint' \
+                    "$SNMP_VALIDATE_LOG" 2>/dev/null; }; then
                 echo "  ✗ snmpd rejected the staged config:"
                 sed 's/^/      /' "$SNMP_VALIDATE_LOG"
                 echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
