@@ -188,6 +188,9 @@ from app.services.dns.server_move import (
 from app.services.dns.technitium_options import (
     allow_transfer_problem as technitium_transfer_problem,
 )
+from app.services.dns.technitium_options import (
+    also_notify_problem as technitium_also_notify_problem,
+)
 from app.services.dns.technitium_options import refusals as technitium_option_refusals
 from app.services.dns.technitium_options import stored_warnings as technitium_stored_warnings
 from app.services.dns.tld_registry import (
@@ -3826,6 +3829,15 @@ async def _validated_zone_named_conf_fields(
             "This group has a Technitium server, which cannot apply this zone's "
             f"{problem}. Move the Technitium server to its own group, or use addresses, "
             "'!' exclusions, 'key <name>' on its own, or a defined ACL.",
+        )
+    if (
+        "also_notify" in cleaned
+        and "technitium" in await _group_driver_names(db, group_id)
+        and (problem := technitium_also_notify_problem(cleaned["also_notify"]))
+    ):
+        raise HTTPException(
+            422,
+            f"This group has a Technitium server, which cannot apply this zone's {problem}.",
         )
     zone_type = changes.get("zone_type") or (zone.zone_type if zone is not None else None)
     if zone_type != "forward":
