@@ -128,6 +128,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Renaming or deleting a client class, or deleting a device policy,
+  left pools restricted to a class that no longer existed (#2285).**
+  A pool's `class_restriction` is a plain name, Kea accepts a name it
+  does not define, and the pool then matches nobody, with the config
+  applying cleanly and nothing reporting an error. Renaming or deleting
+  a client class, or deleting a device policy, is now a 409 naming the
+  pools (and any other class whose `member()` test uses the name) that
+  still reference it. A pool create or update naming a class that does
+  not exist in the group is a 422 instead of being stored; Kea's
+  built-ins (`KNOWN`, `UNKNOWN`, ...) and generated PXE / phone classes
+  still pass. If a dangling reference reaches the config anyway (a
+  disabled or empty device policy, an import), the restriction is kept
+  rather than dropped, so a quarantine pool never opens to every
+  client, and the bundle build logs
+  `dhcp_pool_restricted_to_undefined_class`.
+
 - **`docs/PRIVACY.md` listed the RDAP lookups as per-click only (#2280).**
   Domain, ASN and RPKI ROA refreshes also run from an hourly Beat tick,
   and a Domain row is re-queried every 24 h by default. They now sit in
