@@ -5561,6 +5561,8 @@ export interface DNSServerOptions {
   modified_at: string;
   // Stored values a Technitium server in this group will not apply (#1763).
   technitium_warnings?: string[];
+  // #2128: stored forwarders pinned to port 53 in an encrypted group.
+  forwarder_warnings?: string[];
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the

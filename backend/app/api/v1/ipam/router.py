@@ -4071,7 +4071,11 @@ async def get_effective_space_dns(
     )
 
 
-@router.get("/spaces/{space_id}/effective-dhcp", response_model=EffectiveDhcpResponse)
+@router.get(
+    "/spaces/{space_id}/effective-dhcp",
+    response_model=EffectiveDhcpResponse,
+    dependencies=[Depends(require_module("core.dhcp"))],
+)
 async def get_effective_space_dhcp(
     space_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> EffectiveDhcpResponse:
@@ -5082,7 +5086,11 @@ async def get_effective_block_dns(
     )
 
 
-@router.get("/blocks/{block_id}/effective-dhcp", response_model=EffectiveDhcpResponse)
+@router.get(
+    "/blocks/{block_id}/effective-dhcp",
+    response_model=EffectiveDhcpResponse,
+    dependencies=[Depends(require_module("core.dhcp"))],
+)
 async def get_effective_block_dhcp(
     block_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> EffectiveDhcpResponse:
@@ -6236,7 +6244,11 @@ async def get_effective_subnet_dns(
     )
 
 
-@router.get("/subnets/{subnet_id}/effective-dhcp", response_model=EffectiveDhcpResponse)
+@router.get(
+    "/subnets/{subnet_id}/effective-dhcp",
+    response_model=EffectiveDhcpResponse,
+    dependencies=[Depends(require_module("core.dhcp"))],
+)
 async def get_effective_subnet_dhcp(
     subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> EffectiveDhcpResponse:

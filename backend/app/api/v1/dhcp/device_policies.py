@@ -42,6 +42,7 @@ from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
+from app.api.v1.dhcp.client_classes import refuse_if_name_referenced
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
@@ -488,6 +489,7 @@ async def update_device_policy(
 @router.delete("/device-policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_device_policy(policy_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     row = await _get_policy(db, policy_id)
+    await refuse_if_name_referenced(db, row.group_id, row.class_name, "delete device policy")
     write_audit(
         db,
         user=user,
