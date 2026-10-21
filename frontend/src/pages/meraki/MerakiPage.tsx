@@ -930,9 +930,11 @@ function DeleteOrgModal({
         <p className="text-sm text-muted-foreground">
           Remove the Meraki organization{" "}
           <span className="font-semibold">{org.name}</span>? This only affects
-          SpatiumDDI — nothing on the Meraki side changes. All IPAM rows
-          mirrored from this organization (subnets + addresses) will be removed
-          via the FK cascade.
+          SpatiumDDI — nothing on the Meraki side changes. If active block sync
+          is armed, disarm it first (that lifts the pushed blocks from the
+          device); delete is refused while it is armed. All IPAM rows mirrored
+          from this organization (subnets + addresses) will be removed via the
+          FK cascade.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input

@@ -128,6 +128,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting an armed block-sync target left its blocks enforced on the
+  device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
+  delete handlers removed the push rows without lifting anything, so
+  the blocks stayed on the firewall or controller with no record in
+  SpatiumDDI. Delete now answers 409 while block sync is armed ("disarm
+  first", which lifts the blocks), and also while unlifted push rows
+  remain; `?force=true` bypasses the latter only. The delete modals say
+  so.
 - **`docs/PRIVACY.md` listed the RDAP lookups as per-click only (#2280).**
   Domain, ASN and RPKI ROA refreshes also run from an hourly Beat tick,
   and a Domain row is re-queried every 24 h by default. They now sit in

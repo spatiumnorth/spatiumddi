@@ -1123,7 +1123,9 @@ function DeleteFirewallModal({
         <p className="text-sm text-muted-foreground">
           Remove the Palo Alto firewall{" "}
           <span className="font-semibold">{firewall.name}</span>? This only
-          affects SpatiumDDI — nothing on the PAN-OS side changes. All IPAM rows
+          affects SpatiumDDI — nothing on the PAN-OS side changes. If active
+          block sync is armed, disarm it first (that lifts the pushed blocks
+          from the device); delete is refused while it is armed. All IPAM rows
           mirrored from this firewall (subnets + addresses) will be removed via
           the FK cascade.
         </p>

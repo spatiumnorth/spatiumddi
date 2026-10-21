@@ -797,9 +797,11 @@ function DeleteRouterModal({
         <p className="text-sm text-muted-foreground">
           Remove the OPNsense firewall{" "}
           <span className="font-semibold">{router.name}</span>? This only
-          affects SpatiumDDI — nothing on the OPNsense side changes. All IPAM
-          rows mirrored from this firewall (subnets + addresses) will be removed
-          via the FK cascade.
+          affects SpatiumDDI — nothing on the OPNsense side changes. If active
+          block sync is armed, disarm it first (that lifts the pushed blocks
+          from the device); delete is refused while it is armed. All IPAM rows
+          mirrored from this firewall (subnets + addresses) will be removed via
+          the FK cascade.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input
