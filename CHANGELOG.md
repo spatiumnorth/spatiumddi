@@ -148,6 +148,65 @@ the formatter handles the rest.
   `get_conformity_summary`, which counted every history row, reports
   the same numbers as the dashboard.
 
+- **Renaming or deleting a client class, or deleting a device policy,
+  left pools restricted to a class that no longer existed (#2285).**
+  A pool's `class_restriction` is a plain name, Kea accepts a name it
+  does not define, and the pool then matches nobody, with the config
+  applying cleanly and nothing reporting an error. Renaming or deleting
+  a client class, or deleting a device policy, is now a 409 naming the
+  pools (and any other class whose `member()` test uses the name) that
+  still reference it. A pool create or update naming a class that does
+  not exist in the group is a 422 instead of being stored; Kea's
+  built-ins (`KNOWN`, `UNKNOWN`, ...) and generated PXE / phone classes
+  still pass. If a dangling reference reaches the config anyway (a
+  disabled or empty device policy, an import), the restriction is kept
+  rather than dropped, so a quarantine pool never opens to every
+  client, and the bundle build logs (once per change, not per long-poll)
+  `dhcp_pool_restricted_to_undefined_class`.
+
+- **The PCI "no admin ports" conformity check fails a host with an
+  admin port open, instead of passing every scanned host (#2257).** The
+  `no_open_ports` check read `open_ports` from the nmap scan summary, a
+  key the nmap parser never wrote, so it found no open ports and passed
+  any host with a scan in the window: the built-in PCI-DSS 1.4.4 policy
+  reported PASS for a host with 22 and 3389 open, and that result went
+  into the compliance PDF. It now reads the scan's port list and fails
+  on any forbidden port in state `open`. For a CIDR scan it reads the
+  target's own entry, never the first host's. **Expect results to
+  change** when the policy is enabled: hosts that passed can now fail,
+  or warn where the scan cannot answer: no parsed summary, no result
+  for the address (a CIDR sweep leaves out hosts that did not answer),
+  a host that was not `up`, a forbidden port nmap reported only as
+  `open|filtered`, or a forbidden port the scan never probed (a
+  ping-only `subnet_sweep`, or a `-p` list that leaves it out: nmap
+  lists only ports in a non-default state, so an absent port is not a
+  closed one). The nmap summary also records the `address` its
+  single-host fields describe, so a sweep where one other host answered
+  is no longer mistaken for the target, and the `scanned_ports` nmap
+  says it probed.
+
+- **Logs → DNS Queries and DHCP Activity rows open in full (#2246).**
+  The grids cut the client, qname and raw columns off at one line, and
+  the rest was only a hover tooltip, which cannot be selected or
+  copied, does not work on touch, and is clipped for long lines. Each
+  row now starts with a details button that opens every field
+  untruncated: the timestamp in full ISO plus local time, client
+  `ip#port` and view, qname / qtype / qclass, the result, the answer
+  count, flags, and the raw line in a wrapping block with a Copy
+  button. The result uses the grid's wording: NODATA for NOERROR with
+  no answers, and "not recorded" when response logging is off, never
+  NOERROR (#914). A DNS row's details also offer Filter by client and
+  Filter by qname. DHCP rows show severity, log code, MAC, IP,
+  transaction id and raw the same way.
+
+- **`docs/PRIVACY.md` listed the RDAP lookups as per-click only (#2280).**
+  Domain, ASN and RPKI ROA refreshes also run from an hourly Beat tick,
+  and a Domain row is re-queried every 24 h by default. They now sit in
+  §3.3 with their trigger, cadence, default and payload. Nothing is
+  default-on on a fresh install (no rows, no calls), but Domains have no
+  feature module, so creating one arms the schedule; the ASN and ROA
+  tasks do not check `network.asn`. Docs only, no behaviour change.
+
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
   forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,
@@ -991,6 +1050,32 @@ the formatter handles the rest.
   are unchanged.
 
 ### Security
+
+- **Group membership changes are now bounded by the same privilege
+  ceiling as role attachment.** A group's roles, and its live
+  time-bound grants, are what its members hold, so adding a member,
+  removing one and deleting the group now need the caller to be able
+  to grant those permissions themselves, exactly as attaching a role
+  already did. A permission held only through a live time-bound grant
+  no longer counts towards that ceiling anywhere (roles, groups or new
+  grants), so it cannot be turned into access that outlives the grant.
+  Only a superadmin can change the membership of a group
+  carrying a wildcard (`*`) permission. The same ceiling now bounds
+  detaching a role from a group, changing or deleting an existing
+  role, and revoking a wildcard time-bound grant. Resending a group's unchanged
+  member list (as the edit form does) is not a membership change, so
+  renaming or describing a group is unaffected. Superadmins are
+  unaffected throughout.
+  **No change may leave the install without an active superadmin.**
+  Disabling, un-flagging or deleting a user, removing the last
+  superadmin from a group, detaching or editing the wildcard role,
+  and deleting that group or role now answer 409 when nobody active
+  would be left. A superadmin through a time-bound grant alone does
+  not count, since the grant expires.
+  Refusals from both checks write a `denied` audit row, as a
+  permission refusal does. External sign-in (LDAP / OIDC / SAML /
+  RADIUS / TACACS+) still syncs group membership from the identity
+  provider's group mappings, which only a superadmin can configure.
 
 - **Forwarded audit events are redacted the way the audit API
   redacts them (#2015).** #2014 redacted an audit entry's
