@@ -11,7 +11,10 @@ reads only the ops actually waiting, which is none at all in the common case.
 
 Partial, so it holds only those rows and costs nothing to keep for the rest
 of the queue. Built non-concurrently, as ``d8e1b5a26c47``'s index was:
-Alembic runs each revision in a transaction, and the indexed rows are few.
+Alembic runs each revision in a transaction. The build still reads the whole
+table, holding writes to it meanwhile, but that is one sequential scan: 83 ms
+over 230k ops on a scratch Postgres 16, so a few seconds at the 1.4M of the
+largest backlog measured.
 
 Revision ID: f27379a82b17
 Revises: d3a7f19c52e8

@@ -16,12 +16,19 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import event, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecordOp, DNSServer, DNSServerGroup
 from app.services.dns.agent_config import page_pending_ops
-from app.services.dns.record_ops import RRSET_KEY_CHUNK, ack_op, op_rrset_key, rrset_match_where
+from app.services.dns.record_ops import (
+    RRSET_KEY_CHUNK,
+    ack_op,
+    backed_off_match_where,
+    op_rrset_key,
+    rrset_match_where,
+)
 
 
 async def _server(db: AsyncSession) -> DNSServer:
@@ -188,3 +195,16 @@ async def test_the_match_selects_exactly_the_ops_whose_key_is_listed(
 
     assert got == {ops[0].id, ops[1].id, ops[2].id}
     assert got == {op.id for op in ops if op_rrset_key(op) in set(keys)}
+
+
+def test_the_backed_off_lookup_names_the_partial_index_predicate_literally() -> None:
+    """``ix_dns_record_op_server_backoff`` is partial on ``state = 'pending'``.
+    The planner may use it only when it can prove the query's own predicate
+    implies that, and a generic plan (which a prepared statement settles on)
+    cannot prove it from ``state = $1``: it reads every op of the server
+    instead. So the state must reach Postgres as a literal."""
+    stmt = select(DNSRecordOp.id).where(
+        backed_off_match_where(uuid.uuid4(), datetime.now(UTC), [("a.example.", "@", "A")])
+    )
+    sql = str(stmt.compile(dialect=postgresql.asyncpg.dialect()))
+    assert "dns_record_op.state = 'pending'" in sql, sql

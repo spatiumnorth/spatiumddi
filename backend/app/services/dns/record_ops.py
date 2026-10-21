@@ -21,7 +21,18 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import Text, and_, event, func, literal, or_, select, tuple_, update
+from sqlalchemy import (
+    Text,
+    and_,
+    event,
+    func,
+    literal,
+    literal_column,
+    or_,
+    select,
+    tuple_,
+    update,
+)
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -158,7 +169,10 @@ def backed_off_match_where(
         )
         .where(
             DNSRecordOp.server_id == server_id,
-            DNSRecordOp.state == "pending",
+            # A literal, not a bind parameter: the partial index's predicate
+            # is ``state = 'pending'``, and a generic plan cannot prove that
+            # from ``state = $1``, so it would read every op of the server.
+            DNSRecordOp.state == literal_column("'pending'"),
             DNSRecordOp.next_attempt_at > now,
             DNSRecordOp.record.has_key("rrset"),
         )
