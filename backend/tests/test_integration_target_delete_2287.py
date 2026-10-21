@@ -214,7 +214,12 @@ async def test_target_delete_keeps_registry_referenced_rows(
         space_id=space.id, block_id=blk.id, network="10.95.0.0/25", name="z", total_ips=126, **owner
     )
     sn_dev = Subnet(
-        space_id=space.id, block_id=blk.id, network="10.95.0.128/25", name="d", total_ips=126, **owner
+        space_id=space.id,
+        block_id=blk.id,
+        network="10.95.0.128/25",
+        name="d",
+        total_ips=126,
+        **owner,
     )
     db_session.add_all([sn_zone, sn_dev])
     await db_session.flush()

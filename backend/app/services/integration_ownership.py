@@ -148,13 +148,12 @@ async def release_integration_rows(
     """
     if own_fk not in INTEGRATION_OWNERSHIP:
         raise ValueError(f"not an integration ownership FK: {own_fk!r}")
-    from app.models.dhcp import DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
-    from app.models.dns import DNSRecord  # noqa: PLC0415
-    from app.models.ipam import IPBlock, Subnet, SubnetDomain  # noqa: PLC0415
-
     from app.models.address_set import AddressSet  # noqa: PLC0415
     from app.models.bacnet import BACnetDevice  # noqa: PLC0415
+    from app.models.dhcp import DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
+    from app.models.dns import DNSRecord  # noqa: PLC0415
     from app.models.e911 import ERLBinding  # noqa: PLC0415
+    from app.models.ipam import IPBlock, Subnet, SubnetDomain  # noqa: PLC0415
     from app.models.multicast import MulticastMembership  # noqa: PLC0415
     from app.models.ot import OTDevice, OTZone  # noqa: PLC0415
 
