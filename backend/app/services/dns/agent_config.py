@@ -265,6 +265,12 @@ def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
         return sorted(prepared, key=lambda a: a["name"])
 
 
+def _key_name_norm(name: str) -> str:
+    """A TSIG key name as BIND compares it: a DNS name, so case-insensitive
+    and absolute (``Foo`` / ``foo.`` are one key)."""
+    return name.rstrip(".").lower()
+
+
 def _drop_undefined_key_refs(
     elements: Any,
     known_keys: frozenset[str],
@@ -282,14 +288,23 @@ def _drop_undefined_key_refs(
     refuse to create or orphan one (rename / delete of a cited key or ACL is a
     409), so this covers a row stored before that guard, or an operator key
     whose secret no longer decrypts and was therefore left out of ``tsig_keys``.
-    Returns the original object untouched when nothing is dropped, so a
-    healthy bundle keeps its ETag.
+    ``known_keys`` holds :func:`_key_name_norm` forms; ``known_acls`` holds ACL
+    names verbatim (BIND ACL names are case-sensitive). Returns the original
+    object untouched when nothing is dropped, so a healthy bundle keeps its
+    ETag.
 
-    Dropping must never widen access. For an access list (``deny_if_emptied``)
-    that ends up empty, ``["none"]`` is returned: an empty zone ``allow-query``
-    is not rendered at all and so inherits the server's (often ``any``), and
-    the server one defaults to ``any``. A dropped *negated* element
-    (``!name``) would also widen, so it collapses the list to ``["none"]``.
+    Dropping must never widen access. Every renderer reads an empty
+    address-match list as "unset" and falls back to something wider: the
+    BIND9 agent renders an empty ``match-clients`` / options ``allow-query``
+    as ``any`` and omits an empty zone / view ``allow-query`` so it inherits
+    the server's (often ``any``). So for an access list
+    (``deny_if_emptied``) that ends up empty, ``["none"]`` is returned. A
+    dropped *negated* element (``!key x`` / ``!name``) collapses the list to
+    ``["none"]`` too, keeping one rule for every dropped negation. ``none``
+    is never substituted in place (``["none", "10/8"]`` denies everyone).
+    ``also-notify`` is not an access list and ``none`` is not legal there;
+    ACL entries are not either, since an entry-less ACL already renders
+    ``{ none; }``.
     """
     if not isinstance(elements, list):
         return elements
@@ -299,7 +314,7 @@ def _drop_undefined_key_refs(
         text = str(el)
         name = key_reference(text)
         acl = is_name_reference(text) if known_acls is not None else None
-        if name is not None and name not in known_keys:
+        if name is not None and _key_name_norm(name) not in known_keys:
             logger.warning("dns_bundle_entry_dropped_undefined_key", where=where, key=name)
         elif acl is not None and known_acls is not None and acl not in known_acls:
             logger.warning("dns_bundle_entry_dropped_undefined_acl", where=where, acl=acl)
@@ -1256,7 +1271,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
 
     # #2282 / #2283 — never ship a ``key <name>`` or ACL name the bundle does
     # not define. Access lists that empty out become ``none``, not "inherit".
-    known_key_names = frozenset(k["name"] for k in tsig_keys)
+    known_key_names = frozenset(_key_name_norm(k["name"]) for k in tsig_keys)
     known_acl_names = frozenset(a["name"] for a in acls_block)
     for a in acls_block:
         a["entries"] = [

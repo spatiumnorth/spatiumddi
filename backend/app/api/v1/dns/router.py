@@ -4622,9 +4622,15 @@ async def _assert_tsig_key_is_unreferenced(
     hold a foreign key, not a name, and a delete reports them separately.
     """
     name = key.name
+    # BIND compares key names as DNS names — case-insensitively, with or
+    # without the trailing dot — so a citation of ``Foo.`` still names ``foo``.
+    norm = name.rstrip(".").lower()
 
     def cites(elements: Any) -> bool:
-        return any(key_reference(str(el)) == name for el in (elements or []))
+        return any(
+            (ref := key_reference(str(el))) is not None and ref.rstrip(".").lower() == norm
+            for el in (elements or [])
+        )
 
     cited: list[str] = []
     for a in (
