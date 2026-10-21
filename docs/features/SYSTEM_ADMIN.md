@@ -61,7 +61,14 @@ control plane is doing without standing up a separate Prometheus
   one-line setup hint when `/var/run/docker.sock` isn't mounted
   into the api container.
 - **Conformity** — promoted from the Compliance surface; shows
-  the latest conformity-evaluation rollup.
+  the latest conformity-evaluation rollup. "Latest" is each
+  **enabled** policy's most recent evaluation pass: a target deleted
+  or moved out of a policy's scope drops out at that policy's next
+  pass, a disabled policy counts towards `policies_total` but reports
+  no results, and editing what a policy checks (`target_kind`,
+  `target_filter`, `check_kind`, `check_args`) clears its last pass
+  until it runs again. The conformity PDF reports the same set and
+  prints each policy's as-of time (#2278).
 - **Copilot Usage** — Operator Copilot token / cost observability.
 
 Backend at `app/api/v1/admin/postgres.py` (5 endpoints) +
