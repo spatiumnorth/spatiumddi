@@ -143,6 +143,39 @@ def set_group_tsig_secret(group: DNSServerGroup, secret: str) -> None:
     group.tsig_key_secret_encrypted = encrypt_str(secret)
 
 
+RESERVED_TSIG_PREFIX = "spatium-"
+
+
+def normalize_tsig_name(name: str | None) -> str:
+    """The identity BIND gives a key name: case-folded, trailing dot dropped.
+
+    ``Foo.``, ``foo.`` and ``foo`` are ONE key to named, so a second ``key``
+    statement for any of them is a redefinition that fails ``named-checkconf``
+    and makes the agent decline the whole bundle (#2295).
+    """
+    return (name or "").strip().lower().rstrip(".")
+
+
+def dedupe_tsig_keys(keys: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop every key whose normalised name an earlier entry already holds.
+
+    First writer wins, so the order the caller built decides: the legacy
+    group key first (it is ``tsig_keys[0]``, the agent's loopback identity),
+    then operator keys by name. Rows stored before the API refused the clash
+    are therefore rendered once, deterministically, and logged.
+    """
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for k in keys:
+        norm = normalize_tsig_name(k.get("name"))
+        if norm in seen:
+            logger.warning("dns_tsig_key_duplicate_skipped", key=k.get("name"))
+            continue
+        seen.add(norm)
+        out.append(k)
+    return out
+
+
 def legacy_group_key(group: DNSServerGroup | None) -> TsigKey | None:
     """The group's own auto-minted key (``ensure_group_tsig_key``), or None.
 
