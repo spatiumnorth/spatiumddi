@@ -1060,6 +1060,24 @@ the formatter handles the rest.
 
 ### Security
 
+- **The MFA step of sign-in honours account lockout and has its own
+  attempt budget.** `POST /auth/login/mfa` now refuses a locked account
+  with the same 403 `/login` gives it, before checking the code, so a
+  correct code can no longer complete a sign-in or clear the lock.
+  Wrong codes (TOTP or recovery) still count towards the lockout
+  counter, and also against a per-account MFA budget that applies
+  whether or not lockout is enabled: 5 wrong codes in 15 minutes and
+  the MFA step answers 429 with `Retry-After` until 15 minutes after the
+  last one. The budget lives on the user row, so it holds when Redis is
+  unavailable, and attempts are read under a row lock so concurrent
+  ones are counted one at a time. Each MFA challenge also accepts at
+  most 3 wrong codes; after that, and after a successful sign-in, it is
+  spent and sign-in starts again at the password. A successful sign-in
+  or an admin unlock resets the budget. Refusals are audited as
+  `login` failures (`account_locked`, `mfa_attempts_exhausted`,
+  `mfa_challenge_spent`), and using up the budget writes an
+  `account.mfa_attempts_exhausted` row. See `docs/features/AUTH.md`.
+
 - **Group membership changes are now bounded by the same privilege
   ceiling as role attachment.** A group's roles, and its live
   time-bound grants, are what its members hold, so adding a member,
@@ -1110,6 +1128,10 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `e4c9b2a17f60` — adds `user.mfa_failed_count` (Integer, NOT NULL,
+  server default 0) and nullable `user.mfa_last_failed_at`, the
+  per-account wrong-code budget for the MFA sign-in step. Downgrade
+  drops both.
 - `d3a7f19c52e8` — #2112, data only: `dns_server.notes` equal to exactly
   `agent v2026.04.14.1` becomes empty. Downgrade does nothing.
 - `a2078c5e1d90` — #2078, adds nullable `dns_server.agent_version`
