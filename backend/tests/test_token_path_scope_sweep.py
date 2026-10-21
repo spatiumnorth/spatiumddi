@@ -811,3 +811,187 @@ async def test_block_and_space_writes_refuse_a_zone_the_token_holds_no_grant_on(
         f"/api/v1/ipam/blocks/{block.id}", json={"dns_zone_id": str(g["zone_a"].id)}, headers=hdr
     )
     assert r.status_code == 200, r.text
+
+
+# ── Routes outside the IPAM and DNS routers ─────────────────────────────────
+#
+# A report or metrics series mounted elsewhere passed its coarse gate on the
+# resource TYPE a token is bound to and then answered for every subnet, zone
+# or server. Outside the IPAM and DNS routers a bound token is now refused,
+# except on the few routes that narrow to its grants themselves.
+
+#: Routes outside the IPAM and DNS routers that still serve a bound token,
+#: because they narrow their answer to its grants or say nothing about the
+#: estate.
+_SERVES_A_BOUND_TOKEN = {
+    "/api/v1/auth/me",
+    "/api/v1/auth/me/permissions",
+    "/api/v1/search",
+    "/api/v1/search/types",
+    "/api/v1/ai/mcp",
+}
+
+#: Responses that stream until the client goes away.
+_STREAMS = ("/stream",)
+
+
+async def _bound_token_fixtures(db: AsyncSession) -> tuple[dict, dict, str]:
+    """Subnet B (in A's block) at 99 % so every ranking lists it first, zone B
+    beside zone A, and a token bound to subnet A and zone A only."""
+    f = await _container_fixtures(db)
+    g = await _fixtures(db)
+    f["sub_b"].utilization_percent = 99.0
+    f["sub_b"].allocated_ips = 250
+    f["sub_b"].total_ips = 254
+    owner = await _owner(db)
+    tok = await _token(
+        db,
+        owner,
+        [
+            {"action": "*", "resource_type": "subnet", "resource_id": str(f["sub_a"].id)},
+            {"action": "*", "resource_type": "dns_zone", "resource_id": str(g["zone_a"].id)},
+        ],
+    )
+    return f, g, tok
+
+
+@pytest.mark.asyncio
+async def test_a_bound_token_is_refused_by_every_route_outside_the_scoped_routers(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Every authenticated GET outside ``/api/v1/ipam`` and ``/api/v1/dns``
+    refuses a bound token, other than the routes that narrow to its
+    grants. None of them, refused or not, returns anything about subnet B or
+    zone B."""
+    from app.main import app
+
+    f, g, tok = await _bound_token_fixtures(db_session)
+    await db_session.commit()
+    markers = [*f["markers"], g["zone_b"].name, str(g["zone_b"].id)]
+    ids = {
+        "subnet_id": str(f["sub_a"].id),
+        "address_id": str(f["addr_a"].id),
+        "zone_id": str(g["zone_a"].id),
+        "group_id": str(g["group"].id),
+        "block_id": str(f["block"].id),
+        "space_id": str(f["space"].id),
+    }
+    hdr = {"Authorization": f"Bearer {tok}"}
+
+    checked = 0
+    served = []
+    leaked = []
+    for path, ops in sorted(app.openapi()["paths"].items()):
+        if "get" not in ops or path.startswith(("/api/v1/ipam", "/api/v1/dns")):
+            continue
+        if path.endswith(_STREAMS):
+            continue
+        url = _fill(path, ids)
+        params = {
+            k: v for k, v in _REQUIRED_QUERY_DEFAULTS.items() if k in _query_names(ops["get"])
+        }
+        if (await client.get(url, params=params)).status_code != 401:
+            continue  # not an authenticated route (or gated before auth)
+        r = await client.get(url, params=params, headers=hdr)
+        checked += 1
+        if r.status_code < 400 and any(m in r.text for m in markers):
+            leaked.append(f"GET {path} -> {r.status_code}")
+        # 401: an agent surface, which takes no user credential at all.
+        if path not in _SERVES_A_BOUND_TOKEN and r.status_code not in (401, 403):
+            served.append(f"GET {path} -> {r.status_code}")
+    assert checked > 100, f"route discovery found only {checked} authenticated routes"
+    assert not leaked, "a bound token read ungranted data:\n" + "\n".join(leaked)
+    assert not served, "a bound token was served outside the scoped routers:\n" + "\n".join(served)
+
+
+@pytest.mark.asyncio
+async def test_top_subnets_report_refuses_a_subnet_bound_token(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    f, _g, tok = await _bound_token_fixtures(db_session)
+    await db_session.commit()
+    r = await client.get(
+        "/api/v1/reports/top-subnets-by-utilization", headers={"Authorization": f"Bearer {tok}"}
+    )
+    assert r.status_code == 403, r.text
+    assert "10.77.0.0/24" not in r.text
+
+
+@pytest.mark.asyncio
+async def test_top_subnets_report_unchanged_for_a_session_and_an_unbound_token(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    f, _g, _tok = await _bound_token_fixtures(db_session)
+    admin = await _owner(db_session)
+    other = await _owner(db_session)
+    plain = await _token(db_session, other, [])
+    await db_session.commit()
+    for hdr in (
+        {"Authorization": f"Bearer {create_access_token(str(admin.id))}"},
+        {"Authorization": f"Bearer {plain}"},
+    ):
+        r = await client.get("/api/v1/reports/top-subnets-by-utilization", headers=hdr)
+        assert r.status_code == 200, r.text
+        assert str(f["sub_b"].id) in {row["id"] for row in r.json()["rows"]}
+
+
+@pytest.mark.asyncio
+async def test_dns_timeseries_refuses_a_zone_bound_token(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    g = await _fixtures(db_session)
+    server = DNSServer(
+        group_id=g["group"].id, name=f"s-{uuid.uuid4().hex[:6]}", driver="bind9", host="192.0.2.1"
+    )
+    db_session.add(server)
+    owner = await _owner(db_session)
+    tok = await _token(
+        db_session,
+        owner,
+        [{"action": "read", "resource_type": "dns_zone", "resource_id": str(g["zone_a"].id)}],
+    )
+    admin = await _owner(db_session)
+    await db_session.commit()
+    for params in ({}, {"server_id": str(server.id)}):
+        r = await client.get(
+            "/api/v1/metrics/dns/timeseries",
+            params=params,
+            headers={"Authorization": f"Bearer {tok}"},
+        )
+        assert r.status_code == 403, r.text
+    session = {"Authorization": f"Bearer {create_access_token(str(admin.id))}"}
+    r = await client.get("/api/v1/metrics/dns/timeseries", headers=session)
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_routes_that_narrow_to_the_grant_still_serve_a_bound_token(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    f, _g, tok = await _bound_token_fixtures(db_session)
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {tok}"}
+
+    assert (await client.get("/api/v1/auth/me/permissions", headers=hdr)).status_code == 200
+    assert (await client.get("/api/v1/auth/me", headers=hdr)).status_code == 200
+    assert (await client.get("/api/v1/ai/mcp", headers=hdr)).status_code == 200
+    found = await client.get("/api/v1/search", params={"q": "10.77"}, headers=hdr)
+    assert found.status_code == 200, found.text
+    assert "10.77.0.0/24" not in found.text
+    # Inside the scoped routers the token keeps working on its own subnet.
+    own = await client.get(f"/api/v1/ipam/subnets/{f['sub_a'].id}", headers=hdr)
+    assert own.status_code == 200, own.text
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_refuse_a_bound_token(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _f, _g, tok = await _bound_token_fixtures(db_session)
+    other = await _owner(db_session)
+    plain = await _token(db_session, other, [])
+    await db_session.commit()
+    r = await client.get("/metrics", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 401, r.text
+    r = await client.get("/metrics", headers={"Authorization": f"Bearer {plain}"})
+    assert r.status_code == 200, r.text

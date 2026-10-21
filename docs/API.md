@@ -397,6 +397,10 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
   the tools that narrow their answers to the bound zones / subnets
   (`honours_token_binding` in `app/services/ai/tools/base.py`); the rest
   are not listed and are refused if called.
+  Over REST, a bound token is served by the IPAM and DNS routers and a
+  short list of routes that narrow to its grants (see
+  [`features/AUTH.md`](features/AUTH.md)); every other endpoint answers
+  `403` to it.
 
 A token can never exceed its owner's RBAC: the scope / grant check is
 an *additional* gate, applied on top of the owning user's permissions.

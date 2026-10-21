@@ -11,6 +11,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
+from app.api.token_binding import route_honours_token_binding
 from app.core.security import decode_access_token, hash_api_token, live_access_session
 from app.db import AsyncSessionLocal, get_db
 from app.models.auth import APIToken, User
@@ -169,6 +170,18 @@ async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> Us
     # Stash this token's resource grants (issue #374) so the permission layer
     # can intersect them with the owner's RBAC. Empty/None = unrestricted.
     user._api_token_resource_grants = list(token.resource_grants or [])
+    # A coarse permission gate admits a bound token on a resource TYPE match
+    # alone, so only a route that narrows to the bound instances may serve
+    # one. Every other route refuses it, rather than answering for the whole
+    # estate (``app.api.token_binding``).
+    if user._api_token_resource_grants and not route_honours_token_binding(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This API token is restricted to specific subnets or DNS zones, "
+                "and this endpoint cannot be limited to them"
+            ),
+        )
     return user
 
 

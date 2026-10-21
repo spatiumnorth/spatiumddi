@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
 from app.api.deps import CurrentUser
+from app.api.token_binding import honours_token_binding
 from app.core.permissions import require_any_resource_permission
 from app.services.nettools.schemas import assert_target_allowed
 
@@ -191,6 +192,7 @@ async def _query_one(
 
 
 @router.post("/propagation-check", response_model=PropagationCheckResult)
+@honours_token_binding
 async def propagation_check(
     body: PropagationCheckRequest, current_user: CurrentUser
 ) -> PropagationCheckResult:
@@ -230,6 +232,7 @@ async def propagation_check(
 
 
 @router.get("/default-resolvers", response_model=list[dict[str, str]])
+@honours_token_binding
 async def list_default_resolvers(
     current_user: CurrentUser,
 ) -> list[dict[str, str]]:
