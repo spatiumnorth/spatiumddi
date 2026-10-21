@@ -38,6 +38,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.kubernetes import KubernetesCluster
+from app.services.dns.bundle_dirty import mark_integration_dns_released
 
 router = APIRouter(
     tags=["kubernetes"],
@@ -640,6 +641,8 @@ async def delete_cluster(cluster_id: uuid.UUID, db: DB, user: SuperAdmin) -> Non
         cluster_id=c.id,
         cluster_name=c.name,
     )
+    # #2288 — the DNS rows cascade in the database; mark their groups' bundles dirty.
+    await mark_integration_dns_released(db, own_fk="kubernetes_cluster_id", target_id=c.id)
     await db.delete(c)
     await db.commit()
 

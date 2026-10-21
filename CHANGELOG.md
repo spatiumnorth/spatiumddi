@@ -128,6 +128,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting a Kubernetes cluster, Tailscale tenant or NetBird instance
+  left its DNS names served (#2288).** The mirrored zone and records go
+  with the target through a database CASCADE, which the bundle-dirty
+  listener cannot see, so every agent kept answering them until some
+  unrelated change re-rendered the group. The three delete handlers now
+  mark the affected groups' bundles dirty and wake their agents before the
+  delete, the same path the reconcilers' own ORM retraction relies on.
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
