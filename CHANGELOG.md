@@ -136,11 +136,12 @@ the formatter handles the rest.
   now a `network.domains` module (Settings → Features, group Network).
   Off, the Domains pages, API, sidebar entry, dashboard card and
   `list_domains` tool disappear, and neither the sweep nor the lookup
-  queued at create time makes any RDAP call. It ships **on**, unlike
-  `network.asn`: installs that already track domains have rows but no
-  module row, so default-off would have 404'd their pages and silently
-  stopped expiry tracking on upgrade. A fresh install has no Domain rows,
-  so it still makes no such call. `docs/PRIVACY.md` §3.3 names the switch.
+  queued at create time makes any RDAP call. It ships **off** on a fresh
+  install, so nothing is sent, but resolves **on** wherever Domain rows
+  already exist (`default_on_if_rows_in`, as `ipam.nat` does, with no
+  seeded row), so an upgraded install keeps its pages and expiry
+  tracking; an explicit setting wins either way. `docs/PRIVACY.md` §3.3
+  names the switch.
 
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
