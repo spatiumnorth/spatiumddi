@@ -158,3 +158,27 @@ async def test_yes_without_anchors_warns_and_anchor_clears_it(
     assert r.status_code == 201
     r = await client.get(url, headers=headers)
     assert r.json()["dnssec_warnings"] == []
+
+
+@pytest.mark.asyncio
+async def test_non_bind9_server_cannot_join_a_group_holding_anchors(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.services.dns.server_move import ServerMoveError, ensure_group_single_driver
+
+    headers = await _superadmin(db_session)
+    group, _ = await _group(db_session, None)
+    await db_session.commit()
+    r = await client.post(
+        f"/api/v1/dns/groups/{group.id}/options/trust-anchors", json=_anchor(), headers=headers
+    )
+    assert r.status_code == 201, r.text
+
+    # BIND9 may join; any other driver would silently ignore the anchors.
+    await ensure_group_single_driver(db_session, group.id, "bind9", group_name="g", hint="")
+    with pytest.raises(ServerMoveError) as exc:
+        await ensure_group_single_driver(
+            db_session, group.id, "technitium", group_name="g", hint=""
+        )
+    assert exc.value.status_code == 422
+    assert "trust anchors" in str(exc.value)
