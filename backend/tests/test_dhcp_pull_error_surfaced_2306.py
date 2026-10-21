@@ -117,3 +117,80 @@ async def test_api_response_exposes_the_error(db_session: AsyncSession) -> None:
     await db_session.commit()
     out = ServerResponse.from_model(await _row(db_session, sid))
     assert out.last_sync_error == "boom"
+
+
+@pytest.mark.asyncio
+async def test_caught_lease_read_failure_sets_error_then_good_pull_clears(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The realistic failure: the driver's read raises INSIDE the pull, which
+    catches it into ``result.errors`` — no exception reaches the caller."""
+    sid = await _arm(db_session)
+    state = {"fail": True}
+
+    class _Driver:
+        async def get_leases(self, server):  # type: ignore[no-untyped-def]
+            if state["fail"]:
+                raise RuntimeError("Get-DhcpServerv4Lease: access denied")
+            return []
+
+    monkeypatch.setattr(pl, "get_driver", lambda _d: _Driver())
+    monkeypatch.setattr(pl, "is_agentless", lambda _d: True)
+
+    srv = await _row(db_session, sid)
+    result = await pl.pull_leases_from_server(db_session, srv, apply=True)
+    await db_session.commit()
+    assert result.errors  # caught, not raised
+    row = await _row(db_session, sid)
+    assert row.last_sync_error is not None
+    assert "access denied" in row.last_sync_error
+    assert len(row.last_sync_error) <= 2000
+    assert row.last_sync_error_at is not None
+
+    state["fail"] = False
+    await pl.pull_leases_from_server(db_session, row, apply=True)
+    await db_session.commit()
+    row = await _row(db_session, sid)
+    assert row.last_sync_error is None
+    assert row.last_sync_error_at is None
+
+
+@pytest.mark.asyncio
+async def test_partial_failure_flags_and_names_the_failing_part(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scopes read fine but the lease read fails: still failing, and named."""
+    sid = await _arm(db_session)
+
+    class _Driver:
+        async def get_scopes(self, server):  # type: ignore[no-untyped-def]
+            return []
+
+        async def get_leases(self, server):  # type: ignore[no-untyped-def]
+            raise RuntimeError("winrm boom")
+
+    monkeypatch.setattr(pl, "get_driver", lambda _d: _Driver())
+    monkeypatch.setattr(pl, "is_agentless", lambda _d: True)
+    srv = await _row(db_session, sid)
+    await pl.pull_leases_from_server(db_session, srv, apply=True)
+    await db_session.commit()
+    row = await _row(db_session, sid)
+    assert row.last_sync_error and "get_leases failed" in row.last_sync_error
+
+
+@pytest.mark.asyncio
+async def test_dry_run_does_not_touch_the_error(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = await _arm(db_session)
+
+    class _Driver:
+        async def get_leases(self, server):  # type: ignore[no-untyped-def]
+            raise RuntimeError("x")
+
+    monkeypatch.setattr(pl, "get_driver", lambda _d: _Driver())
+    monkeypatch.setattr(pl, "is_agentless", lambda _d: True)
+    srv = await _row(db_session, sid)
+    await pl.pull_leases_from_server(db_session, srv, apply=False)
+    await db_session.commit()
+    assert (await _row(db_session, sid)).last_sync_error is None
