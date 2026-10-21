@@ -144,6 +144,41 @@ the formatter handles the rest.
   client, and the bundle build logs (once per change, not per long-poll)
   `dhcp_pool_restricted_to_undefined_class`.
 
+- **The PCI "no admin ports" conformity check fails a host with an
+  admin port open, instead of passing every scanned host (#2257).** The
+  `no_open_ports` check read `open_ports` from the nmap scan summary, a
+  key the nmap parser never wrote, so it found no open ports and passed
+  any host with a scan in the window: the built-in PCI-DSS 1.4.4 policy
+  reported PASS for a host with 22 and 3389 open, and that result went
+  into the compliance PDF. It now reads the scan's port list and fails
+  on any forbidden port in state `open`. For a CIDR scan it reads the
+  target's own entry, never the first host's. **Expect results to
+  change** when the policy is enabled: hosts that passed can now fail,
+  or warn where the scan cannot answer: no parsed summary, no result
+  for the address (a CIDR sweep leaves out hosts that did not answer),
+  a host that was not `up`, a forbidden port nmap reported only as
+  `open|filtered`, or a forbidden port the scan never probed (a
+  ping-only `subnet_sweep`, or a `-p` list that leaves it out: nmap
+  lists only ports in a non-default state, so an absent port is not a
+  closed one). The nmap summary also records the `address` its
+  single-host fields describe, so a sweep where one other host answered
+  is no longer mistaken for the target, and the `scanned_ports` nmap
+  says it probed.
+
+- **Logs → DNS Queries and DHCP Activity rows open in full (#2246).**
+  The grids cut the client, qname and raw columns off at one line, and
+  the rest was only a hover tooltip, which cannot be selected or
+  copied, does not work on touch, and is clipped for long lines. Each
+  row now starts with a details button that opens every field
+  untruncated: the timestamp in full ISO plus local time, client
+  `ip#port` and view, qname / qtype / qclass, the result, the answer
+  count, flags, and the raw line in a wrapping block with a Copy
+  button. The result uses the grid's wording: NODATA for NOERROR with
+  no answers, and "not recorded" when response logging is off, never
+  NOERROR (#914). A DNS row's details also offer Filter by client and
+  Filter by qname. DHCP rows show severity, log code, MAC, IP,
+  transaction id and raw the same way.
+
 - **`docs/PRIVACY.md` listed the RDAP lookups as per-click only (#2280).**
   Domain, ASN and RPKI ROA refreshes also run from an hourly Beat tick,
   and a Domain row is re-queried every 24 h by default. They now sit in
