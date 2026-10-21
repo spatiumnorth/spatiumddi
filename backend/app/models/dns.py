@@ -1517,9 +1517,10 @@ class DNSPoolMember(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         JSONB, nullable=False, default=list, server_default="[]"
     )
     # Optional Site whose linked subnets contribute client CIDRs to this
-    # member's serving scope. ON DELETE SET NULL — deleting a Site just
-    # drops the association; the member reverts to whatever ``serving_cidrs``
-    # remain (default target if none).
+    # member's serving scope. ON DELETE SET NULL is a backstop only: the site
+    # delete endpoints return 409 while a member references the site (#2292),
+    # because the nulled member would revert to a default served to everyone.
+    # A member whose site has no subnets left serves nobody (fail closed).
     site_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("site.id", ondelete="SET NULL"),

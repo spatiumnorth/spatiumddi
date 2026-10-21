@@ -21,6 +21,7 @@ from sqlalchemy import func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
 from app.core.permissions import require_resource_permission
+from app.models.dns import DNSPool, DNSPoolMember
 from app.models.ownership import SITE_KINDS, Site
 
 router = APIRouter(
@@ -259,6 +260,34 @@ async def update_site(site_id: uuid.UUID, body: SiteUpdate, db: DB, user: Curren
     return SiteRead.model_validate(row)
 
 
+async def _pool_member_referrers(db: DB, site_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[str]]:
+    """DNS pool members geo-scoped to each site (``site_id`` is SET NULL, so a
+    delete would silently turn them into default answers for every client)."""
+    rows = (
+        await db.execute(
+            select(DNSPoolMember.site_id, DNSPool.name, DNSPoolMember.address)
+            .join(DNSPool, DNSPool.id == DNSPoolMember.pool_id)
+            .where(DNSPoolMember.site_id.in_(site_ids))
+            .order_by(DNSPool.name, DNSPoolMember.address)
+        )
+    ).all()
+    out: dict[uuid.UUID, list[str]] = {}
+    for sid, pool_name, address in rows:
+        out.setdefault(sid, []).append(f"{pool_name} ({address})")
+    return out
+
+
+def _refuse_if_referenced(row_name: str, refs: list[str]) -> None:
+    if refs:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Site '{row_name}' is the geo scope of DNS pool member(s): "
+                f"{', '.join(refs)}. Re-scope or remove them first."
+            ),
+        )
+
+
 @router.delete("/{site_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_site(site_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     """Hard-delete (sites aren't soft-deletable). Children re-parent
@@ -268,6 +297,7 @@ async def delete_site(site_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     row = await db.get(Site, site_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Site not found")
+    _refuse_if_referenced(row.name, (await _pool_member_referrers(db, [row.id])).get(row.id, []))
 
     write_audit(
         db,
@@ -289,6 +319,10 @@ async def bulk_delete_sites(body: SiteBulkDelete, db: DB, user: CurrentUser) -> 
     rows = (await db.execute(select(Site).where(Site.id.in_(body.ids)))).scalars().all()
     found_ids = {r.id for r in rows}
     not_found = [str(i) for i in body.ids if i not in found_ids]
+
+    refs = await _pool_member_referrers(db, [r.id for r in rows])
+    for r in rows:
+        _refuse_if_referenced(r.name, refs.get(r.id, []))
 
     for r in rows:
         write_audit(
