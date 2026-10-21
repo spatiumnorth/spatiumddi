@@ -128,6 +128,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Webhook subscriptions could be created, repointed, deleted and
+  have deliveries retried with no audit row (#2293).** All four routes
+  now write one `audit_log` row in the mutation's transaction. The row
+  carries name, enabled, event types, limits, header names and
+  `secret_set` / `headers_set` flags; the HMAC secret and header values
+  never appear, and the URL is reduced to scheme and host (the path
+  is where receiver credentials live), with `url_changed` /
+  `secret_rotated` flags on update. Delivery attempts by the worker stay
+  unaudited: they are telemetry visible in the deliveries list.
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
