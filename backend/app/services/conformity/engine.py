@@ -280,6 +280,7 @@ async def _maybe_fire_alert(
     outcome: CheckOutcome,
     previous_status: str | None,
     now: datetime,
+    rewired: bool = False,
 ) -> None:
     """Open an alert event when this evaluation flipped a previously
     non-fail result (or first observation) to ``fail`` and the policy
@@ -289,6 +290,10 @@ async def _maybe_fire_alert(
     events so operators see them on the existing alerts dashboard.
     Idempotent: if a matching open event already exists for this
     (rule, policy, resource) trio we skip.
+
+    ``rewired`` — this pass closed the subject's open event because the
+    policy now points at a different rule (#2277); a failure still in
+    progress pages once on the new rule instead of going silent.
     """
     if outcome.status != STATUS_FAIL:
         return
@@ -300,8 +305,10 @@ async def _maybe_fire_alert(
         return
 
     subject_id = _subject_id(policy.id, target.kind, target.row_id)
-    if previous_status == STATUS_FAIL and not await _last_event_cleared_by_engine(
-        db, rule_id=rule.id, subject_id=subject_id
+    if (
+        previous_status == STATUS_FAIL
+        and not rewired
+        and not await _last_event_cleared_by_engine(db, rule_id=rule.id, subject_id=subject_id)
     ):
         return  # already failing — don't re-page
     existing = (
@@ -363,6 +370,7 @@ RESOLUTION_NOT_APPLICABLE = "not_applicable"
 RESOLUTION_OUT_OF_SCOPE = "out_of_scope"
 RESOLUTION_POLICY_DISABLED = "policy_disabled"
 RESOLUTION_POLICY_DELETED = "policy_deleted"
+RESOLUTION_ALERT_RULE_CHANGED = "alert_rule_changed"
 
 _STATUS_RESOLUTION = {
     STATUS_PASS: RESOLUTION_PASSED,
@@ -419,6 +427,23 @@ async def _last_event_cleared_by_engine(
     if last is None or last.resolved_at is None:
         return False
     return (last.last_observed_value or {}).get("resolved_by") == _RESOLVED_BY_ENGINE
+
+
+async def _resolve_unlinked_rule_alerts(
+    db: AsyncSession, *, policy: ConformityPolicy, now: datetime
+) -> set[str]:
+    """Close this policy's open events raised against a rule it is no
+    longer wired to — ``fail_alert_rule_id`` was cleared or switched.
+    Left open they would sit on a rule nothing feeds any more, red until
+    the resource happened to pass. Returns the closed subject ids so the
+    pass can page a still-failing resource on the new rule. Idempotent.
+    """
+    closed: set[str] = set()
+    for ev in await _open_policy_events(db, policy.id):
+        if ev.rule_id != policy.fail_alert_rule_id:
+            _close_event(ev, reason=RESOLUTION_ALERT_RULE_CHANGED, now=now)
+            closed.add(ev.subject_id)
+    return closed
 
 
 async def _resolve_cleared_alerts(
@@ -534,6 +559,10 @@ async def evaluate_policy(
     if now is None:
         now = datetime.now(UTC)
 
+    # #2277 — before the targets, so a re-wired rule pages a failure
+    # still in progress in this same pass.
+    rewired = await _resolve_unlinked_rule_alerts(db, policy=policy, now=now)
+
     if policy.target_kind not in _TARGET_KINDS:
         logger.warning(
             "conformity_unknown_target_kind",
@@ -599,6 +628,7 @@ async def evaluate_policy(
             )
             crashed = True
 
+        subject = _subject_id(policy.id, target.kind, target.row_id)
         previous = await _previous_status_for(
             db,
             policy_id=policy.id,
@@ -624,10 +654,9 @@ async def evaluate_policy(
             outcome=outcome,
             previous_status=previous,
             now=now,
+            rewired=subject in rewired,
         )
-        evaluated[_subject_id(policy.id, target.kind, target.row_id)] = (
-            None if crashed else outcome.status
-        )
+        evaluated[subject] = None if crashed else outcome.status
 
         summary["total"] += 1
         if outcome.status == "pass":

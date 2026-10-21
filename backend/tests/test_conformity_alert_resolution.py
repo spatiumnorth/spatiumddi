@@ -444,3 +444,62 @@ async def test_beat_pass_pages_after_commit_and_resolves(
     events = await _events(db_session, policy)
     assert _open(events) == [] and _resolution(events[0]) == "passed"
     assert len(harness.paged) == 1
+
+
+async def _rule(db: AsyncSession) -> AlertRule:
+    rule = AlertRule(
+        name=f"conf-{uuid.uuid4().hex[:8]}",
+        description="",
+        rule_type="compliance_change",
+        classification="pci_scope",
+        severity="critical",
+        enabled=True,
+    )
+    db.add(rule)
+    await db.flush()
+    return rule
+
+
+@pytest.mark.asyncio
+async def test_switching_the_alert_rule_moves_the_failure_to_the_new_rule(
+    db_session: AsyncSession, harness: _Harness
+) -> None:
+    """Re-wiring ``fail_alert_rule_id`` while a resource fails closes the
+    old rule's event and pages the ongoing failure once on the new rule."""
+    subnet = await _subnet(db_session)
+    policy = await _policy(db_session)
+    old_rule_id = policy.fail_alert_rule_id
+    harness.verdicts[subnet.id] = "fail"
+    await _evaluate(db_session, policy)
+
+    new_rule = await _rule(db_session)
+    policy.fail_alert_rule_id = new_rule.id
+    await db_session.commit()
+    await _evaluate(db_session, policy)
+    await _evaluate(db_session, policy)
+
+    events = await _events(db_session, policy)
+    assert len(events) == 2
+    old, new = events
+    assert old.rule_id == old_rule_id and old.resolved_at is not None
+    assert _resolution(old) == "alert_rule_changed"
+    assert new.rule_id == new_rule.id and new.resolved_at is None
+    assert len(harness.paged) == 2
+
+
+@pytest.mark.asyncio
+async def test_clearing_the_alert_rule_resolves_and_does_not_page(
+    db_session: AsyncSession, harness: _Harness
+) -> None:
+    subnet = await _subnet(db_session)
+    policy = await _policy(db_session)
+    harness.verdicts[subnet.id] = "fail"
+    await _evaluate(db_session, policy)
+
+    policy.fail_alert_rule_id = None
+    await db_session.commit()
+    await _evaluate(db_session, policy)
+
+    events = await _events(db_session, policy)
+    assert _open(events) == [] and _resolution(events[0]) == "alert_rule_changed"
+    assert len(harness.paged) == 1

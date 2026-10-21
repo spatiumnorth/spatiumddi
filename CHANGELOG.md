@@ -142,7 +142,10 @@ the formatter handles the rest.
   `pass` or `not_applicable`, when the resource is deleted or leaves the
   policy's scope, and when the policy is disabled or deleted (from the
   REST API, the copilot, and a once-a-minute sweep that catches any
-  other path). `warn` and a check that raised keep the event open.
+  other path). Clearing or switching the policy's alert rule closes
+  the old rule's events at its next evaluation, and a failure still
+  in progress pages once on the new rule. `warn` and a check that
+  raised keep the event open.
   A re-failure after the engine closed the event opens a new one and
   pages; an event an operator resolved by hand while the resource is
   still failing is not re-paged, as before.

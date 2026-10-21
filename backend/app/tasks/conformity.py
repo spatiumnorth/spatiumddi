@@ -39,9 +39,15 @@ def evaluate_conformity(self: object) -> dict[str, int]:  # type: ignore[type-ar
 async def _run() -> dict[str, int]:
     async with task_session() as session:
         try:
-            # #2277 — close events a disabled / deleted policy left open.
-            if await resolve_orphaned_policy_alerts(session):
-                await session.commit()
+            # #2277 — close events a disabled / deleted / re-wired policy
+            # left open. Isolated: a sweep failure must not stop the
+            # evaluation pass behind it.
+            try:
+                if await resolve_orphaned_policy_alerts(session):
+                    await session.commit()
+            except SQLAlchemyError:
+                await session.rollback()
+                logger.exception("conformity_orphan_sweep_failed")
             result = await evaluate_due_policies(session)
             if result["policies_evaluated"]:
                 logger.info("conformity_evaluated", **result)
