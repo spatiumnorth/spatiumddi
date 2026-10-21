@@ -72,9 +72,9 @@ async def test_dashboard_does_not_count_a_circuit_on_its_last_day(
     await db_session.commit()
     headers = {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
 
-    base = (
-        await client.get("/api/v1/dashboards/network/summary", headers=headers)
-    ).json()["circuit_term_expiring_count"]
+    base = (await client.get("/api/v1/dashboards/network/summary", headers=headers)).json()[
+        "circuit_term_expiring_count"
+    ]
     assert base == 0
 
     await _circuit(db_session, p, -1)
