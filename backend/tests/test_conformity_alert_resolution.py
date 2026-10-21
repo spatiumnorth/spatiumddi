@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
@@ -402,3 +402,45 @@ async def test_beat_sweep_resolves_events_of_a_policy_disabled_out_of_band(
     gone = await _events(db_session, disabled)
     assert _open(gone) == [] and _resolution(gone[0]) == "policy_disabled"
     assert len(_open(await _events(db_session, live))) == 1
+
+
+@pytest.mark.asyncio
+async def test_beat_pass_pages_after_commit_and_resolves(
+    db_session: AsyncSession, harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through the beat entry point, which defers delivery (#2261): the
+    page goes out for an event another connection can already see, and
+    the next due pass resolves it once the resource passes."""
+    subnet = await _subnet(db_session)
+    policy = await _policy(db_session)
+    await db_session.commit()
+
+    committed_when_paged: list[int] = []
+
+    async def deliver(rule: AlertRule, event: AlertEvent, targets: Any) -> Any:
+        async with db_session.bind.connect() as conn:
+            committed_when_paged.append(
+                (
+                    await conn.execute(
+                        select(func.count())
+                        .select_from(AlertEvent)
+                        .where(AlertEvent.id == event.id)
+                    )
+                ).scalar_one()
+            )
+        return await harness.deliver(rule, event, targets)
+
+    monkeypatch.setattr(alert_service, "_deliver", deliver)
+
+    harness.verdicts[subnet.id] = "fail"
+    await engine.evaluate_due_policies(db_session)
+    assert len(_open(await _events(db_session, policy))) == 1
+    assert committed_when_paged == [1]
+
+    harness.verdicts[subnet.id] = "pass"
+    policy.last_evaluated_at = None  # due again
+    await db_session.commit()
+    await engine.evaluate_due_policies(db_session)
+    events = await _events(db_session, policy)
+    assert _open(events) == [] and _resolution(events[0]) == "passed"
+    assert len(harness.paged) == 1
