@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A rate-limit counter could be left without an expiry and throttle an IP
+  or user forever (#2294).** The login, E911 self-query, step-up and
+  network-tools limiters did `INCR` and then a separate `EXPIRE`; a crash,
+  timeout or dropped connection between the two left a counting key with no
+  TTL that never reset (a whole office NAT locked out of login, a phone that
+  never got a location again). The step-up claim's `SET NX EX` then `INCR`
+  had the same gap if the key expired in between. All four now use one
+  atomic script that sets the expiry whenever the key has none, so a
+  TTL-less key is also repaired by its next hit. Limits, window start and
+  fail-open / fail-closed behaviour on a Redis error are unchanged.
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
