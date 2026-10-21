@@ -53,13 +53,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.stepup import require_operator_stepup
 from app.core.crypto import decrypt_str, encrypt_str
-from app.core.permissions import is_effective_superadmin, require_permission
+from app.core.permissions import require_permission
 from app.models.appliance import PairingClaim, PairingCode
 from app.models.audit import AuditLog
-from app.models.auth import User
 
 logger = structlog.get_logger(__name__)
 
@@ -183,14 +182,6 @@ class PairingCodeRevealResponse(BaseModel):
 # ── Helpers ────────────────────────────────────────────────────────
 
 
-def _require_superadmin(user: CurrentUser) -> None:
-    if not is_effective_superadmin(user):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Pairing-code management is restricted to superadmins.",
-        )
-
-
 def _state_for(row: PairingCode, now: datetime, claim_count: int) -> CodeState:
     """Derive the operator-facing state.
 
@@ -227,10 +218,9 @@ async def _get_claim_count(db: DB, code_id: uuid.UUID) -> int:
 )
 async def create_pairing_code(
     body: PairingCodeCreate,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> PairingCodeCreated:
-    _require_superadmin(current_user)
 
     now = datetime.now(UTC)
     expires_at: datetime | None
@@ -347,11 +337,10 @@ async def create_pairing_code(
     summary="List pairing codes (superadmin)",
 )
 async def list_pairing_codes(
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
     include_terminal: bool = Query(default=True),
 ) -> PairingCodeList:
-    _require_superadmin(current_user)
 
     rows = (
         (await db.execute(select(PairingCode).order_by(PairingCode.created_at.desc())))
@@ -408,10 +397,9 @@ async def list_pairing_codes(
 )
 async def revoke_pairing_code(
     code_id: uuid.UUID,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> None:
-    _require_superadmin(current_user)
     row = await db.get(PairingCode, code_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Pairing code not found.")
@@ -444,10 +432,9 @@ async def _toggle_persistent_code(
     code_id: uuid.UUID,
     *,
     enable: bool,
-    current_user: User,
+    current_user: SuperAdmin,
     db: DB,
 ) -> None:
-    _require_superadmin(current_user)
     row = await db.get(PairingCode, code_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Pairing code not found.")
@@ -518,7 +505,7 @@ async def disable_pairing_code(code_id: uuid.UUID, current_user: CurrentUser, db
 async def reveal_pairing_code(
     code_id: uuid.UUID,
     body: PairingCodeRevealRequest,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> PairingCodeRevealResponse:
     """Re-display a persistent code's original cleartext.
@@ -531,7 +518,6 @@ async def reveal_pairing_code(
     Gated: superadmin + password-or-TOTP re-confirm (#408) + audited.
     Mirrors agent-bootstrap-keys reveal.
     """
-    _require_superadmin(current_user)
 
     # #408 — local users re-confirm with password or TOTP; external-auth
     # users with TOTP (enrol under Settings → Security if not yet enrolled).

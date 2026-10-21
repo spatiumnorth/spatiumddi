@@ -128,6 +128,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A refused request to a superadmin-only route is now audited (#2304).**
+  `require_permission` has always written a `denied` audit row when it
+  refuses; the `SuperAdmin` dependency and the per-router
+  `_require_superadmin` helpers (backup and restore drills, factory reset,
+  support bundle, diagnostics, alert rules, pairing codes, upgrade images,
+  appliance fleet, audit-forward and InfluxDB targets, branding) answered
+  403 and wrote nothing, so probing them with a low-privilege token was
+  invisible to the Dashboard security panel and to a SIEM fed by audit
+  forwarding. They now share one dependency that records the refusal the
+  same way (`action` access on `superadmin`). The status code stays 403;
+  the refusal text of those routes is now the generic "Superadmin
+  required".
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
