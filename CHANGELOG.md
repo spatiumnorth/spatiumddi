@@ -140,7 +140,12 @@ the formatter handles the rest.
   `X-Removed-Update-Grants` header and the audit row). As defence in
   depth, the bundle drops any `key <name>` element whose key it does not
   define (logged as `dns_bundle_entry_dropped_undefined_key`), so a
-  reference stored before this guard cannot break the group.
+  reference stored before this guard cannot break the group. That drop
+  never widens access: an access list it empties, or that loses a
+  negated `!key` element, ships as `none` rather than empty, because
+  every renderer reads an empty list as "unset" (`any`, or inherit the
+  server's). Key names compare as BIND compares them, case-insensitively
+  and with or without the trailing dot.
 
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group

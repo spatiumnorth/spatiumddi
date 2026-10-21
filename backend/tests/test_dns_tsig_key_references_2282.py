@@ -94,6 +94,8 @@ async def _cite(db: AsyncSession, group: DNSServerGroup, where: str) -> None:
         db.add(DNSServerOptions(group_id=group.id, also_notify=[f"192.0.2.9 key {KEY}"]))
     elif where == "zone_allow_transfer":
         await _zone(db, group, allow_transfer=[cite])
+    elif where == "zone_allow_query":
+        await _zone(db, group, allow_query=[cite])
     elif where == "zone_also_notify":
         await _zone(db, group, also_notify=[f"192.0.2.9 key {KEY}"])
     await db.flush()
@@ -105,6 +107,7 @@ WHERES = [
     "option",
     "option_also_notify",
     "zone_allow_transfer",
+    "zone_allow_query",
     "zone_also_notify",
 ]
 
@@ -223,4 +226,107 @@ async def test_bundle_drops_a_stored_dangling_key_reference(db_session):
     assert bundle["options"]["allow_transfer"] == ["192.0.2.0/24"]
     assert bundle["options"]["also_notify"] == ["192.0.2.10"]
     zones = [z for z in bundle["zones"] if z["name"] == "example.test."]
-    assert zones and all(z["allow_transfer"] == [] and z["also_notify"] == [] for z in zones)
+    # Emptied access lists fail CLOSED (``none``), never empty — see below.
+    assert zones and all(z["allow_transfer"] == ["none"] and z["also_notify"] == [] for z in zones)
+
+
+async def _bundle_for(db: AsyncSession, group: DNSServerGroup) -> dict:
+    server = DNSServer(group_id=group.id, name="s1", driver="bind9", host="127.0.0.1", port=53)
+    db.add(server)
+    await db.flush()
+    loaded = (await db.execute(select(DNSServer).where(DNSServer.id == server.id))).scalar_one()
+    return await build_config_bundle(db, loaded)
+
+
+@pytest.mark.asyncio
+async def test_a_list_emptied_by_the_drop_fails_closed(db_session):
+    """Dropping the only element must not WIDEN access. Every renderer reads
+    an empty address-match list as "unset": the BIND9 agent renders an empty
+    ``match-clients`` / options ``allow-query`` as ``any`` and omits an empty
+    zone / view ``allow-query`` so it inherits. A key-only list therefore
+    ships as ``none`` — which is what it effectively said once the key was
+    gone — and a negated-only list too."""
+    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(group)
+    await db_session.flush()
+    gone = "key gone-key"
+    db_session.add(
+        DNSView(
+            group_id=group.id,
+            name="ext",
+            match_clients=[gone],
+            match_destinations=[f"!{gone}"],
+            allow_query=[gone],
+            # A dropped negation collapses the list too, survivors or not.
+            allow_query_cache=[f"!{gone}", "10.0.0.0/8"],
+        )
+    )
+    db_session.add(
+        DNSServerOptions(
+            group_id=group.id,
+            allow_query=[gone],
+            allow_query_cache=[gone],
+            allow_recursion=[gone],
+            allow_transfer=[gone],
+            allow_notify=[gone],
+            also_notify=["192.0.2.9 key gone-key"],
+        )
+    )
+    await _zone(db_session, group, allow_query=[gone], allow_transfer=[f"! {gone}"])
+    bundle = await _bundle_for(db_session, group)
+
+    (view,) = [v for v in bundle["views"] if v["name"] == "ext"]
+    for f in ("match_clients", "match_destinations", "allow_query", "allow_query_cache"):
+        assert view[f] == ["none"], f
+    opts = bundle["options"]
+    # Only the options the bundle ships (allow_query_cache is not one).
+    for f in ("allow_query", "allow_recursion", "allow_transfer", "allow_notify"):
+        assert opts[f] == ["none"], f
+    # also-notify is not an access list, and ``none`` is not legal there.
+    assert opts["also_notify"] == []
+    zones = [z for z in bundle["zones"] if z["name"] == "example.test."]
+    assert zones and all(
+        z["allow_query"] == ["none"] and z["allow_transfer"] == ["none"] for z in zones
+    )
+
+
+@pytest.mark.asyncio
+async def test_key_names_compare_as_dns_names(client: AsyncClient, db_session):
+    """BIND treats ``Ext-Key.`` and ``ext-key`` as one key. The guard must see
+    the citation, and the bundle must not drop a citation BIND resolves."""
+    hdr = await _admin(db_session)
+    group, key = await _group_with_key(db_session)
+    db_session.add(DNSServerOptions(group_id=group.id, allow_transfer=['key "EXT-KEY."']))
+    await db_session.flush()
+    r = await client.delete(f"/api/v1/dns/groups/{group.id}/tsig-keys/{key.id}", headers=hdr)
+    assert r.status_code == 409, r.text
+    bundle = await _bundle_for(db_session, group)
+    assert bundle["options"]["allow_transfer"] == ['key "EXT-KEY."']
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_bundle_is_unchanged_by_the_drop(db_session, monkeypatch):
+    """Every element resolves → the drop is a no-op and the ETag is the one
+    the pre-#2282 builder produced (the drop patched out to identity)."""
+    from app.services.dns import agent_config
+
+    group, _key = await _group_with_key(db_session)
+    for where in ("acl", "view", "option"):
+        await _cite(db_session, group, where)
+    await _zone(
+        db_session,
+        group,
+        allow_query=[f"key {KEY}", "10.0.0.0/8"],
+        allow_transfer=[f"key {KEY}"],
+        also_notify=[f"192.0.2.9 key {KEY}"],
+    )
+    with_drop = await _bundle_for(db_session, group)
+    monkeypatch.setattr(
+        agent_config, "_drop_undefined_key_refs", lambda elements, *a, **k: elements
+    )
+    loaded = (
+        await db_session.execute(select(DNSServer).where(DNSServer.group_id == group.id))
+    ).scalar_one()
+    without = await build_config_bundle(db_session, loaded)
+    assert with_drop["etag"] == without["etag"]
+    assert with_drop["structural_etag"] == without["structural_etag"]
