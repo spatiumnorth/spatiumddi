@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import io
 import os
-import re
 import socket
 import zipfile
 from dataclasses import asdict, dataclass
@@ -47,6 +46,7 @@ from app.services.appliance.containers import (
     get_container_logs,
     list_containers,
 )
+from app.services.support_bundle.scrub import redact_secrets, render_env, render_env_file
 
 logger = structlog.get_logger(__name__)
 
@@ -313,19 +313,18 @@ def _check_role_present(name_substring: str, label: str) -> CheckResult:
 # ── Diagnostic bundle ───────────────────────────────────────────────
 
 
-# Secret-looking env keys — never include the raw value in the bundle.
-# The regex matches the .env-style ``KEY=VALUE`` lines. We replace
-# the value with ``[REDACTED]`` instead of stripping the key so the
-# operator (or support) can see which keys WERE set.
-_SECRET_RE = re.compile(
-    r"^(POSTGRES_PASSWORD|SECRET_KEY|CREDENTIAL_ENCRYPTION_KEY|"
-    r"DNS_AGENT_KEY|DHCP_AGENT_KEY|.*PASSWORD.*|.*SECRET.*|.*TOKEN.*|.*API_KEY.*)=.+$",
-    re.MULTILINE | re.IGNORECASE,
-)
+def _clean(text: str) -> str:
+    """Strip secret-shaped substrings (Fernet blobs, JWTs, PEM keys, URL
+    credentials, …) — the support bundle's hard-exclude pass, shared so
+    the two bundles cannot drift apart again."""
+    return redact_secrets(text)[0]
 
 
-def _redact_env(text: str) -> str:
-    return _SECRET_RE.sub(lambda m: f"{m.group(0).split('=', 1)[0]}=[REDACTED]", text)
+def _put(zf: zipfile.ZipFile, name: str, content: str) -> None:
+    """Write one bundle member. EVERY member goes through here, so a log
+    line that happens to carry a credential is redacted like the env dump
+    is, instead of shipping verbatim."""
+    zf.writestr(name, _clean(content))
 
 
 def generate_diagnostic_bundle() -> bytes:
@@ -344,14 +343,16 @@ def generate_diagnostic_bundle() -> bytes:
             "appliance_hostname": settings.appliance_hostname,
             "version": settings.version,
         }
-        zf.writestr(
+        _put(
+            zf,
             "manifest.txt",
             "\n".join(f"{k}: {v}" for k, v in manifest.items()),
         )
 
         # Self-test snapshot at bundle-generation time
         report = run_self_test()
-        zf.writestr(
+        _put(
+            zf,
             "self-test.txt",
             _format_self_test_report(report),
         )
@@ -362,7 +363,7 @@ def generate_diagnostic_bundle() -> bytes:
         for name in list_log_sources():
             try:
                 content = (_log_dir() / name).read_text(encoding="utf-8", errors="replace")
-                zf.writestr(f"logs/{name}", content)
+                _put(zf, f"logs/{name}", content)
             except OSError:
                 pass
 
@@ -375,9 +376,9 @@ def generate_diagnostic_bundle() -> bytes:
                     logs = get_container_logs(c.name, tail=500)
                 except DockerUnavailableError as exc:
                     logs = f"[unable to fetch logs: {exc}]"
-                zf.writestr(f"pods/{c.name}.log", logs)
+                _put(zf, f"pods/{c.name}.log", logs)
         except DockerUnavailableError as exc:
-            zf.writestr("pods/_error.txt", f"kubeapi unreachable: {exc}")
+            _put(zf, "pods/_error.txt", f"kubeapi unreachable: {exc}")
 
         # Sanitised /etc/spatiumddi/.env if accessible. Not currently
         # bind-mounted into the api pod by default; the placeholder
@@ -385,15 +386,17 @@ def generate_diagnostic_bundle() -> bytes:
         if _HOST_ENV_FILE.is_file():
             try:
                 raw = _HOST_ENV_FILE.read_text(encoding="utf-8")
-                zf.writestr("config/env.redacted", _redact_env(raw))
+                _put(zf, "config/env.redacted", render_env_file(raw, _clean))
             except OSError as exc:
-                zf.writestr("config/env.error", f"read failed: {exc}")
+                _put(zf, "config/env.error", f"read failed: {exc}")
         else:
-            zf.writestr(
+            _put(
+                zf,
                 "config/env.unavailable",
                 "/etc/spatiumddi/.env is not bind-mounted into the api "
                 "pod by default — operator can copy it manually after "
-                "running `sed -E 's/(PASSWORD|SECRET|KEY|TOKEN)=.*/\\1=[REDACTED]/i' /etc/spatiumddi/.env`.",
+                "blanking every value with "
+                "`sed -E 's/=.*/=[REDACTED]/' /etc/spatiumddi/.env`.",
             )
 
         # System info — uname, uptime, meminfo. /proc is in the api
@@ -401,7 +404,8 @@ def generate_diagnostic_bundle() -> bytes:
         # shared, so /proc/version reports the host kernel.
         for proc in ("/proc/version", "/proc/uptime", "/proc/meminfo", "/proc/cpuinfo"):
             try:
-                zf.writestr(
+                _put(
+                    zf,
                     f"system{proc}",
                     Path(proc).read_text(encoding="utf-8", errors="replace"),
                 )
@@ -409,11 +413,11 @@ def generate_diagnostic_bundle() -> bytes:
                 # Record the failure inline so support can see why a
                 # given /proc file is missing from the bundle instead
                 # of guessing from its absence.
-                zf.writestr(f"system{proc}.error", f"{type(exc).__name__}: {exc}")
+                _put(zf, f"system{proc}.error", f"{type(exc).__name__}: {exc}")
 
-        # Environment variables visible to the api (handy for support)
-        env_dump = "\n".join(f"{k}={v}" for k, v in sorted(os.environ.items()))
-        zf.writestr("system/env.redacted", _redact_env(env_dump))
+        # Environment variables visible to the api (handy for support).
+        # Values are shown for allowlisted names only; see render_env.
+        _put(zf, "system/env.redacted", render_env(os.environ, _clean))
 
     return buf.getvalue()
 
