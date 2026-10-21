@@ -128,6 +128,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **PowerDNS agent answers on IPv6 as well as IPv4 (#2307).** The agent
+  rendered `local-address=0.0.0.0`, which replaces pdns's default and so
+  never bound `::`: IPv6 clients got no answer while BIND9 groups did, and
+  the firewall's open v6 port made it look like a network fault. It now
+  renders `0.0.0.0, ::`. On a host with no IPv6 stack at all (kernel
+  `ipv6.disable=1`) pdns aborts on a `::` entry, so there the line stays
+  IPv4-only, the same tolerance BIND shows for `listen-on-v6`. The dnsdist
+  front binds both families already.
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
