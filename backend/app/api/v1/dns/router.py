@@ -180,6 +180,7 @@ from app.services.dns.server_move import (
     CATALOG_UNSUPPORTED_DRIVERS,
     ServerMoveError,
     catalog_unsupported_message,
+    elect_primary,
     ensure_group_catalog_compatible,
     ensure_group_single_driver,
     lock_server_row,
@@ -2534,6 +2535,12 @@ async def delete_server(
     group_id: uuid.UUID, server_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> None:
     server = await _require_server(group_id, server_id, db)
+    # #2276 — deleting the primary elects a successor in the same transaction,
+    # the way the #934 move does. A group left without one used to drop every
+    # later record write before the agent fan-out, behind a 200.
+    successor = None
+    if server.is_primary:
+        successor = await elect_primary(db, server.group_id, exclude_id=server.id)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -2543,6 +2550,11 @@ async def delete_server(
             resource_type="dns_server",
             resource_id=str(server.id),
             resource_display=server.name,
+            new_value=(
+                {"primary_elected": str(successor.id), "primary_elected_name": successor.name}
+                if successor is not None
+                else None
+            ),
             result="success",
         )
     )

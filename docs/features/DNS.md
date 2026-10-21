@@ -290,6 +290,17 @@ prevent, and the resulting dropped writes are silent (a log line; no error
 reaches whoever made the change). Promote a replacement instead; that demotes
 the incumbent as a side effect.
 
+**Deleting the primary elects a successor (#2276)** in the same transaction:
+the oldest enabled, unpaused survivor, or any survivor if every one is disabled
+or paused. Revoking an appliance that owned the primary does the same. The
+delete's audit row names the server elected. A group that is still left with
+no primary (one that lost it on an older build) keeps receiving record writes:
+agent-based groups fan out to every enabled server regardless, an agentless
+group writes through the server the election would pick, and a 60 s beat
+sweep marks that server primary. Only a group with no servers at all queues
+nothing, and nothing is lost there: a server added later receives the zone's
+records in its bundle.
+
 ---
 
 ## 2. DNS Views (Split-Horizon)

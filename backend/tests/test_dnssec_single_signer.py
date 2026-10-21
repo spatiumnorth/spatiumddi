@@ -461,7 +461,8 @@ async def test_dnssec_state_report_is_group_scoped_and_primary_only(
 async def test_dnssec_state_report_survives_losing_the_primary(
     db_session: AsyncSession,
 ) -> None:
-    """Nothing re-elects a primary on delete. With no primary among the
+    """An ORM-level delete re-elects nothing (the API delete does, #2276, and
+    the beat self-heal catches up within a minute). With no primary among the
     signers the oldest one reports; back down to one server, whoever is
     left reports."""
     g, (p, s1, s2) = await _group(db_session, "bind9", servers=3)

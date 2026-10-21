@@ -56,7 +56,7 @@ from app.services.appliance.cluster_dns_group import cluster_dns_group_refusal
 from app.services.appliance.ownership import owning_appliance_for_dns_server
 from app.services.dns import technitium_api_scope
 from app.services.dns.dnssec_signers import second_signer_refusal
-from app.services.dns.record_ops import QUEUED_OP_STATES
+from app.services.dns.record_ops import QUEUED_OP_STATES, primary_candidate
 from app.services.dns.row_locks import lock_op_ids, lock_zone_state_rows
 from app.services.dns.tsig import ensure_group_tsig_key
 from app.services.dns.tsig_algorithms import group_key_refusal
@@ -190,10 +190,11 @@ async def ensure_group_single_driver(
             )
 
 
-async def _elect_primary(
-    db: AsyncSession, group_id: uuid.UUID, *, exclude_id: uuid.UUID
+async def elect_primary(
+    db: AsyncSession, group_id: uuid.UUID, *, exclude_id: uuid.UUID | None
 ) -> DNSServer | None:
-    """Pick a replacement primary for a group that has just lost one.
+    """Pick a replacement primary for a group that has just lost one — by a
+    move out of it, or by its primary being deleted (#2276).
 
     Prefers a server that can actually accept writes: enabled, not paused
     for maintenance (``record_ops`` excludes paused servers from
@@ -207,29 +208,14 @@ async def _elect_primary(
     query re-elects the very server being demoted. The move then silently
     does nothing: the old group's flag sits on a member that has left, and
     the target group ends up with two primaries, which is the shape that
-    500s the agent long-poll rather than merely picking wrong.
+    500s the agent long-poll rather than merely picking wrong. ``None`` is
+    for a caller that has already flushed the departing rows away (the
+    appliance revoke, which can delete several of one group's servers).
     """
-    base = (
-        select(DNSServer)
-        .where(DNSServer.group_id == group_id, DNSServer.id != exclude_id)
-        .order_by(DNSServer.created_at, DNSServer.id)
-        .limit(1)
-    )
-    candidate = (
-        await db.execute(
-            base.where(
-                DNSServer.is_enabled.is_(True),
-                DNSServer.maintenance_mode.is_(False),
-            )
-        )
-    ).scalar_one_or_none()
-    if candidate is None:
-        # Every remaining server is disabled or paused. Fall back to any
-        # member rather than leaving the group primary-less: a paused
-        # primary still beats none, because ``resolve_primary_server``
-        # returning None drops record writes SILENTLY (a log line, no
-        # error to the caller), whereas a paused one is visible in the UI.
-        candidate = (await db.execute(base)).scalar_one_or_none()
+    # The ordering (enabled + unpaused, oldest first, else any member) lives
+    # in ``primary_candidate`` so the write path's stand-in and the beat
+    # self-heal pick the same server this does (#2276).
+    candidate = await primary_candidate(db, group_id, exclude_id=exclude_id)
     if candidate is not None:
         candidate.is_primary = True
     return candidate
@@ -377,7 +363,7 @@ async def move_server_to_group(
     old_group_new_primary_id: uuid.UUID | None = None
     if demoted:
         server.is_primary = False
-        replacement = await _elect_primary(db, old_group_id, exclude_id=server.id)
+        replacement = await elect_primary(db, old_group_id, exclude_id=server.id)
         old_group_new_primary_id = replacement.id if replacement else None
 
     server.group_id = target_group.id
