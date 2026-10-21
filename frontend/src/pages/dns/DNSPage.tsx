@@ -7448,6 +7448,22 @@ function OptionsTab({ groupId }: { groupId: string }) {
         </div>
       )}
 
+      {/* Stored forwarders pinned to port 53 in a group that forwards
+          encrypted (#2128): saved before the refusal, they render as TLS to
+          port 53 and never answer. */}
+      {(opts?.forwarder_warnings?.length ?? 0) > 0 && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          <p className="font-medium">These forwarders cannot answer:</p>
+          <ul className="mt-1 list-disc pl-4">
+            {opts?.forwarder_warnings?.map((w) => (
+              <li key={w} className="break-words">
+                {w}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       <div className={card}>
         <div className="flex items-center justify-between">
           <h4 className={cardTitle}>

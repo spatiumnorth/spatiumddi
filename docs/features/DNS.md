@@ -1006,6 +1006,19 @@ The first apply after upgrading renders and reloads every RPZ zone once:
 there is no recorded hash to match yet, and the zone's SOA serial now
 derives from its content. After that, only changed lists are touched.
 
+**Worked example: one popular catalog feed.** The catalog's AdGuard DNS
+filter was about 186k entries when this was written; the count moves with
+every upstream update. On a group with no views that is one RPZ zone, so by
+the rule of thumb above it needs about 400 MB + 186,000 x 3 kB, roughly
+1 GB, while an apply is in flight; with one view it is two zones and roughly
+1.5 GB. These are estimates from the rule, not a measurement of that list.
+Either way they are well over the `512Mi` in the chart's
+`dnsAgents.servers[].resources` example, so copying that example and
+subscribing to a single well-known list is likely to get the agent
+OOM-killed mid-apply. Treat `512Mi` as a figure for a group with no
+blocklists, and size the limit from the rule above before you subscribe.
+Entry counts are on each list after its first sync.
+
 Where to change it:
 
 - Appliance: `dnsBind9.resources` on the role chart, as a HelmChartConfig
@@ -1472,9 +1485,9 @@ Zone permissions are assignable to groups via the standard Permission model, sam
 DDNS_DEFAULT_TTL=300
 DDNS_GRACE_PERIOD_SECONDS=60   # how long to keep record after lease expiry
 
-# Blocking lists
-BLOCKLIST_UPDATE_INTERVAL_HOURS=24
-BLOCKLIST_SINKHOLE_IP=0.0.0.0
+# Blocking lists have no environment variables: the refresh interval and the
+# sinkhole IP are per list, in the database (the list's refresh interval and
+# its `sinkhole_ip`).
 
 # BIND9 TSIG (global default — per-server keys stored in DB encrypted)
 BIND_TSIG_ALGORITHM=hmac-sha256
