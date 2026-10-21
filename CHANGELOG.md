@@ -128,6 +128,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Logs → DNS Queries and DHCP Activity rows open in full (#2246).**
+  The grids cut the client, qname and raw columns off at one line, and
+  the rest was only a hover tooltip, which cannot be selected or
+  copied, does not work on touch, and is clipped for long lines. Each
+  row now starts with a details button that opens every field
+  untruncated: the timestamp in full ISO plus local time, client
+  `ip#port` and view, qname / qtype / qclass, the result, the answer
+  count, flags, and the raw line in a wrapping block with a Copy
+  button. The result uses the grid's wording: NODATA for NOERROR with
+  no answers, and "not recorded" when response logging is off, never
+  NOERROR (#914). A DNS row's details also offer Filter by client and
+  Filter by qname. DHCP rows show severity, log code, MAC, IP,
+  transaction id and raw the same way.
+
 - **`docs/PRIVACY.md` listed the RDAP lookups as per-click only (#2280).**
   Domain, ASN and RPKI ROA refreshes also run from an hourly Beat tick,
   and a Domain row is re-queried every 24 h by default. They now sit in
