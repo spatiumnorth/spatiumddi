@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -76,7 +77,7 @@ async def test_create_update_delete_each_write_one_audit_row(
     assert rows[0].new_value["secret_set"] is True
     assert rows[0].new_value["headers_set"] is True
     assert rows[0].new_value["event_types"] == ["subnet.created"]
-    assert rows[0].new_value["url"].startswith("https://receiver.example.test")
+    assert urlsplit(rows[0].new_value["url"]).hostname == "receiver.example.test"
 
     u = await client.put(
         f"{_SUBS}/{sid}",
