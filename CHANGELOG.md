@@ -181,6 +181,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Overlapping DHCP lease pulls no longer duplicate a lease and stop
+  that server's pull for good (#2262).** The Windows DHCP / FortiGate
+  lease pull stamped its interval only at the end of a pass and took
+  no lock, so a pass slower than the 10 s beat tick was started again
+  while it ran, and the manual Sync Leases raced it too. Both passes
+  inserted the same new lease, and from then on every pull of that
+  server failed on that address, leaving leases and IPAM `dhcp`
+  mirrors stale until someone deleted the row by hand. The scheduled
+  pass now claims its interval when it starts, the scheduled pass and
+  the manual Sync share a per-server lock (a Sync that hits it answers
+  409), the insert is an upsert, and a pull that meets an address with
+  two rows keeps the newest and carries on, so an install wedged today
+  recovers on its next pull. Migration `e4b8c2d17a95` deletes existing
+  duplicates (keeping the most recently seen row) and adds unique
+  indexes on the lease identity: (server, address, MAC) for DHCPv4,
+  (server, address, DUID, IAID) for DHCPv6. Not on (server, address)
+  alone, because the Kea lease-event path keeps one row per client on
+  an address on purpose (#1318).
+
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
   forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,
@@ -6510,6 +6529,13 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `e4b8c2d17a95` — #2262: deletes duplicate `dhcp_lease` rows (same
+  server, address and MAC, or same server, address, DUID and IAID),
+  keeping the most recently seen, then adds the partial unique indexes
+  `uq_dhcp_lease_server_ip_mac` (`WHERE duid IS NULL`) and
+  `uq_dhcp_lease_server_ip_duid` (`WHERE duid IS NOT NULL`, NULLS NOT
+  DISTINCT). Downgrade drops the indexes; the deleted duplicates are not
+  restored.
 - `d3a7f19c52e8` — #2112, data only: `dns_server.notes` equal to exactly
   `agent v2026.04.14.1` becomes empty. Downgrade does nothing.
 - `b8e41c7a2d95` — #1817, data + server default:
