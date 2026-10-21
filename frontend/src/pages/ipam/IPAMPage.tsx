@@ -1426,13 +1426,13 @@ function DhcpSettingsSection({
   const { data: blockDhcp } = useQuery({
     queryKey: ["effective-dhcp-block", parentBlockId],
     queryFn: () => ipamApi.getEffectiveBlockDhcp(parentBlockId!),
-    enabled: !!parentBlockId,
+    enabled: dhcpOn && !!parentBlockId,
     staleTime: 30_000,
   });
   const { data: spaceDhcp } = useQuery({
     queryKey: ["effective-dhcp-space", fallbackSpaceId],
     queryFn: () => ipamApi.getEffectiveSpaceDhcp(fallbackSpaceId!),
-    enabled: !parentBlockId && !!fallbackSpaceId,
+    enabled: dhcpOn && !parentBlockId && !!fallbackSpaceId,
     staleTime: 30_000,
   });
   const effectiveDhcp = blockDhcp ?? spaceDhcp ?? null;

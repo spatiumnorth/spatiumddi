@@ -397,10 +397,23 @@ async def update_router(
 
 
 @router.delete("/routers/{router_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_router(router_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_router(
+    router_id: uuid.UUID, db: DB, user: SuperAdmin, force: bool = False
+) -> None:
     r = await db.get(OPNsenseRouter, router_id)
     if r is None:
         raise HTTPException(status_code=404, detail="OPNsense firewall not found")
+    from app.services.block_sync.delete_guard import (  # noqa: PLC0415
+        assert_block_sync_deletable,
+    )
+
+    await assert_block_sync_deletable(
+        db,
+        target_kind="opnsense",
+        target_id=r.id,
+        armed=r.block_sync_enabled,
+        force=force,
+    )
     # #601 — sweep any active block-sync push rows for this target. They have no
     # FK to opnsense_router (target_id is polymorphic), so nothing cascades.
     # NOTE: this does NOT lift the blocks off the firewall — disarm the target
