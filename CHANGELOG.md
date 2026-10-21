@@ -128,6 +128,24 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Conformity alerts open, close and page again (#2277).** Two
+  defects. A conformity alert against a subnet, IP address, DNS zone,
+  DHCP scope or multicast group never opened: its subject id is 80 to
+  89 characters and `alert_event.subject_id` was VARCHAR(64), so the
+  insert failed and took the whole policy pass with it, results and
+  `last_evaluated_at` included. Only `platform` policies could alert.
+  And no conformity alert ever closed: #1578 took them away from the
+  alert evaluator and the conformity engine never resolved its own. A
+  fixed target, a deleted one or a disabled policy stayed red, and
+  because the event was still open, a later re-failure did not page.
+  The engine now resolves an event when its resource next evaluates
+  `pass` or `not_applicable`, when the resource is deleted or leaves the
+  policy's scope, and when the policy is disabled or deleted (from the
+  REST API, the copilot, and a once-a-minute sweep that catches any
+  other path). `warn` and a check that raised keep the event open.
+  A re-failure after the engine closed the event opens a new one and
+  pages; an event an operator resolved by hand while the resource is
+  still failing is not re-paged, as before.
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
   forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,
@@ -996,6 +1014,10 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `e2b9c46f1a83` — #2277, widens `alert_event.subject_id` from
+  VARCHAR(64) to VARCHAR(128). Catalogue-only, no rewrite. Downgrade
+  deletes events whose subject id is longer than 64 (only conformity
+  events written by this release) and narrows it back.
 - `d3a7f19c52e8` — #2112, data only: `dns_server.notes` equal to exactly
   `agent v2026.04.14.1` becomes empty. Downgrade does nothing.
 - `a2078c5e1d90` — #2078, adds nullable `dns_server.agent_version`

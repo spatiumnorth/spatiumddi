@@ -27,6 +27,14 @@ result for a (policy, resource) flips from any non-fail status to
 ``fail``, the engine opens an :class:`AlertEvent` against the named
 rule. Operators see the change in the same alerts dashboard they
 already monitor.
+
+The engine also owns closing those events (#2277) — the generic alert
+evaluator skips ``subject_type="conformity"`` since #1578. An open event
+resolves when its (policy, resource) next evaluates ``pass`` or
+``not_applicable``, when the resource drops out of the policy's scope
+(deleted, or no longer matching ``target_filter``), and when the policy
+is disabled or deleted. A ``warn`` result or a crashed check holds the
+event open: neither says the failure is gone.
 """
 
 from __future__ import annotations
@@ -53,6 +61,7 @@ from app.services.conformity.checks import (
     CHECK_REGISTRY,
     STATUS_FAIL,
     STATUS_NOT_APPLICABLE,
+    STATUS_PASS,
     CheckOutcome,
 )
 
@@ -234,6 +243,11 @@ async def _resolve_targets(
 # ── Alert hand-off on pass→fail transition ──────────────────────────
 
 
+def _subject_id(policy_id: uuid.UUID | str, kind: str, row_id: str) -> str:
+    """``AlertEvent.subject_id`` for one (policy, resource)."""
+    return f"{policy_id}:{kind}:{row_id}"
+
+
 async def _previous_status_for(
     db: AsyncSession,
     *,
@@ -280,14 +294,16 @@ async def _maybe_fire_alert(
         return
     if policy.fail_alert_rule_id is None:
         return
-    if previous_status == STATUS_FAIL:
-        return  # already failing — don't re-page
 
     rule = await db.get(AlertRule, policy.fail_alert_rule_id)
     if rule is None or not rule.enabled:
         return
 
-    subject_id = f"{policy.id}:{target.kind}:{target.row_id}"
+    subject_id = _subject_id(policy.id, target.kind, target.row_id)
+    if previous_status == STATUS_FAIL and not await _last_event_cleared_by_engine(
+        db, rule_id=rule.id, subject_id=subject_id
+    ):
+        return  # already failing — don't re-page
     existing = (
         await db.execute(
             select(AlertEvent).where(
@@ -332,6 +348,163 @@ async def _maybe_fire_alert(
     event.delivered_smtp = dm
 
 
+# ── Alert resolution (#2277) ────────────────────────────────────────
+
+# Stamped into a resolved event's ``last_observed_value`` so a later
+# re-fail can tell "the engine closed this because the failure went
+# away" (page again) from "an operator resolved it by hand while it was
+# still failing" (don't).
+_RESOLVED_BY_ENGINE = "conformity_engine"
+
+RESOLUTION_PASSED = "passed"
+RESOLUTION_NOT_APPLICABLE = "not_applicable"
+RESOLUTION_OUT_OF_SCOPE = "out_of_scope"
+RESOLUTION_POLICY_DISABLED = "policy_disabled"
+RESOLUTION_POLICY_DELETED = "policy_deleted"
+
+_STATUS_RESOLUTION = {
+    STATUS_PASS: RESOLUTION_PASSED,
+    STATUS_NOT_APPLICABLE: RESOLUTION_NOT_APPLICABLE,
+}
+
+
+def _close_event(event: AlertEvent, *, reason: str, now: datetime) -> None:
+    event.resolved_at = now
+    # Reassign, not mutate: JSONB isn't change-tracked in place.
+    event.last_observed_value = {
+        **(event.last_observed_value or {}),
+        "resolved_by": _RESOLVED_BY_ENGINE,
+        "resolution": reason,
+    }
+
+
+async def _open_policy_events(db: AsyncSession, policy_id: uuid.UUID | str) -> list[AlertEvent]:
+    return list(
+        (
+            await db.execute(
+                select(AlertEvent).where(
+                    AlertEvent.subject_type == "conformity",
+                    AlertEvent.subject_id.startswith(f"{policy_id}:", autoescape=True),
+                    AlertEvent.resolved_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _last_event_cleared_by_engine(
+    db: AsyncSession, *, rule_id: uuid.UUID, subject_id: str
+) -> bool:
+    """True when the newest event for (rule, subject) was resolved by
+    this engine — the failure went away and has now come back, so the
+    re-fail is a new incident even though the last stored result is
+    ``fail`` (a target that left scope, or a policy that was disabled,
+    writes no result in between)."""
+    last = (
+        await db.execute(
+            select(AlertEvent)
+            .where(
+                AlertEvent.rule_id == rule_id,
+                AlertEvent.subject_type == "conformity",
+                AlertEvent.subject_id == subject_id,
+            )
+            .order_by(desc(AlertEvent.fired_at))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if last is None or last.resolved_at is None:
+        return False
+    return (last.last_observed_value or {}).get("resolved_by") == _RESOLVED_BY_ENGINE
+
+
+async def _resolve_cleared_alerts(
+    db: AsyncSession,
+    *,
+    policy: ConformityPolicy,
+    evaluated: dict[str, str | None],
+    now: datetime,
+) -> int:
+    """Close this policy's open events whose resource no longer fails.
+
+    ``evaluated`` maps each subject this pass covered to its status
+    (``None`` for a crashed check). A subject absent from it has left the
+    policy's scope — deleted, or no longer matching the filter. ``fail``,
+    ``warn`` and a crash hold the event open. Idempotent: only open
+    events are touched.
+    """
+    resolved = 0
+    for ev in await _open_policy_events(db, policy.id):
+        if ev.subject_id not in evaluated:
+            reason = RESOLUTION_OUT_OF_SCOPE
+        else:
+            status = evaluated[ev.subject_id]
+            if status is None or status not in _STATUS_RESOLUTION:
+                continue
+            reason = _STATUS_RESOLUTION[status]
+        _close_event(ev, reason=reason, now=now)
+        resolved += 1
+    if resolved:
+        logger.info("conformity_alerts_resolved", policy=str(policy.id), count=resolved)
+    return resolved
+
+
+async def resolve_policy_alerts(
+    db: AsyncSession,
+    policy_id: uuid.UUID,
+    *,
+    reason: str,
+    now: datetime | None = None,
+) -> int:
+    """Close every open event a policy raised — it was disabled or
+    deleted, so nothing will evaluate it again. The caller commits."""
+    now = now or datetime.now(UTC)
+    events = await _open_policy_events(db, policy_id)
+    for ev in events:
+        _close_event(ev, reason=reason, now=now)
+    return len(events)
+
+
+async def resolve_orphaned_policy_alerts(db: AsyncSession) -> int:
+    """Backstop for :func:`resolve_policy_alerts`: close open conformity
+    events whose policy is disabled or gone, whatever path got it there
+    (a write path that doesn't call the hook, a restore, a direct SQL
+    edit). The caller commits."""
+    events = (
+        (
+            await db.execute(
+                select(AlertEvent).where(
+                    AlertEvent.subject_type == "conformity",
+                    AlertEvent.resolved_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not events:
+        return 0
+    enabled_by_id = {
+        str(pid): enabled
+        for pid, enabled in (
+            await db.execute(select(ConformityPolicy.id, ConformityPolicy.enabled))
+        ).all()
+    }
+    now = datetime.now(UTC)
+    resolved = 0
+    for ev in events:
+        enabled = enabled_by_id.get(ev.subject_id.split(":", 1)[0])
+        if enabled:
+            continue
+        reason = RESOLUTION_POLICY_DELETED if enabled is None else RESOLUTION_POLICY_DISABLED
+        _close_event(ev, reason=reason, now=now)
+        resolved += 1
+    if resolved:
+        logger.info("conformity_orphaned_alerts_resolved", count=resolved)
+    return resolved
+
+
 # ── Core entry points ───────────────────────────────────────────────
 
 
@@ -361,6 +534,7 @@ async def evaluate_policy(
             policy=str(policy.id),
             target_kind=policy.target_kind,
         )
+        await _resolve_cleared_alerts(db, policy=policy, evaluated={}, now=now)
         policy.last_evaluated_at = now
         return {"passed": 0, "failed": 0, "warned": 0, "not_applicable": 0, "total": 0}
 
@@ -368,6 +542,8 @@ async def evaluate_policy(
     if check_fn is None:
         # Stale / unknown check_kind. Write a single not_applicable
         # result so the operator can see what's broken in the dashboard.
+        # Nothing this policy targets can fail any more, so its events close.
+        await _resolve_cleared_alerts(db, policy=policy, evaluated={}, now=now)
         policy.last_evaluated_at = now
         db.add(
             ConformityResult(
@@ -385,8 +561,12 @@ async def evaluate_policy(
 
     targets = await _resolve_targets(db, policy)
     summary = {"passed": 0, "failed": 0, "warned": 0, "not_applicable": 0, "total": 0}
+    # #2277 — subject_id → this pass's status, or ``None`` when the check
+    # crashed (an unknown, which must not close a failing event).
+    evaluated: dict[str, str | None] = {}
 
     for target in targets:
+        crashed = False
         try:
             outcome = await check_fn(
                 db,
@@ -407,6 +587,7 @@ async def evaluate_policy(
                 f"check raised {exc.__class__.__name__}: {exc}",
                 {"error_type": exc.__class__.__name__},
             )
+            crashed = True
 
         previous = await _previous_status_for(
             db,
@@ -434,6 +615,9 @@ async def evaluate_policy(
             previous_status=previous,
             now=now,
         )
+        evaluated[_subject_id(policy.id, target.kind, target.row_id)] = (
+            None if crashed else outcome.status
+        )
 
         summary["total"] += 1
         if outcome.status == "pass":
@@ -445,6 +629,7 @@ async def evaluate_policy(
         else:
             summary["not_applicable"] += 1
 
+    await _resolve_cleared_alerts(db, policy=policy, evaluated=evaluated, now=now)
     policy.last_evaluated_at = now
     return summary
 
@@ -494,4 +679,9 @@ async def evaluate_due_policies(db: AsyncSession) -> dict[str, int]:
     return totals
 
 
-__all__ = ["evaluate_policy", "evaluate_due_policies"]
+__all__ = [
+    "evaluate_due_policies",
+    "evaluate_policy",
+    "resolve_orphaned_policy_alerts",
+    "resolve_policy_alerts",
+]

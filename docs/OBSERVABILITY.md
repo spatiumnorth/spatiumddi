@@ -1057,6 +1057,17 @@ against the named alert rule with `subject_type="conformity"` so
 operators see drift in the same dashboard. Configure the wiring in
 the policy edit modal at `/admin/conformity`.
 
+The conformity engine, not the alert evaluator, closes these events
+(#2277). An open event resolves when its (policy, resource) next
+evaluates `pass` or `not_applicable`, when the resource is deleted or
+drops out of the policy's target filter, and when the policy is
+disabled or deleted. A `warn` result or a check that raised holds the
+event open. The resolved event's `last_observed_value.resolution` says
+why (`passed`, `not_applicable`, `out_of_scope`, `policy_disabled`,
+`policy_deleted`). A later re-failure opens a new event and pages
+again. An event you resolve by hand while the resource is still failing
+stays resolved until the resource passes and then fails again.
+
 ### 9.1a BGP prefix-hijack monitoring (#527)
 
 Extends the ASN subsystem with route-origin monitoring: **is someone
