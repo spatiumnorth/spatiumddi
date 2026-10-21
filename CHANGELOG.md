@@ -128,6 +128,7 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An unattended install no longer aborts when k3s unpacks its tools during the root copy (#2256).** The live-root rsync now skips `/var/lib/rancher/k3s/data/` (k3s's self-extraction area, regenerated on the installed system's first start; the baked air-gap images under `agent/` are still copied) and treats rsync exit 24 ("some files vanished") as success for that copy only, logging it. Every other rsync failure still aborts the install.
 - **Webhook subscriptions could be created, repointed, deleted and
   have deliveries retried with no audit row (#2293).** All four routes
   now write one `audit_log` row in the mutation's transaction. The row
