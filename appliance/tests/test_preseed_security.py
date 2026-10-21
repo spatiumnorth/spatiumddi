@@ -569,5 +569,8 @@ def test_trace_log_is_excluded_from_the_installed_system():
     """/var/log/* must not be rsynced onto the target — otherwise every
     guard above is undone by shipping the trace log to the installed
     machine."""
-    fn = extract_fn("do_install")
+    # The live-root rsync moved into _copy_live_root (#2256), and
+    # do_install calls it.
+    assert "_copy_live_root" in extract_fn("do_install")
+    fn = extract_fn("_copy_live_root")
     assert '--exclude="/var/log/*"' in fn
