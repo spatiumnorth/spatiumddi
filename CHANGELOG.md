@@ -128,6 +128,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Streaming responses kept sending after the caller's access ended.**
+  The cluster-health, pod-log, nmap-progress and AI-chat streams checked
+  the caller once, when the connection opened, and then sent until the
+  client disconnected — so signing a session out, disabling the account,
+  revoking or expiring the API token, or removing the permission did not
+  stop a stream already open. Each stream now re-runs the request's
+  authentication and permission checks every 15 seconds and ends when
+  they fail, or when the access token it was opened with expires. The
+  log panes reconnect on their own, without re-tailing. The nmap stream's
+  open-time check now goes through the same path as every other route,
+  so it also applies the password-change gate and honours time-bound
+  grants.
+
 - **Webhook subscriptions could be created, repointed, deleted and
   have deliveries retried with no audit row (#2293).** All four routes
   now write one `audit_log` row in the mutation's transaction. The row

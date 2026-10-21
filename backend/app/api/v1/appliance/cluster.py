@@ -30,6 +30,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
+from app.api.stream_auth import StreamAuthGuard
 from app.core.permissions import require_permission
 from app.core.responses import EventStreamResponse
 from app.db import AsyncSessionLocal
@@ -474,11 +475,18 @@ async def cluster_health_stream(request: Request) -> StreamingResponse:
     animates each frame. A momentarily-unreachable kubeapi emits an
     ``available: false`` frame (with a reason) rather than dropping the
     stream, so the dashboard self-heals when the control plane settles.
+
+    The caller is re-validated on a bounded cadence (``StreamAuthGuard``);
+    the stream ends once they are signed out, disabled or lose
+    ``read:appliance``, and the client reconnects with a current token.
     """
+    guard = StreamAuthGuard(request, permission=("read", "appliance"))
 
     async def event_source():
         while True:
             if await request.is_disconnected():
+                break
+            if not await guard.still_authorized():
                 break
             try:
                 snap = await anyio.to_thread.run_sync(get_cluster_health)

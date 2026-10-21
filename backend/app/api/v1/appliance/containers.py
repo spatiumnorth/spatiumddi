@@ -14,11 +14,12 @@ import json
 from datetime import datetime
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.api.deps import DB, CurrentUser
+from app.api.stream_auth import StreamAuthGuard
 from app.core.permissions import require_permission
 from app.models.audit import AuditLog
 from app.services.appliance.containers import (
@@ -120,19 +121,27 @@ async def get_logs(name: str, tail: int = 200) -> dict[str, str]:
     return {"name": name, "tail": text}
 
 
-def _sse_log_response(gen) -> StreamingResponse:
+def _sse_log_response(gen, request: Request) -> StreamingResponse:
     """Wrap a log-chunk generator as an SSE response.
 
     Chunks are JSON-encoded ``{"line": "..."}`` so embedded newlines /
     quotes round-trip cleanly through the SSE wire format.
     ``X-Accel-Buffering: no`` disables nginx response buffering so each
     line reaches the browser ASAP (same pattern as the AI-chat stream).
+    The caller is re-validated on a bounded cadence before each chunk is
+    sent (``StreamAuthGuard``); the stream ends once that fails.
     """
+    guard = StreamAuthGuard(request, permission=("read", "appliance"))
 
     async def event_source():
-        async for chunk in gen:
-            for line in chunk.splitlines():
-                yield f"data: {json.dumps({'line': line})}\n\n"
+        try:
+            async for chunk in gen:
+                if not await guard.still_authorized():
+                    return
+                for line in chunk.splitlines():
+                    yield f"data: {json.dumps({'line': line})}\n\n"
+        finally:
+            await gen.aclose()
 
     return StreamingResponse(
         event_source(),
@@ -146,13 +155,13 @@ def _sse_log_response(gen) -> StreamingResponse:
     dependencies=[Depends(require_permission("read", "appliance"))],
     summary="Stream a single pod's logs as SSE (follow=true)",
 )
-async def stream_logs(name: str, tail: int = 100):
+async def stream_logs(name: str, request: Request, tail: int = 100):
     """Stream one pod's logs by exact pod name; closes on client disconnect."""
     try:
         gen = stream_container_logs(name, tail=tail)
     except DockerUnavailableError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
-    return _sse_log_response(gen)
+    return _sse_log_response(gen, request)
 
 
 @router.get(
@@ -160,7 +169,7 @@ async def stream_logs(name: str, tail: int = 100):
     dependencies=[Depends(require_permission("read", "appliance"))],
     summary="Stream a workload's logs as SSE — resolves component → current pod",
 )
-async def stream_workload_logs(component: str, tail: int = 100):
+async def stream_workload_logs(component: str, request: Request, tail: int = 100):
     """Tail a workload (deployment / daemonset) by its component label
     (api / worker / frontend / …) instead of a churny pod name (#416).
 
@@ -182,4 +191,4 @@ async def stream_workload_logs(component: str, tail: int = 100):
         gen = stream_container_logs(pod, tail=tail, container=container)
     except DockerUnavailableError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
-    return _sse_log_response(gen)
+    return _sse_log_response(gen, request)
