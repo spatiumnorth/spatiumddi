@@ -34,6 +34,7 @@ from app.services.dhcp.static_ipam import (
 )
 from app.services.dhcp.windows_writethrough import push_scope_restore
 from app.services.dns.record_ops import push_records_restore, retract_address_records
+from app.services.dns.view_collisions import RenderGuard, collision_detail
 from app.services.soft_delete import (  # noqa: PLC2701 — canonical labels, keep in one place
     SOFT_DELETE_RESOURCE_TYPES,
     TYPE_TO_MODEL,
@@ -484,6 +485,64 @@ async def list_trash(
 _PARTIAL_RESTORE_TYPES = frozenset({"dns_record"})
 
 
+async def _capture_render_guards(db: Any, batch_id: uuid.UUID) -> list[RenderGuard]:
+    """Baselines for the zone names a restore of ``batch_id`` can re-place (#2275).
+
+    A restored zone renders into its view (or, when it has none, every view),
+    and a restored view-scoped record places its zone in that view too. Either
+    can put a second copy of a zone name into one view.
+    """
+    pairs = (
+        await db.execute(
+            select(DNSZone.group_id, DNSZone.name)
+            .where(DNSZone.deletion_batch_id == batch_id)
+            .execution_options(include_deleted=True)
+        )
+    ).all()
+    pairs += (
+        await db.execute(
+            select(DNSZone.group_id, DNSZone.name)
+            .join(DNSRecord, DNSRecord.zone_id == DNSZone.id)
+            .where(DNSRecord.deletion_batch_id == batch_id, DNSRecord.view_id.is_not(None))
+            .distinct()
+            .execution_options(include_deleted=True)
+        )
+    ).all()
+    by_group: dict[uuid.UUID, set[str]] = {}
+    for gid, name in pairs:
+        by_group.setdefault(gid, set()).add(name)
+    return [
+        await RenderGuard.capture(db, gid, names, savepoint=False)
+        for gid, names in by_group.items()
+    ]
+
+
+async def _refuse_render_collisions(db: Any, guards: list[RenderGuard], savepoint: Any) -> None:
+    found = []
+    for guard in guards:
+        found.extend(await guard.new_collisions(db))
+    if not found:
+        await savepoint.commit()
+        return
+    await savepoint.rollback()
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": collision_detail(found, "restore"),
+            "conflicts": [
+                {
+                    "type": "dns_zone",
+                    "id": c.zone_ids[0],
+                    "display": f"{c.zone_name}.",
+                    "reason": c.describe(),
+                }
+                for c in found
+            ],
+            "skip_conflicts_allowed": False,
+        },
+    )
+
+
 @router.post("/trash/{type}/{row_id}/restore", response_model=RestoreResponse)
 async def restore_row(
     type: str,
@@ -542,8 +601,13 @@ async def restore_row(
     async def _check(obj: Any) -> str | None:
         return await default_conflict_check(db, obj)
 
+    render_guards = await _capture_render_guards(db, batch_id)
+    # #2275 — the restore runs in a SAVEPOINT so a refused one leaves nothing.
+    restore_sp = await db.begin_nested() if render_guards else None
     result = await restore_batch(db, batch_id, conflict_check=_check, skip_conflicts=skip_conflicts)
     restored, conflicts = result.restored, result.conflicts
+    if restore_sp is not None and (not conflicts or skip_conflicts):
+        await _refuse_render_collisions(db, render_guards, restore_sp)
     if conflicts and not skip_conflicts:
         # Tell the client whether ``skip_conflicts`` would be accepted, so the
         # page offers "Restore the others" only where the 422 above will not
