@@ -373,3 +373,128 @@ async def test_zone_move_preview_reports_a_twin_in_the_targets_views(
     )
     assert r.status_code == 200, r.text
     assert r.json()["name_collision"] is True
+
+
+# ── the guard's own contract ────────────────────────────────────────────────
+
+
+async def test_an_existing_collision_blocks_neither_unrelated_edits_nor_its_fix(
+    client: AsyncClient, db_session
+):
+    """Only collisions a change introduces are refused (the baseline rule)."""
+    hdr = await _admin(db_session)
+    group = await _group(db_session)
+    internal = await _view(client, hdr, group.id, "internal", "10.0.0.0/8")
+    # Written straight to the table, as a pre-#2275 install could hold it.
+    pinned = DNSZone(group_id=group.id, name="corp.example.", view_id=uuid.UUID(internal))
+    shared = DNSZone(group_id=group.id, name="corp.example.")
+    db_session.add_all([pinned, shared])
+    await db_session.flush()
+    assert _dupes(await _rendered(db_session, group.id)) == [("internal", "corp.example")]
+
+    # Unrelated: a view-scoped record in the pinned twin changes nothing new.
+    r = await _record(client, hdr, group.id, str(pinned.id), internal)
+    assert r.status_code == 201, r.text
+
+    # The fix: renaming the shared twin away resolves the collision.
+    r = await client.put(
+        f"/api/v1/dns/groups/{group.id}/zones/{shared.id}",
+        headers=hdr,
+        json={"name": "other.example."},
+    )
+    assert r.status_code == 200, r.text
+    assert _dupes(await _rendered(db_session, group.id)) == []
+
+
+async def test_the_dns_importer_fails_a_shared_zone_beside_a_pinned_twin(
+    client: AsyncClient, db_session
+):
+    from tests.test_dns_import import _BASIC_NAMED, _BASIC_ZONE, _build_tar
+
+    hdr = await _admin(db_session)
+    group = await _group(db_session)
+    internal = await _view(client, hdr, group.id, "internal", "10.0.0.0/8")
+    assert (await _zone(client, hdr, group.id, "example.com.", internal)).status_code == 201
+    gid = str(group.id)
+    await db_session.commit()
+
+    archive = _build_tar(
+        [("etc/named.conf", _BASIC_NAMED), ("var/named/example.com.zone", _BASIC_ZONE)]
+    )
+    preview = await client.post(
+        "/api/v1/dns/import/bind9/preview",
+        headers=hdr,
+        files={"file": ("bind.tar.gz", archive, "application/gzip")},
+        data={"target_group_id": gid},
+    )
+    assert preview.status_code == 200, preview.text
+    r = await client.post(
+        "/api/v1/dns/import/bind9/commit",
+        headers=hdr,
+        json={"target_group_id": gid, "plan": preview.json(), "conflict_actions": {}},
+    )
+    assert r.status_code == 200, r.text
+    (zone_result,) = r.json()["zones"]
+    assert zone_result["action_taken"] == "failed"
+    assert "twice in one view" in zone_result["error"]
+    assert _dupes(await _rendered(db_session, uuid.UUID(gid))) == []
+
+
+async def test_the_guard_and_the_bundle_agree_on_every_placement(client: AsyncClient, db_session):
+    """Built behind the guard's back: what it reports is what the bundle renders."""
+    from app.services.dns.view_collisions import zone_render_collisions
+
+    hdr = await _admin(db_session)
+    group = await _group(db_session)
+    a = uuid.UUID(await _view(client, hdr, group.id, "a", "10.0.0.0/8"))
+    b = uuid.UUID(await _view(client, hdr, group.id, "b", "172.16.0.0/12"))
+    await _view(client, hdr, group.id, "c", "any")
+
+    def zone(name: str, view: uuid.UUID | None) -> DNSZone:
+        z = DNSZone(group_id=group.id, name=name, view_id=view)
+        db_session.add(z)
+        return z
+
+    # one.: shared (a, b, c) + pinned a          → a
+    # two.: shared scoped to b by a record + pinned b → b
+    # three.: shared scoped to a + pinned b       → none
+    # four.: pinned a + pinned b                 → none
+    # five.: alone, shared                        → none (and no record scan)
+    zones = [
+        zone("one.", None),
+        zone("one.", a),
+        zone("two.", None),
+        zone("two.", b),
+        zone("three.", None),
+        zone("three.", b),
+        zone("four.", a),
+        zone("four.", b),
+        zone("five.", None),
+    ]
+    await db_session.flush()
+    by_name: dict[str, list[DNSZone]] = {}
+    for z in zones:
+        by_name.setdefault(z.name, []).append(z)
+    for zname, view in (("two.", b), ("three.", a)):
+        shared = next(z for z in by_name[zname] if z.view_id is None)
+        db_session.add(
+            DNSRecord(
+                zone_id=shared.id,
+                name="h",
+                fqdn=f"h.{zname}",
+                record_type="A",
+                value="192.0.2.1",
+                view_id=view,
+            )
+        )
+    await db_session.flush()
+
+    expected = sorted(_dupes(await _rendered(db_session, group.id)))
+    assert expected == [("a", "one"), ("b", "two")]
+    got = sorted((c.view, c.zone_name) for c in await zone_render_collisions(db_session, group.id))
+    assert got == expected
+    for zname in ("one.", "two.", "three.", "four.", "five."):
+        scoped = await zone_render_collisions(db_session, group.id, names=[zname])
+        assert sorted((c.view, c.zone_name) for c in scoped) == [
+            k for k in expected if k[1] == zname.rstrip(".")
+        ]

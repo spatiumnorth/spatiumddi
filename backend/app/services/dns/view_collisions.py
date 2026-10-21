@@ -4,7 +4,7 @@ A zone's view placement is not just ``DNSZone.view_id``. The bundle builder
 renders a zone into every view named by its own ``view_id`` and by the
 ``view_id`` of each view-scoped record in it; a zone with neither is *shared*
 and renders into every operator view, and geo views (#530) render every zone
-(``pool_geo.view_renders_zone``). A group with no views renders each zone once,
+(``pool_geo.views_rendering_zone``, the call the bundle builder makes). A group with no views renders each zone once,
 flat.
 
 The unique constraint ``(group_id, view_id, name)`` cannot see any of that:
@@ -24,6 +24,7 @@ them.
 from __future__ import annotations
 
 import uuid
+from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -36,7 +37,7 @@ from app.models.dns import DNSRecord, DNSView, DNSZone
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
-    view_renders_zone,
+    views_rendering_zone,
 )
 
 # The label a collision carries when the group has no views and every zone
@@ -89,54 +90,61 @@ async def zone_render_collisions(
     if wanted is not None and not wanted:
         return []
 
-    views = (await db.execute(select(DNSView).where(DNSView.group_id == group_id))).scalars().all()
-    geo = await build_geo_steering(db, group_id)
-    has_views = bool(views) or geo.active
-    descs = build_view_descriptors(sorted(views, key=lambda v: (v.order, v.name)), geo)
-
     stmt: Any = select(DNSZone.id, DNSZone.name, DNSZone.view_id).where(
         DNSZone.group_id == group_id
     )
     if wanted is not None:
         stmt = stmt.where(func.lower(func.rtrim(DNSZone.name, ".")).in_(wanted))
-    zones: list[tuple[Any, str, Any]] = [
-        (z.id, normalise_zone_name(z.name), z.view_id) for z in (await db.execute(stmt)).all()
+    zones: list[ExtraZone] = [
+        ExtraZone(id=z.id, name=normalise_zone_name(z.name), view_id=z.view_id)
+        for z in (await db.execute(stmt)).all()
     ]
-    record_views: dict[Any, set[Any]] = {}
-    zone_ids = [z[0] for z in zones]
-    if zone_ids and has_views:
-        rows = await db.execute(
-            select(DNSRecord.zone_id, DNSRecord.view_id)
-            .where(DNSRecord.zone_id.in_(zone_ids), DNSRecord.view_id.is_not(None))
-            .distinct()
-        )
-        for zid, vid in rows.all():
-            record_views.setdefault(zid, set()).add(vid)
-
-    targets: list[tuple[Any, str, set[Any]]] = []
-    for zid, zname, zview in zones:
-        t = set(record_views.get(zid, set()))
-        if zview is not None:
-            t.add(zview)
-        targets.append((zid, zname, t))
-    live_ids = {z[0] for z in zones}
+    live_ids = {z.id for z in zones}
     for extra in extra_zones:
         zname = normalise_zone_name(extra.name)
         if extra.id in live_ids or (wanted is not None and zname not in wanted):
             continue
-        t = set(extra.record_view_ids)
-        if extra.view_id is not None:
-            t.add(extra.view_id)
-        targets.append((extra.id, zname, t))
+        zones.append(
+            ExtraZone(
+                id=extra.id,
+                name=zname,
+                view_id=extra.view_id,
+                record_view_ids=set(extra.record_view_ids),
+            )
+        )
+
+    # Only a name held by two zones or more can render twice anywhere. Most
+    # names are held by one, so the record scan below (the expensive part: it
+    # reads every record of the zone, and a zone can hold millions) runs only
+    # for the twins that can actually collide.
+    per_name = Counter(z.name for z in zones)
+    zones = [z for z in zones if per_name[z.name] > 1]
+    if not zones:
+        return []
+
+    views = (await db.execute(select(DNSView).where(DNSView.group_id == group_id))).scalars().all()
+    geo = await build_geo_steering(db, group_id)
+    has_views = bool(views) or geo.active
+    descs = build_view_descriptors(sorted(views, key=lambda v: (v.order, v.name)), geo)
+
+    live_twin_ids = [z.id for z in zones if z.id in live_ids]
+    if live_twin_ids and has_views:
+        rows = await db.execute(
+            select(DNSRecord.zone_id, DNSRecord.view_id)
+            .where(DNSRecord.zone_id.in_(live_twin_ids), DNSRecord.view_id.is_not(None))
+            .distinct()
+        )
+        by_id = {z.id: z for z in zones}
+        for zid, vid in rows.all():
+            by_id[zid].record_view_ids.add(vid)
 
     placements: dict[tuple[str, str], list[str]] = {}
-    for zid, zname, t in targets:
+    for z in zones:
         if not has_views:
-            placements.setdefault((FLAT, zname), []).append(str(zid))
+            placements.setdefault((FLAT, z.name), []).append(str(z.id))
             continue
-        for vd in descs:
-            if view_renders_zone(vd, t):
-                placements.setdefault((vd["name"], zname), []).append(str(zid))
+        for vd in views_rendering_zone(descs, z.view_id, z.record_view_ids):
+            placements.setdefault((vd["name"], z.name), []).append(str(z.id))
 
     return [
         ZoneRenderCollision(view=v, zone_name=n, zone_ids=tuple(sorted(ids)))

@@ -725,6 +725,13 @@ async def commit_import(
             action, rename_to = entry
         has_conflict = target_name in conflicting
 
+        # A SAVEPOINT per zone, so a failed zone is undone without a session
+        # rollback: that expires every loaded object, ``current_user`` among
+        # them, and the next access to it (the next zone's audit row, the
+        # route's log line) is lazy IO outside the greenlet, a 500 after the
+        # zones before it were committed (#2275 made a refusal here routine).
+        # A zone that succeeds commits, which ends the savepoint with the rest.
+        zone_sp = await db.begin_nested()
         try:
             result = await _commit_one_zone(
                 db,
@@ -739,8 +746,13 @@ async def commit_import(
                 now=now,
                 source_server_id=preview.source_server_id,
             )
+            if zone_sp.is_active:  # skipped, or failed without raising
+                await zone_sp.commit()
         except Exception as exc:  # noqa: BLE001 — operator-facing error capture
-            await db.rollback()
+            if zone_sp.is_active:
+                await zone_sp.rollback()
+            else:
+                await db.rollback()
             result = CommitZoneResult(
                 zone_name=parsed.name,
                 action_taken="failed",
