@@ -1337,7 +1337,7 @@ XLSX**. Over REST:
 |---|---|
 | Export | `GET /api/v1/dns/groups/{gid}/zones/{zid}/export?format=csv\|xlsx` (`format=zone`, the default, is the zone file). File name `dns-zone-<zone>-<YYYYMMDD-HHMMSS>.<ext>`, UTC. Needs read. |
 | Template | `GET …/zones/{zid}/import/template?format=csv\|xlsx` |
-| Import | `POST …/zones/{zid}/import/spreadsheet/preview` then `…/commit`, multipart: `file`, `mode` (`merge` / `replace`), and on a replace commit `confirm_zone`. Needs write on `dns_record`; a replace that deletes also needs delete. |
+| Import | `POST …/zones/{zid}/import/spreadsheet/preview` then `…/commit`, multipart: `file`, `mode` (`merge` / `replace`), and on a replace commit `confirm_zone`. Needs write on `dns_record` and read (as the export does); a replace that deletes also needs delete. |
 
 **Columns.** One row per record. The header row is required; column names are
 case-insensitive and `record_type` is accepted for `type`.
