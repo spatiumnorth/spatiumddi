@@ -26,18 +26,22 @@ import uuid
 from datetime import UTC, datetime
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.api.stepup import require_stepup_if_granting_superadmin
 from app.api.v1.roles.router import _VALID_ACTIONS
-from app.core.permissions import caller_can_grant, require_permission
+from app.core.permissions import caller_can_grant, refuse_and_audit, require_permission
 from app.models.audit import AuditLog
 from app.models.auth import Group
 from app.models.time_bound_grant import TimeBoundGrant
-from app.services.superadmin_grant import SuperadminModel, permissions_grant_superadmin
+from app.services.superadmin_grant import (
+    SuperadminModel,
+    leaves_no_active_superadmin,
+    permissions_grant_superadmin,
+)
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -275,7 +279,7 @@ async def create_time_bound_grant(
     dependencies=[Depends(require_permission("admin", "group"))],
 )
 async def revoke_time_bound_grant(
-    grant_id: uuid.UUID, current_user: CurrentUser, db: DB
+    grant_id: uuid.UUID, request: Request, current_user: CurrentUser, db: DB
 ) -> TimeBoundGrantResponse:
     """Soft-revoke a grant now — sets ``revoked_at`` and keeps the row for
     audit / history. Idempotent: re-revoking an already-revoked grant is a
@@ -286,6 +290,72 @@ async def revoke_time_bound_grant(
 
     if grant.revoked_at is not None:
         return _to_response(grant)
+
+    display = (
+        f"revoke {grant.action} on {grant.resource_type}"
+        f"{('/' + grant.resource_id) if grant.resource_id else ''} for group {grant.group_id}"
+    )
+    # Revoking a grant only narrows access, so a group admin may revoke one
+    # they do not hold themselves. A wildcard grant is the exception: only a
+    # superadmin can mint one, and only a superadmin can take one away.
+    wildcard = grant.action == "*" or grant.resource_type == "*"
+    if wildcard and not caller_can_grant(current_user, [grant]):
+        await refuse_and_audit(
+            db,
+            current_user,
+            request,
+            action="permission_change",
+            resource_type="time_bound_grant",
+            resource_id=str(grant.id),
+            resource_display=display,
+            reason="above the caller's privilege ceiling",
+            detail=("Only a superadmin can revoke a grant carrying wildcard ('*') " "permissions."),
+        )
+    if permissions_grant_superadmin(
+        [
+            {
+                "action": grant.action,
+                "resource_type": grant.resource_type,
+                "resource_id": grant.resource_id,
+            }
+        ]
+    ):
+        group_id = grant.group_id
+
+        def _change(model: SuperadminModel) -> None:
+            model.granted_groups.discard(group_id)
+
+        # ``granted_groups`` holds one entry per group; this is the only
+        # ``*`` / ``*`` grant on the group unless another live one exists.
+        others = await db.scalar(
+            select(TimeBoundGrant.id)
+            .where(
+                TimeBoundGrant.group_id == group_id,
+                TimeBoundGrant.id != grant.id,
+                TimeBoundGrant.revoked_at.is_(None),
+                TimeBoundGrant.expires_at > datetime.now(UTC),
+                TimeBoundGrant.action == "*",
+                TimeBoundGrant.resource_type == "*",
+                TimeBoundGrant.resource_id.is_(None),
+            )
+            .limit(1)
+        )
+        if others is None and await leaves_no_active_superadmin(db, _change):
+            await refuse_and_audit(
+                db,
+                current_user,
+                request,
+                action="permission_change",
+                resource_type="time_bound_grant",
+                resource_id=str(grant.id),
+                resource_display=display,
+                reason="would leave no active superadmin",
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This change would leave no active superadmin. Make another "
+                    "account a superadmin first."
+                ),
+            )
 
     grant.revoked_at = datetime.now(UTC)
     db.add(

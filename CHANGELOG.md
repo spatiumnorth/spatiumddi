@@ -972,6 +972,29 @@ the formatter handles the rest.
 
 ### Security
 
+- **Group membership changes are now bounded by the same privilege
+  ceiling as role attachment.** A group's roles, and its live
+  time-bound grants, are what its members hold, so adding a member,
+  removing one and deleting the group now need the caller to be able
+  to grant those permissions themselves, exactly as attaching a role
+  already did. Only a superadmin can change the membership of a group
+  carrying a wildcard (`*`) permission. The same ceiling now bounds
+  detaching a role from a group, changing or deleting an existing
+  role, and revoking a wildcard time-bound grant. Resending a group's unchanged
+  member list (as the edit form does) is not a membership change, so
+  renaming or describing a group is unaffected. Superadmins are
+  unaffected throughout.
+  **No change may leave the install without an active superadmin.**
+  Disabling, un-flagging or deleting a user, removing the last
+  superadmin from a group, detaching or editing the wildcard role,
+  deleting that group or role, and revoking the last wildcard
+  time-bound grant now answer 409 when nobody active would be left.
+  Refusals from both checks write a `denied` audit row, as a
+  permission refusal does. External sign-in (LDAP / OIDC / SAML /
+  RADIUS / TACACS+) still syncs group membership from the identity
+  provider's group mappings, which only a superadmin can configure.
+
+
 - **Forwarded audit events are redacted the way the audit API
   redacts them (#2015).** #2014 redacted an audit entry's
   `old_value`, `new_value` and `error_detail` on read, for the API,

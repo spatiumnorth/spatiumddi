@@ -25,7 +25,7 @@ Two entry points are exported:
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Annotated
+from typing import Annotated, NoReturn
 from uuid import UUID
 
 import structlog
@@ -541,6 +541,53 @@ async def _record_denial(
         await db.commit()
     except Exception as exc:  # noqa: BLE001 — don't let audit failures block the 403
         logger.warning("permission_audit_write_failed", error=str(exc))
+
+
+async def refuse_and_audit(
+    db: AsyncSession,
+    user: User,
+    request: Request | None,
+    *,
+    action: str,
+    resource_type: str,
+    resource_id: str,
+    resource_display: str,
+    reason: str,
+    status_code: int = status.HTTP_403_FORBIDDEN,
+    detail: str,
+) -> NoReturn:
+    """Write a ``denied`` audit row for a refused mutation, then raise.
+
+    For refusals decided inside a handler (a privilege ceiling, an invariant)
+    rather than by a :func:`require_permission` gate, so they leave the same
+    trail. Call it before anything is written: the row is committed, and so
+    would be any pending change. Best-effort on the audit write, as
+    :func:`_record_denial` is — the refusal never depends on it.
+    """
+    try:
+        db.add(
+            AuditLog(
+                user_id=user.id,
+                user_display_name=user.display_name,
+                auth_source=getattr(user, "auth_source", "local") or "local",
+                source_ip=get_trusted_client_ip(request) if request is not None else None,
+                user_agent=(
+                    clean_user_agent(request.headers.get("user-agent"))
+                    if request is not None
+                    else None
+                ),
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                resource_display=resource_display,
+                result="denied",
+                error_detail=reason,
+            )
+        )
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 — don't let audit failures block the refusal
+        logger.warning("permission_audit_write_failed", error=str(exc))
+    raise HTTPException(status_code=status_code, detail=detail)
 
 
 def require_permission(

@@ -57,6 +57,11 @@ class SuperadminModel:
     group_roles: dict[uuid.UUID, set[uuid.UUID]] = field(default_factory=lambda: defaultdict(set))
     role_wildcard: dict[uuid.UUID, bool] = field(default_factory=dict)
     granted_groups: set[uuid.UUID] = field(default_factory=set)
+    # Accounts with ``is_active`` set. Only :meth:`active_superadmins` reads
+    # it: "who would become a superadmin" deliberately ignores it (see the
+    # module docstring), but "is anyone left who can administer the install"
+    # cannot.
+    active: set[uuid.UUID] = field(default_factory=set)
 
     def group_grants_superadmin(self, group_id: uuid.UUID) -> bool:
         return group_id in self.granted_groups or any(
@@ -70,6 +75,9 @@ class SuperadminModel:
                 out |= members
         return out
 
+    def active_superadmins(self) -> set[uuid.UUID]:
+        return self.superadmins() & self.active
+
 
 async def load_model(db: AsyncSession) -> SuperadminModel:
     model = SuperadminModel()
@@ -82,6 +90,9 @@ async def load_model(db: AsyncSession) -> SuperadminModel:
         model.group_roles[group_id].add(role_id)
     for role_id, permissions in await db.execute(select(Role.id, Role.permissions)):
         model.role_wildcard[role_id] = permissions_grant_superadmin(permissions)
+    model.active = set(
+        (await db.execute(select(User.id).where(User.is_active.is_(True)))).scalars()
+    )
     model.granted_groups = set(
         (
             await db.execute(
@@ -111,6 +122,25 @@ async def newly_superadmin(
     return after.superadmins() - before.superadmins()
 
 
+async def leaves_no_active_superadmin(
+    db: AsyncSession, change: Callable[[SuperadminModel], None]
+) -> bool:
+    """Whether ``change`` would take the install from at least one active
+    superadmin to none.
+
+    With none left, only the CLI password-reset recipe can administer the
+    install again. Like :func:`newly_superadmin`, ``change`` mutates an
+    in-memory copy, so call this before writing anything. An install that
+    already has none is not made worse by the change, so it is not refused
+    here."""
+    before = await load_model(db)
+    if not before.active_superadmins():
+        return False
+    after = copy.deepcopy(before)
+    change(after)
+    return not after.active_superadmins()
+
+
 def loaded_user_holds_superadmin(user: User) -> bool:
     """The flag or a ``*`` / ``*`` role among the user's LOADED groups,
     regardless of ``is_active``. For sync contexts (a response validator)
@@ -137,6 +167,7 @@ async def holds_superadmin(db: AsyncSession, user_id: uuid.UUID) -> bool:
 __all__ = [
     "SuperadminModel",
     "holds_superadmin",
+    "leaves_no_active_superadmin",
     "load_model",
     "loaded_user_holds_superadmin",
     "newly_superadmin",
