@@ -1317,31 +1317,36 @@ async def _apply_backup_restore_inner(
     # been renamed across migrations).
     from app.config import settings as _settings  # noqa: PLC0415
 
-    try:
-        rewrap_outcome = await rewrap_secrets(
-            db_url=db_url,
-            source_secret_key=secrets_payload.get("platform_secret_key", "") or "",
-            source_credential_key=secrets_payload.get("platform_credential_encryption_key", "")
-            or "",
-            dest_secret_key=_settings.secret_key,
-            dest_credential_key=_settings.credential_encryption_key or "",
-        )
-    except Exception as exc:  # noqa: BLE001
-        # Rewrap failure shouldn't blow away the whole restore —
-        # the data is in. Log loudly + surface in the response so
-        # the operator knows to apply the recovered SECRET_KEY
-        # manually.
-        #
-        # ``rewrap_secrets`` now absorbs walk failures itself and returns
-        # a partial outcome with ``aborted=True``, precisely so the
-        # counters survive; this branch is the backstop for something
-        # raised before it could (a bad key pair, say). A fresh
-        # ``RewrapOutcome()`` is honest HERE — nothing was walked — but it
-        # was NOT honest when it also swallowed a mid-walk abort (#781).
-        logger.error("backup_restore_rewrap_failed", error=str(exc))
+    if "platform_secret_key" not in secrets_payload:
+        # An exclude-secrets archive carries no key, and every value it
+        # would have decrypted was scrubbed from the dump: nothing to rewrap.
         rewrap_outcome = RewrapOutcome()
-        rewrap_outcome.aborted = True
-        rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
+    else:
+        try:
+            rewrap_outcome = await rewrap_secrets(
+                db_url=db_url,
+                source_secret_key=secrets_payload.get("platform_secret_key", "") or "",
+                source_credential_key=secrets_payload.get("platform_credential_encryption_key", "")
+                or "",
+                dest_secret_key=_settings.secret_key,
+                dest_credential_key=_settings.credential_encryption_key or "",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Rewrap failure shouldn't blow away the whole restore —
+            # the data is in. Log loudly + surface in the response so
+            # the operator knows to apply the recovered SECRET_KEY
+            # manually.
+            #
+            # ``rewrap_secrets`` now absorbs walk failures itself and returns
+            # a partial outcome with ``aborted=True``, precisely so the
+            # counters survive; this branch is the backstop for something
+            # raised before it could (a bad key pair, say). A fresh
+            # ``RewrapOutcome()`` is honest HERE — nothing was walked — but it
+            # was NOT honest when it also swallowed a mid-walk abort (#781).
+            logger.error("backup_restore_rewrap_failed", error=str(exc))
+            rewrap_outcome = RewrapOutcome()
+            rewrap_outcome.aborted = True
+            rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
 
     # Phase 4d (issue #127): scan the restored DB for PowerDNS
     # DNSSEC-enabled zones and surface a registrar-republish

@@ -88,6 +88,17 @@ class ACMEProtocolError(Exception):
 # ── base64url helpers (no padding, per JOSE) ────────────────────────
 
 
+def generate_account_key_pem() -> str:
+    """A fresh EC-P256 ACME account key, PKCS#8 PEM, unencrypted (the
+    caller Fernet-wraps it for storage)."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+
+
 def b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 

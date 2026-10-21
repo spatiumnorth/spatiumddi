@@ -51,7 +51,11 @@ from app.models.appliance import (
 )
 from app.models.audit import AuditLog
 from app.services.acme_client import dns01, http01
-from app.services.acme_client.engine import ACMEClient, ACMEProtocolError
+from app.services.acme_client.engine import (
+    ACMEClient,
+    ACMEProtocolError,
+    generate_account_key_pem,
+)
 from app.services.appliance.tls import (
     CSRSubject,
     generate_csr_and_key,
@@ -113,6 +117,12 @@ async def run_order(
     if order.status != ACME_ORDER_PROCESSING:
         order.last_error = None
     order.status = ACME_ORDER_PROCESSING
+    if not account.account_key_encrypted:
+        # Scrubbed by an exclude-secrets backup that was then restored: mint
+        # a new account key and register it afresh, since the CA-side
+        # account belongs to the key that is gone.
+        account.account_key_encrypted = encrypt_str(generate_account_key_pem())
+        account.account_url = None
     await db.commit()
 
     handles: list[dns01.DNS01Handle] = []
