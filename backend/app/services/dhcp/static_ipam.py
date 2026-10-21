@@ -315,7 +315,10 @@ async def detach_ipam_for_static(
     handovers: list[LeaseHandover] = []
 
     res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
-    for row in res.scalars().all():
+    rows = list(res.scalars().all())
+    # #2269 — one scope lookup for every row, not one per row.
+    suppressed = await lease_hostname_suppressed_subnets(db, subnet_ids={r.subnet_id for r in rows})
+    for row in rows:
         subnet_row = await db.get(Subnet, row.subnet_id)
         if subnet_row is not None:
             try:
@@ -329,8 +332,7 @@ async def detach_ipam_for_static(
                 _mirror_lease_onto(
                     row,
                     lease,
-                    write_hostname=row.subnet_id
-                    not in await lease_hostname_suppressed_subnets(db, subnet_ids=[row.subnet_id]),
+                    write_hostname=row.subnet_id not in suppressed,
                 )
                 if subnet_row is not None:
                     handovers.append(LeaseHandover(subnet_row, row, lease))
