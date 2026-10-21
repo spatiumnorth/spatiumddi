@@ -10,8 +10,10 @@ on every tick, leaving leases and IPAM mirrors stale.
 
 Covered here: the pull recovers from a duplicate that already exists; two
 pulls of one server at once write one row; the manual sync answers 409 while
-another pull holds the server; concurrent beat ticks run one pass; and the
-migration dedupes by lease identity, keeping the newest row.
+another pull holds the server; concurrent beat ticks run one pass; the
+migration dedupes by lease identity, keeping the newest row; and a Kea
+lease-event batch that loses an insert race on the new identity index answers
+503 (which the agent retries) rather than 409 (which it drops).
 """
 
 from __future__ import annotations
@@ -307,3 +309,83 @@ async def test_migration_dedupes_by_lease_identity_keeping_the_newest(
     ).scalar_one()
     assert count == 4
     await db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_kea_lease_event_identity_race_answers_503_and_converges_on_retry(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Kea lease-event path does select-then-insert too, so the new
+    identity index can fire there when another request inserts the same lease
+    between the two. The global handler would answer 409, which the agent's
+    spool classifies as REJECTED and drops the whole batch. It must answer 503
+    (RETRY) instead, with the receipt rolled back, so the retry lands."""
+    from app.api.v1.dhcp import agents
+    from app.main import app
+    from app.models.agent_ingest import AgentIngestReceipt
+
+    grp = DHCPServerGroup(name=f"k-{uuid.uuid4().hex[:6]}")
+    db_session.add(grp)
+    await db_session.flush()
+    srv = DHCPServer(
+        name=f"kea-{uuid.uuid4().hex[:6]}",
+        driver="kea",
+        host="127.0.0.1",
+        port=67,
+        status="active",
+        server_group_id=grp.id,
+    )
+    db_session.add(srv)
+    await db_session.flush()
+    sid = srv.id
+    await db_session.commit()
+
+    now = datetime.now(UTC)
+    ev = {
+        "ip_address": "10.73.1.5",
+        "mac_address": "aa:bb:cc:73:00:05",
+        "hostname": "first",
+        "state": "active",
+        "starts_at": now.isoformat(),
+        "expires_at": (now + timedelta(hours=1)).isoformat(),
+    }
+    far = int((now + timedelta(days=30)).timestamp())
+
+    async def post(body: dict):  # type: ignore[no-untyped-def]
+        # Re-read per request: the test client shares this session, and the
+        # handler's rollback on the race expires the instance.
+        server = await db_session.get(DHCPServer, sid)
+        app.dependency_overrides[agents._auth_agent] = lambda: (server, {"exp": far})
+        try:
+            return await client.post("/api/v1/dhcp/agents/lease-events", json=body)
+        finally:
+            app.dependency_overrides.pop(agents._auth_agent, None)
+
+    r = await post({"leases": [ev], "batch_id": uuid.uuid4().hex})
+    assert r.status_code == 200, r.text
+
+    # Stage the race: the handler's SELECT "misses" the committed row, exactly
+    # as it would when another request committed it after the SELECT ran.
+    real_identity = agents._lease_identity
+    calls = iter(range(10_000))
+    monkeypatch.setattr(agents, "_lease_identity", lambda *a: (*real_identity(*a), next(calls)))
+    raced = {"leases": [{**ev, "hostname": "second"}], "batch_id": uuid.uuid4().hex}
+    r = await post(raced)
+    assert r.status_code == 503, r.text
+    assert r.headers.get("retry-after") == "1"
+    receipts = await db_session.scalar(
+        select(func.count())
+        .select_from(AgentIngestReceipt)
+        .where(AgentIngestReceipt.batch_id == raced["batch_id"])
+    )
+    assert receipts == 0  # rolled back with the batch, so the retry is not a "duplicate"
+
+    # The agent retries the same batch; it now finds the row and updates it.
+    monkeypatch.setattr(agents, "_lease_identity", real_identity)
+    r = await post(raced)
+    assert r.status_code == 200, r.text
+    assert r.json()["duplicate"] is False
+    db_session.expire_all()
+    rows = await _rows(db_session, sid, "10.73.1.5")
+    assert len(rows) == 1
+    assert rows[0].hostname == "second"

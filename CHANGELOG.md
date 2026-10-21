@@ -145,7 +145,11 @@ the formatter handles the rest.
   indexes on the lease identity: (server, address, MAC) for DHCPv4,
   (server, address, DUID, IAID) for DHCPv6. Not on (server, address)
   alone, because the Kea lease-event path keeps one row per client on
-  an address on purpose (#1318).
+  an address on purpose (#1318). If two Kea lease reports for one
+  server insert the same new lease at once, the later one now answers
+  `503` so the agent retries it and it lands as an update, rather than
+  a `409` that the agent would treat as a rejection and drop with the
+  rest of its batch.
 
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
