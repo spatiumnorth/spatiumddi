@@ -360,9 +360,13 @@ export function OpnsensePage() {
       {del && (
         <DeleteRouterModal
           router={del}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           onConfirm={() => delMut.mutate(del.id)}
           isPending={delMut.isPending}
+          error={delMut.isError ? errMsg(delMut.error, "Delete failed") : null}
         />
       )}
     </div>
@@ -784,11 +788,13 @@ function DeleteRouterModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   router: OPNsenseRouter;
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  error?: string | null;
 }) {
   const [checked, setChecked] = useState(false);
   return (
@@ -797,9 +803,11 @@ function DeleteRouterModal({
         <p className="text-sm text-muted-foreground">
           Remove the OPNsense firewall{" "}
           <span className="font-semibold">{router.name}</span>? This only
-          affects SpatiumDDI — nothing on the OPNsense side changes. All IPAM
-          rows mirrored from this firewall (subnets + addresses) will be removed
-          via the FK cascade.
+          affects SpatiumDDI — nothing on the OPNsense side changes. If active
+          block sync is armed, disarm it first (that lifts the pushed blocks
+          from the device); delete is refused while it is armed. All IPAM rows
+          mirrored from this firewall (subnets + addresses) will be removed via
+          the FK cascade.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input
@@ -810,6 +818,11 @@ function DeleteRouterModal({
           />
           <span>I understand.</span>
         </label>
+        {error && (
+          <p className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

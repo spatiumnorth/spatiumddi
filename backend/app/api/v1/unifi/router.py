@@ -770,10 +770,23 @@ async def update_controller(
 
 
 @router.delete("/controllers/{controller_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_controller(controller_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_controller(
+    controller_id: uuid.UUID, db: DB, user: SuperAdmin, force: bool = False
+) -> None:
     c = await db.get(UnifiController, controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="UniFi controller not found")
+    from app.services.block_sync.delete_guard import (  # noqa: PLC0415
+        assert_block_sync_deletable,
+    )
+
+    await assert_block_sync_deletable(
+        db,
+        target_kind="unifi",
+        target_id=c.id,
+        armed=c.block_sync_enabled,
+        force=force,
+    )
     # #601 — sweep any active block-sync push rows for this target (polymorphic
     # target_id, no cascade). Disarm the target first if the controller should
     # stop quarantining the MACs (disarm lifts them; delete does not).
