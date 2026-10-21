@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DHCP MAC blocklist is now enforced on DHCPv6 scopes, best
+  effort (#2268).** The reserved `DROP` client class was rendered into
+  Dhcp4 only, so a blocked (rogue / lost_stolen / quarantine) device
+  still got DHCPv6 leases. Kea has no `pkt6.mac` and a DHCPv6 packet
+  carries no hardware address, so the Dhcp6 `DROP` class matches the
+  MAC inside an Ethernet DUID-LL / DUID-LLT and the relay's RFC 6939
+  link-layer option (79). A client with a DUID-EN / DUID-UUID or a
+  randomised DUID, or behind a relay that adds no option 79, is not
+  caught. DHCP.md section 4a now says so; the rendered expression was
+  checked with `kea-dhcp6 -t` (Kea 3.0.3).
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
