@@ -128,6 +128,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting an armed block-sync target left its blocks enforced on the
+  device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
+  delete handlers removed the push rows without lifting anything, so
+  the blocks stayed on the firewall or controller with no record in
+  SpatiumDDI. Delete now answers 409 while block sync is armed ("disarm
+  first", which lifts the blocks), and also while unlifted push rows
+  remain; `?force=true` bypasses the latter only. The delete modals say
+  so.
+
 - **The conformity summary and PDF report only the current state
   (#2278).** Both read every `conformity_result` row ever written and
   kept the newest per (policy, resource), so a target deleted or moved
