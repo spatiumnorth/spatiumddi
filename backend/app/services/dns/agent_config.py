@@ -265,28 +265,53 @@ def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
         return sorted(prepared, key=lambda a: a["name"])
 
 
-def _drop_undefined_key_refs(elements: Any, known_keys: frozenset[str], *, where: str) -> Any:
-    """``elements`` without any ``key <name>`` citing a key the bundle does not define (#2282).
+def _drop_undefined_key_refs(
+    elements: Any,
+    known_keys: frozenset[str],
+    *,
+    where: str,
+    known_acls: frozenset[str] | None = None,
+    deny_if_emptied: bool = False,
+) -> Any:
+    """``elements`` without any citation the bundle does not define (#2282, #2283).
 
-    ``key_reference`` also reads ``also-notify``'s ``<ip> key <name>``. A
-    citation of an undefined key is an undefined symbol: ``named-checkconf``
+    Covers ``key <name>`` (``key_reference`` also reads ``also-notify``'s
+    ``<ip> key <name>``) and, when ``known_acls`` is given, a bare ACL name.
+    A citation of an undefined name is an undefined symbol: ``named-checkconf``
     rejects the file and the agent declines the whole bundle. The write paths
-    refuse to create or orphan one (rename / delete of a cited key is a 409),
-    so this covers a row stored before that guard, or an operator key whose
-    secret no longer decrypts and was therefore left out of ``tsig_keys``.
+    refuse to create or orphan one (rename / delete of a cited key or ACL is a
+    409), so this covers a row stored before that guard, or an operator key
+    whose secret no longer decrypts and was therefore left out of ``tsig_keys``.
     Returns the original object untouched when nothing is dropped, so a
-    healthy bundle keeps its ETag. Dropping an element only narrows the list.
+    healthy bundle keeps its ETag.
+
+    Dropping must never widen access. For an access list (``deny_if_emptied``)
+    that ends up empty, ``["none"]`` is returned: an empty zone ``allow-query``
+    is not rendered at all and so inherits the server's (often ``any``), and
+    the server one defaults to ``any``. A dropped *negated* element
+    (``!name``) would also widen, so it collapses the list to ``["none"]``.
     """
     if not isinstance(elements, list):
         return elements
     kept = []
+    widened = False
     for el in elements:
-        name = key_reference(str(el))
+        text = str(el)
+        name = key_reference(text)
+        acl = is_name_reference(text) if known_acls is not None else None
         if name is not None and name not in known_keys:
             logger.warning("dns_bundle_entry_dropped_undefined_key", where=where, key=name)
+        elif acl is not None and known_acls is not None and acl not in known_acls:
+            logger.warning("dns_bundle_entry_dropped_undefined_acl", where=where, acl=acl)
+        else:
+            kept.append(el)
             continue
-        kept.append(el)
-    return kept if len(kept) != len(elements) else elements
+        widened = widened or text.strip().startswith("!")
+    if len(kept) == len(elements):
+        return elements
+    if deny_if_emptied and (widened or not kept):
+        return ["none"]
+    return kept
 
 
 def _master_host(master: Any) -> str:
@@ -1229,8 +1254,10 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     # one was an undefined symbol that failed the entire bundle.
     acls_block = _safe_acls_block(acls)
 
-    # #2282 — never ship a ``key <name>`` the bundle does not define.
+    # #2282 / #2283 — never ship a ``key <name>`` or ACL name the bundle does
+    # not define. Access lists that empty out become ``none``, not "inherit".
     known_key_names = frozenset(k["name"] for k in tsig_keys)
+    known_acl_names = frozenset(a["name"] for a in acls_block)
     for a in acls_block:
         a["entries"] = [
             e
@@ -1240,17 +1267,29 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     for ve in views_block:
         for f in ("match_clients", "match_destinations", "allow_query", "allow_query_cache"):
             ve[f] = _drop_undefined_key_refs(
-                ve.get(f), known_key_names, where=f"view:{ve['name']}.{f}"
+                ve.get(f),
+                known_key_names,
+                where=f"view:{ve['name']}.{f}",
+                known_acls=known_acl_names,
+                deny_if_emptied=True,
             )
     for f in (*ADDRESS_MATCH_LIST_OPTIONS, "also_notify"):
         if f in options_block:
             options_block[f] = _drop_undefined_key_refs(
-                options_block[f], known_key_names, where=f"options.{f}"
+                options_block[f],
+                known_key_names,
+                where=f"options.{f}",
+                known_acls=known_acl_names,
+                deny_if_emptied=f != "also_notify",
             )
     for zp in zone_payload:
         for f in ("allow_query", "allow_transfer", "also_notify"):
             zp[f] = _drop_undefined_key_refs(
-                zp.get(f), known_key_names, where=f"zone:{zp['name']}.{f}"
+                zp.get(f),
+                known_key_names,
+                where=f"zone:{zp['name']}.{f}",
+                known_acls=known_acl_names,
+                deny_if_emptied=f != "also_notify",
             )
 
     # Blocklists: one RPZ zone per view (if any) + one group-level zone.

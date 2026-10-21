@@ -223,4 +223,4 @@ async def test_bundle_drops_a_stored_dangling_key_reference(db_session):
     assert bundle["options"]["allow_transfer"] == ["192.0.2.0/24"]
     assert bundle["options"]["also_notify"] == ["192.0.2.10"]
     zones = [z for z in bundle["zones"] if z["name"] == "example.test."]
-    assert zones and all(z["allow_transfer"] == [] and z["also_notify"] == [] for z in zones)
+    assert zones and all(z["allow_transfer"] == ["none"] and z["also_notify"] == [] for z in zones)
