@@ -128,6 +128,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Switching an appliance from BIND9 to PowerDNS and to a new DNS group
+  in one save could leave two server rows, with the new group's zones
+  REFUSED (#2190).** The supervisor labelled the node for the new engine
+  before it wrote the new chart values, so the engine's DaemonSet, which
+  already existed with the previous `AGENT_GROUP`, started a pod in the old
+  group seconds before helm-controller rolled the new one. That pod
+  registered a second row in the old group and its cached token kept it
+  there. The supervisor now writes the values first and sets a role label
+  only once that engine's DaemonSet carries the assigned group (waiting up
+  to 30 s, then leaving it to the next heartbeat, at most 5 minutes). And
+  registration no longer trusts the pod's env for an appliance's agent: a
+  new agent whose hostname is one approved appliance's, running its current
+  engine, registers into the appliance's assigned group and adopts the
+  appliance's row there, taking that row's agent id. A row found by agent
+  id is still never moved (#934).
+
 - **Webhook subscriptions could be created, repointed, deleted and
   have deliveries retried with no audit row (#2293).** All four routes
   now write one `audit_log` row in the mutation's transaction. The row
