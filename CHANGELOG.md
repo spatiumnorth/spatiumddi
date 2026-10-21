@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Sync DNS commit counted an address as created when nothing was
+  written (#2352).** Every address named in `create_for_ip_ids` (and
+  every record-linked address in `update_record_ids`) was counted as
+  created / updated, and written to the `dns-sync` audit row, even when
+  its A and PTR already existed and no DNS op was queued. The commit
+  now counts only addresses it queued ops for, so an address already in
+  sync reads as unchanged and writes no audit row, at subnet, block and
+  space scope alike. Also fixed on the way: a block-scope commit that
+  did write something answered 422 ("cannot be stored as sent"), because
+  its audit row was handed the CIDR as an object rather than a string.
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
