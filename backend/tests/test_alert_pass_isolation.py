@@ -682,3 +682,74 @@ async def test_stranded_delivery_for_a_resolved_event_is_dropped(
         )
     ).scalar_one()
     assert pending == 0
+
+
+async def test_copilot_conformity_evaluate_pages_only_after_commit(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Copilot's ``evaluate_conformity_policy`` write op opens the same
+    alert events as the beat pass, so it must commit them before paging."""
+    from app.core.security import hash_password
+    from app.models.auth import User
+    from app.services.ai.operations import get_operation
+    from app.services.ai.operations_writes import EvaluateConformityPolicyArgs
+
+    db = db_session
+    rule = AlertRule(
+        name="conformity-sink",
+        description="",
+        rule_type=alerts.RULE_TYPE_COMPLIANCE_CHANGE,
+        severity="warning",
+        enabled=True,
+    )
+    db.add(rule)
+    await db.flush()
+
+    async def check_fail(_db, **_kw):  # type: ignore[no-untyped-def]
+        return CheckOutcome.fail("nope")
+
+    monkeypatch.setitem(conformity_checks.CHECK_REGISTRY, "t2261_fail", check_fail)
+    policy = ConformityPolicy(
+        name="copilot-failing",
+        target_kind="platform",
+        check_kind="t2261_fail",
+        severity="warning",
+        fail_alert_rule_id=rule.id,
+        enabled=True,
+        eval_interval_hours=0,
+    )
+    user = User(
+        username="copilot-2261",
+        email="copilot-2261@example.test",
+        display_name="Copilot",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    user.groups = []
+    db.add_all([policy, user])
+    await db.commit()
+
+    seen_from_other_connection: list[int] = []
+
+    async def fake_deliver(rule, event, targets):  # type: ignore[no-untyped-def]
+        async with db.bind.connect() as conn:
+            n = (
+                await conn.execute(
+                    select(func.count()).select_from(AlertEvent).where(AlertEvent.id == event.id)
+                )
+            ).scalar_one()
+        seen_from_other_connection.append(n)
+        return (False, True, False)
+
+    monkeypatch.setattr(alerts, "_deliver", fake_deliver)
+
+    op = get_operation("evaluate_conformity_policy")
+    assert op is not None
+    summary = await op.apply(db, user, EvaluateConformityPolicyArgs(policy_id=policy.id))
+
+    assert summary["failed"] == 1
+    assert seen_from_other_connection == [1]
+    [event] = await _open_events(db)
+    await db.refresh(event)
+    assert event.delivered_webhook is True
+    assert event.delivery_pending_since is None
