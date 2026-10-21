@@ -186,3 +186,52 @@ def test_every_owner_fk_on_ipam_rows_is_registered() -> None:
         and c != "parent_block_id"
     }
     assert owner_cols == set(INTEGRATION_OWNERSHIP), owner_cols ^ set(INTEGRATION_OWNERSHIP)
+
+
+@pytest.mark.asyncio
+async def test_target_delete_keeps_registry_referenced_rows(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A purely mirrored address / subnet that an operator registry row points
+    at (ON DELETE CASCADE) is operator content and must survive."""
+    from decimal import Decimal
+
+    from app.models.bacnet import BACnetDevice
+    from app.models.ot import OTZone
+
+    h = await _admin(db_session)
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    target = _docker(space)
+    db_session.add(target)
+    await db_session.flush()
+    owner = {"docker_host_id": target.id}
+    blk = IPBlock(space_id=space.id, network="10.95.0.0/24", name="b", **owner)
+    db_session.add(blk)
+    await db_session.flush()
+    sn_zone = Subnet(
+        space_id=space.id, block_id=blk.id, network="10.95.0.0/25", name="z", total_ips=126, **owner
+    )
+    sn_dev = Subnet(
+        space_id=space.id, block_id=blk.id, network="10.95.0.128/25", name="d", total_ips=126, **owner
+    )
+    db_session.add_all([sn_zone, sn_dev])
+    await db_session.flush()
+    addr = IPAddress(subnet_id=sn_dev.id, address="10.95.0.130", status="used", **owner)
+    db_session.add(addr)
+    await db_session.flush()
+    db_session.add(OTZone(subnet_id=sn_zone.id, purdue_level=Decimal("2.0")))
+    db_session.add(BACnetDevice(ip_address_id=addr.id, subnet_id=sn_dev.id, device_instance=4242))
+    await db_session.flush()
+    ids = (sn_zone.id, sn_dev.id, addr.id)
+
+    r = await client.delete(f"/api/v1/docker/hosts/{target.id}", headers=h)
+    assert r.status_code == 204, r.text
+    db_session.expire_all()
+    for model, pk in zip((Subnet, Subnet, IPAddress), ids):
+        row = await db_session.get(model, pk)
+        assert row is not None, model
+        assert getattr(row, "docker_host_id") is None
+    assert (await db_session.scalar(select(OTZone))) is not None
+    assert (await db_session.scalar(select(BACnetDevice))) is not None

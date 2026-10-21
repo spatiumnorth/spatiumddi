@@ -152,8 +152,23 @@ async def release_integration_rows(
     from app.models.dns import DNSRecord  # noqa: PLC0415
     from app.models.ipam import IPBlock, Subnet, SubnetDomain  # noqa: PLC0415
 
+    from app.models.address_set import AddressSet  # noqa: PLC0415
+    from app.models.bacnet import BACnetDevice  # noqa: PLC0415
+    from app.models.e911 import ERLBinding  # noqa: PLC0415
+    from app.models.multicast import MulticastMembership  # noqa: PLC0415
+    from app.models.ot import OTDevice, OTZone  # noqa: PLC0415
+
     summary = ReleaseSummary()
     fk_addr = getattr(IPAddress, own_fk)
+
+    # Operator registries whose FK to ip_address / subnet is ON DELETE CASCADE:
+    # a row one of them points at is operator content even when purely mirrored.
+    registry_ref = or_(
+        exists().where(OTDevice.ip_address_id == IPAddress.id),
+        exists().where(BACnetDevice.ip_address_id == IPAddress.id),
+        exists().where(ERLBinding.ip_address_id == IPAddress.id),
+        exists().where(MulticastMembership.ip_address_id == IPAddress.id),
+    )
 
     # 1. Addresses. A purely mirrored one is left for the FK cascade.
     survivor = or_(
@@ -161,6 +176,7 @@ async def release_integration_rows(
         *(getattr(IPAddress, fk).is_not(None) for fk in INTEGRATION_OWNERSHIP if fk != own_fk),
         exists().where(DNSRecord.ip_address_id == IPAddress.id),
         exists().where(DHCPStaticAssignment.ip_address_id == IPAddress.id),
+        registry_ref,
     )
     summary.addresses_removed = (
         await db.scalar(
@@ -195,6 +211,23 @@ async def release_integration_rows(
             or bool(sn.tags)
             or bool(sn.custom_fields)
             or await subnet_has_surviving_addresses(db, sn.id, own_fk)
+            or bool(
+                await db.scalar(
+                    select(func.count())
+                    .select_from(IPAddress)
+                    .where(IPAddress.subnet_id == sn.id)
+                    .where(registry_ref)
+                )
+            )
+            or bool(
+                await db.scalar(
+                    select(
+                        exists().where(OTZone.subnet_id == sn.id)
+                        | exists().where(ERLBinding.subnet_id == sn.id)
+                        | exists().where(AddressSet.subnet_id == sn.id)
+                    )
+                )
+            )
             or bool(
                 await db.scalar(
                     select(func.count())
