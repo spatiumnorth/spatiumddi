@@ -289,7 +289,10 @@ async def check_no_open_ports(
     ``args["max_age_days"]`` (int, optional, default 30): if no
     completed scan exists within this window the result is ``warn``
     — operators see "we don't actually know yet" instead of a false
-    pass.
+    pass. The same ``warn`` applies when the latest scan has no parsed
+    summary, has no result for the target's address (a CIDR sweep
+    omits hosts that did not answer), reports the host as anything but
+    ``up``, or shows a forbidden port only as ``open|filtered``.
 
     Today the check only runs against ``target_kind=ip_address``.
     Subnet-level is a useful follow-up but needs aggregation logic
@@ -328,35 +331,112 @@ async def check_no_open_ports(
             f"no completed nmap scan within {max_age_days} d for {target.address}",
             {"max_age_days": max_age_days, "ports": sorted(forbidden)},
         )
-    summary = scan.summary_json if isinstance(scan.summary_json, dict) else {}
-    open_ports_raw = summary.get("open_ports") or []
+    scan_meta = {
+        "scan_id": str(scan.id),
+        "scan_finished_at": scan.finished_at.isoformat() if scan.finished_at else None,
+        "scan_target": scan.target_ip,
+        "ports": sorted(forbidden),
+    }
+    # Every branch below that cannot positively establish the port
+    # state is ``warn``, never ``pass`` (#2257): the check used to read
+    # a key the parser never wrote and so passed every scanned host.
+    summary = scan.summary_json
+    if not isinstance(summary, dict):
+        return CheckOutcome.warn(
+            f"nmap scan {scan.id} has no parsed summary — port state unknown",
+            scan_meta,
+        )
+    entry = _nmap_entry_for_address(
+        summary, address=str(target.address), scan_target=scan.target_ip
+    )
+    if entry is None:
+        return CheckOutcome.warn(
+            f"nmap scan {scan.id} has no result for {target.address} — port state unknown",
+            scan_meta,
+        )
+    host_state = entry.get("host_state")
+    if host_state != "up":
+        return CheckOutcome.warn(
+            f"nmap scan {scan.id} reported {target.address} as "
+            f"{host_state or 'unknown'} — port state unknown",
+            {**scan_meta, "host_state": host_state},
+        )
+    raw_ports = entry.get("ports")
+    if not isinstance(raw_ports, list):
+        return CheckOutcome.warn(
+            f"nmap scan {scan.id} has an unreadable port list — port state unknown",
+            scan_meta,
+        )
     open_ports: set[int] = set()
-    for entry in open_ports_raw:
-        if isinstance(entry, int):
-            open_ports.add(entry)
-        elif isinstance(entry, dict) and isinstance(entry.get("port"), int):
-            open_ports.add(int(entry["port"]))
-        elif isinstance(entry, str) and entry.isdigit():
-            open_ports.add(int(entry))
+    ambiguous_ports: set[int] = set()
+    for port_entry in raw_ports:
+        if not isinstance(port_entry, dict) or not isinstance(port_entry.get("port"), int):
+            continue
+        state = port_entry.get("state")
+        if state == "open":
+            open_ports.add(int(port_entry["port"]))
+        elif state == "open|filtered":
+            # nmap could not tell open from filtered (typical for UDP).
+            ambiguous_ports.add(int(port_entry["port"]))
+    diagnostic = {
+        **scan_meta,
+        "host_state": host_state,
+        "open_ports": sorted(open_ports),
+        "forbidden": sorted(forbidden),
+    }
     overlap = sorted(open_ports & forbidden)
     if overlap:
         return CheckOutcome.fail(
             f"forbidden port(s) {overlap} open per scan {scan.id}",
-            {
-                "scan_id": str(scan.id),
-                "scan_finished_at": scan.finished_at.isoformat() if scan.finished_at else None,
-                "open_ports": sorted(open_ports),
-                "forbidden": sorted(forbidden),
-            },
+            diagnostic,
+        )
+    ambiguous = sorted(ambiguous_ports & forbidden)
+    if ambiguous:
+        return CheckOutcome.warn(
+            f"forbidden port(s) {ambiguous} open|filtered per scan {scan.id} — "
+            "nmap could not tell whether they are open",
+            {**diagnostic, "open_filtered_ports": sorted(ambiguous_ports)},
         )
     return CheckOutcome.passed(
         f"no forbidden ports open per scan {scan.id}",
-        {
-            "scan_id": str(scan.id),
-            "scan_finished_at": scan.finished_at.isoformat() if scan.finished_at else None,
-            "open_ports": sorted(open_ports),
-        },
+        diagnostic,
     )
+
+
+def _normalise_ip(value: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if value is None:
+        return None
+    try:
+        return ipaddress.ip_address(str(value))
+    except ValueError:
+        return None
+
+
+def _nmap_entry_for_address(
+    summary: dict[str, Any], *, address: str, scan_target: str
+) -> dict[str, Any] | None:
+    """Return the per-host block of a ``parse_nmap_xml`` summary that
+    describes ``address``, or ``None`` when the scan says nothing about it.
+
+    A multi-host (CIDR) scan carries one entry per host in ``hosts``;
+    nmap omits hosts that did not answer, so a target missing from that
+    list is unknown, not clean. A single-host summary carries its own
+    ``address``; rows written before that field existed are trusted only
+    when the scan targeted exactly this IP — a CIDR sweep where one host
+    answered also produces a single-host summary, for whichever host it was.
+    """
+    want = _normalise_ip(address)
+    if want is None:
+        return None
+    hosts = summary.get("hosts")
+    if isinstance(hosts, list) and hosts:
+        for host in hosts:
+            if isinstance(host, dict) and _normalise_ip(host.get("address")) == want:
+                return host
+        return None
+    if "address" in summary:
+        return summary if _normalise_ip(summary.get("address")) == want else None
+    return summary if _normalise_ip(scan_target) == want else None
 
 
 # ── Check 4: alert_rule_covers ──────────────────────────────────────
@@ -587,11 +667,6 @@ async def check_voice_segment_not_internet_facing(
         "voice subnet is not flagged internet_facing",
         {"subnet_role": target.subnet_role, "network": str(target.network)},
     )
-
-
-# Suppress unused-import warning when this module is read in
-# isolation — referenced by check_no_open_ports.
-_ = ipaddress
 
 
 # ── Check: no_multicast_collision ──────────────────────────────────

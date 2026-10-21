@@ -181,6 +181,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The PCI "no admin ports" conformity check fails a host with an
+  admin port open, instead of passing every scanned host (#2257).** The
+  `no_open_ports` check read `open_ports` from the nmap scan summary, a
+  key the nmap parser never wrote, so it found no open ports and passed
+  any host with a scan in the window: the built-in PCI-DSS 1.4.4 policy
+  reported PASS for a host with 22 and 3389 open, and that result went
+  into the compliance PDF. It now reads the scan's port list and fails
+  on any forbidden port in state `open`. For a CIDR scan it reads the
+  target's own entry, never the first host's. **Expect results to
+  change** when the policy is enabled: hosts that passed can now fail,
+  or warn where the scan cannot answer: no parsed summary, no result
+  for the address (a CIDR sweep leaves out hosts that did not answer),
+  a host that was not `up`, or a forbidden port nmap reported only as
+  `open|filtered`. The nmap summary also records the `address` its
+  single-host fields describe, so a sweep where one other host answered
+  is no longer mistaken for the target.
+
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
   forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,
