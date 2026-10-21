@@ -297,12 +297,15 @@ async def _apply_evaluate_conformity_policy(
     db: AsyncSession, user: User, args: EvaluateConformityPolicyArgs
 ) -> dict[str, Any]:
     from app.models.conformity import ConformityPolicy  # noqa: PLC0415
+    from app.services import alerts as alert_service  # noqa: PLC0415
     from app.services.conformity import evaluate_policy  # noqa: PLC0415
 
     p = await db.get(ConformityPolicy, args.policy_id)
     if p is None:
         raise ValueError(f"Conformity policy {args.policy_id} not found")
-    summary = await evaluate_policy(db, p)
+    # #2261 — queue any alert this opens; it pages only after the commit below.
+    with alert_service.defer_deliveries() as pending:
+        summary = await evaluate_policy(db, p)
     write_audit(
         db,
         user=user,
@@ -313,6 +316,7 @@ async def _apply_evaluate_conformity_policy(
         new_value={"via": "ai_proposal", **{k: int(v) for k, v in summary.items()}},
     )
     await db.commit()
+    await alert_service.deliver_deferred(db, pending)
     return {"id": str(p.id), "name": p.name, **{k: int(v) for k, v in summary.items()}}
 
 
