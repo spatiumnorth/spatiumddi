@@ -38,7 +38,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertEvent, AlertRule
@@ -48,7 +48,7 @@ from app.models.dns import DNSZone
 from app.models.ipam import IPAddress, Subnet
 from app.models.multicast import MulticastGroup
 from app.services import audit_forward
-from app.services.alerts import _deliver
+from app.services.alerts import _deliver_or_defer, defer_deliveries, deliver_deferred
 from app.services.conformity.checks import (
     CHECK_REGISTRY,
     STATUS_FAIL,
@@ -326,13 +326,19 @@ async def _maybe_fire_alert(
     )
     db.add(event)
     await db.flush()
-    ds, dw, dm = await _deliver(rule, event, targets)
+    # #2261 — queued, not sent, when the caller defers: the event must be
+    # committed before it pages anyone.
+    ds, dw, dm = await _deliver_or_defer(rule, event, targets)
     event.delivered_syslog = ds
     event.delivered_webhook = dw
     event.delivered_smtp = dm
 
 
 # ── Core entry points ───────────────────────────────────────────────
+
+# #2261 — advisory-lock key serialising beat passes of
+# :func:`evaluate_due_policies`. Transaction-scoped.
+_EVALUATE_LOCK_KEY = 0x53504D434F4E  # "SPMCON"
 
 
 async def evaluate_policy(
@@ -388,13 +394,17 @@ async def evaluate_policy(
 
     for target in targets:
         try:
-            outcome = await check_fn(
-                db,
-                target=target.row,
-                target_kind=policy.target_kind,
-                args=(policy.check_args if isinstance(policy.check_args, dict) else {}),
-                now=now,
-            )
+            # #2261 — a check that raises a DB error has aborted the
+            # transaction; without the savepoint every later statement in
+            # the pass (results, alerts, ``last_evaluated_at``) failed too.
+            async with db.begin_nested():
+                outcome = await check_fn(
+                    db,
+                    target=target.row,
+                    target_kind=policy.target_kind,
+                    args=(policy.check_args if isinstance(policy.check_args, dict) else {}),
+                    now=now,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "conformity_check_crashed",
@@ -457,13 +467,11 @@ async def evaluate_due_policies(db: AsyncSession) -> dict[str, int]:
     Per-policy failures are isolated — one broken policy doesn't
     halt the rest of the pass. ``eval_interval_hours == 0`` policies
     are skipped (operator wants on-demand only).
+
+    #2261 — the same three properties as ``alerts.evaluate_all``: each
+    policy in its own SAVEPOINT, alerts delivered only after the commit
+    that stores them, and passes serialised by an advisory lock.
     """
-    now = datetime.now(UTC)
-    pol_rows = (
-        (await db.execute(select(ConformityPolicy).where(ConformityPolicy.enabled.is_(True))))
-        .scalars()
-        .all()
-    )
     totals = {
         "policies_evaluated": 0,
         "passed": 0,
@@ -472,6 +480,20 @@ async def evaluate_due_policies(db: AsyncSession) -> dict[str, int]:
         "not_applicable": 0,
         "total": 0,
     }
+    got_lock = (
+        await db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": _EVALUATE_LOCK_KEY})
+    ).scalar()
+    if not got_lock:
+        logger.info("conformity_evaluate_skipped_locked")
+        return totals
+
+    now = datetime.now(UTC)
+    pol_rows = (
+        (await db.execute(select(ConformityPolicy).where(ConformityPolicy.enabled.is_(True))))
+        .scalars()
+        .all()
+    )
+    pending: list[tuple[AlertRule, AlertEvent]] = []
     for policy in pol_rows:
         if policy.eval_interval_hours <= 0:
             continue
@@ -479,18 +501,27 @@ async def evaluate_due_policies(db: AsyncSession) -> dict[str, int]:
             cutoff = now - timedelta(hours=policy.eval_interval_hours)
             if policy.last_evaluated_at >= cutoff:
                 continue
+        # Read before the savepoint: a rollback expires the row, and an
+        # expired attribute cannot be lazy-loaded from an async session.
+        policy_id, check_kind = str(policy.id), policy.check_kind
         try:
-            summary = await evaluate_policy(db, policy, now=now)
-            totals["policies_evaluated"] += 1
-            for k in ("passed", "failed", "warned", "not_applicable", "total"):
-                totals[k] += summary[k]
+            with defer_deliveries() as policy_queue:
+                async with db.begin_nested():
+                    summary = await evaluate_policy(db, policy, now=now)
         except Exception:  # noqa: BLE001
+            # Rolled back to the savepoint; its queued alerts go with it.
             logger.exception(
                 "conformity_policy_eval_failed",
-                policy=str(policy.id),
-                check_kind=policy.check_kind,
+                policy=policy_id,
+                check_kind=check_kind,
             )
+            continue
+        pending.extend(policy_queue)
+        totals["policies_evaluated"] += 1
+        for k in ("passed", "failed", "warned", "not_applicable", "total"):
+            totals[k] += summary[k]
     await db.commit()
+    await deliver_deferred(db, pending)
     return totals
 
 

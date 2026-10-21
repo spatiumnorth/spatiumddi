@@ -30,12 +30,16 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
 from sqlalchemy import func, or_, select, text
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertEvent, AlertRule
@@ -2894,7 +2898,7 @@ async def _evaluate_tls_cert_transition_rule(
         )
         db.add(event)
         await db.flush()
-        ds, dw, dm = await _deliver(rule, event, targets)
+        ds, dw, dm = await _deliver_or_defer(rule, event, targets)
         event.delivered_syslog = ds
         event.delivered_webhook = dw
         event.delivered_smtp = dm
@@ -3050,7 +3054,7 @@ async def _evaluate_domain_transition_rule(
         )
         db.add(event)
         await db.flush()  # populate event.id for delivery payload
-        ds, dw, dm = await _deliver(rule, event, targets)
+        ds, dw, dm = await _deliver_or_defer(rule, event, targets)
         event.delivered_syslog = ds
         event.delivered_webhook = dw
         event.delivered_smtp = dm
@@ -4419,7 +4423,7 @@ async def _evaluate_circuit_status_changed_rule(
         )
         db.add(event)
         await db.flush()
-        ds, dw, dm = await _deliver(rule, event, targets)
+        ds, dw, dm = await _deliver_or_defer(rule, event, targets)
         event.delivered_syslog = ds
         event.delivered_webhook = dw
         event.delivered_smtp = dm
@@ -4826,7 +4830,7 @@ async def _evaluate_compliance_change_rule(
         )
         db.add(event)
         await db.flush()
-        ds, dw, dm = await _deliver(rule, event, targets)
+        ds, dw, dm = await _deliver_or_defer(rule, event, targets)
         event.delivered_syslog = ds
         event.delivered_webhook = dw
         event.delivered_smtp = dm
@@ -6230,6 +6234,106 @@ async def _deliver(
     return delivered_syslog, delivered_webhook, delivered_smtp
 
 
+# ── Deferred delivery (#2261) ──────────────────────────────────────────────
+#
+# A page that goes out for an event the database never stored is the worst
+# outcome this module can produce: the operator is paged for something that
+# does not exist under /alerts, and because nothing was stored the next pass
+# finds no open event and pages again — every 60 s, and up to four times per
+# tick once Celery's autoretry joins in. So inside an evaluator pass an event
+# is never delivered before the transaction that opened it has COMMITTED.
+#
+# The openers below (``evaluate_all`` and its transition-rule helpers, the
+# conformity engine) call :func:`_deliver_or_defer`. Under
+# :func:`defer_deliveries` that only queues the event; the caller commits, then
+# hands the queue to :func:`deliver_deferred`. Called outside that context it
+# delivers immediately, which is what a direct caller of a helper gets.
+#
+# The trade is deliberate: at-most-once. A process killed between the commit
+# and the delivery leaves a stored, open event with its ``delivered_*``
+# receipts false — visible in the UI, never re-sent. The alternative order
+# (deliver, then commit) is at-least-once with an unbounded "least", which is
+# the bug this replaces.
+
+_DEFERRED_DELIVERIES: ContextVar[list[tuple[AlertRule, AlertEvent]] | None] = ContextVar(
+    "alert_deferred_deliveries", default=None
+)
+
+
+@contextmanager
+def defer_deliveries() -> Iterator[list[tuple[AlertRule, AlertEvent]]]:
+    """Queue every delivery made inside the block instead of sending it.
+
+    Yields the queue. The caller commits the events, then passes the queue
+    to :func:`deliver_deferred`. Nested blocks each get their own queue, so a
+    caller can drop the queue of a unit of work it rolled back.
+    """
+    pending: list[tuple[AlertRule, AlertEvent]] = []
+    token = _DEFERRED_DELIVERIES.set(pending)
+    try:
+        yield pending
+    finally:
+        _DEFERRED_DELIVERIES.reset(token)
+
+
+async def _deliver_or_defer(
+    rule: AlertRule,
+    event: AlertEvent,
+    targets: list[dict[str, Any]],
+) -> tuple[bool, bool, bool]:
+    """:func:`_deliver`, or queue it when inside :func:`defer_deliveries`.
+
+    A queued event reports no receipts yet; :func:`deliver_deferred` ORs the
+    real ones in after the commit.
+    """
+    pending = _DEFERRED_DELIVERIES.get()
+    if pending is None:
+        return await _deliver(rule, event, targets)
+    pending.append((rule, event))
+    return False, False, False
+
+
+async def deliver_deferred(
+    db: AsyncSession,
+    pending: list[tuple[AlertRule, AlertEvent]],
+    targets: list[dict[str, Any]] | None = None,
+) -> tuple[int, int, int]:
+    """Deliver queued events that are now stored, then commit their receipts.
+
+    Call only after the transaction that opened the events has committed.
+    An event that is not persistent (its insert was rolled back) is skipped:
+    delivering it is exactly the page-for-nothing this exists to prevent.
+
+    Returns ``(syslog, webhook, smtp)`` delivery counts. A failure to commit
+    the receipts is logged, not raised: the events are already stored and
+    open, so the next pass will not re-send them, and raising would only
+    hand the pass to Celery's autoretry for nothing.
+    """
+    if not pending:
+        return 0, 0, 0
+    if targets is None:
+        targets = await audit_forward._load_targets()  # noqa: SLF001
+    syslog = webhook = smtp = 0
+    for rule, event in pending:
+        if not sa_inspect(event).persistent:
+            continue
+        ds, dw, dm = await _deliver(rule, event, targets)
+        # OR-in: an escalation re-delivery must not clear a receipt the
+        # opening delivery set.
+        event.delivered_syslog = event.delivered_syslog or ds
+        event.delivered_webhook = event.delivered_webhook or dw
+        event.delivered_smtp = event.delivered_smtp or dm
+        syslog += int(ds)
+        webhook += int(dw)
+        smtp += int(dm)
+    try:
+        await db.commit()
+    except SQLAlchemyError as exc:
+        logger.warning("alert_delivery_receipts_not_stored", error=str(exc))
+        await db.rollback()
+    return syslog, webhook, smtp
+
+
 # ── Main entry point ───────────────────────────────────────────────────────
 
 
@@ -6693,6 +6797,12 @@ _RULE_TYPE_MODULE: dict[str, str] = {
 }
 
 
+# #2261 — ``pg_try_advisory_xact_lock`` key serialising evaluator passes
+# across beat ticks, autoretries, worker replicas and the API's "evaluate
+# now". Transaction-scoped, so a killed pass cannot strand it.
+_EVALUATE_LOCK_KEY = 0x53504D414C52  # "SPMALR"
+
+
 def rule_type_module(rule_type: str) -> str | None:
     """The feature module a rule type is gated on, or None when un-gated."""
     return _RULE_TYPE_MODULE.get(rule_type)
@@ -6705,7 +6815,37 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     resolved, delivered_syslog, delivered_webhook. Per-rule failures are
     logged but don't abort the pass — one broken rule shouldn't silence
     the rest.
+
+    #2261 — three properties make a pass safe to fail, retry and overlap:
+
+    * Each rule runs in its own SAVEPOINT. A matcher that raises a DB error
+      (or hits ``command_timeout``) rolls back only its own rule; without the
+      savepoint the PostgreSQL transaction was aborted, every later rule
+      failed too, and the final commit discarded the whole pass.
+    * Nothing is delivered until the events are committed (see
+      :func:`deliver_deferred`). A pass that fails before its commit has sent
+      nothing, so Celery's autoretry cannot re-page; a pass that fails after
+      it left the events stored and open, so the retry finds them and does not
+      re-open them.
+    * Passes are serialised by a transaction-scoped advisory lock. A pass that
+      cannot take it returns immediately with zero counts — the pass holding
+      it is doing the same work. The lock ends at the commit, before delivery,
+      which is safe: by then the events are stored, so a pass starting during
+      delivery sees them as already open.
     """
+    got_lock = (
+        await db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": _EVALUATE_LOCK_KEY})
+    ).scalar()
+    if not got_lock:
+        logger.info("alert_evaluate_skipped_locked")
+        return {
+            "opened": 0,
+            "resolved": 0,
+            "delivered_syslog": 0,
+            "delivered_webhook": 0,
+            "delivered_smtp": 0,
+        }
+
     settings = await db.get(PlatformSettings, 1)
     targets = await audit_forward._load_targets()  # noqa: SLF001
 
@@ -6726,7 +6866,19 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     # #1068 — resolved once per pass, not per rule (it is a cached read, but
     # the loop can be long and the answer cannot change mid-pass).
     enabled_modules = await feature_modules.get_enabled_modules(db)
+    # Deliveries queued by rules whose savepoint was released. A rule that
+    # failed drops its queue: its events were rolled back with it.
+    pending: list[tuple[AlertRule, AlertEvent]] = []
     for rule in rules:
+        # #2261 — one SAVEPOINT and one delivery queue per rule. Managed by
+        # hand rather than with ``async with`` because the dispatch below
+        # ``continue``s out of several branches; the ``finally`` sees every
+        # exit, a clean one included.
+        rule_failed = False
+        counts_before = (opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp)
+        rule_queue: list[tuple[AlertRule, AlertEvent]] = []
+        queue_token = _DEFERRED_DELIVERIES.set(rule_queue)
+        savepoint = await db.begin_nested()
         try:
             # Each match tuple is (subject_id, display, message,
             # severity_override). Threshold-style rules pass
@@ -7110,7 +7262,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     if _severity_rank(new_severity) > _severity_rank(existing.severity):
                         existing.severity = new_severity
                         existing.message = message
-                        ds, dw, dm = await _deliver(rule, existing, targets)
+                        ds, dw, dm = await _deliver_or_defer(rule, existing, targets)
                         # OR-in: a channel that delivered on open should
                         # stay flagged even if a later escalation skips it.
                         existing.delivered_syslog = existing.delivered_syslog or ds
@@ -7134,7 +7286,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 )
                 db.add(event)
                 await db.flush()  # populate event.id for delivery payload
-                ds, dw, dm = await _deliver(rule, event, targets)
+                ds, dw, dm = await _deliver_or_defer(rule, event, targets)
                 event.delivered_syslog = ds
                 event.delivered_webhook = dw
                 event.delivered_smtp = dm
@@ -7145,6 +7297,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     delivered_webhook += 1
                 if dm:
                     delivered_smtp += 1
+                # A matcher that lists one subject twice must not open it
+                # twice — the open-event index is unique (#2261), so the
+                # second insert would fail the whole rule.
+                open_by_subject[subject_id] = event
 
             # Resolve open events whose subject no longer matches.
             for subject_id, event in open_by_subject.items():
@@ -7157,6 +7313,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             # "no matches": open events stay open, nothing new opens, and the
             # next tick with real data decides. Logged at info because during
             # a genuine outage this fires every 60 s.
+            rule_failed = True
             logger.info(
                 "alert_rule_eval_skipped_no_data",
                 rule=str(rule.id),
@@ -7164,18 +7321,46 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 reason=str(exc),
             )
         except Exception as exc:  # noqa: BLE001
+            rule_failed = True
             logger.exception(
                 "alert_rule_eval_failed",
                 rule=str(rule.id),
                 rule_type=rule.rule_type,
                 error=str(exc),
             )
+        finally:
+            _DEFERRED_DELIVERIES.reset(queue_token)
+            if not rule_failed:
+                try:
+                    # Flushes whatever the rule left pending (resolves,
+                    # escalations), so a flush error lands here, on this
+                    # rule, rather than on the commit for the whole pass.
+                    await savepoint.commit()
+                except Exception as exc:  # noqa: BLE001
+                    rule_failed = True
+                    logger.exception(
+                        "alert_rule_eval_failed",
+                        rule=str(rule.id),
+                        rule_type=rule.rule_type,
+                        error=str(exc),
+                    )
+                else:
+                    pending.extend(rule_queue)
+            if rule_failed:
+                # Its opens / resolves were rolled back; so are its counts.
+                opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp = (
+                    counts_before
+                )
+                if savepoint.is_active:
+                    await savepoint.rollback()
 
     await db.commit()
+    # Only now, with every event stored, does anything leave the building.
+    ds_n, dw_n, dm_n = await deliver_deferred(db, pending, targets)
     return {
         "opened": opened,
         "resolved": resolved,
-        "delivered_syslog": delivered_syslog,
-        "delivered_webhook": delivered_webhook,
-        "delivered_smtp": delivered_smtp,
+        "delivered_syslog": delivered_syslog + ds_n,
+        "delivered_webhook": delivered_webhook + dw_n,
+        "delivered_smtp": delivered_smtp + dm_n,
     }

@@ -201,11 +201,15 @@ class AlertEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_observed_value: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     __table_args__ = (
+        # #2261 — UNIQUE: at most one open event per (rule, subject). Two
+        # overlapping evaluator passes used to open a pair, and only one of
+        # the pair was ever resolved.
         Index(
             "ix_alert_event_rule_subject_open",
             "rule_id",
             "subject_type",
             "subject_id",
+            unique=True,
             postgresql_where=sa_text("resolved_at IS NULL"),
         ),
         Index("ix_alert_event_fired_at", "fired_at"),
