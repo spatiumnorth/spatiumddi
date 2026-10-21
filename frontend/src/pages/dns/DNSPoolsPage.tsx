@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { humanTime } from "../network/_shared";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -261,9 +262,7 @@ function PoolRow({
       </td>
       <td className="px-3 py-2 text-right text-xs tabular-nums">{pool.ttl}s</td>
       <td className="px-3 py-2 text-right text-xs text-muted-foreground">
-        {pool.last_checked_at
-          ? new Date(pool.last_checked_at).toLocaleTimeString()
-          : "—"}
+        {pool.last_checked_at ? humanTime(pool.last_checked_at) : "—"}
       </td>
       <td className="px-3 py-2 text-right">
         <div className="flex items-center justify-end gap-1">

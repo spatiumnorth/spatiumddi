@@ -261,6 +261,14 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # status: active | unreachable | syncing | error | pending
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="active")
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #2306 — why the most recent scheduled lease pull failed (agentless
+    # drivers). NULL = the last pull succeeded (or none has run); cleared by
+    # every successful pull. Kept apart from ``status``, which the health
+    # probe owns and rewrites every cycle.
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_sync_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_health_check_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

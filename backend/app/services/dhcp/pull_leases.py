@@ -462,6 +462,8 @@ async def pull_leases_from_server(
                 )
             if apply:
                 server.last_sync_at = now
+                server.last_sync_error = None
+                server.last_sync_error_at = None
                 await db.flush()
             return result
 
@@ -526,6 +528,8 @@ async def pull_leases_from_server(
 
     if apply:
         server.last_sync_at = now
+        server.last_sync_error = None
+        server.last_sync_error_at = None
         await db.flush()
 
     return result

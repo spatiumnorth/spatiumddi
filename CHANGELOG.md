@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A failing Windows DHCP lease pull now shows on the server row
+  (#2306).** The scheduled pull recorded a failure only in the audit
+  log, so a server whose lease cmdlet kept failing stayed green and
+  read "synced 10:04:12" for weeks. The error is now stored on the
+  server (`last_sync_error`, `last_sync_error_at`, returned by the
+  DHCP server API), shown as an amber **Sync failing** chip with the
+  reason on hover, and cleared by the next successful pull. The DHCP
+  and DNS server rows, DNS pools and pool members also show a relative
+  age ("3d ago") instead of a time of day with no date. Migration
+  `e2b6f81d4a37`.
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
