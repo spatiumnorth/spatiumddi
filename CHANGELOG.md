@@ -128,6 +128,13 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Deleting a site no longer silently deletes its E911 site-default
+  binding (#2298).** The binding is `ON DELETE CASCADE`, so a site delete
+  (single or bulk) removed the fallback emergency location for every
+  phone on it with no warning. Both now answer 409 naming the site and the
+  ERL, until the binding is removed under Network > E911 > Bindings; bulk
+  delete is all-or-nothing.
+
 - **The Audit page "Chain verified" badge now checks the newest audit
   rows, not the oldest (#2297).** It verified the first 1,000 rows ever
   written, so once an install passed 1,000 rows, tampering with recent
