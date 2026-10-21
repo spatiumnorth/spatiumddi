@@ -128,6 +128,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Acknowledging, suppressing or deleting a captured internal error
+  left no audit row (#2301).** The three Diagnostics routes mutated or
+  hard-deleted the error with nothing in `audit_log`, so a fault (or
+  the exception an exploit attempt tripped) could be silenced or
+  erased without a trace. Each now writes one `internal_error` audit
+  row in the same transaction, carrying the fingerprint, exception
+  class and, for suppress, the hours and expiry. There are no bulk
+  endpoints. Re-acknowledging an already-acknowledged error changes
+  nothing and writes nothing.
+
 - **The wake calendar sync deleted today's holiday for schedules west
   of UTC, so the fleet woke on it (#2305).** The sync kept events from
   the worker's UTC date onward and deleted every stored span outside
