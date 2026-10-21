@@ -30,6 +30,11 @@ UNSUPPORTED_OPTIONS: dict[str, tuple[Any, str]] = {
     "tcp_clients": (None, "Technitium has no TCP client limit setting"),
     "clients_per_query": (None, "Technitium has no clients-per-query setting"),
     "max_clients_per_query": (None, "Technitium has no clients-per-query setting"),
+    "allow_query_cache": (
+        ["localhost", "localnets"],
+        "Technitium has no separate cache-access ACL (allow_recursion is the "
+        "recursion ACL it honours)",
+    ),
     "forward_tls_verify": (
         True,
         "Technitium always validates an encrypted upstream's certificate and has no "

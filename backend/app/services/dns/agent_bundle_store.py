@@ -85,7 +85,9 @@ _MAX_ERROR = 2000
 #   stored default is local + private networks (migration b8e41c7a2d95).
 # 11 (#1706): with views, the group's blocklist zone is no longer shipped into
 #   a group whose every view already carries the group's lists in its own.
-RENDERER_REVISION = 11
+# 12 (#2264): a BIND9 server's bundle carries a non-default ``allow_query_cache``
+#   (the agent now renders ``allow-query-cache``); unchanged for default groups.
+RENDERER_REVISION = 12
 
 
 def _serves(revision: int | None) -> bool:
