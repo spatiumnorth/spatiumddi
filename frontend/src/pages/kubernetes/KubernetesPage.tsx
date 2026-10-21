@@ -817,9 +817,10 @@ function DeleteClusterModal({
         <p className="text-sm text-muted-foreground">
           Remove the cluster connection for{" "}
           <span className="font-semibold">{cluster.name}</span>? This only
-          affects SpatiumDDI — nothing on the cluster changes. Any IPAM / DNS
-          rows previously mirrored from this cluster will be cleaned up on the
-          next reconcile pass.
+          affects SpatiumDDI — nothing on the cluster changes. Only rows that
+          were purely mirrored are removed. Anything you added yourself
+          (addresses, DHCP scopes, reservations, edited rows, custom fields) is
+          kept and detached from this integration.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input

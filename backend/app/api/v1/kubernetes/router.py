@@ -38,6 +38,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.kubernetes import KubernetesCluster
+from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
     tags=["kubernetes"],
@@ -639,6 +640,11 @@ async def delete_cluster(cluster_id: uuid.UUID, db: DB, user: SuperAdmin) -> Non
         action="delete",
         cluster_id=c.id,
         cluster_name=c.name,
+    )
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="kubernetes_cluster_id", target_id=c.id, user=user, target_name=c.name
     )
     await db.delete(c)
     await db.commit()

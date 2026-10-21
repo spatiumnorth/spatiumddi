@@ -686,10 +686,10 @@ function DeleteInstanceModal({
         <p className="text-sm text-muted-foreground">
           Remove the NetBird instance{" "}
           <span className="font-semibold">{instance.name}</span>? This only
-          affects SpatiumDDI — nothing on the NetBird side changes. All IPAM
-          rows mirrored from this instance (the auto-created overlay block +
-          subnet + every peer IP, plus any synthetic DNS zone) will be removed
-          via the FK cascade.
+          affects SpatiumDDI — nothing on the NetBird side changes. Only rows
+          that were purely mirrored are removed. Anything you added yourself
+          (addresses, DHCP scopes, reservations, edited rows, custom fields) is
+          kept and detached from this integration.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input

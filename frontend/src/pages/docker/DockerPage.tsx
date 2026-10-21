@@ -791,8 +791,10 @@ function DeleteHostModal({
         <p className="text-sm text-muted-foreground">
           Remove the host connection for{" "}
           <span className="font-semibold">{host.name}</span>? This only affects
-          SpatiumDDI — nothing on the Docker host changes. Any IPAM rows
-          mirrored from this host will be cleaned up on the next reconcile pass.
+          SpatiumDDI — nothing on the Docker host changes. Only rows that were
+          purely mirrored are removed. Anything you added yourself (addresses,
+          DHCP scopes, reservations, edited rows, custom fields) is kept and
+          detached from this integration.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input
