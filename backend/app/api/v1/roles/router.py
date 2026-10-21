@@ -8,19 +8,24 @@ need to tweak a built-in role should clone it first.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.api.stepup import require_stepup_if_granting_superadmin
-from app.core.permissions import caller_can_grant, require_permission
+from app.core.permissions import caller_can_grant, refuse_and_audit, require_permission
 from app.models.audit import AuditLog
 from app.models.auth import Role, User
-from app.services.superadmin_grant import SuperadminModel, permissions_grant_superadmin
+from app.services.superadmin_grant import (
+    SuperadminModel,
+    leaves_no_active_superadmin,
+    permissions_grant_superadmin,
+)
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -140,7 +145,20 @@ def _perm_list_to_dicts(perms: list[PermissionEntry]) -> list[dict[str, Any]]:
     return out
 
 
-def _enforce_grant_ceiling(actor: User, perms: list[PermissionEntry]) -> None:
+async def _enforce_grant_ceiling(
+    db: DB,
+    actor: User,
+    request: Request,
+    perms: list[Any],
+    *,
+    action: str,
+    resource_id: str,
+    resource_display: str,
+    detail: str = (
+        "You can only grant permissions you already hold, and only a "
+        "superadmin can grant wildcard ('*') permissions."
+    ),
+) -> None:
     """SECURITY (#400, finding C4): privilege ceiling on role authoring.
 
     A non-superadmin holding delegated ``admin:role`` could otherwise mint a
@@ -148,15 +166,54 @@ def _enforce_grant_ceiling(actor: User, perms: list[PermissionEntry]) -> None:
     and self-assign it → effective superadmin. ``caller_can_grant`` rejects
     wildcard minting and any triple the caller doesn't already hold. Effective
     superadmins bypass so the platform owner can still build arbitrary roles.
+
+    The same ceiling bounds changing or deleting an existing role: whoever
+    could not have created its current permissions cannot take them away
+    from the groups that hold it either. A refusal writes a ``denied`` audit
+    row, as a ``require_permission`` refusal does.
     """
-    if not caller_can_grant(actor, perms):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "You can only grant permissions you already hold, and only a "
-                "superadmin can grant wildcard ('*') permissions."
-            ),
-        )
+    if caller_can_grant(actor, perms):
+        return
+    await refuse_and_audit(
+        db,
+        actor,
+        request,
+        action=action,
+        resource_type="role",
+        resource_id=resource_id,
+        resource_display=resource_display,
+        reason="above the caller's privilege ceiling",
+        detail=detail,
+    )
+
+
+async def _enforce_superadmin_remains(
+    db: DB,
+    actor: User,
+    request: Request,
+    change: Callable[[SuperadminModel], None],
+    *,
+    action: str,
+    role: Role,
+) -> None:
+    """Refuse (409) a role change that would leave no active superadmin."""
+    if not await leaves_no_active_superadmin(db, change):
+        return
+    await refuse_and_audit(
+        db,
+        actor,
+        request,
+        action=action,
+        resource_type="role",
+        resource_id=str(role.id),
+        resource_display=f"{action} role {role.name}",
+        reason="would leave no active superadmin",
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            "This change would leave no active superadmin. Make another account a "
+            "superadmin first."
+        ),
+    )
 
 
 def _audit(
@@ -200,11 +257,21 @@ async def list_roles(db: DB, _: CurrentUser) -> list[RoleResponse]:
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permission("admin", "role"))],
 )
-async def create_role(body: RoleCreate, current_user: CurrentUser, db: DB) -> RoleResponse:
+async def create_role(
+    body: RoleCreate, request: Request, current_user: CurrentUser, db: DB
+) -> RoleResponse:
     existing = await db.scalar(select(Role).where(Role.name == body.name))
     if existing is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Role name already in use")
-    _enforce_grant_ceiling(current_user, body.permissions)
+    await _enforce_grant_ceiling(
+        db,
+        current_user,
+        request,
+        list(body.permissions),
+        action="create",
+        resource_id=body.name,
+        resource_display=f"create role {body.name}",
+    )
     r = Role(
         name=body.name,
         description=body.description,
@@ -234,7 +301,11 @@ async def get_role(role_id: uuid.UUID, db: DB, _: CurrentUser) -> RoleResponse:
     dependencies=[Depends(require_permission("admin", "role"))],
 )
 async def update_role(
-    role_id: uuid.UUID, body: RoleUpdate, current_user: CurrentUser, db: DB
+    role_id: uuid.UUID,
+    body: RoleUpdate,
+    request: Request,
+    current_user: CurrentUser,
+    db: DB,
 ) -> RoleResponse:
     r = await db.get(Role, role_id)
     if r is None:
@@ -254,13 +325,27 @@ async def update_role(
     method: str | None = None
     granted = 0
     if body.permissions is not None:
-        _enforce_grant_ceiling(current_user, body.permissions)
+        # Both what the role carries now (whoever could not have granted it
+        # cannot take it away from the groups holding it) and what it will.
+        await _enforce_grant_ceiling(
+            db,
+            current_user,
+            request,
+            [*(r.permissions or []), *body.permissions],
+            action="update",
+            resource_id=str(r.id),
+            resource_display=f"update role {r.name}",
+        )
         new_permissions = _perm_list_to_dicts(body.permissions)
         role_id = r.id
         wildcard = permissions_grant_superadmin(new_permissions)
 
         def _change(model: SuperadminModel) -> None:
             model.role_wildcard[role_id] = wildcard
+
+        await _enforce_superadmin_remains(
+            db, current_user, request, _change, action="update", role=r
+        )
 
         # Before touching the row: a refused step-up commits its audit row.
         method, granted = await require_stepup_if_granting_superadmin(
@@ -291,7 +376,9 @@ async def update_role(
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require_permission("admin", "role"))],
 )
-async def delete_role(role_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def delete_role(
+    role_id: uuid.UUID, request: Request, current_user: CurrentUser, db: DB
+) -> None:
     r = await db.get(Role, role_id)
     if r is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
@@ -300,6 +387,27 @@ async def delete_role(role_id: uuid.UUID, current_user: CurrentUser, db: DB) -> 
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Built-in roles cannot be deleted. Clone and delete the clone instead.",
         )
+    await _enforce_grant_ceiling(
+        db,
+        current_user,
+        request,
+        list(r.permissions or []),
+        action="delete",
+        resource_id=str(r.id),
+        resource_display=f"delete role {r.name}",
+        detail=(
+            "You can only delete a role whose permissions you already hold, and "
+            "only a superadmin can delete a role carrying wildcard ('*') permissions."
+        ),
+    )
+    doomed = r.id
+
+    def _change(model: SuperadminModel) -> None:
+        model.role_wildcard.pop(doomed, None)
+        for roles in model.group_roles.values():
+            roles.discard(doomed)
+
+    await _enforce_superadmin_remains(db, current_user, request, _change, action="delete", role=r)
     name = r.name
     db.add(_audit(current_user, "delete", r, f"Deleted role {name}"))
     await db.delete(r)
@@ -314,7 +422,11 @@ async def delete_role(role_id: uuid.UUID, current_user: CurrentUser, db: DB) -> 
     dependencies=[Depends(require_permission("admin", "role"))],
 )
 async def clone_role(
-    role_id: uuid.UUID, body: RoleClone, current_user: CurrentUser, db: DB
+    role_id: uuid.UUID,
+    body: RoleClone,
+    request: Request,
+    current_user: CurrentUser,
+    db: DB,
 ) -> RoleResponse:
     src = await db.get(Role, role_id)
     if src is None:
@@ -325,14 +437,19 @@ async def clone_role(
     # SECURITY (#400, C4): cloning copies the source permissions verbatim into a
     # role the caller controls — apply the same ceiling so a non-superadmin can't
     # clone a Superadmin (or any over-privileged) role and self-assign the clone.
-    if not caller_can_grant(current_user, list(src.permissions or [])):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "You can only clone a role whose permissions you already hold, and "
-                "only a superadmin can clone a role carrying wildcard ('*') permissions."
-            ),
-        )
+    await _enforce_grant_ceiling(
+        db,
+        current_user,
+        request,
+        list(src.permissions or []),
+        action="create",
+        resource_id=str(src.id),
+        resource_display=f"clone role {src.name}",
+        detail=(
+            "You can only clone a role whose permissions you already hold, and "
+            "only a superadmin can clone a role carrying wildcard ('*') permissions."
+        ),
+    )
     clone = Role(
         name=body.name,
         description=f"Cloned from '{src.name}'",

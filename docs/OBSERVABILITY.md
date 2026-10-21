@@ -428,6 +428,17 @@ inside `after_flush`, then in `after_commit` schedules one
 `asyncio.create_task` per (row, target) pair so slow collectors
 don't serialize the queue.
 
+**Redaction (#2015).** `old_value`, `new_value` and `error_detail`
+are forwarded with the same redaction the audit API applies on read
+(`app/services/audit_redact.py`): a value under a credential-shaped
+key arrives as `[redacted]`, and a credential-shaped string (a JWT,
+a Fernet token, a PEM private key) is replaced wherever it appears.
+Booleans and integers are kept, so a writer's `smtp_password_set`
+flag still arrives. The redaction is applied in `_deliver_to_target`,
+the one function every target kind sends through, and on a copy: the
+stored audit row is unchanged. Typed-event webhook deliveries are
+redacted the same way.
+
 **Transports.**
 - **Syslog UDP** — `socket.sendto`, fire-and-forget, one syscall.
 - **Syslog TCP** — `asyncio.open_connection`, 5 s connect timeout.
