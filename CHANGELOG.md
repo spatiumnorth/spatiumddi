@@ -128,6 +128,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DNS bundle render that kills its worker is no longer requeued
+  forever (#2271).** `render_dns_bundle` runs with the global late-ack +
+  reject-on-worker-lost, so a render the OOM killer took down was handed to
+  the next worker, which died the same way, with nothing recorded because
+  the process never reached its failure handler. Each delivery of one render
+  message is now counted in Redis (kombu's `redelivered` is only a boolean);
+  past 3 deliveries the render is abandoned, logged as
+  `dns_agent_bundle_render_abandoned` and recorded as `failed` on the server
+  row, and the 30 s sweep's 5-minute failed-backoff paces the next attempt.
+  With Redis unreachable the bound is skipped and the render runs.
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
