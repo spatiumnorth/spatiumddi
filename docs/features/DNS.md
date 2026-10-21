@@ -285,10 +285,9 @@ registrar still points at the old group's, so issuance fails until repointed.
 applied at. It is auto-elected on create and on first agent registration when
 the group has none; send `is_primary: true` on the same PUT to move it, which
 demotes whichever server currently holds it. **Clearing the last primary is
-refused (422)** — it re-creates the footgun the auto-election exists to
-prevent, and the resulting dropped writes are silent (a log line; no error
-reaches whoever made the change). Promote a replacement instead; that demotes
-the incumbent as a side effect.
+refused (422)** — it would not stick, because a group without a primary has
+one re-elected automatically (below). Promote a replacement instead; that
+demotes the incumbent as a side effect.
 
 **Deleting the primary elects a successor (#2276)** in the same transaction:
 the oldest enabled, unpaused survivor, or any survivor if every one is disabled

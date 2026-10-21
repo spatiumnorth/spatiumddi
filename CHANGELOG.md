@@ -143,7 +143,11 @@ the formatter handles the rest.
   `dns_group_has_no_primary`), and the 60 s agent stale sweep marks
   that server primary, so existing installs heal on upgrade. Only a
   group with no servers queues nothing, and its servers-to-be get the
-  records in their bundle.
+  records in their bundle. The 422 for clearing a group's last primary,
+  the server form's hint and the Copilot's `find_dns_servers`
+  description no longer claim a missing primary drops writes, and the
+  scheduled pull-from-server sweep caps its primary lookup at one row so
+  a group briefly holding two cannot abort it.
 
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group

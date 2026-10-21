@@ -19,11 +19,12 @@ state that becomes a lie the moment its group changes:
   * ``config_apply_status`` (#882) says whether the LIVE config is the
     SAVED one. A move changes the saved one, so a carried-over ``ok`` is
     false at the instant of commit — and NULL means UNKNOWN, never ok.
-  * ``is_primary`` is per-group and load-bearing: ``resolve_primary_server``
-    drops every record write for a group with no primary, and
-    ``build_config_bundle`` fetches the primary with ``scalar_one_or_none``,
-    so a group with TWO would 500 the agent long-poll rather than merely
-    pick wrong.
+  * ``is_primary`` is per-group and load-bearing: it picks the server an
+    agentless group writes through (a group with none used to drop every
+    record write; since #2276 ``resolve_primary_server`` stands in the
+    election's pick and a beat sweep re-stamps the flag), and a group with
+    TWO used to 500 the agent long-poll, which is why every primary lookup
+    now caps at one.
 
 So the move is a small transaction rather than an assignment, and it lives
 here rather than in the router so it can be tested without HTTP.

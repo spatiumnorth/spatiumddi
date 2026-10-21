@@ -517,9 +517,17 @@ async def heal_primaryless_groups(db: AsyncSession) -> int:
     Self-heal for installs left without one — by deleting the primary on a
     build that did not re-elect. Run from the 60 s agent stale sweep.
     Idempotent: a group that has a primary is untouched. The UPDATE re-checks
-    "no primary in this group" in the same statement, so an operator
-    promoting a server concurrently cannot end up with two — the shape that
-    500s the agent long-poll (#934). Returns the number of groups healed.
+    "no primary in this group" in the same statement, which closes the gap
+    between the scan and the write and makes two concurrent sweeps converge
+    on one server (the pick is deterministic). It does NOT serialise against
+    an operator promotion that is still uncommitted — READ COMMITTED cannot
+    see it, and the promotion takes no group lock — so that narrow window can
+    still leave two primaries, exactly as two concurrent promotions or a
+    promotion racing create-time auto-election always could. Every primary
+    lookup caps at one row, so that state mis-picks rather than 500s (#934),
+    and only a group already without a primary is ever touched, which after
+    this fix means one left over from an older build. Returns the number of
+    groups healed.
     """
     primaried = select(DNSServer.group_id).where(DNSServer.is_primary.is_(True))
     group_ids = (
