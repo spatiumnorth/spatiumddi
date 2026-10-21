@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Query-log severity and print-* settings now reach named.conf
+  (#2265).** The Options UI let operators pick the log channel, file,
+  severity and print flags, and the BIND9 agent rendered a hard-coded
+  channel regardless. Severity (`info` / `debug [N]` / `dynamic`) and
+  `print-category` / `print-severity` are now rendered, in the agent and
+  the control-plane template. The channel and path stay fixed at
+  `/var/log/named/queries.log`, which the DNS Queries shipper tails, so
+  syslog / stderr / another path, a severity above `info` (it would drop
+  every query line) and `print-time` off are refused with a 422, and the
+  channel / path fields are gone from the UI. Default groups render
+  byte-identically.
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
