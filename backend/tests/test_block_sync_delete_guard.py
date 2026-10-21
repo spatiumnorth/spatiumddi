@@ -235,7 +235,8 @@ async def test_disarm_lifts_then_delete_succeeds(
     bs_router = importlib.import_module("app.api.v1.block_sync.router")
     monkeypatch.setattr(bs_router, "_enqueue_lift", lambda targets: lifts.extend(targets))
 
-    assert (await client.delete(f"{URLS['opnsense']}/{tid}", headers=hdr)).status_code == 409
+    refused = await client.delete(f"{URLS['opnsense']}/{tid}", headers=hdr)
+    assert refused.status_code == 409
 
     r = await client.put(
         f"/api/v1/block-sync/targets/opnsense/{tid}",
