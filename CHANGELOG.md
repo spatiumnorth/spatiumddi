@@ -128,6 +128,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DNS records mirrored from an external RFC 2136 writer are audited
+  (#2302).** An agent's `ingested-records` batch created and hard-deleted
+  `ddns_external` mirror records (an AD DC registering and deregistering
+  hosts) with no audit row, so they appeared and vanished with no history.
+  Each batch that adds or removes records now writes one
+  `dns.record.external_ingest` row on the zone naming them (added in
+  `new_value`, removed in `old_value`, capped at 50 per batch).
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
