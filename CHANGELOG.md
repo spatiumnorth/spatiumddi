@@ -128,6 +128,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Renaming or deleting a TSIG key that something still cites stopped
+  the whole DNS group (#2282).** `key <name>` is cited from ACL entries,
+  view match lists, the group's address-match options and `also_notify`,
+  and zone `allow_query` / `allow_transfer` / `also_notify`. Renaming or
+  deleting the key left an undefined symbol in `named.conf`, so
+  `named-checkconf` failed, the agent declined the bundle and the group
+  stopped converging. Both now answer 409 naming every referrer; an
+  uncited key still renames and deletes freely. Deleting a key also
+  reports how many zone dynamic-update grants it took with it (the
+  `X-Removed-Update-Grants` header and the audit row). As defence in
+  depth, the bundle drops any `key <name>` element whose key it does not
+  define (logged as `dns_bundle_entry_dropped_undefined_key`), so a
+  reference stored before this guard cannot break the group.
+
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
   forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,

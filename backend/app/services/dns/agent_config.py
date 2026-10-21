@@ -58,10 +58,12 @@ from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.dns.agent_bundle_store import WIRE_JSON, BodyWriter
 from app.services.dns.named_conf_validation import (
+    ADDRESS_MATCH_LIST_OPTIONS,
     UPDATE_POLICY_NAMED_SCOPES,
     AclCycleError,
     ViewValidationError,
     is_name_reference,
+    key_reference,
     order_acls_for_render,
     split_zone_forwarders,
     validate_acl_name,
@@ -261,6 +263,30 @@ def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
     except AclCycleError as exc:
         logger.error("dns_acl_cycle_in_bundle", error=str(exc))
         return sorted(prepared, key=lambda a: a["name"])
+
+
+def _drop_undefined_key_refs(elements: Any, known_keys: frozenset[str], *, where: str) -> Any:
+    """``elements`` without any ``key <name>`` citing a key the bundle does not define (#2282).
+
+    ``key_reference`` also reads ``also-notify``'s ``<ip> key <name>``. A
+    citation of an undefined key is an undefined symbol: ``named-checkconf``
+    rejects the file and the agent declines the whole bundle. The write paths
+    refuse to create or orphan one (rename / delete of a cited key is a 409),
+    so this covers a row stored before that guard, or an operator key whose
+    secret no longer decrypts and was therefore left out of ``tsig_keys``.
+    Returns the original object untouched when nothing is dropped, so a
+    healthy bundle keeps its ETag. Dropping an element only narrows the list.
+    """
+    if not isinstance(elements, list):
+        return elements
+    kept = []
+    for el in elements:
+        name = key_reference(str(el))
+        if name is not None and name not in known_keys:
+            logger.warning("dns_bundle_entry_dropped_undefined_key", where=where, key=name)
+            continue
+        kept.append(el)
+    return kept if len(kept) != len(elements) else elements
 
 
 def _master_host(master: Any) -> str:
@@ -1202,6 +1228,30 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     # ``{id, name}`` only, so an ACL was inert config and any reference to
     # one was an undefined symbol that failed the entire bundle.
     acls_block = _safe_acls_block(acls)
+
+    # #2282 — never ship a ``key <name>`` the bundle does not define.
+    known_key_names = frozenset(k["name"] for k in tsig_keys)
+    for a in acls_block:
+        a["entries"] = [
+            e
+            for e in a["entries"]
+            if _drop_undefined_key_refs([e["value"]], known_key_names, where=f"acl:{a['name']}")
+        ]
+    for ve in views_block:
+        for f in ("match_clients", "match_destinations", "allow_query", "allow_query_cache"):
+            ve[f] = _drop_undefined_key_refs(
+                ve.get(f), known_key_names, where=f"view:{ve['name']}.{f}"
+            )
+    for f in (*ADDRESS_MATCH_LIST_OPTIONS, "also_notify"):
+        if f in options_block:
+            options_block[f] = _drop_undefined_key_refs(
+                options_block[f], known_key_names, where=f"options.{f}"
+            )
+    for zp in zone_payload:
+        for f in ("allow_query", "allow_transfer", "also_notify"):
+            zp[f] = _drop_undefined_key_refs(
+                zp.get(f), known_key_names, where=f"zone:{zp['name']}.{f}"
+            )
 
     # Blocklists: one RPZ zone per view (if any) + one group-level zone.
     # Each assembled list has its entries resolved against view/group scope
