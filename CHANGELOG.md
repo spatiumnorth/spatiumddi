@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Starting a fleet upgrade, forcing a block-sync reconcile and
+  syncing an integration now record who did it (#2303).** All three
+  enqueue a worker task whose own audit rows say `system`, so "who
+  started the rolling upgrade" or "who forced this firewall push"
+  existed only in structlog. Each route now writes an audit row
+  attributed to the caller before the response returns:
+  `upgrade.start_requested` on the upgrade run, `reconcile` on the
+  block-sync target (not written for `?preview=true`), and `sync` on the
+  Cloud, Docker, Kubernetes, NetBird, OPNsense, Palo Alto, Fortinet,
+  Meraki, Proxmox, Tailscale and UniFi target. The worker's own rows
+
 - **DNS records mirrored from an external RFC 2136 writer are audited
   (#2302).** An agent's `ingested-records` batch created and hard-deleted
   `ddns_external` mirror records (an AD DC registering and deregistering
