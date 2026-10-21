@@ -21,8 +21,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, event, func, or_, select, tuple_, update
+from sqlalchemy import Text, and_, event, func, literal, or_, select, tuple_, update
 from sqlalchemy import delete as sa_delete
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import set_committed_value
@@ -63,8 +64,9 @@ OP_RETRY_MAX_SECONDS = 15 * 60
 # next heartbeat (~30 s) and keeps an unsent ack across failed heartbeats, so
 # five minutes is several missed heartbeats, not a slow one.
 IN_FLIGHT_ACK_TIMEOUT = timedelta(minutes=5)
-# Keys per ``IN`` list when matching RRsets in SQL: three bind parameters a
-# key, well under asyncpg's 32767.
+# Keys per statement when matching RRsets in SQL (``rrset_match_where``). The
+# keys ride as three array parameters (#2289), so this no longer bounds a
+# bind-parameter count; it only bounds what one statement carries.
 RRSET_KEY_CHUNK = 3000
 
 
@@ -100,11 +102,73 @@ def _op_type_sql() -> Any:
     return func.upper(DNSRecordOp.record["type"].astext)
 
 
+def _keys_in(cols: tuple[Any, Any, Any], keys: Collection[tuple[str, str, str]]) -> Any:
+    """``cols`` is one of ``keys``, with the keys as three array parameters.
+
+    Never a row ``IN`` list (#2289): Postgres cannot turn ``(a, b, c) IN
+    ((..), ..)`` into an array comparison, so a 3,000-key list was a
+    9,000-comparison OR-of-ANDs, costed over ``jit_above_cost`` and
+    JIT-compiled in the backend and every parallel worker — 1.3-1.5 GB and
+    seconds to minutes per process, which OOM-killed the primary under seven
+    polling agents. Unnested, the statement is the same size whatever the key
+    count and the planner joins against the keys. Same rows: no key component
+    is ever NULL (``op_rrset_key``)."""
+    keys = list(keys)
+    wanted = (
+        func.unnest(
+            literal([k[0] for k in keys], ARRAY(Text)),
+            literal([k[1] for k in keys], ARRAY(Text)),
+            literal([k[2] for k in keys], ARRAY(Text)),
+        )
+        .table_valued("zone_name", "name", "type")
+        .render_derived()
+    )
+    return tuple_(*cols).in_(select(wanted.c.zone_name, wanted.c.name, wanted.c.type))
+
+
 def rrset_match_where(keys: Collection[tuple[str, str, str]]) -> Any:
     """WHERE clause matching ops whose RRset is one of ``keys``."""
     return and_(
         DNSRecordOp.record.has_key("rrset"),
-        tuple_(DNSRecordOp.zone_name, _op_name_sql(), _op_type_sql()).in_(list(keys)),
+        _keys_in((DNSRecordOp.zone_name, _op_name_sql(), _op_type_sql()), keys),
+    )
+
+
+def backed_off_match_where(
+    server_id: uuid.UUID, now: datetime, keys: Collection[tuple[str, str, str]]
+) -> Any:
+    """WHERE clause matching ``server_id``'s ops still backing off at ``now``
+    (``pending``, ``next_attempt_at`` later) whose RRset is one of ``keys``.
+
+    The candidates are read first, in a MATERIALIZED CTE served by the partial
+    ``ix_dns_record_op_server_backoff``, and the keys are matched against that
+    set only (#2289). So the cost follows the page and the ops actually
+    waiting — none, usually — and never the server's whole backlog or the
+    size of a zone: given the keys directly, the planner either read every
+    queued op of the server (the cost grew with the backlog, 88 s at 1.41M
+    ops) or, in the generic plan a prepared statement settles on, probed the
+    zone-name index once per key and read every op of each zone.
+    """
+    waiting = (
+        select(
+            DNSRecordOp.id.label("id"),
+            DNSRecordOp.zone_name.label("zone_name"),
+            _op_name_sql().label("name"),
+            _op_type_sql().label("type"),
+        )
+        .where(
+            DNSRecordOp.server_id == server_id,
+            DNSRecordOp.state == "pending",
+            DNSRecordOp.next_attempt_at > now,
+            DNSRecordOp.record.has_key("rrset"),
+        )
+        .cte("backed_off")
+        .prefix_with("MATERIALIZED")
+    )
+    return DNSRecordOp.id.in_(
+        select(waiting.c.id).where(
+            _keys_in((waiting.c.zone_name, waiting.c.name, waiting.c.type), keys)
+        )
     )
 
 
