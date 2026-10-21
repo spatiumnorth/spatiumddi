@@ -292,7 +292,9 @@ async def check_no_open_ports(
     pass. The same ``warn`` applies when the latest scan has no parsed
     summary, has no result for the target's address (a CIDR sweep
     omits hosts that did not answer), reports the host as anything but
-    ``up``, or shows a forbidden port only as ``open|filtered``.
+    ``up``, shows a forbidden port only as ``open|filtered``, or never
+    probed a forbidden port (a ping-only sweep, or a ``-p`` list that
+    leaves it out).
 
     Today the check only runs against ``target_kind=ip_address``.
     Subnet-level is a useful follow-up but needs aggregation logic
@@ -397,10 +399,48 @@ async def check_no_open_ports(
             "nmap could not tell whether they are open",
             {**diagnostic, "open_filtered_ports": sorted(ambiguous_ports)},
         )
+    unprobed = _unprobed_ports(summary, scan, forbidden)
+    if unprobed:
+        return CheckOutcome.warn(
+            f"nmap scan {scan.id} did not probe forbidden port(s) {unprobed} — "
+            "port state unknown",
+            {**diagnostic, "unprobed_ports": unprobed},
+        )
     return CheckOutcome.passed(
         f"no forbidden ports open per scan {scan.id}",
         diagnostic,
     )
+
+
+def _services_cover(spec: str, port: int) -> bool:
+    """True when nmap's ``<scaninfo services>`` range list (``"1,3-4,22"``)
+    includes ``port``."""
+    for part in spec.split(","):
+        lo, _, hi = part.strip().partition("-")
+        try:
+            if int(lo) <= port <= int(hi or lo):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _unprobed_ports(summary: dict[str, Any], scan: NmapScan, forbidden: set[int]) -> list[int]:
+    """Forbidden ports the scan never probed, so their absence from the
+    port list proves nothing (nmap lists only ports in a non-default
+    state). A ping-only ``-sn`` sweep probes none; ``-p 80`` probes one.
+
+    Summaries stored before the parser recorded ``scanned_ports`` cannot
+    say what was probed; only a ping sweep is known to have probed
+    nothing, so those are still trusted otherwise.
+    """
+    scanned = summary.get("scanned_ports")
+    if isinstance(scanned, dict):
+        specs = [v for v in scanned.values() if isinstance(v, str)]
+        return sorted(p for p in forbidden if not any(_services_cover(s, p) for s in specs))
+    if scan.preset == "subnet_sweep" or "-sn" in (scan.extra_args or "").split():
+        return sorted(forbidden)
+    return []
 
 
 def _normalise_ip(value: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:

@@ -193,10 +193,14 @@ the formatter handles the rest.
   change** when the policy is enabled: hosts that passed can now fail,
   or warn where the scan cannot answer: no parsed summary, no result
   for the address (a CIDR sweep leaves out hosts that did not answer),
-  a host that was not `up`, or a forbidden port nmap reported only as
-  `open|filtered`. The nmap summary also records the `address` its
+  a host that was not `up`, a forbidden port nmap reported only as
+  `open|filtered`, or a forbidden port the scan never probed (a
+  ping-only `subnet_sweep`, or a `-p` list that leaves it out: nmap
+  lists only ports in a non-default state, so an absent port is not a
+  closed one). The nmap summary also records the `address` its
   single-host fields describe, so a sweep where one other host answered
-  is no longer mistaken for the target.
+  is no longer mistaken for the target, and the `scanned_ports` nmap
+  says it probed.
 
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group

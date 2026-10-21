@@ -558,6 +558,12 @@ def parse_nmap_xml(xml_str: str) -> dict:
     a CIDR sweep where only one host answered also yields ``hosts: None``,
     and the conformity ``no_open_ports`` check must not read that host's
     ports as another address's (#2257).
+
+    ``scanned_ports`` maps each probed protocol to nmap's ``<scaninfo
+    services>`` range list (``{"tcp": "1,3-4,6-7,..."}``). nmap lists only
+    ports in a non-default state, so a port absent from ``ports`` was
+    either closed or never probed; this says which. A ping-only ``-sn``
+    scan emits no ``<scaninfo>`` and so yields ``{}``.
     """
     out: dict[str, Any] = {
         "address": None,
@@ -565,6 +571,7 @@ def parse_nmap_xml(xml_str: str) -> dict:
         "ports": [],
         "os": None,
         "hosts": None,
+        "scanned_ports": {},
     }
     if not xml_str:
         return out
@@ -573,6 +580,13 @@ def parse_nmap_xml(xml_str: str) -> dict:
     except ET.ParseError as exc:
         logger.debug("nmap_xml_parse_failed", error=str(exc))
         return out
+
+    for info in root.findall("scaninfo"):
+        proto = info.get("protocol")
+        services = info.get("services")
+        if proto and services:
+            prior = out["scanned_ports"].get(proto)
+            out["scanned_ports"][proto] = f"{prior},{services}" if prior else services
 
     host_elems = root.findall("host")
     if not host_elems:
