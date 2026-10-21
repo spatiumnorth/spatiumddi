@@ -74,7 +74,7 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v5
         with:
-          version: v4.3.0
+          version: v4.3.1
 
       - name: Create kind cluster
         # #983 — kind and the node image are BOTH pinned, and the node image
