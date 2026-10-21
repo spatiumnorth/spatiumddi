@@ -137,8 +137,10 @@ the formatter handles the rest.
   pages), so memory stays flat. The task records how far it verified in
   the new `audit_chain_checkpoint` table and checks only rows added
   since, re-walking the whole chain once a week and whenever the
-  checkpoint no longer matches the table (a restore, a rewritten row).
-  A run that dies keeps its progress but fails loudly; it is never
+  checkpoint no longer matches the table (a restore, a rewritten row)
+  or its recorded full-pass time lies in the future, so an edit to an
+  already-verified row is alerted within a week, not overnight
+  (documented in SYSTEM_ADMIN.md §2.7). A run that dies keeps its progress but fails loudly; it is never
   reported as verified. `GET /audit/integrity` also returns
   `verified_through_seq` and `complete`, so a capped check says how far
   it got (#2297). Migration `e7b2d4c81f06`.

@@ -177,6 +177,31 @@ async def test_a_stale_full_pass_walks_everything_again() -> None:
     assert out["rows_checked"] == 4 and out["ok"] is False
 
 
+async def test_a_full_pass_dated_in_the_future_cannot_postpone_the_weekly_pass() -> None:
+    # Someone who can edit audit_log can edit the checkpoint too. Pushing
+    # full_pass_done_at into the future must not keep it from ever ageing
+    # past the weekly interval, or an edit below the checkpoint stays unseen.
+    seqs = await _seed(4)
+    await acv._async_verify_and_alert()
+    await _sql("UPDATE audit_log SET resource_display = 'x' WHERE seq = :s", s=seqs[0])
+    await _sql(
+        "UPDATE audit_chain_checkpoint SET full_pass_done_at = :t",
+        t=datetime.now(UTC) + timedelta(days=3650),
+    )
+    out = await acv._async_verify_and_alert()
+    assert out["rows_checked"] == 4 and out["ok"] is False
+
+
+async def test_small_clock_skew_on_the_full_pass_time_is_not_a_full_pass() -> None:
+    await _seed(3)
+    await acv._async_verify_and_alert()
+    await _sql(
+        "UPDATE audit_chain_checkpoint SET full_pass_done_at = :t",
+        t=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    assert (await acv._async_verify_and_alert())["rows_checked"] == 0
+
+
 async def test_a_checkpoint_the_table_no_longer_matches_forces_a_full_walk() -> None:
     seqs = await _seed(4)
     await acv._async_verify_and_alert()
