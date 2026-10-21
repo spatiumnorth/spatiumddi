@@ -146,6 +146,35 @@ the formatter handles the rest.
   A re-failure after the engine closed the event opens a new one and
   pages; an event an operator resolved by hand while the resource is
   still failing is not re-paged, as before.
+
+- **One failing alert rule no longer re-pages every alert in the pass,
+  every minute (#2261).** The alert evaluator ran every rule in one
+  transaction and delivered each new event as soon as it opened, before
+  the single commit at the end. A rule whose query failed (a SQL error,
+  or a slow DNS-threat matcher hitting the task's command timeout)
+  aborted that transaction, so the commit discarded every event the
+  pass had already sent: the pages went out, nothing appeared under
+  /alerts, and the next tick (plus Celery's three autoretries) sent
+  them again. Now each rule runs in its own savepoint, so a failing
+  rule rolls back only itself, and nothing is delivered until the
+  events are committed; a pass that fails before its commit has sent
+  nothing, and one that fails after it finds its events already open
+  and does not re-send them. The trade is at-most-once: a worker killed
+  between the commit and the send leaves the event open in the UI with
+  its delivery receipts unset, rather than paging twice. Passes are
+  serialised by an advisory lock (an overlapping pass, including
+  "Evaluate now", returns zero counts), and at most one event per
+  rule and subject can be open: the index is now unique, and the
+  migration resolves any duplicates already stored, keeping the
+  earliest. The conformity engine had the same shape and gets the same
+  fix: a check that raises a database error no longer loses every
+  policy's results and `last_evaluated_at` (so policies no longer re-run
+  and re-page every minute), and its alerts, including "evaluate now",
+  are sent only after they are stored. The audit-chain and schema-check
+  tasks commit their alert before delivering it too, and a resumed
+  upgrade run that fails again resolves its previous failure alert
+  before opening the new one.
+
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
   forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,
@@ -1014,6 +1043,11 @@ the formatter handles the rest.
 
 ### Migrations
 
+- `b4d81f2e6a93` — #2261: `ix_alert_event_rule_subject_open` becomes a
+  UNIQUE partial index (one open `alert_event` per rule, subject type
+  and subject). Duplicate open events are resolved first, keeping the
+  earliest-fired. Downgrade restores the non-unique index; the resolved
+  duplicates stay resolved.
 - `e2b9c46f1a83` — #2277, widens `alert_event.subject_id` from
   VARCHAR(64) to VARCHAR(128). Catalogue-only, no rewrite. Downgrade
   deletes events whose subject id is longer than 64 (only conformity

@@ -22,7 +22,7 @@ old column, so they are deleted first; they are alert history, not audit
 records.
 
 Revision ID: e2b9c46f1a83
-Revises: d3a7f19c52e8
+Revises: b4d81f2e6a93
 Create Date: 2026-10-21
 """
 
@@ -33,7 +33,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "e2b9c46f1a83"
-down_revision = "d3a7f19c52e8"
+down_revision = "b4d81f2e6a93"
 branch_labels = None
 depends_on = None
 
