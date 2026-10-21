@@ -128,6 +128,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **`docs/PRIVACY.md` listed the RDAP lookups as per-click only (#2280).**
+  Domain, ASN and RPKI ROA refreshes also run from an hourly Beat tick,
+  and a Domain row is re-queried every 24 h by default. They now sit in
+  §3.3 with their trigger, cadence, default and payload. Nothing is
+  default-on on a fresh install (no rows, no calls), but Domains have no
+  feature module, so creating one arms the schedule; the ASN and ROA
+  tasks do not check `network.asn`. Docs only, no behaviour change.
+
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
   forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,
