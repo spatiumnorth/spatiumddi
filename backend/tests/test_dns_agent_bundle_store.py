@@ -342,3 +342,20 @@ async def test_bundle_dirty_at_tracks_how_long_the_stored_bundle_has_been_behind
     await db_session.commit()
     await db_session.refresh(server)
     assert server.bundle_dirty_at == first_mark, "kept across further marks"
+
+
+@pytest.mark.asyncio
+async def test_a_nightly_stamps_the_bundle_with_the_version_endpoint_spelling(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2354: the server row named a nightly by its bare image tag while
+    ``GET /version`` names it ``0.0.0-nightly-…+sha``."""
+    monkeypatch.setattr(settings, "version", "nightly-20261020")
+    monkeypatch.setattr(settings, "app_version", "0.0.0-nightly-20261020+885ae97")
+    server, _zone = await _agent(db_session, records=2)
+    await db_session.commit()
+    first = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    assert server.bundle_app_version == "0.0.0-nightly-20261020+885ae97"
+    assert first.bundle is not None
+    assert first.bundle.app_version == "0.0.0-nightly-20261020+885ae97"

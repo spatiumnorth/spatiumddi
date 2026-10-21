@@ -128,6 +128,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A nightly no longer calls itself `nightly-YYYYMMDD` in the update
+  check, the upgrade pre-flight and the DNS bundle stamp (#2354).**
+  #2111 gave `GET /version` one spelling of a nightly
+  (`0.0.0-nightly-YYYYMMDD+sha`), but three places still read the bare
+  image tag, which names no build date: the daily update check offered a
+  nightly a release it already includes, the upgrade pre-flight called it
+  "not a release" instead of "already includes the target", and every DNS
+  server row's `bundle_app_version` named the build differently from
+  `/version`. All three now use `canonical_version`. Releases are
+  unaffected. Existing server rows pick up the new spelling on their next
+  render.
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
