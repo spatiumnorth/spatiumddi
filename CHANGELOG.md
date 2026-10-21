@@ -128,6 +128,15 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Audit page "Chain verified" badge now checks the newest audit
+  rows, not the oldest (#2297).** It verified the first 1,000 rows ever
+  written, so once an install passed 1,000 rows, tampering with recent
+  history still showed green. `GET /audit/integrity` takes
+  `newest=true` with `max_rows` to verify the latest window, anchored
+  on the row before it, and reports `first_seq` / `last_seq` /
+  `partial`; the badge tooltip states the range it covered and that the
+  nightly verify walks the whole chain.
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
