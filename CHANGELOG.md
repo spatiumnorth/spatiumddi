@@ -128,6 +128,14 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Changing the Copilot tool catalog left no audit row (#2300).**
+  `PUT /ai/tools/catalog` is the switch that turns on the tools
+  that are default-off because they expose secrets, write broadly or
+  call off-prem, and it committed with no record of who flipped it.
+  It now writes one `audit_log` row in the same transaction, listing
+  the tools it enabled and the tools it disabled (a diff, not the
+  whole catalog). A write that changes nothing writes no row.
+
 - **Acknowledging, suppressing or deleting a captured internal error
   left no audit row (#2301).** The three Diagnostics routes mutated or
   hard-deleted the error with nothing in `audit_log`, so a fault (or
