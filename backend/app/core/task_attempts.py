@@ -42,9 +42,13 @@ async def count_delivery(task_name: str, task_id: str | None) -> int | None:
     try:
         client = make_async_redis(settings.redis_url, socket_connect_timeout=2.0)
         key = f"{DELIVERY_KEY_PREFIX}{task_name}:{task_id}"
-        n = int(await client.incr(key))
-        await client.expire(key, DELIVERY_TTL_SECONDS)
-        return n
+        # One MULTI/EXEC so a worker killed between the two cannot leave the
+        # key without a TTL (the #2294 shape).
+        async with client.pipeline(transaction=True) as pipe:
+            pipe.incr(key)
+            pipe.expire(key, DELIVERY_TTL_SECONDS)
+            n, _ = await pipe.execute()
+        return int(n)
     except Exception as exc:  # noqa: BLE001 — advisory: unknown count, run anyway
         logger.warning("task_delivery_count_unavailable", task=task_name, error=str(exc))
         return None
