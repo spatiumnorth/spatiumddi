@@ -207,6 +207,11 @@ class IntegrityResponse(BaseModel):
     ok: bool
     rows_checked: int
     breaks: list[ChainBreakResponse]
+    # Highest ``seq`` the walk examined, and whether it reached the end of
+    # the table. ``ok`` with ``complete=false`` is "clean up to
+    # ``verified_through_seq``" only (#2297).
+    verified_through_seq: int | None = None
+    complete: bool = True
 
 
 @router.get("/integrity", response_model=IntegrityResponse)
@@ -229,6 +234,8 @@ async def get_audit_integrity(
     return IntegrityResponse(
         ok=result.ok,
         rows_checked=result.rows_checked,
+        verified_through_seq=result.last_seq,
+        complete=result.complete,
         breaks=[
             ChainBreakResponse(
                 seq=b.seq,

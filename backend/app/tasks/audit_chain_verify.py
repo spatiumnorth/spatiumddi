@@ -21,11 +21,18 @@ import structlog
 from celery import shared_task
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import task_session
 from app.models.alerts import AlertEvent, AlertRule
-from app.services.audit_chain import verify_chain
+from app.models.audit import AuditChainCheckpoint
+from app.services.audit_chain import (
+    FULL_PASS_INTERVAL,
+    ChainVerifyResult,
+    checkpoint_still_valid,
+    verify_chain,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -33,9 +40,61 @@ logger = structlog.get_logger(__name__)
 _RULE_NAME = "audit-chain-broken"
 
 
+async def _walk_with_checkpoint(db: AsyncSession) -> ChainVerifyResult:
+    """Verify the chain, resuming from the stored checkpoint (#2286).
+
+    Walks only rows added since the last clean run, unless there is no
+    usable checkpoint or the last full pass is older than
+    ``FULL_PASS_INTERVAL``, in which case it starts from the first row.
+    The checkpoint is advanced after every page while the walk is clean, so
+    a run cut short keeps its progress and the next one carries on; it is
+    never advanced past a break, so a break is found again (and deduped)
+    rather than skipped. A failure raises: nothing here turns a walk that
+    did not finish into a result.
+    """
+    now = datetime.now(UTC)
+    cp = await db.get(AuditChainCheckpoint, 1)
+    start: tuple[int, str] | None = None
+    if cp is not None and cp.verified_seq > 0 and cp.verified_hash:
+        stale = cp.full_pass_done_at is not None and now - cp.full_pass_done_at > FULL_PASS_INTERVAL
+        if not stale and await checkpoint_still_valid(db, cp.verified_seq, cp.verified_hash):
+            start = (cp.verified_seq, cp.verified_hash)
+        else:
+            logger.info("audit_chain_verify_full_pass", reason="stale" if stale else "mismatch")
+    if cp is None:
+        cp = AuditChainCheckpoint(id=1, verified_seq=0)
+        db.add(cp)
+    if start is None:
+        cp.verified_seq = 0
+        cp.verified_hash = None
+        cp.full_pass_done_at = None
+    await db.commit()
+
+    async def _save(last_seq: int, last_hash: str, _rows: int, breaks: int) -> None:
+        if breaks:
+            return
+        cp.verified_seq = last_seq
+        cp.verified_hash = last_hash
+        cp.updated_at = datetime.now(UTC)
+        await db.commit()
+
+    result = await verify_chain(db, start_after=start, on_chunk=_save)
+    if result.ok and result.complete and cp.full_pass_done_at is None:
+        cp.full_pass_done_at = datetime.now(UTC)
+        await db.commit()
+    return result
+
+
 async def _async_verify_and_alert() -> dict:
     async with task_session(command_timeout=settings.task_db_long_command_timeout) as db:
-        result = await verify_chain(db)
+        try:
+            result = await _walk_with_checkpoint(db)
+        except Exception:
+            # A walk that dies (timeout, lost connection) verified nothing
+            # past its checkpoint; say so loudly and fail the task rather
+            # than return anything that reads as "verified".
+            logger.exception("audit_chain_verify_failed")
+            raise
         rule = (
             await db.execute(select(AlertRule).where(AlertRule.name == _RULE_NAME))
         ).scalar_one_or_none()
@@ -58,7 +117,11 @@ async def _async_verify_and_alert() -> dict:
                 if open_evt is not None:
                     open_evt.resolved_at = datetime.now(UTC)
                     await db.commit()
-            return {"ok": True, "rows_checked": result.rows_checked}
+            return {
+                "ok": True,
+                "rows_checked": result.rows_checked,
+                "verified_through_seq": result.last_seq,
+            }
 
         if rule is None:
             # Seeder ran late or operator deleted the rule. Log loudly
