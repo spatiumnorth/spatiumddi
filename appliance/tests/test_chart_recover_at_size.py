@@ -1,10 +1,10 @@
 """The charts let DNS and Postgres come back at size (#2240, #2132).
 
-* DNS: the agent renders and ``named-checkzone``s every zone before named
-  listens. At 20,009 zones that took 16-20 minutes, and the tcp :53 liveness
-  probe (30 s delay, 3 x 30 s) killed the container after ~2 minutes, in a
-  loop. Each DNS role now carries a startupProbe with a 30-minute budget,
-  rendered ahead of that liveness probe.
+* DNS: the agent renders every zone before the server listens. At 20,009
+  zones that took 16-20 minutes, and the tcp :53 liveness probe (30 s delay,
+  3 x 30 s) killed the container after ~2 minutes, in a loop. dns-powerdns
+  and dns-technitium carry a startupProbe with a 30-minute budget, rendered
+  ahead of that liveness probe (dns-bind9's is #2226's).
 * Postgres: a former primary rejoining after a partition needs WAL back to
   where it diverged, for ``pg_rewind`` and for streaming. With CloudNativePG's
   512MB default retention it looped for ever (#2132), so the Cluster carries
@@ -25,9 +25,8 @@ REPO = Path(__file__).resolve().parent.parent.parent
 APPLIANCE = REPO / "charts" / "spatiumddi-appliance"
 UMBRELLA = REPO / "charts" / "spatiumddi"
 
-# role values key -> template file; all three share the tcp :53 liveness probe.
+# role values key -> template file; both share the tcp :53 liveness probe.
 DNS_ROLES = {
-    "dnsBind9": "dns-bind9.yaml",
     "dnsPowerdns": "dns-powerdns.yaml",
     "dnsTechnitium": "dns-technitium.yaml",
 }

@@ -138,23 +138,6 @@ dnsBind9:
       memory: 256Mi
     limits:
       memory: 2Gi
-  # #2240 — a startupProbe (tcpSocket :53) ahead of the liveness probe.
-  # The agent renders every zone and runs ``named-checkzone`` on each one
-  # BEFORE it starts named, so :53 stays closed for as long as that takes. At
-  # ~1M devices (20,009 zones, 2M A + PTR records) it took 16-20 minutes,
-  # and the liveness probe (tcp :53 from 30 s, every 30 s, 3 misses) killed
-  # the container after ~2 minutes, every time, so the server never came
-  # up. While a startupProbe runs, Kubernetes runs neither liveness nor
-  # readiness; once :53 answers, both take over unchanged. 180 x 10 s gives
-  # named 30 minutes to listen. A container that never listens (its bundle
-  # never arrives: wrong group, revoked key) is still restarted, after 30
-  # minutes instead of ~2. ``enabled: false`` drops the probe and leaves the
-  # liveness probe on its own, as before #2240.
-  startupProbe:
-    enabled: true
-    periodSeconds: 10
-    failureThreshold: 180  # x periodSeconds = 30 min before a restart
-    timeoutSeconds: 2
   # Pass-through to the agent via env. The supervisor fills these in
   # when assigning the DNS role.
   # controlPlaneUrl is the EXTERNAL operator-facing URL. #409 — the
@@ -219,12 +202,20 @@ dnsPowerdns:
     requests:
       cpu: 250m
       memory: 128Mi
-  # #2240 — same tcp :53 startupProbe as dnsBind9.startupProbe (same
-  # liveness probe behind it, same 30-minute budget).
+  # #2240 — a startupProbe (tcpSocket :53) ahead of the liveness probe.
+  # The agent takes its bundle and writes every zone BEFORE the server
+  # listens, so :53 stays closed for as long as that takes, and the liveness
+  # probe (tcp :53 from 30 s, every 30 s, 3 misses) kills the container after
+  # ~2 minutes. While a startupProbe runs, Kubernetes runs neither liveness
+  # nor readiness; once :53 answers, both take over unchanged. 180 x 10 s
+  # gives the server 30 minutes to listen. A container that never listens is
+  # still restarted, after 30 minutes instead of ~2. ``enabled: false`` drops
+  # the probe and leaves the liveness probe on its own, as before #2240.
+  # (dns-bind9's own startup probe is #2226's.)
   startupProbe:
     enabled: true
     periodSeconds: 10
-    failureThreshold: 180
+    failureThreshold: 180  # x periodSeconds = 30 min before a restart
     timeoutSeconds: 2
   controlPlaneUrl: ""
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
@@ -264,7 +255,7 @@ dnsTechnitium:
     requests:
       cpu: 250m
       memory: 256Mi
-  # #2240 — same tcp :53 startupProbe as dnsBind9.startupProbe (same
+  # #2240 — same tcp :53 startupProbe as dnsPowerdns.startupProbe (same
   # liveness probe behind it, same 30-minute budget).
   startupProbe:
     enabled: true

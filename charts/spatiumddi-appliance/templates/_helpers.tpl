@@ -116,12 +116,13 @@ values.yaml): a supervisor that does not verify pins nothing. Paths match ``cp_t
 {{- end -}}
 
 {{/*
-#2240 — the DNS serving container's startupProbe, shared by dns-bind9,
-dns-powerdns and dns-technitium (all three use the same tcpSocket :53
-liveness probe). Called with the role's ``startupProbe`` values map; renders
-nothing when that map is absent or ``enabled`` is false, which leaves the
-liveness probe on its own as before. See ``dnsBind9.startupProbe`` in
-values.yaml for why the budget is 30 minutes.
+#2240 — the DNS serving container's startupProbe, shared by dns-powerdns
+and dns-technitium (both use the same tcpSocket :53 liveness probe;
+dns-bind9's startup probe is #2226's). Called with the role's
+``startupProbe`` values map; renders nothing when that map is absent or
+``enabled`` is false, which leaves the liveness probe on its own as before.
+See ``dnsPowerdns.startupProbe`` in values.yaml for why the budget is 30
+minutes.
 */}}
 {{- define "spatiumddi-appliance.dnsStartupProbe" -}}
 {{- with . -}}

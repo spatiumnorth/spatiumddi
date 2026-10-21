@@ -181,15 +181,6 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
             timeoutSeconds: 3
-          # #2240 — the startupProbe holds this liveness probe (and the
-          # readiness probe above) off until named listens on :53. The agent
-          # renders and ``named-checkzone``s every zone BEFORE it starts
-          # named: at 20,009 zones that took 16-20 min, and this probe alone
-          # (30 s delay, 3 × 30 s) killed the container after ~2 min, in a
-          # loop. Budget and the off switch: ``dnsBind9.startupProbe``.
-          {{- with include "spatiumddi-appliance.dnsStartupProbe" .Values.dnsBind9.startupProbe }}
-          {{- . | nindent 10 }}
-          {{- end }}
           livenessProbe:
             tcpSocket:
               port: 53

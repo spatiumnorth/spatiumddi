@@ -132,8 +132,9 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
             timeoutSeconds: 3
-          # #2240 — startupProbe before liveness, same as dns-bind9.yaml
-          # (``dnsPowerdns.startupProbe``).
+          # #2240 — the startupProbe holds this liveness probe (and the
+          # readiness probe above) off until the server listens on :53.
+          # Budget and the off switch: ``dnsPowerdns.startupProbe``.
           {{- with include "spatiumddi-appliance.dnsStartupProbe" .Values.dnsPowerdns.startupProbe }}
           {{- . | nindent 10 }}
           {{- end }}
