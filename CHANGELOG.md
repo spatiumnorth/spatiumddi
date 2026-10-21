@@ -141,7 +141,7 @@ the formatter handles the rest.
   still pass. If a dangling reference reaches the config anyway (a
   disabled or empty device policy, an import), the restriction is kept
   rather than dropped, so a quarantine pool never opens to every
-  client, and the bundle build logs
+  client, and the bundle build logs (once per change, not per long-poll)
   `dhcp_pool_restricted_to_undefined_class`.
 
 - **`docs/PRIVACY.md` listed the RDAP lookups as per-click only (#2280).**

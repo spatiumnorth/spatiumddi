@@ -49,7 +49,7 @@ from app.models.dhcp import (
 )
 from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.ipam import Subnet
-from app.services.dhcp.class_refs import dangling_restrictions
+from app.services.dhcp.class_refs import dangling_changed, dangling_restrictions
 from app.services.dhcp.device_policy import (
     compile_device_policy,
     load_fingerprint_snapshot,
@@ -395,16 +395,19 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
     # changes the scope's capacity. The restriction ships as stored (the pool
     # matches nobody, which is what Kea does with it anyway) and we say so
     # loudly, since Kea itself accepts the config without a word.
-    for label, cls in dangling_restrictions(
+    # Logged when the dangling set changes, not on every long-poll rebuild.
+    dangling = dangling_restrictions(
         [(f"{p.start_ip}-{p.end_ip}", p.class_restriction or "") for s in scopes for p in s.pools],
         {c.name for c in client_classes} | {d.name for d in device_policy_classes},
-    ):
-        log.warning(
-            "dhcp_pool_restricted_to_undefined_class",
-            server_id=str(server.id),
-            pool=label,
-            client_class=cls,
-        )
+    )
+    if dangling_changed(str(server.id), dangling):
+        for label, cls in dangling:
+            log.warning(
+                "dhcp_pool_restricted_to_undefined_class",
+                server_id=str(server.id),
+                pool=label,
+                client_class=cls,
+            )
 
     # IPv6 Router Advertisements (issue #524) — one radvd stanza per
     # RA-enabled IPv6 subnet in the group. The rendered radvd.conf ships in

@@ -51,11 +51,22 @@ async def pools_restricted_to(
     return [(r[0] or "", str(r[1]), str(r[2])) for r in rows]
 
 
+def calls_member(expr: str, name: str) -> bool:
+    """Whether a Kea test expression calls ``member('<name>')``."""
+    return bool(re.search(r"\bmember\s*\(\s*(['\"])" + re.escape(name) + r"\1\s*\)", expr))
+
+
 async def classes_testing_membership(
     db: AsyncSession, group_id: uuid.UUID, name: str, exclude_id: uuid.UUID | None = None
 ) -> list[str]:
-    """Other client classes whose test is ``member('<name>')``-dependent."""
-    needles = (f"'{name}'", f'"{name}"')
+    """Other client classes whose test calls ``member('<name>')``.
+
+    Matched as the call, not as the quoted name anywhere in a test that also
+    happens to use ``member()``: ``member('a') and option[60].text == 'b'``
+    does not reference a class ``b``. Whitespace inside the call and a
+    leading ``not`` are both tolerated; Kea strings are single-quoted, but a
+    double-quoted spelling is matched too rather than missed.
+    """
     rows = (
         await db.execute(
             select(DHCPClientClass.id, DHCPClientClass.name, DHCPClientClass.match_expression)
@@ -65,9 +76,9 @@ async def classes_testing_membership(
     ).all()
     out: list[str] = []
     for cid, cname, expr in rows:
-        if cid == exclude_id or not expr or "member(" not in expr:
+        if cid == exclude_id or not expr:
             continue
-        if any(n in expr for n in needles):
+        if calls_member(expr, name):
             out.append(cname)
     return out
 
@@ -106,3 +117,24 @@ def dangling_restrictions(
         for label, c in pool_classes
         if c and c not in defined and not is_builtin_or_generated(c)
     ]
+
+
+# server id -> the dangling set last logged for it. The bundle is rebuilt on
+# every agent long-poll iteration (the 2 s fallback / 12 s wake tick), so an
+# unconditional warning would repeat for as long as the reference dangles,
+# which is routinely a while: a freshly-created device policy compiles to
+# nothing until its device classes are observed. Per process, so each worker
+# says it once; a change in the set (fixed, or a new one) says it again.
+_last_reported: dict[str, frozenset[tuple[str, str]]] = {}
+
+
+def dangling_changed(server_id: str, dangling: list[tuple[str, str]]) -> bool:
+    """True when ``dangling`` differs from what was last reported for the server."""
+    current = frozenset(dangling)
+    if _last_reported.get(server_id) == current:
+        return False
+    if current:
+        _last_reported[server_id] = current
+    else:
+        _last_reported.pop(server_id, None)
+    return True

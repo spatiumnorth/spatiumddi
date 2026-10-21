@@ -235,3 +235,45 @@ async def test_a_dangling_restriction_is_kept_and_logged_in_the_bundle(
     assert restrictions == {"ghost", "defined"}
     warned = [e for e in logs if e["event"] == "dhcp_pool_restricted_to_undefined_class"]
     assert [(e["client_class"], e["pool"]) for e in warned] == [("ghost", "10.77.1.10-10.77.1.20")]
+
+    # Rebuilt on every long-poll: the same dangling set is not re-reported.
+    with capture_logs() as again:
+        await build_config_bundle(db_session, srv)
+    assert not [e for e in again if e["event"] == "dhcp_pool_restricted_to_undefined_class"]
+
+
+def test_member_references_are_matched_as_the_call() -> None:
+    """``member('x')`` counts in any spelling Kea accepts; the bare quoted
+    name elsewhere in a test that also uses member() does not."""
+    from app.services.dhcp.class_refs import calls_member as refs
+
+    assert refs("member('iot')", "iot")
+    assert refs("not member( 'iot' )", "iot")
+    assert refs("member ('a') or (member('iot') and pkt4.mac == 0x01)", "iot")
+    assert refs('member("iot")', "iot")
+    assert not refs("member('a') and option[60].text == 'iot'", "iot")
+    assert not refs("member('iot2')", "iot")
+    assert not refs("member('i.t')", "iot")
+    assert not refs("nonmember('iot')", "iot")
+
+
+async def test_a_string_literal_is_not_a_member_reference(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.dhcp.class_refs import classes_testing_membership
+
+    grp, _scope, _srv = await _v4_scope(db_session)
+    db_session.add_all(
+        [
+            DHCPClientClass(
+                group_id=grp.id,
+                name="vendor",
+                match_expression="member('KNOWN') and option[60].text == 'printers'",
+            ),
+            DHCPClientClass(
+                group_id=grp.id, name="child", match_expression="not member( 'printers' )"
+            ),
+        ]
+    )
+    await db_session.commit()
+    assert await classes_testing_membership(db_session, grp.id, "printers") == ["child"]
