@@ -1318,8 +1318,9 @@ grandfathered.
 
 **Compliance + Copilot.** The `no_lanwide_control_plane_ports` conformity check
 (platform-kind, PCI-DSS 1.2.1 / HIPAA segmentation) fails only on a *confirmed*
-LAN-wide node and reports **PASS-stale** for nodes it can't currently reach
-(never connectivity-FAIL, per #5). Five Operator-Copilot MCP tools
+LAN-wide node and reports **warn** for stale or unverified nodes (unknown is
+not compliant, but lost contact is never a FAIL), and **not applicable** when no
+appliance reports at all (#2259). Five Operator-Copilot MCP tools
 (`find_firewall_policies` / `count_firewall_policies` / `find_firewall_aliases`
 / `find_firewall_effective` reads + the default-off `propose_toggle_firewall_policy`)
 surface the model to the chat, tagged `module="appliance.firewall"`.

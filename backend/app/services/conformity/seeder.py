@@ -267,9 +267,10 @@ _BUILTIN_POLICIES: list[dict[str, object]] = [
             "Network segmentation — no SpatiumDDI appliance node may accept "
             "the k3s control-plane ports (etcd 2379/2380, kubelet 10250) from "
             "the whole LAN; #285 scopes them to cluster peers. Fails on a "
-            "node confirmed still on the legacy LAN-wide base; a node the "
-            "control plane can't currently reach reports PASS-stale (never "
-            "connectivity-FAIL, per the control-plane-loss invariant)."
+            "node confirmed still on the legacy LAN-wide base; a stale or "
+            "unverified node reports warn (unknown, never a PASS and never a "
+            "connectivity-FAIL), and a deployment with no reporting appliance "
+            "is not applicable."
         ),
         "framework": "PCI-DSS 4.0",
         "reference": "1.2.1",
