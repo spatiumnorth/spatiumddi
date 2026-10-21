@@ -35,6 +35,7 @@ from app.models.dns import DNSPool
 from app.services.dns.pool_apply import apply_pool_state
 from app.services.dns.pool_healthcheck import apply_check_to_member, run_check
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -165,6 +166,7 @@ async def _dispatch_due_async() -> int:
 
 
 @celery_app.task(name="app.tasks.dns_pool_healthcheck.dispatch_due_pools", bind=True)
+@module_gated("core.dns")
 def dispatch_due_pools(self: Any) -> int:  # noqa: ARG001
     """Beat-fired sweep — queues ``run_pool_check`` per due pool."""
     return asyncio.run(_dispatch_due_async())

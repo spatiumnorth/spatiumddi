@@ -28,6 +28,7 @@ from app.models.opnsense import OPNsenseRouter
 from app.models.panos import PANOSFirewall
 from app.models.unifi import UnifiController
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -237,6 +238,7 @@ async def _run_lift(target_kind: str, target_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.block_sync.sweep_block_sync", bind=True)
+@module_gated("security.block_sync")
 def sweep_block_sync(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_sweep())
 

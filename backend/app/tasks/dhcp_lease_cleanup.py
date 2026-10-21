@@ -31,6 +31,7 @@ from app.services.dhcp.lease_cleanup import (
 )
 from app.services.dhcp.lease_history import record_lease_history
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -144,6 +145,7 @@ async def _sweep() -> tuple[int, int]:
 
 
 @celery_app.task(name="app.tasks.dhcp_lease_cleanup.sweep_expired_leases")
+@module_gated("core.dhcp")
 def sweep_expired_leases() -> dict[str, int]:
     cleaned, deleted = asyncio.run(_sweep())
     logger.info(

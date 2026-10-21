@@ -23,6 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.celery_app import celery_app
 from app.db import task_session
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -36,6 +37,7 @@ logger = structlog.get_logger(__name__)
     retry_jitter=True,
     max_retries=3,
 )
+@module_gated("security.dnsbl")
 def sweep_dnsbl(self) -> dict[str, object]:
     """Daily DNSBL reputation sweep across every public-facing candidate IP."""
     return asyncio.run(_sweep_async())

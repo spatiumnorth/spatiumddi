@@ -31,6 +31,7 @@ from app.config import settings
 from app.db import task_connect_args
 from app.models.dns import DNSBlockList
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -103,6 +104,7 @@ async def _dispatch_due_async() -> int:
 
 
 @celery_app.task(name="app.tasks.blocklist_refresh_sweep.dispatch_due_blocklists", bind=True)
+@module_gated("core.dns")
 def dispatch_due_blocklists(self: Any) -> int:  # noqa: ARG001
     """Beat-fired sweep — queues ``refresh_blocklist_feed`` per due list."""
     return asyncio.run(_dispatch_due_async())

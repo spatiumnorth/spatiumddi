@@ -20,6 +20,7 @@ from app.config import settings
 from app.db import task_connect_args
 from app.models.meraki import MerakiOrg
 from app.models.settings import PlatformSettings
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -129,6 +130,7 @@ async def _run_one(org_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.meraki_sync.sweep_meraki_orgs", bind=True)
+@module_gated("integrations.meraki")
 def sweep_meraki_orgs(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_sweep())
 

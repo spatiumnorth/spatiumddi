@@ -21,6 +21,7 @@ from app.config import settings
 from app.db import task_connect_args
 from app.models.docker import DockerHost
 from app.models.settings import PlatformSettings
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -137,6 +138,7 @@ async def _run_one(host_id: str) -> dict[str, Any]:
     name="app.tasks.docker_sync.sweep_docker_hosts",
     bind=True,
 )
+@module_gated("integrations.docker")
 def sweep_docker_hosts(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_sweep())
 

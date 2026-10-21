@@ -37,6 +37,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServer, DNSZone
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -180,6 +181,7 @@ async def _run_sync() -> dict[str, Any]:
 # Celery task name kept stable for backward-compatibility with any deployed
 # beat schedule / in-flight messages from the pull-only era.
 @celery_app.task(name="app.tasks.dns_pull.auto_pull_dns_from_servers", bind=True)
+@module_gated("core.dns")
 def auto_pull_dns_from_servers(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     """Celery beat entrypoint — fires every 60 s; the task itself checks
     the platform-settings gate and the per-run interval. Runs the full

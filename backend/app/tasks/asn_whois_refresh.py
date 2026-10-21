@@ -44,6 +44,7 @@ from app.db import task_session
 from app.models.asn import ASN
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -250,6 +251,7 @@ async def _run_refresh() -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.asn_whois_refresh.refresh_due_asns", bind=True)
+@module_gated("network.asn")
 def refresh_due_asns(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     """Beat-fired hourly. Per-row ``next_check_at`` gates the actual
     pace; ``PlatformSettings.asn_whois_interval_hours`` controls the
@@ -347,6 +349,7 @@ async def _refresh_one_by_id_async(asn_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.asn_whois_refresh.refresh_one_asn_by_id", bind=True)
+@module_gated("network.asn")
 def refresh_one_asn_by_id(self: object, asn_id: str) -> dict[str, Any]:  # type: ignore[type-arg]
     """One-shot whois (+ RPKI) refresh for a single ASN, dispatched right
     after create_asn (#278 follow-up) so a public AS is populated within

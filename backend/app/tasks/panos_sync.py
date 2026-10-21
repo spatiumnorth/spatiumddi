@@ -20,6 +20,7 @@ from app.config import settings
 from app.db import task_connect_args
 from app.models.panos import PANOSFirewall
 from app.models.settings import PlatformSettings
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -136,6 +137,7 @@ async def _run_one(firewall_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.panos_sync.sweep_panos_firewalls", bind=True)
+@module_gated("integrations.paloalto")
 def sweep_panos_firewalls(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_sweep())
 

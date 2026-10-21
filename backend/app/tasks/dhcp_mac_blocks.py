@@ -30,6 +30,7 @@ from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.registry import get_driver
 from app.models.dhcp import DHCPMACBlock, DHCPServer
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -124,6 +125,7 @@ async def _run_sync() -> dict[str, Any]:
     retry_backoff=True,
     max_retries=2,
 )
+@module_gated("core.dhcp")
 def sync_dhcp_mac_blocks(self: Any) -> dict[str, Any]:  # noqa: ARG001
     """Beat-fired entrypoint. Runs the async reconciler under asyncio."""
     return asyncio.run(_run_sync())

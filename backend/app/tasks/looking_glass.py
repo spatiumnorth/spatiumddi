@@ -34,6 +34,7 @@ from app.services.looking_glass.ipam_link import (
     resolve_route_links,
 )
 from app.services.looking_glass.vrf_match import build_vrf_rt_index, match_vrf_for_route
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -75,6 +76,7 @@ async def _collector_stale_sweep_async() -> dict[str, int]:
 
 
 @celery_app.task(name="app.tasks.looking_glass.collector_stale_sweep")
+@module_gated("network.looking_glass")
 def collector_stale_sweep() -> dict[str, int]:
     """Celery beat task — flips stale Looking Glass collectors to 'unreachable'."""
     return asyncio.run(_collector_stale_sweep_async())
@@ -146,6 +148,7 @@ async def _reresolve_route_links_async() -> dict[str, int]:
 
 
 @celery_app.task(name="app.tasks.looking_glass.reresolve_route_links")
+@module_gated("network.looking_glass")
 def reresolve_route_links() -> dict[str, int]:
     """Celery beat task — re-resolves matched_*_id for every active route."""
     return asyncio.run(_reresolve_route_links_async())

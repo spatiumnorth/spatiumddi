@@ -58,6 +58,7 @@ from app.services.snmp.poller import (
     NeighbourData,
     walk_lldp_neighbours,
 )
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -466,6 +467,7 @@ async def _poll_device_async(device_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.snmp_poll.poll_device", bind=True)
+@module_gated("network.device")
 def poll_device(self: Any, device_id_str: str) -> dict[str, Any]:  # noqa: ARG001
     """Poll one device. Idempotent — safe to retry."""
     return asyncio.run(_poll_device_async(device_id_str))
@@ -509,6 +511,7 @@ async def _dispatch_due_async() -> int:
 
 
 @celery_app.task(name="app.tasks.snmp_poll.dispatch_due_devices", bind=True)
+@module_gated("network.device")
 def dispatch_due_devices(self: Any) -> int:  # noqa: ARG001
     """Beat-fired sweep — queues a ``poll_device`` task per due row."""
     return asyncio.run(_dispatch_due_async())

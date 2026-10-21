@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, Subnet
 from app.models.nmap import NmapScan
+from app.services.feature_modules import is_module_enabled
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.nmap.runner import PRESETS
 
@@ -55,6 +56,10 @@ class ProbeSuppressed(Exception):
 # Operator-driven scans count toward the cap too (we'd rather defer
 # the next auto-profile than queue ahead of a human-triggered scan).
 MAX_CONCURRENT_PROFILES_PER_SUBNET = 4
+
+# Every scan this module dispatches is an nmap scan, so it answers to the
+# nmap feature module (#2279).
+NMAP_MODULE_ID = "tools.nmap"
 
 
 async def _count_in_flight_profiles(db: AsyncSession, subnet_id) -> int:
@@ -112,6 +117,17 @@ async def maybe_enqueue_for_lease(
     """
     try:
         if not getattr(subnet, "auto_profile_on_dhcp_lease", False):
+            return None
+
+        # The subnet flag outlives the module (#2279): an operator who turns
+        # nmap off expects no scans, and the subnet setting that asked for
+        # them is no longer even visible to switch off.
+        if not await is_module_enabled(db, NMAP_MODULE_ID):
+            logger.debug(
+                "auto_profile_skip_module_disabled",
+                subnet=str(subnet.id),
+                ip=str(ipam_row.address),
+            )
             return None
 
         # Fragile-device suppression (#722). Checked before the refresh

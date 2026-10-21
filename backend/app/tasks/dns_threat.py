@@ -24,6 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.celery_app import celery_app
 from app.config import settings
 from app.db import task_session
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -56,6 +57,7 @@ async def _run() -> dict[str, object]:
     retry_backoff_max=600,
     max_retries=3,
 )
+@module_gated("security.dns_threat")
 def aggregate_dns_client_windows(self) -> dict[str, object]:  # type: ignore[no-untyped-def]
     result = asyncio.run(_run())
     if result.get("status") == "ok" and (
