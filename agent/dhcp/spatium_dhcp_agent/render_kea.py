@@ -756,6 +756,7 @@ def _build_drop_expression_v6(mac_blocks: list[dict[str, Any]]) -> str:
         clauses.append(
             f"(substring(option[1].hex, 0, 4) == 0x00030001 and substring(option[1].hex, 4, 6) == {h})"
             f" or (substring(option[1].hex, 0, 4) == 0x00010001 and substring(option[1].hex, 8, 6) == {h})"
+            f" or (substring(relay6[-1].option[79].hex, 0, 2) == 0x0001 and substring(relay6[-1].option[79].hex, 2, 6) == {h})"
             f" or (substring(relay6[0].option[79].hex, 0, 2) == 0x0001 and substring(relay6[0].option[79].hex, 2, 6) == {h})"
         )
     return " or ".join(clauses)

@@ -405,6 +405,9 @@ def test_mac_blocks_render_drop_class_on_dhcp6(wire_bundle_v6: dict) -> None:
     assert "pkt4" not in t
     assert "substring(option[1].hex, 4, 6) == 0xaabbccddeeff" in t  # DUID-LL
     assert "substring(option[1].hex, 8, 6) == 0xaabbccddeeff" in t  # DUID-LLT
+    # relay6[-1] is the innermost relay (the first hop, which adds option
+    # 79); relay6[0] the outermost. One relay: the same; a chain: -1 matters.
+    assert "relay6[-1].option[79]" in t
     assert "relay6[0].option[79]" in t
     assert "garbage" not in t
     # v4 keeps its own expression.
