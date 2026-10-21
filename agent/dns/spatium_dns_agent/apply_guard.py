@@ -24,32 +24,14 @@ keeps running, and a bundle still settling goes on settling.
 What a count means is decided in ``sync.SyncLoop``:
 
 * :data:`SYNC_FIRST_AFTER_DEATHS` deaths: the cached bundle is not applied at
-  startup. The agent asks the control plane first, and re-applies the cache
-  when the control plane cannot be reached, or when it has not sent a bundle
-  that applied within :data:`SYNC_FIRST_FALLBACK_SECONDS` (non-negotiable #5:
-  one death may be a power cut, and a cache that is never used is no cache).
+  startup. The agent asks the control plane first, and only re-applies the
+  cache when the control plane cannot be reached (non-negotiable #5: one
+  death may be a power cut, and a cache that is never used is no cache).
 * :data:`QUARANTINE_AFTER_DEATHS` deaths the agent WATCHED (the daemon exited
   while the agent was alive to see it, :meth:`ApplyGuard.daemon_died`): the
   bundle is quarantined (#882) as well. Offline it falls back to the
   last-known-good bundle when that is a different one, and otherwise retries
   the cache on the quarantine's backoff rather than on every container start.
-
-Why the wait for the control plane is bounded (#2240). "Reachable" is not
-"able to send a bundle". At about 1.1M records in 20,000 zones the control
-plane answered every poll but could not render a bundle at that size (each
-render outgrew its worker), so the five servers the OOM kill had restarted sat
-dark for about 3.5 h with valid caches on disk, until the guard was bypassed by
-hand. So the hold lasts at most :data:`SYNC_FIRST_FALLBACK_SECONDS` (the
-``SPATIUM_DNS_SYNC_FIRST_FALLBACK_S`` variable overrides it), counted from the
-start. Past it the control plane counts as unreachable whatever it answers (a
-304 with nothing stored, a pending approval, a bundle still streaming in): the
-cache is applied under the marker like any other apply, so a death on it
-counts as usual, and the sync loop goes on asking, so a fresh bundle replaces
-the cache when one lands. A cache that is condemned or quarantined is never
-applied by the wait: the quarantine still decides when it is retried, and what
-the wait can serve is the last-known-good under the usual rules. The cost is a
-server that serves a stale bundle (the one it died on, once) for as long as the
-control plane takes to render a fresh one.
 
 Why the quarantine needs WATCHED deaths. A marker left armed says only that
 the process ended without an orderly exit inside the window: a power cut, a
@@ -85,15 +67,6 @@ SETTLE_SECONDS = 300.0
 
 #: Deaths of the same bundle after which startup syncs before using the cache.
 SYNC_FIRST_AFTER_DEATHS = 1
-
-#: How long a sync-first startup waits for a bundle from the control plane
-#: before it serves the cache anyway (#2240, module doc). The default for
-#: ``AgentConfig.sync_first_fallback_seconds``, which
-#: ``SPATIUM_DNS_SYNC_FIRST_FALLBACK_S`` overrides. In #2223's run every server
-#: answered new names within 6.9 min at 1M records, while the control plane
-#: could still render; ten minutes leaves it room for that and bounds the dark
-#: time when it cannot.
-SYNC_FIRST_FALLBACK_SECONDS = 600.0
 
 #: WATCHED deaths of the same bundle (the agent saw the daemon exit) after
 #: which it is quarantined. Unwatched deaths never quarantine (module doc).

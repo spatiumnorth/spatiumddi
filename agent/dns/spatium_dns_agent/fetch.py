@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any
 
@@ -11,15 +10,6 @@ import httpx
 from .cache import FETCH_SPOOL, parse_bundle_file
 
 CONFIG_PATH = "/api/v1/dns/agents/config"
-
-
-class BundleDeadlinePassed(httpx.ReadTimeout):
-    """The body was still arriving when the caller's deadline passed (#2240).
-
-    A read timeout bounds one read, not the reply: a control plane too loaded
-    to send a large bundle faster than a trickle never trips it. A sync-first
-    startup that has waited its full bound counts that as unreachable, as it
-    does a timeout, and serves its cache instead."""
 
 
 class _SpooledConfig:
@@ -45,12 +35,7 @@ class _SpooledConfig:
             self._spool.unlink(missing_ok=True)
 
 
-def get_config(
-    client: Any,
-    headers: dict[str, str],
-    state_dir: Path,
-    deadline: float | None = None,
-) -> Any:
+def get_config(client: Any, headers: dict[str, str], state_dir: Path) -> Any:
     """GET the config bundle, streaming a 200's body to disk (#2029).
 
     ``Client.get`` reads the whole body into memory — chunk list and joined
@@ -62,10 +47,6 @@ def get_config(
 
     A client that offers only ``get`` (no httpx streaming) is asked the old
     way; its reply has the same three members ``_poll_once`` uses.
-
-    ``deadline`` (``time.monotonic``): a 200 whose body is still streaming when
-    it passes is abandoned with :class:`BundleDeadlinePassed` (#2240). Checked
-    between chunks, so a stalled read still ends on the client's own timeout.
     """
     stream = getattr(client, "stream", None)
     if stream is None:
@@ -78,11 +59,6 @@ def get_config(
         try:
             with spool.open("wb") as fh:
                 for chunk in resp.iter_bytes():
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise BundleDeadlinePassed(
-                            "the control plane's bundle was still arriving when the "
-                            "startup wait for it ran out"
-                        )
                     fh.write(chunk)
         except BaseException:
             # A body cut off mid-stream raises here (an httpx error the poll
