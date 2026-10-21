@@ -22,6 +22,7 @@ import {
   type ServiceStatus,
   type ServiceUpdate,
 } from "@/lib/api";
+import { formatDateOnly, termDaysLeft } from "@/lib/localTime";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -118,9 +119,7 @@ function KindBadge({ kind }: { kind: ServiceKind }) {
 
 function TermBadge({ termEnd }: { termEnd: string | null }) {
   if (!termEnd) return <span className="text-muted-foreground/50">—</span>;
-  const days = Math.floor(
-    (new Date(termEnd).getTime() - Date.now()) / (24 * 3600 * 1000),
-  );
+  const days = termDaysLeft(termEnd);
   let cls =
     "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400";
   let label = `${days}d`;
@@ -136,7 +135,7 @@ function TermBadge({ termEnd }: { termEnd: string | null }) {
   return (
     <span className="inline-flex items-center gap-2">
       <span className="text-[11px] tabular-nums text-muted-foreground">
-        {new Date(termEnd).toLocaleDateString()}
+        {formatDateOnly(termEnd)}
       </span>
       <span
         className={cn(
