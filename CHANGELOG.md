@@ -128,6 +128,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The conformity summary and PDF report only the current state
+  (#2278).** Both read every `conformity_result` row ever written and
+  kept the newest per (policy, resource), so a target deleted or moved
+  out of a policy's scope (no longer `pci_scope`, say) was never
+  evaluated again and its last `fail` counted forever, in the
+  dashboard and in the auditor-facing PDF. Disabled policies' results
+  counted too, and every Dashboard, Conformity and Platform Insights
+  load pulled the whole history into the api. They now report each
+  enabled policy's most recent evaluation pass, selected in SQL on the
+  existing `(policy_id, evaluated_at)` index, so a target leaves at
+  the policy's next pass and the read is bounded by policies × current
+  targets. Editing what a policy checks clears its last pass until it
+  runs again (the beat task then runs it on its next tick, unless it
+  is on-demand only). The PDF states this scope, prints when each
+  policy's pass ran and how many disabled policies it leaves out, and
+  a framework filter that matches no policy now gives an empty report
+  instead of every framework's results. The Copilot's
+  `get_conformity_summary`, which counted every history row, reports
+  the same numbers as the dashboard.
+
 - **A DoT group's forwarder pinned to port 53 is refused, and the
   DNS docs lose two unused variables (#2128, #2125).** In a group
   forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,
