@@ -86,8 +86,18 @@ def host(tmp_path):
         (root / d).mkdir(parents=True)
     stub = tmp_path / "stubs"
     stub.mkdir()
+    # The runner sets root ownership on what it installs. CI runs these tests
+    # unprivileged, so ownership changes are stubbed: chown is a no-op and
+    # install drops its -o/-g arguments before calling the real install.
+    install_stub = (
+        "#!/bin/bash\nargs=()\nwhile [ $# -gt 0 ]; do\n"
+        '  case "$1" in -o|-g) shift 2 ;; *) args+=("$1"); shift ;; esac\n'
+        'done\nexec /usr/bin/install "${args[@]}"\n'
+    )
     for name, body in (("snmpd", SNMPD_STUB), ("systemctl", SYSTEMCTL_STUB),
-                       ("nft", "#!/bin/bash\nexit 0\n")):
+                       ("nft", "#!/bin/bash\nexit 0\n"),
+                       ("chown", "#!/bin/bash\nexit 0\n"),
+                       ("install", install_stub)):
         p = stub / name
         p.write_text(body)
         p.chmod(p.stat().st_mode | stat.S_IEXEC)
