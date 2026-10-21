@@ -114,9 +114,5 @@ def test_a_corrupt_record_is_replaced(node) -> None:
 
 def test_the_heartbeat_sizes_from_the_boot_maximum() -> None:
     src = Path(heartbeat.__file__).read_text(encoding="utf-8")
-    # #2240 — read once, and handed to both the control-plane sizing and
-    # dns-bind9's memory limit.
-    assert "sizing_mem_mib = k8s_api.sizing_memory_mib(cfg.state_dir)" in src
-    assert src.count("mem_total_mib=sizing_mem_mib") == 2
+    assert "mem_total_mib=k8s_api.sizing_memory_mib(cfg.state_dir)" in src
     assert "mem_total_mib=k8s_api.node_memory_mib()" not in src
-    assert "node_memory_mib()" not in src

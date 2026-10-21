@@ -1293,9 +1293,6 @@ def heartbeat_once(
         # that size too (_release_size): a replace re-sizes nothing, so it
         # neither rolls the api nor scales it down beside a dead replica.
         cnpg_instances = pg_scale.spec_after(cp_size)
-        # The seed's RAM (largest seen this boot, #1585) sizes both the
-        # control plane here and dns-bind9's limit below (#2240).
-        sizing_mem_mib = k8s_api.sizing_memory_mib(cfg.state_dir)
         if cnpg_instances is None:
             log.warning(
                 "supervisor.heartbeat.control_plane_overrides_deferred",
@@ -1309,7 +1306,7 @@ def heartbeat_once(
                 release_size,
                 str(ml_vip),
                 web_ui_allowed_cidrs=list(web_ui_cidrs),
-                mem_total_mib=sizing_mem_mib,
+                mem_total_mib=k8s_api.sizing_memory_mib(cfg.state_dir),
                 cpu_count=k8s_api.node_cpu_count(),
                 cnpg_instances=cnpg_instances,
             )
@@ -1350,14 +1347,10 @@ def heartbeat_once(
         # spatiumddi-appliance HelmChartConfig, leaving every other key
         # (an operator's dnsBind9.resources, #2024) as it is. Inert until
         # the chart exists, i.e. until a DNS/DHCP role is assigned.
-        # #2240 — plus dns-bind9's memory limit, sized from the seed's RAM,
-        # unless an operator set their own (k8s_api.dataplane_resources).
         dns_vip = body_out.get("desired_dns_vip") or ""
         relay_vip = body_out.get("desired_dhcp_relay_vip") or ""
         dp_changed, dp_err = k8s_api.apply_dataplane_vip_overrides(
-            dns_vip=str(dns_vip),
-            dhcp_relay_vip=str(relay_vip),
-            mem_total_mib=sizing_mem_mib,
+            dns_vip=str(dns_vip), dhcp_relay_vip=str(relay_vip)
         )
         if dp_changed:
             log.info(

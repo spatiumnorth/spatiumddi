@@ -1009,8 +1009,7 @@ Where to change it:
 - Appliance: `dnsBind9.resources` on the role chart, as a HelmChartConfig
   (see `docs/deployment/APPLIANCE.md`, "Memory sizing for named"). The limit
   is one value for the whole cluster; the role chart renders the same on
-  every node. The seed sizes it from its own RAM (2-8 GiB, #2240) unless you
-  set your own.
+  every node.
 - Umbrella chart: `dnsAgents.servers[].resources`.
 - Docker Compose: `DNS_BIND9_MEM_LIMIT` in `.env` (default `2g`).
 - Raw manifests: edit `k8s/dns/bind9-statefulset.yaml`.

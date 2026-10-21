@@ -1941,79 +1941,11 @@ def apply_metallb_overrides(
     return _merge_owned_overrides("spatium-metallb", owned)
 
 
-# #2240 — dns-bind9's memory limit, sized from the seed's RAM. The role chart
-# ships 2Gi for every node; at ~1.1M records five bind9 containers of a 7-node
-# lab were OOM-killed at it (agent 1.14 GB + named 0.95 GB), and at a 4Gi
-# limit the peaks reached 3.24-3.76 GiB at 1.4-2M records. A quarter of what
-# the platform reserve leaves, floor the chart's own 2Gi, cap 8 GiB: a 24 GiB
-# node gets 5632Mi, a node of 10 GiB or less keeps 2048Mi (the chart's 2Gi).
-#
-# The limit is one value for the cluster (a DaemonSet has one pod template),
-# so it is written where a cluster has ONE writer: the seed's
-# ``spatiumddi-appliance`` HelmChartConfig, beside the data-plane VIP keys,
-# not the role HelmChart every member renders (#1137). An appliance that is
-# not a seed (a DNS node on its own k3s) writes no Config and keeps the
-# chart's 2Gi.
-#
-# This Config is also where APPLIANCE.md sends an operator to raise
-# ``dnsBind9.resources`` (#2024), and an operator's value must keep winning.
-# So the supervisor records the value it wrote under
-# ``_DATAPLANE_SIZING_KEY`` in the same document, in the same PATCH, and owns
-# the limit only while the live value is absent or still the one it recorded.
-# A value that differs from the record (or a value with no record: every
-# override written before #2240) is the operator's, and is left alone;
-# deleting it hands the limit back to the supervisor. The record is a values
-# key the chart does not read, so it renders nothing.
-_DNS_BIND9_MEM_SHARE = 0.25
-_DNS_BIND9_MEM_MIN_MIB = 2048
-_DNS_BIND9_MEM_MAX_MIB = 8192
-_DATAPLANE_SIZING_KEY = "supervisorSizing"
-_DNS_BIND9_MEM_PATH = ("dnsBind9", "resources", "limits", "memory")
-
-
-def dns_bind9_memory_mib(mem_total_mib: int) -> int:
-    """PURE: dns-bind9's memory limit in MiB for a seed with ``mem_total_mib``
-    of RAM (#2240): a quarter of what the 2 GiB platform reserve leaves,
-    clamped 2048-8192."""
-    budget = max(mem_total_mib - _PLATFORM_RESERVE_MIB, 0)
-    return _clamp_mib(
-        budget, _DNS_BIND9_MEM_SHARE, _DNS_BIND9_MEM_MIN_MIB, _DNS_BIND9_MEM_MAX_MIB
-    )
-
-
-def _dig(doc: Any, path: tuple[str, ...]) -> Any:
-    for key in path:
-        if not isinstance(doc, dict) or key not in doc:
-            return None
-        doc = doc[key]
-    return doc
-
-
-def dataplane_resources(mem_total_mib: int | None, current_doc: dict) -> dict[str, Any]:
-    """PURE: the dns-bind9 memory override for the ``spatiumddi-appliance``
-    HelmChartConfig whose live document is ``current_doc`` (#2240) — ``{}``
-    when the RAM is unknown, or when the live limit is an operator's (it
-    differs from the value the supervisor recorded writing, or there is no
-    record); otherwise the sized limit plus the record of it."""
-    if not mem_total_mib or mem_total_mib <= 0:
-        return {}
-    live = _dig(current_doc, _DNS_BIND9_MEM_PATH)
-    recorded = _dig(current_doc, (_DATAPLANE_SIZING_KEY, "dnsBind9MemoryLimit"))
-    if live is not None and live != recorded:
-        return {}
-    sized = f"{dns_bind9_memory_mib(mem_total_mib)}Mi"
-    return {
-        "dnsBind9": {"resources": {"limits": {"memory": sized}}},
-        _DATAPLANE_SIZING_KEY: {"dnsBind9MemoryLimit": sized},
-    }
-
-
 def apply_dataplane_vip_overrides(
-    *, dns_vip: str, dhcp_relay_vip: str, mem_total_mib: int | None = None
+    *, dns_vip: str, dhcp_relay_vip: str
 ) -> tuple[bool, str | None]:
     """Durably set the data-plane resolver VIPs (#272 Phase 10) on the
-    spatiumddi-appliance HelmChartConfig, and dns-bind9's memory limit sized
-    from ``mem_total_mib`` (#2240, see ``dataplane_resources``).
+    spatiumddi-appliance HelmChartConfig.
 
     ``dns_vip`` (non-empty) flips the bind9 / powerdns DaemonSets OFF
     hostNetwork and behind a single L2 LoadBalancer Service at the VIP
@@ -2029,29 +1961,18 @@ def apply_dataplane_vip_overrides(
     does not touch the per-role ``enabled`` flags.
 
     #2024 — this Config is ALSO where APPLIANCE.md sends an operator to
-    raise ``dnsBind9.resources``, so the supervisor owns its three VIP keys,
-    the dns-bind9 memory limit only while it is not an operator's
-    (``dataplane_resources``), and nothing else: they are merged into the
-    live document and every other key survives the heartbeat. The VIP keys
-    are written explicitly when off (``useMetalLBVIP: false``, ``vip: ""``,
-    ``relayVIP: ""``) because a merge cannot remove a key by leaving it out.
-    Writes only when the merge changes something.
-
-    #2240 — a new limit is a rolling restart of the dns-bind9 DaemonSet, on
-    the first heartbeat that writes it (an appliance upgrading into the
-    sizing, or a seed whose RAM grew); later heartbeats write nothing."""
+    raise ``dnsBind9.resources``, so the supervisor owns its three keys
+    and nothing else: they are merged into the live document and every
+    other key survives the heartbeat. The VIP keys are written explicitly
+    when off (``useMetalLBVIP: false``, ``vip: ""``, ``relayVIP: ""``)
+    because a merge cannot remove a key by leaving it out. Writes only
+    when the merge changes something."""
     dns_vip = (dns_vip or "").strip()
     relay_vip = (dhcp_relay_vip or "").strip()
-    vip_keys = {
+    owned = {
         "dns": {"useMetalLBVIP": bool(dns_vip), "vip": dns_vip},
         "dhcpKea": {"relayVIP": relay_vip},
     }
-
-    def owned(current_doc: dict) -> dict[str, Any]:
-        # The memory limit's ownership is read from the same document the
-        # merge writes into.
-        return _deep_merge(vip_keys, dataplane_resources(mem_total_mib, current_doc))
-
     return _merge_owned_overrides("spatiumddi-appliance", owned)
 
 

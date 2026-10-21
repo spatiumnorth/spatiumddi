@@ -1168,25 +1168,12 @@ Postgres and the api, and the kernel killed named. With the limit the kernel
 kills named inside the pod's own cgroup instead, and the control plane stays
 up.
 
-On an appliance cluster the seed's supervisor sizes this limit from the
-seed's RAM (#2240): a quarter of what the 2 GiB platform reserve leaves,
-floor the chart's 2Gi, cap 8 GiB, so a node of 10 GiB or less keeps 2048Mi,
-a 16 GiB seed about 3.5 GiB and a 24 GiB seed about 5.5 GiB. A DaemonSet has one limit
-for all its pods, and the role chart is one HelmChart that every node's
-supervisor writes, so it must render the same everywhere (#1137). The limit
-therefore goes into the `spatiumddi-appliance` HelmChartConfig, which only
-the seed writes, beside its data-plane VIP keys, with a record of the value
-under `supervisorSizing.dnsBind9MemoryLimit` (a key the chart does not read).
-A DNS appliance that is not a seed (its own k3s, no control plane) keeps the
-chart's 2Gi. A new value is one rolling restart of `dns-bind9`, on the
-heartbeat that writes it.
-
-Your own value still wins. The supervisor re-sizes the limit only while it is
-absent or still the value it recorded; any other value, including every
-override written before #2240, is left alone. Delete your
-`dnsBind9.resources.limits.memory` to hand it back. To raise it for the
-cluster, edit the `spatiumddi-appliance` HelmChartConfig in place rather
-than applying a fresh manifest:
+Unlike the api, worker and Postgres limits, this one is **not** sized from
+the node's RAM. The role chart is one HelmChart for the whole cluster and
+every node's supervisor writes it, so it must render the same everywhere
+(#1137), and a DaemonSet has one limit for all its pods. A node whose
+blocklists need more raises it for the cluster in the `spatiumddi-appliance`
+HelmChartConfig. Edit it in place rather than applying a fresh manifest:
 
 ```sh
 kubectl -n kube-system edit helmchartconfig spatiumddi-appliance
@@ -1211,9 +1198,9 @@ spec:
 ```
 
 The supervisor writes the same CR on every heartbeat, but it owns only its
-data-plane VIP keys (`dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP`) and
-the sized `dnsBind9` limit described above: it merges them into the live
-document and leaves every other key as you wrote it (#2024). The supervisor creates this CR on its first heartbeat, so on a
+data-plane VIP keys (`dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP`): it
+merges them into the live document and leaves every other key as you wrote
+it (#2024). The supervisor creates this CR on its first heartbeat, so on a
 running appliance it already exists. Do not `kubectl apply` a manifest over
 it: `valuesContent` is a single string, so an apply replaces all of it, the
 VIP keys vanish until the next heartbeat puts them back, and
