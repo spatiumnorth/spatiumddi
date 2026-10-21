@@ -22,7 +22,7 @@ skip is logged at debug, once per task per process until the module is
 seen enabled again, so a 30 s beat tick does not repeat it forever.
 
 The decorator stamps ``__module_gate__`` on the wrapper, which is what
-``tests/test_beat_task_module_gates.py`` reads: every task in the beat
+``tests/test_module_gated_tasks_2279.py`` reads: every task in the beat
 schedule must carry a gate or appear in :data:`UNGATED_BEAT_TASKS` with
 the reason it runs regardless. A new beat task therefore cannot ship
 ungated by omission.
@@ -96,7 +96,7 @@ def module_gated(module_id: str) -> Callable[[_F], _F]:
 
 
 # Beat tasks that deliberately run whatever the feature modules say. Every
-# entry carries the reason; ``tests/test_beat_task_module_gates.py`` fails
+# entry carries the reason; ``tests/test_module_gated_tasks_2279.py`` fails
 # any beat task that is neither gated nor listed here, and any entry here
 # that is not in the schedule (a stale allowlist hides nothing, but it
 # reads as coverage that is not there).
