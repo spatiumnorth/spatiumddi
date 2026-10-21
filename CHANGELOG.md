@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The wake calendar sync deleted today's holiday for schedules west
+  of UTC, so the fleet woke on it (#2305).** The sync kept events from
+  the worker's UTC date onward and deleted every stored span outside
+  that, but the gate judges the schedule's local date. For a schedule in
+  America/Los_Angeles, a refresh after 00:00 UTC removed the 20th's
+  holiday while it was still the 20th locally: a `skip_on_event`
+  schedule fired, and an `only_on_event` one silently skipped. The sync
+  now starts its horizon at the earliest local today among the
+  schedules attached to the calendar (DST-aware, never later than the
+  UTC date), or the UTC-12 date when none is attached.
+
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
   delete handlers removed the push rows without lifting anything, so
