@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A replayed grant no longer re-points an address's IPAM row to the
+  client that already released it (#2391).** After an agent restart
+  the lease file is re-sent, so an old client's grant (and release) of
+  an address can arrive after a new client holds it. #1318 kept the
+  replayed release from deleting the row, but the grant still wrote the
+  old client's MAC, hostname and lease onto it, and re-activated the old
+  lease. A grant older than another client's live lease on the same
+  address (compared on the lease start Kea reports), or one whose lease
+  ends later in the same batch, is now ignored. A newer grant, a
+  renewal, or a real new client updates the row as before.
+
 - **Webhook subscriptions could be created, repointed, deleted and
   have deliveries retried with no audit row (#2293).** All four routes
   now write one `audit_log` row in the mutation's transaction. The row
