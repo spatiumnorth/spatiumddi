@@ -114,25 +114,3 @@ values.yaml): a supervisor that does not verify pins nothing. Paths match ``cp_t
     type: Directory
 {{- end }}
 {{- end -}}
-
-{{/*
-#2240 — the DNS serving container's startupProbe, shared by dns-powerdns
-and dns-technitium (both use the same tcpSocket :53 liveness probe;
-dns-bind9's startup probe is #2226's). Called with the role's
-``startupProbe`` values map; renders nothing when that map is absent or
-``enabled`` is false, which leaves the liveness probe on its own as before.
-See ``dnsPowerdns.startupProbe`` in values.yaml for why the budget is 30
-minutes.
-*/}}
-{{- define "spatiumddi-appliance.dnsStartupProbe" -}}
-{{- with . -}}
-{{- if .enabled -}}
-startupProbe:
-  tcpSocket:
-    port: 53
-  periodSeconds: {{ .periodSeconds | default 10 }}
-  failureThreshold: {{ .failureThreshold | default 180 }}
-  timeoutSeconds: {{ .timeoutSeconds | default 2 }}
-{{- end -}}
-{{- end -}}
-{{- end -}}
