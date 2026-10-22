@@ -4069,6 +4069,7 @@ _save_install_logs() {
     # Say what happened. An unconditional success line is the last thing
     # written to the log that is then (not) copied, so on a full or
     # read-only /var it ends with a claim the three WARNs above disprove.
+    _INSTALL_LOGS_SAVED=$saved
     if [ "$saved" -gt 0 ]; then
         log "Installer logs preserved under /var/log/spatiumddi/install/ ($saved file(s), $failed failed)"
     else
@@ -6608,10 +6609,35 @@ on_failure() {
     # are exactly the ones that leave none, and the operator's natural
     # next move re-runs the installer, whose startup TRUNCATES both logs.
     # The target is still mounted here: the unmount block is at 95%.
-    if [ -d "$MOUNT/var/log" ]; then
+    #
+    # #2405 — "$MOUNT/var/log exists" was the wrong gate: a root copy that
+    # fails early (rsync exit 11 in /usr/lib/modules) stops before /var is
+    # populated, so /var/log is absent and nothing was saved OR said. The
+    # question is whether the target is MOUNTED; _save_install_logs
+    # creates the directory itself. Before anything is mounted (the
+    # wizard prompts) there is no target to write to, and creating
+    # $MOUNT/... would only litter the live tmpfs, so that case skips.
+    # The gate is /var, not the root: /var is its own partition, so a
+    # failure between mounting the root and mounting /var would write the
+    # logs into the root's /var directory, hidden under the real /var
+    # mount on every boot after.
+    local _logs_kept=0
+    if mountpoint -q "$MOUNT/var" 2>/dev/null \
+        || [ -d "$MOUNT/var/log" ]; then
+        _INSTALL_LOGS_SAVED=0
         _save_install_logs || true
+        if [ "${_INSTALL_LOGS_SAVED:-0}" -gt 0 ]; then
+            _logs_kept=1
+        fi
     fi
     clear
+    if [ "${_logs_kept:-0}" -eq 1 ]; then
+        echo "Installer logs were saved to the target: /var/log/spatiumddi/install/"
+    else
+        echo "WARN: the installer logs could NOT be saved to the target."
+        echo "      They remain on the live system only: $INSTALL_LOG, $TRACE_LOG,"
+        echo "      /var/log/spatium-install-launch.log. Copy them off before rebooting."
+    fi
     echo
     echo "Installer exited with status $exit_code"
     echo

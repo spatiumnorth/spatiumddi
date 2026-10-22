@@ -68,9 +68,10 @@ def test_logs_are_also_saved_on_the_failure_path():
     truncates both logs."""
     fn = _fn("on_failure")
     assert "_save_install_logs" in fn
-    # Guarded: the trap also fires from the wizard prompts, long before
-    # anything is mounted.
-    assert '[ -d "$MOUNT/var/log" ]' in fn
+    # Guarded on the target's /var being MOUNTED (#2405), not on /var/log
+    # existing: the trap also fires from the wizard prompts, long before
+    # anything is mounted. Behaviour is pinned in test_install_on_failure_logs.py.
+    assert 'mountpoint -q "$MOUNT/var"' in fn
 
 
 def test_saving_logs_cannot_abort_a_successful_install():
