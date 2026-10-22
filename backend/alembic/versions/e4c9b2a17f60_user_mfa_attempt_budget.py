@@ -12,7 +12,7 @@ Kept on the row rather than in Redis so the budget still holds when
 Redis is unavailable.
 
 Revision ID: e4c9b2a17f60
-Revises: d3a7f19c52e8
+Revises: f4c2a8e61b93
 Create Date: 2026-10-21 10:00:00.000000
 """
 
@@ -21,7 +21,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "e4c9b2a17f60"
-down_revision = "d3a7f19c52e8"
+down_revision = "f4c2a8e61b93"
 branch_labels = None
 depends_on = None
 

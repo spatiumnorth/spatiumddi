@@ -146,6 +146,46 @@ the formatter handles the rest.
   `mfa_challenge_spent`), and using up the budget writes an
   `account.mfa_attempts_exhausted` row. See `docs/features/AUTH.md`.
 
+- **Deleting a Kubernetes cluster, Tailscale tenant or NetBird instance
+  left its DNS names served (#2288).** The mirrored zone and records go
+  with the target through a database CASCADE, which the bundle-dirty
+  listener cannot see, so every agent kept answering them until some
+  unrelated change re-rendered the group. The three delete handlers now
+  mark the affected groups' bundles dirty and wake their agents before the
+  delete, the same path the reconcilers' own ORM retraction relies on.
+
+- **Two DNS agents running as one server no longer pass record
+  changes back and forth until they fail (#2044).** Since #2042 a
+  DNS agent's config poll takes back a record change still in flight
+  to a different agent process, which is right when that process is
+  gone. With two processes live on one server identity at once (a
+  cloned VM that kept its `agent_id`, two containers given one state
+  directory), each one's polls took the change back from the other,
+  and it bounced between them, one retry each time, until its eight
+  attempts were spent. The control plane now records which agent
+  process owns each server. A process it has never seen takes over at
+  once, so replacing an agent works as before. The process it
+  replaced is refused with 409 if it polls again while the owner is
+  still polling: it logs `sync_duplicate_agent_instance`, keeps
+  serving its cached config, does not re-register, and retries every
+  30 s, taking the server back by itself once the owner has been
+  silent for 5 minutes. A long-poll whose process lost ownership
+  while it waited ships nothing. Refusals that last over 2 minutes
+  show a **Duplicate agent** chip on the server, with the address the
+  refused agent polled from, and raise the new default-on
+  `dns_agent_duplicate_instance` alert ("Two DNS agents on one
+  server"); both clear 10 minutes after the extra agent stops. The
+  2-minute wait keeps an overlapping rollout, whose old pod polls
+  once more before it exits, from alarming. The `find_dns_servers`
+  copilot tool reports `duplicate_agent`. The refused agent's
+  heartbeats still count for liveness and op acks, but its daemon,
+  config-apply and spool reports no longer reach the server row, so
+  they cannot flap it against the owner's or raise (or hide) an
+  `agent_config_rejected` alert; the agent now names its process on
+  heartbeats too. The rule is seeded once, by the migration, so
+  deleting it is final. Agents too old to send an instance id are
+  never refused.
+
 - **IPAM to DNS auto-sync at a 1-minute interval ran every 2 minutes
   (#2346).** Beat fires every 60 s, but the task stamps its last run from
   a clock read a variable fraction of a second into the run, so two
@@ -1519,6 +1559,17 @@ the formatter handles the rest.
   alert rule, enabled, unless a rule of that type or name already
   exists. Downgrade drops the constraint and both columns and leaves
   the rule in place.
+- `f4c2a8e61b93` — #2044: six nullable `dns_server` columns.
+  `agent_instance` and `agent_instance_seen_at` name the agent process
+  that owns the server and when it last polled;
+  `agent_instances_displaced` (JSONB) lists the processes it replaced;
+  `duplicate_agent_first_at`, `duplicate_agent_last_at` and
+  `duplicate_agent_ip` describe the current duplicate-agent episode. No
+  backfill: the first agent to poll becomes the owner. Also inserts the
+  `dns_agent_duplicate_instance` alert rule ("Two DNS agents on one
+  server", enabled) when no rule of that type or name exists; it is
+  not seeded at startup, so an operator who deletes it keeps it
+  deleted. Downgrade drops the six columns and leaves the rule.
 - `e4c9b2a17f60` — adds `user.mfa_failed_count` (Integer, NOT NULL,
   server default 0) and nullable `user.mfa_last_failed_at`, the
   per-account wrong-code budget for the MFA sign-in step. Downgrade

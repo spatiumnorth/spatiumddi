@@ -753,6 +753,33 @@ An op moves `pending` → `in_flight` when a long-poll ships it, then
   leftover poll, which is always the older of the two, never takes an op
   from its replacement. A poll whose client has already disconnected rolls its page
   back. An agent that sends no id falls back to the 5-minute reset above.
+- **Only one agent process is served per server
+  ([#2044](https://github.com/spatiumnorth/spatiumddi/issues/2044)).** The
+  take-back above assumes the other process is gone. Two processes live on
+  one server identity at once (a cloned VM that kept its `agent_id`, two
+  containers given one state directory) used to take each op back from
+  each other on every poll until its retries ran out. The control plane
+  now records which process owns the server (`dns_server.agent_instance`).
+  A process it has never seen takes over at once, so replacing an agent is
+  unchanged. The one it replaced is remembered, and if it polls again
+  while the owner is still polling it is answered `409` with
+  `X-Spatium-Duplicate-Agent-Instance: 1`. That agent logs
+  `sync_duplicate_agent_instance`, keeps serving its cached config and asks
+  again every 30 s; it does not re-register, because a new token would not
+  change which process owns the row. If the owner stops polling for 5
+  minutes, the refused agent takes the server back by itself. A long-poll
+  whose process lost ownership while it waited stops before shipping
+  anything. Refusals that go on for over 2 minutes show a **Duplicate
+  agent** chip on the server, with the address the refused agent polled
+  from, and raise the default-on `dns_agent_duplicate_instance` alert
+  ("Two DNS agents on one server"). Both clear 10 minutes after the extra
+  agent stops. The 2-minute wait is so an overlapping rollout, where the
+  old pod finishes one last poll before it exits, does not alarm. The
+  agent also sends its process id on heartbeats: a refused process's
+  heartbeats still count for liveness and op acks, but its daemon,
+  config-apply and spool reports are kept off the server row, which shows
+  the owner's. To fix it, stop the extra agent, or clear its state
+  directory so it registers as a server of its own.
 - **A late ack is not charged twice.** Each shipped op carries a
   `dispatch` number (its attempt count), which the agent echoes in its
   ack. An error that answers an earlier dispatch was already counted when
