@@ -34,7 +34,7 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 - **k3s static binary** (~70 MB) at `/usr/local/bin/k3s`; `kubectl` / `crictl` / `ctr` symlink to it.
 - **k3s airgap images** (CoreDNS / local-path / pause / metrics-server) as zst-compressed tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst`. k3s auto-imports them into containerd at boot.
 - **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.10.2-alpine for the Control plane role.
-- **Control-plane environment** is written once, under the chart's `sharedEnv` value, which the umbrella chart appends to the api, worker AND beat containers (#1826). That is where `APPLIANCE_MODE`, `APPLIANCE_VERSION` (re-read from the booted slot's `/etc/spatiumddi/appliance-release` on every boot, so it follows an upgrade or rollback; on a multi-node cluster it is the seed's, since only the seed renders this manifest), `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and `INITIAL_NTP_SERVERS` live. When the slot-image mirror is on, its URL and secret go to the api and the worker (the worker's upgrade preflight checks the mirror's free space), not to beat. The worker runs alert evaluation (`node_pressure`, `cluster_dns_degraded`) and the rolling-upgrade orchestrator, so a variable only the api carries makes every `appliance_mode` gate read as off there. Agent pre-shared keys stay under `api.env`: only the api reads them. `charts-render-check.sh` fails a render where api, worker and beat disagree on the shared set, or where beat carries the mirror secret.
+- **Control-plane environment** is written once, under the chart's `sharedEnv` value, which the umbrella chart appends to the api, worker AND beat containers (#1826). That is where `APPLIANCE_MODE`, `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and `INITIAL_NTP_SERVERS` live. `APPLIANCE_VERSION` joins them from a value of its own, `applianceVersion`: it is re-read from the booted slot's `/etc/spatiumddi/appliance-release` on every boot, so it follows an upgrade or rollback, and on a multi-node cluster it is the seed's, since only the seed renders this manifest. It is not a `sharedEnv` entry because a cluster Rolling Upgrade holds it with `image.tag` until every node runs the target (#2176): a HelmChartConfig can pin a single value but replaces a list whole, so as an entry the seed's boot onto its new slot rolled the api, worker and beat mid-run. When the slot-image mirror is on, its URL and secret go to the api and the worker (the worker's upgrade preflight checks the mirror's free space), not to beat. The worker runs alert evaluation (`node_pressure`, `cluster_dns_degraded`) and the rolling-upgrade orchestrator, so a variable only the api carries makes every `appliance_mode` gate read as off there. Agent pre-shared keys stay under `api.env`: only the api reads them. `charts-render-check.sh` fails a render where api, worker and beat disagree on the shared set, or where beat carries the mirror secret.
 - **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Appliance installs (and the supervisor on the Control plane); the umbrella chart drives the Control plane. Built at release time + signed.
 - **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
 
@@ -1318,8 +1318,9 @@ grandfathered.
 
 **Compliance + Copilot.** The `no_lanwide_control_plane_ports` conformity check
 (platform-kind, PCI-DSS 1.2.1 / HIPAA segmentation) fails only on a *confirmed*
-LAN-wide node and reports **PASS-stale** for nodes it can't currently reach
-(never connectivity-FAIL, per #5). Five Operator-Copilot MCP tools
+LAN-wide node and reports **warn** for stale or unverified nodes (unknown is
+not compliant, but lost contact is never a FAIL), and **not applicable** when no
+appliance reports at all (#2259). Five Operator-Copilot MCP tools
 (`find_firewall_policies` / `count_firewall_policies` / `find_firewall_aliases`
 / `find_firewall_effective` reads + the default-off `propose_toggle_firewall_policy`)
 surface the model to the chat, tagged `module="appliance.firewall"`.
@@ -2751,16 +2752,24 @@ introduced by an upgrade don't clobber operator-created ones.
    clear-ingests`), so a write an earlier import left behind
    cannot fail this boot's imports (#1630). k3s imports the new
    tarballs. `spatiumddi-firstboot.service` waits for
-   `/health/live` to return 200. It then checks that k3s
-   imported every baked tarball and that every image is in
-   containerd, and has k3s re-import whatever is missing
-   (`spatium-k3s-images verify --repair`, #1630).
+   `/health/live` to return 200. It then waits until k3s holds
+   none of the tarballs open, which is how long each import
+   lasts (#2109), checks that k3s imported every baked tarball
+   and that every image is in containerd, and has k3s
+   re-import whatever is missing, never one it is still
+   importing (`spatium-k3s-images verify --repair`, #1630).
+   It waits at most what is left of firstboot's 10-minute
+   start timeout. If k3s is still importing when that runs
+   out, the slot is not committed; once
+   `spatium-k3s-images verify` passes, **Approve trial** in
+   Fleet keeps it before the next reboot reverts it.
 7. On health-OK: `grub-set-default <new_slot>` commits the
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack
    broken, or an image still missing after the re-import,
-   which would leave a workload in `ErrImageNeverPull`; for
-   that one firstboot exits 1 before the commit): no commit
+   which would leave a workload in `ErrImageNeverPull`, or k3s
+   still importing when that time runs out; for those
+   firstboot exits 1 before the commit): no commit
    happens. Next reboot reverts to the
    previous `saved_entry` automatically. If the new slot's
    migrate step had already run, the reverted release cannot

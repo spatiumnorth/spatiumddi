@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertEvent, AlertRule
@@ -207,8 +207,11 @@ def operator_hint(category: str) -> str:
         )
     if category == CATEGORY_DRAIN_STUCK:
         return (
-            "Drain timed out — a workload pod blocked eviction. Check "
-            "PodDisruptionBudgets + per-pod status; once unblocked, abort + "
+            "Drain timed out — a workload pod blocked eviction, or was evicted "
+            "but never left the node (the step's error counts both; a node "
+            "whose kubelet is down removes nothing, #1804). Check "
+            "PodDisruptionBudgets, per-pod status and the node's Ready "
+            "condition; once unblocked, abort + "
             "plan a fresh run (drain doesn't auto-retry mid-run). "
             "The new slot is already staged and armed for this node's next "
             "boot (#1463), so an unplanned reboot boots it."
@@ -344,6 +347,21 @@ async def emit_upgrade_failed_alert(
     if stuck:
         detail["stuck"] = stuck
 
+    # #2261 — one OPEN event per (rule, subject) is now a unique index. A
+    # run that fails, is resumed and fails again still pages for the second
+    # failure: the earlier event is resolved first, rather than the insert
+    # tripping the index and taking the orchestrator's transaction with it.
+    now = datetime.now(UTC)
+    await db.execute(
+        update(AlertEvent)
+        .where(
+            AlertEvent.rule_id == rule.id,
+            AlertEvent.subject_type == "system_upgrade_run",
+            AlertEvent.subject_id == str(run.id),
+            AlertEvent.resolved_at.is_(None),
+        )
+        .values(resolved_at=now)
+    )
     evt = AlertEvent(
         rule_id=rule.id,
         subject_type="system_upgrade_run",
@@ -351,7 +369,7 @@ async def emit_upgrade_failed_alert(
         subject_display=f"upgrade → {run.target_version}",
         severity=rule.severity,
         message=message,
-        fired_at=datetime.now(UTC),
+        fired_at=now,
         last_observed_value=detail,
     )
     db.add(evt)
