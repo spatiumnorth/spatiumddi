@@ -780,6 +780,7 @@ DDNS is safe to call repeatedly. If the resolved hostname matches what's already
 
 - RFC 2136 updates to BIND9 use TSIG signing (key stored Fernet-encrypted).
 - A TSIG key that an ACL, view, server option or zone still cites as `key <name>` cannot be renamed or deleted (409, naming each referrer); remove the references first. The bundle also drops any `key <name>` it does not define, so a stale reference cannot stop the group converging; an access list that empties (or loses a `!key` negation) that way ships as `none`, never as an empty list that would read as unset (#2282).
+- An ACL that a view, server option or zone (`allow_query` / `allow_transfer` / `also_notify`) still cites by name cannot be renamed or deleted (409). The bundle drops any ACL name it does not define; an access list emptied that way renders as `none`, never as inherit-the-server (#2283).
 - WinRM calls to Windows DNS go over HTTPS with cert validation by default.
 - The DDNS service itself never touches manual IPAM allocations (it gates on `auto_from_lease=True` before doing anything).
 
