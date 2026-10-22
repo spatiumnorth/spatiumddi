@@ -157,6 +157,8 @@ the formatter handles the rest.
   Bundles without a blocklist are byte-identical; `RENDERER_REVISION`
   is 12.
 
+- **The looking-glass image's GoBGP builder moves to Go 1.27.3.** Go 1.27.2's `crypto/x509` carries CVE-2026-111943 (HIGH), and Go static-links its standard library into the binary, so only a rebuild with the fixed toolchain clears it. The nightly's Trivy gate failed on it.
+
 - **Starting a fleet upgrade, forcing a block-sync reconcile and
   syncing an integration now record who did it (#2303).** All three
   enqueue a worker task whose own audit rows say `system`, so "who
