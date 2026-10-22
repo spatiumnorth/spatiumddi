@@ -105,6 +105,15 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["delete"]
+    # #2190/#2403 — the role-label gate reads each role DaemonSet's pod
+    # template (k8s_api.daemonset_template_env) to hold a node's role label
+    # until the template carries the node's assigned group. Without this a
+    # read is a 403, which the gate (by design) does not treat as a hold, so
+    # an engine+group switch briefly ran an old-template pod in the old group.
+    # Read-only.
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

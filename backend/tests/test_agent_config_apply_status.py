@@ -75,6 +75,28 @@ def test_ok_clears_the_stale_failure_detail() -> None:
     assert row.config_failed_etag is None
 
 
+def test_ok_without_an_etag_is_unknown_not_ok() -> None:
+    """#2258: an agent's pre-first-apply placeholder must not store ``ok``."""
+    row = _row()
+    _report(row, {"status": STATUS_OK, "etag": None})
+    assert row.config_apply_status is None
+    assert row.config_apply_at is None
+
+
+def test_ok_without_an_etag_does_not_undo_a_reset_or_a_failure() -> None:
+    row = _row()
+    _report(row, {"status": STATUS_REVERTED, "failed_etag": "bad", "error": "boom"})
+    _report(row, {"status": STATUS_OK})
+    assert row.config_apply_status == STATUS_REVERTED
+    assert row.config_failed_etag == "bad"
+
+
+def test_ok_with_an_etag_is_stored() -> None:
+    row = _row()
+    _report(row, {"status": STATUS_OK, "etag": "abc"})
+    assert row.config_apply_status == STATUS_OK
+
+
 def test_empty_report_leaves_a_recorded_failure_alone() -> None:
     """A pre-#882 agent sends ``config: {}``.
 

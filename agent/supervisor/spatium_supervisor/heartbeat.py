@@ -1684,54 +1684,7 @@ def heartbeat_once(
         return False
 
     if not env_write_failed and appliance_state.detect_deployment_kind() == "appliance":
-        # Phase 10 wave 2 — reconcile node labels every heartbeat
-        # regardless of the env-hash skip below. patch_node_labels is
-        # idempotent (same-value = no-op), so the cost is one PATCH
-        # per minute; the win is catching drift from out-of-band
-        # ``kubectl label node`` runs or manual unlabeling without
-        # waiting for the operator to flip a role.
-        try:
-            label_ok, label_err = reconcile_node_labels(target.profiles)
-            if not label_ok:
-                log.warning(
-                    "supervisor.heartbeat.labels_reconcile_failed",
-                    error=label_err,
-                )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("supervisor.heartbeat.labels_reconcile_crashed", error=str(exc))
-
-        apply_due, env_hash = _role_apply_due(cfg.state_dir, rendered, env_path)
-        if not apply_due:
-            log.info(
-                "supervisor.heartbeat.lifecycle_skipped",
-                reason="env_unchanged",
-                env_hash=env_hash[:12],
-            )
-        else:
-            lifecycle = apply_role_assignment(target.profiles, env_path)
-            log.info(
-                "supervisor.heartbeat.lifecycle_applied",
-                state=lifecycle.state,
-                reason=lifecycle.reason,
-                started=list(lifecycle.started),
-                stopped=list(lifecycle.stopped),
-            )
-            # The state + reason are returned on the NEXT heartbeat (not
-            # this one — we've already POSTed). Cache them on disk so a
-            # supervisor restart doesn't lose them.
-            _persist_lifecycle_state(cfg.state_dir, lifecycle.state, lifecycle.reason)
-            # The runtime set just changed (or attempted to) — invalidate
-            # the watchdog cache so the next heartbeat re-probes
-            # immediately rather than rendering 5-min-stale health.
-            # ``_last_watchdog_at`` is already declared global at the
-            # top of this function (one declaration per scope rule).
-            _last_watchdog_at = 0.0
-            # Only stamp the hash on success — a failed apply should
-            # re-attempt on the next heartbeat (the failure may have
-            # been transient: image pull glitch, transient port
-            # conflict, etc).
-            if _apply_settled(lifecycle):
-                _write_last_apply_hash(cfg.state_dir, env_hash)
+        _run_role_lifecycle(cfg.state_dir, target.profiles, rendered, env_path)
 
     # Identity unused in C2's payload but kept on the signature so
     # C2's mTLS upgrade doesn't need to thread it back in. Silence
@@ -1739,6 +1692,71 @@ def heartbeat_once(
     _ = identity
 
     return held
+
+
+def _run_role_lifecycle(
+    state_dir: Path, profiles: list[str], rendered: str, env_path: Path
+) -> None:
+    """Write the role chart (when due), THEN reconcile the node labels (#2190).
+
+    The order is the fix. The labels used to be reconciled first, on every
+    tick, so a role swap that also moved the DNS group (BIND9 in A → PowerDNS
+    in B, one save) labelled the node for PowerDNS while the dns-powerdns
+    DaemonSet still carried the previous chart's ``AGENT_GROUP=A``: the pod it
+    started registered a new server row in A, and the agent's cached token
+    kept it there after helm-controller rolled the template to B a second
+    later. Now the values are written first, ``apply_role_assignment`` labels
+    only what its new template can serve, and the reconcile after it — which
+    still runs on every tick, to catch an out-of-band ``kubectl label`` — gates
+    the same way.
+    """
+    global _last_watchdog_at
+    apply_due, env_hash = _role_apply_due(state_dir, rendered, env_path)
+    if not apply_due:
+        log.info(
+            "supervisor.heartbeat.lifecycle_skipped",
+            reason="env_unchanged",
+            env_hash=env_hash[:12],
+        )
+    else:
+        lifecycle = apply_role_assignment(profiles, env_path)
+        log.info(
+            "supervisor.heartbeat.lifecycle_applied",
+            state=lifecycle.state,
+            reason=lifecycle.reason,
+            started=list(lifecycle.started),
+            stopped=list(lifecycle.stopped),
+        )
+        # The state + reason are returned on the NEXT heartbeat (not
+        # this one — we've already POSTed). Cache them on disk so a
+        # supervisor restart doesn't lose them.
+        _persist_lifecycle_state(state_dir, lifecycle.state, lifecycle.reason)
+        # The runtime set just changed (or attempted to) — invalidate
+        # the watchdog cache so the next heartbeat re-probes
+        # immediately rather than rendering 5-min-stale health.
+        _last_watchdog_at = 0.0
+        # Only stamp the hash on success — a failed apply should
+        # re-attempt on the next heartbeat (the failure may have
+        # been transient: image pull glitch, transient port
+        # conflict, etc).
+        if _apply_settled(lifecycle):
+            _write_last_apply_hash(state_dir, env_hash)
+
+    # Phase 10 wave 2 — reconcile node labels every heartbeat
+    # regardless of the env-hash skip above. patch_node_labels is
+    # idempotent (same-value = no-op), so the cost is one PATCH
+    # per minute; the win is catching drift from out-of-band
+    # ``kubectl label node`` runs or manual unlabeling without
+    # waiting for the operator to flip a role.
+    try:
+        label_ok, label_err = reconcile_node_labels(profiles, env_path)
+        if not label_ok:
+            log.warning(
+                "supervisor.heartbeat.labels_reconcile_failed",
+                error=label_err,
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("supervisor.heartbeat.labels_reconcile_crashed", error=str(exc))
 
 
 _LIFECYCLE_STATE_FILE = "role-switch-state"

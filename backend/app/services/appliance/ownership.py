@@ -180,6 +180,38 @@ async def owning_appliance_for_dns_server(db: AsyncSession, server: Any) -> Appl
     return appliance
 
 
+async def owning_appliance_for_dns_agent(
+    db: AsyncSession, hostname: str, driver: str
+) -> Appliance | None:
+    """The appliance a REGISTERING DNS agent runs on, or None (#2190).
+
+    The same rule as :func:`owning_appliance_for_dns_server`'s hostname branch,
+    applied before a row exists: one approved appliance whose normalised
+    hostname is the agent's, running ``driver`` as its current DNS engine.
+    The bootstrap key is platform-wide, so the hostname is the agent's only
+    claim to an appliance; a hostname two approved appliances share, or an
+    engine the appliance no longer runs, claims nothing.
+    """
+    host = norm_host(hostname or "")
+    if not host:
+        return None
+    matches = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    hostname_sql(Appliance.hostname) == host,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(matches) != 1 or driver not in current_dns_drivers(matches[0]):
+        return None
+    return matches[0]
+
+
 async def owning_appliance_for_dhcp_server(db: AsyncSession, server: Any) -> Appliance | None:
     """The appliance that owns ``server`` (a DHCPServer), or None.
 

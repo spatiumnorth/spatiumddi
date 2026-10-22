@@ -298,8 +298,10 @@ same 595 tests — PR #1018). The file is committed and kept honest by CI:
    belongs to tests the file has never seen. Runner variance never trips
    it, because no refresh can fix runner variance.
 4. `make test-durations` downloads the newest `main` artifact into
-   `backend/.test_durations` for you to commit. Do it at release prep, or
-   when the warning fires.
+   `backend/.test_durations` for you to commit (push, daily-schedule or
+   dispatch runs, newest first — most pushes no longer run the shards, see
+   §Skipping the shards on a push to main). Do it at release prep, or when
+   the warning fires.
 
 A stale file only costs balance — pytest-split assumes the average for a
 test it has never seen — never correctness, so this is a chore, not a gate.
@@ -323,8 +325,8 @@ artifact (`.github/scripts/build_test_impact_map.py`). The next PR's
 `all` or a list of test files, and the shards run exactly that.
 
 Every rule fails **open**, toward `all` — a wrong "run these" is caught by
-the push-to-`main` run, which always runs everything; a wrong "skip that"
-would not be:
+the push-to-`main` run, which runs everything after a narrowed PR run (see
+below); a wrong "skip that" would not be:
 
 | Changed path | Selection |
 |---|---|
@@ -345,6 +347,54 @@ dependency data that is actually true.
 Pinned by `backend/tests/test_test_impact_selection.py` and
 `test_merge_test_durations.py`, both of which skip inside the dev api
 container (no repo root above `backend/` there) and run in CI.
+
+### Skipping the shards on a push to main (#2429)
+
+Under strict up-to-date branch protection, the squash-merge of a PR has
+exactly the tree of the PR head CI just passed, so re-running the twelve
+shards on the push to `main` tested nothing new: it cost ~180 runner-minutes
+per merge on a 20-job runner pool and was cancelled by the next merge more
+than half the time. The `changes` job now asks
+`.github/scripts/ci-tested-on-pr-head.sh` first, and skips the shards only
+when **all** of these are established:
+
+- the push added one single-parent commit, and GitHub records exactly one
+  PR merged into `main` whose merge commit it is, from a branch in this
+  repository (a fork PR's run used the fork's copy of the workflow);
+- that PR's head has the identical tree and contains the previous `main`
+  (so the PR run's test merge was a no-op on the head's tree);
+- a `pull_request` run of `ci.yml` on exactly that head, from the PR's head
+  branch, concluded `success`, was created before the merge and at most
+  24 h before it, and its **latest attempt** published the unexpired
+  `backend-full-suite-attempt-<n>` marker. The `Backend — Tests` aggregator
+  uploads that marker only when all twelve shards passed the **full**
+  suite, so a narrowed (#1020) or shard-skipped (#813) PR run never
+  qualifies, and the push run stays the safety net that catches what the
+  narrowed run did not select. (The run cannot be tied to the PR through
+  its `pull_requests` array: GitHub clears it when the PR merges.)
+
+Anything else — an API error, a tree mismatch, a forced or multi-commit
+push — runs the full suite. A skipped run reports `Backend — Tests` green
+with a notice and uploads a `backend-skipped-tested-on-pr-head-attempt-<n>`
+marker.
+
+**A release never rests on a skipped run.** release.yml's gate asks
+`.github/scripts/ci-full-suite-passed.sh` for a `ci.yml` run on the tagged
+commit itself whose latest attempt carries the full-suite marker (or a push
+run from before the markers existed, which always ran the suite). If the
+commit's only green run skipped the shards, the gate fails and prints the
+command that produces one — `gh workflow run ci.yml --ref <tag>`. A
+dispatched run cannot skip: only a `push` consults the skip script.
+
+Because those pushes no longer produce the test-impact map or the
+durations artifact, a **daily scheduled** full run on `main` (and
+`workflow_dispatch`) produces both; it has its own concurrency group, so a
+merge never cancels it. A failing scheduled run shows red on `main`, and
+GitHub emails the user who last changed the workflow's `cron` line; nothing
+else notifies. Both consumers — the impact-map lookup and
+`make test-durations` — find the newest artifact by name through
+`.github/scripts/latest-main-artifact.sh`, which never accepts a
+`pull_request` run's. Pinned by `backend/tests/test_ci_tested_on_pr_head.py`.
 
 ### What a new endpoint needs
 
@@ -387,7 +437,7 @@ triggered on push to `main` and on every pull request:
 | Job | What it does |
 |---|---|
 | **Backend — Lint & Type Check** (`backend-lint`) | `pip install -e ".[dev]"` on Python 3.12, then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8), the **version-pin manifest linter** (`python3 scripts/lint_versions.py` — see §9) and the **workflow shell-status linter** (`python3 scripts/lint_workflow_shell.py` — see §10). |
-| **Backend — Tests** (`backend-test`) | A required-check aggregator over **twelve** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.10.2-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 12 --group N --store-durations --clean-durations` (pytest-split selects the shard's slice, **balanced by duration** from the committed `backend/.test_durations` — see §Shard balancing; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). On a PR the `changes` job may first narrow the run to the test files the diff can affect (#1020 — see §Test-impact selection). The aggregator passes only if all twelve shards pass; on a full run it also merges the shards' measured durations into a `test-durations` artifact, and on a push to `main` it builds the `test-impact-map` artifact from the shards' coverage contexts. Coverage is otherwise **not** collected here (#1019). |
+| **Backend — Tests** (`backend-test`) | A required-check aggregator over **twelve** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.10.2-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 12 --group N --store-durations --clean-durations` (pytest-split selects the shard's slice, **balanced by duration** from the committed `backend/.test_durations` — see §Shard balancing; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). On a PR the `changes` job may first narrow the run to the test files the diff can affect (#1020 — see §Test-impact selection). The aggregator passes only if all twelve shards pass; on a full run it also merges the shards' measured durations into a `test-durations` artifact, and on a full `main` run (a push that ran the shards, the daily schedule or a dispatch) it builds the `test-impact-map` artifact from the shards' coverage contexts. A push to `main` whose tree a green full PR run already tested skips the shards (#2429 — see §Skipping the shards on a push to main). Coverage is otherwise **not** collected here (#1019). |
 | **Frontend — Lint & Type Check** (`frontend-lint`) | Node 22, `npm install`, then `npm run lint`, `npm run format:check`, `npm run typecheck`, `npm test`. |
 | **Frontend — Build** (`frontend-build`) | Node 22, `npm install`, `npm run build`. |
 | **Charts — Lint & Template** (`charts-lint`) | Helm v4.3.1 + a checksum-pinned kubeconform. `helm lint --strict` all three charts at defaults and with every role / feature toggle on, `helm template` 14 value sets (umbrella: defaults, all-on, external DB + Redis, the CNPG + Sentinel HA shape, and two pod-posture shapes; appliance: defaults, all-on, the single-node full-stack shape, and the two release-bootstrap / release-supervisor shapes; metallb: defaults, all-on, BGP mode), `kubeconform -strict` against the Kubernetes 1.36 + CRD-catalog schemas (kept at the version the appliance's k3s serves — it was five minors behind until #974), and `.github/scripts/chart-no-besteffort.py` on every render (#965 — no serving container may lack CPU + memory requests or limits; init containers are exempt, they finish before the pod serves) plus `chart-toggle-coverage.py`, which fails if a template is gated on a values key none of the value sets flips, and `chart-webhooks-fail-open.py` on the MetalLB render (#1103 — its validating webhooks must be `failurePolicy: Ignore`, or the pool CRs in the same install are refused while the controller serving the webhook starts; `helm lint` and `helm template` pass either way). Rendered manifests are uploaded as the `rendered-charts` artifact. Until #966 nothing on a PR parsed the appliance chart at all; it was first read by helm during the release. `make charts-lint` runs the same script in a helm container. |
