@@ -147,7 +147,11 @@ the formatter handles the rest.
   settled target gets a `backup_target_run_reconciled` audit row, and
   the restore audit row lists them. No migration. Archives taken
   before this change carry no `run` record, so their claims settle as
-  `failed`.
+  `failed`. The stale-run reap (the schedule sweep's, and Run now's)
+  now re-reads the target under a row lock and stands down while a
+  restore holds its lock, so a sweep tick landing between the replay's
+  commit and the settle can no longer reap an archive's two-hour-old
+  claim and fire a second run.
 
 - **Webhook subscriptions could be created, repointed, deleted and
   have deliveries retried with no audit row (#2293).** All four routes

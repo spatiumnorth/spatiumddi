@@ -225,6 +225,36 @@ async def reap_stale_backup_run(
     now = datetime.now(UTC)
     if not backup_run_is_stale(target, now):
         return False
+    # #2097 — a restore puts back the claim its archive holds, two hours old
+    # if the archive is, and settles it only after the replay has committed.
+    # Reaping in between stamps a run that succeeded ``failed`` and lets the
+    # caller fire a new one, which the settle then leaves alone as live. So:
+    # lock the row and read it again (the caller's copy may predate the
+    # replay or the settle), then refuse while a restore holds its lock. The
+    # row lock is what makes the order safe: the settle commits before the
+    # restore lock is released, and it cannot commit this row while we hold
+    # it, so either the re-read sees the settled row or the lock is still
+    # held when we look.
+    from app.services.backup.restore import restore_lock_held  # noqa: PLC0415
+
+    current = (
+        await db.execute(
+            select(BackupTarget)
+            .where(BackupTarget.id == target.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if current is None or not backup_run_is_stale(current, now):
+        # commit, not rollback: a rollback expires every loaded object, and
+        # the sweep goes on reading the rest of its rows.
+        await db.commit()
+        return False
+    target = current
+    if await restore_lock_held(db):
+        await db.commit()
+        logger.info("backup_stale_reap_deferred_restore", target_id=str(target.id))
+        return False
     started_at = target.last_run_at
     error = (
         f"run marked in progress since {started_at.isoformat() if started_at else 'an unknown time'} "

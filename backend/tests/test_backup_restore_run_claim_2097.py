@@ -9,6 +9,7 @@ schedule skipped the target until the 2 h reap stamped a successful run
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
@@ -287,3 +288,176 @@ async def test_an_archive_no_run_wrote_carries_no_run_record(
         db_session, passphrase="hunter2hunter2"
     )
     assert "run" not in read_backup_manifest(archive_bytes)
+
+
+async def test_a_sweep_tick_between_the_replay_and_the_settle_does_not_reap(
+    db_session: AsyncSession, monkeypatch
+) -> None:
+    """QA case 8: an archive over two hours old, and a schedule-sweep tick
+    landing after the replay has committed but before the restore settles
+    the claim it carried.
+
+    The tick used to read the restored claim as a run dead for two hours,
+    stamp it ``failed`` and fire a new run, which the settle then left alone
+    as live. Driven through the real ``apply_backup_restore`` (its real
+    advisory lock, its real settle on its own engine), with the replay
+    stubbed to commit the archived row and then run the sweep, the exact
+    point ddi-pg caught it at.
+    """
+    import asyncpg
+
+    from app.services.backup import restore as restore_mod
+    from app.services.backup.migrations import MigrationOutcome
+    from app.services.backup.rewrap import RewrapOutcome
+    from app.tasks import backup_sweep
+
+    now = datetime.now(UTC)
+    target = _target("aged", last_run_status="success", next_run_at=now - timedelta(minutes=1))
+    db_session.add(target)
+    await db_session.commit()
+    target_id = target.id
+
+    claimed_at = now - timedelta(hours=2, minutes=7)
+    manifest = {
+        "format_version": next(iter(restore_mod.SUPPORTED_FORMAT_VERSIONS)),
+        "created_at": (claimed_at + timedelta(seconds=3)).isoformat(),
+        "run": {
+            "target_id": str(target_id),
+            "filename": "spatiumddi-aged.zip",
+            "node": NODE,
+            "claimed_at": claimed_at.isoformat(),
+        },
+    }
+    db_url = os.environ["DATABASE_URL"]
+
+    async def _async(value):
+        return value
+
+    monkeypatch.setattr(
+        restore_mod,
+        "extract_archive_members",
+        lambda _b: (manifest, b"dump", "custom", b"enc"),
+    )
+    monkeypatch.setattr(restore_mod, "decrypt_secrets", lambda *_a, **_k: {})
+    monkeypatch.setattr(restore_mod, "schema_direction_error", lambda _v: None)
+    monkeypatch.setattr(restore_mod, "_write_pre_restore_safety_dump", lambda _db: _async(None))
+    monkeypatch.setattr(
+        restore_mod,
+        "maybe_upgrade_after_restore",
+        lambda **_k: _async(
+            MigrationOutcome(
+                state="up_to_date", source_head=None, local_head=None, migrations_applied=[]
+            )
+        ),
+    )
+    monkeypatch.setattr(restore_mod, "rewrap_secrets", lambda **_k: _async(RewrapOutcome()))
+    monkeypatch.setattr(restore_mod, "_collect_post_restore_warnings", lambda _u: _async([]))
+
+    fired: list = []
+
+    async def _record_run(_db, *, target, **_k):
+        fired.append(target.id)
+        return {"success": True}
+
+    monkeypatch.setattr(backup_sweep, "run_backup_for_target", _record_run)
+
+    sweep_results: list[dict[str, int]] = []
+
+    async def _replay(_dump_path, url):
+        # The replay commits: the table now holds the archive's claim.
+        conn = await asyncpg.connect(url.replace("+asyncpg", ""))
+        try:
+            await conn.execute(
+                "UPDATE backup_target SET last_run_status = 'in_progress', "
+                "last_run_at = $1, last_run_filename = NULL, last_run_node = NULL, "
+                "last_run_error = NULL WHERE id = $2",
+                claimed_at,
+                target_id,
+            )
+        finally:
+            await conn.close()
+        # ...and a schedule tick reaches the worker before the settle.
+        sweep_results.append(await backup_sweep._sweep())
+
+    monkeypatch.setattr(restore_mod, "_run_pg_restore", _replay)
+
+    outcome = await restore_mod.apply_backup_restore(
+        db_session,
+        db_url=db_url,
+        archive_bytes=b"zip",
+        passphrase="hunter2hunter2",
+        confirmation_phrase=restore_mod.CONFIRM_PHRASE,
+    )
+
+    assert sweep_results == [{"fired": 0, "skipped_in_progress": 1, "reaped_stale": 0}]
+    assert fired == []
+    assert [(s["target_id"], s["settled_as"]) for s in outcome.reconciled_backup_targets] == [
+        (str(target_id), "success")
+    ]
+    row = (
+        await db_session.execute(
+            select(BackupTarget)
+            .where(BackupTarget.id == target_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert row.last_run_status == "success"
+    assert row.last_run_filename == "spatiumddi-aged.zip"
+    assert row.next_run_at is not None and row.next_run_at > now
+    reaped = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.resource_id == str(target_id),
+                    AuditLog.action == "backup_target_run_failed",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert reaped == []
+
+    # Once the restore has released its lock the sweep is back to normal:
+    # the settled target is not due, so nothing fires and nothing is reaped.
+    assert await backup_sweep._sweep() == {"fired": 0, "skipped_in_progress": 0, "reaped_stale": 0}
+    assert fired == []
+
+
+async def test_a_copy_read_before_the_settle_does_not_overwrite_it(
+    db_session: AsyncSession,
+) -> None:
+    """A tick that read the restored claim before the settle and reaches
+    the reap after the restore let its lock go must not stamp over the
+    settled row: the reap reads the row again, under a row lock."""
+    from app.db import AsyncSessionLocal
+
+    target = _target("raced")
+    db_session.add(target)
+    started = datetime.now(UTC) - timedelta(hours=3)
+    _as_restored(target, started)
+    await db_session.commit()
+
+    async with AsyncSessionLocal() as sweep_db:
+        stale_copy = await sweep_db.get(BackupTarget, target.id)
+        assert stale_copy is not None
+        assert runner_mod.backup_run_is_stale(stale_copy, datetime.now(UTC))
+
+        # The restore settles the claim and commits, from another session.
+        manifest = {
+            "created_at": (started + timedelta(seconds=5)).isoformat(),
+            "run": {
+                "target_id": str(target.id),
+                "filename": "b.zip",
+                "node": None,
+                "claimed_at": started.isoformat(),
+            },
+        }
+        await runner_mod.reconcile_restored_run_claims(db_session, manifest=manifest)
+
+        assert not await runner_mod.reap_stale_backup_run(sweep_db, target=stale_copy)
+        assert stale_copy.last_run_status == "success"
+
+    await db_session.refresh(target)
+    assert target.last_run_status == "success"
+    assert target.last_run_filename == "b.zip"

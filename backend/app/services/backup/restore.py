@@ -987,6 +987,24 @@ _RESTORE_LOCK_HOLDERS_SQL = (
 )
 
 
+async def restore_lock_held(db) -> bool:
+    """True while a restore holds the install-wide restore lock (#2097).
+
+    A read of ``pg_locks``, not a ``pg_try_advisory_lock``: taking the lock,
+    even for an instant, would refuse a restore that started in that instant
+    as "already in progress". Nothing here blocks or changes state.
+
+    The lock is held from before the replay until after the restore has
+    settled the run claims its archive carried, so a caller that sees it
+    free has either run before the replay or after the settle — never in the
+    window between the replay's commit and the settle, where a restored
+    claim reads as two hours old with nothing behind it.
+    """
+    from sqlalchemy import text  # noqa: PLC0415
+
+    return bool(await db.scalar(text(f"SELECT EXISTS ({_RESTORE_LOCK_HOLDERS_SQL})")))
+
+
 async def apply_backup_restore(db, *, db_url: str, **kwargs: Any) -> RestoreOutcome:
     """Restore under the install-wide advisory lock (#1571).
 
