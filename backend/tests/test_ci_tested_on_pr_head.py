@@ -447,6 +447,106 @@ def test_malformed_input_runs_the_suite(repo: Repo, env: dict[str, str]) -> None
     assert repo.run(**env).returncode == 1
 
 
+# ── ci-tested-on-pr-head.sh, path A: the merge queue (#2431) ────────────────
+
+
+def _mq_run(sha: str, **over: object) -> dict[str, object]:
+    """A merge_group run of SHA, created an hour ago (path A's age bound is
+    measured against now, not against a merge time)."""
+    fields: dict[str, object] = {
+        "id": 300,
+        "head_branch": f"gh-readonly-queue/main/pr-{PR}-{'f' * 40}",
+        "event": "merge_group",
+        "repository": {"full_name": REPO},
+        "created_at": _iso(datetime.now(UTC) - timedelta(hours=1)),
+    }
+    fields.update(over)
+    return _run(sha, **fields)
+
+
+def test_a_merge_queue_run_of_this_commit_skips(repo: Repo) -> None:
+    """The queue fast-forwards main to the commit its run tested, so commit
+    identity is the proof — no PR lookup, no tree comparison needed."""
+    repo.runs([_mq_run(repo.squash)])
+    repo.artifacts(300, "backend-full-suite-attempt-1")
+    result = repo.run()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "merge_group run=300 attempt=1"
+    calls = repo.stub.calls()
+    assert (
+        f"repos/{REPO}/actions/workflows/ci.yml/runs?head_sha={repo.squash}"
+        "&event=merge_group&status=completed&per_page=30"
+    ) in calls
+    assert f"repos/{REPO}/commits/{repo.squash}/pulls" not in calls
+
+
+def test_a_merge_queue_group_of_several_commits_skips(repo: Repo) -> None:
+    """A group of N squash commits lands as one push: path B refuses that
+    (more than one commit), path A does not need to."""
+    o = repo.origin
+    _git(o, "commit", "-q", "--allow-empty", "-m", "second queued PR (#8)")
+    top = _git(o, "rev-parse", "HEAD")
+    repo.refetch()
+    repo.runs([_mq_run(top)])
+    repo.artifacts(300, "backend-full-suite-attempt-1")
+    result = repo.run(SHA=top, BEFORE=repo.base)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("merge_group ")
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"conclusion": "failure"},
+        {"status": "in_progress", "conclusion": None},
+        {"head_branch": "gh-readonly-queue/release/pr-7-abc"},
+        {"head_branch": "main"},
+        {"repository": {"full_name": "fork/repo"}},
+        {"head_repository": {"full_name": "fork/repo"}},
+        {"created_at": _iso(datetime.now(UTC) - timedelta(hours=25))},
+    ],
+)
+def test_a_merge_queue_run_that_does_not_qualify_falls_through(
+    repo: Repo, over: dict[str, object]
+) -> None:
+    """Falls through to path B, which (no qualifying PR run here) refuses."""
+    repo.runs([_mq_run(repo.squash, **over)])
+    repo.artifacts(300, "backend-full-suite-attempt-1")
+    result = repo.run()
+    assert result.returncode == 1
+    assert "not tested in the merge queue" in result.stderr
+
+
+def test_a_merge_queue_run_of_another_commit_does_not_count(repo: Repo) -> None:
+    repo.runs([_mq_run(repo.head)])
+    repo.artifacts(300, "backend-full-suite-attempt-1")
+    assert repo.run().returncode == 1
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        (),  # a docs-only group skipped its shards (#813): no marker
+        ("backend-full-suite-attempt-1",),  # an earlier attempt's marker
+    ],
+)
+def test_a_merge_queue_run_without_the_latest_full_marker_does_not_count(
+    repo: Repo, names: tuple[str, ...]
+) -> None:
+    repo.runs([_mq_run(repo.squash, run_attempt=2)])
+    repo.artifacts(300, *names)
+    assert repo.run().returncode == 1
+
+
+def test_path_b_still_answers_when_the_merge_queue_lookup_fails(repo: Repo) -> None:
+    """Both lookups share the runs endpoint in the stub, so a malformed
+    merge-group row must not stop path B finding the PR run beside it."""
+    repo.runs([_run(repo.head), _mq_run(repo.squash, created_at="not-a-date")])
+    result = repo.run()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith(f"pr={PR} ")
+
+
 # ── ci-full-suite-passed.sh (release.yml's gate) ─────────────────────────────
 
 SHA = "a" * 40
@@ -523,6 +623,60 @@ def test_gate_waits_while_a_dispatched_run_is_in_progress(gate: Gate) -> None:
     )
     gate.artifacts(1, "backend-skipped-tested-on-pr-head-attempt-1")
     assert gate.run().returncode == 2
+
+
+def test_gate_accepts_the_merge_queue_run_of_the_commit(gate: Gate) -> None:
+    """#2431 — the queue fast-forwards main to the commit it tested, so its
+    full run of that commit counts beside a skipped push run."""
+    gate.runs(
+        _main_run(
+            2,
+            "merge_group",
+            head_branch="gh-readonly-queue/main/pr-7-abc",
+            repository={"full_name": REPO},
+        ),
+        _main_run(1),
+    )
+    gate.artifacts(1, "backend-skipped-tested-in-merge-queue-attempt-1")
+    gate.artifacts(2, "backend-full-suite-attempt-1")
+    result = gate.run()
+    assert result.returncode == 0, result.stderr
+    assert "merge_group run 2" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"head_branch": "issue-7"},
+        {"head_branch": "gh-readonly-queue/release/pr-7-abc"},
+        {"repository": {"full_name": "fork/repo"}},
+    ],
+)
+def test_gate_ignores_a_merge_group_run_off_mains_queue(
+    gate: Gate, over: dict[str, object]
+) -> None:
+    fields: dict[str, object] = {
+        "head_branch": "gh-readonly-queue/main/pr-7-abc",
+        "repository": {"full_name": REPO},
+    }
+    fields.update(over)
+    gate.runs(_main_run(2, "merge_group", **fields))
+    gate.artifacts(2, "backend-full-suite-attempt-1")
+    assert gate.run().returncode == 4
+
+
+def test_gate_refuses_a_merge_queue_skipped_push_run_alone(gate: Gate) -> None:
+    gate.runs(_main_run(1))
+    gate.artifacts(1, "backend-skipped-tested-in-merge-queue-attempt-1")
+    result = gate.run()
+    assert result.returncode == 3
+    assert "merge queue" in result.stderr
+
+
+def test_gate_legacy_push_with_a_merge_queue_skip_marker_is_not_full(gate: Gate) -> None:
+    gate.runs(_main_run(1, created_at=BEFORE_CUTOFF))
+    gate.artifacts(1, "backend-skipped-tested-in-merge-queue-attempt-1")
+    assert gate.run().returncode == 3
 
 
 def test_gate_reports_no_run(gate: Gate) -> None:

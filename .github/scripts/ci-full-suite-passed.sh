@@ -5,10 +5,16 @@
 # with the 12 backend shards skipped, resting on the merged PR's own run of
 # the identical tree. That is sound for merging, but a release must never
 # rest on a skipped-shards run alone, so this asks for a ci.yml run on SHA
-# itself — push, schedule or workflow_dispatch — whose LATEST attempt
-# published the ``backend-full-suite-attempt-<n>`` marker (all 12 shards,
-# full suite, that attempt). A ``workflow_dispatch`` run cannot skip: the
-# ``changes`` job only consults ci-tested-on-pr-head.sh on a push.
+# itself — push, schedule, workflow_dispatch or merge_group — whose LATEST
+# attempt published the ``backend-full-suite-attempt-<n>`` marker (all 12
+# shards, full suite, that attempt). A ``workflow_dispatch`` run cannot skip:
+# the ``changes`` job only consults ci-tested-on-pr-head.sh on a push.
+#
+# #2431 — a ``merge_group`` run counts because the merge queue fast-forwards
+# main to the very commit it tested, so its head_sha IS the released commit
+# and it ran that commit's own workflow. Only one from a
+# ``gh-readonly-queue/main/`` branch of this repository; a merge-group run
+# never narrows its tests (#1020), and the marker check below still decides.
 #
 # Push runs created before LEGACY_CUTOFF predate the markers and always ran
 # the full suite (there was no skip), so a successful one counts on its own.
@@ -41,15 +47,19 @@ trap 'rm -rf "$tmp"' EXIT
 
 gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&per_page=50" > "$tmp/runs.json" 2>/dev/null \
   || { say "could not list ci.yml runs for ${SHA::7}"; exit 1; }
-rows="$(jq -r --arg sha "$SHA" '
+rows="$(jq -r --arg sha "$SHA" --arg repo "$REPO" '
     .workflow_runs[]
     | select(.head_sha == $sha
-             and (.event == "push" or .event == "schedule" or .event == "workflow_dispatch"))
+             and (.event == "push" or .event == "schedule" or .event == "workflow_dispatch"
+                  or (.event == "merge_group"
+                      and ((.head_branch // "") | startswith("gh-readonly-queue/main/"))
+                      and (.repository.full_name // "") == $repo
+                      and (.head_repository.full_name // "") == $repo)))
     | [.id, .event, .status, (.conclusion // "none"), .run_attempt, .created_at, .html_url] | @tsv' \
     "$tmp/runs.json" 2>/dev/null)" || { say "unexpected reply listing ci.yml runs"; exit 1; }
 
 if [ -z "$rows" ]; then
-  say "ci.yml has not run on ${SHA::7} as a push, schedule or dispatch"
+  say "ci.yml has not run on ${SHA::7} as a push, schedule, dispatch or merge group"
   exit 4
 fi
 
@@ -77,12 +87,15 @@ while IFS=$'\t' read -r id event status conclusion attempt created url; do
     exit 0
   fi
   if [ "$event" = push ] && [[ "$created" < "$LEGACY_CUTOFF" ]] \
-     && ! has "backend-skipped-tested-on-pr-head-attempt-${attempt}"; then
+     && ! has "backend-skipped-tested-on-pr-head-attempt-${attempt}" \
+     && ! has "backend-skipped-tested-in-merge-queue-attempt-${attempt}"; then
     say "✓ push run $id predates the backend-suite markers and ran the full suite: $url"
     exit 0
   fi
   if has "backend-skipped-tested-on-pr-head-attempt-${attempt}"; then
     say "$event run $id passed with the backend shards SKIPPED (tree tested on the merged PR's head, #2429): $url"
+  elif has "backend-skipped-tested-in-merge-queue-attempt-${attempt}"; then
+    say "$event run $id passed with the backend shards SKIPPED (commit tested in the merge queue, #2431): $url"
   else
     say "$event run $id passed but carries no full-suite marker for attempt $attempt: $url"
   fi

@@ -16,6 +16,25 @@
 # an API error, an unexpected shape, a missing artifact — is exit 1, and
 # the caller runs the full suite.
 #
+# Two independent ways to establish it, tried in this order:
+#
+#   A. The merge queue (#2431) tested THIS COMMIT. The queue builds each
+#      entry on a ``gh-readonly-queue/main/...`` branch and, when the group
+#      merges, fast-forwards main to that branch's head — the very commit
+#      its ``merge_group`` run tested, whatever the number of commits in the
+#      push (a group of N squash commits lands as one push). So: a
+#      ``merge_group`` run of ci.yml in this repository with head_sha == SHA,
+#      from a ``gh-readonly-queue/main/`` branch, concluded ``success``,
+#      created no more than MAX_RUN_AGE_SECONDS ago, whose LATEST attempt
+#      published ``backend-full-suite-attempt-<run_attempt>``. A merge-group
+#      run never narrows (#1020), but a docs-only group skips its shards
+#      (#813) and publishes no marker, so its push runs the suite. Commit
+#      identity is a stronger guarantee than the tree comparison of path B,
+#      and the run executed the workflow of the commit itself, so no fork
+#      concern arises. Any failure on this path falls through to B.
+#
+#   B. The merged PR's own run tested an identical tree:
+#
 #   1. The push added exactly one commit: BEFORE is SHA's only parent. A
 #      direct push, a multi-commit rebase merge or a merge commit fails.
 #   2. GitHub records exactly one PR, merged into main, whose merge commit
@@ -46,7 +65,9 @@
 # is fetched as raw JSON and filtered here with jq, so the filters are the
 # ones the tests exercise.
 #
-# stdout on exit 0: one line, ``pr=<N> head=<sha> run=<id> attempt=<n>``.
+# stdout on exit 0: one line — path A ``merge_group run=<id> attempt=<n>``,
+# path B ``pr=<N> head=<sha> run=<id> attempt=<n>``. ci.yml keys the skip
+# reason it reports on the first word.
 # stderr: the reason for the verdict either way.
 #
 # Pinned by backend/tests/test_ci_tested_on_pr_head.py.
@@ -79,6 +100,47 @@ command -v jq >/dev/null 2>&1 || no "jq is not installed"
 
 tmp="$(mktemp -d)" || no "cannot create a temp dir"
 trap 'rm -rf "$tmp"' EXIT
+
+# A. The merge queue's run of this exact commit (#2431). Every failure here
+#    only means "not established this way": fall through to B.
+merge_queue_run() {
+  gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&event=merge_group&status=completed&per_page=30" \
+    > "$tmp/mq-runs.json" 2>/dev/null || return 1
+  local now cands id attempt marker n
+  now="$(date -u +%s)" || return 1
+  cands="$(jq -r --arg sha "$SHA" --arg repo "$REPO" --argjson now "$now" \
+                --argjson max "$MAX_RUN_AGE_SECONDS" '
+      [ .workflow_runs[]
+        | select(.head_sha == $sha and .event == "merge_group"
+                 and .status == "completed" and .conclusion == "success"
+                 and ((.head_branch // "") | startswith("gh-readonly-queue/main/"))
+                 and (.repository.full_name // "") == $repo
+                 and (.head_repository.full_name // "") == $repo)
+        | (.created_at | fromdateiso8601) as $c
+        | select($c <= $now and ($now - $c) <= $max)
+        | {id, run_attempt, c: $c} ]
+      | sort_by(-.c) | .[] | "\(.id)\t\(.run_attempt)"' "$tmp/mq-runs.json" 2>/dev/null)" || return 1
+  [ -n "$cands" ] || return 1
+  while IFS=$'\t' read -r id attempt; do
+    [[ "$id" =~ ^[0-9]+$ && "$attempt" =~ ^[0-9]+$ ]] || continue
+    marker="backend-full-suite-attempt-${attempt}"
+    gh api "repos/${REPO}/actions/runs/${id}/artifacts?name=${marker}" > "$tmp/mq-art.json" 2>/dev/null || continue
+    n="$(jq --arg n "$marker" '[.artifacts[] | select(.name == $n and .expired == false)] | length' \
+           "$tmp/mq-art.json" 2>/dev/null)" || continue
+    if [ "$n" -ge 1 ] 2>/dev/null; then
+      echo "skip shards: the merge queue's CI run $id (attempt $attempt) passed the full backend suite on exactly ${SHA:0:12}" >&2
+      echo "merge_group run=$id attempt=$attempt"
+      return 0
+    fi
+  done <<< "$cands"
+  return 1
+}
+if merge_queue_run; then
+  exit 0
+fi
+echo "not tested in the merge queue as this exact commit; checking the merged PR's head" >&2
+
+# B. The merged PR's head.
 
 # 1. Exactly one new commit, with exactly one parent.
 parents="$(git rev-list --parents -n 1 "$SHA" 2>/dev/null)" || no "cannot read $SHA"
