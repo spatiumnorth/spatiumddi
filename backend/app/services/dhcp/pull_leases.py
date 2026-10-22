@@ -197,9 +197,14 @@ async def pull_leases_from_server(
     one (scopes read but the lease read failed, or one scope's enumeration
     failed); the summary names the failing parts. Only a clean pull clears
     ``last_sync_error``. Agent-based drivers are not applicable and untouched.
+
+    A ``busy`` result (#2262) records nothing: this call did no pull, so it
+    has no outcome to report, and the pass that holds the server records its
+    own. Writing the row here would also wait on that pass's row lock, so a
+    manual Sync that should answer 409 at once would hang until it finished.
     """
     result = await _pull_leases_core(db, server, apply=apply)
-    if apply and is_agentless(server.driver):
+    if apply and not result.busy and is_agentless(server.driver):
         if result.errors:
             server.last_sync_error = _summarise_errors(result.errors)
             server.last_sync_error_at = datetime.now(UTC)

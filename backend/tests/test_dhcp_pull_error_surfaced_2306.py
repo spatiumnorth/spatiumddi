@@ -194,3 +194,28 @@ async def test_dry_run_does_not_touch_the_error(
     await pl.pull_leases_from_server(db_session, srv, apply=False)
     await db_session.commit()
     assert (await _row(db_session, sid)).last_sync_error is None
+
+
+@pytest.mark.asyncio
+async def test_busy_pull_leaves_the_error_untouched(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A busy result (#2262) did no pull, so it records nothing. Writing the
+    row would also wait on the lock the holding pass has on it, which is what
+    hung the manual Sync's 409."""
+    sid = await _arm(db_session)
+
+    async def _busy(db, server, apply=True):  # type: ignore[no-untyped-def]
+        return pl.PullLeasesResult(busy=True)
+
+    monkeypatch.setattr(pl, "_pull_leases_core", _busy)
+    monkeypatch.setattr(pl, "is_agentless", lambda _d: True)
+    srv = await _row(db_session, sid)
+    srv.last_sync_error = "earlier failure"
+    await db_session.commit()
+
+    srv = await _row(db_session, sid)
+    result = await pl.pull_leases_from_server(db_session, srv, apply=True)
+    assert result.busy
+    await db_session.commit()
+    assert (await _row(db_session, sid)).last_sync_error == "earlier failure"
