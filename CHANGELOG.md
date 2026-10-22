@@ -174,6 +174,178 @@ the formatter handles the rest.
   refusal as a failed record op rather than, as on 15.4.0, filing the
   record in the child zone.
 
+- **Turning BIND9 query logging on or off now takes effect without
+  restarting named (#2249).** `rndc reconfig` never applies the
+  `querylog` switch: a named that started with query logging off
+  stayed off after the agent rendered the `queries` category, and one
+  that started with it on kept logging after it was removed. #914 fixed
+  the same thing for `responselog` but believed query logging followed
+  its category on reload; it only does when named starts. So enabling
+  query logging on a running server reported success and logged
+  nothing, and with response logging on the control plane dropped
+  every response line as an orphan, leaving the DNS Queries tab empty
+  until the daemon restarted. The agent now renders `querylog yes;`
+  when query logging is on and, after each structural reload, runs
+  `rndc querylog on|off` alongside `rndc responselog on|off`, read back
+  off the config it just swapped in. A group with query logging off
+  renders the same `named.conf` as before, and the control-plane
+  `named.conf` preview mirrors the new statement. A new live check,
+  `agent/dns/tests/live_query_log_check.py`, toggles both switches on a
+  running BIND 9.20 through the agent's real reload path and asserts
+  `rndc status` and the lines named writes; it runs in the DNS image
+  build. PowerDNS was not affected: it restarts `pdns_server` when
+  `pdns.conf` changes. Technitium has no query-log toggle yet (#742).
+
+- **A node staging an upgrade could stall its own etcd until k3s restarted
+  (#1804).** The node keeps serving while it writes the new slot, and the
+  write was buffered: hundreds of MB of the 8 GiB image piled up in the page
+  cache and flushed ahead of etcd's WAL fdatasync, which then waited for
+  seconds. On the node holding the cluster's leases the controller-manager
+  missed its renewal and k3s exited in the middle of the write, taking the
+  node's kubelet down until it came back (and longer when the restart landed
+  after the stage had refreshed the image tarballs, which k3s re-imports
+  before it starts the kubelet). The slot write now bypasses the page cache
+  (`dd oflag=direct iflag=fullblock`), so etcd waits behind one 4 MiB block
+  at most, and the image download, which lands on the same filesystem as
+  etcd's WAL, is flushed to disk every 16 MiB as it arrives instead of
+  piling up 300-400 MB to flush when the write begins. The write is also
+  paced to 32 MiB/s: where a cluster's members share a disk (VMs on one host
+  or one datastore), a direct write at the disk's full speed slowed every
+  member's etcd at once and the cluster's leases were lost on each node that
+  held them. Paced, the 8 GiB write takes about 4.5 minutes, with the node
+  serving throughout.
+
+- **A rolling upgrade's drain that timed out said "0 pod(s) still present"
+  while every pod was still on the node (#1804).** The count was the
+  evictions refused in the drain's last cycle, not the pods left on the
+  node. A node whose kubelet is down accepts every eviction and removes
+  nothing, so it timed out reporting none. The error now counts the pods
+  the last poll still found, says how many evictions were refused and how
+  many were accepted but never removed, and the step detail lists them
+  (`remaining`, `not_removed`). The drain-stuck hint says to check the
+  node's Ready condition as well as PodDisruptionBudgets.
+
+- **The BIND9 agent no longer rewrites every RPZ zone file on every
+  structural apply (#2157).** Removing a forward zone or editing a group
+  option re-serialised every blocklist from scratch: ~11 MB per catalog
+  list per agent, written again on every replica of its volume, with the
+  previous copy deleted from `rendered.prev` at the same time. The
+  control plane now ships a content hash with each RPZ zone
+  (`rpz_sha256`, BIND9 bundles only), and the agent records it beside
+  the file it wrote. When the hash matches, the file it already serves
+  is hard-linked into the new tree (copied, if the volume refuses
+  links): nothing is serialised or written, the zone is not checked or
+  reloaded, and the backup tree shares the inode, so it costs no extra
+  disk. Only a list that changed is rendered and reloaded. The #882
+  revert takes the previous bundle's zone back from `rendered.prev` the
+  same way, with its mtime refreshed, because named skips `rndc reload`
+  of a zone whose file is older than its last load. Every write into a
+  rendered tree now lands as a new inode (temp file and rename): a write
+  through a hard-linked name would change the backup too, and the one
+  place that did so, putting the live copy back over a zone
+  `named-checkzone` refused, now copies. The RPZ SOA serial derives
+  from the content instead of being a constant 1, so a changed zone's
+  load is verified like any other zone's. A file is flushed to disk
+  before its hash is recorded beside it, since a reused file is never
+  checked again, and the hash files are left out of the rendered-config
+  snapshot the agent uploads. A bundle from an older control
+  plane carries no hash and renders every time, as before. The first
+  apply after upgrading renders and reloads every RPZ zone once.
+  Bundles without a blocklist are byte-identical; `RENDERER_REVISION`
+  is 12.
+
+- **The looking-glass image's GoBGP builder moves to Go 1.27.3.** Go 1.27.2's `crypto/x509` carries CVE-2026-111943 (HIGH), and Go static-links its standard library into the binary, so only a rebuild with the fixed toolchain clears it. The nightly's Trivy gate failed on it.
+
+- **Starting a fleet upgrade, forcing a block-sync reconcile and
+  syncing an integration now record who did it (#2303).** All three
+  enqueue a worker task whose own audit rows say `system`, so "who
+  started the rolling upgrade" or "who forced this firewall push"
+  existed only in structlog. Each route now writes an audit row
+  attributed to the caller before the response returns:
+  `upgrade.start_requested` on the upgrade run, `reconcile` on the
+  block-sync target (not written for `?preview=true`), and `sync` on the
+  Cloud, Docker, Kubernetes, NetBird, OPNsense, Palo Alto, Fortinet,
+  Meraki, Proxmox, Tailscale and UniFi target. The worker's own rows
+
+- **DNS records mirrored from an external RFC 2136 writer are audited
+  (#2302).** An agent's `ingested-records` batch created and hard-deleted
+  `ddns_external` mirror records (an AD DC registering and deregistering
+  hosts) with no audit row, so they appeared and vanished with no history.
+  Each batch that adds or removes records now writes one
+  `dns.record.external_ingest` row on the zone naming them (added in
+  `new_value`, removed in `old_value`, capped at 50 per batch).
+
+- **Changing the Copilot tool catalog left no audit row (#2300).**
+  `PUT /ai/tools/catalog` is the switch that turns on the tools
+  that are default-off because they expose secrets, write broadly or
+  call off-prem, and it committed with no record of who flipped it.
+  It now writes one `audit_log` row in the same transaction, listing
+  the tools it enabled and the tools it disabled (a diff, not the
+  whole catalog). A write that changes nothing writes no row.
+
+- **Acknowledging, suppressing or deleting a captured internal error
+  left no audit row (#2301).** The three Diagnostics routes mutated or
+  hard-deleted the error with nothing in `audit_log`, so a fault (or
+  the exception an exploit attempt tripped) could be silenced or
+  erased without a trace. Each now writes one `internal_error` audit
+  row in the same transaction, carrying the fingerprint, exception
+  class and, for suppress, the hours and expiry. There are no bulk
+  endpoints. Re-acknowledging an already-acknowledged error changes
+  nothing and writes nothing.
+
+- **The wake calendar sync deleted today's holiday for schedules west
+  of UTC, so the fleet woke on it (#2305).** The sync kept events from
+  the worker's UTC date onward and deleted every stored span outside
+  that, but the gate judges the schedule's local date. For a schedule in
+  America/Los_Angeles, a refresh after 00:00 UTC removed the 20th's
+  holiday while it was still the 20th locally: a `skip_on_event`
+  schedule fired, and an `only_on_event` one silently skipped. The sync
+  now starts its horizon at the earliest local today among the
+  schedules attached to the calendar (DST-aware, never later than the
+  UTC date), or the UTC-12 date when none is attached.
+
+- **Deleting a site no longer silently deletes its E911 site-default
+  binding (#2298).** The binding is `ON DELETE CASCADE`, so a site delete
+  (single or bulk) removed the fallback emergency location for every
+  phone on it with no warning. Both now answer 409 naming the site and the
+  ERL, until the binding is removed under Network > E911 > Bindings; bulk
+  delete is all-or-nothing.
+
+- **The Audit page "Chain verified" badge now checks the newest audit
+  rows, not the oldest (#2297).** It verified the first 1,000 rows ever
+  written, so once an install passed 1,000 rows, tampering with recent
+  history still showed green. `GET /audit/integrity` takes
+  `newest=true` with `max_rows` to verify the latest window, anchored
+  on the row before it, and reports `first_seq` / `last_seq` /
+  `partial`; the badge tooltip states the range it covered and that the
+  nightly verify walks the whole chain.
+
+- **Sync DNS commit counted an address as created when nothing was
+  written (#2352).** Every address named in `create_for_ip_ids` (and
+  every record-linked address in `update_record_ids`) was counted as
+  created / updated, and written to the `dns-sync` audit row, even when
+  its A and PTR already existed and no DNS op was queued. The commit
+  now counts only addresses it queued ops for, so an address already in
+  sync reads as unchanged and writes no audit row, at subnet, block and
+  space scope alike. Also fixed on the way: a block-scope commit that
+  did write something answered 422 ("cannot be stored as sent"), because
+  its audit row was handed the CIDR as an object rather than a string.
+
+- **Timezone shifts in MAC-block expiry, the lease-history Since picker
+  and date-only terms (#2260).** Editing a DHCP MAC block fed its UTC
+  `expires_at` to a local `datetime-local` input and re-parsed it as
+  local on save, so every save moved the expiry by the browser's UTC
+  offset (a quarantine block could lift hours early east of UTC); the
+  lease-history Since picker had the same fault. Both now convert
+  through shared helpers in `lib/localTime.ts`. Circuit and service
+  term dates and an operator-entered Tailscale token expiry rendered a
+  day early west of UTC, and a term read "expired" on its last day.
+  Dates now parse as local calendar days and the end date is inclusive.
+  The `circuit_term_expiring` / `service_term_expiring` alerts say
+  "term expires today" on the last day, and the Network dashboard no
+  longer counts a circuit as past its term until the day after. A
+  source-scanning vitest guard fails on the old patterns.
+
 - **Webhook subscriptions could be created, repointed, deleted and
   have deliveries retried with no audit row (#2293).** All four routes
   now write one `audit_log` row in the mutation's transaction. The row
