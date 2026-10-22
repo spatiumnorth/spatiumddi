@@ -559,8 +559,18 @@ def _waits_on_redis_claim(pod: dict) -> bool:
     return False
 
 
+def _k3s_node_names(names: str | Iterable[str]) -> set[str]:
+    """PURE: the names as k3s registers its Nodes, lowercased with no trailing
+    dot (#1757), as delete_node sends them. A bare string is one name."""
+    given = [names] if isinstance(names, str) else names
+    return {str(n).strip().rstrip(".").lower() for n in given if n} - {""}
+
+
 def reclaim_stranded_redis_storage(
-    evicted_nodes: str | Iterable[str] = (), namespace: str = "spatium"
+    evicted_nodes: str | Iterable[str] = (),
+    namespace: str = "spatium",
+    *,
+    owed_nodes: str | Iterable[str] = (),
 ) -> RedisReclaim:
     """Delete Redis PVCs (and their Pending consumer pods) stranded on a
     node that no longer exists. Returns a :class:`RedisReclaim`, which
@@ -599,11 +609,17 @@ def reclaim_stranded_redis_storage(
     three-node cluster, Redis still ran two of three 37 minutes after a
     replace). The seed calls it on every tick now:
 
-    * ``evicted_nodes``: the names the caller deleted this tick, and any a
-      failed sweep left owed (a bare name is one node). They are
-      authoritative, as for Postgres: their claims go at once, with no
-      Node read (the DELETE is milliseconds old and the Node can still be
-      listed).
+    * ``evicted_nodes``: the names the caller deleted this tick (a bare
+      name is one node). They are authoritative, as for Postgres: their
+      claims go at once, with no Node read (the DELETE is milliseconds old
+      and the Node can still be listed).
+    * ``owed_nodes``: the names a failed sweep left owed. They were evicted
+      on an earlier tick, and a run of failed sweeps can keep them owed
+      while the node rejoins under the same hostname, its replica running
+      on the claim again (review of #2433). So one Node read decides: a
+      name the list no longer has goes as if evicted now, and one it lists
+      again keeps its claim and pod. A Node list that cannot be read is an
+      error, and nothing is freed.
     * otherwise one read, the namespace's Pending pods. Only while a pod
       that mounts a ``-redis-`` claim is Pending does the sweep read the
       Node list, and it reclaims each claim whose every pinned hostname
@@ -617,10 +633,15 @@ def reclaim_stranded_redis_storage(
     fails is an error, never a guess. A claim an earlier sweep deleted is
     reported ``terminating``, not reclaimed again, and its pod DELETE is
     retried."""
-    names = [evicted_nodes] if isinstance(evicted_nodes, str) else list(evicted_nodes)
-    # #1757: k3s registers the host's name lowercased, as delete_node sends it.
-    forced = {str(n).strip().rstrip(".").lower() for n in names if n} - {""}
+    forced = _k3s_node_names(evicted_nodes)
+    owed = _k3s_node_names(owed_nodes) - forced
     base = f"/api/v1/namespaces/{quote(namespace)}"
+    if owed:
+        # Owed, not evicted this tick: only while the Node list lacks the name.
+        listed, nodes_err = cluster_node_names()
+        if listed is None:
+            return RedisReclaim(error=nodes_err)
+        forced |= owed - set(listed)
     live: set[str] | None = None
     if not forced:
         try:

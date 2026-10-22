@@ -551,3 +551,92 @@ def test_a_failure_that_repeats_is_logged_once(seed_tick, monkeypatch) -> None:
     assert len(failed) == 2 and "503" in failed[0] and "500" in failed[1]
     assert [e["pvcs"] for e in _said(logs, "redis_storage_reclaimed")] == [[R2]]
     assert kube.deleted[-2:] == FREED
+
+
+# ---------------------------------------------------------------------------
+# Review of #2433, point 1: a name a failed sweep left owed is not this tick's
+# eviction. It can outlive a run of failed sweeps, and its node can rejoin under
+# the same hostname meanwhile, its Redis replica running on the claim again.
+# Only the Node list can say the name is still gone.
+# ---------------------------------------------------------------------------
+
+MEMBER_4 = "ddipg-member-4"
+
+
+def test_a_node_back_under_an_owed_name_keeps_its_claim_and_pod(seed_tick, monkeypatch) -> None:
+    # The eviction tick's claim list fails, so member-2 is owed. By the next
+    # tick member-2 is back under the same hostname and redis-2 runs there on
+    # its claim (no Redis pod is Pending). Handed back as evicted, the owed
+    # name cost it the claim and the running pod, for a replica resync.
+    gets = _walk(nodes=(*LIVE, DEAD), pending=())
+    gets[PVC_PATH] = [(503, "etcdserver: request timed out"), gets[PVC_PATH]]
+    kube = _Kube(gets)
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    first = seed_tick(_REPLACE_MEMBER_2)
+    second = seed_tick(_SETTLED)
+
+    assert len(_said(first, "redis_storage_reclaim_failed")) == 1
+    assert kube.deleted == [f"/api/v1/nodes/{DEAD}"]
+    assert not _said(second, "redis_storage_reclaimed")
+    assert heartbeat._redis_stranded_pending == set()  # back, so owed no more
+
+
+@pytest.mark.parametrize("ready", [True, False], ids=["ready", "not-ready"])
+def test_an_owed_name_the_node_list_has_again_is_left_alone(monkeypatch, ready) -> None:
+    # Listed again is not gone, Ready or not, as on the sweep.
+    kube = _Kube(_walk(nodes=(*LIVE, _node(DEAD, ready=ready)), pending=()))
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    out = k8s_api.reclaim_stranded_redis_storage(owed_nodes=[DEAD])
+
+    assert tuple(out) == ([], None)
+    assert kube.deleted == []
+
+
+def test_an_owed_name_still_missing_from_the_node_list_is_reclaimed(monkeypatch) -> None:
+    # Still gone: freed at once on one Node read, without waiting for its pod
+    # to show Pending, and matched as delete_node sends it (#1757).
+    kube = _Kube(_walk(pending=()))
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    out = k8s_api.reclaim_stranded_redis_storage(owed_nodes=["DDIPG-Member-2."])
+
+    assert tuple(out) == ([R2], None)
+    assert kube.deleted == FREED
+    assert kube.reads.count(NODES_PATH) == 1 and PENDING_PATH not in kube.reads
+
+
+def test_an_owed_name_is_not_reclaimed_on_a_node_list_that_fails(monkeypatch) -> None:
+    # An unreadable Node list says nothing about the owed node: it stays owed.
+    gets = _walk(pending=())
+    gets[NODES_PATH] = (500, "boom")
+    kube = _Kube(gets)
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    out = k8s_api.reclaim_stranded_redis_storage(owed_nodes=[DEAD])
+
+    assert out.reclaimed == []
+    assert out.error is not None and "500" in out.error
+    assert kube.deleted == []
+
+
+def test_this_ticks_eviction_stays_authoritative_beside_an_owed_name(monkeypatch) -> None:
+    # member-2 was evicted this tick and is still listed (its DELETE is
+    # milliseconds old); member-4, owed from an earlier tick, is back with
+    # redis-3 on it. The Node read the owed name costs decides member-4 only.
+    claims = (*_WALK_CLAIMS, _redis_claim(3, "pv-r3", selected=MEMBER_4))
+    kube = _Kube(
+        _walk(
+            nodes=(*LIVE, DEAD, MEMBER_4),
+            pending=(),
+            claims=claims,
+            pvs={**_WALK_PVS, "pv-r3": MEMBER_4},
+        )
+    )
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    out = k8s_api.reclaim_stranded_redis_storage({DEAD}, owed_nodes=[MEMBER_4])
+
+    assert tuple(out) == ([R2], None)
+    assert kube.deleted == FREED
