@@ -18,7 +18,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete as sa_delete
@@ -71,6 +71,7 @@ from app.services.dns import dnssec_signers
 from app.services.dns.agent_bundle_render import render_and_store
 from app.services.dns.agent_bundle_store import RENDERED_BY_API, encode_body
 from app.services.dns.agent_config import page_pending_ops
+from app.services.dns.agent_instance import claim_poll, is_displaced
 from app.services.dns.agent_token import (
     hash_token,
     mint_agent_token,
@@ -765,6 +766,33 @@ def _agent_instance(raw: str | None) -> str | None:
     return value
 
 
+#: #2044 — set on the 409 a refused duplicate agent receives, so it can tell
+#: this refusal from any other 409 without parsing the body.
+DUPLICATE_INSTANCE_HEADER = "X-Spatium-Duplicate-Agent-Instance"
+
+
+def _duplicate_instance_response(server: DNSServer) -> JSONResponse:
+    """409 for a poll from an agent process that does not own ``server`` (#2044).
+
+    Not 401 / 404: those make the agent drop its token and re-register
+    (#2052), which would not change which process owns the row. The agent logs
+    the refusal and keeps serving its cached config, polling again on a slow
+    backoff; it takes the server back by itself if the owner stops polling."""
+    return JSONResponse(
+        status_code=409,
+        headers={DUPLICATE_INSTANCE_HEADER: "1"},
+        content={
+            "detail": (
+                f"Another agent process is polling as DNS server '{server.name}'. "
+                "Two live agents share one server identity (a cloned VM or a "
+                "copied agent state directory keeps the same agent_id); only the "
+                "most recent one is served. Stop the other agent, or give it its "
+                "own identity by clearing its state directory."
+            )
+        },
+    )
+
+
 @router.get("/config")
 async def agent_config_longpoll(
     request: Request,
@@ -839,6 +867,14 @@ async def agent_config_longpoll(
     them. And a handler whose client has disconnected rolls its page back
     instead of committing it; that check is advisory (TCP may not have
     noticed yet), the instance id is what makes the recovery certain.
+
+    #2044 — that recovery assumes the other instance is GONE. Two processes
+    live on one server identity took each op back from each other on every
+    poll until its retries ran out. So one instance owns the server
+    (``agent_instance.claim_poll``): a new one takes over at once, the one it
+    displaced is refused with 409 if it polls again while the owner is live,
+    and a poll whose instance lost ownership while it waited stops before it
+    pages anything.
     """
     server, _payload = auth
     instance = _agent_instance(agent_instance)
@@ -848,6 +884,17 @@ async def agent_config_longpoll(
     if server.pending_approval:
         response.headers["X-Spatium-Pending-Approval"] = "1"
         return {"pending_approval": True, "etag": None}
+    # #2044 — one agent process owns the server at a time. A second live one
+    # on the same identity is refused here rather than served ops, or the two
+    # take each op back from each other until its retries are spent.
+    if instance is not None and not await claim_poll(
+        db,
+        server,
+        instance,
+        now=poll_started_at,
+        client_ip=request.client.host if request.client is not None else None,
+    ):
+        return _duplicate_instance_response(server)
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     enqueued = False
@@ -864,6 +911,12 @@ async def agent_config_longpoll(
             # any replica, or the worker's store, is seen here
             # (expire_on_commit=False, no in-loop commit).
             await refresh_agent_server(db, server)
+            if instance is not None and server.agent_instance not in (None, instance):
+                # #2044 — another agent process took the server over while this
+                # poll waited: a replacement (this poll is the departed agent's
+                # leftover, read by nobody) or a second live agent. Either way
+                # it must not page ops; the new owner's polls ship them.
+                return _duplicate_instance_response(server)
             # The newest bundle this release stored, current or not: under a
             # write storm no render is current until the writes stop, and
             # each one that lands is served as it lands (docstring).
@@ -952,11 +1005,17 @@ async def agent_heartbeat(
     request: Request,
     body: AgentHeartbeatRequest,
     db: DB,
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
     auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> AgentHeartbeatResponseV2:
     """Heartbeat: updates last_seen_at, processes op ACKs, rotates token if near expiry."""
     server, payload = auth
     now = datetime.now(UTC)
+    # #2044 — a process the owner displaced (the refused half of two live
+    # agents on one identity) still heartbeats. Its liveness and acks count;
+    # what it reports about its daemon, config and spool describes a process
+    # that is not being served, so it stays off the row.
+    displaced = is_displaced(server, _agent_instance(agent_instance))
     # #1929 — the ops this heartbeat writes are locked before the server row
     # (``row_locks``): its first write to the server row is flushed by the
     # next statement, so the lock has to come before any of them.
@@ -964,106 +1023,109 @@ async def agent_heartbeat(
     server.last_seen_at = now
     server.last_health_check_at = now
     server.status = "active"
-    # Capture the source IP so the operator can identify which host
-    # this agent is running on — the operator-set ``host`` column is
-    # just a label that may not match the real machine in NAT /
-    # distributed deployments.
-    if request.client is not None:
-        server.last_seen_ip = request.client.host
+    if not displaced:
+        # Capture the source IP so the operator can identify which host
+        # this agent is running on — the operator-set ``host`` column is
+        # just a label that may not match the real machine in NAT /
+        # distributed deployments.
+        if request.client is not None:
+            server.last_seen_ip = request.client.host
 
-    # #638 — only overwrite when the agent actually reported a version. A probe
-    # that failed answers None, and clobbering a known-good value with NULL
-    # would make the PowerDNS LMDB preflight fall back to "unknown" for no
-    # reason.
-    if body.daemon_version:
-        server.daemon_version = body.daemon_version
-    # #2078 — likewise only when reported (an older agent omits it).
-    if body.agent_version:
-        server.agent_version = body.agent_version
-    # #1171 — on every heartbeat, from the header: the same server row is run
-    # by an older agent until the upgrade replaces its pod, and by an older one
-    # again if a node is rolled back.
-    server.agent_renders_soa_timers = renders_soa_timers(request.headers.get(AGENT_FEATURES_HEADER))
+        # #638 — only overwrite when the agent actually reported a version. A probe
+        # that failed answers None, and clobbering a known-good value with NULL
+        # would make the PowerDNS LMDB preflight fall back to "unknown" for no
+        # reason.
+        if body.daemon_version:
+            server.daemon_version = body.daemon_version
+        # #2078 — likewise only when reported (an older agent omits it).
+        if body.agent_version:
+            server.agent_version = body.agent_version
+        # #1171 — on every heartbeat, from the header: the same server row is run
+        # by an older agent until the upgrade replaces its pod, and by an older one
+        # again if a node is rolled back.
+        server.agent_renders_soa_timers = renders_soa_timers(
+            request.headers.get(AGENT_FEATURES_HEADER)
+        )
 
-    # Phase 8f-2 — persist whatever slot state the agent reported. Only
-    # overwrite when the agent actually sent a value (older agents
-    # leave these as None, in which case we leave the DB columns
-    # untouched rather than nulling out previously-known state).
-    if body.deployment_kind is not None:
-        server.deployment_kind = body.deployment_kind
-    if body.installed_appliance_version is not None:
-        server.installed_appliance_version = body.installed_appliance_version
-    if body.current_slot is not None:
-        server.current_slot = body.current_slot
-    if body.durable_default is not None:
-        server.durable_default = body.durable_default
-    if body.is_trial_boot is not None:
-        server.is_trial_boot = body.is_trial_boot
-    if body.last_upgrade_state is not None:
-        server.last_upgrade_state = body.last_upgrade_state
-    if body.last_upgrade_state_at is not None:
-        server.last_upgrade_state_at = body.last_upgrade_state_at
+        # Phase 8f-2 — persist whatever slot state the agent reported. Only
+        # overwrite when the agent actually sent a value (older agents
+        # leave these as None, in which case we leave the DB columns
+        # untouched rather than nulling out previously-known state).
+        if body.deployment_kind is not None:
+            server.deployment_kind = body.deployment_kind
+        if body.installed_appliance_version is not None:
+            server.installed_appliance_version = body.installed_appliance_version
+        if body.current_slot is not None:
+            server.current_slot = body.current_slot
+        if body.durable_default is not None:
+            server.durable_default = body.durable_default
+        if body.is_trial_boot is not None:
+            server.is_trial_boot = body.is_trial_boot
+        if body.last_upgrade_state is not None:
+            server.last_upgrade_state = body.last_upgrade_state
+        if body.last_upgrade_state_at is not None:
+            server.last_upgrade_state_at = body.last_upgrade_state_at
 
-    # Phase 8f-7 — auto-clear the operator-intent stamp once the agent
-    # confirms it landed. The Fleet view's "pending" indicator drops
-    # to None as soon as installed_appliance_version matches the
-    # desired one + the slot upgrade reported done. Cancellation flow
-    # (operator cleared desired_ manually before the agent picked it
-    # up) is handled by the Fleet endpoint's clear handler — that
-    # already nulls both fields directly.
-    if (
-        server.desired_appliance_version is not None
-        and server.installed_appliance_version
-        and server.installed_appliance_version == server.desired_appliance_version
-        and (server.last_upgrade_state in ("done", None))
-    ):
-        server.desired_appliance_version = None
-        server.desired_slot_image_url = None
+        # Phase 8f-7 — auto-clear the operator-intent stamp once the agent
+        # confirms it landed. The Fleet view's "pending" indicator drops
+        # to None as soon as installed_appliance_version matches the
+        # desired one + the slot upgrade reported done. Cancellation flow
+        # (operator cleared desired_ manually before the agent picked it
+        # up) is handled by the Fleet endpoint's clear handler — that
+        # already nulls both fields directly.
+        if (
+            server.desired_appliance_version is not None
+            and server.installed_appliance_version
+            and server.installed_appliance_version == server.desired_appliance_version
+            and (server.last_upgrade_state in ("done", None))
+        ):
+            server.desired_appliance_version = None
+            server.desired_slot_image_url = None
 
-    # Phase 8f-8 — clear reboot_requested once the agent reconnects
-    # after the reboot landed. We don't have a discrete "I rebooted"
-    # signal from the agent, but: agents heartbeat every ~30 s, the
-    # host reboot takes ~30-60 s, so any heartbeat that arrives more
-    # than 15 s after the request was stamped AND finds the request
-    # still set is post-reboot by construction (a pre-reboot agent
-    # wouldn't be heartbeating — the container's down). 15 s is a
-    # safety margin to avoid races where the heartbeat arrives mid-
-    # ConfigBundle-pickup but the box hasn't actually rebooted yet.
-    if server.reboot_requested and server.reboot_requested_at is not None:
-        elapsed = (datetime.now(UTC) - server.reboot_requested_at).total_seconds()
-        if elapsed > 15:
-            server.reboot_requested = False
-            server.reboot_requested_at = None
+        # Phase 8f-8 — clear reboot_requested once the agent reconnects
+        # after the reboot landed. We don't have a discrete "I rebooted"
+        # signal from the agent, but: agents heartbeat every ~30 s, the
+        # host reboot takes ~30-60 s, so any heartbeat that arrives more
+        # than 15 s after the request was stamped AND finds the request
+        # still set is post-reboot by construction (a pre-reboot agent
+        # wouldn't be heartbeating — the container's down). 15 s is a
+        # safety margin to avoid races where the heartbeat arrives mid-
+        # ConfigBundle-pickup but the box hasn't actually rebooted yet.
+        if server.reboot_requested and server.reboot_requested_at is not None:
+            elapsed = (datetime.now(UTC) - server.reboot_requested_at).total_seconds()
+            if elapsed > 15:
+                server.reboot_requested = False
+                server.reboot_requested_at = None
 
-    # #882 — the config-apply verdict. ``body.config`` has been declared on
-    # this model since it was written and read by nothing; a server could be
-    # reachable, healthy and serving a config the operator never approved.
-    apply_reported_status(server, body.config, agent_kind="dns", server_id=str(server.id))
-    # #1077 — spool state. Only written when the heartbeat carries it.
-    apply_reported_spool(server, body.spool, agent_kind="dns", server_id=str(server.id))
-    # #1067 — the daemon state. ``body.daemon`` has been declared on this model
-    # since it was written and read by nothing: an agent whose ``named`` never
-    # started (no bundle yet — #1061 says ``degraded`` on every heartbeat) was
-    # indistinguishable from a healthy one.
-    # #2018 — on the appliance the kubelet kills the whole container when
-    # named hits its memory limit, the agent with it, so the agent never
-    # records the kill and its restarted self reports ``ok``. The supervisor
-    # carries the kubelet's ``OOMKilled`` on its heartbeat; while that kill
-    # is current it is the daemon state, whatever the agent says.
-    appliance = await owning_appliance_for_dns_server(db, server)
-    daemon_report, daemon_stamp = effective_daemon_report(
-        body.daemon,
-        fresh_role_health(appliance, now),
-        server.driver,
-        now,
-    )
-    apply_reported_daemon_state(
-        server,
-        daemon_report,
-        agent_kind="dns",
-        server_id=str(server.id),
-        now=min(daemon_stamp, now),
-    )
+        # #882 — the config-apply verdict. ``body.config`` has been declared on
+        # this model since it was written and read by nothing; a server could be
+        # reachable, healthy and serving a config the operator never approved.
+        apply_reported_status(server, body.config, agent_kind="dns", server_id=str(server.id))
+        # #1077 — spool state. Only written when the heartbeat carries it.
+        apply_reported_spool(server, body.spool, agent_kind="dns", server_id=str(server.id))
+        # #1067 — the daemon state. ``body.daemon`` has been declared on this model
+        # since it was written and read by nothing: an agent whose ``named`` never
+        # started (no bundle yet — #1061 says ``degraded`` on every heartbeat) was
+        # indistinguishable from a healthy one.
+        # #2018 — on the appliance the kubelet kills the whole container when
+        # named hits its memory limit, the agent with it, so the agent never
+        # records the kill and its restarted self reports ``ok``. The supervisor
+        # carries the kubelet's ``OOMKilled`` on its heartbeat; while that kill
+        # is current it is the daemon state, whatever the agent says.
+        appliance = await owning_appliance_for_dns_server(db, server)
+        daemon_report, daemon_stamp = effective_daemon_report(
+            body.daemon,
+            fresh_role_health(appliance, now),
+            server.driver,
+            now,
+        )
+        apply_reported_daemon_state(
+            server,
+            daemon_report,
+            agent_kind="dns",
+            server_id=str(server.id),
+            now=min(daemon_stamp, now),
+        )
 
     # Process op ACKs — batched, and scoped to this agent's own ops (#1232).
     await apply_acks(db, server.id, body.ops_ack)
