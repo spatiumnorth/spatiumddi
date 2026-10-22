@@ -128,6 +128,35 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **One failing alert rule no longer re-pages every alert in the pass,
+  every minute (#2261).** The alert evaluator ran every rule in one
+  transaction and delivered each new event as soon as it opened, before
+  the single commit at the end. A rule whose query failed (a SQL error,
+  or a slow DNS-threat matcher hitting the task's command timeout)
+  aborted that transaction, so the commit discarded every event the
+  pass had already sent: the pages went out, nothing appeared under
+  /alerts, and the next tick (plus Celery's three autoretries) sent
+  them again. Now each rule runs in its own savepoint, so a failing
+  rule rolls back only itself, and nothing is delivered until the
+  events are committed; a pass that fails before its commit has sent
+  nothing, and one that fails after it finds its events already open
+  and does not re-send them. Each queued delivery is claimed before it
+  is sent, so it is never sent twice, and one a worker died before
+  sending is re-sent by a later pass once it is ten minutes old, unless
+  the event has resolved or its rule is disabled. Passes are
+  serialised by an advisory lock (an overlapping pass, including
+  "Evaluate now", returns zero counts), and at most one event per
+  rule and subject can be open: the index is now unique, and the
+  migration resolves any duplicates already stored, keeping the
+  earliest. The conformity engine had the same shape and gets the same
+  fix: a check that raises a database error no longer loses every
+  policy's results and `last_evaluated_at` (so policies no longer re-run
+  and re-page every minute), and its alerts, including "evaluate now",
+  are sent only after they are stored. The audit-chain and schema-check
+  tasks commit their alert before delivering it too, and a resumed
+  upgrade run that fails again resolves its previous failure alert
+  before opening the new one.
+
 - **Overlapping DHCP lease pulls no longer duplicate a lease and stop
   that server's pull for good (#2262).** The Windows DHCP / FortiGate
   lease pull stamped its interval only at the end of a pass and took
@@ -1684,6 +1713,14 @@ the formatter handles the rest.
   `uq_dhcp_lease_server_ip_duid` (`WHERE duid IS NOT NULL`, NULLS NOT
   DISTINCT). Downgrade drops the indexes; the deleted duplicates are not
   restored.
+- `b4d81f2e6a93` — #2261: `ix_alert_event_rule_subject_open` becomes a
+  UNIQUE partial index (one open `alert_event` per rule, subject type
+  and subject). Duplicate open events are resolved first, keeping the
+  earliest-fired. Also adds the nullable
+  `alert_event.delivery_pending_since` with a partial index on its
+  non-NULL rows; existing rows stay NULL. Downgrade restores the
+  non-unique index and drops the column; the resolved duplicates stay
+  resolved.
 
 ## 1.0.0-beta.1 — 2026-10-21
 
