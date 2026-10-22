@@ -3601,7 +3601,9 @@ class IPAddressCreate(BaseModel):
     owner_user_id: uuid.UUID | None = None
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
-    dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
+    dns_zone_id: str | None = (
+        None  # explicit zone override; null falls back to subnet's effective DNS; "" = no DNS record
+    )
     # Issue #25 — split-horizon publishing. Additional zone UUIDs to
     # publish A/AAAA records into beyond the singular primary. Each
     # entry is a UUID stored as string (Pydantic accepts UUIDs as
@@ -3836,7 +3838,9 @@ class NextIPRequest(BaseModel):
     description: str = ""
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
-    dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
+    dns_zone_id: str | None = (
+        None  # explicit zone override; null falls back to subnet's effective DNS; "" = no DNS record
+    )
     # Issue #25 — split-horizon publishing. Additional zone UUIDs to publish
     # A/AAAA records into beyond the singular primary. Mirrors
     # ``IPAddressCreate.extra_zone_ids`` so next-IP allocation reaches parity
@@ -8425,8 +8429,14 @@ async def create_address(
     # Resolve the zone that WILL be used by _sync_dns_record so the collision
     # check sees the same forward_zone_id that will land on the row.
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
-    effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
-    if body.hostname:
+    # ``dns_zone_id: ""`` is the dialog's "None (no DNS record)" (#2466): the
+    # address is allocated with no forward zone, no A and no PTR. Absent / null
+    # still means "use the subnet's effective zone".
+    no_dns = body.dns_zone_id == ""
+    effective_zone = (
+        None if no_dns else (explicit_zone or await _resolve_effective_zone(db, subnet))
+    )
+    if body.hostname and not no_dns:
         await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
         warnings = await _check_ip_collisions(
@@ -8471,6 +8481,8 @@ async def create_address(
         created_by_user_id=current_user.id,
         **body.model_dump(exclude={"dns_zone_id", "force", "aliases"}),
     )
+    if no_dns:
+        ip.extra_zone_ids = []
     db.add(ip)
     await db.flush()
 
@@ -8480,9 +8492,10 @@ async def create_address(
         await _record_mac_history(db, ip.id, body.mac_address)
 
     # Sync DNS A record
-    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
+    if not no_dns:
+        await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
     # User-specified alias records (CNAME / A) tied to this IP
-    if body.aliases:
+    if body.aliases and not no_dns:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
 
     # #1628 — a ``static_dhcp`` row must own a real DHCPStaticAssignment or
@@ -8949,6 +8962,18 @@ async def update_address(
             await _clear_ip_dns_zone(db, ip, subnet)
         else:
             await _sync_dns_record(db, ip, subnet, action="delete")
+    elif (
+        subnet
+        and not dns_zone_explicit
+        and not extras_changed
+        and ip.forward_zone_id is None
+        and not (old["hostname"] != ip.hostname)
+    ):
+        # An address with no forward zone and an unchanged hostname has no DNS
+        # presence to keep in step — an untouched Save must not resolve the
+        # subnet's zone and publish the A / PTR an operator removed with "None"
+        # (#2466). A *changed* hostname still falls through to the sync below.
+        pass
     elif subnet and ("hostname" in changes or dns_zone_explicit or extras_changed):
         # zone_cleared is handled above, so an explicit zone here is a real
         # UUID; otherwise preserve the IP's current forward zone (#493).
@@ -10196,8 +10221,14 @@ async def allocate_next_ip(
         db, current_user, subnet, [body.dns_zone_id, *(body.extra_zone_ids or [])]
     )
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
-    effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
-    if body.hostname:
+    # ``dns_zone_id: ""`` is the dialog's "None (no DNS record)" (#2466): the
+    # address is allocated with no forward zone, no A and no PTR. Absent / null
+    # still means "use the subnet's effective zone".
+    no_dns = body.dns_zone_id == ""
+    effective_zone = (
+        None if no_dns else (explicit_zone or await _resolve_effective_zone(db, subnet))
+    )
+    if body.hostname and not no_dns:
         await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
         warnings = await _check_ip_collisions(
@@ -10275,7 +10306,7 @@ async def allocate_next_ip(
         tags=body.tags,
         role=body.role,
         reserved_until=body.reserved_until,
-        extra_zone_ids=body.extra_zone_ids,
+        extra_zone_ids=[] if no_dns else body.extra_zone_ids,
         decom_date=body.decom_date,
         created_by_user_id=current_user.id,
     )
@@ -10286,9 +10317,10 @@ async def allocate_next_ip(
         await _record_mac_history(db, ip.id, body.mac_address)
 
     # Sync DNS A record
-    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
+    if not no_dns:
+        await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
     # User-specified alias records (CNAME / A) tied to this IP
-    if body.aliases:
+    if body.aliases and not no_dns:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
 
     # #1628 — same server-side reservation sync as create_address.

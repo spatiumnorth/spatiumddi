@@ -3513,7 +3513,10 @@ export function AddAddressModal({
 
   const mutation = useMutation({
     mutationFn: async (force: boolean) => {
-      const zoneParam = dnsZoneId || undefined;
+      // "None (no DNS record)" is sent as "" — an absent / null zone means
+      // "use the subnet's effective zone" to the API (#2466).
+      const zoneParam =
+        dnsZoneId || (availableZones.length > 0 ? "" : undefined);
       const cleanedAliases = aliases
         .map((a) => ({ ...a, name: a.name.trim() }))
         .filter((a) => a.name.length > 0);
