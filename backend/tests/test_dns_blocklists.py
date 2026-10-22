@@ -81,7 +81,9 @@ def test_parse_feed_adblock() -> None:
 ||bad.example.org/
 """
     domains = parse_feed(text, "adblock")
-    assert set(domains) == {"ads.example.com", "tracker.example.net", "bad.example.org"}
+    # #2123 — a ``$third-party`` rule narrows the block, and ``||host/`` is a
+    # path rule: neither is widened into an unconditional block any more.
+    assert domains == ["ads.example.com"]
 
 
 def test_parse_feed_domains() -> None:

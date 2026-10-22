@@ -168,7 +168,8 @@ class AlertEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # 40 chars accommodates the longest type today
     # (``network_service_resource`` = 25) with room for future families.
     subject_type: Mapped[str] = mapped_column(String(40), nullable=False)
-    subject_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 128: a conformity subject is "<policy>:<kind>:<target>", up to 89 (#2277).
+    subject_id: Mapped[str] = mapped_column(String(128), nullable=False)
     subject_display: Mapped[str] = mapped_column(String(500), nullable=False, default="")
 
     severity: Mapped[str] = mapped_column(String(10), nullable=False, default="warning")

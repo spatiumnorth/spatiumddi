@@ -298,8 +298,10 @@ same 595 tests — PR #1018). The file is committed and kept honest by CI:
    belongs to tests the file has never seen. Runner variance never trips
    it, because no refresh can fix runner variance.
 4. `make test-durations` downloads the newest `main` artifact into
-   `backend/.test_durations` for you to commit. Do it at release prep, or
-   when the warning fires.
+   `backend/.test_durations` for you to commit (push, daily-schedule or
+   dispatch runs, newest first — most pushes no longer run the shards, see
+   §Skipping the shards on a push to main). Do it at release prep, or when
+   the warning fires.
 
 A stale file only costs balance — pytest-split assumes the average for a
 test it has never seen — never correctness, so this is a chore, not a gate.
@@ -323,8 +325,8 @@ artifact (`.github/scripts/build_test_impact_map.py`). The next PR's
 `all` or a list of test files, and the shards run exactly that.
 
 Every rule fails **open**, toward `all` — a wrong "run these" is caught by
-the push-to-`main` run, which always runs everything; a wrong "skip that"
-would not be:
+the push-to-`main` run, which runs everything after a narrowed PR run (see
+below); a wrong "skip that" would not be:
 
 | Changed path | Selection |
 |---|---|
@@ -345,6 +347,68 @@ dependency data that is actually true.
 Pinned by `backend/tests/test_test_impact_selection.py` and
 `test_merge_test_durations.py`, both of which skip inside the dev api
 container (no repo root above `backend/` there) and run in CI.
+
+### Skipping the shards on a push to main (#2429)
+
+Under strict up-to-date branch protection, the squash-merge of a PR has
+exactly the tree of the PR head CI just passed, so re-running the twelve
+shards on the push to `main` tested nothing new: it cost ~180 runner-minutes
+per merge on a 20-job runner pool and was cancelled by the next merge more
+than half the time. The `changes` job now asks
+`.github/scripts/ci-tested-on-pr-head.sh` first, and skips the shards only
+when **all** of these are established:
+
+- the push added one single-parent commit, and GitHub records exactly one
+  PR merged into `main` whose merge commit it is, from a branch in this
+  repository (a fork PR's run used the fork's copy of the workflow);
+- that PR's head has the identical tree and contains the previous `main`
+  (so the PR run's test merge was a no-op on the head's tree);
+- a `pull_request` run of `ci.yml` on exactly that head, from the PR's head
+  branch, concluded `success`, was created before the merge and at most
+  24 h before it, and its **latest attempt** published the unexpired
+  `backend-full-suite-attempt-<n>` marker. The `Backend — Tests` aggregator
+  uploads that marker only when all twelve shards passed the **full**
+  suite, so a narrowed (#1020) or shard-skipped (#813) PR run never
+  qualifies, and the push run stays the safety net that catches what the
+  narrowed run did not select. (The run cannot be tied to the PR through
+  its `pull_requests` array: GitHub clears it when the PR merges.)
+
+Anything else — an API error, a tree mismatch, a forced or multi-commit
+push — runs the full suite. A skipped run reports `Backend — Tests` green
+with a notice and uploads a `backend-skipped-tested-on-pr-head-attempt-<n>`
+marker.
+
+**A release never rests on a skipped run.** release.yml's gate asks
+`.github/scripts/ci-full-suite-passed.sh` for a `ci.yml` run on the tagged
+commit itself whose latest attempt carries the full-suite marker (or a push
+run from before the markers existed, which always ran the suite). If the
+commit's only green run skipped the shards, the gate fails and prints the
+command that produces one — `gh workflow run ci.yml --ref <tag>`. A
+dispatched run cannot skip: only a `push` consults the skip script.
+
+Because those pushes no longer produce the test-impact map or the
+durations artifact, a **daily scheduled** full run on `main` (and
+`workflow_dispatch`) produces both; it has its own concurrency group, so a
+merge never cancels it. A failing scheduled run shows red on `main`, and
+GitHub emails the user who last changed the workflow's `cron` line; nothing
+else notifies. Both consumers — the impact-map lookup and
+`make test-durations` — find the newest artifact by name through
+`.github/scripts/latest-main-artifact.sh`, which never accepts a
+`pull_request` run's. Pinned by `backend/tests/test_ci_tested_on_pr_head.py`.
+
+**Through the merge queue (#2431) the proof is stronger, and checked
+first.** When a merge group lands, GitHub fast-forwards `main` to the very
+commit the queue's `merge_group` run tested, so the script first looks for a
+successful `merge_group` run of `ci.yml` on exactly the pushed SHA, from a
+`gh-readonly-queue/main/` branch of this repository, at most 24 h old, whose
+latest attempt published `backend-full-suite-attempt-<n>`. Commit identity
+needs no PR lookup and no tree comparison, and it holds for a group of
+several commits landing as one push (which the PR path refuses). A
+docs-only group skips its shards (#813) and publishes no marker, so its push
+runs the suite. Anything that does not qualify falls through to the PR path
+above. Such a push run uploads
+`backend-skipped-tested-in-merge-queue-attempt-<n>`, and the release gate
+accepts the `merge_group` run itself as the full run of the tagged commit.
 
 ### What a new endpoint needs
 
@@ -387,7 +451,7 @@ triggered on push to `main` and on every pull request:
 | Job | What it does |
 |---|---|
 | **Backend — Lint & Type Check** (`backend-lint`) | `pip install -e ".[dev]"` on Python 3.12, then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8), the **version-pin manifest linter** (`python3 scripts/lint_versions.py` — see §9) and the **workflow shell-status linter** (`python3 scripts/lint_workflow_shell.py` — see §10). |
-| **Backend — Tests** (`backend-test`) | A required-check aggregator over **twelve** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.10.2-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 12 --group N --store-durations --clean-durations` (pytest-split selects the shard's slice, **balanced by duration** from the committed `backend/.test_durations` — see §Shard balancing; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). On a PR the `changes` job may first narrow the run to the test files the diff can affect (#1020 — see §Test-impact selection). The aggregator passes only if all twelve shards pass; on a full run it also merges the shards' measured durations into a `test-durations` artifact, and on a push to `main` it builds the `test-impact-map` artifact from the shards' coverage contexts. Coverage is otherwise **not** collected here (#1019). |
+| **Backend — Tests** (`backend-test`) | A required-check aggregator over **twelve** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.10.2-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 12 --group N --store-durations --clean-durations` (pytest-split selects the shard's slice, **balanced by duration** from the committed `backend/.test_durations` — see §Shard balancing; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). On a PR the `changes` job may first narrow the run to the test files the diff can affect (#1020 — see §Test-impact selection). The aggregator passes only if all twelve shards pass; on a full run it also merges the shards' measured durations into a `test-durations` artifact, and on a full `main` run (a push that ran the shards, the daily schedule or a dispatch) it builds the `test-impact-map` artifact from the shards' coverage contexts. A push to `main` whose tree a green full PR run already tested skips the shards (#2429 — see §Skipping the shards on a push to main). Coverage is otherwise **not** collected here (#1019). |
 | **Frontend — Lint & Type Check** (`frontend-lint`) | Node 22, `npm install`, then `npm run lint`, `npm run format:check`, `npm run typecheck`, `npm test`. |
 | **Frontend — Build** (`frontend-build`) | Node 22, `npm install`, `npm run build`. |
 | **Charts — Lint & Template** (`charts-lint`) | Helm v4.3.1 + a checksum-pinned kubeconform. `helm lint --strict` all three charts at defaults and with every role / feature toggle on, `helm template` 14 value sets (umbrella: defaults, all-on, external DB + Redis, the CNPG + Sentinel HA shape, and two pod-posture shapes; appliance: defaults, all-on, the single-node full-stack shape, and the two release-bootstrap / release-supervisor shapes; metallb: defaults, all-on, BGP mode), `kubeconform -strict` against the Kubernetes 1.36 + CRD-catalog schemas (kept at the version the appliance's k3s serves — it was five minors behind until #974), and `.github/scripts/chart-no-besteffort.py` on every render (#965 — no serving container may lack CPU + memory requests or limits; init containers are exempt, they finish before the pod serves) plus `chart-toggle-coverage.py`, which fails if a template is gated on a values key none of the value sets flips, and `chart-webhooks-fail-open.py` on the MetalLB render (#1103 — its validating webhooks must be `failurePolicy: Ignore`, or the pool CRs in the same install are refused while the controller serving the webhook starts; `helm lint` and `helm template` pass either way). Rendered manifests are uploaded as the `rendered-charts` artifact. Until #966 nothing on a PR parsed the appliance chart at all; it was first read by helm during the release. `make charts-lint` runs the same script in a helm container. |
@@ -412,6 +476,7 @@ Three of the four events have distinct jobs:
 | Event | Runs | Why |
 |---|---|---|
 | **Pull request** | `ci.yml` (backend shards gated on change detection — see below), the per-image builds (single-arch + **Trivy**, path-filtered to their own `agent/<name>/**`), `agent-e2e.yml` (path-filtered to `agent/**` + `charts/spatiumddi/**` — it installs the control plane from the `:latest` release images, so a `backend/` or `frontend/` change cannot reach the cluster it tests; #1021), plus two GitHub-managed CodeQL runs that are not workflow files: **CodeQL** (default setup: actions, JS/TS, Python) and **CodeQL - Code Quality** (JS/TS, Python — the source of the bot review threads that must be resolved before merge). | Where correctness is gated. Nothing merges without it. |
+| **Merge queue** (`merge_group`, #2431) | `ci.yml` only. All nine required checks come from it; the per-image Trivy builds, `agent-e2e.yml`, CodeQL and Code Quality do not run here, so they must be green on the PR before it is enqueued. | The queue merges only what this run passed, on `main` + every entry ahead + the PR. The backend shards use the PR path filter over everything the group's head adds to `main` — diffed from `git merge-base origin/main <head>`, not from the event's `merge_group.base_sha`, which GitHub documents only loosely and which for a later entry may be the previous entry's temporary commit — and never narrow. Any doubt (a failed fetch, no merge base, a head that is not the checked-out commit) runs everything. |
 | **Push to `main`** | `ci.yml`, `docs-publish.yml`, `build-appliance-builder.yml` | Post-merge safety net + the two things that must be *published* from `main`. |
 | **Release tag** | `release.yml` only | Builds and publishes every image multi-arch, the chart, and the appliance ISO — after three gates (#1226): the tag is on `main` and `ci.yml` passed on it; each image is built once, pushed by digest, and both architectures pass Trivy + `trivy-gate.sh` before that digest is tagged; and `:latest` moves last, once the GitHub release exists. |
 | **Schedule** | `nightly.yml`, `trivy-scheduled.yml`, `prune-release-assets.yml` | Work that is about *elapsed time*, not about a change. |
@@ -771,6 +836,72 @@ multi-arch fan-out happens in CI on a tagged release.
   closes the first.
 - **Run `make ci` before pushing**, and `make test` for any
   behavioral change.
+- **Add a changelog fragment; don't edit `CHANGELOG.md`.** See below.
+
+### Changelog fragments
+
+Every PR used to add its entry at the top of `### Fixed` under
+`## Unreleased`, so any two open PRs conflicted on that spot, and the merge
+queue removes an entry that conflicts with the one ahead of it. Each PR now
+adds one new file, `changelog.d/<issue>-<slug>.md`, written exactly as the
+entry would read under `## Unreleased` and starting with a section heading:
+
+```markdown
+### Fixed
+
+- **One-line summary (#1234).** Body, hard-wrapped at ~70 characters.
+
+### Migrations
+
+- `abcdef012345` — #1234, what the migration does.
+```
+
+Sections are `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`,
+`Security`, `Migrations` and `Breaking`; one fragment may use several. The
+issue number leads the name so fragments fold in issue order, and the slug
+keeps two PRs for one issue apart. A line starting with `#` in column 0 is
+refused (the release-notes formatter reads it as a heading); indent wrapped
+lines as usual, and lines inside a fenced code block are left alone.
+Nothing but `README.md` and such fragments may live in `changelog.d/`: a
+subdirectory, a dotfile or a misnamed file fails the check, the fold and the
+release gate, because the fold would otherwise skip it. CI's Backend Lint
+job validates the directory (`make changelog-check`, also part of
+`make ci`), and the `changes` job warns on a PR that edits `CHANGELOG.md`
+directly.
+
+**Release prep folds them.** `make changelog` (`scripts/changelog_assemble.py`)
+puts each fragment's entries at the **top** of the matching section of
+`## Unreleased`, newest issue first, matching the newest-first order the
+file already has. It creates a missing section in the order above, then
+deletes the fragments; `--dry-run` prints the result without changing
+anything. Run it **before** renaming `## Unreleased` to the release version
+(it refuses to run when there is no `## Unreleased`, rather than file the
+entries under a release they did not ship in), and commit the result in the
+release-prep PR. `release.yml` publishes the notes from `CHANGELOG.md`
+and refuses a tag whose tree still has a fragment
+(`changelog_assemble.py --pending`), so a skipped fold fails the release
+early instead of publishing notes with entries missing.
+
+### The merge queue
+
+Once the `merge_queue` rule is on `protect-main`, `gh pr merge N` adds a PR
+to the queue rather than merging it. The queue builds each entry on a
+`gh-readonly-queue/main/pr-N-<sha>` branch (`main` + every entry ahead +
+this PR), runs `ci.yml` there (`merge_group`), and merges the group when the
+required checks pass. A PR is never updated with `main`, so its head stays
+the commit QA walked. Things to know:
+
+- **Only `ci.yml` runs on the queue's branch.** Trivy image builds,
+  `agent-e2e.yml`, CodeQL and Code Quality run on the PR only, so wait for
+  them there before enqueuing.
+- **A failing entry is removed, and every entry behind it is rebuilt.** A
+  flaky test at the front of the queue costs a full run for each entry
+  behind it.
+- **Enqueue migration PRs one at a time.** Two migrations in one group give
+  the second entry two Alembic heads, which fails every backend shard.
+  Re-point the second migration at the first after the first merges.
+- **A new push to a queued PR removes it from the queue.** Re-enqueue after
+  the new head's checks pass.
 
 ### Pre-PR checklist
 
@@ -779,6 +910,7 @@ multi-arch fan-out happens in CI on a tagged release.
 - [ ] Mutations write to `audit_log` before returning
 - [ ] New endpoints have success / unauthorized / validation-error tests
 - [ ] Alembic migration included if models changed (and it's expand/contract-safe)
+- [ ] A `changelog.d/<issue>-<slug>.md` fragment, not an edit to `CHANGELOG.md`
 - [ ] `k8s/base/` + `k8s/README.md` updated if a service or its env changed
 - [ ] Matching MCP tools added for any new REST surface
 - [ ] Third-party components added to the root `NOTICE` if you bundled any
