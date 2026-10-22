@@ -148,6 +148,74 @@ the formatter handles the rest.
   taken over every target rather than the trimmed row list, which
   used to undercount past 20 targets.
 
+- **A trial slot on slow storage is no longer reverted because the
+  image check judged k3s's import while it was still running
+  (#2109).** Before it commits a trial slot, firstboot checks that
+  k3s imported every baked image tarball. It waited 120 s for the
+  kubelet, took a kubelet that answers to mean k3s's start-up import
+  was over, and then touched every tarball it could not yet see as
+  imported so k3s would import it again. On a node whose import
+  outlasted that wait, it touched the tarball k3s was importing at
+  that moment, which made k3s import it a second time, gave up before
+  that import ended, and left a healthy slot uncommitted, so the
+  next reboot reverted it. The kubelet is not the signal even on a
+  fast node: k3s starts it once its import queue is empty, while the
+  last tarball is still being imported (seen on a real k3s v1.36.4:
+  the kubelet started 8 s before the last import ended, and the old
+  check made k3s import that tarball twice). The check now asks
+  whether a process holds a baked tarball open, which k3s does for
+  exactly as long as it imports it. It waits while one is open, never
+  touches one that is, and judges once none is. It waits at most what
+  is left of firstboot's 10-minute start timeout, and if k3s is still
+  importing then it reports that and does not commit, rather than
+  calling an unfinished import a missing image, and names the Fleet
+  action (Approve trial) that keeps the slot once the import is over.
+  An open tarball is recognised by its inode rather than its path, so
+  a tarball k3s opened under another name (a bind mount, a symlinked
+  directory) still counts as being imported. On a node whose import
+  finished long ago it judges at once, as before.
+
+- **A DNS server holding its cached config after a crash no longer
+  stays dark while the control plane answers but cannot send a
+  bundle (#2241).** After named dies on a bundle, the #2019 hold asks
+  the control plane for a fresh one before starting it, and serves
+  the cache at once only when the control plane cannot be reached. A
+  control plane that answers but cannot render (renders OOM-killed or
+  killed at their time limit at scale, a long-poll that only ever ends
+  in 304) never counted as unreachable, so in the #2240 scale lab five
+  servers with valid caches stayed dark for about 3.5 hours. Once the
+  hold has lasted `AGENT_BOOT_HOLD_MAX_WAIT_S` seconds (default 600)
+  with nothing applied, the control plane now counts as unreachable:
+  the agent logs `bootstrap_hold_max_wait_elapsed_applying_cache`,
+  serves the cache under the offline rules and keeps syncing, and the
+  control plane's bundle is applied normally when it arrives, as a
+  reload of the daemon the fallback started. A bundle named was seen
+  dying on twice is never re-applied by this timer, not even on its
+  quarantine backoff: only a different last-known-good may serve (one
+  with no recorded etag does not count, since nothing says it is not
+  the same bundle), and with none the server stays down. A held cache
+  that fails to apply hands over to the last-known-good once, not on
+  every poll. The server row shows the wait in
+  the hold's `no_previous` reason, then `ok` once the cache serves.
+
+- **The MFA step of sign-in honours account lockout and has its own
+  attempt budget.** `POST /auth/login/mfa` now refuses a locked account
+  with the same 403 `/login` gives it, before checking the code, so a
+  correct code can no longer complete a sign-in or clear the lock.
+  Wrong codes (TOTP or recovery) still count towards the lockout
+  counter, and also against a per-account MFA budget that applies
+  whether or not lockout is enabled: 5 wrong codes in 15 minutes and
+  the MFA step answers 429 with `Retry-After` until 15 minutes after the
+  last one. The budget lives on the user row, so it holds when Redis is
+  unavailable, and attempts are read under a row lock so concurrent
+  ones are counted one at a time. Each MFA challenge also accepts at
+  most 3 wrong codes; after that, and after a successful sign-in, it is
+  spent and sign-in starts again at the password. A successful sign-in
+  or an admin unlock resets the budget. Refusals are audited as
+  `login` failures (`account_locked`, `mfa_attempts_exhausted`,
+  `mfa_challenge_spent`), and using up the budget writes an
+  `account.mfa_attempts_exhausted` row. See `docs/features/AUTH.md`.
+
 - **Deleting a Kubernetes cluster, Tailscale tenant or NetBird instance
   left its DNS names served (#2288).** The mirrored zone and records go
   with the target through a database CASCADE, which the bundle-dirty
@@ -1572,6 +1640,10 @@ the formatter handles the rest.
   server", enabled) when no rule of that type or name exists; it is
   not seeded at startup, so an operator who deletes it keeps it
   deleted. Downgrade drops the six columns and leaves the rule.
+- `e4c9b2a17f60` — adds `user.mfa_failed_count` (Integer, NOT NULL,
+  server default 0) and nullable `user.mfa_last_failed_at`, the
+  per-account wrong-code budget for the MFA sign-in step. Downgrade
+  drops both.
 
 ## 1.0.0-beta.1 — 2026-10-21
 
