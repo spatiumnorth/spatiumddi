@@ -138,6 +138,29 @@ end
 return 0
 """
 
+# INCR a fixed-window counter and open its window when it has none, in ONE
+# script (#2294). ``INCR`` then a separate ``EXPIRE`` (only when the result is
+# 1) lets a crash, timeout or dropped connection between the two leave the key
+# counting with no TTL; every later call then sees a count above 1, never sets
+# the expiry, and that address / user is throttled forever. Here the expiry is
+# set whenever the key has none, so a TTL-less key is also repaired by the next
+# call. The window still starts at the first hit and is not slid by later ones.
+_INCR_WINDOW_LUA = """
+local n = redis.call('INCR', KEYS[1])
+if redis.call('TTL', KEYS[1]) < 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return n
+"""
+
+
+async def incr_with_window(r: Any, key: str, window_seconds: int) -> int:
+    """Count one hit against ``key`` in a fixed ``window_seconds`` window and
+    return the new count. Atomic; never leaves ``key`` without an expiry.
+    Raises whatever the Redis client raises -- each caller picks its own
+    fail-open / fail-closed answer."""
+    return int(await r.eval(_INCR_WINDOW_LUA, 1, key, window_seconds))
+
 
 async def login_rate_limited(ip: str | None) -> bool:
     """Increment the per-IP login counter and return True once it exceeds
@@ -149,9 +172,7 @@ async def login_rate_limited(ip: str | None) -> bool:
     try:
         r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         try:
-            count = await r.incr(key)
-            if count == 1:
-                await r.expire(key, _LOGIN_RL_WINDOW_SECONDS)
+            count = await incr_with_window(r, key, _LOGIN_RL_WINDOW_SECONDS)
             return int(count) > _LOGIN_RL_MAX
         finally:
             await r.aclose()
@@ -179,9 +200,7 @@ async def e911_self_query_rate_limited(ip: str | None) -> bool:
     try:
         r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         try:
-            count = await r.incr(key)
-            if count == 1:
-                await r.expire(key, _E911_SELF_RL_WINDOW_SECONDS)
+            count = await incr_with_window(r, key, _E911_SELF_RL_WINDOW_SECONDS)
             return int(count) > _E911_SELF_RL_MAX
         finally:
             await r.aclose()
@@ -321,16 +340,15 @@ async def claim_stepup_attempt(user_id: object) -> bool:
     the attempt atomically instead, and refunds it on success
     (``refund_stepup_attempt``) so only wrong answers stay counted.
 
-    The window opens with ``SET NX EX`` before the ``INCR`` (which keeps the
-    TTL), so a key can never be left counting without an expiry.
+    The count and its expiry are set by one script (``incr_with_window``), so
+    a key can never be left counting without an expiry.
 
     Fails CLOSED, like ``stepup_password_blocked``."""
     key = _stepup_key(user_id)
     try:
         r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         try:
-            await r.set(key, 0, ex=_STEPUP_FAIL_WINDOW_SECONDS, nx=True)
-            count = await r.incr(key)
+            count = await incr_with_window(r, key, _STEPUP_FAIL_WINDOW_SECONDS)
             return int(count) <= _STEPUP_FAIL_MAX
         finally:
             await r.aclose()
@@ -382,9 +400,7 @@ async def record_stepup_password_failure(user_id: object) -> None:
     try:
         r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         try:
-            count = await r.incr(_stepup_key(user_id))
-            if count == 1:
-                await r.expire(_stepup_key(user_id), _STEPUP_FAIL_WINDOW_SECONDS)
+            await incr_with_window(r, _stepup_key(user_id), _STEPUP_FAIL_WINDOW_SECONDS)
         finally:
             await r.aclose()
     except Exception as exc:  # noqa: BLE001 — throttle must never break the step-up
