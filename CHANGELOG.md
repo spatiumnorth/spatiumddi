@@ -128,6 +128,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DNS server holding its cached config after a crash no longer
+  stays dark while the control plane answers but cannot send a
+  bundle (#2241).** After named dies on a bundle, the #2019 hold asks
+  the control plane for a fresh one before starting it, and serves
+  the cache at once only when the control plane cannot be reached. A
+  control plane that answers but cannot render (renders OOM-killed or
+  killed at their time limit at scale, a long-poll that only ever ends
+  in 304) never counted as unreachable, so in the #2240 scale lab five
+  servers with valid caches stayed dark for about 3.5 hours. Once the
+  hold has lasted `AGENT_BOOT_HOLD_MAX_WAIT_S` seconds (default 600)
+  with nothing applied, the control plane now counts as unreachable:
+  the agent logs `bootstrap_hold_max_wait_elapsed_applying_cache`,
+  serves the cache under the offline rules and keeps syncing, and the
+  control plane's bundle is applied normally when it arrives, as a
+  reload of the daemon the fallback started. A bundle named was seen
+  dying on twice is never re-applied by this timer, not even on its
+  quarantine backoff: only a different last-known-good may serve (one
+  with no recorded etag does not count, since nothing says it is not
+  the same bundle), and with none the server stays down. A held cache
+  that fails to apply hands over to the last-known-good once, not on
+  every poll. The server row shows the wait in
+  the hold's `no_previous` reason, then `ok` once the cache serves.
+
 - **The MFA step of sign-in honours account lockout and has its own
   attempt budget.** `POST /auth/login/mfa` now refuses a locked account
   with the same 403 `/login` gives it, before checking the code, so a
