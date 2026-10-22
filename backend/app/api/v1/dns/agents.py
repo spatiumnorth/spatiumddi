@@ -65,7 +65,10 @@ from app.services.agents.ingest_receipt import (
 )
 from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
-from app.services.appliance.ownership import owning_appliance_for_dns_server
+from app.services.appliance.ownership import (
+    owning_appliance_for_dns_agent,
+    owning_appliance_for_dns_server,
+)
 from app.services.dns import agent_bundle_store as bundle_store
 from app.services.dns import dnssec_signers
 from app.services.dns.agent_bundle_render import render_and_store
@@ -377,25 +380,9 @@ async def agent_register(
                 "agents cannot register. Enable it on the Features & Integrations page."
             ),
         )
-    # Resolve or create group
-    if body.group_name:
-        res = await db.execute(select(DNSServerGroup).where(DNSServerGroup.name == body.group_name))
-        group = res.scalar_one_or_none()
-        if group is None:
-            group = DNSServerGroup(
-                name=body.group_name, description="Auto-created by agent registration"
-            )
-            db.add(group)
-            await db.flush()
-    else:
-        res = await db.execute(select(DNSServerGroup).order_by(DNSServerGroup.created_at).limit(1))
-        group = res.scalar_one_or_none()
-        if group is None:
-            group = DNSServerGroup(name="default", description="Auto-created by agent registration")
-            db.add(group)
-            await db.flush()
-
-    # Find by agent_id first (stable across restarts) then by hostname
+    # Find by agent_id first (stable across restarts, and never moved: a row
+    # the operator moved stays where they put it, whatever AGENT_GROUP says —
+    # #934), then by hostname within the group resolved below.
     server: DNSServer | None = None
     if body.agent_id:
         try:
@@ -404,6 +391,55 @@ async def agent_register(
             raise HTTPException(status_code=422, detail=f"Invalid agent_id: {e}") from e
         res = await db.execute(select(DNSServer).where(DNSServer.agent_id == aid))
         server = res.scalar_one_or_none()
+
+    # #2190 — an agent with no row yet that runs on an appliance lands in the
+    # group the APPLIANCE is assigned, not the one its pod env names. The env
+    # can be a chart revision behind: a roles save that switches the engine
+    # and the group in one go labels the node for the new engine a few seconds
+    # before helm-controller rolls the new ``AGENT_GROUP`` into its DaemonSet,
+    # and a pod started in that window registered a second row in the OLD
+    # group, where its cached token then kept it.
+    group: DNSServerGroup | None = None
+    appliance = None
+    if server is None:
+        appliance = await owning_appliance_for_dns_agent(db, body.hostname, body.driver)
+        if appliance is not None and appliance.assigned_dns_group_id is not None:
+            group = await db.get(DNSServerGroup, appliance.assigned_dns_group_id)
+            if group is not None and body.group_name != group.name:
+                logger.warning(
+                    "dns_agent_group_follows_appliance",
+                    appliance_id=str(appliance.id),
+                    hostname=body.hostname,
+                    driver=body.driver,
+                    env_group=body.group_name,
+                    assigned_group=group.name,
+                    issue="#2190",
+                )
+
+    # Resolve or create group
+    if group is None:
+        if body.group_name:
+            res = await db.execute(
+                select(DNSServerGroup).where(DNSServerGroup.name == body.group_name)
+            )
+            group = res.scalar_one_or_none()
+            if group is None:
+                group = DNSServerGroup(
+                    name=body.group_name, description="Auto-created by agent registration"
+                )
+                db.add(group)
+                await db.flush()
+        else:
+            res = await db.execute(
+                select(DNSServerGroup).order_by(DNSServerGroup.created_at).limit(1)
+            )
+            group = res.scalar_one_or_none()
+            if group is None:
+                group = DNSServerGroup(
+                    name="default", description="Auto-created by agent registration"
+                )
+                db.add(group)
+                await db.flush()
 
     if server is None:
         res = await db.execute(
@@ -484,6 +520,16 @@ async def agent_register(
             server.agent_version = reported
         if server.agent_id is None:
             server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
+        elif (
+            appliance is not None and body.agent_id and server.agent_id != uuid.UUID(body.agent_id)
+        ):
+            # #2190 — the appliance's row, found by hostname in its assigned
+            # group, still carries the agent id of the engine it ran before
+            # (a roles save moves the old engine's row for the new one to
+            # adopt, #1856). The agent registering now is the appliance's
+            # current engine, so the row takes its id: its next re-register
+            # then finds the row by id rather than by name again.
+            server.agent_id = uuid.UUID(body.agent_id)
 
     # #1782 — Technitium cannot do catalog zones (#1766). Registration must
     # not refuse (a refused agent re-bootstraps in a loop), and the group API
