@@ -1379,11 +1379,154 @@ def _zone_label(zname: str, view: str | None) -> str:
     return f"{zname} (view {view})" if view else zname
 
 
+# ── Unchanged RPZ zones are not rewritten (#2157) ───────────────────────────
+#
+# Every structural apply used to re-serialise every RPZ zone from scratch: a
+# catalog feed is ~186k entries and an ~11 MB file, written again on every
+# agent for an edit that touched no blocklist (removing a forward zone,
+# changing a group option), and deleted again one apply later as
+# ``rendered.prev``. The control plane now ships a content hash per RPZ zone
+# (``rpz_sha256``), and the render records it beside the file it wrote, in a
+# ``<zone>.db.sha256`` sidecar. When the next bundle's hash matches a tree's
+# sidecar, the file is hard-linked into ``rendered.new`` instead of rendered:
+# no serialisation, no bytes written, and — because the live and backup trees
+# then share the inode — no extra blocks for ``rendered.prev`` either.
+#
+# That sharing is only safe while nothing ever writes INTO a rendered file.
+# Every write to a rendered tree therefore lands as a new inode (a temp file
+# renamed over the name, ``_write_new_inode``): a write through the name of a
+# hard-linked file would silently change the backup the #882 revert restores
+# from, and the live tree named serves, at the same time.
+
+#: Bumped whenever ``_rpz_zone_lines`` would write different bytes for the
+#: same zone dict. The control plane's hash covers the INPUT; this covers the
+#: renderer, so an agent upgrade that changes the output re-renders every RPZ
+#: file once instead of hard-linking the old renderer's bytes forever.
+#:
+#: 2 (#2124): a ``sinkhole`` entry renders as A + AAAA local data instead of
+#: ``CNAME rpz-drop.``. An entry whose list names no address ships the same
+#: bytes as before, so its ``rpz_sha256`` does not move and only this bump
+#: stops a #2157 agent's dropping file from being linked forward.
+_RPZ_RENDER_REVISION = 2
+_RPZ_HASH_SUFFIX = ".sha256"
+
+
+def _rpz_sidecar(path: Path) -> Path:
+    """The hash sidecar of an RPZ zone file. Not ``*.db``, so neither the
+    zone enumeration nor the byte comparison ever mistakes it for a zone."""
+    return path.with_name(path.name + _RPZ_HASH_SUFFIX)
+
+
+def _rpz_render_key(bl: dict[str, Any]) -> str | None:
+    """What a reusable file's sidecar must say, or None when this bundle
+    carries no hash (a control plane from before #2157): then the zone is
+    rendered every time, exactly as before, and no sidecar is written."""
+    digest = bl.get("rpz_sha256")
+    if not isinstance(digest, str) or not digest or any(c.isspace() for c in digest):
+        return None
+    return f"r{_RPZ_RENDER_REVISION}:{digest}"
+
+
+def _rpz_serial(bl: dict[str, Any]) -> int:
+    """The SOA serial of an RPZ zone's file: derived from its content.
+
+    Never the render time: the same zone must render the same bytes, or the
+    byte comparison reloads it on every apply. It was a constant 1, which is
+    deterministic too, but left ``_verify_zones_loaded`` nothing to check —
+    every version of the zone carried the same serial, so "named is still on
+    the old copy" and "named loaded the new one" read the same. A serial that
+    moves with the content makes the load verifiable like any other zone's.
+    RFC 1982 order means nothing here (nothing transfers an RPZ zone from
+    us), so a hash is fine; 0 is skipped because the render reads it as "no
+    serial". A bundle without a hash keeps the old constant, and its bytes.
+    """
+    key = _rpz_render_key(bl)
+    if key is None:
+        return 1
+    return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16) % (2**32 - 1) + 1
+
+
+def _rpz_reusable(src: Path, key: str) -> bool:
+    """``src`` is a regular file whose sidecar records ``key`` and whose size
+    is the size it had when it was written.
+
+    The size is the cheap half of the check: these files are never rewritten
+    once they are reused, so a file truncated by a crash (written, renamed,
+    not yet flushed) would otherwise be linked forward from tree to tree
+    rather than replaced by the next render.
+    """
+    try:
+        recorded = _rpz_sidecar(src).read_text(encoding="utf-8").split()
+        size = src.stat().st_size if src.is_file() and not src.is_symlink() else None
+    except (OSError, UnicodeDecodeError):
+        return False
+    return (
+        size is not None and len(recorded) == 2 and recorded[0] == key and recorded[1] == str(size)
+    )
+
+
+def _fsync_path(path: Path) -> None:
+    """Flush ``path``'s data to disk before anything vouches for it.
+
+    An RPZ file's sidecar is that vouching (#2157): once it exists, the file
+    is linked forward instead of re-rendered, and is never again run through
+    ``named-checkzone``. So the file's bytes must be durable before its
+    sidecar is written. The sidecar itself needs no fsync: losing it only
+    costs one re-render. The size recorded in the sidecar still catches the
+    commonest crash shape (a delayed-allocation file that comes back empty);
+    this closes the rest, at one fsync per RPZ file actually written."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_new_inode(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` as a NEW inode: a temp file renamed over it.
+
+    Never opens ``path`` itself for writing, so a file hard-linked into
+    another tree (#2157) keeps its bytes there."""
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("wb") as fh:
+        fh.write(data)
+    os.replace(tmp, path)
+
+
+def _copy_new_inode(src: Path, dst: Path) -> None:
+    """A private copy of ``src`` at ``dst``, as a new inode."""
+    tmp = dst.with_name(dst.name + ".tmp")
+    shutil.copyfile(src, tmp)
+    _fsync_path(tmp)
+    os.replace(tmp, dst)
+
+
+def _link_or_copy(src: Path, dst: Path) -> str:
+    """Put ``src``'s bytes at ``dst`` without writing them, when the
+    filesystem allows: a hard link. A copy when it does not (another device,
+    a filesystem without links). Returns which one it was."""
+    tmp = dst.with_name(dst.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    try:
+        os.link(src, tmp)
+        how = "link"
+    except OSError:
+        shutil.copyfile(src, tmp)
+        _fsync_path(tmp)
+        how = "copy"
+    os.replace(tmp, dst)
+    return how
+
+
 def _zones_differing(new_root: Path, old_root: Path) -> set[tuple[str, str | None]] | None:
     """Zones under ``new_root`` whose file is new or differs from ``old_root``.
 
     ``None`` means "cannot tell, treat every zone as changed": no old tree,
     or a read error. The empty set is a real answer and must stay distinct.
+
+    A file hard-linked from the old tree (#2157) is the same inode, so it is
+    unchanged without reading it: that is an ~11 MB RPZ zone file compared
+    twice per apply for nothing.
     """
     if not old_root.exists():
         return None
@@ -1392,7 +1535,12 @@ def _zones_differing(new_root: Path, old_root: Path) -> set[tuple[str, str | Non
         for zname, view in _zone_views_under(new_root):
             rel = _zone_rel(zname, view)
             old_p = old_root / rel
-            if not old_p.exists() or (new_root / rel).read_bytes() != old_p.read_bytes():
+            new_p = new_root / rel
+            if not old_p.exists():
+                changed.add((zname, view))
+            elif os.path.samefile(new_p, old_p):
+                continue
+            elif new_p.read_bytes() != old_p.read_bytes():
                 changed.add((zname, view))
     except OSError:
         return None
@@ -1447,7 +1595,7 @@ def _set_rendered_serial(path: Path, serial: int) -> bool:
     new, count = _RENDERED_SOA_SERIAL.subn(rf"\g<1>{serial}\g<3>", text, count=1)
     if count != 1:
         return False
-    path.write_text(new)
+    _write_new_inode(path, new.encode("utf-8"))
     return True
 
 
@@ -1866,7 +2014,7 @@ class Bind9Driver(DriverBase):
             zname = bl["rpz_zone_name"]
             rel = f"zones/{file_prefix}{zname.rstrip('.')}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel
-            self._write_rpz_zone_file(new_dir / rel, bl)
+            self._place_rpz_zone_file(new_dir / rel, bl, rel)
             return (
                 f'zone "{zname}" {{ type master; file "{abs_zfile}"; '
                 f"allow-query {{ localhost; }}; }};\n"
@@ -2186,6 +2334,48 @@ class Bind9Driver(DriverBase):
         path.write_text("\n".join(lines) + "\n")
         return apex.notes + timer_notes
 
+    def _place_rpz_zone_file(self, path: Path, bl: dict[str, Any], rel: str) -> None:
+        """Put the RPZ zone ``bl`` at ``path``, rendering it only if it changed.
+
+        Reused (#2157) when the bundle's content hash matches the sidecar of
+        the live tree's file, or of the backup's — the backup matters on a
+        #882 revert, which re-renders the previous bundle while the live tree
+        holds the failed one. A reused file is hard-linked, so it costs no
+        write and no blocks; its bytes are by construction the bytes this
+        render would have produced, so the zone stays out of the changed set,
+        out of ``named-checkzone`` and out of every ``rndc reload``.
+        """
+        key = _rpz_render_key(bl)
+        if key is not None:
+            for tree in (self.rendered_dir_name, "rendered.prev"):
+                src = self.state_dir / tree / rel
+                if not _rpz_reusable(src, key):
+                    continue
+                path.parent.mkdir(parents=True, exist_ok=True)
+                how = _link_or_copy(src, path)
+                if tree != self.rendered_dir_name:
+                    # From the backup: a revert, putting back the zone named
+                    # served before the failed one. named skips ``rndc
+                    # reload`` of a primary zone whose file is OLDER than its
+                    # last load ("master file older than last load"), and this
+                    # file is older than the failed one it loaded — so it
+                    # would keep serving the failed copy. A fresh mtime fixes
+                    # that; it changes no byte, and the backup sharing the
+                    # inode loses nothing.
+                    os.utime(path)
+                _write_new_inode(_rpz_sidecar(path), f"{key} {path.stat().st_size}\n".encode())
+                log.info(
+                    "bind9_rpz_reused",
+                    zone=bl["rpz_zone_name"],
+                    source=tree,
+                    via=how,
+                    entries=len(bl.get("entries") or []),
+                )
+                return
+        self._write_rpz_zone_file(path, bl)
+        if key is not None:
+            _write_new_inode(_rpz_sidecar(path), f"{key} {path.stat().st_size}\n".encode())
+
     def _write_rpz_zone_file(self, path: Path, bl: dict[str, Any]) -> None:
         """Render an RPZ zone file, streaming it to disk.
 
@@ -2238,12 +2428,19 @@ class Bind9Driver(DriverBase):
         collisions: list[str] = []
         bad_targets: list[str] = []
         bad_sinkholes: set[str] = set()
-        with path.open("w", encoding="utf-8", buffering=1 << 20) as fh:
+        # A temp file renamed into place, so the file is always a NEW inode
+        # (#2157): ``path`` may be a name another tree hard-links.
+        tmp = path.with_name(path.name + ".tmp")
+        with tmp.open("w", encoding="utf-8", buffering=1 << 20) as fh:
             for line in self._rpz_zone_lines(
                 bl, seen, collisions, bad_targets, bad_sinkholes
             ):
                 fh.write(line)
                 fh.write("\n")
+            # Durable before the caller's sidecar vouches for it (#2157).
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
         if bad_sinkholes:
             log.warning(
                 "bind9_rpz_sinkhole_ip_unusable",
@@ -2300,7 +2497,7 @@ class Bind9Driver(DriverBase):
     ) -> Iterator[str]:
         """Yield the RPZ zone file's lines; see ``_write_rpz_zone_file``."""
         yield "$TTL 60"
-        yield "@ IN SOA localhost. root.localhost. ( 1 3600 600 86400 60 )"
+        yield f"@ IN SOA localhost. root.localhost. ( {_rpz_serial(bl)} 3600 600 86400 60 )"
         yield "@ IN NS localhost."
         # Exceptions are emitted as passthru below, so an entry for the
         # same name must not also be emitted. Matches the control-plane
@@ -2488,10 +2685,21 @@ class Bind9Driver(DriverBase):
             )
             last_good = live / rel
             served = last_good.is_file()
+            staged_sidecar = _rpz_sidecar(new_dir / rel)
             if served:
-                shutil.copyfile(last_good, new_dir / rel)
+                # A copy as a new inode, never a write through the staged
+                # name: that name can be a hard link into ``rendered.prev``
+                # (#2157), whose bytes the #882 revert restores from.
+                _copy_new_inode(last_good, new_dir / rel)
+                # The staged sidecar described the refused render; the file
+                # is now the live one, so it gets the live one's (or none).
+                if _rpz_sidecar(last_good).is_file():
+                    _copy_new_inode(_rpz_sidecar(last_good), staged_sidecar)
+                else:
+                    staged_sidecar.unlink(missing_ok=True)
             else:
                 (new_dir / rel).unlink()
+                staged_sidecar.unlink(missing_ok=True)
             held.append(HeldZone(zname, view, detail, served))
         if held:
             log.warning(
@@ -2864,8 +3072,10 @@ class Bind9Driver(DriverBase):
         was already ahead of the render, and still reads that same serial,
         may never have loaded the render at all.
 
-        An RPZ's serial never moves (its SOA is fixed at 1), so its content
-        is covered by the pre-swap ``named-checkzone`` rather than here.
+        An RPZ zone's serial is derived from its content (#2157), so a
+        changed RPZ zone is verified here like any other; one rendered from a
+        bundle with no content hash keeps the old constant serial 1, and its
+        load is covered only by the pre-swap ``named-checkzone``.
         """
         if not shutil.which("rndc"):
             return

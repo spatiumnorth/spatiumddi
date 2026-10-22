@@ -26,7 +26,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
@@ -809,10 +809,20 @@ async def delete_controller(
     "/controllers/{controller_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_controller(controller_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_controller(controller_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     c = await db.get(UnifiController, controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="UniFi controller not found")
+
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="unifi_controller",
+        resource_id=c.id,
+        resource_display=str(getattr(c, "name", None) or c.id),
+        action="sync",
+    )
+    await db.commit()
 
     from app.tasks.unifi_sync import sync_controller_now  # noqa: PLC0415
 
