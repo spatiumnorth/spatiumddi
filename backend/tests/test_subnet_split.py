@@ -317,3 +317,46 @@ async def test_endpoint_rejects_bad_confirm(client: AsyncClient, db_session: Asy
         json={"new_prefix_length": 25, "confirm_cidr": "wrong"},
     )
     assert resp.status_code == 422
+
+
+async def _host(db: AsyncSession, subnet: Subnet, addr: str) -> None:
+    db.add(IPAddress(subnet_id=subnet.id, address=addr, status="allocated", hostname="h"))
+    await db.flush()
+
+
+@pytest.mark.asyncio
+async def test_preview_names_hosts_on_child_network_and_broadcast(
+    db_session: AsyncSession,
+) -> None:
+    """#2415: .127 / .128 of a /24 -> /25 split are conflicts, named."""
+    subnet = await _make_subnet(db_session, "10.0.0.0/24")
+    for a in ("10.0.0.10", "10.0.0.127", "10.0.0.128"):
+        await _host(db_session, subnet, a)
+    preview = await preview_subnet_split(db_session, subnet, 25)
+    details = [c.detail for c in preview.conflicts if c.type == "host_on_child_boundary"]
+    assert len(details) == 2
+    assert any("10.0.0.127" in d and "broadcast" in d for d in details)
+    assert any("10.0.0.128" in d and "network" in d for d in details)
+    assert any("netmask" in w for w in preview.warnings)
+
+
+@pytest.mark.asyncio
+async def test_commit_refuses_host_on_child_boundary(db_session: AsyncSession) -> None:
+    subnet = await _make_subnet(db_session, "10.0.0.0/24")
+    await _host(db_session, subnet, "10.0.0.127")
+    with pytest.raises(SplitError) as exc:
+        await commit_subnet_split(db_session, subnet, 25, confirm_cidr="10.0.0.0/24")
+    assert exc.value.status_code == 409
+    assert "10.0.0.127" in str(exc.value)
+    still = (await db_session.execute(select(Subnet).where(Subnet.id == subnet.id))).scalar_one()
+    assert str(still.network) == "10.0.0.0/24"
+
+
+@pytest.mark.asyncio
+async def test_default_placeholders_are_not_boundary_conflicts(db_session: AsyncSession) -> None:
+    subnet = await _make_subnet(db_session, "10.0.0.0/24")
+    db_session.add(IPAddress(subnet_id=subnet.id, address="10.0.0.0", status="network"))
+    db_session.add(IPAddress(subnet_id=subnet.id, address="10.0.0.255", status="broadcast"))
+    await _host(db_session, subnet, "10.0.0.10")
+    preview = await preview_subnet_split(db_session, subnet, 25)
+    assert preview.conflicts == []

@@ -1924,7 +1924,11 @@ confirmation gates and pg advisory locks held through commit:
   subnet into 2^k aligned children at a longer prefix. Preview
   reports the prospective children + any IP-address conflicts
   (rows that wouldn't fit cleanly into one child or the other);
-  commit refuses if the typed CIDR doesn't match. Service in
+  commit refuses if the typed CIDR doesn't match. A host sitting on
+  a child's network or broadcast address (e.g. .127 / .128 of a /24
+  split into /25s) is a `host_on_child_boundary` conflict naming the
+  address, and the commit refuses it; the preview also warns that
+  every client needs the new netmask. Service in
   `app.services.ipam.subnet_split`.
 
 - `POST /ipam/subnets/{id}/merge/preview` + `/commit` — collapse
