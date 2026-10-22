@@ -16,7 +16,13 @@ import {
   Lock,
   LockOpen,
 } from "lucide-react";
-import { authProvidersApi, usersApi, type AppUser } from "@/lib/api";
+import {
+  authProvidersApi,
+  formatApiError,
+  usersApi,
+  type AppUser,
+} from "@/lib/api";
+import { apiErrorStatus } from "@/lib/refusal";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { StepUpSection } from "@/components/StepUpSection";
@@ -513,6 +519,14 @@ function DeleteUserModal({
       qc.invalidateQueries({ queryKey: ["users"] });
       onClose();
     },
+    // 404: already gone (another tab or admin), which is what was asked for,
+    // so refresh the list and close. Any other refusal is shown (#2436).
+    onError: (err: unknown) => {
+      if (apiErrorStatus(err) === 404) {
+        qc.invalidateQueries({ queryKey: ["users"] });
+        onClose();
+      }
+    },
   });
 
   return (
@@ -523,6 +537,11 @@ function DeleteUserModal({
           <strong className="text-foreground">{user.username}</strong>? This
           cannot be undone.
         </p>
+        {mutation.isError && apiErrorStatus(mutation.error) !== 404 && (
+          <p className="text-xs text-destructive">
+            {formatApiError(mutation.error)}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
