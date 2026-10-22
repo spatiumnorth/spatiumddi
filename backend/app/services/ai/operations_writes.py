@@ -250,6 +250,14 @@ async def _apply_update_conformity_policy(
         if getattr(p, key) != value:
             setattr(p, key, value)
             applied[key] = value
+    if "enabled" in applied and not p.enabled:
+        from app.services.conformity.engine import (  # noqa: PLC0415
+            RESOLUTION_POLICY_DISABLED,
+            resolve_policy_alerts,
+        )
+
+        # #2277 — close the alerts a now-disabled policy left open.
+        await resolve_policy_alerts(db, p.id, reason=RESOLUTION_POLICY_DISABLED)
     # #2278 — same rule as the REST PATCH: a re-scoped policy's last
     # pass no longer describes it.
     retire_pass_if_rescoped(p, applied)

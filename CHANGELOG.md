@@ -128,6 +128,31 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Conformity alerts open, close and page again (#2277).** Two
+  defects. A conformity alert against a subnet, IP address, DNS zone,
+  DHCP scope or multicast group never opened: its subject id is 80 to
+  89 characters and `alert_event.subject_id` was VARCHAR(64), so the
+  insert failed and took the whole policy pass with it, results and
+  `last_evaluated_at` included. Only `platform` policies could alert.
+  And no conformity alert ever closed: #1578 took them away from the
+  alert evaluator and the conformity engine never resolved its own. A
+  fixed target, a deleted one or a disabled policy stayed red, and
+  because the event was still open, a later re-failure did not page.
+  The engine now resolves an event when its resource next evaluates
+  `pass` or `not_applicable`, when the resource is deleted or leaves the
+  policy's scope, and when the policy is disabled or deleted (from the
+  REST API, the copilot, and a once-a-minute sweep that catches any
+  other path). Clearing or switching the policy's alert rule closes
+  the old rule's events at its next evaluation, and a failure still
+  in progress pages once on the new rule. `warn` and a check that
+  raised keep the event open.
+  A re-failure after the engine closed the event opens a new one and
+  pages; an event an operator resolved by hand while the resource is
+  still failing is not re-paged, as before.
+
+  earliest-fired. Downgrade restores the non-unique index; the resolved
+  duplicates stay resolved.
+
 - **A DNS blocklist set to `sinkhole` answers with the sinkhole address
   instead of dropping the query, and `refused` is retired (#2124).** The
   agent rendered `sinkhole` as `CNAME rpz-drop.`, which makes named send
@@ -1879,6 +1904,10 @@ the formatter handles the rest.
   NULL means not recorded) and `dns_blocklist_exception.source`
   (`manual` | `feed`, server default `manual`). Downgrade drops both
   columns and leaves the `refused` rewrite in place.
+- `e2b9c46f1a83` — #2277, widens `alert_event.subject_id` from
+  VARCHAR(64) to VARCHAR(128). Catalogue-only, no rewrite. Downgrade
+  deletes events whose subject id is longer than 64 (only conformity
+  events written by this release) and narrows it back.
 
 ## 1.0.0-beta.1 — 2026-10-21
 
