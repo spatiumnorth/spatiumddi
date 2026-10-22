@@ -265,11 +265,10 @@ async def test_a_render_redelivered_past_the_bound_is_recorded_failed_not_render
     server, _zone = await _agent(db_session)
     await db_session.commit()
 
-    calls = 0
+    calls: list[int] = []  # one entry per render attempt
 
     async def _count_render(db, server, *, rendered_by):  # noqa: ANN001
-        nonlocal calls
-        calls += 1
+        calls.append(1)
         raise MemoryError("simulated")
 
     monkeypatch.setattr(agent_bundles, "render_and_store", _count_render)
@@ -278,11 +277,11 @@ async def test_a_render_redelivered_past_the_bound_is_recorded_failed_not_render
     for _ in range(limit):
         with pytest.raises(MemoryError):
             await agent_bundles._run_bounded(str(server.id), None, task_id)
-    assert calls == limit
+    assert len(calls) == limit
 
     result = await agent_bundles._run_bounded(str(server.id), None, task_id)
     assert result["status"] == "abandoned"
-    assert calls == limit  # no further render attempted
+    assert len(calls) == limit  # no further render attempted
     await db_session.refresh(server)
     assert server.bundle_render_status == store.RENDER_STATUS_FAILED
     assert "delivered" in (server.bundle_render_error or "")
