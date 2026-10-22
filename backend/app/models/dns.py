@@ -358,6 +358,36 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         index=True,
     )
     last_config_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # ── #2044 which agent PROCESS owns this server identity ──
+    #
+    # A DNS agent names its process on every config poll
+    # (``X-Spatium-Agent-Instance``, #2042). Only the owner is served record
+    # ops; ``services.dns.agent_instance.claim_poll`` decides who that is. A new
+    # instance takes over at once (an agent was replaced) and the one it
+    # replaced goes into ``agent_instances_displaced``; a displaced instance
+    # that polls again while the owner is live is a SECOND live agent on one
+    # identity (a cloned VM, two containers on one state dir) and is refused
+    # with 409, so the two do not pass record ops back and forth until the
+    # ops' retries run out. NULL = no agent that sends an instance id has
+    # polled yet.
+    agent_instance: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_instance_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    agent_instances_displaced: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # The current duplicate episode: the first and latest refused poll and
+    # where the latest came from. Read through
+    # ``agent_instance.duplicate_active`` by the server row and the
+    # ``dns_agent_duplicate_instance`` alert.
+    duplicate_agent_first_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    duplicate_agent_last_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    duplicate_agent_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+
     pending_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
@@ -1517,9 +1547,10 @@ class DNSPoolMember(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         JSONB, nullable=False, default=list, server_default="[]"
     )
     # Optional Site whose linked subnets contribute client CIDRs to this
-    # member's serving scope. ON DELETE SET NULL — deleting a Site just
-    # drops the association; the member reverts to whatever ``serving_cidrs``
-    # remain (default target if none).
+    # member's serving scope. ON DELETE SET NULL is a backstop only: the site
+    # delete endpoints return 409 while a member references the site (#2292),
+    # because the nulled member would revert to a default served to everyone.
+    # A member whose site has no subnets left serves nobody (fail closed).
     site_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("site.id", ondelete="SET NULL"),

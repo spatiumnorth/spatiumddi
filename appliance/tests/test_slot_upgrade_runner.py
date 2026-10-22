@@ -307,3 +307,11 @@ def test_atomic_write_failure_leaves_the_target_and_no_temp(tmp_path: Path) -> N
         r = subprocess.run(["bash", "-c", src], capture_output=True, text=True)
         assert r.returncode != 0
         assert not target.exists()
+
+
+def test_exit_trap_is_armed_before_the_in_flight_stamp() -> None:
+    """#2424: a SIGTERM landing between the in-flight stamp and the trap
+    left the state at in-flight. The trap must come first."""
+    text = RUNNER.read_text(encoding="utf-8")
+    body = text[text.index('if [ ! -f "$TRIGGER" ]; then') :]
+    assert body.index("trap on_exit EXIT") < body.index("\nmark_inflight")

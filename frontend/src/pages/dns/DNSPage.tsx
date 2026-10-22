@@ -49,6 +49,7 @@ import {
 import { useNavigate } from "react-router-dom";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
@@ -5700,6 +5701,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   <ConfigApplyChip server={s} />
                   <SpoolChip server={s} />
                   <DaemonStateChip server={s} />
+                  <DuplicateAgentChip server={s} />
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {s.host}:{s.port}
@@ -7677,11 +7679,19 @@ function OptionsTab({ groupId }: { groupId: string }) {
               auto — validate using built-in managed keys (recommended)
             </option>
             <option value="yes">
-              yes — validate; trust anchors must be configured manually
+              yes — validate; only against trust anchors added via the API
+              (BIND9)
             </option>
             <option value="no">no — do not validate DNSSEC signatures</option>
           </select>
         </Field>
+        {(opts?.dnssec_warnings?.length ?? 0) > 0 && (
+          <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+            {opts?.dnssec_warnings?.map((w) => (
+              <p key={w}>{w}</p>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className={card}>
