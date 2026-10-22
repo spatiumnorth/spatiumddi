@@ -26,7 +26,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.core.auth_throttle as throttle
-from app.core.auth_throttle import MFA_CHALLENGE_FAIL_MAX
 from app.core.security import create_mfa_challenge_token, hash_password
 from app.models.audit import AuditLog
 from app.models.auth import User
@@ -202,7 +201,7 @@ async def test_a_challenge_is_spent_after_its_wrong_code_budget(
     user, secret, _ = await _mfa_user(db_session)
     token = await _challenge(client, user)
 
-    for _ in range(MFA_CHALLENGE_FAIL_MAX):
+    for _ in range(throttle.MFA_CHALLENGE_FAIL_MAX):
         r = await client.post(_MFA, json={"mfa_token": token, "code": _wrong(secret)})
         assert r.status_code == 401, r.text
         assert r.json()["detail"] == "Invalid MFA code"
