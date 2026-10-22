@@ -213,16 +213,31 @@ def _rpz_hash_value(hasher: Any) -> str:
 
 
 def _entry_dict(
-    domain: str, action: str, block_mode: str, target: str | None, is_wildcard: bool
+    domain: str,
+    action: str,
+    block_mode: str,
+    target: str | None,
+    is_wildcard: bool,
+    sinkhole_ip: str | None = None,
 ) -> dict[str, Any]:
-    """One blocklist entry as the bundle ships it."""
-    return {
+    """One blocklist entry as the bundle ships it.
+
+    ``sinkhole_ip`` rides only on a ``sinkhole`` entry whose list names an
+    address (#2124) — the agent never received it, so every sinkhole list
+    rendered as ``rpz-drop``. Leaving the key off everywhere else keeps the
+    bundle of a list that does not sinkhole byte-identical, ETag included,
+    and costs nothing on the ~600k-entry feeds the bundle is sized for.
+    """
+    out: dict[str, Any] = {
         "domain": domain,
         "action": action,
         "block_mode": block_mode,
         "target": target,
         "is_wildcard": is_wildcard,
     }
+    if block_mode == "sinkhole" and sinkhole_ip:
+        out["sinkhole_ip"] = sinkhole_ip
+    return out
 
 
 def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
@@ -1292,7 +1307,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     # with exceptions already applied by `build_effective_for_{view,group}`.
     def _entries_payload(eff_entries: list[Any]) -> list[dict[str, Any]]:
         return [
-            _entry_dict(e.domain, e.action, e.block_mode, e.target, e.is_wildcard)
+            _entry_dict(e.domain, e.action, e.block_mode, e.target, e.is_wildcard, e.sinkhole_ip)
             for e in eff_entries
         ]
 

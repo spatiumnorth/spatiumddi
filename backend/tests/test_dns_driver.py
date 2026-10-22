@@ -543,6 +543,7 @@ def test_render_rpz_zone_nxdomain_and_sinkhole_and_exception() -> None:
     assert "spatium-blocklist.rpz. IN SOA" in out
     assert "ads.example.com IN CNAME ." in out
     assert "*.tracker.example.net IN A 10.0.0.250" in out
+    assert "*.tracker.example.net IN AAAA ::" in out  # #2124
     assert "redirect.example.org IN A 1.2.3.4" in out
     assert "allowed.example.com" not in out  # exception excluded
 

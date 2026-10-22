@@ -23,6 +23,7 @@ from sqlalchemy import delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import (
+    DNSBlockList,
     DNSBlockListEntry,
     DNSBlockListException,
     DNSServer,
@@ -160,6 +161,57 @@ async def test_the_hash_moves_with_the_zone_content(db_session: AsyncSession, ch
 
     after = (await _zones(db_session, server))["spatium-blocklist.rpz."]
     assert after[RPZ_CONTENT_HASH_KEY] != before[RPZ_CONTENT_HASH_KEY]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    ["sinkhole_ip", "sinkhole_ip_cleared", "block_mode", "feed_exception"],
+)
+async def test_the_hash_moves_with_the_2124_rpz_inputs(
+    db_session: AsyncSession, change: str
+) -> None:
+    """#2124 changed what an RPZ zone renders from: a sinkhole list's address
+    rides on its entries, the list's block mode picks the policy, and a feed's
+    own ``@@`` rules join the exceptions when they carve its own wildcard. An
+    unchanged hash over any of them would make the agent hard-link a stale
+    file (#2157): a silent wrong answer, not a slow one."""
+    server = await _setup(db_session, views=False)
+    before = (await _zones(db_session, server))["spatium-blocklist.rpz."]
+    alpha_id = _id(0x4000 + 0x10000)
+    bravo_id = _id(0x4000 + 0x20000)
+
+    if change == "sinkhole_ip":
+        await db_session.execute(
+            update(DNSBlockList)
+            .where(DNSBlockList.id == bravo_id)
+            .values(sinkhole_ip="192.0.2.100")
+        )
+    elif change == "sinkhole_ip_cleared":
+        await db_session.execute(
+            update(DNSBlockList).where(DNSBlockList.id == bravo_id).values(sinkhole_ip=None)
+        )
+    elif change == "block_mode":
+        await db_session.execute(
+            update(DNSBlockList).where(DNSBlockList.id == alpha_id).values(block_mode="sinkhole")
+        )
+    else:
+        # ``sink.example`` is bravo's own wildcard and no other list blocks
+        # anything under it, so bravo's feed exception takes effect.
+        db_session.add(
+            DNSBlockListException(
+                id=_id(0x4E003),
+                list_id=bravo_id,
+                domain="cdn.sink.example",
+                source="feed",
+            )
+        )
+    await db_session.commit()
+
+    after = (await _zones(db_session, server))["spatium-blocklist.rpz."]
+    assert after != before, "the change must reach the zone the agent renders"
+    assert after[RPZ_CONTENT_HASH_KEY] != before[RPZ_CONTENT_HASH_KEY]
+    assert after[RPZ_CONTENT_HASH_KEY] == _independent_hash(after)
 
 
 @pytest.mark.asyncio
