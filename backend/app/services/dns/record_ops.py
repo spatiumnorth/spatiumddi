@@ -32,9 +32,9 @@ from app.core.agent_wake import collect_wake, dns_group_channel
 from app.drivers.dns import AGENTLESS_DRIVERS, get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
 from app.models.audit import AuditLog
-from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone
+from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone, servable_ttl
 from app.models.ipam import IPAddress
-from app.services.dns.row_locks import ids_in, lock_op_ids
+from app.services.dns.row_locks import ids_in, lock_op_ids, lock_ops
 from app.services.dns.rrset import rrset_key as record_rrset_key
 from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
@@ -270,6 +270,72 @@ async def reset_unacknowledged_ops(
     return len(stale)
 
 
+async def return_ops_dispatched_elsewhere(
+    db: AsyncSession,
+    server_id: uuid.UUID,
+    instance: str,
+    *,
+    poll_started_at: datetime,
+    now: datetime | None = None,
+) -> int:
+    """Return this server's ops shipped to another agent process to ``pending``
+    (#2042). Returns the count; flushes, the caller commits.
+
+    When an agent is replaced (a pod roll, a container restart), the API can
+    still be holding a long-poll for the agent that went away. A record change
+    committed in the next few seconds is paged into that poll, marked
+    ``in_flight`` and written to a connection nobody reads, and the
+    replacement never receives it. Each op records the instance it was shipped
+    to (``dispatched_to``); a poll from instance ``instance`` therefore knows
+    any op still ``in_flight`` to a DIFFERENT instance cannot be one it holds,
+    and sends it back to be shipped on this poll. ``reset_unacknowledged_ops``
+    did the same, but only after five minutes.
+
+    Counted as an attempt, like the 5-minute reset: the departed agent may have
+    applied the op and died before acking it, and an op that crashes the agent
+    on every start must still exhaust its retries. But no backoff: nothing
+    failed here, the op was delivered to the wrong place. Record ops are
+    whole-RRset replaces (#773), so re-applying one the old agent did apply is
+    a no-op, and its late ``ok`` ack still marks the op applied.
+
+    Only an op shipped by a poll that STARTED BEFORE this one
+    (``dispatched_poll_at < poll_started_at``). The departed agent's leftover
+    poll runs at the same time as its replacement's and also passes through
+    here; without the ranking it would take back ops the replacement has
+    received and not yet acked (acks ride the ~30 s heartbeat), re-send them to
+    nobody, and the replacement would get them a second time — one more
+    attempt each, and a second ``rndc dnssec -rollover`` for a rollover op. The
+    leftover poll always started first, so it never qualifies; the
+    replacement's polls always started after it, so they always do.
+
+    An op with no ``dispatched_to`` (shipped by an older control plane, or to
+    an agent too old to send an instance id) is left to the 5-minute reset.
+    """
+    now = now or datetime.now(UTC)
+    stale = await lock_ops(
+        db,
+        DNSRecordOp.server_id == server_id,
+        DNSRecordOp.state == "in_flight",
+        DNSRecordOp.dispatched_to.is_not(None),
+        DNSRecordOp.dispatched_to != instance,
+        DNSRecordOp.dispatched_poll_at < poll_started_at,
+    )
+    if not stale:
+        return 0
+    message = "shipped to an agent instance that has since been replaced; re-sending"
+    await fail_attempts(db, [(op, message) for op in stale], now=now)
+    for op in stale:
+        if op.state == "pending":
+            op.next_attempt_at = None
+    logger.info(
+        "dns_record_ops_returned_from_replaced_agent",
+        server_id=str(server_id),
+        count=len(stale),
+    )
+    await db.flush()
+    return len(stale)
+
+
 def queued_zone_ops_where(zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
     """WHERE clauses selecting the live (queued) ops for ``zone`` on the servers
     of ``group_id`` — every server, as a correlated subquery, so no caller has
@@ -310,6 +376,39 @@ def queued_zone_ops_where(zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
         DNSRecordOp.zone_name == zone.name,
         DNSRecordOp.state.in_(QUEUED_OP_STATES),
     ]
+
+
+async def queued_op_counts(
+    db: AsyncSession,
+    *,
+    server_ids: Collection[uuid.UUID],
+    zone_names: Collection[str] | None = None,
+) -> dict[tuple[uuid.UUID, str], int]:
+    """How many ops each ``(server, zone name)`` pair still has unacknowledged
+    — ``pending`` or ``in_flight`` (#2042). Pairs with none are absent.
+    ``zone_names`` None counts every zone the servers have ops for.
+
+    A zone's server-state compares the serial a server reported with the
+    zone's target serial, and a serial is not proof a record arrived: an agent
+    that starts from its cached bundle reports what it serves, which can match
+    or pass the target while a record op is still undelivered. Until the op is
+    acknowledged the server is not in sync for that zone, whatever its serial
+    says. Name-scoped like :func:`queued_zone_ops_where`, for the same reason.
+    """
+    if not server_ids or (zone_names is not None and not zone_names):
+        return {}
+    conds: list[Any] = [
+        DNSRecordOp.server_id.in_(list(server_ids)),
+        DNSRecordOp.state.in_(QUEUED_OP_STATES),
+    ]
+    if zone_names is not None:
+        conds.append(DNSRecordOp.zone_name.in_(list(zone_names)))
+    rows = await db.execute(
+        select(DNSRecordOp.server_id, DNSRecordOp.zone_name, func.count())
+        .where(*conds)
+        .group_by(DNSRecordOp.server_id, DNSRecordOp.zone_name)
+    )
+    return {(sid, name): int(n) for sid, name, n in rows.all()}
 
 
 async def count_queued_zone_ops(db: AsyncSession, zone: DNSZone, group_id: uuid.UUID) -> int:
@@ -1358,7 +1457,9 @@ def record_op_payload(record: DNSRecord) -> dict[str, Any]:
         "name": record.name,
         "type": record.record_type,
         "value": record.value,
-        "ttl": record.ttl,
+        # #2073 — a TTL stored negative before the API bounded it is sent as
+        # null (inherit the zone's), never as a value no server accepts.
+        "ttl": servable_ttl(record.ttl),
         "priority": record.priority,
         "weight": record.weight,
         "port": record.port,

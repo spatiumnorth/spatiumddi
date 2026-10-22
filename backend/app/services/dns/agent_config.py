@@ -39,6 +39,7 @@ from app.drivers.dns.base import TsigKey
 from app.models.appliance import ApplianceCertificate
 from app.models.dns import (
     DEFAULT_ALLOW_RECURSION,
+    ZONE_DEFAULT_TTL,
     DNSAcl,
     DNSRecord,
     DNSRecordOp,
@@ -50,6 +51,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
     DNSZoneUpdateAcl,
+    servable_ttl,
 )
 from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
@@ -76,6 +78,7 @@ from app.services.dns.powerdns_alias import alias_resolver
 from app.services.dns.record_ops import (
     QUEUED_OP_STATES,
     RRSET_KEY_CHUNK,
+    _mark_applied,
     op_rrset_key,
     queued_after,
     rrset_match_where,
@@ -425,6 +428,13 @@ def _safe_update_acl(zone_id: Any, entries: list[dict[str, Any]]) -> list[dict[s
             continue
         kept.append(entry)
     return kept
+
+
+def _zone_ttl(zone: Any) -> int:
+    """The zone's ``$TTL`` as shipped: the stored one, or ``ZONE_DEFAULT_TTL``
+    when it is not servable (a negative one stored before #2073)."""
+    ttl = servable_ttl(getattr(zone, "ttl", None))
+    return ZONE_DEFAULT_TTL if ttl is None else ttl
 
 
 def _safe_zone_forwarders(zone: Any) -> list[str]:
@@ -846,7 +856,9 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         return {
             "name": r.name,
             "type": r.record_type,
-            "ttl": r.ttl,
+            # #2073 — a TTL stored negative before the API bounded it would
+            # make BIND refuse the whole zone file; the record inherits $TTL.
+            "ttl": servable_ttl(r.ttl),
             "value": r.value,
             "priority": r.priority,
             "weight": r.weight,
@@ -884,7 +896,9 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             # #430 — was getattr(z, "default_ttl", 3600): DNSZone has no
             # default_ttl, so this silently pinned every zone's $TTL to the
             # literal 3600 and editing a zone's TTL never re-rendered.
-            "ttl": getattr(z, "ttl", 3600),
+            # #2073 — a $TTL stored negative before the API bounded it makes
+            # BIND refuse the zone file, so it ships as the create default.
+            "ttl": _zone_ttl(z),
             # #430 (D1) — the agent's zone-state reporter skips any zone with
             # serial=None, so omitting this made it report nothing for every
             # zone and the per-server ZoneSyncPill stayed empty. Ship the
@@ -945,6 +959,20 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             # one SOA per serial (``soa_timers.served_soa_timers``).
             **served_soa_timers(z, serves_soa_timers),
         }
+        # A forward zone's OWN upstream transport (#2121). It used to inherit
+        # the group's ``forward_transport``; an agent older than #2121 ignores
+        # these keys and keeps inheriting, so the fix needs the agent upgraded
+        # too. Shipped only when the zone forwards over something other than
+        # plain DNS: an absent key reads as ``do53`` on the agent
+        # (``_forwarders.zone_forward_transport``), so a group that does not
+        # use the feature ships the bundle it did before and its etag does not
+        # move on upgrade, which would reload every agent in the fleet for a
+        # byte-identical named.conf. Inside zone_payload, so setting or
+        # clearing a transport shifts the structural etag.
+        zone_transport = getattr(z, "forward_transport", None) or "do53"
+        if getattr(z, "zone_type", None) == "forward" and zone_transport != "do53":
+            base_zp["forward_transport"] = zone_transport
+            base_zp["forward_tls_hostname"] = getattr(z, "forward_tls_hostname", None)
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone
         # files for serving — primary/secondary distinction matters for
@@ -1622,8 +1650,11 @@ async def retire_queued_ops(
     # #1929 — locked in ``row_locks`` order (ascending id) before the write:
     # a row a group move deletes meanwhile is skipped, not a StaleDataError.
     stale_ops = await lock_ops(db, *conds)
+    # #2108 — stamp it the way every other applied op is (one helper, not a
+    # copy of its field list): the render delivered it, once.
+    now = datetime.now(UTC)
     for op in stale_ops:
-        op.state = "applied"
+        _mark_applied(op, now)
     if stale_ops:
         await db.flush()
     return len(stale_ops)
@@ -1636,6 +1667,8 @@ async def page_pending_ops(
     up_to: datetime | None = None,
     visible_xacts: str | None = None,
     non_record_only: bool = False,
+    dispatched_to: str | None = None,
+    poll_started_at: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """One PAGE of this server's pending ops, oldest first, marked ``in_flight``.
 
@@ -1679,6 +1712,13 @@ async def page_pending_ops(
     ``non_record_only`` (#1946): a split-horizon bundle carries record
     changes in the zone payload and retires their ops, but a DNSSEC op has
     no carrier there; the page then holds only those kinds.
+
+    ``dispatched_to`` (#2042): the instance id of the agent process the page
+    is for, stamped on each op so a replacement agent's poll can tell an op
+    shipped to a predecessor from one shipped to itself
+    (``record_ops.return_ops_dispatched_elsewhere``). ``poll_started_at`` is
+    when the poll began, stamped with it: it decides which of two concurrent
+    polls may take an op back from the other.
     """
     if server.maintenance_mode:
         return [], 0
@@ -1753,6 +1793,8 @@ async def page_pending_ops(
         op.state = "in_flight"
         # The dispatch time: the stale-``in_flight`` reset measures from it.
         op.updated_at = now
+        op.dispatched_to = dispatched_to
+        op.dispatched_poll_at = poll_started_at if dispatched_to is not None else None
     if ops_to_dispatch:
         await db.flush()
     return page, remaining

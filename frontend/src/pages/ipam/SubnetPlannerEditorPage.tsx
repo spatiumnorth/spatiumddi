@@ -33,6 +33,7 @@ import {
 } from "@/lib/api";
 import { newNodeId } from "@/lib/uuid";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { Modal } from "@/components/ui/modal";
 
 /**
@@ -627,15 +628,21 @@ function PropertiesPanel({
 }) {
   // Canonical group keys (#367) — match the rest of the app so create/edit
   // invalidations refresh these pickers without a full reload.
+  // #2135 — DNS server groups only exist while core.dns is on.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
     staleTime: 5 * 60 * 1000,
+    enabled: dnsOn,
   });
+  // #2130 — DHCP server groups only exist while core.dhcp is on.
+  const dhcpOn = useModuleOn("core.dhcp");
   const { data: dhcpGroups = [] } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: () => dhcpApi.listGroups(),
     staleTime: 5 * 60 * 1000,
+    enabled: dhcpOn,
   });
 
   const isSubnet = node.kind === "subnet";
@@ -722,38 +729,44 @@ function PropertiesPanel({
         <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
           Resources (optional — blank = inherit)
         </p>
-        <Field label="DNS server group">
-          <select
-            value={node.dns_group_id ?? ""}
-            onChange={(e) => onChange({ dns_group_id: e.target.value || null })}
-            disabled={readOnly}
-            className="w-full rounded border bg-background px-2 py-1 text-sm disabled:opacity-50"
-          >
-            <option value="">— inherit —</option>
-            {dnsGroups.map((g) => (
-              <option key={g.id} value={g.id}>
-                {g.name}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <Field label="DHCP server group">
-          <select
-            value={node.dhcp_server_group_id ?? ""}
-            onChange={(e) =>
-              onChange({ dhcp_server_group_id: e.target.value || null })
-            }
-            disabled={readOnly}
-            className="w-full rounded border bg-background px-2 py-1 text-sm disabled:opacity-50"
-          >
-            <option value="">— inherit —</option>
-            {dhcpGroups.map((g) => (
-              <option key={g.id} value={g.id}>
-                {g.name}
-              </option>
-            ))}
-          </select>
-        </Field>
+        {dnsOn && (
+          <Field label="DNS server group">
+            <select
+              value={node.dns_group_id ?? ""}
+              onChange={(e) =>
+                onChange({ dns_group_id: e.target.value || null })
+              }
+              disabled={readOnly}
+              className="w-full rounded border bg-background px-2 py-1 text-sm disabled:opacity-50"
+            >
+              <option value="">— inherit —</option>
+              {dnsGroups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
+        {dhcpOn && (
+          <Field label="DHCP server group">
+            <select
+              value={node.dhcp_server_group_id ?? ""}
+              onChange={(e) =>
+                onChange({ dhcp_server_group_id: e.target.value || null })
+              }
+              disabled={readOnly}
+              className="w-full rounded border bg-background px-2 py-1 text-sm disabled:opacity-50"
+            >
+              <option value="">— inherit —</option>
+              {dhcpGroups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
         {isSubnet && (
           <Field label="Gateway IP">
             <input

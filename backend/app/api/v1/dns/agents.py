@@ -83,6 +83,7 @@ from app.services.dns.record_ops import (
     apply_acks,
     lock_heartbeat_ops,
     reset_unacknowledged_ops,
+    return_ops_dispatched_elsewhere,
 )
 from app.services.dns.row_locks import (
     lock_op_ids,
@@ -148,6 +149,19 @@ class AgentRegisterRequestV2(BaseModel):
                 f"driver must be one of {sorted(AGENT_CAPABLE_DRIVERS)} " "for agent registration"
             )
         return v
+
+
+# #2078 — every DNS agent released before this fix registered with this
+# literal, whatever build it ran (its heartbeat already sent the real stamp).
+# It names no build, so it is treated as "not reported": stored, it would show
+# a version the agent does not run until the next heartbeat corrected it.
+_UNSTAMPED_REGISTER_VERSION = "2026.04.14.1"
+
+
+def _reported_agent_version(version: str | None) -> str | None:
+    if not version or version == _UNSTAMPED_REGISTER_VERSION:
+        return None
+    return version
 
 
 class AgentRegisterResponseV2(BaseModel):
@@ -436,7 +450,8 @@ async def agent_register(
             agent_fingerprint=body.fingerprint,
             pending_approval=require_approval,
             is_primary=not has_primary,
-            notes=f"agent v{body.version}" if body.version else "auto-registered",
+            # ``notes`` is the operator's field; the agent never writes it.
+            agent_version=_reported_agent_version(body.version),
         )
         pending_approval = require_approval
         db.add(server)
@@ -460,6 +475,12 @@ async def agent_register(
         server.driver = body.driver
         server.roles = body.roles
         server.status = "active"
+        # Only overwrite when the agent actually reported one: an older agent
+        # sends the fixed literal (or nothing) and must not overwrite the real
+        # version its own heartbeat already recorded.
+        reported = _reported_agent_version(body.version)
+        if reported:
+            server.agent_version = reported
         if server.agent_id is None:
             server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
 
@@ -729,11 +750,28 @@ async def _bounded_inline(db: AsyncSession, server: DNSServer) -> DNSAgentBundle
                 pass
 
 
+#: #2042 — the per-process id a DNS agent sends on every config poll. A new
+#: value for a server means a new agent process; see ``agent_config_longpoll``.
+AGENT_INSTANCE_HEADER = "X-Spatium-Agent-Instance"
+_AGENT_INSTANCE_MAX = 64  # dns_record_op.dispatched_to
+
+
+def _agent_instance(raw: str | None) -> str | None:
+    """The agent's instance id, or None when it sent none or an unusable one
+    (an older agent; its ops are left to the 5-minute reset)."""
+    value = (raw or "").strip()
+    if not value or len(value) > _AGENT_INSTANCE_MAX or not value.isprintable():
+        return None
+    return value
+
+
 @router.get("/config")
 async def agent_config_longpoll(
+    request: Request,
     db: DB,
     response: Response,
     if_none_match: str | None = Header(default=None, alias="If-None-Match"),
+    agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
     auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> Any:
     """Long-poll for config changes.
@@ -789,8 +827,24 @@ async def agent_config_longpoll(
     has never had one. One attempt per server at a time, none during a
     failed attempt's backoff, and a failed attempt leaves the poll on the
     worker's renders like the fallback being off.
+
+    #2042 — an agent that is replaced leaves this handler running: nothing
+    cancels a long-poll when its client goes, so a record change committed
+    in the next seconds was paged into a response nobody read and sat
+    ``in_flight`` until the 5-minute unacknowledged reset. Two guards. The
+    agent names its process on every poll (``X-Spatium-Agent-Instance``),
+    each shipped op records it and when its poll started, and every pass
+    first returns the ops ``in_flight`` to a different instance, shipped by a
+    poll that started before this one, to ``pending`` so this poll ships
+    them. And a handler whose client has disconnected rolls its page back
+    instead of committing it; that check is advisory (TCP may not have
+    noticed yet), the instance id is what makes the recovery certain.
     """
     server, _payload = auth
+    instance = _agent_instance(agent_instance)
+    # #2042 — ranks this poll against any other the API holds for the server;
+    # see ``return_ops_dispatched_elsewhere``.
+    poll_started_at = datetime.now(UTC)
     if server.pending_approval:
         response.headers["X-Spatium-Pending-Approval"] = "1"
         return {"pending_approval": True, "etag": None}
@@ -830,6 +884,13 @@ async def agent_config_longpoll(
                     await enqueue_renders([server.id])
                     enqueued = True
             if bundle is not None:
+                if instance is not None and await return_ops_dispatched_elsewhere(
+                    db, server.id, instance, poll_started_at=poll_started_at
+                ):
+                    # Committed on its own: this pass may ship nothing (a
+                    # paused server) and then waits, and a wait must not hold
+                    # op row locks the heartbeat needs.
+                    await db.commit()
                 ops: list[dict[str, Any]] = []
                 remaining_ops = 0
                 # Under views the body carries record changes (their ops were
@@ -841,7 +902,15 @@ async def agent_config_longpoll(
                     up_to=bundle.snapshot_at,
                     visible_xacts=bundle.visible_xacts,
                     non_record_only=not bundle.ships_ops,
+                    dispatched_to=instance,
+                    poll_started_at=poll_started_at,
                 )
+                if ops and await request.is_disconnected():
+                    # #2042 — the agent this poll was for is gone; marking
+                    # the page in_flight would ship it to nobody.
+                    await db.rollback()
+                    AGENT_BUNDLE_SERVED.labels(family="dns", outcome="client_gone").inc()
+                    return Response(status_code=304)
                 # Early return if there are pending ops (fast-path per §3)
                 if not etag_matches(if_none_match, bundle.etag) or ops:
                     # The body before the commit, and never assumed: the
@@ -908,6 +977,9 @@ async def agent_heartbeat(
     # reason.
     if body.daemon_version:
         server.daemon_version = body.daemon_version
+    # #2078 — likewise only when reported (an older agent omits it).
+    if body.agent_version:
+        server.agent_version = body.agent_version
     # #1171 — on every heartbeat, from the header: the same server row is run
     # by an older agent until the upgrade replaces its pod, and by an older one
     # again if a node is rolled back.
@@ -1366,15 +1438,39 @@ async def agent_ingested_records(
         for r in body.records
     ]
     result = await reconcile_external_records(db, zone, incoming)
-    await db.commit()
     summary = to_summary(result)
     if summary["added"] or summary["removed"]:
+        # One summarising row per batch (not per record): an external writer
+        # churning records would otherwise flood audit_log. Names are capped.
+        cap = 50
+        db.add(
+            AuditLog(
+                user_display_name="system:dns-agent",
+                auth_source="system",
+                action="dns.record.external_ingest",
+                resource_type="dns_zone",
+                resource_id=str(zone.id),
+                resource_display=zone_name,
+                old_value=(
+                    {"removed_records": result.removed_records[:cap]} if result.removed else None
+                ),
+                new_value={
+                    "server_id": str(server.id),
+                    "server": server.name,
+                    **summary,
+                    "added_records": result.added_records[:cap],
+                    "truncated": max(result.added, result.removed) > cap,
+                },
+                result="success",
+            )
+        )
         logger.info(
             "dns_ingested_external_records",
             server_id=str(server.id),
             zone=zone_name,
             **summary,
         )
+    await db.commit()
     return {"zone": zone_name, **summary}
 
 

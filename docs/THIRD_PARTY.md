@@ -162,7 +162,7 @@ packages: they are vendored in `backend/app/static/api-docs/` and pinned in
 |---|---|---|
 | [Python](https://www.python.org/) 3.12 | PSF | Runtime |
 | [FastAPI](https://fastapi.tiangolo.com/) / [Starlette](https://www.starlette.io/) | MIT / BSD 3-Clause | HTTP framework |
-| [Swagger UI](https://github.com/swagger-api/swagger-ui) 5.33.1, vendored | Apache 2.0 | The interactive API docs at `/api/docs`, served by the api with no CDN |
+| [Swagger UI](https://github.com/swagger-api/swagger-ui) 5.34.0, vendored | Apache 2.0 | The interactive API docs at `/api/docs`, served by the api with no CDN |
 | [ReDoc](https://github.com/Redocly/redoc) 2.5.4, vendored | MIT | The reference API docs at `/api/redoc`, served by the api with no CDN |
 | [Uvicorn](https://www.uvicorn.org/) | BSD 3-Clause | ASGI server |
 | [SQLAlchemy](https://www.sqlalchemy.org/) / [Alembic](https://alembic.sqlalchemy.org/) | MIT | ORM + migrations |
@@ -326,7 +326,7 @@ Apache license covers it.
 | [technitium/dns-server](https://hub.docker.com/r/technitium/dns-server) | 15.4.0 (digest-pinned; Ubuntu-based) | GPL v3 | Technitium agent image **runtime** — the one agent image that is not Alpine |
 | [python:3.12-slim](https://www.python.org/) | 3.12 | PSF + Debian | API image |
 | [node](https://nodejs.org/) | 22-alpine | MIT | Frontend build stage |
-| [nginx](https://nginx.org/) | 1.31.6-alpine | BSD 2-Clause | Frontend runtime |
+| [nginx](https://nginx.org/) | 1.31.7-alpine | BSD 2-Clause | Frontend runtime |
 | [ASP.NET Core runtime](https://dotnet.microsoft.com/) | 10.0 | MIT | Technitium agent image |
 | [tini](https://github.com/krallin/tini) | Alpine/Debian pkg | MIT | PID 1 in every agent image |
 | [su-exec](https://github.com/ncopa/su-exec) / [gosu](https://github.com/tianon/gosu) | Alpine / Debian pkg | MIT / Apache 2.0 | Privilege drop at entrypoint |

@@ -16,6 +16,8 @@
  * silently converted, since the browser can't run IDNA reliably.
  */
 
+import { parseSecondsInput } from "./seconds";
+
 export const MAX_LABEL_LEN = 63;
 export const MAX_NAME_LEN = 253;
 
@@ -55,6 +57,22 @@ export function hostnameError(name: string): string | null {
     if (err) return err;
   }
   if (body.length > MAX_NAME_LEN) return `exceeds ${MAX_NAME_LEN} characters`;
+  return null;
+}
+
+/**
+ * Whether `<hostname>.<zone>` fits a DNS name (issue #2072): at most 253
+ * characters of dotted presentation form (255 octets on the wire), the
+ * whole name and not just the hostname. Mirrors `name_in_zone_error` in
+ * `app/core/dns_names.py`.
+ */
+export function nameInZoneError(host: string, zone: string): string | null {
+  const h = host.trim().replace(/\.+$/, "");
+  const z = zone.trim().replace(/\.+$/, "");
+  if (!h || !z) return null;
+  const full = `${h}.${z}`;
+  if (full.length > MAX_NAME_LEN)
+    return `"${h.length > 40 ? h.slice(0, 37) + "..." : h}" in zone "${z}" makes a ${full.length}-character name; a DNS name holds at most ${MAX_NAME_LEN}. Shorten the hostname or choose another zone.`;
   return null;
 }
 
@@ -126,4 +144,29 @@ export function zoneKindForName(name: string): "forward" | "reverse" {
 export function summarizeZoneNames(names: string[], max = 4): string {
   if (names.length <= max) return names.join(", ");
   return `${names.slice(0, max).join(", ")} + ${names.length - max} more`;
+}
+
+/** RFC 2181 §8: the largest TTL, and what the API accepts (#2073). */
+export const DNS_TTL_MAX = 2147483647;
+
+/**
+ * A TTL field's text as seconds (#2073 / #2074): `null` when blank, a reason
+ * string when it is not a whole number in 0..DNS_TTL_MAX. Never `parseInt`:
+ * it reads `"1h"` as 1 and `"1e3"` (a number input accepts it) as 1.
+ */
+export function parseTtlInput(
+  text: string,
+  bounds: { min: number; max: number } = { min: 0, max: DNS_TTL_MAX },
+): number | null | string {
+  return parseSecondsInput(text, bounds);
+}
+
+/** A DNS pool's TTL bounds: the API's `ge=1, le=86400` (`api/v1/dns/pools.py`). */
+export const POOL_TTL_BOUNDS = { min: 1, max: 86400 } as const;
+
+/** Whether a typed confirmation names the zone (trailing dot optional,
+ *  case-insensitive) — the same comparison the server makes. */
+export function confirmsZone(typed: string, zoneName: string): boolean {
+  const norm = (s: string) => s.trim().replace(/\.$/, "").toLowerCase();
+  return typed.trim() !== "" && norm(typed) === norm(zoneName);
 }

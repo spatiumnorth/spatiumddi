@@ -22,6 +22,7 @@ import {
   type ServiceStatus,
   type ServiceUpdate,
 } from "@/lib/api";
+import { formatDateOnly, termDaysLeft } from "@/lib/localTime";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -30,6 +31,7 @@ import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerChip } from "@/components/ownership/pickers";
 import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { useModuleOn } from "@/hooks/useModuleOn";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -117,9 +119,7 @@ function KindBadge({ kind }: { kind: ServiceKind }) {
 
 function TermBadge({ termEnd }: { termEnd: string | null }) {
   if (!termEnd) return <span className="text-muted-foreground/50">—</span>;
-  const days = Math.floor(
-    (new Date(termEnd).getTime() - Date.now()) / (24 * 3600 * 1000),
-  );
+  const days = termDaysLeft(termEnd);
   let cls =
     "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400";
   let label = `${days}d`;
@@ -135,7 +135,7 @@ function TermBadge({ termEnd }: { termEnd: string | null }) {
   return (
     <span className="inline-flex items-center gap-2">
       <span className="text-[11px] tabular-nums text-muted-foreground">
-        {new Date(termEnd).toLocaleDateString()}
+        {formatDateOnly(termEnd)}
       </span>
       <span
         className={cn(
@@ -198,13 +198,17 @@ function useResourcePool() {
     staleTime: 60_000,
   });
 
+  // #2135 — DNS zones can only be attached while core.dns is on; the reads
+  // would 404 otherwise.
+  const dnsOn = useModuleOn("core.dns");
   const dnsGroups = useQuery({
     queryKey: ["dns-groups", "all"],
     queryFn: () => dnsApi.listGroups(),
     staleTime: 60_000,
+    enabled: dnsOn,
   });
   const dnsZones = useQuery({
-    enabled: !!dnsGroups.data,
+    enabled: dnsOn && !!dnsGroups.data,
     queryKey: ["dns-zones", "all", (dnsGroups.data ?? []).map((g) => g.id)],
     queryFn: async () => {
       const groups = dnsGroups.data ?? [];
@@ -220,13 +224,17 @@ function useResourcePool() {
     staleTime: 60_000,
   });
 
+  // #2130 — DHCP scopes can only be attached while core.dhcp is on; the
+  // reads would 404 otherwise.
+  const dhcpOn = useModuleOn("core.dhcp");
   const dhcpGroups = useQuery({
     queryKey: ["dhcp-groups", "all"],
     queryFn: () => dhcpApi.listGroups(),
     staleTime: 60_000,
+    enabled: dhcpOn,
   });
   const dhcpScopes = useQuery({
-    enabled: !!dhcpGroups.data,
+    enabled: dhcpOn && !!dhcpGroups.data,
     queryKey: ["dhcp-scopes", "all", (dhcpGroups.data ?? []).map((g) => g.id)],
     queryFn: async () => {
       const groups = dhcpGroups.data ?? [];
@@ -313,6 +321,8 @@ function ResourcesTab({
 }) {
   const qc = useQueryClient();
   const pool = useResourcePool();
+  const dhcpOn = useModuleOn("core.dhcp");
+  const dnsOn = useModuleOn("core.dns");
 
   const [addKind, setAddKind] = useState<ServiceResourceKind>("vrf");
   const [addId, setAddId] = useState<string>("");
@@ -427,7 +437,10 @@ function ResourcesTab({
               setAddId("");
             }}
           >
-            {RESOURCE_KINDS.map((k) => (
+            {RESOURCE_KINDS.filter(
+              (k) =>
+                (dhcpOn || k !== "dhcp_scope") && (dnsOn || k !== "dns_zone"),
+            ).map((k) => (
               <option key={k} value={k}>
                 {RESOURCE_KIND_LABELS[k]}
               </option>

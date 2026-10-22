@@ -10,6 +10,7 @@ from __future__ import annotations
 import shutil
 import threading
 import time
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from .apply_guard import (
     SYNC_FIRST_AFTER_DEATHS,
     ApplyGuard,
 )
+from .bootstrap import reauth_generation, reauthenticate
 from .cache import commit_config, load_config, load_previous_config, save_config
 from .config import AgentConfig
 from .config_apply import (
@@ -43,6 +45,17 @@ from .fetch import get_config
 from .oom_watch import OomWatch, is_oom_status
 
 log = structlog.get_logger(__name__)
+
+# #2042 — names this agent PROCESS on every config poll. The control plane
+# stamps it on each op it ships, so when a replacement process polls, an op
+# still in flight to the previous one (paged into a long-poll the API held for
+# an agent that is gone) is recognised as undelivered and shipped again at
+# once, instead of after the 5-minute unacknowledged reset. Per process, not
+# per ``Sync``: a re-bootstrap keeps the heartbeat and its unsent acks, so the
+# ops this process received are still its own. A header, so an older control
+# plane ignores it.
+AGENT_INSTANCE_HEADER = "X-Spatium-Agent-Instance"
+AGENT_INSTANCE = uuid.uuid4().hex
 
 
 def _touch_ready_marker(state_dir: Path) -> None:
@@ -223,6 +236,8 @@ class SyncLoop:
         # #1725 — the supervisor's; ``None`` in tests that build a loop
         # directly. Only read on a failed apply, to name an OOM kill.
         self.oom_watch = oom_watch
+        # #2052 — the re-registration this loop last caught up with.
+        self._reauth_gen = reauth_generation()
 
         # #2019 — the death-during-apply marker. Read before anything is
         # applied: a process that died with it armed counts a death of the
@@ -682,7 +697,7 @@ class SyncLoop:
         if bundle is None:
             return
         self._boot_report_attempts += 1
-        done = self._report_zone_state(bundle, skip={h.zone.lower() for h in self.driver.held_back})
+        done = self._report_zone_state(bundle, skip=self._unconverged_zone_keys())
         if done or self._boot_report_attempts >= BOOT_REPORT_MAX_ATTEMPTS:
             if not done:
                 log.warning(
@@ -700,6 +715,40 @@ class SyncLoop:
             timeout=timeout,
             headers=features.headers(),
         )
+
+    def _on_reregistered(self) -> None:
+        """Resend what a fresh process sends at startup, to the new row (#2052).
+
+        Re-registering after a 404 lands on a NEW server row. A container
+        restart used to give it the cache apply's zone-state report, a DNSSEC
+        state report and the rendered-config push; in process, none of them
+        would be sent until the next structural change — the structural etag
+        carries no server id, so the new row's bundle re-renders nothing, and
+        its zone-state, Config tab and DS state would read empty until then.
+        The serials already reported are forgotten: they were the old row's
+        (a reset control plane may number its zones lower), and the report
+        re-arms them. Nothing here touches the daemon.
+        """
+        self._current_etag = None
+        if self._dnssec_bundle is not None:
+            zones = []
+            for zone in self._dnssec_bundle.get("zones") or []:
+                served = self._reported_serials.get(_zone_key(zone.get("name")))
+                serial = zone.get("serial")
+                if served is not None and (serial is None or _serial_later(served, int(serial))):
+                    # Record ops moved it past the structural apply's serial.
+                    zone = {**zone, "serial": served}
+                zones.append(zone)
+            self._boot_report_bundle = {"zones": zones}
+            self._boot_report_attempts = 0
+        self._reported_serials = {}
+        self._dnssec_reported = None
+        self._dnssec_settle_streak = 0
+        self._dnssec_refresh_at = 0.0
+        try:
+            push_rendered_config(self.cfg, self.token_ref[0])
+        except Exception:
+            log.exception("rendered_config_reregister_push_failed")
 
     def _maybe_settle(self) -> None:
         """Disarm the #2019 marker once the daemon outlived the settle window.
@@ -726,14 +775,23 @@ class SyncLoop:
             log.error("dns_daemon_died_during_config_apply_watched", etag=etag)
 
     def note_orderly_exit(self) -> None:
-        """The process is exiting by choice (SIGTERM, a re-bootstrap): an
-        apply still settling did not kill anything, so it is not a death."""
+        """The process is exiting by choice (SIGTERM, a critical thread
+        ending): an apply still settling did not kill anything, so it is not a
+        death. A 401/404 re-registration does not exit (#2052)."""
         self._guard.disarm()
 
     def _poll_once(self) -> None:
+        gen = reauth_generation()
+        if gen != self._reauth_gen:
+            self._reauth_gen = gen
+            log.info("sync_reregistered_resending_reports")
+            self._on_reregistered()
         self._maybe_settle()
         self._flush_boot_report()
-        headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
+        headers = {
+            "Authorization": f"Bearer {self.token_ref[0]}",
+            AGENT_INSTANCE_HEADER: AGENT_INSTANCE,
+        }
         # #882 — a quarantined bundle is parked on a 304 by the etag we sent
         # last time, so the only way to give it another attempt is to stop
         # sending that etag. Dropping If-None-Match makes the server answer
@@ -784,10 +842,13 @@ class SyncLoop:
                 status=resp.status_code,
                 reason="token_invalid" if resp.status_code == 401 else "server_missing",
             )
-            from .cache import save_token
-
-            save_token(self.cfg.state_dir, "")
-            self._stop.set()
+            # #2052 — re-register in this thread; do NOT stop it. Stopping
+            # made the supervisor exit the container and take the daemon down.
+            reauthenticate(self.cfg, self.token_ref, headers["Authorization"][7:])
+            # Force a fresh 200. The next poll also sees the generation move
+            # and resends the startup reports to the new row
+            # (``_on_reregistered``), whichever thread registered.
+            self._current_etag = None
             return
         if resp.status_code != 200:
             log.warning("sync_unexpected_status", status=resp.status_code)
@@ -866,7 +927,7 @@ class SyncLoop:
             # roll back the apply (we already serve the new config). A zone
             # held back (#1403) is not serving the serial it was rendered
             # with, so it is left out and keeps the serial it last reported.
-            self._report_zone_state(bundle, skip={h.zone.lower() for h in self.driver.held_back})
+            self._report_zone_state(bundle, skip=self._unconverged_zone_keys())
             # This bundle replaces the one applied at startup, and its report
             # covers the same question.
             self._boot_report_bundle = None
@@ -929,8 +990,15 @@ class SyncLoop:
             # just reported is the pre-rollover set. Look again soon.
             self._dnssec_settle_streak = 0
             self._dnssec_recheck_soon()
+        # A zone the structural apply left partly refused (#2060) is not
+        # reported converged by an op that landed beside the refusal either.
+        unconverged = self._unconverged_zone_keys()
         self._report_reached_serials(
-            {zone: serial for zone, serial in reached.items() if zone not in failed_zones}
+            {
+                zone: serial
+                for zone, serial in reached.items()
+                if zone not in failed_zones and zone.lower() not in unconverged
+            }
         )
 
         # #882 — we got here with nothing quarantined and nothing to
@@ -1221,6 +1289,24 @@ class SyncLoop:
             "status": "degraded",
             "reason": f"config_apply_{status.status}: {status.error}",
         }
+
+    def _unconverged_zone_keys(self) -> set[str]:
+        """Zones (lowercase, no trailing dot) the live apply did not converge,
+        whose serial is therefore not reported as served (#1403, #2060).
+
+        A zone held back serves an older serial than it was rendered with. A
+        zone whose data the daemon refused in part may serve the NEW serial —
+        PowerDNS applies the rest of such a zone piecemeal, SOA last — with
+        records missing, and reporting that serial would make per-server sync
+        status read "in sync" beside the very refusal the apply status names.
+        Left out, the zone keeps the serial it last reported and reads behind
+        until an apply serves it whole.
+        """
+        keys = {h.zone.rstrip(".").lower() for h in self.driver.held_back}
+        hook = getattr(self.driver, "unconverged_zones", None)
+        if callable(hook):
+            keys |= {str(z).rstrip(".").lower() for z in hook()}
+        return keys
 
     def _report_zone_state(self, bundle: dict[str, Any], skip: set[str] | None = None) -> bool:
         """POST ``{zones: [{zone_name, serial}, ...]}`` after a successful apply.

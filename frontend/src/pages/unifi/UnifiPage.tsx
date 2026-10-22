@@ -1,3 +1,4 @@
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -32,6 +33,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 
 // One-shot snippet operators can paste into Settings → Control
 // Plane → Integrations on UniFi OS to mint an API key with the
@@ -345,9 +347,13 @@ export function UnifiPage() {
       {del && (
         <DeleteControllerModal
           controller={del}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           onConfirm={() => delMut.mutate(del.id)}
           isPending={delMut.isPending}
+          error={delMut.isError ? errMsg(delMut.error, "Delete failed") : null}
         />
       )}
     </div>
@@ -356,7 +362,7 @@ export function UnifiPage() {
 
 // ── Create / Edit modal ─────────────────────────────────────────────
 
-function ControllerModal({
+export function ControllerModal({
   controller,
   onClose,
 }: {
@@ -366,9 +372,13 @@ function ControllerModal({
   const qc = useQueryClient();
   const editing = !!controller;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [name, setName] = useState(controller?.name ?? "");
@@ -418,7 +428,7 @@ function ControllerModal({
     controller?.include_vpn ?? false,
   );
   const [syncInterval, setSyncInterval] = useState(
-    controller?.sync_interval_seconds ?? 60,
+    String(controller?.sync_interval_seconds ?? 60),
   );
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
@@ -494,7 +504,7 @@ function ControllerModal({
           include_wired: includeWired,
           include_wireless: includeWireless,
           include_vpn: includeVpn,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (caBundle) update.ca_bundle_pem = caBundle;
         if (apiKey) update.api_key = apiKey;
@@ -525,7 +535,7 @@ function ControllerModal({
         include_wired: includeWired,
         include_wireless: includeWireless,
         include_vpn: includeVpn,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return unifiApi.createController(create);
     },
@@ -545,6 +555,17 @@ function ControllerModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -779,20 +800,22 @@ function ControllerModal({
           <Field label="IPAM space">
             <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
         </div>
 
         <Field
@@ -849,7 +872,7 @@ function ControllerModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
@@ -881,11 +904,13 @@ function DeleteControllerModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   controller: UnifiController;
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  error?: string | null;
 }) {
   const [checked, setChecked] = useState(false);
   return (
@@ -894,9 +919,11 @@ function DeleteControllerModal({
         <p className="text-sm text-muted-foreground">
           Remove the UniFi controller{" "}
           <span className="font-semibold">{controller.name}</span>? This only
-          affects SpatiumDDI — nothing on the controller side changes. All IPAM
-          rows mirrored from this controller (subnets, blocks, IP addresses)
-          will be removed via the FK cascade.
+          affects SpatiumDDI — nothing on the controller side changes. If active
+          block sync is armed, disarm it first (that lifts the pushed blocks
+          from the device); delete is refused while it is armed. All IPAM rows
+          mirrored from this controller (subnets, blocks, IP addresses) will be
+          removed via the FK cascade.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input
@@ -907,6 +934,11 @@ function DeleteControllerModal({
           />
           <span>I understand.</span>
         </label>
+        {error && (
+          <p className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

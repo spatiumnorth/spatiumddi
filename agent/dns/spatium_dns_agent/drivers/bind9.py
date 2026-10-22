@@ -33,6 +33,8 @@ except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
 from ..oom_watch import cgroup_memory_limit_bytes as _cgroup_memory_limit_bytes
+from ._forwarders import bind_zone_forwarders as _bind_zone_forwarders
+from ._forwarders import bind_zone_tls_statement as _bind_zone_tls_statement
 from ._process import (
     find_running_daemon,
     is_zombie,
@@ -666,6 +668,25 @@ def _render_tls_statements(
     return ("\n".join(blocks) + "\n") if blocks else ""
 
 
+def _render_zone_tls_statements(zones: list[dict[str, Any]] | None) -> str:
+    """One ``tls`` statement per distinct upstream hostname that a TLS forward
+    zone forwards to (#2121), sorted so the file is stable.
+
+    Rendered with the other top-level tls statements, above ``options`` and
+    so above every zone that names one: BIND resolves a tls name where it is
+    written. A zone on plain DNS contributes nothing, so a group with no TLS
+    forward zone renders exactly what it did before.
+    """
+    hostnames: set[str] = set()
+    for zone in zones or []:
+        if zone.get("type") != "forward":
+            continue
+        _tokens, hostname, _refusal = _bind_zone_forwarders(zone)
+        if hostname:
+            hostnames.add(hostname)
+    return "".join(_bind_zone_tls_statement(h) for h in sorted(hostnames))
+
+
 def _render_encrypted_listeners(opts: dict[str, Any], has_cert: bool) -> str:
     """``listen-on`` clauses for DoT / DoH, rendered inside ``options {}``.
 
@@ -688,7 +709,10 @@ def _render_encrypted_listeners(opts: dict[str, Any], has_cert: bool) -> str:
 
 
 def _format_forwarder(entry: str, opts: dict[str, Any]) -> str:
-    """Render one ``forwarders`` token, honouring the upstream transport.
+    """Render one of the GROUP's ``forwarders`` tokens, honouring its transport.
+
+    The group's forwarders only: a forward zone's upstreams carry their own
+    transport and render through ``_forwarders.bind_zone_forwarders`` (#2121).
 
     Accepts ``ip`` or ``ip@port`` (the control-plane wire shape, same as
     ``_format_master``). Previously the raw string was emitted verbatim,
@@ -834,6 +858,24 @@ def _absolute_name(value: Any) -> str | None:
     return name if name.endswith(".") else name + "."
 
 
+_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def _is_host_name(absolute: str) -> bool:
+    """Whether absolute ``absolute`` is a usable Primary NS: the control
+    plane's ``primary_ns_error`` rule (backend ``app/core/dns_names.py``, kept
+    in step by shared test vectors). RFC 1123 labels, at most 63 octets each
+    and 253 in all, as BIND's default ``check-names`` requires: a row stored
+    before #2075 with ``ns_1.…`` made named refuse the zone and the agent
+    revert the whole bundle. And at least two labels: a single label such as
+    ``ns1`` is read as absolute and would be served as a name at the root,
+    not the ``ns1.<zone>`` the operator meant."""
+    body = absolute[:-1] if absolute.endswith(".") else absolute
+    if not body or len(body) > 253 or "." not in body:
+        return False
+    return all(_HOST_LABEL_RE.match(label) for label in body.split("."))
+
+
 def _zone_file_name(value: str, origin: str) -> str:
     """How BIND reads ``value`` written into the file of zone ``origin``:
     absolute when it ends in a dot, the apex for ``@`` or nothing, otherwise
@@ -902,6 +944,8 @@ def _zone_apex(zone: dict[str, Any]) -> ZoneApex:
             declared_ns.append(_zone_file_name(str(rec.get("value") or ""), origin))
 
     primary_ns = _absolute_name(zone.get("primary_ns"))
+    if primary_ns is not None and not _is_host_name(primary_ns):
+        primary_ns = None  # reported below as an unusable field, then healed
     admin = _absolute_name(zone.get("admin_email"))
     for field, parsed in (("primary_ns", primary_ns), ("admin_email", admin)):
         if parsed is None and str(zone.get(field) or "").strip():
@@ -1637,7 +1681,10 @@ class Bind9Driver(DriverBase):
             logging_block=logging_block,
             tsig_include=tsig_include,
             acl_statements=_render_acl_statements(bundle.get("acls")),
-            tls_statements=_render_tls_statements(opts, self.state_dir, has_cert),
+            tls_statements=(
+                _render_tls_statements(opts, self.state_dir, has_cert)
+                + _render_zone_tls_statements(bundle.get("zones"))
+            ),
             encrypted_listeners=_render_encrypted_listeners(opts, has_cert),
         )
 
@@ -1681,15 +1728,20 @@ class Bind9Driver(DriverBase):
                 return ""
             zone_type = zone.get("type", "primary")
             # Forward zones: just a forwarders block, no file / allow-update.
-            # Per-zone upstreams inherit the group's forward transport
-            # (issue #50) — a group forwarding over DoT shouldn't silently
-            # fall back to plaintext for its zone-scoped upstreams.
+            # The transport is the ZONE's own (#2121), not the group's: the
+            # group's ``forward_transport`` applies to its resolver
+            # forwarders only. Inheriting it sent DoT to plain-DNS upstreams
+            # like Tailscale's 100.100.100.100, validated against the group
+            # provider's certificate name, and the zone SERVFAILed.
             if zone_type == "forward":
-                fwds = [
-                    _format_forwarder(str(f), opts)
-                    for f in (zone.get("forwarders") or [])
-                    if f
-                ]
+                fwds, _tls_host, refusal = _bind_zone_forwarders(zone)
+                if refusal:
+                    # Skipped rather than downgraded to plain DNS or to
+                    # unverified TLS, neither of which the operator chose.
+                    log.warning(
+                        "bind9_forward_zone_skipped", zone=zname, reason=refusal
+                    )
+                    return ""
                 if not fwds:
                     return ""
                 policy = "only" if bool(zone.get("forward_only", True)) else "first"

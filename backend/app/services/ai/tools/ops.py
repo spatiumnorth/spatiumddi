@@ -439,6 +439,7 @@ def _parse_x509_date(value: str | None) -> datetime | None:
 
 @register_tool(
     name="tls_cert_check",
+    rate_limit="default",
     permission=("read", "use_network_tools"),
     description=(
         "Fetch the TLS certificate served by host:port and report the "
@@ -562,6 +563,7 @@ class HelpWritePermissionArgs(BaseModel):
 
 @register_tool(
     name="help_write_permission",
+    honours_token_binding=True,
     permission="authenticated",
     description=(
         "Build the RBAC permission JSON to paste into a Role's "

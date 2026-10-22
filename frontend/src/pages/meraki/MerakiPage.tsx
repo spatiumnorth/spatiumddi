@@ -1,3 +1,4 @@
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -32,6 +33,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 
 // ── Page ─────────────────────────────────────────────────────────────
 
@@ -352,9 +354,13 @@ export function MerakiPage() {
       {del && (
         <DeleteOrgModal
           org={del}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           onConfirm={() => delMut.mutate(del.id)}
           isPending={delMut.isPending}
+          error={delMut.isError ? errMsg(delMut.error, "Delete failed") : null}
         />
       )}
     </div>
@@ -517,9 +523,13 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
   const qc = useQueryClient();
   const editing = !!org;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [name, setName] = useState(org?.name ?? "");
@@ -549,7 +559,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
     org?.mirror_clients ?? false,
   );
   const [syncInterval, setSyncInterval] = useState(
-    org?.sync_interval_seconds ?? 300,
+    String(org?.sync_interval_seconds ?? 300),
   );
   const [error, setError] = useState("");
 
@@ -596,7 +606,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
           mirror_dhcp_reservations: mirrorDhcpReservations,
           mirror_nat_rules: mirrorNatRules,
           mirror_clients: mirrorClients,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (apiKey) update.api_key = apiKey;
         return merakiApi.update(org!.id, update);
@@ -616,7 +626,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
         mirror_dhcp_reservations: mirrorDhcpReservations,
         mirror_nat_rules: mirrorNatRules,
         mirror_clients: mirrorClients,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return merakiApi.create(create);
     },
@@ -636,6 +646,17 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -766,20 +787,22 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
           <Field label="IPAM space">
             <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
         </div>
 
         <Field label="Sync interval (seconds)" hint="Minimum 30 s.">
@@ -788,7 +811,7 @@ function OrgModal({ org, onClose }: { org?: MerakiOrg; onClose: () => void }) {
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 300)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
@@ -898,11 +921,13 @@ function DeleteOrgModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   org: MerakiOrg;
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  error?: string | null;
 }) {
   const [checked, setChecked] = useState(false);
   return (
@@ -911,9 +936,11 @@ function DeleteOrgModal({
         <p className="text-sm text-muted-foreground">
           Remove the Meraki organization{" "}
           <span className="font-semibold">{org.name}</span>? This only affects
-          SpatiumDDI — nothing on the Meraki side changes. All IPAM rows
-          mirrored from this organization (subnets + addresses) will be removed
-          via the FK cascade.
+          SpatiumDDI — nothing on the Meraki side changes. If active block sync
+          is armed, disarm it first (that lifts the pushed blocks from the
+          device); delete is refused while it is armed. All IPAM rows mirrored
+          from this organization (subnets + addresses) will be removed via the
+          FK cascade.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input
@@ -924,6 +951,11 @@ function DeleteOrgModal({
           />
           <span>I understand.</span>
         </label>
+        {error && (
+          <p className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

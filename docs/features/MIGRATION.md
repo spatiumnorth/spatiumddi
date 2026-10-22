@@ -78,9 +78,12 @@ Five sources, all reducing to canonical `ImportedZone` + `ImportedRecord`:
 
 - **BIND9 archive** — upload a `.zip` / `.tar(.gz|.bz2|.xz)` containing
   `named.conf` + the referenced master files. The parser walks every
-  `zone "…" { … }` declaration (including those nested in `view {}`
-  blocks), resolves the `file "…"` directive inside the archive, and
-  parses each master file. ACL / controls / logging / key declarations
+  `zone "…" [class] { … }` declaration (including those nested in
+  `view {}` blocks), resolves the `file "…"` directive inside the
+  archive, and parses each master file. Only class `IN` zones import;
+  `hint` / `mirror` / `redirect` / `static-stub` / `delegation-only`
+  zones, unquoted zone names and `include`d files are not read, and
+  each is named in the preview's warnings. ACL / controls / logging / key declarations
   stay out of scope; DNSSEC records (DNSKEY / RRSIG / NSEC* / DS) are
   stripped with a warning — re-sign post-import via the zone DNSSEC tab.
 - **Windows DNS live-pull** — pick a registered `windows_dns` server
@@ -153,6 +156,27 @@ foreign host. Delegations below the apex are never touched, the change is
 recorded in the zone's audit row (`apex_ns_replaced`), and a group with no such
 server keeps the imported rows with a warning rather than falling back to the
 agent's loopback placeholder. Existing zones are not rewritten.
+
+**CNAME beside other data (#2089).** A CNAME must be the only record at its
+name and never sits at the apex (RFC 1034 §3.6.2, RFC 2181 §10.1). The record
+API refuses both (#1381), and so does every importer, with the same rule
+(`services/dns/cname_conflict.py`). A source that holds such a pair (a
+PowerDNS, Windows, Technitium or cloud zone; a zone file with one is already
+refused by the parser) imports without the offending row, rather than as a zone
+the server then refuses to load. Which side is kept:
+
+- within one imported zone, the non-CNAME data is kept and the CNAME skipped;
+  of several CNAMEs at one name the first in the source's order is kept; an
+  apex CNAME is skipped;
+- in a zone-file import into an existing zone, the records already there win,
+  in both directions. Records in the trash do not count, IPAM-generated records
+  do, and records match per view (a row with no view meets every view). A
+  `replace` frees the names of the records it deletes, so the preview takes
+  `conflict_strategy` as the commit does.
+
+The preview lists each such record as a warning (or under **Will not be
+imported** for a zone file), the commit's warnings repeat it, and the zone's
+audit row names it (`records_skipped_unsafe`, or `skipped` for a zone file).
 
 See `docs/drivers/DNS_DRIVERS.md` for parser + agentless-driver
 internals.

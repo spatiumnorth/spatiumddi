@@ -270,6 +270,11 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # crosses that boundary. NULL = not reported yet (agentless drivers never
     # report one) and must be treated as UNKNOWN, never as "old".
     daemon_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # #2078 — the python AGENT's own version (the image's stamped release, or
+    # ``dev`` for an unstamped build), reported on register and each heartbeat.
+    # Distinct from ``daemon_version`` above. NULL = never reported (an older
+    # agent, or an agentless driver): UNKNOWN, never a made-up value.
+    agent_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # #1171 — this server's agent writes each zone's own SOA timers into its
     # SOA: it sent ``soa-timers`` in ``X-Spatium-Agent-Features`` on its last
     # register or heartbeat. False for an agent of an older release, which
@@ -560,6 +565,22 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
         DNS_RECORD_OP_SEQ,
         server_default=DNS_RECORD_OP_SEQ.next_value(),
         nullable=True,
+    )
+    # #2042 — the agent PROCESS the op was last shipped to: the instance id the
+    # agent sends on every config poll (``X-Spatium-Agent-Instance``). A
+    # long-poll the API still holds for an agent that has since been replaced
+    # can page an op into a connection nobody reads; the replacement's polls
+    # carry a different id, which is how the op is recognised as undelivered
+    # and returned to ``pending`` at once instead of after the 5-minute
+    # unacknowledged reset. NULL = shipped to an agent too old to say, or
+    # never shipped; NULL is never treated as "another instance".
+    dispatched_to: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # #2042 — when the long-poll that shipped the op STARTED. Ranks two polls
+    # the API holds at once for one server: only a poll that started after the
+    # one that shipped an op may take it back, so a replaced agent's leftover
+    # poll (the older one) never takes an op from its replacement's poll.
+    dispatched_poll_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 
@@ -957,6 +978,27 @@ ZONE_DEFAULT_RETRY = 600
 ZONE_DEFAULT_EXPIRE = 86400
 ZONE_DEFAULT_MINIMUM = 300
 
+# The largest TTL a zone ($TTL), a record or an SOA timer may carry: RFC 2181
+# section 8 bounds a TTL at 2^31 - 1, and it is also what the int4 columns hold.
+# A negative one is never servable: BIND refuses the whole zone file over it
+# (#2073). Every API that stores an operator's TTL bounds it 0..DNS_TTL_MAX.
+DNS_TTL_MAX = 2**31 - 1
+# A zone's default TTL ($TTL) when none is given at create.
+ZONE_DEFAULT_TTL = 3600
+
+
+def servable_ttl(ttl: int | None) -> int | None:
+    """``ttl`` when a server can serve it, else ``None``.
+
+    The API bounds every TTL it stores (#2073), but rows written before the
+    bound can hold a negative one. Shipping it makes BIND refuse the whole
+    zone file, so the senders map it to ``None``: a record then inherits the
+    zone's ``$TTL``, and a zone falls back to ``ZONE_DEFAULT_TTL``.
+    """
+    if ttl is None or ttl < 0 or ttl > DNS_TTL_MAX:
+        return None
+    return ttl
+
 
 class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """DNS zone — authoritative, secondary, stub, or forward."""
@@ -987,7 +1029,7 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     kind: Mapped[str] = mapped_column(String(10), nullable=False, default="forward")
 
     # SOA fields
-    ttl: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
+    ttl: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_TTL)
     refresh: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_REFRESH)
     retry: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_RETRY)
     expire: Mapped[int] = mapped_column(Integer, nullable=False, default=ZONE_DEFAULT_EXPIRE)
@@ -1106,6 +1148,18 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     forward_only: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
+    # A forward zone's OWN upstream transport (#2121): ``do53`` | ``tls``, plus
+    # ``https`` | ``quic`` on a Technitium group. It does NOT inherit the
+    # group's ``DNSServerOptions.forward_transport`` — that one applies to the
+    # group's resolver forwarders only. A conditional forwarder usually points
+    # at something internal that speaks plain DNS (Tailscale MagicDNS, an AD
+    # DC), and inheriting the group's DoT sent it TLS it never answers.
+    # ``forward_tls_hostname`` is the name the upstream's certificate is
+    # checked against; required for every encrypted transport.
+    forward_transport: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="do53", server_default=sa_text("'do53'")
+    )
+    forward_tls_hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Primary (master) server IPs this zone transfers FROM (issue #336).
     # Required + non-empty for ``zone_type`` in {secondary, stub}: a
@@ -1190,6 +1244,14 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     weight: Mapped[int | None] = mapped_column(Integer, nullable=True)
     port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     auto_generated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # #2084 — True for a user-added alias (CNAME or secondary A/AAAA) of an IP
+    # address, written by IPAM's alias paths; False for the address's own host
+    # record(s) (one per forward zone it publishes into) and its PTR. Stored
+    # rather than inferred from name / zone / ``IPAddress.dns_record_id``,
+    # which cannot tell the two apart once a host record sits in an extra zone.
+    ip_alias: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     # TLS certificate monitoring (#118) — per-record opt-in for cert
     # probing (the parent zone's auto_tls_probe opts in the whole zone).
     auto_tls_probe: Mapped[bool] = mapped_column(

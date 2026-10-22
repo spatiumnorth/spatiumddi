@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   settingsApi,
   authApi,
+  formatApiError,
   type OUITaskStatus,
   type PlatformSettings,
 } from "@/lib/api";
@@ -26,6 +27,7 @@ import { TldRegistrySection } from "@/components/TldRegistrySection";
 import { AgentBootstrapKeysSection } from "@/components/AgentBootstrapKeysSection";
 import { BrandLogo } from "@/components/BrandLogo";
 import { usePublicSettings } from "@/hooks/usePublicSettings";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 
 const OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv";
 
@@ -129,6 +131,8 @@ interface SectionDef {
   group: SectionGroup;
   /** Search keywords (lowercased) so the section sidebar filter can match deeper terms. */
   keywords: string[];
+  /** Feature module the section belongs to. Hidden while it is off (#2130). */
+  module?: string;
 }
 
 // Group display order. Within each group, entries render in the order
@@ -855,6 +859,7 @@ const SECTIONS: SectionDef[] = [
   },
   {
     id: "device-profiling",
+    module: "core.dhcp",
     title: "Device Profiling",
     group: "IPAM",
     description:
@@ -892,6 +897,7 @@ const SECTIONS: SectionDef[] = [
     id: "dns",
     title: "DNS Defaults",
     group: "DNS",
+    module: "core.dns",
     description: "Default values applied to new zones and server groups.",
     keywords: ["zone", "ttl", "dnssec", "recursion", "agent", "key"],
   },
@@ -899,6 +905,7 @@ const SECTIONS: SectionDef[] = [
     id: "dns-auto-sync",
     title: "IPAM → DNS Reconciliation",
     group: "DNS",
+    module: "core.dns",
     description:
       "Catches drift between IPAM's expected records (hostname + IP) and SpatiumDDI's DNS DB. Fills in missing A/AAAA/PTR when the live sync missed one — e.g. bulk imports or a previously failed push.",
     keywords: [
@@ -934,6 +941,7 @@ const SECTIONS: SectionDef[] = [
     id: "dns-pull-from-server",
     title: "Zone ↔ Server Reconciliation",
     group: "DNS",
+    module: "core.dns",
     description:
       "Catches drift between SpatiumDDI's DNS DB and the authoritative server's wire (Windows DNS today). AXFR imports out-of-band edits; any DB-only records get pushed back via RFC 2136. Additive only — never deletes.",
     keywords: [
@@ -957,6 +965,7 @@ const SECTIONS: SectionDef[] = [
     id: "dns-tld-registry",
     title: "TLD Registry",
     group: "DNS",
+    module: "core.dns",
     description:
       "IANA's root-zone list, which decides whether a zone name reads as Public, Private, Undelegated or Reverse. A copy ships with every release; refresh on demand to pick up TLDs delegated since. No scheduled fetch.",
     keywords: [
@@ -980,6 +989,7 @@ const SECTIONS: SectionDef[] = [
   // ── DHCP ─────────────────────────────────────────────────────────────
   {
     id: "dhcp",
+    module: "core.dhcp",
     title: "DHCP Defaults",
     group: "DHCP",
     description:
@@ -988,6 +998,7 @@ const SECTIONS: SectionDef[] = [
   },
   {
     id: "dhcp-lease-sync",
+    module: "core.dhcp",
     title: "DHCP Lease Sync",
     group: "DHCP",
     description:
@@ -1123,6 +1134,18 @@ export function SettingsPage() {
   const [saved, setSaved] = useState(false);
   const [activeId, setActiveId] = useState<SectionId>("branding");
   const [search, setSearch] = useState("");
+  // #2130 — sections that belong to a feature module exist only while it is
+  // on. The agent bootstrap keys deliberately do NOT carry a module: agents
+  // already deployed may still need them.
+  const { enabled: moduleEnabled, ready: modulesReady } = useFeatureModules();
+  const visibleSections = SECTIONS.filter(
+    (s) => !s.module || (modulesReady && moduleEnabled(s.module)),
+  );
+  useEffect(() => {
+    // The open section vanished (module switched off): fall back to the first.
+    if (!visibleSections.some((s) => s.id === activeId))
+      setActiveId(SECTIONS[0].id);
+  });
 
   const values: PlatformSettings = {
     ...(data ?? ({} as PlatformSettings)),
@@ -1238,15 +1261,15 @@ export function SettingsPage() {
   const dirty = Object.keys(form).length > 0;
   const q = search.trim().toLowerCase();
   const filteredSections = q
-    ? SECTIONS.filter(
+    ? visibleSections.filter(
         (s) =>
           s.title.toLowerCase().includes(q) ||
           s.description.toLowerCase().includes(q) ||
           s.keywords.some((k) => k.includes(q)),
       )
-    : SECTIONS;
+    : visibleSections;
 
-  const active = SECTIONS.find((s) => s.id === activeId)!;
+  const active = visibleSections.find((s) => s.id === activeId) ?? SECTIONS[0];
   const inputCls =
     "rounded-md border bg-background px-3 py-1.5 text-sm disabled:opacity-60";
 
@@ -1299,7 +1322,9 @@ export function SettingsPage() {
                 // Each group keeps its declared order — the grouping
                 // is intentional (e.g. IPAM Import/Export reads
                 // naturally grouped, not alphabetized).
-                const entries = SECTIONS.filter((s) => s.group === group);
+                const entries = visibleSections.filter(
+                  (s) => s.group === group,
+                );
                 if (entries.length === 0) return null;
                 return (
                   <div
@@ -1369,7 +1394,10 @@ export function SettingsPage() {
 
           {mutation.isError && (
             <div className="rounded-md border border-destructive/30 bg-destructive/10 px-4 py-2 text-sm text-destructive">
-              Failed to save settings. Please try again.
+              {formatApiError(
+                mutation.error,
+                "Failed to save settings. Please try again.",
+              )}
             </div>
           )}
 
@@ -1382,6 +1410,7 @@ export function SettingsPage() {
                 >
                   <input
                     value={values.app_title ?? ""}
+                    maxLength={255}
                     onChange={(e) => set("app_title", e.target.value)}
                     disabled={!isSuperadmin}
                     className={cn(inputCls, "w-48")}
@@ -1393,6 +1422,7 @@ export function SettingsPage() {
                 >
                   <input
                     value={values.app_base_url ?? ""}
+                    maxLength={500}
                     onChange={(e) => set("app_base_url", e.target.value)}
                     placeholder="https://ddi.example.com"
                     disabled={!isSuperadmin}

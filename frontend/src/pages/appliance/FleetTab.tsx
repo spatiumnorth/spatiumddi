@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
@@ -4824,7 +4825,7 @@ function RevealKubeconfigModal({
   );
 }
 
-function ApplianceRoleAssignmentSection({
+export function ApplianceRoleAssignmentSection({
   row,
   onSaved,
 }: {
@@ -4879,15 +4880,24 @@ function ApplianceRoleAssignmentSection({
   // create/edit (["dns-groups"] / ["dhcp-groups"]) — the old tuple keys
   // ["dns","groups"] / ["dhcp","groups"] never matched those invalidations,
   // so a freshly-created group didn't appear here until a full reload (#367).
+  // #2135 — the DNS roles and their group picker exist only while core.dns
+  // is on (the server refuses a new DNS role otherwise, and the group read
+  // 404s).
+  const dnsOn = useModuleOn("core.dns");
   const dnsGroupsQuery = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
     staleTime: 60_000,
+    enabled: dnsOn,
   });
+  // #2130 — the DHCP role and its group picker exist only while core.dhcp
+  // is on (the server refuses the role otherwise, and the group read 404s).
+  const dhcpOn = useModuleOn("core.dhcp");
   const dhcpGroupsQuery = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
     staleTime: 60_000,
+    enabled: dhcpOn,
   });
 
   const save = useMutation({
@@ -4975,7 +4985,20 @@ function ApplianceRoleAssignmentSection({
         containers.
       </p>
       <div className="mt-2 flex flex-wrap gap-2">
-        {ROLE_OPTIONS.map((opt) => {
+        {ROLE_OPTIONS.filter(
+          // A DHCP role already on the row stays visible so it can be
+          // kept or un-assigned; it is just never offered as a new choice.
+          // Keyed on the SAVED row, not the form, so unticking it by mistake
+          // does not make it vanish before Save.
+          (opt) =>
+            (opt.value !== "dhcp" ||
+              dhcpOn ||
+              (row.assigned_roles ?? []).includes("dhcp")) &&
+            // The same for the DNS engines (#2135).
+            (!DNS_ROLES.has(opt.value) ||
+              dnsOn ||
+              (row.assigned_roles ?? []).includes(opt.value)),
+        ).map((opt) => {
           const cap = opt.capKey
             ? (caps[opt.capKey as keyof SupervisorCapabilities] as
                 | boolean
@@ -5008,7 +5031,14 @@ function ApplianceRoleAssignmentSection({
         })}
       </div>
 
-      {dnsRoleActive && (
+      {dnsRoleActive && !dnsOn && (
+        <p className="mt-3 text-xs text-amber-600">
+          DNS is switched off (Features &amp; Integrations). This appliance
+          keeps the DNS role it already holds, and its DNS group can be changed
+          once DNS is back on; untick the role to remove it.
+        </p>
+      )}
+      {dnsRoleActive && dnsOn && (
         <div className="mt-3">
           <label className="text-xs text-muted-foreground">DNS group</label>
           <select
@@ -5025,7 +5055,14 @@ function ApplianceRoleAssignmentSection({
           </select>
         </div>
       )}
-      {dhcpRoleActive && (
+      {dhcpRoleActive && !dhcpOn && (
+        <p className="mt-3 text-xs text-amber-600">
+          DHCP is switched off (Features &amp; Integrations). This appliance
+          keeps the DHCP role it already holds, and its DHCP group can be
+          changed once DHCP is back on; untick the role to remove it.
+        </p>
+      )}
+      {dhcpRoleActive && dhcpOn && (
         <div className="mt-3">
           <label className="text-xs text-muted-foreground">DHCP group</label>
           <select

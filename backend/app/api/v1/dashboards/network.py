@@ -24,11 +24,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
-from app.api.deps import DB, CurrentUser  # noqa: F401 — auth via dep
+from app.api.deps import DB, CurrentUser
+from app.core.permissions import require_any_permission, user_has_permission
 from app.models.asn import ASN, ASNRpkiRoa
 from app.models.circuit import Circuit
 from app.models.network_service import NetworkService, NetworkServiceResource
@@ -135,11 +136,29 @@ async def _resolve_asn_number(db: Any, asn_id: Any) -> int | None:
 # ── Route ───────────────────────────────────────────────────────────
 
 
-@router.get("/network/summary", response_model=NetworkDashboardSummary)
-async def network_summary(
-    db: DB, current_user: CurrentUser  # noqa: ARG001 — auth via DI
-) -> NetworkDashboardSummary:
-    """Single-shot rollup for the Network dashboard tab."""
+@router.get(
+    "/network/summary",
+    response_model=NetworkDashboardSummary,
+    # The rollup draws on ASNs, circuits, services and overlays, so it needs
+    # read on at least one of the resource types those routers gate on.
+    dependencies=[
+        Depends(
+            require_any_permission(
+                ("read", "manage_asns"),
+                ("read", "circuit"),
+                ("read", "network_service"),
+                ("read", "overlay_network"),
+            )
+        )
+    ],
+)
+async def network_summary(db: DB, current_user: CurrentUser) -> NetworkDashboardSummary:
+    """Single-shot rollup for the Network dashboard tab.
+
+    Each panel is filled only for a caller who may read its resource type
+    through that resource's own router; the others come back empty, so the
+    rollup never shows more than those routes would.
+    """
     now = datetime.now(UTC)
 
     # ASN drift — count + detail.
@@ -218,7 +237,7 @@ async def network_summary(
                 select(Circuit)
                 .where(Circuit.deleted_at.is_(None))
                 .where(Circuit.term_end_date.is_not(None))
-                .where(Circuit.term_end_date <= today)
+                .where(Circuit.term_end_date < today)  # end date is inclusive
                 .where(Circuit.status != "decom")
             )
         )
@@ -352,7 +371,7 @@ async def network_summary(
     overlay_impact = overlay_impact[:_DETAIL_LIMIT]
     overlay_impacted_count = sum(1 for _ in overlay_impact)
 
-    return NetworkDashboardSummary(
+    summary = NetworkDashboardSummary(
         generated_at=now,
         asn_drift_count=asn_drift_count,
         rpki_expiring_count=len(expiring_rows),
@@ -369,3 +388,27 @@ async def network_summary(
         orphan_services=orphan_services,
         overlay_impact=overlay_impact,
     )
+    return _mask_unreadable_panels(summary, current_user)
+
+
+def _mask_unreadable_panels(summary: NetworkDashboardSummary, user: Any) -> NetworkDashboardSummary:
+    """Empty every panel ``user`` may not read (ASN + RPKI share ``manage_asns``)."""
+    if not user_has_permission(user, "read", "manage_asns"):
+        summary.asn_drift_count = 0
+        summary.asn_drift = []
+        summary.rpki_expiring_count = 0
+        summary.rpki_expired_count = 0
+        summary.rpki_total_count = 0
+        summary.rpki_last_checked_at = None
+        summary.rpki_expiring = []
+    if not user_has_permission(user, "read", "circuit"):
+        summary.circuit_term_expiring_count = 0
+        summary.circuit_status_changed_count = 0
+        summary.circuit_alerts = []
+    if not user_has_permission(user, "read", "network_service"):
+        summary.service_orphan_count = 0
+        summary.orphan_services = []
+    if not user_has_permission(user, "read", "overlay_network"):
+        summary.overlay_impacted_count = 0
+        summary.overlay_impact = []
+    return summary

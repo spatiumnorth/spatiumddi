@@ -483,6 +483,8 @@ export interface DnsSyncStale {
   name: string;
   value: string;
   reason: string;
+  /** Live IPAM row the record hangs off; null when the address is gone. */
+  ip_id?: string | null;
 }
 
 export interface DnsSyncPreview {
@@ -632,6 +634,12 @@ export interface Subnet {
   // ``ipamApi.probePolicy(subnetId)``.
   do_not_probe?: boolean;
   do_not_probe_reason?: string;
+  // #2137 — show the "N free · click to allocate" gap rows. null / absent
+  // = the default rule (off for integration-owned or larger-than-/16).
+  show_free_ranges?: boolean | null;
+  // Name of the integration mirroring this subnet (kubernetes, tailscale…),
+  // null when operator-owned. Read-only.
+  integration_owner?: string | null;
   // Compliance / classification flags. First-class booleans (rather
   // than freeform tags) so auditor queries — "show me every PCI
   // subnet" — are clean indexed predicates. Default false on every
@@ -2638,6 +2646,9 @@ export interface AuditIntegrity {
   ok: boolean;
   rows_checked: number;
   breaks: AuditChainBreak[];
+  first_seq?: number | null;
+  last_seq?: number | null;
+  partial?: boolean;
 }
 
 // ── AI tool catalog (issue #101 follow-up) ──────────────────────────
@@ -2809,10 +2820,12 @@ export const auditApi = {
   /** Walk the chain and report any tampering (issue #73). The
    *  ``max_rows`` cap is for huge tables — leave unset for a full
    *  sweep. */
-  integrity: (maxRows?: number) =>
+  integrity: (maxRows?: number, newest?: boolean) =>
     api
       .get<AuditIntegrity>("/audit/integrity", {
-        params: maxRows ? { max_rows: maxRows } : undefined,
+        params: maxRows
+          ? { max_rows: maxRows, ...(newest ? { newest: true } : {}) }
+          : undefined,
       })
       .then((r) => r.data),
   /** Compliance / change report PDF (#48) — auditor-facing rollup of every
@@ -5039,6 +5052,10 @@ export interface ZoneMovePreview {
    *  algorithm a target driver cannot use (Technitium has no hmac-sha224).
    *  Non-null means the commit refuses — not waivable by acknowledgement. */
   tsig_algorithm_refusal?: string | null;
+  /** #2121 — the forward zone's own upstream transport is one the target
+   *  group cannot serve (DoH / DoQ on BIND9, TLS on Windows DNS). Non-null
+   *  means the commit refuses — not waivable by acknowledgement. */
+  forward_transport_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -5156,6 +5173,9 @@ export interface DNSPerServerZoneStateEntry {
   current_serial: number | null;
   reported_at: string | null;
   in_sync: boolean;
+  // #2042 — ops for this zone the server has not acknowledged; non-zero
+  // means not in sync whatever the serial says.
+  pending_ops: number;
 }
 
 export interface DNSPerServerZoneStateResponse {
@@ -5448,6 +5468,8 @@ export interface DNSServer {
    *  to identify which host an agent is on (the operator-set ``host``
    *  is just a label; doesn't reflect NAT / distributed deployments). */
   last_seen_ip: string | null;
+  /** #2078 — the agent's own version; `null` = never reported (unknown). */
+  agent_version: string | null;
   config_apply_status: ConfigApplyStatus | null;
   config_apply_error: string | null;
   config_failed_etag: string | null;
@@ -5542,6 +5564,8 @@ export interface DNSServerOptions {
   modified_at: string;
   // Stored values a Technitium server in this group will not apply (#1763).
   technitium_warnings?: string[];
+  // #2128: stored forwarders pinned to port 53 in an encrypted group.
+  forwarder_warnings?: string[];
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the
@@ -5690,6 +5714,11 @@ export interface DNSZone {
   // Conditional-forwarder config. Meaningful only when zone_type==="forward".
   forwarders: string[];
   forward_only: boolean;
+  // #2121 — the forward zone's OWN upstream transport (do53 | tls | https |
+  // quic). It does not inherit the group's forward_transport. Optional so a
+  // response from an older control plane still type-checks; absent = do53.
+  forward_transport?: "do53" | "tls" | "https" | "quic";
+  forward_tls_hostname?: string | null;
   // Secondary / stub primaries (issue #336). The master server IPs this
   // zone transfers FROM (ip or ip@port). Required when
   // zone_type==="secondary" | "stub"; empty otherwise.
@@ -5719,6 +5748,8 @@ export interface ZoneServerStateEntry {
   // server, or the zone was only just created).
   current_serial: number | null;
   reported_at: string | null;
+  // #2042 — ops for this zone the server has not acknowledged yet.
+  pending_ops: number;
 }
 
 export interface ZoneServerState {
@@ -5726,7 +5757,8 @@ export interface ZoneServerState {
   zone_name: string;
   target_serial: number;
   servers: ZoneServerStateEntry[];
-  // `false` while any server hasn't reported or is on a different serial.
+  // `false` while any server hasn't reported, is on a different serial, or
+  // still has an unacknowledged op for the zone (#2042).
   in_sync: boolean;
 }
 
@@ -6554,7 +6586,12 @@ export const dnsApi = {
   importZonePreview: (
     groupId: string,
     zoneId: string,
-    data: { zone_file: string; zone_name?: string; view_id?: string | null },
+    data: {
+      zone_file: string;
+      zone_name?: string;
+      view_id?: string | null;
+      conflict_strategy?: "merge" | "replace" | "append";
+    },
   ) =>
     api
       .post<DNSImportPreview>(
@@ -6592,6 +6629,76 @@ export const dnsApi = {
           r.headers["content-disposition"],
         ),
       })),
+  // #2139 — the zone's records as a CSV / XLSX sheet, a blank template, and
+  // the spreadsheet import (preview → commit).
+  exportZoneRecords: (
+    groupId: string,
+    zoneId: string,
+    format: "csv" | "xlsx",
+  ) =>
+    api
+      .get<Blob>(`/dns/groups/${groupId}/zones/${zoneId}/export`, {
+        params: { format },
+        responseType: "blob",
+      })
+      .then((r) => ({
+        data: r.data,
+        filename: _parseContentDispositionFilename(
+          r.headers["content-disposition"],
+        ),
+      })),
+  zoneImportTemplate: (
+    groupId: string,
+    zoneId: string,
+    format: "csv" | "xlsx" = "csv",
+  ) =>
+    api
+      .get<Blob>(`/dns/groups/${groupId}/zones/${zoneId}/import/template`, {
+        params: { format },
+        responseType: "blob",
+      })
+      .then((r) => ({
+        data: r.data,
+        filename: _parseContentDispositionFilename(
+          r.headers["content-disposition"],
+        ),
+      })),
+  importZoneSheetPreview: (
+    groupId: string,
+    zoneId: string,
+    file: File,
+    mode: DNSSheetImportMode,
+  ) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("mode", mode);
+    return api
+      .post<DNSSheetImportPreview>(
+        `/dns/groups/${groupId}/zones/${zoneId}/import/spreadsheet/preview`,
+        form,
+        { headers: { "Content-Type": "multipart/form-data" } },
+      )
+      .then((r) => r.data);
+  },
+  importZoneSheetCommit: (
+    groupId: string,
+    zoneId: string,
+    file: File,
+    mode: DNSSheetImportMode,
+    confirmZone?: string,
+  ) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("mode", mode);
+    if (confirmZone) form.append("confirm_zone", confirmZone);
+    return api
+      .post<DNSSheetImportCommit>(
+        `/dns/groups/${groupId}/zones/${zoneId}/import/spreadsheet/commit`,
+        form,
+        { headers: { "Content-Type": "multipart/form-data" } },
+      )
+      .then((r) => r.data);
+  },
   syncZoneWithServer: (groupId: string, zoneId: string, apply = true) =>
     api
       .post<{
@@ -6661,6 +6768,63 @@ export interface DNSImportPreview {
   unchanged: DNSRecordChange[];
   soa_detected: boolean;
   record_count: number;
+  skipped: string[];
+}
+
+export type DNSSheetImportMode = "merge" | "replace";
+
+export interface DNSSheetRecordChange {
+  row: number | null;
+  op: "create" | "update" | "delete" | "unchanged";
+  name: string;
+  record_type: string;
+  value: string;
+  ttl: number | null;
+  priority: number | null;
+  weight: number | null;
+  port: number | null;
+  view: string | null;
+  comment: string | null;
+  existing_id: string | null;
+  changed_fields: string[];
+  read_only: boolean;
+}
+
+export interface DNSSheetRowIssue {
+  row: number | null;
+  reason: string;
+  name: string | null;
+  record_type: string | null;
+  value: string | null;
+}
+
+export interface DNSSheetImportPreview {
+  zone_id: string;
+  zone_name: string;
+  format: "csv" | "xlsx";
+  mode: DNSSheetImportMode;
+  row_count: number;
+  examples_ignored: number;
+  to_create: DNSSheetRecordChange[];
+  to_update: DNSSheetRecordChange[];
+  to_delete: DNSSheetRecordChange[];
+  unchanged: DNSSheetRecordChange[];
+  errors: DNSSheetRowIssue[];
+  skipped: DNSSheetRowIssue[];
+}
+
+export interface DNSSheetImportCommit {
+  zone_id: string;
+  batch_id: string;
+  format: string;
+  mode: DNSSheetImportMode;
+  created: number;
+  updated: number;
+  deleted: number;
+  unchanged: number;
+  skipped: DNSSheetRowIssue[];
+  target_serial: number | null;
+  provider_warning: string | null;
 }
 
 export interface DNSImportCommit {
@@ -6671,6 +6835,8 @@ export interface DNSImportCommit {
   deleted: number;
   unchanged: number;
   conflict_strategy: string;
+  provider_warning: string | null;
+  skipped: string[];
 }
 
 // ── DNS Blocking Lists ─────────────────────────────────────────────────────
@@ -10822,6 +10988,10 @@ export interface IntegrationsDashboardTargetRow {
   // #797 — non-fatal findings; null for integrations that don't compute them.
   last_sync_warning: string | null;
   is_stale: boolean;
+  // #2138 — credential health; null for integrations that record no expiry.
+  credential_state: CredentialState | null;
+  credential_expires_at: string | null;
+  credential_days_left: number | null;
 }
 export interface IntegrationsDashboardPanel {
   kind: IntegrationDashboardKind;
@@ -15190,6 +15360,14 @@ export const unifiApi = {
 
 // ── Tailscale integration ──────────────────────────────────────────
 
+// #2138 — see backend app/services/integration_credentials.py.
+export type CredentialState =
+  | "ok"
+  | "expiring"
+  | "expired"
+  | "rejected"
+  | "unknown";
+
 export interface TailscaleTenant {
   id: string;
   name: string;
@@ -15197,6 +15375,11 @@ export interface TailscaleTenant {
   enabled: boolean;
   tailnet: string;
   api_key_present: boolean;
+  // #2138 — null = unknown.
+  api_key_expires_at: string | null;
+  api_key_expiry_source: "api" | "operator" | null;
+  credential_state: CredentialState;
+  credential_days_left: number | null;
   ipam_space_id: string;
   dns_group_id: string | null;
   cgnat_cidr: string;
@@ -15217,6 +15400,7 @@ export interface TailscaleTenantCreate {
   enabled?: boolean;
   tailnet?: string;
   api_key: string;
+  api_key_expires_at?: string | null;
   ipam_space_id: string;
   dns_group_id?: string | null;
   cgnat_cidr?: string;
@@ -15231,6 +15415,7 @@ export interface TailscaleTenantUpdate {
   enabled?: boolean;
   tailnet?: string;
   api_key?: string;
+  api_key_expires_at?: string | null;
   ipam_space_id?: string;
   dns_group_id?: string | null;
   cgnat_cidr?: string;
@@ -15244,6 +15429,9 @@ export interface TailscaleTestResult {
   message: string;
   tailnet_domain: string | null;
   device_count: number | null;
+  // #2138 — the tested token's expiry as Tailscale reports it.
+  api_key_expires_at?: string | null;
+  api_key_expiry_note?: string | null;
 }
 
 export const tailscaleApi = {
