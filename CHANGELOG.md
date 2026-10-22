@@ -128,6 +128,26 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Upgrade images is one table, with bulk management and an in-use
+  refusal on delete (#2410).** The release `<select>` and the staged
+  list are replaced by a single table, one row per version and
+  architecture: channel, release date, size, staged, the fleet verdict
+  and an "installed on / scheduled for / rolling run" column, grouped by
+  release and sortable, with filters (fleet architecture, nightlies
+  hidden with a count, staged, text) and a checkbox bulk toolbar for
+  Delete and Import. The air-gap upload moved behind an "Upload
+  image..." button in the shared modal. Server side, `GET
+  /upgrade-images` gains `release`, `channel`, `fleet_architecture`,
+  `installed_on`, `scheduled_for` and `rolling_run_id`; `GET
+  /upgrade-images/available` gains `staged_image_id` and `channel`, an
+  `all_architectures` flag, and a window that keeps looking until it has
+  25 non-nightly releases (it used to be the newest 25, which a few
+  weeks of nightlies could fill with no stable release at all). `DELETE`
+  now answers 409 for an image an appliance is scheduled to fetch or an
+  active run names, instead of leaving the node to 404 on its next
+  fetch; `?force=true` overrides and is audited. Both MCP tools carry the
+  new fields. No migration.
+
 - **Upgrade images: only the fleet's architecture is offered, and a
   mismatched import or upload is refused (#2399).** The release picker
   listed every architecture and the import downloaded whichever row

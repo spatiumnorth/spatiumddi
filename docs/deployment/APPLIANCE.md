@@ -3110,6 +3110,40 @@ whereas pointing the bootloader at it cannot be undone remotely.
    host runner pulls bytes back through the control plane. No node ever
    talks to github.com.
 
+   **The Upgrade images page is one table** (#2410), one row per
+   version + architecture, built from the GitHub releases and the staged
+   images together (an air-gap upload with no matching release is a row
+   too, and a staged release is one row, not two). Columns: version
+   (linked to the release), architecture (`unknown` is shown as such),
+   channel (nightly / pre-release / stable, derived from the tag), release
+   date, size, staged, the fleet-architecture verdict (how many nodes run
+   that architecture, or "no node runs this"), and an **In use** column.
+   Rows are grouped by release, newest first, and sort by any column
+   header. Filters (kept for the browser session): this fleet's
+   architecture vs all, nightlies (hidden by default, with a count of how
+   many are hidden), staged / not staged, and version text. The GitHub
+   listing walks past nightlies until it has 25 stable and pre-release
+   releases, so a month of nightlies cannot push the last stable release
+   out of the table.
+
+   A checkbox column and a bulk toolbar act on the selection: **Delete N**
+   (staged rows, through a confirmation that lists the versions, their
+   total size and any in-use image) and **Import N** (un-staged rows,
+   downloaded one at a time). Each delete is its own request and its own
+   audit row; refused and failed rows stay selected with the reason. The
+   air-gap upload is behind the **Upload image…** button.
+
+   **A delete is refused (409) while an image is in use**: an appliance's
+   `desired_slot_image_url` points at it (an upgrade is scheduled and the
+   node has not fetched it yet) or an active (planned / running / halted)
+   rolling run names it. The answer names the appliance or run. An image
+   that is merely *installed* on a slot is not in use (the bytes are
+   already written) and deletes normally; the row says "installed on" so
+   you know re-staging means another download. For a stale schedule you
+   have already cancelled on the host, `DELETE …/upgrade-images/{id}?force=true`
+   (the single-image dialog offers it as a checkbox) overrides the refusal;
+   the audit row records `force` and what it overrode.
+
    > **Multi-node uses the mirror, and turns it on for you.** Where those
    > bytes live depends on `slotImageMirror.enabled` (`slot-image-mirror`
    > Deployment + PVC — the mirror infra keeps the historical name). With

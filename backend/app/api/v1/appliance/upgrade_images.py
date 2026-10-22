@@ -54,6 +54,7 @@ import hashlib
 import hmac
 import os
 import platform
+import re
 import shutil
 import uuid
 from collections.abc import AsyncIterator
@@ -69,6 +70,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     UploadFile,
     status,
@@ -86,6 +88,7 @@ from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import OctetStreamResponse
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance, ApplianceUpgradeImage
 from app.models.audit import AuditLog
+from app.models.system_upgrade import SystemUpgradeRun
 from app.services.appliance import releases as releases_service
 from app.services.appliance.architecture import ApplianceArchitecture, normalize
 
@@ -524,27 +527,6 @@ class UpgradeImageRow(BaseModel):
     notes: str | None
 
 
-class UpgradeImageList(BaseModel):
-    images: list[UpgradeImageRow]
-
-
-class AvailableUpgradeImageRow(BaseModel):
-    tag: str
-    name: str
-    published_at: datetime
-    body: str
-    html_url: str
-    is_prerelease: bool
-    is_installed: bool
-    image_asset_url: str
-    checksum_asset_url: str
-    size_bytes: int | None
-    # #1026 — a release publishing both architectures appears as two
-    # rows, so the picker shows which is which instead of silently
-    # offering one of them.
-    architecture: str
-
-
 class FleetArchitectures(BaseModel):
     """What the fleet runs, as far as it has told us (#2399)."""
 
@@ -558,6 +540,69 @@ class FleetArchitectures(BaseModel):
     counts: dict[str, int]
     # True when images for other architectures are hidden / refused.
     restricted: bool
+
+
+class UpgradeImageReleaseInfo(BaseModel):
+    """The GitHub release a staged image came from (#2410)."""
+
+    published_at: datetime
+    is_prerelease: bool
+    html_url: str
+
+
+class UpgradeImageListRow(UpgradeImageRow):
+    # #2410 — null when GitHub has not been reached recently (air-gap) or
+    # no release matches this tag + architecture. Read from the release
+    # cache only: listing must not make an outbound call.
+    release: UpgradeImageReleaseInfo | None = None
+    # ``nightly`` / ``prerelease`` / ``stable``, derived from the tag.
+    channel: str
+    # #2399's verdict, per image: ``matches`` (some approved appliance runs
+    # this architecture), ``no_node`` (the whole fleet has reported and
+    # none does) or ``unknown`` (image unlabelled, or a node has not
+    # reported, or no nodes yet).
+    fleet_architecture: str
+    # Approved appliances running this architecture; null when unknown.
+    fleet_nodes: int | None = None
+    # Hostnames whose installed / slot version equals this image's. Not
+    # "in use": the bytes are already written, so a delete is allowed.
+    installed_on: list[str] = Field(default_factory=list)
+    # Hostnames whose ``desired_slot_image_url`` points at this image —
+    # one is about to fetch it, and a delete is refused.
+    scheduled_for: list[str] = Field(default_factory=list)
+    # An active (planned / running / halted) rolling run naming the image.
+    rolling_run_id: uuid.UUID | None = None
+
+
+class UpgradeImageList(BaseModel):
+    images: list[UpgradeImageListRow]
+    fleet: FleetArchitectures
+
+
+class AvailableUpgradeImageRow(BaseModel):
+    tag: str
+    name: str
+    published_at: datetime
+    body: str
+    html_url: str
+    is_prerelease: bool
+    # The CONTROL PLANE's own version equals this tag; says nothing about
+    # the fleet (see ``installed_on`` on the staged rows). Kept for
+    # compatibility.
+    is_installed: bool
+    image_asset_url: str
+    checksum_asset_url: str
+    size_bytes: int | None
+    # #1026 — a release publishing both architectures appears as two
+    # rows, so the picker shows which is which instead of silently
+    # offering one of them.
+    architecture: str
+    # #2410 — the staged row for this tag + architecture, if any.
+    staged_image_id: uuid.UUID | None = None
+    channel: str = "stable"
+    # #2399's verdict, as on the staged rows.
+    fleet_architecture: str = "unknown"
+    fleet_nodes: int | None = None
 
 
 class AvailableUpgradeImagesResponse(BaseModel):
@@ -656,6 +701,83 @@ def _refuse_unused_architecture(fleet: FleetArchitectures, architecture: str | N
             "no node could boot."
         ),
     )
+
+
+def _fleet_verdict(fleet: FleetArchitectures, architecture: str | None) -> tuple[str, int | None]:
+    """#2399's answer for one image: ``(verdict, matching node count)``."""
+    arch = normalize(architecture)
+    if arch is None or not fleet.restricted:
+        return "unknown", None
+    if arch in fleet.architectures:
+        return "matches", fleet.counts.get(arch, 0)
+    return "no_node", 0
+
+
+_ACTIVE_RUN_STATES = ("planned", "running", "halted")
+_IMAGE_URL_RE = re.compile(r"/upgrade-images/([0-9a-fA-F-]{36})/raw\.xz")
+
+
+class _ImageUsage:
+    """Who installed / is scheduled for / has a run naming one image."""
+
+    __slots__ = ("installed_on", "scheduled_for", "run_id")
+
+    def __init__(self) -> None:
+        self.installed_on: list[str] = []
+        self.scheduled_for: list[str] = []
+        self.run_id: uuid.UUID | None = None
+
+
+async def _image_usage(
+    db: AsyncSession, images: list[ApplianceUpgradeImage]
+) -> dict[uuid.UUID, _ImageUsage]:
+    """Derive usage for ``images`` from columns that already exist (#2410)."""
+    usage = {i.id: _ImageUsage() for i in images}
+    appliances = (await db.execute(select(Appliance))).scalars().all()
+    by_version: dict[str, list[ApplianceUpgradeImage]] = {}
+    for img in images:
+        by_version.setdefault(img.appliance_version, []).append(img)
+    for a in sorted(appliances, key=lambda x: x.hostname):
+        if a.desired_slot_image_url:
+            m = _IMAGE_URL_RE.search(a.desired_slot_image_url)
+            if m:
+                try:
+                    target = uuid.UUID(m.group(1))
+                except ValueError:
+                    target = None
+                if target in usage:
+                    usage[target].scheduled_for.append(a.hostname)
+        if a.state != APPLIANCE_STATE_APPROVED:
+            continue
+        versions = {a.installed_appliance_version, a.slot_a_version, a.slot_b_version}
+        for v in versions:
+            for img in by_version.get(v or "", []):
+                # An image labelled for another architecture is not what
+                # this node runs, even if the version string matches.
+                if img.architecture and a.architecture and img.architecture != a.architecture:
+                    continue
+                if a.hostname not in usage[img.id].installed_on:
+                    usage[img.id].installed_on.append(a.hostname)
+    runs = (
+        (
+            await db.execute(
+                select(SystemUpgradeRun)
+                .where(SystemUpgradeRun.state.in_(_ACTIVE_RUN_STATES))
+                .order_by(SystemUpgradeRun.started_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for run in runs:
+        raw = (run.plan or {}).get("slot_image_id")
+        try:
+            rid = uuid.UUID(str(raw)) if raw else None
+        except ValueError:
+            rid = None
+        if rid in usage and usage[rid].run_id is None:
+            usage[rid].run_id = run.id
+    return usage
 
 
 @router.post(
@@ -845,7 +967,46 @@ async def list_upgrade_images(current_user: CurrentUser, db: DB) -> UpgradeImage
         .scalars()
         .all()
     )
-    return UpgradeImageList(images=[_row_to_schema(r) for r in rows])
+    fleet = await _fleet_architectures(db)
+    usage = await _image_usage(db, list(rows))
+    # Cache-only: the staged list must render on an air-gapped control
+    # plane without waiting out a GitHub timeout.
+    cached = releases_service.peek_upgrade_image_releases()
+    out: list[UpgradeImageListRow] = []
+    for r in rows:
+        rel = next(
+            (
+                c
+                for c in cached
+                if c.tag == r.appliance_version and (r.architecture in (None, c.architecture))
+            ),
+            None,
+        )
+        verdict, nodes = _fleet_verdict(fleet, r.architecture)
+        u = usage[r.id]
+        out.append(
+            UpgradeImageListRow(
+                **_row_to_schema(r).model_dump(),
+                release=(
+                    UpgradeImageReleaseInfo(
+                        published_at=rel.published_at,
+                        is_prerelease=rel.is_prerelease,
+                        html_url=rel.html_url,
+                    )
+                    if rel
+                    else None
+                ),
+                channel=releases_service.release_channel(
+                    r.appliance_version, bool(rel and rel.is_prerelease)
+                ),
+                fleet_architecture=verdict,
+                fleet_nodes=nodes,
+                installed_on=u.installed_on,
+                scheduled_for=u.scheduled_for,
+                rolling_run_id=u.run_id,
+            )
+        )
+    return UpgradeImageList(images=out, fleet=fleet)
 
 
 @router.get(
@@ -857,6 +1018,13 @@ async def list_upgrade_images(current_user: CurrentUser, db: DB) -> UpgradeImage
 async def list_available_upgrade_images(
     current_user: CurrentUser,
     db: DB,
+    all_architectures: bool = Query(
+        False,
+        description=(
+            "Return every architecture instead of only the fleet's (#2410). "
+            "Importing an architecture no node runs is still refused."
+        ),
+    ),
 ) -> AvailableUpgradeImagesResponse:
     """Connected-install picker source.
 
@@ -869,9 +1037,23 @@ async def list_available_upgrade_images(
     _require_superadmin(current_user)
     reachable, releases = await releases_service.list_available_upgrade_images()
     fleet = await _fleet_architectures(db)
-    if fleet.restricted:
+    if fleet.restricted and not all_architectures:
         # #2399 — only offer images some node can boot.
         releases = [r for r in releases if r.architecture in fleet.architectures]
+    staged = (await db.execute(select(ApplianceUpgradeImage))).scalars().all()
+
+    def _staged_id(tag: str, arch: str) -> uuid.UUID | None:
+        # An unlabelled staged row (architecture NULL) counts as this
+        # release's image: re-importing it would only dedupe by sha anyway.
+        hit = next(
+            (s_ for s_ in staged if s_.appliance_version == tag and s_.architecture == arch),
+            None,
+        ) or next(
+            (s_ for s_ in staged if s_.appliance_version == tag and s_.architecture is None),
+            None,
+        )
+        return hit.id if hit else None
+
     return AvailableUpgradeImagesResponse(
         github_reachable=reachable,
         fleet=fleet,
@@ -889,6 +1071,10 @@ async def list_available_upgrade_images(
                 checksum_asset_url=r.checksum_asset_url,
                 size_bytes=r.size_bytes,
                 architecture=r.architecture,
+                staged_image_id=_staged_id(r.tag, r.architecture),
+                channel=releases_service.release_channel(r.tag, r.is_prerelease),
+                fleet_architecture=_fleet_verdict(fleet, r.architecture)[0],
+                fleet_nodes=_fleet_verdict(fleet, r.architecture)[1],
             )
             for r in releases
         ],
@@ -1250,11 +1436,39 @@ async def download_upgrade_image(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Delete an uploaded / imported upgrade image",
 )
-async def delete_upgrade_image(image_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def delete_upgrade_image(
+    image_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    force: bool = Query(
+        False,
+        description=(
+            "Delete even though an appliance is scheduled to fetch the image or an "
+            "active rolling run names it. For a stale schedule the operator has "
+            "already cancelled on the host. Audited."
+        ),
+    ),
+) -> None:
     _require_superadmin(current_user)
     row = await db.get(ApplianceUpgradeImage, image_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Upgrade image not found.")
+    # #2410 — an image an appliance is scheduled to fetch, or an active run
+    # names, would 404 on the node's next fetch. Merely *installed* is not
+    # in use: the bytes are already on the slot.
+    in_use = (await _image_usage(db, [row]))[row.id]
+    forced_over: list[str] = []
+    if in_use.scheduled_for:
+        forced_over.append("scheduled for " + ", ".join(in_use.scheduled_for))
+    if in_use.run_id is not None:
+        forced_over.append(f"named by active upgrade run {in_use.run_id}")
+    if forced_over and not force:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Upgrade image {row.appliance_version} is in use: "
+            + "; ".join(forced_over)
+            + ". Cancel the upgrade first, or retry with force=true.",
+        )
     if settings.slot_image_mirror_url:
         # #296 Phase B — delete from the mirror Deployment. Best-effort:
         # the DB row delete below is the authoritative signal; stale
@@ -1293,6 +1507,7 @@ async def delete_upgrade_image(image_id: uuid.UUID, current_user: CurrentUser, d
             resource_type="appliance_upgrade_image",
             resource_id=str(image_id),
             resource_display=f"{filename} ({version})",
+            new_value=({"force": True, "overrode": forced_over} if force else None),
             result="success",
         )
     )
