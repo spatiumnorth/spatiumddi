@@ -43,6 +43,7 @@ import time
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -80,19 +81,40 @@ def _load(monkeypatch):
 
 
 class FakeK3s:
+    """k3s's watcher and containerd, on a fake clock.
+
+    The watcher queues a tarball whose mtime moved and imports the queue one
+    file at a time. An import takes ``slow[name]`` seconds of the fake clock
+    (0: done within the tick), and for that long the tarball is open: a
+    ``<proc>/<pid>/fd/<n>`` symlink names it, which is what k3s's open file
+    looks like in /proc (#2109). The cache entry records the file as it was
+    when its import began, so a tarball touched mid-import is imported again
+    once this import ends, as k3s does."""
+
+    PID = "4242"
+
     def __init__(self, mod, root: Path) -> None:
         self.mod = mod
         self.images_dir = root / "images"
         self.content = root / "content"
+        self.proc = root / "proc"
         self.images_dir.mkdir()
         (self.content / "ingest").mkdir(parents=True)
         (self.content / "blobs" / "sha256").mkdir(parents=True)
         (self.content / "blobs" / "sha256" / ("ab" * 32)).write_bytes(b"a committed blob")
+        (self.proc / self.PID / "fd").mkdir(parents=True)
+        (self.proc / "self").mkdir()  # not a pid: skipped
         self.store: set[str] = set()
         self.down = False
         self.broken: set[str] = set()
         self.attempts: list[str] = []
         self.cache: dict[str, dict] = {}
+        self.slow: dict[str, float] = {}
+        self.clock = 0.0
+        self.kubelet_at: float | None = 0.0  # when the kubelet answers; None: never
+        self.queue: list[str] = []
+        self.current: list | None = None  # [name, seconds left, mtime it started on]
+        self.done_at: dict[str, float] = {}
         self._seen: dict[str, float] = {}
         for name, (_, index) in TARBALLS.items():
             p = self.images_dir / name
@@ -108,13 +130,22 @@ class FakeK3s:
             if name in failed:
                 self.cache.pop(str(p), None)
             else:
-                self._record(p)
+                self._record(p, p.stat().st_mtime)
         self.write_cache()
 
-    def _record(self, p: Path) -> None:
+    # the start-up import, still running when the check begins: the slot
+    # upgrade copied every tarball across, so k3s has all of them queued
+    def booting(self, **seconds: float) -> None:
+        for name in TARBALLS:
+            p = self.images_dir / name
+            os.utime(p, (OLD + 100, OLD + 100))
+            self.slow[name] = seconds.get(name.split(".")[0].replace("-", "_"), 0)
+        self.kubelet_at = None
+        self.tick(0)
+
+    def _record(self, p: Path, mtime: float) -> None:
         imgs = TARBALLS[p.name][0]
-        st = p.stat()
-        self.cache[str(p)] = {"size": st.st_size, "modTime": _rfc3339(st.st_mtime), "images": imgs}
+        self.cache[str(p)] = {"size": p.stat().st_size, "modTime": _rfc3339(mtime), "images": imgs}
         self.store.update(imgs)
 
     def write_cache(self) -> None:
@@ -141,19 +172,48 @@ class FakeK3s:
                 return True
         return False
 
-    # the watcher: one pass over the files whose mtime moved since its last look
-    def tick(self, _seconds: float = 0) -> None:
+    def _fd(self) -> Path:
+        return self.proc / self.PID / "fd" / "171"
+
+    # the watcher, over ``seconds`` of the fake clock
+    def tick(self, seconds: float = 0) -> None:
         for name in TARBALLS:
-            p = self.images_dir / name
-            mtime = p.stat().st_mtime
-            if self._seen.get(name) == mtime:
-                continue
-            self._seen[name] = mtime
-            self.attempts.append(name)
-            if name in self.broken or self._poisoned(TARBALLS[name][1]):
-                continue
-            self._record(p)
+            mtime = (self.images_dir / name).stat().st_mtime
+            if self._seen.get(name) != mtime:
+                self._seen[name] = mtime
+                if name not in self.queue:
+                    self.queue.append(name)
+        budget = seconds
+        while True:
+            if self.current is None:
+                if not self.queue:
+                    break
+                name = self.queue.pop(0)
+                p = self.images_dir / name
+                self.attempts.append(name)
+                self.current = [name, self.slow.get(name, 0), p.stat().st_mtime]
+                self._fd().symlink_to(os.path.realpath(p))
+                if not self.queue and self.kubelet_at is None:
+                    # k3s starts the kubelet once its queue is EMPTY, which is
+                    # when the last tarball is taken off it, not imported
+                    self.kubelet_at = self.clock
+            name, left, mtime = self.current
+            step = min(left, budget)
+            self.clock += step
+            budget -= step
+            if left > step:
+                self.current[1] = left - step
+                break
+            self._fd().unlink()
+            self.current = None
+            self.done_at[name] = self.clock
+            if not (name in self.broken or self._poisoned(TARBALLS[name][1])):
+                self._record(self.images_dir / name, mtime)
+        self.clock += budget
         self.write_cache()
+
+    def kubelet(self) -> bool:
+        return self.kubelet_at is not None and self.clock >= self.kubelet_at
 
     def present(self):
         return None if self.down else set(self.store)
@@ -165,10 +225,11 @@ def k3s(tmp_path, monkeypatch) -> FakeK3s:
     fake = FakeK3s(mod, tmp_path)
     monkeypatch.setattr(mod, "IMAGES_DIR", fake.images_dir)
     monkeypatch.setattr(mod, "CONTENT_DIR", fake.content)
+    monkeypatch.setattr(mod, "PROC_DIR", fake.proc, raising=False)
     monkeypatch.setattr(mod, "present_images", fake.present)
-    monkeypatch.setattr(mod, "kubelet_up", lambda: True)
+    monkeypatch.setattr(mod, "kubelet_up", fake.kubelet)
     monkeypatch.setattr(mod, "_sleep", fake.tick)
-    monkeypatch.setattr(mod, "POLL_S", 0)
+    monkeypatch.setattr(mod, "time", SimpleNamespace(monotonic=lambda: fake.clock, time=time.time))
     return fake
 
 
@@ -341,6 +402,157 @@ def test_verify_reads_k3s_cache_format(k3s: FakeK3s) -> None:
     assert not k3s.mod.imported(k3s.images_dir / "dhcp-kea.tar.zst", raw[key])
 
 
+# ── #2109: k3s still importing when the check begins ─────────────────────────
+
+AIRGAP = "k3s-airgap-images-amd64.tar.zst"
+
+
+def test_a_slow_start_up_import_is_waited_for_and_nothing_is_touched(k3s: FakeK3s, capsys) -> None:
+    """The #2109 seed: the kubelet did not answer for minutes because k3s
+    was still working through the upgraded slot's tarballs. The check judged
+    at 120 s, touched the one being imported (restarting it) and the ones not
+    reached yet, and gave up before the second import ended."""
+    k3s.booting(dhcp_kea=90, dns_bind9=80, k3s_airgap_images_amd64=150)
+
+    assert _verify(k3s, "--repair") == 0
+
+    captured = capsys.readouterr()
+    assert sorted(k3s.attempts) == sorted(TARBALLS), (
+        "a tarball was imported twice: the check touched one k3s was importing (#2109)"
+    )
+    assert "re-importing" not in captured.out, "nothing was missing; nothing may be touched"
+    assert "k3s is importing" in captured.out
+    assert "all 3 baked tarballs imported, 4 images present" in captured.out
+    for name in TARBALLS:
+        assert (k3s.images_dir / name).stat().st_mtime == OLD + 100, f"{name} was touched"
+    assert k3s.clock >= max(k3s.done_at.values()), "judged before k3s's import ended"
+
+
+def test_the_kubelet_up_with_the_last_tarball_still_importing_is_waited_for(k3s: FakeK3s, capsys) -> None:
+    """k3s starts the kubelet once its queue is empty, i.e. with the last
+    tarball still importing (seen on a real k3s v1.36.4: the kubelet started
+    8 s before the last ``Imported 1 images``). A kubelet that answers is not
+    the end of the import."""
+    k3s.booting(k3s_airgap_images_amd64=200)  # sorted last, so imported last
+    k3s.tick(0)
+    assert k3s.kubelet() and k3s.current and k3s.current[0] == AIRGAP
+
+    assert _verify(k3s, "--repair") == 0
+
+    assert k3s.attempts.count(AIRGAP) == 1
+    assert "re-importing" not in capsys.readouterr().out
+
+
+def test_a_tarball_open_at_repair_time_is_never_touched(k3s: FakeK3s, capsys) -> None:
+    """Out of time with k3s still importing: the others are repaired, the one
+    k3s has open is left alone and reported as unfinished, not as missing."""
+    k3s.booted(failed=("dns-bind9.tar.zst",))
+    k3s.store.discard(f"ghcr.io/spatiumnorth/dns-bind9:{TAG}")
+    k3s.slow["dhcp-kea.tar.zst"] = 10_000
+    k3s.cache.pop(str(k3s.images_dir / "dhcp-kea.tar.zst"))
+    k3s.store.discard(f"ghcr.io/spatiumnorth/dhcp-kea:{TAG}")
+    os.utime(k3s.images_dir / "dhcp-kea.tar.zst", (OLD + 100, OLD + 100))
+    k3s.tick(0)  # k3s opens dhcp-kea and is still on it at --max-wait
+    kea_mtime = (k3s.images_dir / "dhcp-kea.tar.zst").stat().st_mtime
+
+    assert _verify(k3s, "--repair", "--max-wait", "300") == 1
+
+    captured = capsys.readouterr()
+    assert (k3s.images_dir / "dhcp-kea.tar.zst").stat().st_mtime == kea_mtime
+    assert k3s.attempts.count("dhcp-kea.tar.zst") == 1
+    assert "leaving dhcp-kea.tar.zst alone: k3s is importing it right now" in captured.out
+    assert "re-importing 1 tarball(s) through k3s: dns-bind9.tar.zst" in captured.out
+    assert "k3s is still importing dhcp-kea.tar.zst after 300s" in captured.err
+    assert "k3s is still importing dhcp-kea.tar.zst; its images are not checked yet" in captured.err
+    assert "k3s had not finished importing dhcp-kea.tar.zst when the time ran out" in captured.err
+    assert k3s.clock <= 300 + 5, "--max-wait bounds the whole check"
+
+
+def test_the_time_runs_out_with_k3s_still_importing(k3s: FakeK3s, capsys) -> None:
+    """Without --repair: the verdict is 1, and it says the import was still
+    running rather than that the image is missing."""
+    k3s.booting(dhcp_kea=10_000)
+    assert _verify(k3s, "--max-wait", "200") == 1
+    err = capsys.readouterr().err
+    assert "k3s is still importing dhcp-kea.tar.zst after 200s" in err
+    assert "k3s has not imported dhcp-kea.tar.zst" not in err
+    assert k3s.attempts.count("dhcp-kea.tar.zst") == 1
+    assert 200 <= k3s.clock <= 205
+
+
+def test_the_repair_waits_past_repair_wait_while_k3s_is_reimporting(k3s: FakeK3s, capsys) -> None:
+    """A re-import on slow storage outlasts --repair-wait (#1859's 180 s was
+    one); while k3s has the tarball open the check keeps waiting."""
+    k3s.booted(failed=("dhcp-kea.tar.zst",))
+    k3s.store.discard(f"ghcr.io/spatiumnorth/dhcp-kea:{TAG}")
+    k3s.slow["dhcp-kea.tar.zst"] = 240
+
+    assert _verify(k3s, "--repair") == 0
+
+    assert k3s.attempts == ["dhcp-kea.tar.zst"]
+    assert "all 3 baked tarballs imported" in capsys.readouterr().out
+
+
+def test_the_fast_path_adds_no_wait(k3s: FakeK3s, monkeypatch) -> None:
+    """A node whose import ended long ago: the kubelet answers and nothing
+    is open, so the check judges at once, without one poll."""
+    k3s.booted()
+    sleeps: list[float] = []
+    monkeypatch.setattr(k3s.mod, "_sleep", sleeps.append)
+    assert _verify(k3s, "--repair") == 0
+    assert sleeps == [] and k3s.clock == 0
+
+
+def test_importing_reads_the_real_proc(tmp_path, monkeypatch) -> None:
+    """The signal itself, against this kernel's /proc: a tarball this very
+    process holds open is reported, the others are not."""
+    mod = _load(monkeypatch)
+    held, idle = tmp_path / "held.tar.zst", tmp_path / "idle.tar.zst"
+    held.write_bytes(b"x")
+    idle.write_bytes(b"y")
+    monkeypatch.setattr(mod, "PROC_DIR", Path("/proc"))
+    with open(held, "rb"):
+        assert mod.importing([held, idle]) == {held}
+    assert mod.importing([held, idle]) == set()
+
+
+def test_importing_knows_the_tarball_by_another_name(tmp_path, monkeypatch) -> None:
+    """k3s may open the tarball under a name that is not ours: through a bind
+    mount, or a symlinked directory. The kernel's fd link then reads that
+    name, so a path compare misses the import and verify would touch the
+    tarball k3s is importing, which is #2109 again. A hard link stands in for
+    a bind mount: the same file under a path no realpath() turns into ours."""
+    mod = _load(monkeypatch)
+    images, other = tmp_path / "images", tmp_path / "bind"
+    images.mkdir()
+    other.mkdir()
+    ours = images / "pg.tar.zst"
+    ours.write_bytes(b"x")
+    os.link(ours, other / "pg.tar.zst")
+    (tmp_path / "linked").symlink_to(images)
+    monkeypatch.setattr(mod, "PROC_DIR", Path("/proc"))
+    for name in (other / "pg.tar.zst", tmp_path / "linked" / "pg.tar.zst"):
+        with open(name, "rb"):
+            assert mod.importing([ours]) == {ours}, name
+    assert mod.importing([ours]) == set()
+
+
+def test_importing_skips_a_process_that_exits_mid_scan(tmp_path, monkeypatch) -> None:
+    """A pid listed in /proc can be gone by the time its fds are read, and an
+    fd can close between its readlink and its stat. Neither is an error."""
+    mod = _load(monkeypatch)
+    tarball = tmp_path / "pg.tar.zst"
+    tarball.write_bytes(b"x")
+    proc = tmp_path / "proc"
+    (proc / "41").mkdir(parents=True)                                  # exited: no fd dir
+    (proc / "42" / "fd").mkdir(parents=True)
+    (proc / "42" / "fd" / "3").symlink_to(tmp_path / "gone.tar.zst")   # closed mid-scan
+    (proc / "43" / "fd").mkdir(parents=True)
+    (proc / "43" / "fd" / "7").symlink_to(tarball)
+    monkeypatch.setattr(mod, "PROC_DIR", proc)
+    assert mod.importing([tarball]) == {tarball}
+
+
 # ── firstboot ────────────────────────────────────────────────────────────────
 
 
@@ -356,6 +568,10 @@ def _extract_function(name: str) -> str:
         if lines[j] == "}":
             return "\n".join(lines[i : j + 1])
     raise AssertionError(f"{name}() has no closing brace at column 0")
+
+
+def _has_function(name: str) -> bool:
+    return f"{name}() {{" in FIRSTBOOT.read_text(encoding="utf-8").splitlines()
 
 
 def _ready_branch() -> list[str]:
@@ -391,7 +607,11 @@ def test_check_slot_images_runs_the_repair_and_reports_its_verdict(tmp_path, hel
     if helper_rc is not None:
         helper.write_text(f'#!/bin/sh\necho "$*" > "{tmp_path}/args"\nexit {helper_rc}\n')
         helper.chmod(0o755)
-    body = _extract_function("check_slot_images").replace("/usr/local/bin/spatium-k3s-images", str(helper))
+    body = "\n".join(
+        [_extract_function(f) for f in ("uptime_s", "slot_images_budget") if _has_function(f)]
+        + ["FIRSTBOOT_TIMEOUT_S=600 FIRSTBOOT_T0=0 SLOT_IMAGES_MARGIN_S=45",
+           _extract_function("check_slot_images")]
+    ).replace("/usr/local/bin/spatium-k3s-images", str(helper))
     proc = subprocess.run(
         [SHELL, "-c", f"set -eu\n{body}\nif check_slot_images; then echo rc=0; else echo rc=$?; fi\n"],
         capture_output=True, text=True, check=False,
@@ -399,4 +619,4 @@ def test_check_slot_images_runs_the_repair_and_reports_its_verdict(tmp_path, hel
     assert f"rc={rc}" in proc.stdout, proc.stdout + proc.stderr
     assert says in proc.stderr
     if helper_rc is not None:
-        assert (tmp_path / "args").read_text().split() == ["verify", "--repair"]
+        assert (tmp_path / "args").read_text().split()[:2] == ["verify", "--repair"]

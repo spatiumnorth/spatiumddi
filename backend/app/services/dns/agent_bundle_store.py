@@ -85,9 +85,16 @@ _MAX_ERROR = 2000
 #   stored default is local + private networks (migration b8e41c7a2d95).
 # 11 (#1706): with views, the group's blocklist zone is no longer shipped into
 #   a group whose every view already carries the group's lists in its own.
-# 12 (#2264): a BIND9 server's bundle carries a non-default ``allow_query_cache``
+# 12 (#2157): a BIND9 bundle's RPZ zones carry ``rpz_sha256``, the content hash
+#   the agent keys its "this RPZ file is unchanged, hard-link it" decision on.
+#   Bundles without a blocklist, and every non-BIND9 bundle, are byte-identical
+#   to 11's, so the re-render this bump forces moves no ETag for them.
+# 13 (#2124): a ``sinkhole`` entry whose list names an address carries
+#   ``sinkhole_ip`` (the agent renders it as A + AAAA local data). It is part
+#   of the entry, so it is inside ``rpz_sha256`` too.
+# 14 (#2264): a BIND9 server's bundle carries a non-default ``allow_query_cache``
 #   (the agent now renders ``allow-query-cache``); unchanged for default groups.
-RENDERER_REVISION = 12
+RENDERER_REVISION = 14
 
 
 def _serves(revision: int | None) -> bool:

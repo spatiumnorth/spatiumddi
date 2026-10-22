@@ -614,6 +614,8 @@ async def _step_drain(
     deadline = time.monotonic() + timeout_s
     evicted: list[str] = []
     blocked: list[dict[str, Any]] = []
+    # The evictable pods the last poll still found on the node (#1804).
+    remaining: list[str] = []
 
     while time.monotonic() < deadline:
         try:
@@ -683,14 +685,34 @@ async def _step_drain(
             else:
                 cycle_blocked.append({"pod": f"{ns}/{name}", "status": status, "error": err})
         blocked = cycle_blocked
+        remaining = sorted(f"{ns}/{name}" for name, ns in candidates)
         await asyncio.sleep(_POLL_INTERVAL_S)
 
+    # #1804 — count the pods still on the node, not the evictions the last
+    # cycle had refused. A node whose kubelet is down accepts every eviction
+    # and removes nothing, so the old count read "0 pod(s) still present"
+    # while all of them were.
+    refused = {b["pod"] for b in blocked}
+    not_removed = [p for p in remaining if p not in refused]
+    why: list[str] = []
+    if refused:
+        why.append(f"{len(refused)} eviction(s) refused")
+    if not_removed:
+        why.append(
+            f"{len(not_removed)} evicted but never removed from the node, "
+            "whose kubelet may be down"
+        )
+    error = f"drain timed out after {timeout_s:.0f}s — {len(remaining)} pod(s) still present"
+    if why:
+        error += f" ({'; '.join(why)})"
     return step.finish(
         False,
-        error=(f"drain timed out after {timeout_s:.0f}s — " f"{len(blocked)} pod(s) still present"),
+        error=error,
         evicted_count=len(set(evicted)),
         evicted=list(set(evicted)),
         blocked=blocked,
+        remaining=remaining,
+        not_removed=not_removed,
     )
 
 

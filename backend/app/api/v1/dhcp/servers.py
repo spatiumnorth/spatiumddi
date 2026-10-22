@@ -1168,6 +1168,13 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
             ),
         )
     result = await pull_leases_from_server(db, s, apply=True)
+    if result.busy:
+        # #2262 — the scheduled pull (or another Sync) is reconciling this
+        # server right now; two at once used to insert the same lease twice.
+        raise HTTPException(
+            status_code=409,
+            detail="A lease pull for this server is already running; try again shortly.",
+        )
 
     # Reconcile the server's MAC deny-filter list against the group's
     # active blocks while we're already holding the WinRM session up.

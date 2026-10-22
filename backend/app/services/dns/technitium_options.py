@@ -35,6 +35,15 @@ UNSUPPORTED_OPTIONS: dict[str, tuple[Any, str]] = {
         "Technitium has no separate cache-access ACL (allow_recursion is the "
         "recursion ACL it honours)",
     ),
+    # #2267: Technitium has no separate allow-notify. A Secondary zone accepts
+    # NOTIFY from its configured primary name servers only (and a Primary has
+    # no incoming-NOTIFY handling at all), so a list of other senders is
+    # stored, shipped and never consulted.
+    "allow_notify": (
+        [],
+        "Technitium has no allow-notify setting (a secondary zone accepts NOTIFY "
+        "only from its own primary name servers)",
+    ),
     "forward_tls_verify": (
         True,
         "Technitium always validates an encrypted upstream's certificate and has no "
@@ -254,6 +263,27 @@ def allow_transfer_problem(
     return address_match_problem(elements, acls, field="allow_transfer", allow_keys=True)
 
 
+def also_notify_problem(elements: list[str] | None) -> str | None:
+    """Why an ``also_notify`` list (group or zone) cannot be applied by
+    Technitium, or ``None`` if it can (#2267). Its notify list takes bare IP
+    addresses, so a port, a key or a hostname has no equivalent."""
+    bad = []
+    for entry in elements or []:
+        text = str(entry).strip()
+        if not text:
+            continue
+        try:
+            ipaddress.ip_address(text)
+        except ValueError:
+            bad.append(text)
+    if not bad:
+        return None
+    return (
+        "also_notify: Technitium notifies bare IP addresses only (no port, key or "
+        "hostname); not expressible: " + ", ".join(bad)
+    )
+
+
 def refusals(changes: dict[str, Any], stored: Any, acls: AclDefinitions | None = None) -> list[str]:
     """Messages for every changed option Technitium would silently ignore."""
     out: list[str] = []
@@ -271,6 +301,10 @@ def refusals(changes: dict[str, Any], stored: Any, acls: AclDefinitions | None =
         and getattr(stored, "forward_policy", "first") != "first"
     ):
         out.append(FORWARD_FIRST_WHY)
+    if "also_notify" in changes and changes["also_notify"] != getattr(stored, "also_notify", None):
+        problem = also_notify_problem(changes["also_notify"])
+        if problem:
+            out.append(problem)
     if "allow_query" in changes and changes["allow_query"] != getattr(stored, "allow_query", None):
         problem = allow_query_problem(changes["allow_query"], acls)
         if problem:
@@ -312,6 +346,9 @@ def stored_warnings(stored: Any, acls: AclDefinitions | None = None) -> list[str
             "always validates the upstream certificate against a name, so these "
             "forwarders are not applied; set forward_tls_hostname"
         )
+    problem = also_notify_problem(getattr(stored, "also_notify", None))
+    if problem:
+        out.append(problem + "; those entries are not notified")
     problem = allow_query_problem(getattr(stored, "allow_query", None), acls)
     if problem:
         out.append(problem + "; query access is left as each zone has it")
