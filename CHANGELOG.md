@@ -151,6 +151,26 @@ the formatter handles the rest.
   shows the member gone, and the leave is refused rather than wiping a
   node whose member may still vote.
 
+- **A disabled Tailscale tenant no longer reads "Token rejected", and
+  the Integrations card always names tenants with a credential problem
+  (#2191, #2192).** A tenant whose last sync got a 401 and was then
+  disabled kept its red chip on the Tailscale page, in
+  `GET /tailscale/tenants` and in `list_tailscale_targets`, while its
+  alert and the dashboard chips had cleared. One shared rule in
+  `credential_status` now gives such a tenant the state `disabled` on
+  all of them; the page greys its last error as "Last error
+  (disabled)". The Integrations dashboard cards used to name only
+  their first three targets, so a rejected tenant beyond them was
+  counted and never named. Targets with a credential problem or a sync
+  error are now listed first, ahead of healthy ones, even past three;
+  this covers every integration card, and the IPAM-tab panel orders
+  the same way. The list stays bounded: a card names up to eight
+  problem targets and says "+N more with problems" for the rest, and
+  the dashboard API returns at most 50 problem rows per integration.
+  Its counts ("N token expired", the new `problem_count`) are now
+  taken over every target rather than the trimmed row list, which
+  used to undercount past 20 targets.
+
 - **A trial slot on slow storage is no longer reverted because the
   image check judged k3s's import while it was still running
   (#2109).** Before it commits a trial slot, firstboot checks that
