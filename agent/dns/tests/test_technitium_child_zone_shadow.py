@@ -56,6 +56,25 @@ def test_shadowing_zone_picks_the_deepest_descendant() -> None:
     assert _shadowing_zone("a.mykid.p2.example", "p2.example", hosted) is None
 
 
+def test_a_child_apex_two_labels_down_is_shadowed() -> None:
+    """#2238 — Technitium 15.6.2 refuses a parent's record at the apex of a
+    hosted child that is two or more labels below it ("The domain name
+    'a.b.p2.test' does not belong to the zone: p2.test"; verified live, and
+    15.4.0 accepted it). One label down is still written."""
+    hosted = ["p2.example", "kid.p2.example", "a.b.p2.example", "x.kid.p2.example"]
+    assert _shadowing_zone("a.b.p2.example", "p2.example", hosted) == "a.b.p2.example"
+    assert _shadowing_zone("A.B.P2.example.", "p2.example", hosted) == "a.b.p2.example"
+    # From the parent two levels up, the deepest owner wins.
+    assert (
+        _shadowing_zone("x.kid.p2.example", "p2.example", hosted) == "x.kid.p2.example"
+    )
+    # One label below its own parent: the cut is still writable there.
+    assert _shadowing_zone("x.kid.p2.example", "kid.p2.example", hosted) is None
+    assert _shadowing_zone("kid.p2.example", "p2.example", hosted) is None
+    # A name two labels down that no hosted zone owns is the parent's own.
+    assert _shadowing_zone("c.b.p2.example", "p2.example", hosted) is None
+
+
 def test_render_leaves_a_shadowed_record_out_of_the_parent(tmp_path: Path) -> None:
     import json
 
