@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A feature-module verdict cached under another catalog no longer
+  answers for this one (#2395).** `get_enabled_modules` kept its
+  5 s verdict whatever catalog it was resolved against, so a lookup
+  made while the shipped defaults were in force (a task finishing
+  after the test fixtures were torn down) made the next test's
+  sweep read a default-off module as disabled and fire nothing,
+  which flaked `test_sweep_gated_off_writes_skip_run_and_restamps`
+  on a CI shard. The cache now remembers the catalog it resolved
+  against and re-resolves when that changes. No production
+  behaviour change.
+
 - **Starting a fleet upgrade, forcing a block-sync reconcile and
   syncing an integration now record who did it (#2303).** All three
   enqueue a worker task whose own audit rows say `system`, so "who
