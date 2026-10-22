@@ -610,6 +610,14 @@ the formatter handles the rest.
   is where receiver credentials live), with `url_changed` /
   `secret_rotated` flags on update. Delivery attempts by the worker stay
   unaudited: they are telemetry visible in the deliveries list.
+- **Deleting a site no longer turns its geo-scoped DNS pool members into
+  answers for every client (#2292).** `dns_pool_member.site_id` is SET NULL,
+  and a member with no site and no CIDRs is the unscoped default, so a member
+  meant for site-A clients began answering everyone. Site delete and bulk
+  delete now return 409 naming the pools and members that reference the site
+  (this does not cover E911 bindings, #2298). Independently, a member linked
+  to a site whose last subnet was unlinked now serves nobody instead of
+  falling back to default.
 
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense

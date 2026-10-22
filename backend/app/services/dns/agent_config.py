@@ -1041,7 +1041,13 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 {
                     **base_zp,
                     "view_name": None,
-                    "records": [_rec_dict(r) for r in rec_rows],
+                    # A member scoped to a site with no subnets serves nobody
+                    # (#2292) — even when no geo view exists to carry it.
+                    "records": [
+                        _rec_dict(r)
+                        for r in rec_rows
+                        if str(r.pool_member_id) not in geo.unreachable_members
+                    ],
                 }
             )
             continue
