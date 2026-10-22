@@ -879,6 +879,26 @@ async def test_probe_stays_green_when_only_the_zone_count_fails(
 
 
 @pytest.mark.asyncio
+async def test_probe_is_not_green_when_the_health_check_skipped_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2238 — Technitium 15.5+ answers the health check ``ok`` with no
+    session at all when the request comes from loopback (a reverse proxy on
+    the Technitium host). Verified live against 15.6.2: a bogus Bearer token
+    gets ``{"status": "ok"}`` from 127.0.0.1 and ``invalid-token`` from
+    elsewhere. The zone listing then rejects the token, and that verdict must
+    win over the health check's — "Authenticated, but…" would be false."""
+    drv, _fake = _driver(
+        monkeypatch,
+        [_FakeResponse({"status": "ok"}), _FakeResponse({"status": "invalid-token"})],
+    )
+    result = await drv.probe(_Server({"api_url": "https://x.test", "api_token": "t"}))
+    assert not result.ok
+    assert "Create Token" in result.message
+    assert "Authenticated" not in result.message
+
+
+@pytest.mark.asyncio
 async def test_probe_without_credentials_is_a_clean_message() -> None:
     drv = TechnitiumAPIDriver()
     result = await drv.probe(_Server(None))

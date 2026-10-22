@@ -1500,15 +1500,39 @@ async def agent_ingested_records(
         for r in body.records
     ]
     result = await reconcile_external_records(db, zone, incoming)
-    await db.commit()
     summary = to_summary(result)
     if summary["added"] or summary["removed"]:
+        # One summarising row per batch (not per record): an external writer
+        # churning records would otherwise flood audit_log. Names are capped.
+        cap = 50
+        db.add(
+            AuditLog(
+                user_display_name="system:dns-agent",
+                auth_source="system",
+                action="dns.record.external_ingest",
+                resource_type="dns_zone",
+                resource_id=str(zone.id),
+                resource_display=zone_name,
+                old_value=(
+                    {"removed_records": result.removed_records[:cap]} if result.removed else None
+                ),
+                new_value={
+                    "server_id": str(server.id),
+                    "server": server.name,
+                    **summary,
+                    "added_records": result.added_records[:cap],
+                    "truncated": max(result.added, result.removed) > cap,
+                },
+                result="success",
+            )
+        )
         logger.info(
             "dns_ingested_external_records",
             server_id=str(server.id),
             zone=zone_name,
             **summary,
         )
+    await db.commit()
     return {"zone": zone_name, **summary}
 
 

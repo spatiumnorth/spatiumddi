@@ -20,6 +20,7 @@ from app.core.permissions import require_resource_permission
 from app.core.update_nulls import resolve_update_changes
 from app.models.dhcp import DHCPClientClass, DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
 from app.models.ipam import IPAddress, Subnet
+from app.services.dhcp.class_refs import is_builtin_or_generated, known_class_names
 from app.services.dhcp.option_validation import normalize_options
 from app.services.dhcp.pool_occupancy import (
     PoolOccupancy,
@@ -183,8 +184,9 @@ def _validate_pd(
 async def _check_class_family(db: AsyncSession, scope: DHCPScope, name: str | None) -> None:
     """422 when a pool restricts to an operator client class its daemon does
     not define (#1229). Kea accepts the reference, so the pool would silently
-    match no one. A name that is not an operator class (a generated PXE /
-    phone / device-policy class, or Kea's built-in ``KNOWN``) is not checked."""
+    match no one. A name that is not an operator class must be a device-policy class, a
+    generated PXE / phone class, or a Kea built-in such as ``KNOWN``; anything
+    else is a typo and a 422 (#2285)."""
     if not name:
         return
     cc = (
@@ -195,6 +197,19 @@ async def _check_class_family(db: AsyncSession, scope: DHCPScope, name: str | No
         )
     ).scalar_one_or_none()
     family = scope.address_family or "ipv4"
+    if (
+        cc is None
+        and not is_builtin_or_generated(name)
+        and name not in await known_class_names(db, scope.group_id)
+    ):
+        # A typo (#2285): Kea accepts it and the pool would never match.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Client class '{name}' does not exist in this scope's server group, so "
+                "the pool would match no client. Create the class first, or pick an existing one."
+            ),
+        )
     if cc is not None and cc.address_family not in (family, "dual"):
         raise HTTPException(
             status_code=422,

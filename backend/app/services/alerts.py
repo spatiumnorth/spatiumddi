@@ -3124,8 +3124,11 @@ async def _matching_circuit_term_expiring_subjects(
             threshold_days=threshold_days,
             days_to_expiry=days_to_expiry,
         )
-        if days_to_expiry <= 0:
+        # The end date is inclusive: the term is still running on it.
+        if days_to_expiry < 0:
             descriptor = "term has expired"
+        elif days_to_expiry == 0:
+            descriptor = "term expires today"
         elif days_to_expiry == 1:
             descriptor = "term expires tomorrow"
         else:
@@ -4531,8 +4534,11 @@ async def _matching_service_term_expiring_subjects(
             threshold_days=threshold_days,
             days_to_expiry=days_to_expiry,
         )
-        if days_to_expiry <= 0:
+        # The end date is inclusive: the term is still running on it.
+        if days_to_expiry < 0:
             descriptor = "term has expired"
+        elif days_to_expiry == 0:
+            descriptor = "term expires today"
         elif days_to_expiry == 1:
             descriptor = "term expires tomorrow"
         else:

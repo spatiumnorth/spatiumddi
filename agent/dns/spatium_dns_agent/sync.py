@@ -510,7 +510,8 @@ class SyncLoop:
     def _boot_hold_fallback(self, failed_etag: str | None = None) -> None:
         """No usable bundle from the control plane while the cache is held.
 
-        Reached offline (unreachable, or not answering 200), when the control
+        Reached offline (unreachable, or not answering 200 — a 401/404 too,
+        while ``reauthenticate`` registers again, #2182), when the control
         plane is serving the held bundle itself and that bundle is
         quarantined, and (``failed_etag``) when the control plane's own bundle
         failed to apply: the hold set the live tree aside, so without this the
@@ -842,6 +843,16 @@ class SyncLoop:
                 status=resp.status_code,
                 reason="token_invalid" if resp.status_code == 401 else "server_missing",
             )
+            # #2182 — during a #2019 boot hold nothing is serving, and
+            # ``reauthenticate`` can back off for up to 5 min before it
+            # registers. The control plane is unusable meanwhile, so the held
+            # cache serves under the offline rules (#5), through the same
+            # ``_boot_hold_fallback`` the unreachable path takes (it declines a
+            # condemned bundle). Nothing was fetched, so ``current.json`` is
+            # still the held bundle; the fresh 200 forced below then goes
+            # through the normal path, re-rendering only if its structural
+            # etag differs from what the fallback put live.
+            self._boot_hold_fallback()
             # #2052 — re-register in this thread; do NOT stop it. Stopping
             # made the supervisor exit the container and take the daemon down.
             reauthenticate(self.cfg, self.token_ref, headers["Authorization"][7:])
