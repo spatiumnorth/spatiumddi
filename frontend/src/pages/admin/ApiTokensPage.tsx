@@ -691,6 +691,9 @@ export function ApiTokensPage() {
     queryKey: ["api-tokens"],
     queryFn: apiTokensApi.list,
   });
+  // A superadmin's list spans users (#2443): name the owner once more than
+  // one user's tokens are present.
+  const showOwner = new Set(tokens.map((t) => t.user_id)).size > 1;
   const [showCreate, setShowCreate] = useState(false);
   const [justCreated, setJustCreated] = useState<ApiTokenCreated | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<ApiToken | null>(null);
@@ -741,6 +744,7 @@ export function ApiTokensPage() {
               <thead className="border-b text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
                 <tr>
                   <th className="px-3 py-2">Name</th>
+                  {showOwner && <th className="px-3 py-2">Owner</th>}
                   <th className="px-3 py-2">Prefix</th>
                   <th className="px-3 py-2">Scopes</th>
                   <th className="px-3 py-2">Expires</th>
@@ -763,6 +767,9 @@ export function ApiTokensPage() {
                         </div>
                       )}
                     </td>
+                    {showOwner && (
+                      <td className="px-3 py-2 text-xs">{ownerLabel(t)}</td>
+                    )}
                     <td className="px-3 py-2 font-mono text-xs">{t.prefix}…</td>
                     <td className="px-3 py-2">
                       <ScopeChips scopes={t.scopes} />
@@ -861,6 +868,16 @@ export function ApiTokensPage() {
                 <strong className="text-foreground">
                   {confirmDelete.name}
                 </strong>
+                {ownerLabel(confirmDelete) && (
+                  <>
+                    {" "}
+                    (owned by{" "}
+                    <strong className="text-foreground">
+                      {ownerLabel(confirmDelete)}
+                    </strong>
+                    )
+                  </>
+                )}
                 ? Any script still using it will start getting 401 responses.
               </p>
               <div className="flex justify-end gap-2">
@@ -916,6 +933,14 @@ function ScopeChips({ scopes }: { scopes: ApiTokenScope[] | undefined }) {
       })}
     </div>
   );
+}
+
+/** "Display Name (username)" or the username; "" when the owner is unknown. */
+function ownerLabel(t: ApiToken): string {
+  if (!t.owner_username) return "";
+  return t.owner_display_name && t.owner_display_name !== t.owner_username
+    ? `${t.owner_display_name} (${t.owner_username})`
+    : t.owner_username;
 }
 
 function ExpiryCell({ iso }: { iso: string }) {
