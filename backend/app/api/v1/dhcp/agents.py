@@ -282,6 +282,11 @@ class LeaseEvent(BaseModel):
         return self
 
 
+def _utc(value: datetime) -> datetime:
+    """Treat a naive timestamp as UTC so two lease times always compare."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 def _lease_identity(
     ip: str, mac: str | None, duid: str | None, iaid: int | None
 ) -> tuple[Any, ...]:
@@ -1260,11 +1265,40 @@ async def agent_lease_events(
         for lease in existing_leases
     }
 
+    def _superseded(ev: Any, key: tuple[Any, ...]) -> bool:
+        """Is this active event older than another client's live lease? (#2391)
+
+        The agent re-sends its whole lease file after a restart, so an old
+        client's grant can arrive after the address went to a new client.
+        Such a grant is history: applying it would resurrect the old lease
+        and re-point the IPAM mirror (MAC, hostname, DDNS) to the old
+        client. Compared on the lease start Kea reports, so a genuine newer
+        grant — a renewal, or a real new client — is never held back. An
+        event with no start time carries no evidence and is applied.
+        """
+        if ev.state != "active" or ev.starts_at is None:
+            return False
+        ev_start = _utc(ev.starts_at)
+        for other_key, other in lease_by_key.items():
+            if other_key == key or other.state != "active" or other.starts_at is None:
+                continue
+            if norm_ip(str(other.ip_address)) != norm_ip(ev.ip_address):
+                continue
+            if other.expires_at is not None and _utc(other.expires_at) <= now:
+                continue
+            if _utc(other.starts_at) > ev_start:
+                return True
+        return False
+
     # Upsert every DHCPLease first, then a single flush so new rows get
     # their ids before we wire dhcp_lease_id on the IPAM mirror.
     upserted = 0
-    for ev in events:
+    stale: set[int] = set()
+    for idx, ev in enumerate(events):
         key = _lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)
+        if _superseded(ev, key):
+            stale.add(idx)
+            continue
         # #428: fall back to ends_at when the agent didn't send a distinct
         # expires_at (Kea ships the same absolute reclaim time as ends_at).
         # Without a non-NULL expires_at the time-based sweep_expired_leases
@@ -1366,7 +1400,9 @@ async def agent_lease_events(
         row.last_seen_method = "dhcp"
 
     # ── IPAM mirror pass ────────────────────────────────────────────────
-    for ev in events:
+    for idx, ev in enumerate(events):
+        if idx in stale:
+            continue  # replayed grant of a lease another client has superseded (#2391)
         subnet = subnet_for_ip.get(ev.ip_address)
         if subnet is None:
             continue  # IP not in any known subnet — can't mirror
@@ -1374,6 +1410,11 @@ async def agent_lease_events(
         ipam_row = ipam_by_key.get((subnet.id, norm_ip(ev.ip_address)))
 
         is_active = ev.state == "active"
+        # A grant whose lease ended later in this same batch (a replayed
+        # grant + release) is history too: re-pointing the row would name a
+        # client that no longer holds the address (#2391).
+        if is_active and lease.state != "active":
+            continue
         if is_active:
             if ipam_row is None:
                 candidate = IPAddress(

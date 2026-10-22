@@ -231,12 +231,12 @@ def test_a_claim_somebody_else_recreated_is_settled(monkeypatch) -> None:
 
 
 def test_the_seed_eviction_reclaims_and_recreates_the_mirror_claim() -> None:
-    """Structural: ``heartbeat_once`` reclaims the mirror's claim where it
-    reclaims Redis's (right after the Node DELETE), and drives the owed
-    claims every tick."""
+    """Structural: ``heartbeat_once`` reclaims the mirror's claim right after
+    the Node DELETE (where Redis's was reclaimed until #2404 moved it to a
+    sweep on every seed tick), and drives the owed claims every tick."""
     src = inspect.getsource(heartbeat.heartbeat_once)
-    redis = src.index("k8s_api.reclaim_stranded_redis_storage(")
+    deleted = src.index("k8s_api.delete_node(")
     mirror = src.index("k8s_api.reclaim_stranded_mirror_storage(")
     recreate = src.index("k8s_api.recreate_reclaimed_claims(")
-    assert redis < mirror < recreate
+    assert deleted < mirror < recreate
     assert "_mirror_claims_owed.update(owed)" in src

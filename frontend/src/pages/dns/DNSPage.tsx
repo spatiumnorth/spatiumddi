@@ -8341,39 +8341,6 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 </span>
               </span>
             </label>
-            <Field label="Log channel">
-              <select
-                className={selCls}
-                value={queryLogChannel}
-                onChange={(e) => {
-                  setQueryLogChannel(e.target.value);
-                  setDirty(true);
-                }}
-              >
-                <option value="file">
-                  file — write to a log file (rotated by BIND)
-                </option>
-                <option value="syslog">
-                  syslog — send to local syslog (daemon facility)
-                </option>
-                <option value="stderr">
-                  stderr — write to container stderr (visible via docker logs)
-                </option>
-              </select>
-            </Field>
-            {queryLogChannel === "file" && (
-              <Field label="Log file path (inside container)">
-                <input
-                  className={inputCls}
-                  value={queryLogFile}
-                  onChange={(e) => {
-                    setQueryLogFile(e.target.value);
-                    setDirty(true);
-                  }}
-                  placeholder="/var/log/named/queries.log"
-                />
-              </Field>
-            )}
             <Field label="Severity">
               <select
                 className={selCls}
@@ -8389,19 +8356,20 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 <option value="debug">
                   debug — very verbose; for troubleshooting only
                 </option>
-                <option value="notice">notice — only notable events</option>
-                <option value="warning">warning — warnings and above</option>
-                <option value="error">error — errors only</option>
               </select>
             </Field>
             <p className="text-xs text-muted-foreground">
               Logs the <code>queries</code> and <code>query-errors</code>{" "}
-              categories. View with{" "}
-              <code className="font-mono">docker logs</code> (stderr) or{" "}
+              categories to <code className="font-mono">{queryLogFile}</code>{" "}
+              inside the DNS container, which is the file the Logs page&apos;s
+              DNS Queries tab reads. The channel and path are fixed for that
+              reason, and so is the severity floor: named logs queries at{" "}
+              <code>info</code>, so anything quieter would empty the tab. View
+              raw with{" "}
               <code className="font-mono">
                 docker exec &lt;dns-container&gt; tail -f {queryLogFile}
-              </code>{" "}
-              (file).
+              </code>
+              .
             </p>
           </>
         )}

@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import math
 import os
 import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -53,7 +56,7 @@ NAMED_CONF_SKELETON = """\
     listen-on-v6 {{ any; }};
 {encrypted_listeners}    recursion {recursion};
 {allow_recursion}    allow-query {{ {allow_query}; }};
-    {allow_transfer}
+{allow_query_cache}    {allow_transfer}
     dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
     check-integrity no;
@@ -64,25 +67,53 @@ statistics-channels {{
 }};
 {logging_block}{tsig_include}"""
 
-# Query-log channel + category block. Path matches the QueryLogShipper
-# default (``/var/log/named/queries.log``) so the shipper can tail the
-# same file the daemon writes — the entrypoint script chowns this
-# directory to the unprivileged ``spatium`` user at boot. Severity +
-# print-* defaults match ``DNSServerOptions``' column defaults; we
-# don't plumb the per-field overrides through the agent yet because
-# the operator-facing UI surfaces the boolean toggle only.
-_QUERY_LOG_HEAD = """\
-logging {
-    channel queries_channel {
-        file "/var/log/named/queries.log" versions 5 size 50m;
-        severity info;
-        print-category yes;
-        print-severity yes;
-        print-time yes;
-    };
-    category queries { queries_channel; };
-    category query-errors { queries_channel; };
+# Query-log channel + category block. The channel is ALWAYS a file at the
+# QueryLogShipper default (``/var/log/named/queries.log``) so the shipper
+# can tail what the daemon writes — the entrypoint script chowns this
+# directory to the unprivileged ``spatium`` user at boot. ``channel`` and
+# ``file`` are not operator-settable (the control plane refuses them, #2265):
+# syslog / stderr / another path would silently starve the DNS Queries tab.
+# ``severity`` and ``print-*`` ARE honoured, within what the shipper can
+# still read (see ``_query_log_channel_settings``).
+_QUERY_LOG_FILE = "/var/log/named/queries.log"
+_QUERY_LOG_DEBUG_RE = re.compile(r"^debug(?:\s+\d{1,3})?$")
+
+
+def _query_log_channel_settings(opts: dict[str, Any]) -> tuple[str, str, str, str]:
+    """``(severity, print-category, print-severity, print-time)`` tokens.
+
+    named logs queries at ``info``, so a channel severity of ``notice`` or
+    above would drop every line; a stored value like that (set before the
+    control plane refused it) falls back to ``info`` here rather than
+    emptying the DNS Queries tab. ``print-time`` is always ``yes`` — the
+    shipper reads each line's timestamp. Absent keys (an older control
+    plane) render the historical defaults.
+    """
+    severity = str(opts.get("query_log_severity") or "info").strip().lower()
+    if severity != "dynamic" and not _QUERY_LOG_DEBUG_RE.match(severity):
+        severity = "info"
+
+    def yn(key: str) -> str:
+        return "no" if opts.get(key) is False else "yes"
+
+    return severity, yn("query_log_print_category"), yn("query_log_print_severity"), "yes"
+
+
+def _query_log_head(opts: dict[str, Any]) -> str:
+    severity, category, print_sev, print_time = _query_log_channel_settings(opts)
+    return f"""\
+logging {{
+    channel queries_channel {{
+        file "{_QUERY_LOG_FILE}" versions 5 size 50m;
+        severity {severity};
+        print-category {category};
+        print-severity {print_sev};
+        print-time {print_time};
+    }};
+    category queries {{ queries_channel; }};
+    category query-errors {{ queries_channel; }};
 """
+
 
 # RPZ policy hits (issue #699). named logs a rewrite to its OWN ``rpz``
 # category, never to ``queries`` — so without these two lines a blocked
@@ -123,7 +154,7 @@ def _render_logging_block(opts: dict[str, Any]) -> str:
     """
     if not bool(opts.get("query_log_enabled")):
         return ""
-    block = _QUERY_LOG_HEAD + _RPZ_LOG_CATEGORIES
+    block = _query_log_head(opts) + _RPZ_LOG_CATEGORIES
     if bool(opts.get("response_log_enabled")):
         block += _RESPONSE_LOG_CATEGORY
     return block + "};\n"
@@ -1362,6 +1393,106 @@ _RNDC_QUERY_TIMEOUT_S = 10.0
 _ZONE_DUMP_TIMEOUT_S = 60.0
 _ZONE_DUMP_POLL_S = 0.1
 
+# Bulk applies (#2180). Every per-zone step of an apply is a process: one
+# ``named-checkzone`` (~63 ms, nearly all of it BIND's library start-up, not the
+# zone) and five ``rndc`` calls (~10 ms each, nearly all of it process start).
+# Run one zone at a time, a change touching 20,000 zones took ~50 minutes to be
+# served. Rendering is ~0.2 ms a zone and was never the cost.
+#
+# The rndc calls for different zones are independent, so they run on a bounded
+# pool; each zone's own calls stay in order. Never wider than the CPUs this
+# process may actually use (the cgroup quota, not the host's count, the #980
+# lesson), so a small node does what it did before: one at a time.
+_APPLY_WORKERS_MAX = 8
+# ``named-checkconf -z`` loads every zone in a config in ONE process, so it
+# screens a batch of zones for the price of one start-up (500 zones: 0.2 s, where
+# named-checkzone took 31 s). It only ever CLEARS zones: a batch that fails, or
+# cannot be read as a clean pass, sends each of its zones back through
+# ``named-checkzone``, which stays the authority on what is refused and why.
+# Below the minimum the per-zone check is as quick; a file over the size bound
+# (an RPZ feed runs to a million records) is checked on its own and serially, as
+# before, so a batch or the pool never holds several of those in memory at once.
+_CHECK_BATCH_MIN_ZONES = 8
+_CHECK_BATCH_ZONES = 500
+_CHECK_BATCH_MAX_FILE_BYTES = 4 * 1024 * 1024
+# And a batch is cut at this many bytes of zone file, so one run stays far inside
+# ``_CHECK_TIMEOUT_S`` (named-checkconf loads ~6-7 MiB/s of zone file on one
+# core; 500 files near the size bound would be ~300 s, and a timed-out batch is
+# all wasted time before the per-zone fallback). Memory does not grow with the
+# batch: -z loads and frees one zone at a time.
+_CHECK_BATCH_MAX_BYTES = 256 * 1024 * 1024
+_CHECK_TIMEOUT_S = 300
+_LOADED_LINE = re.compile(r"^zone \S+: loaded serial \d+", re.MULTILINE)
+
+def _cgroup_cpu_quota(root: Path = Path("/sys/fs/cgroup")) -> float | None:
+    """CPUs this container may use per its cgroup quota, or None if unbounded.
+
+    cgroup v2 (``cpu.max``: ``<quota|max> <period>``) first, then v1
+    (``cpu.cfs_quota_us``, -1 when unbounded). Anything unreadable or
+    malformed reads as unbounded; ``_apply_workers`` still caps the pool at
+    ``_APPLY_WORKERS_MAX``, so a wrong read can never size it past that.
+    """
+    try:
+        quota, period = (root / "cpu.max").read_text().split()[:2]
+        if quota != "max" and int(period) > 0:
+            return int(quota) / int(period)
+        return None
+    except (OSError, ValueError):
+        # No cgroup v2 cpu.max (or an unreadable one): try the v1 files.
+        pass
+    try:
+        quota_us = int((root / "cpu" / "cpu.cfs_quota_us").read_text())
+        period_us = int((root / "cpu" / "cpu.cfs_period_us").read_text())
+        if quota_us > 0 and period_us > 0:
+            return quota_us / period_us
+    except (OSError, ValueError):
+        # No readable v1 quota either: report no limit (the CPU count rules).
+        pass
+    return None
+
+
+def _apply_workers() -> int:
+    """How many per-zone steps of an apply may run at once (#2180)."""
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    quota = _cgroup_cpu_quota()
+    if quota is not None:
+        cpus = min(cpus, max(1, math.ceil(quota)))
+    return max(1, min(cpus, _APPLY_WORKERS_MAX))
+
+
+def _parallel_map[T, R](fn: Callable[[T], R], items: Iterable[T]) -> list[R]:
+    """``[fn(i) for i in items]``, on the bounded apply pool, in input order.
+
+    An exception from any call is raised here, as the serial loop would, but
+    only once EVERY call has run. ``Executor.map`` cancels the calls still
+    queued when one raises; for a thaw pass that strands the zones whose
+    thaw never ran frozen, refusing every RFC 2136 update until named
+    restarts, so nothing here is cancelled.
+    """
+    seq = list(items)
+    workers = min(_apply_workers(), len(seq))
+    if workers <= 1:
+        return [fn(i) for i in seq]
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bind9-apply") as ex:
+        futures = [ex.submit(fn, i) for i in seq]
+    # The ``with`` waited for every call (shutdown without cancel_futures).
+    return [f.result() for f in futures]
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _conf_safe(text: str) -> bool:
+    """Whether ``text`` can sit inside a quoted named.conf string as-is."""
+    return not any(c in text for c in '"\\;{}\n\r')
+
 
 def _zone_views_under(root: Path) -> list[tuple[str, str | None]]:
     """``(zone_name, view_name)`` for every ``*.db`` under ``root/zones``.
@@ -1672,6 +1803,12 @@ def _rndc_run(base: list[str], *args: str) -> tuple[int, str, str]:
         )
     except subprocess.TimeoutExpired:
         return 1, "", f"rndc {args[0]} timed out after {_RNDC_QUERY_TIMEOUT_S:g}s"
+    except OSError as e:
+        # Could not even start it (EAGAIN from fork under load, a binary gone):
+        # also a non-answer. Raised instead, from a worker of the apply pool
+        # (#2180), it would abort a freeze pass that has already frozen other
+        # zones, and nothing would thaw them.
+        return 1, "", f"rndc {args[0]} could not run: {e}"
     return res.returncode, res.stdout or "", res.stderr or ""
 
 
@@ -1752,6 +1889,32 @@ def _render_allow_recursion(
         # Fail closed, as the Technitium agent does (#1761).
         kept = ["none"]
     return f"    allow-recursion {{ {'; '.join(kept)}; }};\n"
+
+
+def _render_allow_query_cache(
+    opts: dict[str, Any], acls: list[dict[str, Any]] | None = None
+) -> str:
+    """The group-level ``allow-query-cache`` line (#2264), or ``""``.
+
+    The control plane ships the key only when the operator set something other
+    than the stored default; absent renders nothing, so BIND keeps its own
+    default and an untouched group's named.conf is byte-identical. Elements
+    named-checkconf would refuse are dropped; if none survive the line is
+    ``none`` (fail closed: this setting exists to narrow cache access).
+    """
+    stored = opts.get("allow_query_cache")
+    if stored is None:
+        return ""
+    acl_names = {str(a.get("name") or "").strip() for a in acls or []}
+    kept: list[str] = []
+    for entry in (str(e).strip() for e in stored if str(e).strip()):
+        if _aml_element_ok(entry, acl_names):
+            kept.append(entry)
+        else:
+            log.warning("bind9_allow_query_cache_entry_dropped", entry=entry)
+    if not kept:
+        kept = ["none"]
+    return f"    allow-query-cache {{ {'; '.join(kept)}; }};\n"
 
 
 _TRUST_ANCHOR_LABEL = r"[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
@@ -1928,6 +2091,7 @@ class Bind9Driver(DriverBase):
             recursion=recursion,
             allow_recursion=_render_allow_recursion(opts, bundle.get("acls")),
             allow_query=allow_query,
+            allow_query_cache=_render_allow_query_cache(opts, bundle.get("acls")),
             allow_transfer=allow_transfer_opt.rstrip(),
             dnssec=dnssec,
             forwarders=fwd_block,
@@ -2703,9 +2867,11 @@ class Bind9Driver(DriverBase):
         its data loads. A checker that cannot run at all (missing, or timed
         out) still fails the apply: that is not a verdict on the zone.
 
-        Not ``named-checkconf -z``: the rendered conf names zone files by
-        absolute path under the LIVE tree, so it would test the files already
-        being served rather than these. And not every zone: a views group
+        Not ``named-checkconf -z`` over the rendered conf: it names zone files
+        by absolute path under the LIVE tree, so it would test the files
+        already being served rather than these. (A scratch config naming the
+        STAGED files is used as a batch screen in front of this check, #2180;
+        see ``_screen_zone_batches``.) And not every zone: a views group
         re-renders on every record change, and loading a million-record RPZ
         each time is the load amplification ``_changed_zones`` exists to
         avoid. A zone whose bytes did not change is the one named already
@@ -2733,29 +2899,32 @@ class Bind9Driver(DriverBase):
                 "named-checkzone is not installed, so the zone files cannot be "
                 "validated; refusing to apply them unchecked"
             )
+        # A batch screen first (#2180): it clears zones, it never refuses one.
+        cleared = self._screen_zone_batches(new_dir, targets)
+        rest = [zv for zv in targets if zv not in cleared]
+        # Large files one at a time, as before, so the pool never holds several
+        # million-record RPZ loads in memory at once; the rest on the pool.
+        large = [
+            zv
+            for zv in rest
+            if _file_size(new_dir / _zone_rel(*zv)) > _CHECK_BATCH_MAX_FILE_BYTES
+        ]
+        small = [zv for zv in rest if zv not in set(large)]
+        refused: dict[tuple[str, str | None], str] = {}
+        verdicts = _parallel_map(lambda zv: self._checkzone(new_dir, zv), small)
+        for zv, reason in zip(small, verdicts):
+            if reason is not None:
+                refused[zv] = reason
+        for zv in large:
+            reason = self._checkzone(new_dir, zv)
+            if reason is not None:
+                refused[zv] = reason
         held: list[HeldZone] = []
         for zname, view in targets:
-            rel = _zone_rel(zname, view)
-            res = subprocess.run(
-                [
-                    "named-checkzone",
-                    "-i",
-                    "none",
-                    "-k",
-                    "fail",
-                    zname,
-                    str(new_dir / rel),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=300,
-            )
-            if res.returncode == 0:
+            detail = refused.get((zname, view))
+            if detail is None:
                 continue
-            detail = _first_line(res.stdout, res.stderr, skip_warnings=True).replace(
-                f"{new_dir}/", ""
-            )
+            rel = _zone_rel(zname, view)
             last_good = live / rel
             served = last_good.is_file()
             staged_sidecar = _rpz_sidecar(new_dir / rel)
@@ -2786,6 +2955,163 @@ class Bind9Driver(DriverBase):
                 ),
             )
         self.held_back = tuple(held)
+
+    def _checkzone(self, new_dir: Path, zv: tuple[str, str | None]) -> str | None:
+        """``named-checkzone`` one staged zone file: None if it loads, else the
+        reason, first line, with the staging path stripped. A checker that
+        cannot run (missing, timed out) raises: that is no verdict on the zone."""
+        zname, view = zv
+        rel = _zone_rel(zname, view)
+        res = subprocess.run(
+            [
+                "named-checkzone",
+                "-i",
+                "none",
+                "-k",
+                "fail",
+                zname,
+                str(new_dir / rel),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_CHECK_TIMEOUT_S,
+        )
+        if res.returncode == 0:
+            return None
+        return _first_line(res.stdout, res.stderr, skip_warnings=True).replace(
+            f"{new_dir}/", ""
+        )
+
+    def _screen_zone_batches(
+        self, new_dir: Path, targets: list[tuple[str, str | None]]
+    ) -> set[tuple[str, str | None]]:
+        """The zones a batched ``named-checkconf -z`` load passes (#2180).
+
+        A fast path in front of the per-zone ``named-checkzone``, never a
+        replacement for it. ``-z`` test-loads every primary zone in a config
+        in one process, with the options the scratch config sets: the same
+        ``check-integrity no`` and ``check-names master fail`` the per-zone
+        flags (``-i none -k fail``) and the rendered config ask for. Verified
+        against BIND 9.20 to refuse exactly what ``named-checkzone`` refuses
+        (bad rdata, check-names, CNAME and other data, an in-zone NS with no
+        address, an over-long TXT) and pass what it passes.
+
+        A batch counts as passed only when the checker exits 0 AND reports a
+        load for every zone in it. A batch the checker refused is split in two
+        and each half screened again, so one bad zone in 500 costs a handful
+        of cheap batch runs and a few per-zone checks rather than 500. Anything
+        else clears nothing: a batch too small to split, or one the checker
+        could not give a verdict on (a timeout, a missing binary, a name the
+        scratch config cannot quote) is not retried, and its zones go through
+        ``named-checkzone`` one by one, so which zone was refused and why is
+        still decided there.
+        """
+        eligible = [
+            zv
+            for zv in targets
+            if _file_size(new_dir / _zone_rel(*zv)) <= _CHECK_BATCH_MAX_FILE_BYTES
+        ]
+        if len(eligible) < _CHECK_BATCH_MIN_ZONES or not shutil.which("named-checkconf"):
+            return set()
+        chunks: list[list[tuple[str, str | None]]] = [[]]
+        chunk_bytes = 0
+        for zv in eligible:
+            size = _file_size(new_dir / _zone_rel(*zv))
+            if chunks[-1] and (
+                len(chunks[-1]) >= _CHECK_BATCH_ZONES
+                or chunk_bytes + size > _CHECK_BATCH_MAX_BYTES
+            ):
+                chunks.append([])
+                chunk_bytes = 0
+            chunks[-1].append(zv)
+            chunk_bytes += size
+        passed: set[tuple[str, str | None]] = set()
+        pending = chunks
+        runs = 0
+        while pending:
+            verdicts = _parallel_map(lambda c: self._screen_chunk(new_dir, c), pending)
+            runs += len(pending)
+            split: list[list[tuple[str, str | None]]] = []
+            for chunk, verdict in zip(pending, verdicts):
+                if verdict is True:
+                    passed.update(chunk)
+                elif verdict is False and len(chunk) > _CHECK_BATCH_MIN_ZONES:
+                    mid = len(chunk) // 2
+                    split += [chunk[:mid], chunk[mid:]]
+            pending = split
+        log.info(
+            "bind9_zone_check_batched",
+            zones=len(targets),
+            batched=len(eligible),
+            cleared=len(passed),
+            batches=runs,
+        )
+        return passed
+
+    def _screen_chunk(
+        self, new_dir: Path, chunk: list[tuple[str, str | None]]
+    ) -> bool | None:
+        """One ``named-checkconf -z`` over ``chunk``.
+
+        True: a clean pass, every zone loaded. False: the checker ran and
+        refused something (a zone, or the scratch config). None: no verdict
+        at all (the checker could not run, or timed out, or a name cannot be
+        quoted), which is not worth splitting and retrying.
+
+        Each real view becomes a scratch view of its own (a zone name can
+        repeat across views, never within one), so every zone sits in a view
+        and the config is valid whatever mix the group renders.
+        """
+        groups: dict[str | None, list[str]] = {}
+        for zname, view in chunk:
+            groups.setdefault(view, []).append(zname)
+        lines = [
+            (
+                f'options {{ directory "{self.state_dir}"; check-integrity no; '
+                "check-names master fail; };"
+            )
+        ]
+        for n, (view, names) in enumerate(groups.items()):
+            lines.append(f'view "c{n}" {{ match-clients {{ none; }};')
+            for zname in names:
+                path = str(new_dir / _zone_rel(zname, view))
+                if not (_conf_safe(zname) and _conf_safe(path)):
+                    return None
+                lines.append(f'zone "{zname}" {{ type master; file "{path}"; }};')
+            lines.append("};")
+        if not _conf_safe(str(self.state_dir)):
+            return None
+        try:
+            fd, conf = tempfile.mkstemp(
+                prefix=".zone-check-", suffix=".conf", dir=self.state_dir
+            )
+        except OSError:
+            return None  # no scratch config, no verdict: the per-zone check decides
+        try:
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    fh.write("\n".join(lines) + "\n")
+            except OSError:
+                return None
+            try:
+                res = subprocess.run(
+                    ["named-checkconf", "-z", conf],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=_CHECK_TIMEOUT_S,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            return res.returncode == 0 and len(_LOADED_LINE.findall(res.stdout or "")) == len(
+                chunk
+            )
+        finally:
+            try:
+                os.unlink(conf)
+            except OSError:
+                pass  # already gone; nothing is left to clean up
 
     def swap_and_reload(self) -> None:
         """Put the staged tree live and confirm named is serving it.
@@ -2857,10 +3183,14 @@ class Bind9Driver(DriverBase):
         """Best-effort thaw of the zones ``_freeze_before_swap`` froze, on the way
         out of an apply that failed before its own thaw: a zone left frozen
         refuses every update until named restarts."""
-        for zname, view in zones:
+
+        def thaw(zv: tuple[str, str | None]) -> None:
+            zname, view = zv
             rc, _out, err = _rndc_run(base, "thaw", zname, *(["in", view] if view else []))
             if rc != 0:
                 log.warning("bind9_zone_thaw_failed", zone=zname, view=view, stderr=err[:200])
+
+        _parallel_map(thaw, list(zones))
 
     def _signal_reload(
         self,
@@ -3035,16 +3365,43 @@ class Bind9Driver(DriverBase):
         land again. ``_verify_zones_loaded`` still fails the apply if named
         then serves anything but the render.
         """
-        frozen: dict[tuple[str, str | None], int | None] = {}
-        for zname, view in _zone_views_under(new_dir):
-            if changed is not None and (zname, view) not in changed:
-                continue
-            if not (live / _zone_rel(zname, view)).exists():
-                continue  # new to named, or moved between views: no file of it to replace
+        # A zone frozen here and then lost track of refuses every RFC 2136
+        # update until named restarts. ``swap_and_reload`` thaws what this
+        # returns; if it raises instead, after some zones froze (a worker of
+        # the pool, #2180, or the wait below), it thaws them itself.
+        froze: list[tuple[str, str | None]] = []
+        try:
+            return self._freeze_and_wait(base, new_dir, live, changed, froze)
+        except BaseException:
+            if froze:
+                self._thaw(base, list(froze))
+            raise
+
+    def _freeze_and_wait(
+        self,
+        base: list[str],
+        new_dir: Path,
+        live: Path,
+        changed: set[tuple[str, str | None]] | None,
+        froze: list[tuple[str, str | None]],
+    ) -> dict[tuple[str, str | None], int | None]:
+        """``_freeze_before_swap``'s body; appends each zone to ``froze`` the
+        moment named confirms the freeze."""
+        candidates = [
+            (zname, view)
+            for zname, view in _zone_views_under(new_dir)
+            if (changed is None or (zname, view) in changed)
+            # new to named, or moved between views: no file of it to replace
+            and (live / _zone_rel(zname, view)).exists()
+        ]
+
+        def freeze(zv: tuple[str, str | None]) -> tuple[bool, int | None]:
+            zname, view = zv
             scope = [zname, *(["in", view] if view else [])]
             rc, _out, _err = _rndc_run(base, "freeze", *scope)
             if rc != 0:
-                continue
+                return False, None
+            froze.append(zv)  # list.append is atomic under the GIL
             rc, out, err = _rndc_run(base, "zonestatus", *scope)
             serving = _zonestatus_serial(out) if rc == 0 else None
             if serving is None:
@@ -3054,22 +3411,30 @@ class Bind9Driver(DriverBase):
                     view=view,
                     stderr=_first_line(err, out)[:200],
                 )
-            frozen[(zname, view)] = serving
+            return True, serving
+
+        # Each zone's freeze and zonestatus stay in order; zones run on the
+        # bounded pool (#2180).
+        frozen: dict[tuple[str, str | None], int | None] = {
+            zv: serving
+            for zv, (ok, serving) in zip(candidates, _parallel_map(freeze, candidates))
+            if ok
+        }
         pending = {zv: s for zv, s in frozen.items() if s is not None}
         deadline = time.monotonic() + _ZONE_DUMP_TIMEOUT_S
         while pending:
-            for zv, serving in list(pending.items()):
-                if _soa_serial(live / _zone_rel(*zv)) == serving:
+            for zv, dumped in list(pending.items()):
+                if _soa_serial(live / _zone_rel(*zv)) == dumped:
                     del pending[zv]
             if not pending or time.monotonic() >= deadline:
                 break
             time.sleep(_ZONE_DUMP_POLL_S)
-        for (zname, view), serving in pending.items():
+        for (zname, view), dumped in pending.items():
             log.warning(
                 "bind9_frozen_zone_not_written_out",
                 zone=zname,
                 view=view,
-                serving=serving,
+                serving=dumped,
                 file_serial=_soa_serial(live / _zone_rel(zname, view)),
                 waited_s=_ZONE_DUMP_TIMEOUT_S,
             )
@@ -3105,15 +3470,16 @@ class Bind9Driver(DriverBase):
         if not shutil.which("rndc"):
             return {}
         live = self.state_dir / self.rendered_dir_name
-        out: dict[tuple[str, str | None], int | None] = {}
-        for zname, view in _zone_views_under(live):
-            if only is not None and (zname, view) not in only:
-                continue
+        zones = [zv for zv in _zone_views_under(live) if only is None or zv in only]
+
+        def serial(zv: tuple[str, str | None]) -> int | None:
+            zname, view = zv
             rc, stdout, _err = _rndc_run(
                 base, "zonestatus", zname, *(["in", view] if view else [])
             )
-            out[(zname, view)] = _zonestatus_serial(stdout) if rc == 0 else None
-        return out
+            return _zonestatus_serial(stdout) if rc == 0 else None
+
+        return dict(zip(zones, _parallel_map(serial, zones)))
 
     def _verify_zones_loaded(
         self,
@@ -3165,29 +3531,36 @@ class Bind9Driver(DriverBase):
         total = len(pending)
         why: dict[tuple[str, str | None], str] = {}
         deadline = time.monotonic() + _ZONE_LOAD_TIMEOUT_S
+
+        def check(item: tuple[tuple[str, str | None], int | None]) -> str | None:
+            """None once the zone serves the render, else why not yet."""
+            (zname, view), want = item
+            rc, out, err = _rndc_run(
+                base, "zonestatus", zname, *(["in", view] if view else [])
+            )
+            if rc != 0:
+                return _first_line(err, out)
+            got = _zonestatus_serial(out)
+            prior = (before or {}).get((zname, view))
+            loaded = (
+                want is None
+                or got == want
+                or (
+                    got is not None
+                    and _serial_at_least(got, want)
+                    and (prior is None or got != prior)
+                )
+            )
+            return None if loaded else f"serving serial {got}, file has {want}"
+
         while pending:
-            for (zname, view), want in list(pending.items()):
-                rc, out, err = _rndc_run(
-                    base, "zonestatus", zname, *(["in", view] if view else [])
-                )
-                if rc != 0:
-                    why[(zname, view)] = _first_line(err, out)
-                    continue
-                got = _zonestatus_serial(out)
-                prior = (before or {}).get((zname, view))
-                loaded = (
-                    want is None
-                    or got == want
-                    or (
-                        got is not None
-                        and _serial_at_least(got, want)
-                        and (prior is None or got != prior)
-                    )
-                )
-                if loaded:
-                    del pending[(zname, view)]
+            # Each pass asks every pending zone once, on the bounded pool (#2180).
+            items = list(pending.items())
+            for (zv, _want), reason in zip(items, _parallel_map(check, items)):
+                if reason is None:
+                    del pending[zv]
                 else:
-                    why[(zname, view)] = f"serving serial {got}, file has {want}"
+                    why[zv] = reason
             if not pending or time.monotonic() >= deadline:
                 break
             time.sleep(_ZONE_LOAD_POLL_S)
@@ -3330,27 +3703,45 @@ class Bind9Driver(DriverBase):
         """
         all_zones = self.rendered_zone_views()
         targets = all_zones if only is None else [z for z in all_zones if z in only]
-        for zname, view in targets:
+
+        def reload(zv: tuple[str, str | None]) -> None:
+            zname, view = zv
             scope = [zname] + (["in", view] if view else [])
             verbs = (
                 ("reload", "thaw")
                 if (zname, view) in already_frozen
                 else ("freeze", "reload", "thaw")
             )
-            for verb in verbs:
-                res = subprocess.run(
-                    [*base, verb, *scope],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if res.returncode != 0 and verb == "reload":
-                    log.warning(
-                        "bind9_zone_reload_failed",
-                        zone=zname,
-                        view=view,
-                        stderr=res.stderr.strip()[:200],
+            froze_here = False
+            try:
+                for verb in verbs:
+                    res = subprocess.run(
+                        [*base, verb, *scope],
+                        capture_output=True,
+                        text=True,
+                        check=False,
                     )
+                    if verb == "freeze":
+                        froze_here = res.returncode == 0
+                    elif verb == "thaw":
+                        froze_here = False
+                    if res.returncode != 0 and verb == "reload":
+                        log.warning(
+                            "bind9_zone_reload_failed",
+                            zone=zname,
+                            view=view,
+                            stderr=res.stderr.strip()[:200],
+                        )
+            except BaseException:
+                # A zone this call froze must not stay frozen because a later
+                # verb could not run; zones frozen before the swap are thawed
+                # by ``swap_and_reload``'s own ``finally``.
+                if froze_here:
+                    _rndc_run(base, "thaw", *scope)
+                raise
+
+        # One zone's verbs stay in order; zones run on the bounded pool (#2180).
+        _parallel_map(reload, targets)
         log.info(
             "bind9_rendered_zones_reloaded",
             zones=len(targets),

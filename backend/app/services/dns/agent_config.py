@@ -38,6 +38,7 @@ from app.core.crypto import decrypt_str
 from app.drivers.dns.base import TsigKey
 from app.models.appliance import ApplianceCertificate
 from app.models.dns import (
+    DEFAULT_ALLOW_QUERY_CACHE,
     DEFAULT_ALLOW_RECURSION,
     ZONE_DEFAULT_TTL,
     DNSAcl,
@@ -1288,6 +1289,18 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "forward_tls_hostname": (getattr(opts, "forward_tls_hostname", None) if opts else None),
         "forward_tls_verify": (bool(getattr(opts, "forward_tls_verify", True)) if opts else True),
     }
+    if (
+        server.driver == "bind9"
+        and opts is not None
+        and list(opts.allow_query_cache or []) != list(DEFAULT_ALLOW_QUERY_CACHE)
+    ):
+        # #2264: the group-level ``allow-query-cache`` was validated, stored
+        # and never shipped, so narrowing cache access (cache snooping) did
+        # nothing. Shipped only when it differs from the stored default, so a
+        # group nobody touched keeps its bundle (and etag) byte-identical and
+        # an upgrade reloads nothing. BIND9-only: PowerDNS / Technitium have
+        # no such setting and the API refuses a non-default value for them.
+        options_block["allow_query_cache"] = list(opts.allow_query_cache or [])
     if server.driver in ("technitium", "bind9"):
         # #1761 / #1786: Technitium and BIND9 read this (the BIND9 agent
         # renders ``allow-recursion`` from it, literally, #1817), so
