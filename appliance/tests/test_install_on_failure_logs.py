@@ -65,6 +65,13 @@ def _run(tmp_path, *, mounted: bool, make_dest_unwritable: bool = False):
     return r, mount, live
 
 
+def _assert_verdict_is_last(out: str, verdict: str) -> None:
+    """The verdict prints after the ~90 rows of log tails, so it is still on
+    a 50-row console when the installer waits for Enter (#2405 walk)."""
+    assert out.index(verdict) > out.index("Installer exited with status")
+    assert out.index(verdict) > out.index("Also useful from the shell:")
+
+
 def test_logs_land_on_target_when_var_log_is_missing(tmp_path):
     r, mount, _ = _run(tmp_path, mounted=True)
     dest = mount / "var/log/spatiumddi/install"
@@ -75,6 +82,7 @@ def test_logs_land_on_target_when_var_log_is_missing(tmp_path):
         assert oct((dest / name).stat().st_mode & 0o777) == "0o644"
     assert "Installer logs were saved to the target" in r.stdout
     assert "could NOT be saved" not in r.stdout
+    _assert_verdict_is_last(r.stdout, "Installer logs were saved to the target")
     assert "on_failure returned 0" in r.stdout
 
 
@@ -84,6 +92,7 @@ def test_warns_where_the_logs_remain_when_saving_is_impossible(tmp_path):
     assert str(live / "install.log") in r.stdout
     assert str(live / "trace.log") in r.stdout
     assert "on_failure returned 0" in r.stdout  # never fails itself
+    _assert_verdict_is_last(r.stdout, "could NOT be saved to the target")
 
 
 def test_not_mounted_writes_nothing_and_warns(tmp_path):

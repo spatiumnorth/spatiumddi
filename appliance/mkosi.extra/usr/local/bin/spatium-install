@@ -6631,14 +6631,6 @@ on_failure() {
         fi
     fi
     clear
-    if [ "${_logs_kept:-0}" -eq 1 ]; then
-        echo "Installer logs were saved to the target: /var/log/spatiumddi/install/"
-    else
-        echo "WARN: the installer logs could NOT be saved to the target."
-        echo "      They remain on the live system only: $INSTALL_LOG, $TRACE_LOG,"
-        echo "      /var/log/spatium-install-launch.log. Copy them off before rebooting."
-    fi
-    echo
     echo "Installer exited with status $exit_code"
     echo
     echo "-- Last 20 lines of $INSTALL_LOG --"
@@ -6664,6 +6656,18 @@ on_failure() {
     echo "Also useful from the shell:"
     echo "  journalctl -u spatium-install.service --no-pager"
     echo "  systemctl cat spatium-install.service"
+    echo
+    # #2405 — the verdict on the logs goes LAST, just above the prompt: the
+    # tails above run to ~90 rows, so printed first it scrolled off a
+    # 50-row console before anyone could read it.
+    if [ "${_logs_kept:-0}" -eq 1 ]; then
+        echo "Installer logs were saved to the target: /var/log/spatiumddi/install/"
+    else
+        echo "WARN: the installer logs could NOT be saved to the target."
+        echo "      They remain on the live system only: $INSTALL_LOG, $TRACE_LOG,"
+        echo "      /var/log/spatium-install-launch.log. Copy them off before rebooting"
+        echo "      or re-running the installer (a re-run starts them afresh)."
+    fi
     echo
     echo "Press Enter to drop to a root shell."
     echo "(From the shell you can re-run 'spatium-install' or 'reboot'.)"
