@@ -227,6 +227,6 @@ def test_the_heartbeat_stamps_no_apply_key_on_a_deferred_apply() -> None:
     assert heartbeat._apply_settled(result(state="idle")) is True
     assert heartbeat._apply_settled(result(state="failed")) is False
     assert heartbeat._apply_settled(result(state="idle", deferred=True)) is False
-    source = inspect.getsource(heartbeat.heartbeat_once)
+    source = inspect.getsource(heartbeat._run_role_lifecycle)
     assert "if _apply_settled(lifecycle):\n" in source
     assert source.count("_write_last_apply_hash(") == 1

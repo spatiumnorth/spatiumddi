@@ -20,6 +20,7 @@ from app.config import settings
 from app.db import task_connect_args
 from app.models.cloud import CloudEndpoint
 from app.models.settings import PlatformSettings
+from app.services.integration_sync_failure import record_sync_crash
 
 logger = structlog.get_logger(__name__)
 
@@ -79,7 +80,15 @@ async def _run_sweep() -> dict[str, Any]:
                     # PendingRollbackError, turning one bad endpoint into a
                     # sweep-wide failure (issue #333).
                     await db.rollback()
-                    errors.append(f"{endpoint_name}: {exc}")
+                    crash = await record_sync_crash(
+                        db,
+                        CloudEndpoint,
+                        endpoint_id,
+                        resource_type="cloud_endpoint",
+                        action="cloud.reconcile",
+                        exc=exc,
+                    )
+                    errors.append(f"{endpoint_name}: {crash}")
                     logger.warning(
                         "cloud_reconcile_crash",
                         endpoint=str(endpoint_id),
@@ -120,7 +129,21 @@ async def _run_one(endpoint_id: str) -> dict[str, Any]:
             endpoint = await db.get(CloudEndpoint, _uuid.UUID(endpoint_id))
             if endpoint is None:
                 return {"status": "not_found"}
-            summary = await reconcile_endpoint(db, endpoint)
+            row_id = endpoint.id
+            try:
+                summary = await reconcile_endpoint(db, endpoint)
+            except Exception as exc:  # noqa: BLE001 — record it, don't lose it (#2141)
+                await db.rollback()
+                crash = await record_sync_crash(
+                    db,
+                    CloudEndpoint,
+                    row_id,
+                    resource_type="cloud_endpoint",
+                    action="cloud.reconcile",
+                    exc=exc,
+                )
+                logger.warning("cloud_sync_now_crash", target=str(row_id), error=crash)
+                return {"status": "error", "error": crash}
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,
