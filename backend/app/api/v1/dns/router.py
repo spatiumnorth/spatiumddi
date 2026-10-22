@@ -150,6 +150,7 @@ from app.services.dns.named_conf_validation import (
     AclCycleError,
     ViewValidationError,
     is_name_reference,
+    key_reference,
     order_acls_for_render,
     validate_acl_entries,
     validate_acl_name,
@@ -4321,8 +4322,9 @@ async def _assert_acl_is_unreferenced(
 
     Checks every place a name can be cited: another ACL's entries, any
     view's ``match_clients`` / ``match_destinations`` / ``allow_query`` /
-    ``allow_query_cache``, and the group's server options (``allow_query``,
-    ``allow_recursion``, …).
+    ``allow_query_cache``, the group's server options (``allow_query``,
+    ``allow_recursion``, …) and every zone's ``allow_query`` /
+    ``allow_transfer`` / ``also_notify`` (#2283).
     """
     citing_acls = [
         a.name
@@ -4369,13 +4371,22 @@ async def _assert_acl_is_unreferenced(
         if opts is not None
         else []
     )
-    if not citing_acls and not citing_views and not citing_options:
+    citing_zones = sorted(
+        f"{z.name} {f}"
+        for z in (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id)))
+        .scalars()
+        .all()
+        for f in ("allow_query", "allow_transfer", "also_notify")
+        if any(is_name_reference(str(el)) == acl.name for el in getattr(z, f) or [])
+    )
+    if not citing_acls and not citing_views and not citing_options and not citing_zones:
         return
     cited_by = ", ".join(
         [
             *(f"ACL '{n}'" for n in sorted(citing_acls)),
             *(f"view '{n}'" for n in sorted(citing_views)),
             *(f"server option '{n}'" for n in citing_options),
+            *(f"zone '{n}'" for n in citing_zones),
         ]
     )
     raise HTTPException(
@@ -4677,6 +4688,72 @@ async def generate_tsig_secret(
     return TSIGGenerateSecretResponse(algorithm=algo, secret=_generate_tsig_secret(algo))
 
 
+async def _assert_tsig_key_is_unreferenced(
+    group_id: uuid.UUID, key: DNSTSIGKey, db: DB, *, action: str
+) -> None:
+    """Refuse to rename or delete a TSIG key that something still cites (#2282).
+
+    ``key <name>`` appears in ACL entries, view match lists, the group's
+    address-match options / ``also_notify`` and zone ``allow_*`` /
+    ``also_notify``. Removing the name leaves an undefined symbol:
+    ``named-checkconf`` fails and the agent declines the whole bundle, so the
+    group stops converging. Dynamic-update grants are not listed here — they
+    hold a foreign key, not a name, and a delete reports them separately.
+    """
+    name = key.name
+    # BIND compares key names as DNS names — case-insensitively, with or
+    # without the trailing dot — so a citation of ``Foo.`` still names ``foo``.
+    norm = name.rstrip(".").lower()
+
+    def cites(elements: Any) -> bool:
+        return any(
+            (ref := key_reference(str(el))) is not None and ref.rstrip(".").lower() == norm
+            for el in (elements or [])
+        )
+
+    cited: list[str] = []
+    for a in (
+        await db.execute(
+            select(DNSAcl)
+            .where(DNSAcl.group_id == group_id)
+            .options(selectinload(DNSAcl.entries))
+            .execution_options(populate_existing=True)
+        )
+    ).scalars():
+        if cites([e.value for e in a.entries]):
+            cited.append(f"ACL '{a.name}'")
+    for v in (await db.execute(select(DNSView).where(DNSView.group_id == group_id))).scalars():
+        for f in ("match_clients", "match_destinations", "allow_query", "allow_query_cache"):
+            if cites(getattr(v, f)):
+                cited.append(f"view '{v.name}' {f}")
+    opts = (
+        await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
+    ).scalar_one_or_none()
+    if opts is not None:
+        for f in (*ADDRESS_MATCH_LIST_OPTIONS, "also_notify"):
+            if cites(getattr(opts, f, None)):
+                cited.append(f"server option '{f}'")
+    for z in (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))).scalars():
+        for f in ("allow_query", "allow_transfer", "also_notify"):
+            if cites(getattr(z, f)):
+                cited.append(f"zone '{z.name}' {f}")
+    if not cited:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "field": "name",
+            "value": name,
+            "references": cited,
+            "message": (
+                f"Cannot {action} TSIG key '{name}' — it is still referenced by "
+                f"{', '.join(cited)}. BIND would refuse the whole server group's "
+                f"config with that key undefined. Remove the references first."
+            ),
+        },
+    )
+
+
 @router.get("/groups/{group_id}/tsig-keys", response_model=list[TSIGKeyResponse])
 async def list_tsig_keys(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[TSIGKeyResponse]:
     await _require_group(group_id, db)
@@ -4787,6 +4864,7 @@ async def update_tsig_key(
         )
         if clash.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="Name already in use")
+        await _assert_tsig_key_is_unreferenced(group_id, key, db, action="rename")
     for k, v in changes.items():
         setattr(key, k, v)
     db.add(
@@ -4843,11 +4921,25 @@ async def rotate_tsig_key(
 
 @router.delete("/groups/{group_id}/tsig-keys/{key_id}", status_code=204)
 async def delete_tsig_key(
-    group_id: uuid.UUID, key_id: uuid.UUID, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID, key_id: uuid.UUID, response: Response, db: DB, current_user: SuperAdmin
 ) -> None:
     key = await db.get(DNSTSIGKey, key_id)
     if key is None or key.group_id != group_id:
         raise HTTPException(status_code=404, detail="TSIG key not found")
+    await _assert_tsig_key_is_unreferenced(group_id, key, db, action="delete")
+    # The update-grant rows cascade with the key (fail-closed, but the
+    # operator should hear about it).
+    grants = (
+        (
+            await db.execute(
+                select(DNSZoneUpdateAcl.zone_id).where(DNSZoneUpdateAcl.tsig_key_id == key.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if grants:
+        response.headers["X-Removed-Update-Grants"] = str(len(grants))
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4857,6 +4949,7 @@ async def delete_tsig_key(
             resource_type="dns_tsig_key",
             resource_id=str(key.id),
             resource_display=key.name,
+            new_value={"removed_update_grants": len(grants)} if grants else None,
             result="success",
         )
     )

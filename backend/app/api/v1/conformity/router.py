@@ -45,6 +45,11 @@ from app.services.conformity.current import (
     current_status_counts,
     retire_pass_if_rescoped,
 )
+from app.services.conformity.engine import (
+    RESOLUTION_POLICY_DELETED,
+    RESOLUTION_POLICY_DISABLED,
+    resolve_policy_alerts,
+)
 from app.services.conformity.pdf import generate_conformity_pdf
 
 router = APIRouter()
@@ -343,6 +348,10 @@ async def update_policy(
         if old != value:
             changed[key] = {"old": str(old)[:200], "new": str(value)[:200]}
             setattr(p, key, value)
+    if "enabled" in changed and not p.enabled:
+        # #2277 — a disabled policy is never evaluated again; its open
+        # alerts would otherwise stay red forever.
+        await resolve_policy_alerts(db, p.id, reason=RESOLUTION_POLICY_DISABLED)
     # #2278 — a re-scoped policy's last pass answers a different question.
     retire_pass_if_rescoped(p, changed)
     if changed:
@@ -390,6 +399,7 @@ async def delete_policy(policy_id: uuid.UUID, db: DB, current_user: CurrentUser)
             result="success",
         )
     )
+    await resolve_policy_alerts(db, policy_id, reason=RESOLUTION_POLICY_DELETED)
     await db.execute(delete(ConformityPolicy).where(ConformityPolicy.id == policy_id))
     await db.commit()
 

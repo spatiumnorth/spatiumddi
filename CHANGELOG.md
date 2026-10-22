@@ -128,6 +128,125 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A cluster rolling upgrade no longer rolls the control plane, and
+  leaves the run with nothing driving it, when the seed boots its new
+  slot (#2176).** The run holds the shared image tags until every node
+  runs the target (#1710), but the seed's firstboot also writes its
+  slot's version into the control chart as `APPLIANCE_VERSION` (#2004),
+  and that alone changed the api, worker and beat pod templates: they
+  rolled on every node, still on the old image, the worker running the
+  drive was shut down, and the run sat `running` until the drive's
+  Lease ran out (600 s) and the orphan sweep picked it up again. The
+  version is now a value of its own in the control chart
+  (`applianceVersion`, no longer a `sharedEnv` entry), and the run pins
+  it with the tags, to the version the control plane reports, until the
+  flip moves both in one step. The pods still report the version they
+  run once the run has flipped. A roll from a version without this fix
+  still rolls the control plane once, at the seed's boot.
+
+- **A blocked name answered SERVFAIL after ~10 s when its upstream
+  lookup failed (#2427).** The BIND9 `response-policy` statement
+  (global and per-view, agent and control-plane template) lacked
+  `qname-wait-recurse no`, so BIND resolved the blocked name first
+  and did not rewrite a failed lookup - the names a blocklist most
+  wants to answer (dead, sinkholed, broken upstream) were the ones
+  that timed out, and the query also leaked upstream. QNAME-trigger
+  rules now answer at once. IP and NSDNAME triggers still recurse by
+  nature.
+
+- **Renaming or deleting a TSIG key that something still cites stopped
+  the whole DNS group (#2282).** `key <name>` is cited from ACL entries,
+  view match lists, the group's address-match options and `also_notify`,
+  and zone `allow_query` / `allow_transfer` / `also_notify`. Renaming or
+  deleting the key left an undefined symbol in `named.conf`, so
+  `named-checkconf` failed, the agent declined the bundle and the group
+  stopped converging. Both now answer 409 naming every referrer; an
+  uncited key still renames and deletes freely. Deleting a key also
+  reports how many zone dynamic-update grants it took with it (the
+  `X-Removed-Update-Grants` header and the audit row). As defence in
+  depth, the bundle drops any `key <name>` element whose key it does not
+  define (logged as `dns_bundle_entry_dropped_undefined_key`), so a
+  reference stored before this guard cannot break the group. That drop
+  never widens access: an access list it empties, or that loses a
+  negated `!key` element, ships as `none` rather than empty, because
+  every renderer reads an empty list as "unset" (`any`, or inherit the
+  server's). Key names compare as BIND compares them, case-insensitively
+  and with or without the trailing dot.
+
+- **Conformity alerts open, close and page again (#2277).** Two
+  defects. A conformity alert against a subnet, IP address, DNS zone,
+  DHCP scope or multicast group never opened: its subject id is 80 to
+  89 characters and `alert_event.subject_id` was VARCHAR(64), so the
+  insert failed and took the whole policy pass with it, results and
+  `last_evaluated_at` included. Only `platform` policies could alert.
+  And no conformity alert ever closed: #1578 took them away from the
+  alert evaluator and the conformity engine never resolved its own. A
+  fixed target, a deleted one or a disabled policy stayed red, and
+  because the event was still open, a later re-failure did not page.
+  The engine now resolves an event when its resource next evaluates
+  `pass` or `not_applicable`, when the resource is deleted or leaves the
+  policy's scope, and when the policy is disabled or deleted (from the
+  REST API, the copilot, and a once-a-minute sweep that catches any
+  other path). Clearing or switching the policy's alert rule closes
+  the old rule's events at its next evaluation, and a failure still
+  in progress pages once on the new rule. `warn` and a check that
+  raised keep the event open.
+  A re-failure after the engine closed the event opens a new one and
+  pages; an event an operator resolved by hand while the resource is
+  still failing is not re-paged, as before.
+
+  earliest-fired. Downgrade restores the non-unique index; the resolved
+  duplicates stay resolved.
+
+- **A DNS blocklist set to `sinkhole` answers with the sinkhole address
+  instead of dropping the query, and `refused` is retired (#2124).** The
+  agent rendered `sinkhole` as `CNAME rpz-drop.`, which makes named send
+  no response, so every blocked lookup hung for the client's resolver
+  timeout (seconds per lookup, per retry) instead of failing fast. The
+  list's `sinkhole_ip` was never shipped to the agent at all, while the
+  control-plane renderer emitted `A <ip>` only when one was set and
+  rendered `refused` as `rpz-drop`: two renderers, two policies. Both now
+  render `sinkhole` as RPZ local data, an `A` and an `AAAA`: the list's
+  address replaces `0.0.0.0` (IPv4) or `::` (IPv6), and the other family
+  keeps the unspecified address. Verified with `named-checkzone` and a
+  live `named` 9.20: `A 0.0.0.0`, `AAAA ::` and the configured addresses
+  come back at once. On Technitium a sinkhole with no address is now
+  `AnyAddress` (it used to become `NxDomain`), and one with an address is
+  `CustomAddress` with it. BIND's RPZ has no action that answers REFUSED,
+  so `block_mode: "refused"` is now a 422 that says so (a deliberate
+  decision: accepting it and storing `nxdomain` would be the same silent
+  substitution this fixes); stored `refused`
+  lists become `nxdomain`, which is what the agent always served them.
+  `sinkhole_ip` must now be an IP address (a bad legacy value renders the
+  default rather than breaking the zone), and the catalog subscribe
+  endpoint validates `block_mode`, which it did not before.
+
+- **The adblock feed parser keeps `@@` exceptions, honours `$badfilter`
+  and no longer widens narrowing rules into blocks (#2123).** It read only
+  `||` lines and cut each rule at the first `^`, `$` or `/`. So
+  `@@||name^` exceptions were dropped (the name stayed blocked by any
+  broader rule), `||name^$badfilter` (which disables a rule) became a
+  block, and `$domain=`, `$third-party`, `$client=` and similar rules,
+  which narrow a block DNS cannot narrow, became unconditional blocks.
+  Now `@@` rules become the list's exceptions (marked `source: feed` and
+  re-synced on each refresh; exceptions you add stay yours). A feed's
+  `@@` applies to that feed's own list only: it carves a name out of the
+  feed's own blocks and never unblocks a name your manual list, or any
+  other list on the same group or view, blocks. Exceptions you add by
+  hand still apply to every list, and adding or editing one the feed
+  already lists makes it yours, and so group-wide. `$important` is a plain block that still beats a plain `@@` for
+  the same name, a `$badfilter` rule drops the rule it names, and a
+  rule with any other modifier is skipped. Regex rules, path rules and
+  other rules that are not `||name^` are skipped too. Each skipped rule is
+  counted by category, stored as `feed_parse_skipped` on the list, shown
+  on the list as "N rules not enforced" and returned by
+  `list_dns_blocklists`. Adblock rules now count towards the #894
+  "apex-only list overrides a wildcard feed" warning, since `||name^`
+  means the name and its subdomains.
+
+  Bundles without a blocklist are byte-identical. With #2124 below,
+  `RENDERER_REVISION` is 13.
+
 - **DNSSEC trust anchors reach BIND9, so `dnssec-validation yes`
   validates something (#2266).** Anchors added with
   `POST /groups/{id}/options/trust-anchors` were stored and listed
@@ -1824,6 +1943,16 @@ the formatter handles the rest.
   non-NULL rows; existing rows stay NULL. Downgrade restores the
   non-unique index and drops the column; the resolved duplicates stay
   resolved.
+- `f6a2d81c3e57` — #2124 / #2123: stored `dns_blocklist.block_mode =
+  'refused'` rows become `'nxdomain'` (what the agent already served);
+  adds nullable `dns_blocklist.feed_parse_skipped` (JSONB, no backfill:
+  NULL means not recorded) and `dns_blocklist_exception.source`
+  (`manual` | `feed`, server default `manual`). Downgrade drops both
+  columns and leaves the `refused` rewrite in place.
+- `e2b9c46f1a83` — #2277, widens `alert_event.subject_id` from
+  VARCHAR(64) to VARCHAR(128). Catalogue-only, no rewrite. Downgrade
+  deletes events whose subject id is longer than 64 (only conformity
+  events written by this release) and narrows it back.
 
 ## 1.0.0-beta.1 — 2026-10-21
 
