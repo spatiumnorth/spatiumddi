@@ -293,6 +293,7 @@ async def _retention_sweep(
     *,
     target: BackupTarget,
     config: dict[str, Any],
+    just_written: str | None = None,
 ) -> int:
     """Drop archives outside the target's retention window. One of
     ``retention_keep_last_n`` / ``retention_keep_days`` may be set
@@ -396,13 +397,26 @@ async def _retention_sweep(
         return True
 
     deleted = 0
+    # Retention never removes the newest backup, nor the archive this run
+    # just wrote, whatever the stored policy says (#2503). A stored 0 (the
+    # API used to accept it) or a keep-days cutoff at "now" would otherwise
+    # match the whole listing and leave the target with no backup at all
+    # while the run reported success.
+    backups = sorted(backups, key=lambda a: a.created_at, reverse=True)
+    protected: set[str] = {backups[0].filename} if backups else set()
+    if just_written:
+        protected.add(just_written)
     if target.retention_keep_last_n is not None:
-        keep_n = max(target.retention_keep_last_n, 0)
+        keep_n = max(target.retention_keep_last_n, 1)
         for stale in backups[keep_n:]:
+            if stale.filename in protected:
+                continue
             deleted += 1 if await _prune(stale.filename) else 0
     elif target.retention_keep_days is not None:
         cutoff = datetime.now(UTC).timestamp() - target.retention_keep_days * 86400
         for archive in backups:
+            if archive.filename in protected:
+                continue
             if archive.created_at.timestamp() < cutoff:
                 deleted += 1 if await _prune(archive.filename) else 0
     # Safety dumps: their own keep-last-N, independent of which (if
@@ -473,11 +487,35 @@ async def run_backup_for_target(
             passphrase_hint=target.passphrase_hint or None,
         )
         await driver.write(config=plain_config, filename=filename, archive_bytes=archive_bytes)
-        deleted = await _retention_sweep(db, target=target, config=plain_config)
+        # The archive is already on the destination here, so a retention
+        # failure (listing refused, driver bug) must not stamp the run
+        # failed: the backup exists. It is logged and surfaced on the
+        # target's ``last_run_error`` instead (#2503).
+        deleted = 0
+        retention_error: str | None = None
+        retention_exc: Exception | None = None
+        try:
+            deleted = await _retention_sweep(
+                db, target=target, config=plain_config, just_written=filename
+            )
+        except Exception as exc:  # noqa: BLE001
+            retention_exc = exc
+            retention_error = str(exc)
+            logger.warning(
+                "backup_retention_sweep_failed",
+                target_id=str(target.id),
+                kind=target.kind,
+                error=retention_error,
+            )
 
         finished = datetime.now(UTC)
         duration_ms = int((finished - started).total_seconds() * 1000)
         target.last_run_status = "success"
+        target.last_run_error = (
+            f"Backup written, but retention could not run: {retention_error}"[:5000]
+            if retention_error
+            else None
+        )
         target.last_run_filename = filename
         # #1838 — where the archive physically is when the destination
         # is node-local (a ``local_volume`` hostPath on a multi-node
@@ -497,6 +535,8 @@ async def run_backup_for_target(
                 "node_name": target.last_run_node,
             }
         )
+        if retention_exc is not None:
+            result["retention_failure_category"] = backup_failure_category(retention_exc)
         action = "backup_target_run_success"
         result_state = "success"
     except (BackupArchiveError, BackupDestinationError, SecretFieldError) as exc:

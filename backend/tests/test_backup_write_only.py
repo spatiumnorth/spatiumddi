@@ -806,3 +806,46 @@ def test_write_only_targets_never_report_verified(monkeypatch):
     assert (
         "undrillable_reason is None" in src
     ), "verified must be gated on drillability, not merely on last_pass"
+
+
+@pytest.mark.parametrize("field", ["retention_keep_last_n", "retention_keep_days"])
+def test_zero_retention_is_rejected_by_the_api(field):
+    from pydantic import ValidationError
+
+    from app.api.v1.backup.targets import BackupTargetCreate, BackupTargetUpdate
+
+    with pytest.raises(ValidationError):
+        BackupTargetCreate(
+            name="x", kind="local_volume", config={}, passphrase="pw-pw-pw-pw-1", **{field: 0}
+        )
+    with pytest.raises(ValidationError):
+        BackupTargetUpdate(**{field: 0})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["retention_keep_last_n", "retention_keep_days"])
+async def test_stored_zero_retention_never_deletes_the_newest(monkeypatch, field):
+    from app.services.backup import runner as runner_mod
+
+    driver = _CountingDriver(archives=["new.zip", "mid.zip", "old.zip"])
+    monkeypatch.setattr(runner_mod, "get_destination", lambda kind: driver)
+    await runner_mod._retention_sweep(None, target=_target(**{field: 0}), config={})
+    assert "new.zip" not in driver.deleted
+    assert "old.zip" in driver.deleted
+
+
+@pytest.mark.asyncio
+async def test_the_archive_just_written_is_never_pruned(monkeypatch):
+    from app.services.backup import runner as runner_mod
+
+    # Listing order / clock skew: the fresh file is not the newest listed.
+    driver = _CountingDriver(archives=["a.zip", "fresh.zip", "c.zip"])
+    monkeypatch.setattr(runner_mod, "get_destination", lambda kind: driver)
+    await runner_mod._retention_sweep(
+        None,
+        target=_target(retention_keep_last_n=1),
+        config={},
+        just_written="fresh.zip",
+    )
+    assert "fresh.zip" not in driver.deleted
+    assert "a.zip" not in driver.deleted
