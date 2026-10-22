@@ -83,6 +83,7 @@ import {
   useGroupFailover,
 } from "./windowsFailover";
 import { DeleteConfirmModal, StatusDot, V6NoHaTag } from "./_shared";
+import { fromLocalInputValue, toLocalInputValue } from "@/lib/localTime";
 import { haPillTitle, v6ScopeLacksHa } from "@/lib/dhcpHa";
 import {
   APPROVAL_QUEUED_MESSAGE,
@@ -2719,13 +2720,10 @@ function LeaseHistoryTab({ server }: { server: DHCPServer }) {
         <input
           type="datetime-local"
           className="rounded-md border bg-background px-2 py-1 text-xs"
-          // Slice off seconds + Z to satisfy the input control's local
-          // datetime format. Round-trip back to ISO Z on change.
-          value={since ? since.slice(0, 16) : ""}
+          // ``since`` is a UTC instant; the input is local wall-clock (#2260).
+          value={toLocalInputValue(since)}
           onChange={(e) => {
-            setSince(
-              e.target.value ? new Date(e.target.value).toISOString() : "",
-            );
+            setSince(fromLocalInputValue(e.target.value) ?? "");
             setPage(1);
           }}
           title="Show entries with expired_at on or after this time"

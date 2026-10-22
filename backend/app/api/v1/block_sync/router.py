@@ -34,6 +34,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB
 from app.api.stepup import require_operator_stepup
+from app.api.v1._common import add_trigger_audit
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_permission
@@ -730,6 +731,18 @@ async def reconcile_target(
 
     if not preview and diff.error is None:
         forbid_in_demo_mode("Block-sync writes are disabled in demo mode")
+        # #2303 — who forced this push; the worker's ``block_sync_push`` row
+        # is attributed to "system".
+        add_trigger_audit(
+            db,
+            user,
+            resource_type="network_block_target",
+            resource_id=target_id,
+            resource_display=f"{target_kind}:{diff.target_name}",
+            action="reconcile",
+            new_value={"to_add": len(diff.to_add), "to_remove": len(diff.to_remove)},
+        )
+        await db.commit()
         _enqueue_reconcile([(target_kind, target_id)])
     return TargetDiffOut(
         target_kind=diff.target_kind,
