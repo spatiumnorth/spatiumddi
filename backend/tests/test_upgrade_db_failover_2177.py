@@ -41,7 +41,7 @@ def _raised_in(module: str, exc: BaseException) -> BaseException:
     ns: dict[str, Any] = {"__name__": module, "exc": exc}
     try:
         exec("def _raise():\n    raise exc\n_raise()", ns)  # noqa: S102 — test helper
-    except BaseException as caught:  # noqa: BLE001
+    except Exception as caught:  # every exception these tests raise is an Exception
         return caught
     raise AssertionError("unreachable")
 

@@ -1628,7 +1628,7 @@ async def single_node_upgrade(
         ),
     ):
         return _failed(node_name, target_version, "preflight", results)
-    if not await _run("etcd_snapshot", lambda: _step_etcd_snapshot()):
+    if not await _run("etcd_snapshot", _step_etcd_snapshot):
         return _failed(node_name, target_version, "etcd_snapshot", results)
     if not await _run(
         "mirror_ready",
