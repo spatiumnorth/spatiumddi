@@ -38,6 +38,7 @@ import { formatBucket } from "@/lib/chart-time";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import {
   dnsApi,
@@ -297,6 +298,7 @@ function OverviewTab({
       <DaemonStateBanner server={server} />
       <div className="flex flex-wrap gap-1.5 empty:hidden">
         <SpoolChip server={server} />
+        <DuplicateAgentChip server={server} />
       </div>
       <div className="grid grid-cols-2 gap-3">
         <OverviewInfo server={server} />

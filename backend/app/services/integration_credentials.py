@@ -15,6 +15,10 @@ States:
 * ``expiring`` — it passes within :data:`CREDENTIAL_EXPIRY_WARN_DAYS`.
 * ``ok`` — a recorded expiry further out than that.
 * ``unknown`` — no expiry recorded. Never reported as ``ok``.
+* ``disabled`` — the target is switched off (#2191). It syncs nothing, so a
+  lapsed credential breaks nothing and ``secret_expiring`` skips it; its last
+  rejection is history, not a live problem. This is the ONE place that rule
+  lives, so the page, the API, the MCP tool and both dashboards agree.
 """
 
 from __future__ import annotations
@@ -27,7 +31,10 @@ from datetime import datetime
 # so the chip turns amber when the default rule starts warning.
 CREDENTIAL_EXPIRY_WARN_DAYS = 30
 
-CREDENTIAL_STATES = ("ok", "expiring", "expired", "rejected", "unknown")
+CREDENTIAL_STATES = ("ok", "expiring", "expired", "rejected", "unknown", "disabled")
+
+# States that need an operator to act (drive tone and ordering on the cards).
+CREDENTIAL_PROBLEM_STATES = ("rejected", "expired", "expiring")
 
 
 @dataclass(frozen=True)
@@ -39,11 +46,13 @@ class CredentialStatus:
 
 
 def credential_status(
-    *, expires_at: datetime | None, rejected: bool, now: datetime
+    *, expires_at: datetime | None, rejected: bool, now: datetime, enabled: bool = True
 ) -> CredentialStatus:
     days_left: int | None = None
     if expires_at is not None:
         days_left = math.floor((expires_at - now).total_seconds() / 86400)
+    if not enabled:
+        return CredentialStatus("disabled", expires_at, days_left)
     if rejected:
         return CredentialStatus("rejected", expires_at, days_left)
     if expires_at is None:
@@ -57,6 +66,7 @@ def credential_status(
 
 __all__ = [
     "CREDENTIAL_EXPIRY_WARN_DAYS",
+    "CREDENTIAL_PROBLEM_STATES",
     "CREDENTIAL_STATES",
     "CredentialStatus",
     "credential_status",

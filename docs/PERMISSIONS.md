@@ -285,6 +285,14 @@ never shows more than the resources' own routes would. The tag autocomplete
 tags only from the tables whose rows the caller can read, and an empty list
 when there are none.
 
+## Refusals are audited
+
+Every 403 the permission gates produce leaves a `denied` audit row, including a
+refusal from a route that takes `SuperAdmin` (recorded as `access` on
+`superadmin`, #2304). A handler that is superadmin-only must take the `SuperAdmin`
+dependency rather than check `is_effective_superadmin` and raise by hand, or its
+refusal is invisible to the audit log and the security dashboard.
+
 ## The console mirrors the server, it does not enforce
 
 The API is the enforcement point (non-negotiable #3). The console reads the

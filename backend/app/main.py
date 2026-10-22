@@ -599,11 +599,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dns_record_op_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dns_record_op_failed_alert_rule_seed_skipped", reason=str(exc))
+    # The ``dns_agent_duplicate_instance`` rule (#2044) is NOT seeded here: it
+    # is inserted once by migration f4c2a8e61b93, so an operator who deletes
+    # it keeps it deleted (the #2138 pattern).
     # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
     # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
     # no PSI at all, so enabling it everywhere is silent until it is real.
     try:
         from app.services.alerts import (  # noqa: PLC0415
+            seed_appliance_heartbeat_alert_rule,
             seed_appliance_storage_alert_rule,
             seed_cluster_dns_alert_rule,
             seed_node_pressure_alert_rule,
@@ -614,6 +618,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Storage redundancy (#999 Part A) — cannot fire on an appliance
         # with no arrays, or on a supervisor too old to report them.
         await seed_appliance_storage_alert_rule()
+        # Silent supervisor (#2259) — cannot fire with no appliances.
+        await seed_appliance_heartbeat_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("node_pressure_alert_rule_seed_skipped", reason=str(exc))
     # DHCP packet-loss alert rule — singleton, ENABLED by default (issue
