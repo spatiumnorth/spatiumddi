@@ -1368,6 +1368,7 @@ def _cgroup_cpu_quota(root: Path = Path("/sys/fs/cgroup")) -> float | None:
             return int(quota) / int(period)
         return None
     except (OSError, ValueError):
+        # No cgroup v2 cpu.max (or an unreadable one): try the v1 files.
         pass
     try:
         quota_us = int((root / "cpu" / "cpu.cfs_quota_us").read_text())
@@ -1375,6 +1376,7 @@ def _cgroup_cpu_quota(root: Path = Path("/sys/fs/cgroup")) -> float | None:
         if quota_us > 0 and period_us > 0:
             return quota_us / period_us
     except (OSError, ValueError):
+        # No readable v1 quota either: report no limit (the CPU count rules).
         pass
     return None
 
