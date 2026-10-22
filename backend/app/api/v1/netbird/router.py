@@ -18,7 +18,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
@@ -371,10 +371,20 @@ async def delete_instance(instance_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     "/instances/{instance_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_instance(instance_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_instance(instance_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     t = await db.get(NetbirdInstance, instance_id)
     if t is None:
         raise HTTPException(status_code=404, detail="NetBird instance not found")
+
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="netbird_instance",
+        resource_id=t.id,
+        resource_display=str(getattr(t, "name", None) or t.id),
+        action="sync",
+    )
+    await db.commit()
 
     from app.tasks.netbird_sync import sync_instance_now  # noqa: PLC0415
 

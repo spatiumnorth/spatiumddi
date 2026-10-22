@@ -207,6 +207,11 @@ class IntegrityResponse(BaseModel):
     ok: bool
     rows_checked: int
     breaks: list[ChainBreakResponse]
+    # Range walked + whether rows outside it exist (#2297): the badge
+    # states how much it verified instead of implying the whole log.
+    first_seq: int | None = None
+    last_seq: int | None = None
+    partial: bool = False
 
 
 @router.get("/integrity", response_model=IntegrityResponse)
@@ -220,15 +225,25 @@ async def get_audit_integrity(
             "the full walk is expensive — leave unset for a complete sweep."
         ),
     ),
+    newest: bool = Query(
+        default=False,
+        description=(
+            "With max_rows: verify the NEWEST rows (anchored on the row "
+            "before the window) instead of the oldest."
+        ),
+    ),
 ) -> IntegrityResponse:
     """Walk the audit_log chain and report any tamper. Slow on tables
     past ~1M rows — the nightly Celery task pre-computes the same
     answer and writes an alert event when it breaks, so the UI hit
     is mostly for ad-hoc operator confirmation."""
-    result = await verify_chain(db, max_rows=max_rows)
+    result = await verify_chain(db, max_rows=max_rows, newest=newest)
     return IntegrityResponse(
         ok=result.ok,
         rows_checked=result.rows_checked,
+        first_seq=result.first_seq,
+        last_seq=result.last_seq,
+        partial=result.partial,
         breaks=[
             ChainBreakResponse(
                 seq=b.seq,

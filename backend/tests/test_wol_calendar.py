@@ -56,6 +56,7 @@ from app.services.wol_scheduler.calendar import (
     fetch_ical_url,
     normalise_ical_url,
 )
+from app.services.wol_scheduler.calendar_sync import horizon_anchor
 
 _BASE = "/api/v1/wake-scheduler"
 
@@ -357,6 +358,88 @@ async def test_sync_caldav_decrypts_password_and_reconciles(db_session: AsyncSes
     assert args[2] == "dav-pw"
     rows = await _events_for(db_session, cal.id)
     assert len(rows) == 1 and rows[0].uid == "cd-1@test"
+
+
+# ── #2305: the horizon is anchored on the schedule's LOCAL date ────────
+
+
+@pytest.mark.parametrize(
+    ("tz", "now", "expected"),
+    [
+        # Just after UTC midnight: LA / Honolulu are still on the 20th.
+        ("America/Los_Angeles", datetime(2026, 10, 21, 4, 0, tzinfo=UTC), date(2026, 10, 20)),
+        ("Pacific/Honolulu", datetime(2026, 10, 21, 4, 0, tzinfo=UTC), date(2026, 10, 20)),
+        # East of UTC is already on the 21st, so the UTC date bounds it.
+        ("Pacific/Auckland", datetime(2026, 10, 21, 4, 0, tzinfo=UTC), date(2026, 10, 21)),
+        # US fall-back day (2026-11-01): 23:30 PST on the 1st is 07:30Z on the 2nd.
+        ("America/Los_Angeles", datetime(2026, 11, 2, 7, 30, tzinfo=UTC), date(2026, 11, 1)),
+        # ...and 00:30 PDT on the 1st is 07:30Z on the 1st.
+        ("America/Los_Angeles", datetime(2026, 11, 1, 7, 30, tzinfo=UTC), date(2026, 11, 1)),
+        # US spring-forward (2026-03-08): 23:30 PDT on the 8th is 06:30Z on the 9th.
+        ("America/Los_Angeles", datetime(2026, 3, 9, 6, 30, tzinfo=UTC), date(2026, 3, 8)),
+        # Sydney spring-forward (2026-10-04): 02:00 AEST -> 03:00 AEDT at 16:00Z on the 3rd.
+        ("Australia/Sydney", datetime(2026, 10, 3, 15, 30, tzinfo=UTC), date(2026, 10, 3)),
+    ],
+)
+def test_horizon_anchor_is_the_schedules_local_date(tz: str, now: datetime, expected: date) -> None:
+    anchor = horizon_anchor([tz], now)
+    # Never later than the local date the gate will judge.
+    assert anchor <= expected
+    if tz in ("America/Los_Angeles", "Pacific/Honolulu"):
+        assert anchor == expected
+
+
+def test_horizon_anchor_takes_the_earliest_attached_zone_and_covers_no_schedules() -> None:
+    now = datetime(2026, 10, 21, 4, 0, tzinfo=UTC)
+    assert horizon_anchor(["Pacific/Auckland", "America/Los_Angeles"], now) == date(2026, 10, 20)
+    # No schedule attached yet: UTC-12 is the earliest civil date on Earth.
+    assert horizon_anchor([], now) == date(2026, 10, 20)
+    assert horizon_anchor([], datetime(2026, 10, 21, 13, 0, tzinfo=UTC)) == date(2026, 10, 21)
+
+
+async def _attach_schedule(db: AsyncSession, cal: WolCalendar, tz: str) -> None:
+    sched = _cal_schedule("skip_on_event", tz=tz)
+    sched.calendar_id = cal.id
+    db.add(sched)
+    await db.flush()
+
+
+@pytest.mark.parametrize("tz", ["America/Los_Angeles", "Pacific/Honolulu", "Etc/GMT+12"])
+async def test_sync_keeps_todays_local_event_across_utc_midnight(
+    db_session: AsyncSession, tz: str
+) -> None:
+    cal = await _make_calendar(db_session)
+    await _attach_schedule(db_session, cal, tz)
+    holiday = date(2026, 10, 20)
+    ics = _ics(
+        _vevent(uid="hol@test", dtstart=_ymd(holiday), summary="Holiday"),
+        _vevent(uid="later@test", dtstart=_ymd(date(2026, 11, 5)), summary="Later"),
+    )
+    fetch = AsyncMock(return_value=ics)
+    # Before UTC midnight, then after it (still the 20th in every zone above).
+    for now in (
+        datetime(2026, 10, 20, 23, 0, tzinfo=UTC),
+        datetime(2026, 10, 21, 4, 0, tzinfo=UTC),
+    ):
+        with patch("app.services.wol_scheduler.calendar_sync.fetch_ical_url", fetch):
+            await sync_calendar(db_session, cal, now=now)
+        rows = await _events_for(db_session, cal.id)
+        assert holiday in {r.starts_on for r in rows}, now
+
+
+async def test_sync_still_drops_a_span_that_is_over_everywhere(db_session: AsyncSession) -> None:
+    cal = await _make_calendar(db_session)
+    await _attach_schedule(db_session, cal, "America/Los_Angeles")
+    ics = _ics(
+        _vevent(uid="old@test", dtstart="20261019", summary="Yesterday"),
+        _vevent(uid="later@test", dtstart="20261105", summary="Later"),
+    )
+    with patch(
+        "app.services.wol_scheduler.calendar_sync.fetch_ical_url",
+        AsyncMock(return_value=ics),
+    ):
+        await sync_calendar(db_session, cal, now=datetime(2026, 10, 21, 4, 0, tzinfo=UTC))
+    assert {r.uid for r in await _events_for(db_session, cal.id)} == {"later@test"}
 
 
 # ══════════════════════════════════════════════════════════════════════

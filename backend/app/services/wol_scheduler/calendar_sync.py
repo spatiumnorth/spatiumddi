@@ -26,15 +26,16 @@ from __future__ import annotations
 
 import asyncio
 import socket
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
 from sqlalchemy import select
 
 from app.core.crypto import decrypt_str
-from app.models.wol_schedule import WolCalendar, WolCalendarEvent
+from app.models.wol_schedule import WolCalendar, WolCalendarEvent, WolSchedule
 from app.services.wol_scheduler.calendar import (
     DEFAULT_HORIZON_DAYS,
     ParsedEvent,
@@ -59,10 +60,38 @@ def _event_key(uid: str | None, starts_on: Any, ends_on: Any) -> tuple[str | Non
     return (uid, starts_on, ends_on)
 
 
+# The earliest civil date anywhere on Earth is UTC-12's. Used when no schedule
+# is attached, so a calendar synced ahead of its first schedule still never
+# deletes a day that is "today" somewhere.
+_EARLIEST_UTC_OFFSET_HOURS = 12
+
+
+def horizon_anchor(timezones: list[str], now: datetime) -> date:
+    """First date the sync keeps: the earliest *local* today among the
+    attached schedules' zones (never later than the UTC date).
+
+    The gate judges the schedule's local date, so anchoring on the worker's
+    UTC date deletes today's event for any schedule west of UTC for the hours
+    between UTC midnight and local midnight. Computed per zone with zoneinfo,
+    so DST offsets are honoured on the day they change.
+    """
+    now = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    anchor = now.astimezone(UTC).date()
+    if not timezones:
+        return (now.astimezone(UTC) - timedelta(hours=_EARLIEST_UTC_OFFSET_HOURS)).date()
+    for name in timezones:
+        try:
+            anchor = min(anchor, now.astimezone(ZoneInfo(name)).date())
+        except (ValueError, KeyError, OSError):  # unknown zone: ignore, gate rejects it too
+            continue
+    return anchor
+
+
 async def _load_events_for_calendar(
     calendar: WolCalendar,
     *,
     horizon_days: int,
+    today: date,
 ) -> list[ParsedEvent]:
     """Fetch + parse the calendar's feed into flattened all-day spans.
 
@@ -82,11 +111,12 @@ async def _load_events_for_calendar(
             calendar.username,
             password,
             horizon_days=horizon_days,
+            today=today,
         )
 
     # Default / ical_url.
     text = await fetch_ical_url(calendar.url)
-    return parse_ical(text, horizon_days=horizon_days)
+    return parse_ical(text, horizon_days=horizon_days, today=today)
 
 
 async def sync_calendar(
@@ -95,6 +125,7 @@ async def sync_calendar(
     *,
     horizon_days: int = DEFAULT_HORIZON_DAYS,
     force: bool = False,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Refresh one calendar's cached event spans. See module docstring for the
     transient/permanent error contract.
@@ -115,8 +146,21 @@ async def sync_calendar(
     # exclusive.
     await db.execute(select(WolCalendar).where(WolCalendar.id == calendar.id).with_for_update())
 
+    tz_names = list(
+        (
+            await db.execute(
+                select(WolSchedule.timezone)
+                .where(WolSchedule.calendar_id == calendar.id)
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    today = horizon_anchor(tz_names, now or datetime.now(UTC))
+
     try:
-        parsed = await _load_events_for_calendar(calendar, horizon_days=horizon_days)
+        parsed = await _load_events_for_calendar(calendar, horizon_days=horizon_days, today=today)
     except _TRANSIENT as exc:
         # Never surface the raw fetch exception — an httpx error echoes the
         # target URL/status and an SSRF'd body could leak through the

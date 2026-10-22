@@ -733,6 +733,8 @@ DHCPClientClass
 
 Classes are referenced by pool `class_restriction` field. The DHCP driver translates these to server-native syntax.
 
+The reference is by name, and Kea accepts a name it does not define (the pool then matches nobody), so the API guards it (#2285): renaming or deleting a class, or deleting a device policy, is refused with a 409 while a pool in the group (or another class's `member()` test) still names it; a pool naming a class that does not exist is a 422. A dangling restriction that still reaches a bundle is rendered as stored (fail closed, never opened to every client) and logged as `dhcp_pool_restricted_to_undefined_class` when the set of dangling references changes.
+
 ### Address family (#1229, #1295)
 
 Kea runs one daemon per family, and a class goes only into the daemons its
@@ -1077,6 +1079,51 @@ drain the queue faster.
 *What is left.* The re-sends at 1024 and 4096 match the kernel's drops on
 Kea's raw socket in those runs: 1,042 and 505. Those drops are counted:
 they are `socket_drop` (above).
+
+## 4d. An OOM-killed Kea is reported (#2023)
+
+Kea runs under the dhcp-kea container's memory limit. When it reaches
+that limit the container is killed and restarted into the same config,
+and without a record that is a crash loop in which every surface reads
+healthy between kills. The kill is now reported as the daemon state
+`degraded` with an `oom_killed:` reason, which the control plane reads
+as **not serving**: the red chip on the server row and the default-on
+**Agent daemon not serving** alert (five-minute grace, the same rule
+the DNS side uses; no new rule or column). An unreported state stays
+NULL (unknown), never "no OOM".
+
+How the kill is seen depends on the deployment:
+
+- **Appliance (Kubernetes / k3s).** The kubelet sets
+  `memory.oom.group` on every container, so Kea and the DHCP agent die
+  together and the agent can write nothing. The supervisor reports the
+  container's last termination (`OOMKilled`) in `role_health`, and the
+  control plane stamps it onto the live Kea row (the most recently seen
+  of the rows the appliance owns), over the restarted agent's `ok`,
+  timed from the kill. It counts for 10 minutes after the container is
+  back up, and only while the supervisor is heartbeating (15 minutes).
+- **Docker Compose.** Docker kills the one largest process, so the agent
+  survives. It samples the container cgroup's `oom_kill` counter
+  (`memory.events`, or `memory.oom_control` on cgroup v1) once a
+  second, persists a record in its state dir (`daemon_oom.json`) and
+  reports it on every heartbeat, over the sync loop's own `ok`. The
+  record clears when the counter has been still for 10 minutes. The
+  counter says a process in the container was OOM-killed, not which one,
+  and Kea is not the only candidate: the agent's own `kea-dhcpX -t`
+  config preflight loads the whole config, and radvd runs there too. So
+  a move is recorded only when Kea did not survive it, read from Kea's
+  pid files (`/run/kea/kea-dhcp{4,6}.kea-dhcp{4,6}.pid`): a pid gone, or
+  changed since the previous second, is a killed Kea. Both daemons alive
+  under the same pids means something else was killed; the agent logs
+  `dhcp_oom_kill_not_kea` and reports nothing, because Kea is serving.
+  Unreadable pid files prove nothing either way, so the kill is reported,
+  worded as unconfirmed. If the agent itself is the victim nothing is
+  recorded: the entrypoint takes the container down with it.
+- **Plain Helm install (umbrella chart)** group-kills like the
+  appliance but has no supervisor, so only the pod's last state
+  (`kubectl get pod ... -o jsonpath='{.status.containerStatuses[0].lastState}'`)
+  records it. The kubelet's `singleProcessOOMKill: true` (Kubernetes
+  1.32+) restores the single-process kill and the agent's own record.
 
 ---
 
