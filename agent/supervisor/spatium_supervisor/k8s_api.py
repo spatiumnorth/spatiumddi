@@ -1918,6 +1918,44 @@ def patch_node_labels(
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+def daemonset_template_env(
+    name: str,
+    *,
+    env_name: str,
+    namespace: str = "spatium",
+    timeout: float = 5.0,
+) -> tuple[bool | None, str | None, str | None]:
+    """``(exists, value, error)``: the literal ``env_name`` of a DaemonSet's pod
+    TEMPLATE, i.e. what a pod scheduled onto a node right now would start with.
+
+    #2190 — the role apply reads this before it labels a node for a role, so a
+    label flip cannot start a pod from the previous chart revision's values.
+    ``exists`` is ``False`` on a 404 (nothing to schedule from) and ``None``
+    when the read failed (``error`` says why). ``value`` is the first literal
+    ``value`` any container sets for ``env_name``, ``None`` when none does."""
+    path = f"/apis/apps/v1/namespaces/{quote(namespace)}/daemonsets/{quote(name)}"
+    try:
+        status, body = _request("GET", path, timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        return None, None, str(exc)
+    if status == 404:
+        return False, None, None
+    if status != 200:
+        return None, None, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None, None, "unparseable daemonset"
+    if not isinstance(doc, dict):
+        return None, None, "unparseable daemonset"
+    pod_spec = ((doc.get("spec") or {}).get("template") or {}).get("spec") or {}
+    for container in pod_spec.get("containers") or []:
+        for env in (container or {}).get("env") or []:
+            if (env or {}).get("name") == env_name and "value" in env:
+                return True, str(env.get("value") or ""), None
+    return True, None, None
+
+
 def count_nodes(timeout: float = 5.0) -> tuple[int, int, str | None]:
     """``(registered, ready_and_schedulable, error)`` over ``/api/v1/nodes``.
 

@@ -35,6 +35,7 @@ from app.core.permissions import user_has_permission
 from app.core.responses import PdfResponse
 from app.models.audit import AuditLog
 from app.models.conformity import ConformityPolicy, ConformityResult
+from app.services import alerts as alert_service
 from app.services.conformity import evaluate_policy
 from app.services.conformity.checks import (
     CHECK_CATALOG,
@@ -407,8 +408,11 @@ async def evaluate_policy_now(
     p = await db.get(ConformityPolicy, policy_id)
     if p is None:
         raise HTTPException(status_code=404, detail="Policy not found")
-    summary = await evaluate_policy(db, p)
+    # #2261 — commit the results and any alert event before paging anyone.
+    with alert_service.defer_deliveries() as pending:
+        summary = await evaluate_policy(db, p)
     await db.commit()
+    await alert_service.deliver_deferred(db, pending)
     return EvaluateNowResponse(
         passed=summary["passed"],
         failed=summary["failed"],
