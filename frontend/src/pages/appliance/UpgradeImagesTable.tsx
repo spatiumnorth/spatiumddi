@@ -95,6 +95,14 @@ export function UpgradeImagesTable() {
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [outcomes, setOutcomes] = useState<BulkOutcome[]>([]);
   const [running, setRunning] = useState(false);
+  // What a running bulk/single action is doing right now, shown above the
+  // table so it is visible without scrolling to the row's Actions cell.
+  const [activity, setActivity] = useState<{
+    verb: "Importing" | "Deleting";
+    label: string;
+    index: number;
+    total: number;
+  } | null>(null);
 
   const imagesQuery = useQuery({
     queryKey: ["appliance", "upgrade-images"],
@@ -172,11 +180,19 @@ export function UpgradeImagesTable() {
     setRunning(true);
     const results: BulkOutcome[] = [];
     const done = new Set<string>();
-    for (const r of rows) {
-      if (!r.staged) continue;
+    const todo = rows.filter((r) => r.staged);
+    for (const [i, r] of todo.entries()) {
       setBusyKey(r.key);
+      setActivity({
+        verb: "Deleting",
+        label: `${r.version} (${r.architecture ?? "unknown"})`,
+        index: i + 1,
+        total: todo.length,
+      });
+      const staged = r.staged;
+      if (!staged) continue;
       try {
-        await applianceUpgradeImagesApi.remove(r.staged.id, force);
+        await applianceUpgradeImagesApi.remove(staged.id, force);
         results.push({ key: r.key, version: r.version, result: "deleted" });
         done.add(r.key);
       } catch (err) {
@@ -192,6 +208,7 @@ export function UpgradeImagesTable() {
       }
     }
     setBusyKey(null);
+    setActivity(null);
     setRunning(false);
     setSelected((prev) => {
       const next = new Set(prev);
@@ -208,13 +225,21 @@ export function UpgradeImagesTable() {
     setRunning(true);
     const results: BulkOutcome[] = [];
     const done = new Set<string>();
-    for (const r of rows) {
-      if (!r.available) continue;
+    const todo = rows.filter((r) => r.available);
+    for (const [i, r] of todo.entries()) {
       setBusyKey(r.key);
+      setActivity({
+        verb: "Importing",
+        label: `${r.version} (${r.architecture ?? "unknown"})`,
+        index: i + 1,
+        total: todo.length,
+      });
+      const av = r.available;
+      if (!av) continue;
       try {
         await applianceUpgradeImagesApi.importFromGithub(
-          r.available.tag,
-          r.available.architecture,
+          av.tag,
+          av.architecture,
         );
         results.push({ key: r.key, version: r.version, result: "imported" });
         done.add(r.key);
@@ -228,6 +253,7 @@ export function UpgradeImagesTable() {
       }
     }
     setBusyKey(null);
+    setActivity(null);
     setRunning(false);
     setSelected((prev) => {
       const next = new Set(prev);
@@ -386,6 +412,29 @@ export function UpgradeImagesTable() {
         </p>
       )}
 
+      {activity && (
+        <div
+          className="flex min-w-0 flex-wrap items-center gap-2 rounded-md border border-primary/40 bg-primary/5 p-2"
+          role="status"
+        >
+          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+          <span className="min-w-0 break-all font-medium">
+            {activity.verb} {activity.label}
+          </span>
+          {activity.total > 1 && (
+            <span className="text-muted-foreground">
+              {activity.index} of {activity.total}
+            </span>
+          )}
+          {activity.verb === "Importing" && (
+            <span className="text-muted-foreground">
+              Downloading and verifying on the control plane; this can take
+              several minutes.
+            </span>
+          )}
+        </div>
+      )}
+
       {outcomes.length > 0 && (
         <div className="rounded-md border p-2" role="status">
           <div className="mb-1 flex items-center justify-between">
@@ -437,7 +486,7 @@ export function UpgradeImagesTable() {
         </p>
       ) : (
         <div className="overflow-x-auto rounded-md border">
-          <table className="w-full min-w-[1000px] text-xs">
+          <table className="w-full min-w-[900px] text-xs">
             <thead>
               <tr className="border-b bg-muted/30 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
                 <th className="w-8 px-2 py-1.5">
@@ -461,7 +510,9 @@ export function UpgradeImagesTable() {
                 {th("staged", "Staged")}
                 <th className="py-1.5 pr-2 font-medium">Fleet</th>
                 <th className="py-1.5 pr-2 font-medium">In use</th>
-                <th className="py-1.5 pr-2 text-right font-medium">Actions</th>
+                <th className="sticky right-0 bg-muted py-1.5 pl-2 pr-2 text-right font-medium">
+                  Actions
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y">
@@ -632,7 +683,7 @@ function ImageTableRow({
             </div>
           )}
         </td>
-        <td className="py-1 pr-2 text-right">
+        <td className="sticky right-0 bg-background py-1 pl-2 pr-2 text-right">
           <div className="flex flex-wrap justify-end gap-1">
             {!r.staged && r.available && (
               <button

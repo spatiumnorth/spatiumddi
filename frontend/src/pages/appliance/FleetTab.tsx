@@ -1229,12 +1229,14 @@ export function FleetTab({
       <main className="flex-1 overflow-y-auto">
         {/* The appliances list is a wide multi-column table — let it use
             the full pane width (like the IPAM table) instead of the
-            max-w-5xl cap the narrower config forms (pairing / upgrade-images
-            / NTP / SNMP) read better at. */}
+            max-w-5xl cap the narrower config forms (pairing / NTP / SNMP)
+            read better at. Upgrade images is a wide table too (#2410). */}
         <div
           className={cn(
             "mx-auto p-6",
-            view === "appliances" ? "max-w-none" : "max-w-5xl",
+            view === "appliances" || view === "upgrade-images"
+              ? "max-w-none"
+              : "max-w-5xl",
           )}
         >
           {view === "pairing" && (
