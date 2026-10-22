@@ -13,25 +13,17 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 
-from app.api.deps import DB, CurrentUser
-from app.core.permissions import is_effective_superadmin
+from app.api.deps import DB, SuperAdmin
+from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.diagnostics import InternalError
 from app.services.dns_names_report import scan_name_conformance
 
 router = APIRouter()
-
-
-def _require_superadmin(user_obj: User) -> None:
-    if not is_effective_superadmin(user_obj):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Diagnostics surface is restricted to superadmin",
-        )
 
 
 # ── Schemas ────────────────────────────────────────────────────────────
@@ -97,7 +89,7 @@ class InternalErrorStats(BaseModel):
 @router.get("/errors", response_model=list[InternalErrorListItem])
 async def list_errors(
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     service: str | None = Query(None, description="api / worker / beat"),
     acknowledged: str | None = Query(
         None,
@@ -115,7 +107,6 @@ async def list_errors(
     ),
     limit: int = Query(200, ge=1, le=500),
 ) -> list[InternalError]:
-    _require_superadmin(current_user)
     stmt = select(InternalError).order_by(desc(InternalError.last_seen_at))
     if service:
         stmt = stmt.where(InternalError.service == service)
@@ -135,9 +126,8 @@ async def list_errors(
 @router.get("/errors/stats", response_model=InternalErrorStats)
 async def error_stats(
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> InternalErrorStats:
-    _require_superadmin(current_user)
     total = (await db.execute(select(func.count()).select_from(InternalError))).scalar_one()
     unack = (
         await db.execute(
@@ -165,13 +155,34 @@ async def error_stats(
 async def get_error(
     error_id: uuid.UUID,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> InternalError:
-    _require_superadmin(current_user)
     row = await db.get(InternalError, error_id)
     if row is None:
         raise HTTPException(status_code=404, detail="error not found")
     return row
+
+
+def _audit_error(
+    action: str, row: InternalError, user: User, *, extra: dict[str, Any] | None = None
+) -> AuditLog:
+    """One audit row for a mutation of a captured error (#2301). Carries
+    the fingerprint and exception class; never the traceback."""
+    return AuditLog(
+        action=action,
+        resource_type="internal_error",
+        resource_id=str(row.id),
+        resource_display=f"{row.exception_class} ({row.fingerprint[:12]})",
+        user_id=user.id,
+        user_display_name=user.username,
+        result="success",
+        new_value={
+            "fingerprint": row.fingerprint,
+            "exception_class": row.exception_class,
+            "service": row.service,
+            **(extra or {}),
+        },
+    )
 
 
 class AcknowledgeRequest(BaseModel):
@@ -182,15 +193,15 @@ class AcknowledgeRequest(BaseModel):
 async def acknowledge_error(
     error_id: uuid.UUID,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> InternalError:
-    _require_superadmin(current_user)
     row = await db.get(InternalError, error_id)
     if row is None:
         raise HTTPException(status_code=404, detail="error not found")
     if row.acknowledged_by is None:
         row.acknowledged_by = current_user.id
         row.acknowledged_at = datetime.now(UTC)
+        db.add(_audit_error("acknowledge", row, current_user))
         await db.commit()
         await db.refresh(row)
     return row
@@ -205,7 +216,7 @@ async def suppress_error(
     error_id: uuid.UUID,
     body: SuppressRequest,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> InternalError:
     """Silence the matching fingerprint for ``hours``. While the
     suppression window is active the capture loop still bumps
@@ -213,11 +224,18 @@ async def suppress_error(
     inserted. The "Suppress 24h" button in the admin viewer hits
     this with ``hours=24``.
     """
-    _require_superadmin(current_user)
     row = await db.get(InternalError, error_id)
     if row is None:
         raise HTTPException(status_code=404, detail="error not found")
     row.suppressed_until = datetime.now(UTC) + timedelta(hours=body.hours)
+    db.add(
+        _audit_error(
+            "suppress",
+            row,
+            current_user,
+            extra={"hours": body.hours, "suppressed_until": row.suppressed_until.isoformat()},
+        )
+    )
     await db.commit()
     await db.refresh(row)
     return row
@@ -227,12 +245,14 @@ async def suppress_error(
 async def delete_error(
     error_id: uuid.UUID,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> None:
-    _require_superadmin(current_user)
     row = await db.get(InternalError, error_id)
     if row is None:
         raise HTTPException(status_code=404, detail="error not found")
+    db.add(
+        _audit_error("delete", row, current_user, extra={"occurrence_count": row.occurrence_count})
+    )
     await db.delete(row)
     await db.commit()
 
@@ -266,7 +286,7 @@ class NameConformanceReport(BaseModel):
 @router.get("/name-conformance", response_model=NameConformanceReport)
 async def name_conformance(
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> NameConformanceReport:
     """Report existing names that the #597 DNS-name validators would reject.
 
@@ -275,5 +295,4 @@ async def name_conformance(
     hostnames, DNS record owners, DNS zone names, DHCP static hostnames)
     so an operator can fix them deliberately. Nothing is mutated.
     """
-    _require_superadmin(current_user)
     return NameConformanceReport.model_validate(await scan_name_conformance(db))

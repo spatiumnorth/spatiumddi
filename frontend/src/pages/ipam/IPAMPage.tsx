@@ -173,6 +173,7 @@ import { cidrContains, compareNetwork, isCgnatCidr } from "@/lib/cidr";
 import { FreeSpaceBand } from "@/components/ipam/FreeSpaceBand";
 import { PlanAllocationModal } from "@/components/ipam/PlanAllocationModal";
 import { AggregationCandidatesBadge } from "@/components/ipam/AggregationSuggestions";
+import { toLocalInputValue } from "@/lib/localTime";
 import { FreeSpaceTreemap } from "@/components/ipam/FreeSpaceTreemap";
 import { SubnetUtilizationHistory } from "@/components/ipam/SubnetUtilizationHistory";
 import {
@@ -1426,13 +1427,13 @@ function DhcpSettingsSection({
   const { data: blockDhcp } = useQuery({
     queryKey: ["effective-dhcp-block", parentBlockId],
     queryFn: () => ipamApi.getEffectiveBlockDhcp(parentBlockId!),
-    enabled: !!parentBlockId,
+    enabled: dhcpOn && !!parentBlockId,
     staleTime: 30_000,
   });
   const { data: spaceDhcp } = useQuery({
     queryKey: ["effective-dhcp-space", fallbackSpaceId],
     queryFn: () => ipamApi.getEffectiveSpaceDhcp(fallbackSpaceId!),
-    enabled: !parentBlockId && !!fallbackSpaceId,
+    enabled: dhcpOn && !parentBlockId && !!fallbackSpaceId,
     staleTime: 30_000,
   });
   const effectiveDhcp = blockDhcp ?? spaceDhcp ?? null;
@@ -9014,19 +9015,6 @@ function withStoredValue(
   return value && !options.includes(value) ? [value, ...options] : options;
 }
 
-// Format a UTC ISO instant as a ``datetime-local`` value (local wall-clock,
-// ``YYYY-MM-DDTHH:MM``, no TZ suffix). Naively slicing ``toISOString()``
-// yields the *UTC* wall-clock, which the local-time input then misreads — so
-// every open→save cycle drifted the reservation by the browser's UTC offset
-// (#500). Shifting by the offset first makes the sliced string local, matching
-// how ``new Date(value)`` re-parses it on save.
-function toLocalDatetimeInput(iso: string): string {
-  const d = new Date(iso);
-  return new Date(d.getTime() - d.getTimezoneOffset() * 60000)
-    .toISOString()
-    .slice(0, 16);
-}
-
 export function EditAddressModal({
   address,
   onClose,
@@ -9042,7 +9030,7 @@ export function EditAddressModal({
   const [role, setRole] = useState<string>(address.role ?? "");
   // datetime-local needs ``YYYY-MM-DDTHH:MM`` in *local* wall-clock (#500).
   const [reservedUntil, setReservedUntil] = useState<string>(
-    address.reserved_until ? toLocalDatetimeInput(address.reserved_until) : "",
+    address.reserved_until ? toLocalInputValue(address.reserved_until) : "",
   );
   const [customFields, setCustomFields] = useState<Record<string, unknown>>(
     (address.custom_fields as Record<string, unknown>) ?? {},

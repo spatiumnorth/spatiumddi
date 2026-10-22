@@ -17,6 +17,7 @@ from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
 from .ha_tls import AGENT_CAPABILITIES
+from .oom_watch import OomWatch
 from .spool import SpoolManager
 
 log = structlog.get_logger(__name__)
@@ -37,6 +38,9 @@ class HeartbeatClient:
         self.token_ref = token_ref
         self._stop = threading.Event()
         self.daemon_status: dict[str, Any] = {}
+        # #2023 — the supervisor sets this. A standing OOM record outranks
+        # ``daemon_status`` on the wire (see ``_wire_daemon``).
+        self.oom_watch: OomWatch | None = None
         # #882 — set by SyncLoop (constructed after this object, assigns itself
         # in). Rides the heartbeat's ``config`` field so the control plane can
         # tell a Kea that is up but running a REVERTED config apart from one
@@ -92,16 +96,29 @@ class HeartbeatClient:
             self._kea_version_cached = kea_ctrl.version_get(self.cfg.kea_control_socket)
         return self._kea_version_cached
 
+    def _wire_daemon(self) -> dict[str, Any]:
+        """The ``daemon`` field to send: an OOM record (#2023) when one
+        stands, else the sync loop's own status.
+
+        An overlay rather than a ``daemon_status`` assignment because the sync
+        loop writes ``{"status": "ok"}`` after every good reload, and a Kea
+        that was just killed reloads fine: an assignment would be erased on the
+        next apply, and an apply succeeding says nothing about whether Kea then
+        survives its config."""
+        oom = self.oom_watch.daemon_status() if self.oom_watch is not None else None
+        return oom if oom is not None else self.daemon_status
+
     def send_once(self) -> None:
         # Drain queued op acks (queued by SyncLoop when bundle includes pending_ops).
         ops_ack: list[dict] = []
         while self.pending_acks:
             ops_ack.append(self.pending_acks.pop(0))
+        daemon = self._wire_daemon()
         body: dict[str, Any] = {
             "agent_version": __version__,
             "pid": os.getpid(),
-            "status": self.daemon_status.get("status", "ok"),
-            "daemon": self.daemon_status,
+            "status": daemon.get("status", "ok"),
+            "daemon": daemon,
             # #882 — last config-apply verdict. The server's request model has
             # declared a ``config`` field since the beginning; until now the
             # DHCP agent never sent one and the handler never read one.
