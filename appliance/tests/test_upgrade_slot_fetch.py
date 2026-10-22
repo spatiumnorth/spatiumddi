@@ -206,6 +206,51 @@ def test_a_cut_download_is_never_taken_for_a_whole_one(slot_cli, serve, tmp_path
         slot_cli.fetch_to(s.url, dst)
 
 
+# ── #1804: the download must not pile up in the page cache ──────────
+
+
+def _small_flush_window(slot_cli, monkeypatch):
+    """64 KiB reads, a flush every 256 KiB: four flushes in BODY."""
+    monkeypatch.setattr(slot_cli, "_FETCH_CHUNK_BYTES", 64 * 1024, raising=False)
+    monkeypatch.setattr(slot_cli, "_FETCH_SYNC_BYTES", 256 * 1024, raising=False)
+
+
+def test_the_download_is_flushed_to_disk_as_it_lands(slot_cli, serve, tmp_path, monkeypatch):
+    """The image lands on /var, beside etcd's WAL, while the node serves.
+    Left dirty, 300-400 MB of it were flushed in one go when the slot write
+    began, and etcd's fdatasync waited up to 8.4 s behind it (#1804)."""
+    _small_flush_window(slot_cli, monkeypatch)
+    real_fdatasync = getattr(os, "fdatasync", os.fsync)
+    flushed_at: list[int] = []
+
+    def fdatasync(fd):
+        flushed_at.append(os.fstat(fd).st_size)
+        real_fdatasync(fd)
+
+    monkeypatch.setattr(os, "fdatasync", fdatasync, raising=False)
+    s = serve(("full",))
+    dst = tmp_path / "slot.raw.xz"
+    slot_cli.fetch_to(s.url, dst)
+    assert dst.read_bytes() == BODY
+    assert flushed_at == [256 * 1024, 512 * 1024, 768 * 1024, 1024 * 1024]
+
+
+def test_a_flush_that_fails_is_a_local_write_error(slot_cli, serve, tmp_path, monkeypatch):
+    """A disk that fails the flush fails like one that fails a write: at
+    once, not retried as transfer trouble."""
+    _small_flush_window(slot_cli, monkeypatch)
+
+    def fdatasync(fd):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(os, "fdatasync", fdatasync, raising=False)
+    s = serve(("full",))
+    dst = tmp_path / "slot.raw.xz"
+    with pytest.raises(slot_cli._LocalWriteError, match="Input/output error"):
+        slot_cli.fetch_to(s.url, dst)
+    assert len(s.requests) == 1
+
+
 # ── retries ─────────────────────────────────────────────────────────
 
 

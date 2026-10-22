@@ -991,6 +991,21 @@ the factor falls with it). So 582k entries x 2 zones is about 3.9 GB and
 needs a node with 8 GiB or more; one list on a group with no views is about
 half that.
 
+**That peak is paid only when a list changed (#2157).** The control plane
+ships a content hash with each RPZ zone, and the agent records it beside the
+zone file it wrote (`<zone>.db.sha256`). An apply whose hash matches, such
+as removing a forward zone or editing a group option, hard-links the file it
+already serves into the new tree instead of rendering it: no serialisation,
+no bytes written, no `named-checkzone` run, and no reload of that zone in
+named. Only a zone whose entries, exceptions or block mode changed is
+rendered and reloaded, so "about 3 kB per entry while an apply is in flight"
+counts the lists that changed in that apply, not every list on every apply.
+The backup tree the last-known-good revert uses (`rendered.prev`) shares
+those files' inodes, so an unchanged list costs no extra disk there either.
+The first apply after upgrading renders and reloads every RPZ zone once:
+there is no recorded hash to match yet, and the zone's SOA serial now
+derives from its content. After that, only changed lists are touched.
+
 **Worked example: one popular catalog feed.** The catalog's AdGuard DNS
 filter was about 186k entries when this was written; the count moves with
 every upstream update. On a group with no views that is one RPZ zone, so by
