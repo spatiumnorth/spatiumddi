@@ -26,6 +26,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.tailscale import TailscaleTenant
+from app.services.dns.bundle_dirty import mark_integration_dns_released
 from app.services.integration_credentials import credential_status
 from app.services.tailscale.client import AUTH_REJECTED_PREFIX, is_auth_rejected
 from app.services.tailscale.token_expiry import (
@@ -133,7 +134,7 @@ class TenantResponse(BaseModel):
     api_key_expires_at: datetime | None
     # "api" (read from Tailscale) | "operator" (typed in) | null.
     api_key_expiry_source: str | None
-    # ok | expiring | expired | rejected | unknown — see
+    # ok | expiring | expired | rejected | unknown | disabled — see
     # app/services/integration_credentials.py.
     credential_state: str
     credential_days_left: int | None
@@ -178,6 +179,7 @@ def _to_response(t: TailscaleTenant) -> TenantResponse:
         expires_at=t.api_key_expires_at,
         rejected=is_auth_rejected(t.last_sync_error),
         now=datetime.now(UTC),
+        enabled=t.enabled,
     )
     return TenantResponse(
         id=t.id,
@@ -423,6 +425,8 @@ async def delete_tenant(tenant_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     if t is None:
         raise HTTPException(status_code=404, detail="Tailscale tenant not found")
     _audit(db, user=user, action="delete", tenant_id=t.id, tenant_name=t.name)
+    # #2288 — the DNS rows cascade in the database; mark their groups' bundles dirty.
+    await mark_integration_dns_released(db, own_fk="tailscale_tenant_id", target_id=t.id)
     await db.delete(t)
     await db.commit()
 

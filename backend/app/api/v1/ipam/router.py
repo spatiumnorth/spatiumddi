@@ -8730,6 +8730,32 @@ async def list_mac_history(
 # would be circular. See ``_register_network_context_endpoint`` below.
 
 
+async def _clear_ip_dns_zone(db: AsyncSession, ip: IPAddress, subnet: Subnet) -> bool:
+    """Remove an address's DNS presence: the operator picked "None" as its zone.
+
+    The one clear path, shared by single Edit and Bulk edit (#2172) so the two
+    cannot diverge. It deletes every auto-generated record the row owns — the
+    forward A/AAAA in its zone and in any extra zone, the PTR, and its aliases
+    (#2084) — queueing a delete op for each zone IPAM authors. It then nulls
+    ``forward_zone_id`` and empties ``extra_zone_ids``: with either left set,
+    the next Sync DNS (and the scheduled auto-sync) lists the record missing
+    there and publishes it again, as does a later unrelated edit. A subnet
+    that has a forward zone of its own still claims the host: the address
+    follows it, so Sync DNS offers the record there.
+
+    It must go through ``action="delete"``: an ``"update"`` with
+    ``zone_id=None`` means "resolve a zone", which falls back to the subnet's
+    zone (a move) or the row's own ``forward_zone_id`` (a re-publish in place),
+    and removes nothing (#502, #2172). An address with no records is a no-op.
+
+    Returns whether any record was removed.
+    """
+    removed = await _sync_dns_record(db, ip, subnet, action="delete")
+    ip.forward_zone_id = None
+    ip.extra_zone_ids = []
+    return removed
+
+
 @router.put("/addresses/{address_id}", response_model=IPAddressResponse)
 async def update_address(
     address_id: uuid.UUID, body: IPAddressUpdate, current_user: CurrentUser, db: DB
@@ -8912,11 +8938,17 @@ async def update_address(
         # falls back to the subnet's effective zone (and early-returns on an
         # empty hostname), so it would NOT actually remove the records
         # (#502, and the bot review of the #493 fix).
-        await _sync_dns_record(db, ip, subnet, action="delete")
         if zone_cleared:
-            # Make the removal stick: without this a later unrelated edit
-            # would preserve forward_zone_id and re-create the record.
-            ip.forward_zone_id = None
+            # Also nulls forward_zone_id and empties extra_zone_ids, so the
+            # removal sticks: otherwise Sync DNS, or a later unrelated edit,
+            # would publish the records there again (#2172). The clear wins
+            # over extra_zone_ids sent in the same request.
+            if ip.extra_zone_ids:
+                old["extra_zone_ids"] = list(ip.extra_zone_ids)
+                changes_for_audit["extra_zone_ids"] = []
+            await _clear_ip_dns_zone(db, ip, subnet)
+        else:
+            await _sync_dns_record(db, ip, subnet, action="delete")
     elif subnet and ("hostname" in changes or dns_zone_explicit or extras_changed):
         # zone_cleared is handled above, so an explicit zone here is a real
         # UUID; otherwise preserve the IP's current forward zone (#493).
@@ -10957,8 +10989,9 @@ class IPAddressBulkChanges(BaseModel):
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
     # Apply a forward DNS zone change to every selected IP. Triggers per-row
-    # record reconciliation (create / move / delete) via _sync_dns_record.
-    # Use the empty string ``""`` to clear a zone assignment.
+    # record reconciliation (create / move) via _sync_dns_record. The empty
+    # string ``""`` clears: each address's records are removed and its
+    # ``forward_zone_id`` nulled, as single Edit does for zone None (#2172).
     dns_zone_id: str | None = None
     # Role + reservation TTL — both opt-in like the other bulk fields.
     # Empty string on ``role`` clears (= "no specific role" for the
@@ -10993,6 +11026,9 @@ class IPAddressBulkEditResponse(BaseModel):
     updated_count: int
     not_found: list[uuid.UUID] = []
     skipped: list[uuid.UUID] = []
+    # With ``dns_zone_id: ""``: the updated addresses whose DNS records were
+    # removed. An updated address absent from it had none to remove (#2172).
+    dns_cleared: list[uuid.UUID] = []
 
 
 @router.post("/addresses/bulk-edit", response_model=IPAddressBulkEditResponse)
@@ -11034,6 +11070,8 @@ async def bulk_edit_addresses(
     skipped: list[uuid.UUID] = []
     # Subnets whose utilization must be recomputed after the batch (#509).
     touched_subnets: set[uuid.UUID] = set()
+    # Addresses whose DNS records a zone clear removed (#2172).
+    dns_cleared: list[uuid.UUID] = []
 
     tags_patch = body.changes.tags
     cf_patch = body.changes.custom_fields
@@ -11167,9 +11205,20 @@ async def bulk_edit_addresses(
                         subnet_cache[ip.subnet_id] = subnet
                 if subnet is not None:
                     old["forward_zone_id"] = str(ip.forward_zone_id) if ip.forward_zone_id else None
-                    await _sync_dns_record(
-                        db, ip, subnet, zone_id=new_zone_id, action="update", strict=True
-                    )
+                    if new_zone_id is None:
+                        if ip.extra_zone_ids:
+                            old["extra_zone_ids"] = list(ip.extra_zone_ids)
+                        # ``""`` clears (#2172): the same removal single Edit
+                        # runs for zone None. An ``"update"`` with
+                        # ``zone_id=None`` would resolve a zone instead, moving
+                        # the records into the subnet's zone or re-publishing
+                        # them where they are.
+                        if await _clear_ip_dns_zone(db, ip, subnet):
+                            dns_cleared.append(ip.id)
+                    else:
+                        await _sync_dns_record(
+                            db, ip, subnet, zone_id=new_zone_id, action="update", strict=True
+                        )
 
             db.add(
                 _audit(
@@ -11223,6 +11272,7 @@ async def bulk_edit_addresses(
         updated_count=updated,
         not_found=not_found,
         skipped=skipped,
+        dns_cleared=dns_cleared,
     )
 
 

@@ -21,6 +21,7 @@ from sqlalchemy import func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
 from app.core.permissions import require_resource_permission
+from app.models.dns import DNSPool, DNSPoolMember
 from app.models.e911 import EmergencyResponseLocation, ERLBinding
 from app.models.ownership import SITE_KINDS, Site
 
@@ -260,6 +261,34 @@ async def update_site(site_id: uuid.UUID, body: SiteUpdate, db: DB, user: Curren
     return SiteRead.model_validate(row)
 
 
+async def _pool_member_referrers(db: DB, site_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[str]]:
+    """DNS pool members geo-scoped to each site (``site_id`` is SET NULL, so a
+    delete would silently turn them into default answers for every client)."""
+    rows = (
+        await db.execute(
+            select(DNSPoolMember.site_id, DNSPool.name, DNSPoolMember.address)
+            .join(DNSPool, DNSPool.id == DNSPoolMember.pool_id)
+            .where(DNSPoolMember.site_id.in_(site_ids))
+            .order_by(DNSPool.name, DNSPoolMember.address)
+        )
+    ).all()
+    out: dict[uuid.UUID, list[str]] = {}
+    for sid, pool_name, address in rows:
+        out.setdefault(sid, []).append(f"{pool_name} ({address})")
+    return out
+
+
+def _refuse_if_referenced(row_name: str, refs: list[str]) -> None:
+    if refs:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Site '{row_name}' is the geo scope of DNS pool member(s): "
+                f"{', '.join(refs)}. Re-scope or remove them first."
+            ),
+        )
+
+
 async def _refuse_if_e911_bound(db: DB, sites: list[Site]) -> None:
     """409 when any of ``sites`` still carries an E911 ``site_default`` binding.
 
@@ -305,6 +334,7 @@ async def delete_site(site_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     row = await db.get(Site, site_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Site not found")
+    _refuse_if_referenced(row.name, (await _pool_member_referrers(db, [row.id])).get(row.id, []))
 
     await _refuse_if_e911_bound(db, [row])
 
@@ -329,6 +359,9 @@ async def bulk_delete_sites(body: SiteBulkDelete, db: DB, user: CurrentUser) -> 
     found_ids = {r.id for r in rows}
     not_found = [str(i) for i in body.ids if i not in found_ids]
 
+    refs = await _pool_member_referrers(db, [r.id for r in rows])
+    for r in rows:
+        _refuse_if_referenced(r.name, refs.get(r.id, []))
     # All-or-nothing: a partial delete would leave the operator guessing
     # which sites went.
     await _refuse_if_e911_bound(db, list(rows))

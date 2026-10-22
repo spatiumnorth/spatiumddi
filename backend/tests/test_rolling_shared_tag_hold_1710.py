@@ -14,6 +14,12 @@ runs until every node reports the target, then move once.
 
 * Before its first node the run pins the bootstrap and control charts' tag in
   their HelmChartConfigs, and re-asserts the pins before every node.
+* With the tags it pins the control chart's ``applianceVersion``, the value
+  that sets APPLIANCE_VERSION in the api, worker and beat env (#2004), to the
+  version the control plane reports (#2176). The seed's firstboot moves it
+  with the tag, and a pod template that changes rolls the pods whatever their
+  image: the control plane rolled mid-run on the held image and shut down the
+  worker the drive ran on.
 * Each node of the run is told, in its heartbeat, that the cluster is held.
 * When every node is done, the flip removes the pins (the keys, so nothing
   outlives the run), ends the hold, and hands the rest of the run to a worker
@@ -44,6 +50,9 @@ from app.services.upgrades import per_node
 
 FROM = "2026.10.13-1"
 TO = "2026.10.14-1"
+# The version the control plane on FROM reports (APPLIANCE_VERSION). A
+# release's is its tag; a nightly's is not (below).
+FROM_VERSION = FROM
 NODES = ["node-a", "node-b", "node-c"]
 CONTROL_OVERRIDES = "api:\n  replicas: 3\nworker:\n  replicas: 3\n"
 
@@ -124,11 +133,12 @@ class FakeCluster:
 
 
 def _held_cluster() -> FakeCluster:
-    """The cluster in the middle of a held roll: both pins in place."""
+    """The cluster in the middle of a held roll: every pin in place."""
     return FakeCluster(
         {
             "spatium-bootstrap": f"global:\n  imageTag: {FROM}\n",
-            "spatium-control": CONTROL_OVERRIDES + f"image:\n  tag: {FROM}\n",
+            "spatium-control": CONTROL_OVERRIDES
+            + f"applianceVersion: '{FROM_VERSION}'\nimage:\n  tag: {FROM}\n",
         }
     )
 
@@ -137,6 +147,7 @@ def _hold_record(**over: Any) -> dict[str, Any]:
     record: dict[str, Any] = {
         "mode": "hold",
         "from_tag": FROM,
+        "from_version": FROM_VERSION,
         "to_tag": TO,
         "nodes": list(NODES),
         "placed_at": "2026-10-13T18:00:00Z",
@@ -219,6 +230,7 @@ async def test_the_run_pins_the_running_tag_before_its_first_node(
     cluster.install(monkeypatch)
     _quiet(monkeypatch, orch)
     monkeypatch.setattr(settings, "version", FROM)
+    monkeypatch.setattr(settings, "appliance_version", FROM_VERSION)
     seen: dict[str, dict[str, Any]] = {}
 
     async def _single(*_a: Any, node_name: str, **_k: Any) -> Any:
@@ -229,18 +241,21 @@ async def test_the_run_pins_the_running_tag_before_its_first_node(
 
     await orch._drive_loop(db_session, run, asyncio.Event())
 
-    # When the first node starts, both charts are pinned to the running tag;
-    # the supervisor's overrides in the control chart's config are kept.
+    # When the first node starts, both charts are pinned to the running tag,
+    # and the control chart to the running version (#2176); the supervisor's
+    # overrides in the control chart's config are kept.
     assert seen["node-a"]["spatium-bootstrap"] == {"global": {"imageTag": FROM}}
     assert seen["node-a"]["spatium-control"] == {
         "api": {"replicas": 3},
         "worker": {"replicas": 3},
         "image": {"tag": FROM},
+        "applianceVersion": FROM_VERSION,
     }
     await db_session.refresh(run)
     record = run.progress["shared_tags"]
     assert record["mode"] == "hold"
     assert (record["from_tag"], record["to_tag"], record["nodes"]) == (FROM, TO, NODES)
+    assert record["from_version"] == FROM_VERSION
     # The node failed: the run is failed, and the hold stays.
     assert run.state == "failed"
     assert record["released_at"] is None
@@ -273,6 +288,109 @@ async def test_the_pins_are_put_back_before_every_node(
     await orch._drive_loop(db_session, run, asyncio.Event())
 
     assert seen["node-b"]["image"] == {"tag": FROM}
+
+
+@pytest.mark.asyncio
+async def test_2176_a_nightly_is_held_to_the_version_it_reports_not_to_its_tag(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """qa-review's roll e270838d (#2176): the control plane ran image tag
+    ``nightly-20261017`` and reported ``0.0.0-nightly-20261017+cf80471``. The
+    seed's firstboot on the target moved APPLIANCE_VERSION alone, and the
+    api, worker and beat rolled on every node on the held image. The pin is
+    the value the pods carry, set with the tag in one write of the control
+    chart's config, so helm-controller renders it once."""
+    from app.services.upgrades import orchestrator as orch
+
+    run = await _run(db_session, done=[])
+    cluster = FakeCluster({"spatium-control": CONTROL_OVERRIDES})
+    cluster.install(monkeypatch)
+    _quiet(monkeypatch, orch)
+    monkeypatch.setattr(settings, "version", "nightly-20261017")
+    monkeypatch.setattr(settings, "appliance_version", "0.0.0-nightly-20261017+cf80471")
+    seen: dict[str, Any] = {}
+
+    async def _single(*_a: Any, node_name: str, **_k: Any) -> Any:
+        seen[node_name] = cluster.values("spatium-control")
+        return _node_result(node_name, ok=False)
+
+    monkeypatch.setattr(orch.per_node, "single_node_upgrade", _single)
+
+    await orch._drive_loop(db_session, run, asyncio.Event())
+
+    assert seen["node-a"]["image"] == {"tag": "nightly-20261017"}
+    assert seen["node-a"]["applianceVersion"] == "0.0.0-nightly-20261017+cf80471"
+    assert cluster.writes == ["spatium-bootstrap", "spatium-control"]
+    await db_session.refresh(run)
+    assert run.progress["shared_tags"]["from_version"] == "0.0.0-nightly-20261017+cf80471"
+
+
+@pytest.mark.asyncio
+async def test_2176_the_version_put_back_before_a_node_is_the_holds_own(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write racing the pin can drop the version as it can the tag. The
+    next node puts back the version the hold recorded at its placement,
+    whatever the process driving the run now reports."""
+    from app.services.upgrades import orchestrator as orch
+
+    run = await _run(db_session, done=["node-a"], shared=_hold_record())
+    cluster = FakeCluster(
+        {
+            "spatium-bootstrap": f"global:\n  imageTag: {FROM}\n",
+            "spatium-control": CONTROL_OVERRIDES + f"image:\n  tag: {FROM}\n",
+        }
+    )
+    cluster.install(monkeypatch)
+    _quiet(monkeypatch, orch)
+    monkeypatch.setattr(settings, "version", FROM)
+    monkeypatch.setattr(settings, "appliance_version", "something-else")
+    seen: dict[str, Any] = {}
+
+    async def _single(*_a: Any, node_name: str, **_k: Any) -> Any:
+        seen[node_name] = cluster.values("spatium-control")
+        return _node_result(node_name, ok=False)
+
+    monkeypatch.setattr(orch.per_node, "single_node_upgrade", _single)
+
+    await orch._drive_loop(db_session, run, asyncio.Event())
+
+    assert seen["node-b"]["applianceVersion"] == FROM_VERSION
+    assert seen["node-b"]["image"] == {"tag": FROM}
+
+
+@pytest.mark.asyncio
+async def test_2176_a_hold_placed_before_the_version_pin_pins_its_tags_only(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hold whose record names no version was placed by a drive from
+    before #2176, which pinned the tags alone. Re-asserting it pins what that
+    drive pinned, and writes no version of its own into the pod template."""
+    from app.services.upgrades import orchestrator as orch
+
+    record = _hold_record()
+    del record["from_version"]
+    run = await _run(db_session, done=["node-a"], shared=record)
+    cluster = FakeCluster({"spatium-control": CONTROL_OVERRIDES})
+    cluster.install(monkeypatch)
+    _quiet(monkeypatch, orch)
+    monkeypatch.setattr(settings, "version", FROM)
+    monkeypatch.setattr(settings, "appliance_version", FROM_VERSION)
+    seen: dict[str, Any] = {}
+
+    async def _single(*_a: Any, node_name: str, **_k: Any) -> Any:
+        seen[node_name] = cluster.values("spatium-control")
+        return _node_result(node_name, ok=False)
+
+    monkeypatch.setattr(orch.per_node, "single_node_upgrade", _single)
+
+    await orch._drive_loop(db_session, run, asyncio.Event())
+
+    assert seen["node-b"] == {
+        "api": {"replicas": 3},
+        "worker": {"replicas": 3},
+        "image": {"tag": FROM},
+    }
 
 
 @pytest.mark.asyncio
@@ -365,8 +483,9 @@ async def test_the_flip_unpins_ends_the_hold_and_hands_off_to_the_new_version(
     stop = asyncio.Event()
     await orch._drive_loop(db_session, run, stop, "worker-a")
 
-    # Both pins are gone: the keys, not set to the target, so nothing pins
-    # the charts once the run is over. The supervisor's overrides stay.
+    # Every pin is gone, the version's too (#2176): the keys, not set to the
+    # target, so nothing pins the charts once the run is over. The
+    # supervisor's overrides stay.
     assert cluster.values("spatium-bootstrap") == {}
     assert cluster.values("spatium-control") == {"api": {"replicas": 3}, "worker": {"replicas": 3}}
     await db_session.refresh(run)
