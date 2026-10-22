@@ -119,6 +119,14 @@ jobs:
           # merges, while main's CI for that commit is still running, so
           # wait for it rather than failing. An hour covers the full
           # backend suite with room to spare.
+          #
+          # Since #2429 a push run may report success with the 12 backend
+          # shards skipped, when ci-tested-on-pr-head.sh has established that
+          # this commit's tree is byte-identical to a PR head whose own CI run
+          # passed the FULL suite. That is the same tree tested, not a weaker
+          # check, so this gate accepts it as it stands. Anything the script
+          # cannot establish (a narrowed PR run, a tree mismatch, a failed
+          # lookup) makes the push run the full suite, and this gate waits.
           deadline=$((SECONDS + 3600))
           while :; do
             runs=$(gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&event=push&per_page=20" \

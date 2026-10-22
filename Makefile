@@ -236,18 +236,33 @@ test-cov:
 	docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T api python -m pytest -n auto --cov=app --cov-report=term-missing
 
 # Refresh backend/.test_durations — the file pytest-split balances the CI
-# shards with (#1019) — from the ``test-durations`` artifact the most recent
-# successful CI run on main produced, then commit it. Run at release prep,
-# or when the ``Backend — Tests`` aggregator warns that the shards have
-# drifted. A stale file only costs balance (an unknown test is assumed
-# average), never correctness. Needs an authenticated GitHub CLI.
+# shards with (#1019) — from the ``test-durations`` artifact of the most
+# recent successful CI run on main that has one, then commit it. Since #2429
+# most pushes to main skip the shards and publish no artifact, so this looks
+# across push, schedule (the daily full run) and dispatch runs, newest first.
+# Run at release prep, or when the ``Backend — Tests`` aggregator warns that
+# the shards have drifted. A stale file only costs balance (an unknown test
+# is assumed average), never correctness. Needs an authenticated GitHub CLI.
+# Downloads into a temp dir first: ``gh run download`` refuses to overwrite
+# an existing file, so extracting straight into backend/ failed every time
+# the committed file was present — that is, always (#2429).
 test-durations:
 	@command -v gh >/dev/null || { echo "make test-durations needs the GitHub CLI (gh)"; exit 1; }
-	@run=$$(gh run list --workflow CI --branch main --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId'); \
-	test -n "$$run" || { echo "no successful CI run on main found"; exit 1; }; \
-	echo "downloading test-durations from CI run $$run"; \
-	gh run download "$$run" -n test-durations -D backend/ && \
-	echo "wrote backend/.test_durations — review the diff and commit it"
+	@runs=$$(for ev in push schedule workflow_dispatch; do \
+	    gh run list --workflow CI --branch main --event $$ev --status success --limit 10 \
+	      --json databaseId,createdAt --jq '.[] | "\(.createdAt)\t\(.databaseId)"'; \
+	  done | sort -r | cut -f2); \
+	test -n "$$runs" || { echo "no successful CI run on main found"; exit 1; }; \
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	for run in $$runs; do \
+	  if gh run download "$$run" -n test-durations -D "$$tmp" 2>/dev/null && [ -s "$$tmp/.test_durations" ]; then \
+	    mv "$$tmp/.test_durations" backend/.test_durations; \
+	    echo "downloaded test-durations from CI run $$run"; \
+	    echo "wrote backend/.test_durations — review the diff and commit it"; \
+	    exit 0; \
+	  fi; \
+	done; \
+	echo "none of the recent successful main runs published test-durations"; exit 1
 
 # ── CI parity ──────────────────────────────────────────────────────────────────
 # `make ci` runs the same lint + typecheck + build jobs GitHub Actions runs on
