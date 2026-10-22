@@ -90,8 +90,11 @@ rules:
     # #590/#272 Phase 9 — the dead-node evict reclaims Redis PVCs the
     # deleted node stranded (node-affine local-path PVs), then deletes
     # the Pending consumer pod so the StatefulSet recreates both on a
-    # live node (k8s_api.reclaim_stranded_redis_storage, run from the
-    # seed's heartbeat right after delete_node). Without the reclaim the
+    # live node (k8s_api.reclaim_stranded_redis_storage, run from every
+    # seed heartbeat since #2404: the names delete_node just evicted at
+    # once, and any claim pinned to a node that is no longer a Node while
+    # a Redis pod is Pending, found with the pod list above, the node
+    # list and the PV read granted below). Without the reclaim the
     # missing replica's sentinel silently halves the failover quorum and
     # the next node loss strands the Redis master for good. delete on
     # pods+PVCs (and create on PVCs, #1541) — everything else in this
