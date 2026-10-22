@@ -50,9 +50,7 @@ async def test_cache_resolved_against_another_catalog_is_not_reused(
     # Prime the cache while the module is default-off (the leaked state).
     assert MODULE not in await fm.get_enabled_modules(db_session)
     # Back to the suite's catalog (module default-on), cache NOT invalidated.
-    fm.MODULES = tuple(
-        dataclasses.replace(m, default_enabled=True) for m in fm.MODULES
-    )
+    fm.MODULES = tuple(dataclasses.replace(m, default_enabled=True) for m in fm.MODULES)
     fm.MODULES_BY_ID = {m.id: m for m in fm.MODULES}
     assert MODULE in await fm.get_enabled_modules(db_session)
 
