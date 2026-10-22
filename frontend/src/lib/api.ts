@@ -13497,7 +13497,6 @@ export interface AvailableUpgradeImages {
   github_reachable: boolean;
   available: AvailableUpgradeImage[];
   fleet: FleetArchitectures;
-  control_plane_architecture: string | null;
 }
 
 export const applianceUpgradeImagesApi = {

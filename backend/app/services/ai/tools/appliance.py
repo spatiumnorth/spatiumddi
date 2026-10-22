@@ -1026,9 +1026,8 @@ async def find_upgrade_images(
 ) -> dict[str, Any]:
     if (err := _superadmin_gate(user)) is not None:
         return err
-    # Imported locally: the router module pulls in the whole appliance API.
-    from app.api.v1.appliance import upgrade_images as ui  # noqa: PLC0415
     from app.services.appliance import releases as releases_service  # noqa: PLC0415
+    from app.services.appliance import upgrade_image_catalog as catalog  # noqa: PLC0415
 
     rows = list(
         (
@@ -1041,8 +1040,11 @@ async def find_upgrade_images(
         .scalars()
         .all()
     )
-    fleet = await ui._fleet_architectures(db)
-    usage = await ui._image_usage(db, rows)
+    # #2410 — the same derivations GET /upgrade-images uses, so the copilot
+    # and the table cannot disagree about an image.
+    fleet = await catalog.fleet_architectures(db)
+    usage = await catalog.image_usage(db, rows)
+    cached = releases_service.peek_upgrade_image_releases()
     return {
         "images": [
             {
@@ -1061,8 +1063,8 @@ async def find_upgrade_images(
                 # (matches / no_node / unknown); installed_on is NOT in use
                 # (bytes are on a slot), scheduled_for / rolling_run_id are
                 # (a delete is refused while either is set).
-                "channel": releases_service.release_channel(r.appliance_version),
-                "fleet_architecture": ui._fleet_verdict(fleet, r.architecture)[0],
+                "channel": catalog.staged_channel(r, catalog.release_for_staged(r, cached)),
+                "fleet_architecture": catalog.fleet_verdict(fleet, r.architecture)[0],
                 "installed_on": usage[r.id].installed_on,
                 "scheduled_for": usage[r.id].scheduled_for,
                 "rolling_run_id": str(usage[r.id].run_id) if usage[r.id].run_id else None,
@@ -1105,25 +1107,21 @@ async def find_available_upgrade_images(
 ) -> dict[str, Any]:
     if (err := _superadmin_gate(user)) is not None:
         return err
-    from app.api.v1.appliance import upgrade_images as ui  # noqa: PLC0415
     from app.services.appliance import releases as releases_service  # noqa: PLC0415
+    from app.services.appliance import upgrade_image_catalog as catalog  # noqa: PLC0415
 
     reachable, rows = await releases_service.list_available_upgrade_images()
-    fleet = await ui._fleet_architectures(db)
+    fleet = await catalog.fleet_architectures(db)
     staged = (await db.execute(select(ApplianceUpgradeImage))).scalars().all()
+    staged_ids = catalog.staged_assignment(staged, rows)
     return {
         "github_reachable": reachable,
         "available": [
             {
                 "channel": releases_service.release_channel(r.tag, r.is_prerelease),
-                "fleet_architecture": ui._fleet_verdict(fleet, r.architecture)[0],
-                "staged_image_id": next(
-                    (
-                        str(s_.id)
-                        for s_ in staged
-                        if s_.appliance_version == r.tag and s_.architecture == r.architecture
-                    ),
-                    None,
+                "fleet_architecture": catalog.fleet_verdict(fleet, r.architecture)[0],
+                "staged_image_id": (
+                    str(sid) if (sid := staged_ids.get((r.tag, r.architecture))) else None
                 ),
                 "tag": r.tag,
                 "name": r.name,

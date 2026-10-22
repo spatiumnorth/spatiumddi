@@ -1,8 +1,10 @@
 // Row model for Fleet → Upgrade images (#2410).
 //
-// One row per (version, architecture), built from the union of the GitHub
-// listing and the staged rows, so an air-gap upload with no matching
-// release is a row too and a staged release is ONE row, not two. Kept out
+// One row per staged image plus one per GitHub release image that is not
+// staged, so an air-gap upload with no matching release is a row too and a
+// staged release is ONE row, not two. Two staged images of the same
+// version + architecture (different SHA-256) are two rows: the server only
+// links one of them to the release. Kept out
 // of the component so the merge / filter / sort rules can be tested
 // without rendering a table.
 
@@ -15,6 +17,9 @@ import type {
 } from "@/lib/api";
 
 export interface ImageRow {
+  // ``staged:<image id>`` for a staged image (ids are unique; version +
+  // architecture is not), ``github:<version>\0<arch>`` for a release image
+  // that is not staged. Selection, React keys and bulk actions use it.
   key: string;
   version: string;
   // null is UNKNOWN — rendered as such, never defaulted.
@@ -67,11 +72,14 @@ export const DEFAULT_FILTERS: ImageFilters = {
 
 export const DEFAULT_SORT: SortState = { key: "released", dir: "desc" };
 
-const rowKey = (version: string, arch: string | null) =>
-  `${version}\u0000${arch ?? ""}`;
+const stagedKey = (id: string) => `staged:${id}`;
+const githubKey = (version: string, arch: string) =>
+  `github:${version}\u0000${arch}`;
 
-// A staged row with no recorded architecture is the image for whichever
-// architecture the release lists (re-importing it would dedupe by SHA).
+// The server decides which staged image (if any) a GitHub row is: a
+// labelled one of the same version + architecture, or an unlabelled one
+// only when the release publishes a single architecture (#2410). An
+// unlabelled image it did not link stays its own "unknown" row.
 export function buildRows(
   staged: UpgradeImage[],
   available: AvailableUpgradeImage[],
@@ -84,7 +92,7 @@ export function buildRows(
     s: UpgradeImage,
     a: AvailableUpgradeImage | null,
   ): ImageRow => ({
-    key: rowKey(s.appliance_version, s.architecture ?? a?.architecture ?? null),
+    key: stagedKey(s.id),
     version: s.appliance_version,
     architecture: s.architecture ?? a?.architecture ?? null,
     channel: s.channel ?? a?.channel ?? "stable",
@@ -102,14 +110,18 @@ export function buildRows(
   });
 
   for (const a of available) {
-    const s = a.staged_image_id ? (byId.get(a.staged_image_id) ?? null) : null;
+    // An image already linked to another row is never linked twice.
+    const s =
+      a.staged_image_id && !used.has(a.staged_image_id)
+        ? (byId.get(a.staged_image_id) ?? null)
+        : null;
     if (s) {
       used.add(s.id);
       rows.push(fromStaged(s, a));
       continue;
     }
     rows.push({
-      key: rowKey(a.tag, a.architecture),
+      key: githubKey(a.tag, a.architecture),
       version: a.tag,
       architecture: a.architecture,
       channel: a.channel ?? (a.is_prerelease ? "prerelease" : "stable"),
@@ -229,4 +241,52 @@ export function fleetNote(fleet: FleetArchitectures | undefined): string {
       fleet.unknown_count === 1 ? " has" : "s have"
     } not reported an architecture yet, so every architecture is shown.`;
   return "No approved appliances yet, so every architecture is shown.";
+}
+
+// The per-row Import button and the bulk Import set share this rule: a
+// release image the server would refuse (no approved node runs its
+// architecture) is not importable from either.
+export function canImport(r: ImageRow): boolean {
+  return !r.staged && r.available !== null && r.fleet !== "no_node";
+}
+
+export function bulkActions(selectedRows: ImageRow[]): {
+  toDelete: ImageRow[];
+  toImport: ImageRow[];
+} {
+  return {
+    toDelete: selectedRows.filter((r) => r.staged !== null),
+    toImport: selectedRows.filter(canImport),
+  };
+}
+
+// Drop selected keys a filter now hides (or that are gone after a
+// refetch), so a hidden row can never join a later bulk action. Returns
+// the same Set when nothing changed, so a state setter can skip a render.
+export function pruneSelection(
+  selected: Set<string>,
+  shown: ImageRow[],
+): Set<string> {
+  const visible = new Set(shown.map((r) => r.key));
+  let changed = false;
+  const next = new Set<string>();
+  for (const k of selected) {
+    if (visible.has(k)) next.add(k);
+    else changed = true;
+  }
+  return changed ? next : selected;
+}
+
+const ALL_ARCHITECTURES = ["amd64", "arm64"];
+
+// Architectures the air-gap upload offers. When the whole fleet has
+// reported, only its architectures: the server refuses any other, but
+// only after the browser has sent the whole image, so offering it would
+// cost the operator the transfer. Otherwise every architecture. "Unknown"
+// (empty) is always offered by the dialog itself.
+export function uploadArchitectureOptions(
+  fleet: FleetArchitectures | undefined,
+): string[] {
+  if (fleet?.restricted) return [...fleet.architectures];
+  return [...ALL_ARCHITECTURES];
 }

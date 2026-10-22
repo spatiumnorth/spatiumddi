@@ -145,8 +145,17 @@ the formatter handles the rest.
   weeks of nightlies could fill with no stable release at all). `DELETE`
   now answers 409 for an image an appliance is scheduled to fetch or an
   active run names, instead of leaving the node to 404 on its next
-  fetch; `?force=true` overrides and is audited. Both MCP tools carry the
-  new fields. No migration.
+  fetch; `?force=true` overrides and is audited; only approved
+  appliances count as scheduled. An air-gap image with no recorded
+  architecture is linked to a release row only when that release
+  publishes a single architecture, and otherwise shows as its own
+  "unknown" row instead of marking every architecture of its tag as
+  staged. Every staged image is its own row and selection (two images of
+  one version and architecture no longer collide), a filter that hides a
+  selected row unselects it, and the bulk Import leaves out rows no node
+  can boot, like the per-row button. Both MCP tools carry the new fields
+  and share one implementation with the REST endpoints
+  (`services/appliance/upgrade_image_catalog.py`). No migration.
 
 - **Upgrade images: only the fleet's architecture is offered, and a
   mismatched import or upload is refused (#2399).** The release picker
@@ -156,11 +165,16 @@ the formatter handles the rest.
   now returns only images matching an approved appliance's reported
   architecture (with per-architecture node counts), and both the
   GitHub import and the air-gap upload answer 422 naming the fleet's
-  architectures, before downloading or reading anything. An appliance
-  that has not reported an architecture lifts the restriction, and the
-  UI says so. The picker preselects the control plane's own
-  architecture when it is the fleet's only one, and the duplicated
-  description paragraph on the card is gone.
+  architectures. The import refuses before downloading anything; the
+  upload refuses before hashing or storing the image, but only after the
+  request body has arrived (FastAPI receives a multipart upload before
+  the handler runs), so the upload dialog offers only the fleet's
+  architectures (plus "unknown") and an operator never sends the bytes
+  for one the server would refuse. An appliance that has not reported an
+  architecture lifts the restriction, and the UI says so. The duplicated
+  description paragraph on the card is gone; the release picker itself
+  became the #2410 table, where "This fleet's architecture" is the
+  default filter.
 
 - **A disabled Tailscale tenant no longer reads "Token rejected", and
   the Integrations card always names tenants with a credential problem

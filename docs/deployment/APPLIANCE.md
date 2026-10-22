@@ -3113,7 +3113,10 @@ whereas pointing the bootloader at it cannot be undone remotely.
    **The Upgrade images page is one table** (#2410), one row per
    version + architecture, built from the GitHub releases and the staged
    images together (an air-gap upload with no matching release is a row
-   too, and a staged release is one row, not two). Columns: version
+   too, and a staged release is one row, not two). An uploaded image
+   with no recorded architecture is shown on the release's row only when
+   that release publishes a single architecture; otherwise it is its own
+   row with architecture `unknown`, since it could be either. Columns: version
    (linked to the release), architecture (`unknown` is shown as such),
    channel (nightly / pre-release / stable, derived from the tag), release
    date, size, staged, the fleet-architecture verdict (how many nodes run
@@ -3130,8 +3133,13 @@ whereas pointing the bootloader at it cannot be undone remotely.
    (staged rows, through a confirmation that lists the versions, their
    total size and any in-use image) and **Import N** (un-staged rows,
    downloaded one at a time). Each delete is its own request and its own
-   audit row; refused and failed rows stay selected with the reason. The
-   air-gap upload is behind the **Upload image…** button.
+   audit row; refused and failed rows stay selected with the reason. A
+   filter that hides a selected row unselects it, so an action only ever
+   covers rows on screen, and rows no node can boot are left out of
+   **Import N**. The air-gap upload is behind the **Upload image…**
+   button; once every approved appliance has reported its architecture it
+   offers only those (plus "unknown"), because the server refuses any
+   other only after the whole file has been sent.
 
    **A delete is refused (409) while an image is in use**: an appliance's
    `desired_slot_image_url` points at it (an upgrade is scheduled and the

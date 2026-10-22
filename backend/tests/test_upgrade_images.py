@@ -736,3 +736,154 @@ async def test_find_upgrade_images_tool_carries_usage(db_session: AsyncSession) 
     assert row["scheduled_for"] == ["sched-box"]
     assert row["channel"] == "stable"
     assert "fleet_architecture" in row and "installed_on" in row
+
+
+# ── #2410 review fixes ───────────────────────────────────────────────
+
+
+async def _avail_by_arch(client: AsyncClient, token: str) -> dict[str, dict]:
+    body = (
+        await client.get(f"{_BASE}/available?all_architectures=true", headers=_hdr(token))
+    ).json()
+    return {r["architecture"]: r for r in body["available"]}
+
+
+async def test_unlabelled_image_is_not_staged_for_every_architecture(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A two-architecture release: an unlabelled image could be either."""
+    img = await _image(db_session, "2026.05.14-1", None)
+    await _patch_list(monkeypatch)
+    token = await _token(db_session)
+    by_arch = await _avail_by_arch(client, token)
+    assert by_arch["amd64"]["staged_image_id"] is None
+    assert by_arch["arm64"]["staged_image_id"] is None
+    # ...so it is its own row, still listed as staged.
+    listed = (await client.get(_BASE, headers=_hdr(token))).json()["images"]
+    assert [i["id"] for i in listed] == [str(img.id)]
+
+
+async def test_unlabelled_image_links_to_a_single_architecture_release(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    img = await _image(db_session, "2026.05.14-1", None)
+
+    async def fake() -> tuple[bool, list]:
+        return (True, [_rel("amd64")])
+
+    monkeypatch.setattr(releases_service, "list_available_upgrade_images", fake)
+    token = await _token(db_session)
+    by_arch = await _avail_by_arch(client, token)
+    assert by_arch["amd64"]["staged_image_id"] == str(img.id)
+
+
+async def test_labelled_image_wins_over_an_unlabelled_one(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _image(db_session, "2026.05.14-1", None)
+    labelled = await _image(db_session, "2026.05.14-1", "amd64")
+
+    async def fake() -> tuple[bool, list]:
+        return (True, [_rel("amd64")])
+
+    monkeypatch.setattr(releases_service, "list_available_upgrade_images", fake)
+    token = await _token(db_session)
+    by_arch = await _avail_by_arch(client, token)
+    assert by_arch["amd64"]["staged_image_id"] == str(labelled.id)
+
+
+async def test_staged_link_ignores_the_fleet_filter(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fleet filter hides arm64; the release still publishes two."""
+    await _node(db_session, "amd64")
+    await _image(db_session, "2026.05.14-1", None)
+    await _patch_list(monkeypatch)
+    token = await _token(db_session)
+    body = (await client.get(f"{_BASE}/available", headers=_hdr(token))).json()
+    assert [r["architecture"] for r in body["available"]] == ["amd64"]
+    assert body["available"][0]["staged_image_id"] is None
+
+
+async def test_available_has_no_control_plane_architecture(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _patch_list(monkeypatch)
+    token = await _token(db_session)
+    body = (await client.get(f"{_BASE}/available", headers=_hdr(token))).json()
+    assert "control_plane_architecture" not in body
+
+
+async def test_unapproved_appliance_schedule_does_not_count(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from app.models.appliance import APPLIANCE_STATE_REVOKED
+
+    monkeypatch.setattr(upgrade_images, "SLOT_IMAGE_DIR", tmp_path)
+    img = await _image(db_session)
+    revoked = await _appliance(db_session, "gone-box", desired_slot_image_url=_scheduled_url(img))
+    revoked.state = APPLIANCE_STATE_REVOKED
+    await db_session.flush()
+    token = await _token(db_session)
+    row = next(
+        i
+        for i in (await client.get(_BASE, headers=_hdr(token))).json()["images"]
+        if i["id"] == str(img.id)
+    )
+    assert row["scheduled_for"] == []
+    resp = await client.delete(f"{_BASE}/{img.id}", headers=_hdr(token))
+    assert resp.status_code == 204
+
+
+async def test_usage_hostnames_are_deduplicated(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Re-pairing a host leaves two approved rows with one hostname."""
+    img = await _image(db_session)
+    for _ in range(2):
+        await _appliance(
+            db_session,
+            "twice",
+            architecture="amd64",
+            slot_a_version=img.appliance_version,
+            desired_slot_image_url=_scheduled_url(img),
+        )
+    token = await _token(db_session)
+    row = next(
+        i
+        for i in (await client.get(_BASE, headers=_hdr(token))).json()["images"]
+        if i["id"] == str(img.id)
+    )
+    assert row["scheduled_for"] == ["twice"]
+    assert row["installed_on"] == ["twice"]
+
+
+async def test_mcp_tools_agree_with_rest(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same staged link and same channel from both surfaces."""
+    img = await _image(db_session, "2026.05.14-1", None)
+    await _patch_list(monkeypatch)
+    # GitHub flags the tag a prerelease; the tag itself does not say so.
+    rel = _rel("amd64")
+    rel.is_prerelease = True
+    monkeypatch.setattr(releases_service, "peek_upgrade_image_releases", lambda: [rel])
+    token = await _token(db_session)
+    rest_avail = await _avail_by_arch(client, token)
+    rest_row = next(
+        i
+        for i in (await client.get(_BASE, headers=_hdr(token))).json()["images"]
+        if i["id"] == str(img.id)
+    )
+    user = await _user(db_session)
+    mcp_avail = {
+        r["architecture"]: r
+        for r in (
+            await find_available_upgrade_images(db_session, user, FindAvailableUpgradeImagesArgs())
+        )["available"]
+    }
+    mcp_row = (await find_upgrade_images(db_session, user, FindUpgradeImagesArgs()))["images"][0]
+    for arch in ("amd64", "arm64"):
+        assert mcp_avail[arch]["staged_image_id"] == rest_avail[arch]["staged_image_id"]
+    assert rest_row["channel"] == "prerelease"
+    assert mcp_row["channel"] == rest_row["channel"]

@@ -3,7 +3,7 @@
 // toolbar (the ZonesTab pattern). The air-gap upload lives behind a header
 // button in the shared draggable Modal.
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronDown,
@@ -17,6 +17,7 @@ import {
 import {
   applianceUpgradeImagesApi,
   formatApiError,
+  type FleetArchitectures,
   type UpgradeImageChannel,
 } from "@/lib/api";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -29,11 +30,15 @@ import {
   DEFAULT_SORT,
   applyFilters,
   buildRows,
+  bulkActions,
+  canImport,
   fleetNote,
   hiddenNightlyCount,
   inUseReason,
   isInUse,
+  pruneSelection,
   sortRows,
+  uploadArchitectureOptions,
   type ImageFilters,
   type ImageRow,
   type SortKey,
@@ -49,6 +54,11 @@ function fmtMiB(bytes: number | null): string {
 function fmtDate(iso: string | null): string {
   return iso ? new Date(iso).toISOString().slice(0, 10) : "—";
 }
+
+const ARCH_LABEL: Record<string, string> = {
+  amd64: "amd64 (x86-64)",
+  arm64: "arm64 (AArch64)",
+};
 
 const CHANNEL_CLS: Record<UpgradeImageChannel, string> = {
   stable: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
@@ -115,9 +125,15 @@ export function UpgradeImagesTable() {
   );
   const hiddenNightlies = hiddenNightlyCount(allRows, filters);
 
+  // A filter that hides a selected row unselects it: the count below and
+  // every bulk action then cover exactly the rows on screen, and a hidden
+  // row cannot rejoin a later action when the filter is relaxed.
+  useEffect(() => {
+    setSelected((prev) => pruneSelection(prev, shown));
+  }, [shown]);
+
   const selectedRows = shown.filter((r) => selected.has(r.key));
-  const toDelete = selectedRows.filter((r) => r.staged);
-  const toImport = selectedRows.filter((r) => !r.staged && r.available);
+  const { toDelete, toImport } = bulkActions(selectedRows);
   const allShownSelected =
     shown.length > 0 && shown.every((r) => selected.has(r.key));
   const someShownSelected = shown.some((r) => selected.has(r.key));
@@ -312,10 +328,10 @@ export function UpgradeImagesTable() {
           />
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {selected.size > 0 && (
+          {selectedRows.length > 0 && (
             <>
               <span className="text-primary">
-                {selected.size} selected
+                {selectedRows.length} selected
                 {(toDelete.length > 0 || toImport.length > 0) &&
                   ` (${toDelete.length} staged, ${toImport.length} to import)`}
               </span>
@@ -485,6 +501,7 @@ export function UpgradeImagesTable() {
       )}
       {showUpload && (
         <UploadImageModal
+          fleet={fleet}
           onClose={() => setShowUpload(false)}
           onUploaded={() => {
             invalidate();
@@ -621,7 +638,7 @@ function ImageTableRow({
               <button
                 type="button"
                 onClick={onImport}
-                disabled={disabled || r.fleet === "no_node"}
+                disabled={disabled || !canImport(r)}
                 title={
                   r.fleet === "no_node"
                     ? "No approved appliance runs this architecture"
@@ -752,9 +769,11 @@ function DeleteImagesModal({
 }
 
 function UploadImageModal({
+  fleet,
   onClose,
   onUploaded,
 }: {
+  fleet: FleetArchitectures | undefined;
   onClose: () => void;
   onUploaded: () => void;
 }) {
@@ -820,14 +839,19 @@ function UploadImageModal({
               className="mt-1 w-full rounded-md border bg-background px-2 py-1"
             >
               <option value="">Unknown (don&apos;t check)</option>
-              <option value="amd64">amd64 (x86-64)</option>
-              <option value="arm64">arm64 (AArch64)</option>
+              {uploadArchitectureOptions(fleet).map((a) => (
+                <option key={a} value={a}>
+                  {ARCH_LABEL[a] ?? a}
+                </option>
+              ))}
             </select>
             <p className="mt-1 text-[11px] text-muted-foreground">
-              From the asset name you downloaded. The control plane refuses an
-              architecture no appliance in the fleet runs, and an upgrade for a
-              node of the other architecture; the appliance re-checks the real
-              image either way.
+              From the asset name you downloaded.{" "}
+              {fleet?.restricted
+                ? `Only ${fleet.architectures.join(" and ")} ${fleet.architectures.length === 1 ? "is" : "are"} offered: no approved appliance runs anything else, and the server would refuse it after the upload. `
+                : ""}
+              The control plane also refuses an upgrade for a node of the other
+              architecture; the appliance re-checks the real image either way.
             </p>
           </div>
           <div className="sm:col-span-2">

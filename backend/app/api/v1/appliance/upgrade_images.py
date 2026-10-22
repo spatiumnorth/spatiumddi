@@ -53,8 +53,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
-import platform
-import re
 import shutil
 import uuid
 from collections.abc import AsyncIterator
@@ -77,8 +75,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
@@ -86,11 +83,12 @@ from app.config import settings
 from app.core.content_disposition import content_disposition
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import OctetStreamResponse
-from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance, ApplianceUpgradeImage
+from app.models.appliance import ApplianceUpgradeImage
 from app.models.audit import AuditLog
-from app.models.system_upgrade import SystemUpgradeRun
 from app.services.appliance import releases as releases_service
-from app.services.appliance.architecture import ApplianceArchitecture, normalize
+from app.services.appliance import upgrade_image_catalog as catalog
+from app.services.appliance.architecture import ApplianceArchitecture
+from app.services.appliance.upgrade_image_catalog import FleetArchitectures
 
 logger = structlog.get_logger(__name__)
 
@@ -527,21 +525,6 @@ class UpgradeImageRow(BaseModel):
     notes: str | None
 
 
-class FleetArchitectures(BaseModel):
-    """What the fleet runs, as far as it has told us (#2399)."""
-
-    # Distinct non-null ``architecture`` of approved appliances.
-    architectures: list[str]
-    # Approved appliances that have not reported one (older supervisor,
-    # or not yet heartbeated). They could be any architecture, so while
-    # any exist nothing is refused or filtered.
-    unknown_count: int
-    # Approved appliances per architecture, for "which nodes is this for".
-    counts: dict[str, int]
-    # True when images for other architectures are hidden / refused.
-    restricted: bool
-
-
 class UpgradeImageReleaseInfo(BaseModel):
     """The GitHub release a staged image came from (#2410)."""
 
@@ -612,9 +595,6 @@ class AvailableUpgradeImagesResponse(BaseModel):
     github_reachable: bool
     available: list[AvailableUpgradeImageRow]
     fleet: FleetArchitectures
-    # The control plane's own architecture (None if unrecognised); the UI
-    # preselects this row when it is the fleet's only architecture.
-    control_plane_architecture: str | None = None
 
 
 class ImportFromGithubRequest(BaseModel):
@@ -656,37 +636,6 @@ def _row_to_schema(row: ApplianceUpgradeImage) -> UpgradeImageRow:
 # ── Endpoints ──────────────────────────────────────────────────────
 
 
-async def _fleet_architectures(db: AsyncSession) -> FleetArchitectures:
-    """Architectures of the approved appliances (#2399).
-
-    ``restricted`` is only true when every approved appliance has
-    reported an architecture: a NULL one (older supervisor) could be
-    either, so it must not block an import (#1026 treats NULL as
-    unknown). An empty fleet is likewise unrestricted.
-    """
-    rows = (
-        await db.execute(
-            select(Appliance.architecture, func.count())
-            .where(Appliance.state == APPLIANCE_STATE_APPROVED)
-            .group_by(Appliance.architecture)
-        )
-    ).all()
-    counts: dict[str, int] = {}
-    unknown = 0
-    for arch, n in rows:
-        canon = normalize(arch)
-        if canon is None:
-            unknown += n
-        else:
-            counts[canon] = counts.get(canon, 0) + n
-    return FleetArchitectures(
-        architectures=sorted(counts),
-        unknown_count=unknown,
-        counts=counts,
-        restricted=bool(counts) and unknown == 0,
-    )
-
-
 def _refuse_unused_architecture(fleet: FleetArchitectures, architecture: str | None) -> None:
     """422 when ``architecture`` is one no approved appliance runs."""
     if architecture is None or not fleet.restricted:
@@ -701,83 +650,6 @@ def _refuse_unused_architecture(fleet: FleetArchitectures, architecture: str | N
             "no node could boot."
         ),
     )
-
-
-def _fleet_verdict(fleet: FleetArchitectures, architecture: str | None) -> tuple[str, int | None]:
-    """#2399's answer for one image: ``(verdict, matching node count)``."""
-    arch = normalize(architecture)
-    if arch is None or not fleet.restricted:
-        return "unknown", None
-    if arch in fleet.architectures:
-        return "matches", fleet.counts.get(arch, 0)
-    return "no_node", 0
-
-
-_ACTIVE_RUN_STATES = ("planned", "running", "halted")
-_IMAGE_URL_RE = re.compile(r"/upgrade-images/([0-9a-fA-F-]{36})/raw\.xz")
-
-
-class _ImageUsage:
-    """Who installed / is scheduled for / has a run naming one image."""
-
-    __slots__ = ("installed_on", "scheduled_for", "run_id")
-
-    def __init__(self) -> None:
-        self.installed_on: list[str] = []
-        self.scheduled_for: list[str] = []
-        self.run_id: uuid.UUID | None = None
-
-
-async def _image_usage(
-    db: AsyncSession, images: list[ApplianceUpgradeImage]
-) -> dict[uuid.UUID, _ImageUsage]:
-    """Derive usage for ``images`` from columns that already exist (#2410)."""
-    usage = {i.id: _ImageUsage() for i in images}
-    appliances = (await db.execute(select(Appliance))).scalars().all()
-    by_version: dict[str, list[ApplianceUpgradeImage]] = {}
-    for img in images:
-        by_version.setdefault(img.appliance_version, []).append(img)
-    for a in sorted(appliances, key=lambda x: x.hostname):
-        if a.desired_slot_image_url:
-            m = _IMAGE_URL_RE.search(a.desired_slot_image_url)
-            if m:
-                try:
-                    target = uuid.UUID(m.group(1))
-                except ValueError:
-                    target = None
-                if target in usage:
-                    usage[target].scheduled_for.append(a.hostname)
-        if a.state != APPLIANCE_STATE_APPROVED:
-            continue
-        versions = {a.installed_appliance_version, a.slot_a_version, a.slot_b_version}
-        for v in versions:
-            for img in by_version.get(v or "", []):
-                # An image labelled for another architecture is not what
-                # this node runs, even if the version string matches.
-                if img.architecture and a.architecture and img.architecture != a.architecture:
-                    continue
-                if a.hostname not in usage[img.id].installed_on:
-                    usage[img.id].installed_on.append(a.hostname)
-    runs = (
-        (
-            await db.execute(
-                select(SystemUpgradeRun)
-                .where(SystemUpgradeRun.state.in_(_ACTIVE_RUN_STATES))
-                .order_by(SystemUpgradeRun.started_at.desc())
-            )
-        )
-        .scalars()
-        .all()
-    )
-    for run in runs:
-        raw = (run.plan or {}).get("slot_image_id")
-        try:
-            rid = uuid.UUID(str(raw)) if raw else None
-        except ValueError:
-            rid = None
-        if rid in usage and usage[rid].run_id is None:
-            usage[rid].run_id = run.id
-    return usage
 
 
 @router.post(
@@ -840,8 +712,12 @@ async def upload_upgrade_image(
 ) -> UpgradeImageRow:
     _require_superadmin(current_user)
 
-    # #2399 — refuse an architecture no node runs before reading a byte.
-    _refuse_unused_architecture(await _fleet_architectures(db), architecture)
+    # #2399 — refuse an architecture no node runs. FastAPI has already
+    # received the multipart body (spooled to a temp file) before this
+    # handler runs, so this saves the hash pass and the store, not the
+    # transfer; the upload dialog only offers the fleet's architectures,
+    # which is what keeps an operator from sending the bytes at all.
+    _refuse_unused_architecture(await catalog.fleet_architectures(db), architecture)
 
     expected_sha = sha256.lower().strip()
     if not all(c in "0123456789abcdef" for c in expected_sha):
@@ -967,22 +843,15 @@ async def list_upgrade_images(current_user: CurrentUser, db: DB) -> UpgradeImage
         .scalars()
         .all()
     )
-    fleet = await _fleet_architectures(db)
-    usage = await _image_usage(db, list(rows))
+    fleet = await catalog.fleet_architectures(db)
+    usage = await catalog.image_usage(db, rows)
     # Cache-only: the staged list must render on an air-gapped control
     # plane without waiting out a GitHub timeout.
     cached = releases_service.peek_upgrade_image_releases()
     out: list[UpgradeImageListRow] = []
     for r in rows:
-        rel = next(
-            (
-                c
-                for c in cached
-                if c.tag == r.appliance_version and (r.architecture in (None, c.architecture))
-            ),
-            None,
-        )
-        verdict, nodes = _fleet_verdict(fleet, r.architecture)
+        rel = catalog.release_for_staged(r, cached)
+        verdict, nodes = catalog.fleet_verdict(fleet, r.architecture)
         u = usage[r.id]
         out.append(
             UpgradeImageListRow(
@@ -996,9 +865,7 @@ async def list_upgrade_images(current_user: CurrentUser, db: DB) -> UpgradeImage
                     if rel
                     else None
                 ),
-                channel=releases_service.release_channel(
-                    r.appliance_version, bool(rel and rel.is_prerelease)
-                ),
+                channel=catalog.staged_channel(r, rel),
                 fleet_architecture=verdict,
                 fleet_nodes=nodes,
                 installed_on=u.installed_on,
@@ -1036,28 +903,19 @@ async def list_available_upgrade_images(
     """
     _require_superadmin(current_user)
     reachable, releases = await releases_service.list_available_upgrade_images()
-    fleet = await _fleet_architectures(db)
+    fleet = await catalog.fleet_architectures(db)
+    staged = (await db.execute(select(ApplianceUpgradeImage))).scalars().all()
+    # Computed on the UNFILTERED listing: which architectures a release
+    # publishes is evidence for an unlabelled staged image (see
+    # ``staged_assignment``), and the fleet filter would hide some.
+    staged_ids = catalog.staged_assignment(staged, releases)
     if fleet.restricted and not all_architectures:
         # #2399 — only offer images some node can boot.
         releases = [r for r in releases if r.architecture in fleet.architectures]
-    staged = (await db.execute(select(ApplianceUpgradeImage))).scalars().all()
-
-    def _staged_id(tag: str, arch: str) -> uuid.UUID | None:
-        # An unlabelled staged row (architecture NULL) counts as this
-        # release's image: re-importing it would only dedupe by sha anyway.
-        hit = next(
-            (s_ for s_ in staged if s_.appliance_version == tag and s_.architecture == arch),
-            None,
-        ) or next(
-            (s_ for s_ in staged if s_.appliance_version == tag and s_.architecture is None),
-            None,
-        )
-        return hit.id if hit else None
 
     return AvailableUpgradeImagesResponse(
         github_reachable=reachable,
         fleet=fleet,
-        control_plane_architecture=normalize(platform.machine()),
         available=[
             AvailableUpgradeImageRow(
                 tag=r.tag,
@@ -1071,10 +929,10 @@ async def list_available_upgrade_images(
                 checksum_asset_url=r.checksum_asset_url,
                 size_bytes=r.size_bytes,
                 architecture=r.architecture,
-                staged_image_id=_staged_id(r.tag, r.architecture),
+                staged_image_id=staged_ids.get((r.tag, r.architecture)),
                 channel=releases_service.release_channel(r.tag, r.is_prerelease),
-                fleet_architecture=_fleet_verdict(fleet, r.architecture)[0],
-                fleet_nodes=_fleet_verdict(fleet, r.architecture)[1],
+                fleet_architecture=catalog.fleet_verdict(fleet, r.architecture)[0],
+                fleet_nodes=catalog.fleet_verdict(fleet, r.architecture)[1],
             )
             for r in releases
         ],
@@ -1103,7 +961,7 @@ async def import_upgrade_image_from_github(
     _require_superadmin(current_user)
     tag = body.release_tag.strip()
 
-    fleet = await _fleet_architectures(db)
+    fleet = await catalog.fleet_architectures(db)
     # Checked on what the caller asked for before any network call, and
     # again on what resolved (an unspecified architecture resolves to the
     # release's only one) before the download.
@@ -1456,7 +1314,7 @@ async def delete_upgrade_image(
     # #2410 — an image an appliance is scheduled to fetch, or an active run
     # names, would 404 on the node's next fetch. Merely *installed* is not
     # in use: the bytes are already on the slot.
-    in_use = (await _image_usage(db, [row]))[row.id]
+    in_use = (await catalog.image_usage(db, [row]))[row.id]
     forced_over: list[str] = []
     if in_use.scheduled_for:
         forced_over.append("scheduled for " + ", ".join(in_use.scheduled_for))

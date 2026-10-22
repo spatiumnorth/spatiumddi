@@ -5,10 +5,14 @@ import {
   DEFAULT_FILTERS,
   applyFilters,
   buildRows,
+  bulkActions,
+  canImport,
   hiddenNightlyCount,
   inUseReason,
   isInUse,
+  pruneSelection,
   sortRows,
+  uploadArchitectureOptions,
 } from "@/lib/upgrade-image-rows";
 
 const avail = (
@@ -67,6 +71,34 @@ describe("buildRows", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].architecture).toBeNull();
     expect(rows[0].publishedAt).toBeNull();
+  });
+
+  it("gives two staged images of one version + arch their own rows and keys", () => {
+    // Same version and architecture, different SHA-256: the server links
+    // one to the release; the other must still be its own selectable row.
+    const rows = buildRows(
+      [
+        staged("s1", "2026.10.01-1", "amd64"),
+        staged("s2", "2026.10.01-1", "amd64", { sha256: "b".repeat(64) }),
+      ],
+      [avail("2026.10.01-1", "amd64", { staged_image_id: "s1" })],
+    );
+    expect(rows).toHaveLength(2);
+    const keys = rows.map((r) => r.key);
+    expect(new Set(keys).size).toBe(2);
+    expect(rows.map((r) => r.staged?.id).sort()).toEqual(["s1", "s2"]);
+  });
+
+  it("never links one staged image to two release rows", () => {
+    const rows = buildRows(
+      [staged("s1", "2026.10.01-1", null)],
+      [
+        avail("2026.10.01-1", "amd64", { staged_image_id: "s1" }),
+        avail("2026.10.01-1", "arm64", { staged_image_id: "s1" }),
+      ],
+    );
+    expect(rows.filter((r) => r.staged?.id === "s1")).toHaveLength(1);
+    expect(new Set(rows.map((r) => r.key)).size).toBe(rows.length);
   });
 });
 
@@ -148,5 +180,72 @@ describe("in use", () => {
     );
     expect(isInUse(sched)).toBe(true);
     expect(inUseReason(sched)).toContain("box1");
+  });
+});
+
+describe("bulk actions", () => {
+  it("leaves a no-node release out of the bulk import, like the row button", () => {
+    const rows = buildRows(
+      [staged("s1", "2026.10.01-1", "amd64")],
+      [
+        avail("2026.10.01-1", "amd64", { staged_image_id: "s1" }),
+        avail("2026.10.02-1", "amd64", { fleet_architecture: "matches" }),
+        avail("2026.10.02-1", "arm64", { fleet_architecture: "no_node" }),
+      ],
+    );
+    const { toDelete, toImport } = bulkActions(rows);
+    expect(toDelete.map((r) => r.staged?.id)).toEqual(["s1"]);
+    expect(toImport.map((r) => r.architecture)).toEqual(["amd64"]);
+    expect(rows.filter(canImport).every((r) => r.fleet !== "no_node")).toBe(
+      true,
+    );
+  });
+});
+
+describe("pruneSelection", () => {
+  const rows = buildRows(
+    [],
+    [
+      avail("2026.10.01-1", "amd64"),
+      avail("nightly-2026.10.20", "amd64", { channel: "nightly" }),
+    ],
+  );
+  const nightlyKey = rows.find((r) => r.channel === "nightly")!.key;
+  const stableKey = rows.find((r) => r.channel === "stable")!.key;
+
+  it("drops a selection the filter now hides", () => {
+    const shown = applyFilters(rows, DEFAULT_FILTERS);
+    const out = pruneSelection(new Set([nightlyKey, stableKey]), shown);
+    expect([...out]).toEqual([stableKey]);
+  });
+
+  it("returns the same set when nothing is hidden", () => {
+    const sel = new Set([stableKey]);
+    expect(pruneSelection(sel, rows)).toBe(sel);
+  });
+});
+
+describe("uploadArchitectureOptions", () => {
+  it("offers only the fleet's architecture once every node has reported", () => {
+    expect(
+      uploadArchitectureOptions({
+        architectures: ["arm64"],
+        unknown_count: 0,
+        counts: { arm64: 2 },
+        restricted: true,
+      }),
+    ).toEqual(["arm64"]);
+  });
+
+  it("offers every architecture while a node has not reported", () => {
+    expect(
+      uploadArchitectureOptions({
+        architectures: ["amd64"],
+        unknown_count: 1,
+        counts: { amd64: 1 },
+        restricted: false,
+      }),
+    ).toEqual(["amd64", "arm64"]);
+    expect(uploadArchitectureOptions(undefined)).toEqual(["amd64", "arm64"]);
   });
 });
