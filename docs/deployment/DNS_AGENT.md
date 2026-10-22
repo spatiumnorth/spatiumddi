@@ -495,6 +495,23 @@ that bundle. A SIGTERM or a re-bootstrap disarms it first and is not counted.
   reached, or its own bundle fails to apply, does it apply the cache after
   all: one death can be a power cut, and a healthy server must not stay dark
   over it (non-negotiable #5).
+- **No bundle within the max wait (#2241):** a control plane that answers
+  but cannot produce a bundle (renders OOM-killed or killed at their time
+  limit at scale, a long-poll that only ever ends in `304`, a
+  re-registration backing off) never reads as unreachable, and used to keep
+  servers with a valid cache dark for hours. Once the hold has lasted
+  `AGENT_BOOT_HOLD_MAX_WAIT_S` seconds (default `600`, 10 minutes; a value
+  that is not a positive number is ignored) with no bundle applied, the control plane counts as unreachable: the agent logs
+  `bootstrap_hold_max_wait_elapsed_applying_cache`, serves the cache under
+  the same rules as offline, and keeps polling. The apply starts the
+  deferred named; a bundle that arrives later is applied the normal way, as
+  a reload (or not at all, if its structure is the cache's). A bundle the
+  daemon was *seen* dying on twice (below) is never re-applied by this
+  timer, not even on its quarantine backoff: only a different
+  last-known-good may serve (one with no recorded etag, as agents upgraded
+  in the field can carry, does not count: nothing says it is not the same
+  bundle), and with none named stays down until the control plane sends a
+  bundle or becomes unreachable.
 - **Two watched deaths:** the bundle is also quarantined. A death is
   *watched* when named exited while the agent stayed alive to see it (the
   agent's `dns_daemon_exited`). A marker left armed by a process that simply
@@ -514,8 +531,10 @@ that bundle. A SIGTERM or a re-bootstrap disarms it first and is not counted.
 
 While the bundle is held the server row reads `no_previous` (or `reverted`
 when the last-known-good is serving) with an error that says named died on
-the bundle, how many times, and, when the OOM record is present, that the
-memory limit killed it. A revert never goes back to a bundle the daemon was
+the bundle, how many times, when the OOM record is present that the memory
+limit killed it, and how long the hold waits before the cache serves anyway.
+Once the cache serves, the row reads `ok` with the cached bundle's etag in
+`config_apply_etag`, as it does after an offline fallback. A revert never goes back to a bundle the daemon was
 seen dying on, and at startup, before the control plane has been asked, not to
 one it died on at all. Technitium keeps its own configuration under `/etc/dns`, so for it the
 guard can only change the order (sync first); it cannot keep the daemon off
@@ -764,6 +783,33 @@ An op moves `pending` → `in_flight` when a long-poll ships it, then
   leftover poll, which is always the older of the two, never takes an op
   from its replacement. A poll whose client has already disconnected rolls its page
   back. An agent that sends no id falls back to the 5-minute reset above.
+- **Only one agent process is served per server
+  ([#2044](https://github.com/spatiumnorth/spatiumddi/issues/2044)).** The
+  take-back above assumes the other process is gone. Two processes live on
+  one server identity at once (a cloned VM that kept its `agent_id`, two
+  containers given one state directory) used to take each op back from
+  each other on every poll until its retries ran out. The control plane
+  now records which process owns the server (`dns_server.agent_instance`).
+  A process it has never seen takes over at once, so replacing an agent is
+  unchanged. The one it replaced is remembered, and if it polls again
+  while the owner is still polling it is answered `409` with
+  `X-Spatium-Duplicate-Agent-Instance: 1`. That agent logs
+  `sync_duplicate_agent_instance`, keeps serving its cached config and asks
+  again every 30 s; it does not re-register, because a new token would not
+  change which process owns the row. If the owner stops polling for 5
+  minutes, the refused agent takes the server back by itself. A long-poll
+  whose process lost ownership while it waited stops before shipping
+  anything. Refusals that go on for over 2 minutes show a **Duplicate
+  agent** chip on the server, with the address the refused agent polled
+  from, and raise the default-on `dns_agent_duplicate_instance` alert
+  ("Two DNS agents on one server"). Both clear 10 minutes after the extra
+  agent stops. The 2-minute wait is so an overlapping rollout, where the
+  old pod finishes one last poll before it exits, does not alarm. The
+  agent also sends its process id on heartbeats: a refused process's
+  heartbeats still count for liveness and op acks, but its daemon,
+  config-apply and spool reports are kept off the server row, which shows
+  the owner's. To fix it, stop the extra agent, or clear its state
+  directory so it registers as a server of its own.
 - **A late ack is not charged twice.** Each shipped op carries a
   `dispatch` number (its attempt count), which the agent echoes in its
   ack. An error that answers an earlier dispatch was already counted when
@@ -1014,6 +1060,15 @@ dns-bind9-ns1:
 > plane cannot tell, so delete the stale row(s) under DNS → Server groups and
 > save again. The Operator Copilot's role assignment moves the row the same
 > way.
+>
+> On an appliance, a brand-new agent lands in the appliance's assigned DNS
+> group, not the one its `AGENT_GROUP` names (#2190). The supervisor writes
+> the new chart values before it labels the node for a new engine, and labels
+> it only once the engine's DaemonSet carries the new group, but the
+> registration does not rely on that: an agent whose hostname is one approved
+> appliance's, running that appliance's current engine, registers into the
+> appliance's group and adopts its row there by hostname. A row the agent
+> already has (found by agent id) still never moves.
 
 ---
 

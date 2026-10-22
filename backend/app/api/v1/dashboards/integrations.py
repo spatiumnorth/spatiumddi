@@ -41,7 +41,11 @@ from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
-from app.services.integration_credentials import CredentialStatus, credential_status
+from app.services.integration_credentials import (
+    CREDENTIAL_PROBLEM_STATES,
+    CredentialStatus,
+    credential_status,
+)
 from app.services.tailscale.client import is_auth_rejected
 
 router = APIRouter()
@@ -80,6 +84,13 @@ class IntegrationPanel(BaseModel):
     stale_count: int
     error_count: int
     warning_count: int
+    # #2192 — counted over EVERY target, not the capped ``targets`` list, so
+    # the card's counts stay right when the row list is trimmed. A "problem"
+    # is a credential that is rejected / expired / expiring, or a sync error;
+    # ``credential_dead_count`` is rejected + expired.
+    problem_count: int = 0
+    credential_dead_count: int = 0
+    credential_expiring_count: int = 0
     targets: list[IntegrationTargetRow]
 
 
@@ -99,6 +110,10 @@ class IntegrationsDashboardSummary(BaseModel):
 
 
 _TARGET_LIMIT = 20
+# #2192 — problem rows are listed past ``_TARGET_LIMIT``, but not without
+# bound: 200 failing nodes must not become a 200-row payload. Beyond this the
+# card says "+N more with problems" from ``problem_count``.
+_PROBLEM_TARGET_LIMIT = 50
 _RECENT_ERROR_LIMIT = 20
 
 # Resource_type values audit-logged by each integration's reconciler.
@@ -128,6 +143,23 @@ def _is_stale(last: datetime | None, interval_seconds: int, now: datetime) -> bo
         return True
     threshold = max(60, interval_seconds * 2)
     return (now - last) > timedelta(seconds=threshold)
+
+
+def _has_problem(r: IntegrationTargetRow) -> bool:
+    return r.credential_state in CREDENTIAL_PROBLEM_STATES or bool(r.last_sync_error)
+
+
+def _cap_rows(rows: list[IntegrationTargetRow]) -> list[IntegrationTargetRow]:
+    """Cap the row list, but never let the cap hide a problem first (#2192).
+
+    Targets with a credential problem or a sync error come first (stable
+    within each group) and are kept past ``_TARGET_LIMIT``, up to the hard
+    ``_PROBLEM_TARGET_LIMIT``; healthy rows only fill what ``_TARGET_LIMIT``
+    leaves. The panel's ``problem_count`` carries the true total.
+    """
+    problems = [r for r in rows if _has_problem(r)][:_PROBLEM_TARGET_LIMIT]
+    rest = [r for r in rows if not _has_problem(r)]
+    return problems + rest[: max(0, _TARGET_LIMIT - len(problems))]
 
 
 def _build_panel(
@@ -165,9 +197,9 @@ def _build_panel(
             warnings += 1
         else:
             healthy += 1
-        # A disabled target syncs nothing, so a lapsed credential breaks
-        # nothing and ``secret_expiring`` skips it; the dashboard does too.
-        cred = credential(t) if credential is not None and getattr(t, "enabled", True) else None
+        # A disabled target reads ``disabled`` (#2191): the rule lives in
+        # integration_credentials.credential_status.
+        cred = credential(t) if credential is not None else None
         rows.append(
             IntegrationTargetRow(
                 id=str(t.id),
@@ -191,7 +223,10 @@ def _build_panel(
         stale_count=stale,
         error_count=errors,
         warning_count=warnings,
-        targets=rows[:_TARGET_LIMIT],
+        problem_count=sum(1 for r in rows if _has_problem(r)),
+        credential_dead_count=sum(1 for r in rows if r.credential_state in ("rejected", "expired")),
+        credential_expiring_count=sum(1 for r in rows if r.credential_state == "expiring"),
+        targets=_cap_rows(rows),
     )
 
 
@@ -210,6 +245,7 @@ def _tailscale_credential(now: datetime) -> Callable[[Any], CredentialStatus]:
             expires_at=t.api_key_expires_at,
             rejected=is_auth_rejected(t.last_sync_error),
             now=now,
+            enabled=bool(getattr(t, "enabled", True)),
         )
 
     return status

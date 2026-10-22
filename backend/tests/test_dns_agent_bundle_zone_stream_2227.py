@@ -220,22 +220,24 @@ async def _fixture(db: AsyncSession, *, driver: str, views: bool) -> DNSServer:
     return server
 
 
-# What origin/main (945f539d) stored for ``_fixture``, before #2227: the body's
-# SHA-256, the ETag and the structural ETag. The streamed render must store
-# exactly these.
-PINNED_AT_945F539D: dict[str, dict[str, str]] = {
+# What origin/main stored for ``_fixture``, before #2227: the body's SHA-256,
+# the ETag and the structural ETag. The streamed render must store exactly
+# these. Pinned at 945f539d; the two BIND9 shapes re-pinned at 2935d758,
+# whose bundles carry #2157's ``rpz_sha256`` on their blocklist zone (the
+# fixture assigns one), so main's own render of the fixture moved.
+PINNED_ON_MAIN: dict[str, dict[str, str]] = {
     "bind9-plain": {
-        "body_sha256": "e1f1de9157427b57d40fc6a4cecca967d20738d72bb34dd210b02a4d81b37c56",
-        "etag": "sha256:a783e1533b874e981121389fdceec69d7cdb5dcd0f1877bc5f2de4a6dca574f5",
+        "body_sha256": "d428928f453052f2be079128ffdd34af6d7a97b1a3630172279938aa5bdd59b0",
+        "etag": "sha256:af2ea15b4a15bd9f049f5576818273dded46a68e03741058314c34bbcfcaf624",
         "structural_etag": (
-            "sha256:5df1ca2d77ec83255139a6a822b2b97842ee02225aee7bb1ff2426d659da9e90"
+            "sha256:43cd44203ba0f64c673533c43858c29b96f139e208b3474f326d893700f90d96"
         ),
     },
     "bind9-views": {
-        "body_sha256": "7467ce2353b29ce3d76a300e782366a789f730c72bce6c80ce9ceea01440472e",
-        "etag": "sha256:0c19ad75681a78c0f048d437823bb8ebb633efbe96a8d0911d1bf07ca53034b6",
+        "body_sha256": "6773b252daeacad6a00dc6accddad346a3eca682c32e14f8aae0d1159171f591",
+        "etag": "sha256:5a77b7f714146b61fba00804b43b5efc9c61ba5fd3837a7c6feb41e6d6e5ecbd",
         "structural_etag": (
-            "sha256:51864ead52569e9238d5fe17312d45be4efc9383faa7c34675ad0b879ec8217c"
+            "sha256:b7a807264097c2f09589d7ebb21a55fb68d478ddaabc9ce2b73c49fc5e27c6d4"
         ),
     },
     "technitium-plain": {
@@ -306,7 +308,7 @@ async def test_the_streamed_zones_are_the_bundle_stored_before(
     assert outcome.records == reference.records == row.records
     assert row.body_bytes == outcome.body_bytes == len(reference_json)
     # ... and against what origin/main stored.
-    assert got == PINNED_AT_945F539D[_shape_id(shape)], f"{_shape_id(shape)}: {got!r}"
+    assert got == PINNED_ON_MAIN[_shape_id(shape)], f"{_shape_id(shape)}: {got!r}"
 
 
 @pytest.mark.asyncio
