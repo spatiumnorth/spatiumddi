@@ -282,3 +282,30 @@ def test_the_gate_table_matches_the_values_the_chart_renders() -> None:
     for role, (_ds, env_key) in service_lifecycle._ROLE_AGENT_GROUP.items():
         block = service_lifecycle._PROFILE_TO_HELM_KEY[role]
         assert values[block]["serverGroupName"] == env[env_key], role  # type: ignore[index]
+
+
+def test_supervisor_rbac_can_read_role_daemonsets():
+    """#2403 — the label gate reads each role DaemonSet's template; without
+    RBAC every read is a 403 and the gate never holds. Pin the rule."""
+    import pathlib
+
+    import yaml
+
+    root = pathlib.Path(__file__).resolve().parents[3]
+    src = (root / "charts/spatiumddi-appliance/templates/supervisor-rbac.yaml").read_text()
+    # Strip Helm template directives so the YAML parses.
+    import re
+
+    plain = re.sub(r"\{\{.*?\}\}", "", src, flags=re.S)
+    docs = [d for d in yaml.safe_load_all(plain) if d]
+    role = next(
+        d
+        for d in docs
+        if d.get("kind") == "Role" and d["metadata"]["name"] == "spatium-supervisor-namespace"
+    )
+    assert any(
+        "apps" in r.get("apiGroups", [])
+        and "daemonsets" in r.get("resources", [])
+        and "get" in r.get("verbs", [])
+        for r in role["rules"]
+    ), "the supervisor must be able to get role DaemonSets (#2403)"
