@@ -236,17 +236,24 @@ test-cov:
 	docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T api python -m pytest -n auto --cov=app --cov-report=term-missing
 
 # Refresh backend/.test_durations — the file pytest-split balances the CI
-# shards with (#1019) — from the ``test-durations`` artifact the most recent
-# successful CI run on main produced, then commit it. Run at release prep,
-# or when the ``Backend — Tests`` aggregator warns that the shards have
-# drifted. A stale file only costs balance (an unknown test is assumed
-# average), never correctness. Needs an authenticated GitHub CLI.
+# shards with (#1019) — from the ``test-durations`` artifact of the newest
+# successful CI run on main (push, the daily schedule, or a dispatch) that
+# published one, then commit it. Since #2429 most pushes skip the shards and
+# publish none; .github/scripts/latest-main-artifact.sh finds the artifact by
+# name (shared with ci.yml's impact-map lookup) and never accepts a
+# pull_request run's. Downloads into a temp dir: ``gh run download`` refuses
+# to overwrite an existing file, so extracting straight into backend/ failed
+# every time the committed file was present — that is, always. Run at
+# release prep, or when the ``Backend — Tests`` aggregator warns that the
+# shards have drifted. A stale file only costs balance (an unknown test is
+# assumed average), never correctness. Needs an authenticated GitHub CLI.
 test-durations:
 	@command -v gh >/dev/null || { echo "make test-durations needs the GitHub CLI (gh)"; exit 1; }
-	@run=$$(gh run list --workflow CI --branch main --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId'); \
-	test -n "$$run" || { echo "no successful CI run on main found"; exit 1; }; \
-	echo "downloading test-durations from CI run $$run"; \
-	gh run download "$$run" -n test-durations -D backend/ && \
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	run=$$(.github/scripts/latest-main-artifact.sh test-durations "$$tmp") || exit 1; \
+	[ -s "$$tmp/.test_durations" ] || { echo "the artifact from CI run $$run holds no .test_durations"; exit 1; }; \
+	mv "$$tmp/.test_durations" backend/.test_durations; \
+	echo "downloaded test-durations from CI run $$run"; \
 	echo "wrote backend/.test_durations — review the diff and commit it"
 
 # ── CI parity ──────────────────────────────────────────────────────────────────
