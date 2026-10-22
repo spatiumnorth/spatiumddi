@@ -10,6 +10,7 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
@@ -182,3 +183,41 @@ async def test_non_bind9_server_cannot_join_a_group_holding_anchors(
         )
     assert exc.value.status_code == 422
     assert "trust anchors" in str(exc.value)
+
+
+async def _dirty_seq(db: AsyncSession, server_id: uuid.UUID) -> int:
+    db.expire_all()
+    return int(
+        (
+            await db.execute(select(DNSServer.bundle_dirty_seq).where(DNSServer.id == server_id))
+        ).scalar_one()
+    )
+
+
+@pytest.mark.asyncio
+async def test_adding_and_deleting_an_anchor_marks_the_groups_bundle_dirty(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The anchor row carries no group_id, so the dirty-set listener has to
+    resolve it through its options row. Without that, the 201 / 204 changed
+    nothing BIND would ever render until an unrelated options save."""
+    headers = await _superadmin(db_session)
+    group, server = await _group(db_session, "bind9")
+    _other_group, other = await _group(db_session, "bind9")
+    await db_session.commit()
+    assert server is not None and other is not None
+    server_id, other_id, group_id = server.id, other.id, group.id
+    start = await _dirty_seq(db_session, server_id)
+    other_start = await _dirty_seq(db_session, other_id)
+
+    url = f"/api/v1/dns/groups/{group_id}/options/trust-anchors"
+    r = await client.post(url, json=_anchor(), headers=headers)
+    assert r.status_code == 201, r.text
+    assert await _dirty_seq(db_session, server_id) > start
+    assert await _dirty_seq(db_session, other_id) == other_start, "another group is untouched"
+
+    after_add = await _dirty_seq(db_session, server_id)
+    r = await client.delete(f"{url}/{r.json()['id']}", headers=headers)
+    assert r.status_code == 204, r.text
+    assert await _dirty_seq(db_session, server_id) > after_add
+    assert await _dirty_seq(db_session, other_id) == other_start
