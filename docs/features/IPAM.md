@@ -832,6 +832,7 @@ Import behavior:
 - Export a block, subnet, or entire space
 - Formats: CSV, JSON, Excel (`.xlsx`)
 - Includes: all subnet metadata + utilization + custom fields + IP address list (optional)
+- **What each format holds with "Include IP addresses" ticked (#2420):** JSON and XLSX carry the subnet metadata *and* the address list (XLSX as separate sheets); PDF keeps its subnet table and appends the addresses. **CSV is the address list only** (`subnet,address,status,hostname,fqdn,mac_address,description,last_seen_at` + custom fields), the shape the address importer reads, so it round-trips. For subnet metadata in CSV, download it with the box unticked. The CSV follows the box, not whether the scope happens to hold addresses
 
 ### DNS Zone Import / Export
 
