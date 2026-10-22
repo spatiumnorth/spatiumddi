@@ -128,6 +128,7 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A slot upgrade stopped in its first moments no longer stays "in-flight" (#2424).** The runner wrote the in-flight state before arming the trap that records a failure on an abrupt exit, so a stop landing in between left the upgrade reading in-flight with nothing to clear it. The trap is now armed first.
 - **Agents no longer report a config apply of `ok` before they have applied anything (#2258).** The DNS, DHCP and looking-glass agents sent a default `ok` with no etag on every heartbeat until their first apply, so a fresh agent whose `/config` fetch never succeeded showed a green chip and never fired `agent_config_rejected`, and a server move's reset to unknown (#934) was undone within one heartbeat. The agents now send an empty block until something has applied, and the control plane treats `ok` without an etag as unknown (NULL), which also covers older agents still in the field.
 
 - **A disabled Tailscale tenant no longer reads "Token rejected", and
