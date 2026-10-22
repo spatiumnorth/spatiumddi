@@ -264,9 +264,15 @@ export function TailscalePage() {
                             : "never"}
                           {t.last_sync_error && (
                             <div
-                              className="text-[11px] text-destructive max-w-xs truncate"
+                              className={
+                                t.enabled
+                                  ? "text-[11px] text-destructive max-w-xs truncate"
+                                  : "text-[11px] text-muted-foreground max-w-xs truncate"
+                              }
                               title={t.last_sync_error}
+                              data-testid="tenant-last-error"
                             >
+                              {t.enabled ? "" : "Last error (disabled): "}
                               {t.last_sync_error}
                             </div>
                           )}

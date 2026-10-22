@@ -64,25 +64,53 @@ statistics-channels {{
 }};
 {logging_block}{tsig_include}"""
 
-# Query-log channel + category block. Path matches the QueryLogShipper
-# default (``/var/log/named/queries.log``) so the shipper can tail the
-# same file the daemon writes — the entrypoint script chowns this
-# directory to the unprivileged ``spatium`` user at boot. Severity +
-# print-* defaults match ``DNSServerOptions``' column defaults; we
-# don't plumb the per-field overrides through the agent yet because
-# the operator-facing UI surfaces the boolean toggle only.
-_QUERY_LOG_HEAD = """\
-logging {
-    channel queries_channel {
-        file "/var/log/named/queries.log" versions 5 size 50m;
-        severity info;
-        print-category yes;
-        print-severity yes;
-        print-time yes;
-    };
-    category queries { queries_channel; };
-    category query-errors { queries_channel; };
+# Query-log channel + category block. The channel is ALWAYS a file at the
+# QueryLogShipper default (``/var/log/named/queries.log``) so the shipper
+# can tail what the daemon writes — the entrypoint script chowns this
+# directory to the unprivileged ``spatium`` user at boot. ``channel`` and
+# ``file`` are not operator-settable (the control plane refuses them, #2265):
+# syslog / stderr / another path would silently starve the DNS Queries tab.
+# ``severity`` and ``print-*`` ARE honoured, within what the shipper can
+# still read (see ``_query_log_channel_settings``).
+_QUERY_LOG_FILE = "/var/log/named/queries.log"
+_QUERY_LOG_DEBUG_RE = re.compile(r"^debug(?:\s+\d{1,3})?$")
+
+
+def _query_log_channel_settings(opts: dict[str, Any]) -> tuple[str, str, str, str]:
+    """``(severity, print-category, print-severity, print-time)`` tokens.
+
+    named logs queries at ``info``, so a channel severity of ``notice`` or
+    above would drop every line; a stored value like that (set before the
+    control plane refused it) falls back to ``info`` here rather than
+    emptying the DNS Queries tab. ``print-time`` is always ``yes`` — the
+    shipper reads each line's timestamp. Absent keys (an older control
+    plane) render the historical defaults.
+    """
+    severity = str(opts.get("query_log_severity") or "info").strip().lower()
+    if severity != "dynamic" and not _QUERY_LOG_DEBUG_RE.match(severity):
+        severity = "info"
+
+    def yn(key: str) -> str:
+        return "no" if opts.get(key) is False else "yes"
+
+    return severity, yn("query_log_print_category"), yn("query_log_print_severity"), "yes"
+
+
+def _query_log_head(opts: dict[str, Any]) -> str:
+    severity, category, print_sev, print_time = _query_log_channel_settings(opts)
+    return f"""\
+logging {{
+    channel queries_channel {{
+        file "{_QUERY_LOG_FILE}" versions 5 size 50m;
+        severity {severity};
+        print-category {category};
+        print-severity {print_sev};
+        print-time {print_time};
+    }};
+    category queries {{ queries_channel; }};
+    category query-errors {{ queries_channel; }};
 """
+
 
 # RPZ policy hits (issue #699). named logs a rewrite to its OWN ``rpz``
 # category, never to ``queries`` — so without these two lines a blocked
@@ -123,7 +151,7 @@ def _render_logging_block(opts: dict[str, Any]) -> str:
     """
     if not bool(opts.get("query_log_enabled")):
         return ""
-    block = _QUERY_LOG_HEAD + _RPZ_LOG_CATEGORIES
+    block = _query_log_head(opts) + _RPZ_LOG_CATEGORIES
     if bool(opts.get("response_log_enabled")):
         block += _RESPONSE_LOG_CATEGORY
     return block + "};\n"
@@ -460,6 +488,48 @@ def _redirect_rdata(target: str) -> str | None:
             return None
         return f"CNAME {name}."
     return f"{'AAAA' if ip.version == 6 else 'A'} {ip}"
+
+
+#: Answer a ``sinkhole`` list gives when it names no address of a family
+#: (#2124). The unspecified address is what every DNS sinkhole answers with
+#: (Pi-hole, AdGuard Home): a client connecting to it fails at once, rather
+#: than waiting out a resolver timeout as ``rpz-drop`` makes it.
+DEFAULT_SINKHOLE_V4 = "0.0.0.0"
+DEFAULT_SINKHOLE_V6 = "::"
+
+
+def sinkhole_rdatas(sinkhole_ip: Any) -> tuple[tuple[str, ...], bool]:
+    """RPZ local data for a ``sinkhole`` entry: an A *and* an AAAA (#2124).
+
+    Both families are answered, so an AAAA lookup fails fast too instead of
+    falling through to NODATA and a retry over v4. The list's
+    ``sinkhole_ip`` replaces the default of its own family; the other
+    family keeps the unspecified address.
+
+    Returns ``(rdatas, usable)``. ``usable`` is False when ``sinkhole_ip``
+    was set but is not an IP address, in which case the defaults are used:
+    the API validates the field now, but a legacy row is not, and an
+    unparseable address in the rdata would make BIND refuse the WHOLE zone
+    (#878) — answering with the unspecified address is the closer reading
+    of "sinkhole this" than enforcing nothing.
+
+    Mirrored by ``_sinkhole_rdatas`` in the control plane's BIND9 driver;
+    the two implement one contract and must not diverge.
+    """
+    v4, v6 = DEFAULT_SINKHOLE_V4, DEFAULT_SINKHOLE_V6
+    usable = True
+    text = str(sinkhole_ip).strip() if sinkhole_ip is not None else ""
+    if text:
+        try:
+            ip = ipaddress.ip_address(text)
+        except ValueError:
+            usable = False
+        else:
+            if ip.version == 6:
+                v6 = str(ip)
+            else:
+                v4 = str(ip)
+    return (f"A {v4}", f"AAAA {v6}"), usable
 
 
 # ── Resolver cache ceiling (issue #1725) ────────────────────────────────────
@@ -1379,7 +1449,12 @@ def _zone_label(zname: str, view: str | None) -> str:
 #: same zone dict. The control plane's hash covers the INPUT; this covers the
 #: renderer, so an agent upgrade that changes the output re-renders every RPZ
 #: file once instead of hard-linking the old renderer's bytes forever.
-_RPZ_RENDER_REVISION = 1
+#:
+#: 2 (#2124): a ``sinkhole`` entry renders as A + AAAA local data instead of
+#: ``CNAME rpz-drop.``. An entry whose list names no address ships the same
+#: bytes as before, so its ``rpz_sha256`` does not move and only this bump
+#: stops a #2157 agent's dropping file from being linked forward.
+_RPZ_RENDER_REVISION = 2
 _RPZ_HASH_SUFFIX = ".sha256"
 
 
@@ -1707,6 +1782,50 @@ def _render_allow_recursion(
     return f"    allow-recursion {{ {'; '.join(kept)}; }};\n"
 
 
+_TRUST_ANCHOR_LABEL = r"[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+_TRUST_ANCHOR_NAME_RE = re.compile(rf"^(\.|{_TRUST_ANCHOR_LABEL}(\.{_TRUST_ANCHOR_LABEL})*\.?)$")
+_TRUST_ANCHOR_KEY_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+
+def _render_trust_anchors(anchors: Any) -> str:
+    """Top-level ``trust-anchors { ... };`` statement (#2266), or ``""``.
+
+    DNSKEY anchors only, which is all the control plane stores: ``static-key``
+    for a fixed key, ``initial-key`` for one BIND then maintains by RFC 5011.
+    Flags are always 257 (a KSK; the only kind an anchor is) and protocol 3.
+    ``key_tag`` is not part of BIND's syntax. Without this the options API's
+    anchors were stored and never reached named, so ``dnssec-validation yes``
+    validated nothing.
+
+    An entry that would not parse is skipped with a warning rather than
+    rendered: one bad line makes ``named-checkconf`` reject the whole file and
+    the group stops converging. Empty input renders nothing, so a group with
+    no anchors keeps a byte-identical named.conf.
+    """
+    lines: list[str] = []
+    for ta in anchors or []:
+        if not isinstance(ta, dict):
+            continue
+        name = str(ta.get("zone_name") or "").strip()
+        key = "".join(str(ta.get("public_key") or "").split())
+        try:
+            alg = int(ta.get("algorithm"))
+        except (TypeError, ValueError):
+            alg = 0
+        if not (
+            _TRUST_ANCHOR_NAME_RE.match(name)
+            and _TRUST_ANCHOR_KEY_RE.match(key)
+            and 1 <= alg <= 255
+        ):
+            log.warning("bind9_trust_anchor_skipped_invalid", zone=name)
+            continue
+        kind = "initial-key" if ta.get("is_initial_key", True) else "static-key"
+        lines.append(f'    "{name}" {kind} 257 3 {alg} "{key}";\n')
+    if not lines:
+        return ""
+    return "trust-anchors {\n" + "".join(lines) + "};\n"
+
+
 class Bind9Driver(DriverBase):
     rendered_dir_name = "rendered"
 
@@ -1823,8 +1942,13 @@ class Bind9Driver(DriverBase):
             # (otherwise BIND9 returns SERVFAIL on a DNSSEC conflict). For a
             # blocking use-case this is what you want: the user intent is to
             # block, not to preserve validation integrity.
+            # qname-wait-recurse no (#2427): BIND's default (yes) resolves the
+            # qname first and does not rewrite a failed lookup, so a blocked
+            # name whose upstream is dead answered SERVFAIL after ~10 s instead
+            # of the policy answer. A blocklist wants the opposite.
             response_policy_block = (
-                f"    response-policy {{ {zones_list}; }} break-dnssec yes;\n"
+                f"    response-policy {{ {zones_list}; }} "
+                "break-dnssec yes qname-wait-recurse no;\n"
             )
 
         logging_block = _render_logging_block(opts)
@@ -1873,6 +1997,7 @@ class Bind9Driver(DriverBase):
         # BIND's built-in "default" needs none. The key-directory above is
         # where BIND auto-generates + rotates the private keys.
         conf += _render_dnssec_policies(bundle.get("dnssec_policies") or [])
+        conf += _render_trust_anchors(opts.get("trust_anchors"))
 
         # ``(zone, kind, detail)`` from every zone file written below — logged
         # once, aggregated, after the loop (issue #1153).
@@ -1980,9 +2105,9 @@ class Bind9Driver(DriverBase):
         def _rpz_stanza(bl: dict[str, Any], file_prefix: str) -> str:
             """Build an RPZ ``zone "..." { ... };`` and write its file.
 
-            Entries render as CNAME records: nxdomain → CNAME .,
-            sinkhole → CNAME rpz-drop., redirect → CNAME <target>.,
-            exceptions → CNAME rpz-passthru.
+            Entries render as RPZ policy records: nxdomain → CNAME .,
+            sinkhole → A + AAAA local data (#2124), redirect → CNAME
+            <target>. or A/AAAA, exceptions → CNAME rpz-passthru.
             """
             zname = bl["rpz_zone_name"]
             rel = f"zones/{file_prefix}{zname.rstrip('.')}.db"
@@ -2026,7 +2151,10 @@ class Bind9Driver(DriverBase):
                     zlist = "; ".join(
                         f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in view_bls
                     )
-                    body += f"response-policy {{ {zlist}; }} break-dnssec yes;\n"
+                    body += (
+                        f"response-policy {{ {zlist}; }} "
+                        "break-dnssec yes qname-wait-recurse no;\n"
+                    )
                 for zone in bundle.get("zones", []):
                     if zone.get("view_name") != vname:
                         continue
@@ -2360,6 +2488,14 @@ class Bind9Driver(DriverBase):
           - CNAME <target>.    → rewrite response to CNAME target
           - A / AAAA <ip>      → answer with a literal address
 
+        ``block_mode`` maps onto those as: ``nxdomain`` → ``CNAME .``;
+        ``sinkhole`` → an ``A`` and an ``AAAA`` (the list's
+        ``sinkhole_ip``, else the unspecified address; #2124). Nothing
+        renders ``rpz-drop``: a dropped query leaves the client waiting out
+        its resolver timeout, the worst answer an ad blocker can give. A
+        legacy ``refused`` (BIND's RPZ has no REFUSED action, and #2124
+        retired the mode) renders as NXDOMAIN, as it always did here.
+
         Wildcard entries are emitted as `*.<domain>` *in addition to* the
         bare name, because an RPZ wildcard matches subdomains only — a
         `*.example.com`-only rule leaves the apex resolving normally.
@@ -2389,20 +2525,35 @@ class Bind9Driver(DriverBase):
         path.parent.mkdir(parents=True, exist_ok=True)
         zname = bl["rpz_zone_name"]
         # ``seen`` is the owner-name collision ledger (#878) and must stay.
-        seen: dict[str, str] = {}
+        seen: dict[str, tuple[str, ...]] = {}
         collisions: list[str] = []
         bad_targets: list[str] = []
+        bad_sinkholes: set[str] = set()
         # A temp file renamed into place, so the file is always a NEW inode
         # (#2157): ``path`` may be a name another tree hard-links.
         tmp = path.with_name(path.name + ".tmp")
         with tmp.open("w", encoding="utf-8", buffering=1 << 20) as fh:
-            for line in self._rpz_zone_lines(bl, seen, collisions, bad_targets):
+            for line in self._rpz_zone_lines(
+                bl, seen, collisions, bad_targets, bad_sinkholes
+            ):
                 fh.write(line)
                 fh.write("\n")
             # Durable before the caller's sidecar vouches for it (#2157).
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        if bad_sinkholes:
+            log.warning(
+                "bind9_rpz_sinkhole_ip_unusable",
+                zone=zname,
+                sinkhole_ips=sorted(bad_sinkholes)[:5],
+                detail=(
+                    "A sinkhole list's sinkhole_ip is not an IP address, so "
+                    "its entries answer with 0.0.0.0 / :: instead. Rendering "
+                    "it would make BIND reject the whole zone. Correct the "
+                    "list's sinkhole address."
+                ),
+            )
         if bad_targets:
             log.warning(
                 "bind9_rpz_redirect_target_unusable",
@@ -2424,8 +2575,9 @@ class Bind9Driver(DriverBase):
                 sample=sorted(set(collisions))[:5],
                 detail=(
                     "The same domain appears in two assigned blocklists with "
-                    "different block modes. The first was rendered and the "
-                    "rest ignored — emitting both would put two CNAMEs on one "
+                    "different block modes or sinkhole addresses. The first "
+                    "was rendered and the rest ignored — emitting both would "
+                    "put two CNAMEs, or a CNAME beside an address, on one "
                     "owner name, which makes BIND reject the whole zone."
                 ),
             )
@@ -2439,9 +2591,10 @@ class Bind9Driver(DriverBase):
     def _rpz_zone_lines(
         self,
         bl: dict[str, Any],
-        seen: dict[str, str],
+        seen: dict[str, tuple[str, ...]],
         collisions: list[str],
         bad_targets: list[str],
+        bad_sinkholes: set[str] | None = None,
     ) -> Iterator[str]:
         """Yield the RPZ zone file's lines; see ``_write_rpz_zone_file``."""
         yield "$TTL 60"
@@ -2477,21 +2630,31 @@ class Bind9Driver(DriverBase):
                 if rewrite is None:
                     bad_targets.append(domain)
                     continue
-                rdata = rewrite
+                rdatas: tuple[str, ...] = (rewrite,)
             elif block_mode == "sinkhole":
-                rdata = "CNAME rpz-drop."
-            else:  # default: nxdomain
-                rdata = "CNAME ."
+                # Local data, not ``rpz-drop`` (#2124): drop made named
+                # send no response at all, so every blocked lookup hung
+                # for the client's resolver timeout, and the list's
+                # ``sinkhole_ip`` was never read.
+                rdatas, usable = sinkhole_rdatas(e.get("sinkhole_ip"))
+                if not usable and bad_sinkholes is not None:
+                    bad_sinkholes.add(str(e.get("sinkhole_ip")))
+            else:  # nxdomain, and a legacy ``refused`` (#2124)
+                rdatas = ("CNAME .",)
             if key in seen:
                 # An identical repeat is harmless duplication (BIND loads
-                # it); only a differing one would have killed the zone.
-                if seen[key] != rdata:
+                # it); only a differing one would have killed the zone —
+                # and an A beside a CNAME at one owner is as fatal as two
+                # CNAMEs, so the whole rdata set is compared.
+                if seen[key] != rdatas:
                     collisions.append(domain)
                 continue
-            seen[key] = rdata
-            yield f"{domain} {rdata}"
+            seen[key] = rdatas
+            for rdata in rdatas:
+                yield f"{domain} {rdata}"
             if is_wildcard:
-                yield f"*.{domain} {rdata}"
+                for rdata in rdatas:
+                    yield f"*.{domain} {rdata}"
         # Exceptions → passthrough (never blocked even if a broader rule
         # matches). Deduped on the same lowercased key so two spellings of
         # one name cannot land twice either.

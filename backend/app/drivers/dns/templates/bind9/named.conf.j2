@@ -147,17 +147,15 @@ dnssec-policy "{{ p.name }}" {
 {%- if options.query_log_enabled %}
 logging {
     channel queries_channel {
-        {%- if options.query_log_channel == "file" %}
-        file "{{ options.query_log_file }}" versions 5 size 50m;
-        {%- elif options.query_log_channel == "syslog" %}
-        syslog daemon;
-        {%- else %}
-        stderr;
-        {%- endif %}
-        severity {{ options.query_log_severity }};
+        {#- Always a file at the path the agent's shipper tails (#2265); the
+            channel / path are not operator-settable. A severity above
+            ``info`` would drop every query line, so it falls back. #}
+        file "/var/log/named/queries.log" versions 5 size 50m;
+        {%- set qsev = (options.query_log_severity or "info")|lower %}
+        severity {{ qsev if (qsev == "dynamic" or qsev == "debug" or qsev.startswith("debug ")) else "info" }};
         print-category {{ "yes" if options.query_log_print_category else "no" }};
         print-severity {{ "yes" if options.query_log_print_severity else "no" }};
-        print-time {{ "yes" if options.query_log_print_time else "no" }};
+        print-time yes;
     };
     category queries { queries_channel; };
     category query-errors { queries_channel; };
@@ -220,7 +218,7 @@ view "{{ view.name }}" {
     {%- endif %}
     recursion {{ "yes" if view.recursion else "no" }};
     {%- if view_bls %}
-    response-policy { {% for bl in view_bls %}zone "{{ bl.rpz_zone_name }}"; {% endfor %}} break-dnssec yes;
+    response-policy { {% for bl in view_bls %}zone "{{ bl.rpz_zone_name }}"; {% endfor %}} break-dnssec yes qname-wait-recurse no;
     {%- endif %}
 {%- for zone in zones %}
 {%- if zone.view_name == view.name %}

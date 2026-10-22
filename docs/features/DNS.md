@@ -381,7 +381,8 @@ DNSTrustAnchor
   added_at, added_by
 ```
 
-- **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors go in `managed-keys {}` or `trust-anchors {}`
+- **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors are rendered as a top-level `trust-anchors { ... };` statement (`static-key` / `initial-key`, flags 257, protocol 3; DNSKEY anchors only, no DS), shipped in the bundle so adding or removing one re-renders `named.conf` (#2266). `yes` with no anchor validates nothing in BIND 9.20, so the options response carries a `dnssec_warnings` entry (advisory, never a 422); `auto` uses the built-in root anchor
+- **PowerDNS / Technitium / agentless drivers:** have no equivalent, so adding a trust anchor to a group with such a server is a 422. Values are validated (zone name, algorithm 1-255, key tag, base64 key) because they land verbatim in `named.conf`
 - The root DNSSEC trust anchor (ICANN KSK) is pre-loaded automatically when `dnssec_validation: auto`
 - UI shows DNSSEC chain validation status for each zone
 
@@ -460,6 +461,7 @@ DNSServerOptions.allow_notify: list[str]        -- who may send NOTIFY to this s
 ```
 
 - **BIND9:** `notify yes|explicit|master-only|no;` + `also-notify { ... };` + `allow-notify { ... };`
+- **Technitium (agent-managed, #2267):** `notify` + `notifyNameServers` on each Primary / Secondary zone. `yes` is the zone's NS set plus the also-notify list; `explicit` only the list; `no` nothing; `master-only` / `primary-only` as `yes` on a Primary and nothing on a Secondary. A zone's own value overrides the group's. Technitium's list takes bare IP addresses, so an `also_notify` entry with a port, key or hostname is refused with a 422, and so is `allow_notify` (a Technitium secondary accepts NOTIFY only from its own primaries).
 - Notify settings can be overridden per-zone (the zone model inherits from server defaults)
 - `also_notify` is useful when secondaries are stealth (not listed in zone NS records)
 - `allow_notify` on secondaries controls which primaries are trusted to trigger a zone transfer
@@ -778,6 +780,8 @@ DDNS is safe to call repeatedly. If the resolved hostname matches what's already
 ### Security
 
 - RFC 2136 updates to BIND9 use TSIG signing (key stored Fernet-encrypted).
+- A TSIG key that an ACL, view, server option or zone still cites as `key <name>` cannot be renamed or deleted (409, naming each referrer); remove the references first. The bundle also drops any `key <name>` it does not define, so a stale reference cannot stop the group converging; an access list that empties (or loses a `!key` negation) that way ships as `none`, never as an empty list that would read as unset (#2282).
+- An ACL that a view, server option or zone (`allow_query` / `allow_transfer` / `also_notify`) still cites by name cannot be renamed or deleted (409). The bundle drops any ACL name it does not define; an access list emptied that way renders as `none`, never as inherit-the-server (#2283).
 - WinRM calls to Windows DNS go over HTTPS with cert validation by default.
 - The DDNS service itself never touches manual IPAM allocations (it gates on `auto_from_lease=True` before doing anything).
 
@@ -829,15 +833,59 @@ DNSBlockListException
 ### Supported List Formats
 - **Hosts file** (`0.0.0.0 ads.example.com`)
 - **Domain list** (one domain per line)
-- **AdBlock format** (`||ads.example.com^`)
+- **AdBlock format** (`||ads.example.com^`). What the parser does with the
+  rest of the syntax ([#2123](https://github.com/spatiumnorth/spatiumddi/issues/2123)):
+  - `@@||name^` becomes an **exception** on the list (source `feed`),
+    re-synced by every refresh. An exception you add by hand is never
+    removed by a refresh. A feed's `@@` rule applies to **the feed's own
+    list only**: it carves a name out of that feed's own blocks (for
+    example `@@||cdn.ads.example^` under `||ads.example^`), and it never
+    unblocks a name that your manual list, or any other list on the same
+    group or view, blocks exactly, through a wildcard, or anywhere under
+    it. Such a feed exception is still stored and listed, but has no
+    effect. An exception you add by hand applies to every list on the
+    group or view, as before. Adding or editing one that the feed already
+    lists makes it yours, and so makes it group-wide too: that is the
+    operator's call, not the feed's.
+  - `$important` is kept as a plain block, and still beats a plain `@@`
+    for the same name in the feed (that is what it means), so that
+    exception is not stored.
+  - `$badfilter` disables the rule it names; neither becomes an entry.
+  - Any other modifier (`$domain=`, `$third-party`, `$client=`,
+    `$dnstype=`, `$denyallow=`, …) **skips the rule**. Most of them narrow
+    a rule, and DNS cannot express that, so keeping the bare name would
+    block more than the feed asked for.
+  - Regex rules (`/…/`), paths (`||host/ads`), a `*` inside a name and
+    other non-`||name^` rules are skipped.
+
+  Skipped rules are counted by category (regex / modifier / badfilter /
+  malformed), stored on the list as `feed_parse_skipped`, and shown on the
+  list as "N rules not enforced". Every `||name^` rule means "this name and
+  its subdomains", so an adblock feed on a list set to apex-only logs the
+  same override warning a `*.`-prefixed feed does (#894).
 
 ### Block Response Modes
 
 | Mode | DNS Response | Use Case |
 |---|---|---|
-| `nxdomain` | NXDOMAIN | Cleanest; some clients retry on NXDOMAIN |
-| `sinkhole` | Returns configured IP (e.g., 0.0.0.0) | Can serve a block page |
-| `refused` | REFUSED | Strict policy environments |
+| `nxdomain` | NXDOMAIN | Cleanest, fails fast |
+| `sinkhole` | An A and an AAAA record: the list's `sinkhole_ip`, else `0.0.0.0` and `::` | Fails fast, or points clients at a block page |
+
+`sinkhole` is rendered as RPZ local data. An IPv4 `sinkhole_ip` replaces
+`0.0.0.0` and an IPv6 one replaces `::`; the other family keeps the
+unspecified address, so both lookups fail at once. Before
+[#2124](https://github.com/spatiumnorth/spatiumddi/issues/2124) the agent
+rendered `sinkhole` as `rpz-drop`, which sends **no response**, so every
+blocked lookup waited out the client's resolver timeout. On Technitium a
+sinkhole without an address is `AnyAddress` (Technitium's name for
+`0.0.0.0` / `::`); with one it is `CustomAddress` with that address and
+the other family's unspecified address.
+
+There is **no `refused` mode**, deliberately. BIND's RPZ has no action that answers
+REFUSED (its actions are NXDOMAIN, NODATA, PASSTHRU, DROP, TCP-only and
+local data), so the API refuses `refused` with a 422. It used to be
+accepted and was served as NXDOMAIN; upgrading rewrites stored `refused`
+lists to `nxdomain`, which changes nothing they answer.
 
 ### BIND9 Implementation
 - Uses a `Response Policy Zone (RPZ)` — an industry-standard BIND9 feature
@@ -898,7 +946,7 @@ The rendered config puts the RPZ inside the matching view only:
 ```
 view "guest" {
     match-clients { 10.20.0.0/16; };
-    response-policy { zone "spatium-blocklist-guest.rpz"; } break-dnssec yes;
+    response-policy { zone "spatium-blocklist-guest.rpz"; } break-dnssec yes qname-wait-recurse no;
     ...
 };
 ```
@@ -1745,12 +1793,17 @@ unrelated edit.
 - **`dnssec_validation` enum.** `auto`, `yes`, or `no`.
 - **`notify_enabled` enum.** `yes`, `no`, `explicit`, `master-only` or
   `primary-only`.
-- **`query_log_channel` enum.** `file`, `syslog` or `stderr`.
-- **`query_log_severity`.** `critical`, `error`, `warning`, `notice`,
-  `info`, `dynamic`, `debug` or `debug <level>`.
-- **Paths.** `query_log_file` must be a file under `/var/log/named/` (the
-  directory the agent makes writable and its query-log shipper tails), and
-  `gss_tsig_keytab_path` a file under `/etc/` or `/var/lib/`. Both must be
+- **`query_log_channel` / `query_log_file`.** Fixed: the channel is
+  `file` at `/var/log/named/queries.log`, the file the agent's query-log
+  shipper tails (and the DNS Queries tab reads). Any other channel or path
+  is refused with a 422 (#2265), since it would silently empty that tab.
+- **`query_log_severity`.** `info`, `dynamic`, `debug` or `debug <level>`.
+  named logs queries at `info`, so `notice` and quieter would drop every
+  line and are refused. `query_log_print_category` / `_print_severity`
+  are honoured; `query_log_print_time` must stay on (the shipper reads the
+  timestamp).
+- **Paths.** `gss_tsig_keytab_path` must be a file under `/etc/` or
+  `/var/lib/`. It must be
   absolute, with no `.` or `..` segment, using only letters, digits, `.`,
   `_`, `-` and `/`: the path sits inside `"…"` in `named.conf`.
 
