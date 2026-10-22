@@ -220,7 +220,7 @@ view "{{ view.name }}" {
     {%- endif %}
     recursion {{ "yes" if view.recursion else "no" }};
     {%- if view_bls %}
-    response-policy { {% for bl in view_bls %}zone "{{ bl.rpz_zone_name }}"; {% endfor %}} break-dnssec yes;
+    response-policy { {% for bl in view_bls %}zone "{{ bl.rpz_zone_name }}"; {% endfor %}} break-dnssec yes qname-wait-recurse no;
     {%- endif %}
 {%- for zone in zones %}
 {%- if zone.view_name == view.name %}

@@ -128,6 +128,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A blocked name answered SERVFAIL after ~10 s when its upstream
+  lookup failed (#2427).** The BIND9 `response-policy` statement
+  (global and per-view, agent and control-plane template) lacked
+  `qname-wait-recurse no`, so BIND resolved the blocked name first
+  and did not rewrite a failed lookup - the names a blocklist most
+  wants to answer (dead, sinkholed, broken upstream) were the ones
+  that timed out, and the query also leaked upstream. QNAME-trigger
+  rules now answer at once. IP and NSDNAME triggers still recurse by
+  nature.
+
 - **Switching an appliance from BIND9 to PowerDNS and to a new DNS group
   in one save could leave two server rows, with the new group's zones
   REFUSED (#2190).** The supervisor labelled the node for the new engine

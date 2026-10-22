@@ -1823,8 +1823,13 @@ class Bind9Driver(DriverBase):
             # (otherwise BIND9 returns SERVFAIL on a DNSSEC conflict). For a
             # blocking use-case this is what you want: the user intent is to
             # block, not to preserve validation integrity.
+            # qname-wait-recurse no (#2427): BIND's default (yes) resolves the
+            # qname first and does not rewrite a failed lookup, so a blocked
+            # name whose upstream is dead answered SERVFAIL after ~10 s instead
+            # of the policy answer. A blocklist wants the opposite.
             response_policy_block = (
-                f"    response-policy {{ {zones_list}; }} break-dnssec yes;\n"
+                f"    response-policy {{ {zones_list}; }} "
+                "break-dnssec yes qname-wait-recurse no;\n"
             )
 
         logging_block = _render_logging_block(opts)
@@ -2026,7 +2031,10 @@ class Bind9Driver(DriverBase):
                     zlist = "; ".join(
                         f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in view_bls
                     )
-                    body += f"response-policy {{ {zlist}; }} break-dnssec yes;\n"
+                    body += (
+                        f"response-policy {{ {zlist}; }} "
+                        "break-dnssec yes qname-wait-recurse no;\n"
+                    )
                 for zone in bundle.get("zones", []):
                     if zone.get("view_name") != vname:
                         continue
