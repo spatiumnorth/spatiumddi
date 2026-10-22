@@ -150,6 +150,161 @@ the formatter handles the rest.
   pages; an event an operator resolved by hand while the resource is
   still failing is not re-paged, as before.
 
+  earliest-fired. Downgrade restores the non-unique index; the resolved
+  duplicates stay resolved.
+
+- **A DNS blocklist set to `sinkhole` answers with the sinkhole address
+  instead of dropping the query, and `refused` is retired (#2124).** The
+  agent rendered `sinkhole` as `CNAME rpz-drop.`, which makes named send
+  no response, so every blocked lookup hung for the client's resolver
+  timeout (seconds per lookup, per retry) instead of failing fast. The
+  list's `sinkhole_ip` was never shipped to the agent at all, while the
+  control-plane renderer emitted `A <ip>` only when one was set and
+  rendered `refused` as `rpz-drop`: two renderers, two policies. Both now
+  render `sinkhole` as RPZ local data, an `A` and an `AAAA`: the list's
+  address replaces `0.0.0.0` (IPv4) or `::` (IPv6), and the other family
+  keeps the unspecified address. Verified with `named-checkzone` and a
+  live `named` 9.20: `A 0.0.0.0`, `AAAA ::` and the configured addresses
+  come back at once. On Technitium a sinkhole with no address is now
+  `AnyAddress` (it used to become `NxDomain`), and one with an address is
+  `CustomAddress` with it. BIND's RPZ has no action that answers REFUSED,
+  so `block_mode: "refused"` is now a 422 that says so (a deliberate
+  decision: accepting it and storing `nxdomain` would be the same silent
+  substitution this fixes); stored `refused`
+  lists become `nxdomain`, which is what the agent always served them.
+  `sinkhole_ip` must now be an IP address (a bad legacy value renders the
+  default rather than breaking the zone), and the catalog subscribe
+  endpoint validates `block_mode`, which it did not before.
+
+- **The adblock feed parser keeps `@@` exceptions, honours `$badfilter`
+  and no longer widens narrowing rules into blocks (#2123).** It read only
+  `||` lines and cut each rule at the first `^`, `$` or `/`. So
+  `@@||name^` exceptions were dropped (the name stayed blocked by any
+  broader rule), `||name^$badfilter` (which disables a rule) became a
+  block, and `$domain=`, `$third-party`, `$client=` and similar rules,
+  which narrow a block DNS cannot narrow, became unconditional blocks.
+  Now `@@` rules become the list's exceptions (marked `source: feed` and
+  re-synced on each refresh; exceptions you add stay yours). A feed's
+  `@@` applies to that feed's own list only: it carves a name out of the
+  feed's own blocks and never unblocks a name your manual list, or any
+  other list on the same group or view, blocks. Exceptions you add by
+  hand still apply to every list, and adding or editing one the feed
+  already lists makes it yours, and so group-wide. `$important` is a plain block that still beats a plain `@@` for
+  the same name, a `$badfilter` rule drops the rule it names, and a
+  rule with any other modifier is skipped. Regex rules, path rules and
+  other rules that are not `||name^` are skipped too. Each skipped rule is
+  counted by category, stored as `feed_parse_skipped` on the list, shown
+  on the list as "N rules not enforced" and returned by
+  `list_dns_blocklists`. Adblock rules now count towards the #894
+  "apex-only list overrides a wildcard feed" warning, since `||name^`
+  means the name and its subdomains.
+
+  Bundles without a blocklist are byte-identical. With #2124 below,
+  `RENDERER_REVISION` is 13.
+
+- **DNSSEC trust anchors reach BIND9, so `dnssec-validation yes`
+  validates something (#2266).** Anchors added with
+  `POST /groups/{id}/options/trust-anchors` were stored and listed
+  but never shipped or rendered; with `yes` BIND 9.20 validates
+  nothing without one. The bundle now carries them (BIND9 groups
+  only, and only when there are any, so a group without anchors
+  keeps a byte-identical `named.conf` and etag) and the agent
+  renders a top-level `trust-anchors { ... };` statement with
+  `static-key` / `initial-key` (DNSKEY anchors; DS anchors are not
+  stored). Checked with `named-checkconf` on BIND 9.20. The values
+  are validated at the API, as they land verbatim in `named.conf`,
+  and adding an anchor to a group with a PowerDNS, Technitium or
+  agentless server is a 422 naming the driver. The options response
+  gains an advisory `dnssec_warnings` entry (shown on the DNS
+  Options tab) for `yes` with no anchor on a BIND9 group.
+
+- **The backup target form keeps the line breaks of a multi-line
+  field (#2199).** Every destination field was a one-line input, and
+  an input turns each line break into a space. So an SCP private key
+  reached paramiko as one line ("not a valid OPENSSH private key
+  file"), a two-host known_hosts became one entry, and a second HTTPS
+  header folded into the first one's value. The destination catalog
+  (`GET /backup/targets/kinds`) now marks each field whose value is
+  lines `multiline`: SCP's private key and known_hosts, HTTPS PUT's
+  extra headers and GCS's service-account JSON. The form renders
+  those as textareas, masked for the secret ones with a Show toggle,
+  and sends the value unchanged. Editing a target without retyping
+  its key still keeps the stored key. The API now refuses (422) a
+  PEM key whose BEGIN and END lines arrive on one line, naming the
+  lost line breaks rather than leaving paramiko to call it an invalid
+  key. Azure Blob's Connection string help no longer calls the
+  one-line portal string "multi-line".
+
+- **The Manual restore card no longer offers a selective restore of
+  an Exclude-secrets archive (#2201).** The card decided whether an
+  archive could be restored selectively from `format_version == 2`,
+  and every archive is version 2, including an Exclude-secrets one,
+  whose database dump is plain SQL. The API refuses a selective
+  restore of a plain dump, and that refusal stays: a selective restore
+  filters pg_restore's custom format by table, which plain SQL cannot
+  be. So the card enabled Apply for a request that always failed. The
+  manifest preview (`POST /backup/manifest-preview`) now returns the
+  `dump_format` the restore resolves, from the same helper the restore
+  uses, and `selective_restore_supported`. The card reads them, keeps
+  Apply disabled for a selective restore of a plain archive, and says
+  why. A full restore of the same archive is still offered.
+
+- **A demoted member whose etcd stops before answering its own removal
+  now finishes its leave (#2394).** When a member removes itself
+  through its own etcd, a peer that has applied the removal can reject
+  that etcd's traffic before the member has applied the change itself:
+  k3s then closes etcd, and the removal call answers
+  `etcdserver: server stopped` though the member is gone.
+  `spatium-etcd-evict --leave-self` read any error as "not removed"
+  and refused the leave at once, before it asked the node it joined.
+  k3s restarted, found its removal tombstone, wiped its etcd data and
+  rejoined as a new voter, and the row read `failed`. Seen once in
+  nine three-node demote drills. An error answer for the node's own
+  member now stops k3s and goes to the same check as an accepted one:
+  the node it joined decides, and a survivor that answers and still
+  lists the member still refuses the leave. Only an error that shows
+  etcd never acted on the call refuses at once, with k3s left running:
+  curl failing before it sent the call (it could not connect, or TLS
+  failed), no gRPC status, or the strict reconfiguration check's
+  refusal. When no survivor can be reached after an error answer, the
+  leave goes on only if k3s left its tombstone (it writes one only
+  once a peer has applied the member's removal); without one, nothing
+  shows the member gone, and the leave is refused rather than wiping a
+  node whose member may still vote.
+
+- **A slot upgrade stopped in its first moments no longer stays "in-flight" (#2424).** The runner wrote the in-flight state before arming the trap that records a failure on an abrupt exit, so a stop landing in between left the upgrade reading in-flight with nothing to clear it. The trap is now armed first.
+
+- **A refused request to a superadmin-only route is now audited (#2304).**
+  `require_permission` has always written a `denied` audit row when it
+  refuses; the `SuperAdmin` dependency and the per-router
+  `_require_superadmin` helpers (backup and restore drills, factory reset,
+  support bundle, diagnostics, alert rules, pairing codes, upgrade images,
+  appliance fleet, audit-forward and InfluxDB targets, branding) answered
+  403 and wrote nothing, so probing them with a low-privilege token was
+  invisible to the Dashboard security panel and to a SIEM fed by audit
+  forwarding. They now share one dependency that records the refusal the
+  same way (`action` access on `superadmin`). The status code stays 403;
+  the refusal text of those routes is now the generic "Superadmin
+  required". The imperative checks on `?permanent=true` deletes and in the
+  approval engine's risky operations, which cannot take a dependency, use
+  a separate synchronous `ensure_superadmin` and are not audited.
+
+- **Switching an appliance from BIND9 to PowerDNS and to a new DNS group
+  in one save could leave two server rows, with the new group's zones
+  REFUSED (#2190).** The supervisor labelled the node for the new engine
+  before it wrote the new chart values, so the engine's DaemonSet, which
+  already existed with the previous `AGENT_GROUP`, started a pod in the old
+  group seconds before helm-controller rolled the new one. That pod
+  registered a second row in the old group and its cached token kept it
+  there. The supervisor now writes the values first and sets a role label
+  only once that engine's DaemonSet carries the assigned group (waiting up
+  to 30 s, then leaving it to the next heartbeat, at most 5 minutes). And
+  registration no longer trusts the pod's env for an appliance's agent: a
+  new agent whose hostname is one approved appliance's, running its current
+  engine, registers into the appliance's assigned group and adopts the
+  appliance's row there, taking that row's agent id. A row found by agent
+  id is still never moved (#934).
+
 - **One failing alert rule no longer re-pages every alert in the pass,
   every minute (#2261).** The alert evaluator ran every rule in one
   transaction and delivered each new event as soon as it opened, before
@@ -1675,15 +1830,6 @@ the formatter handles the rest.
 
 ### Migrations
 
-- `b4d81f2e6a93` — #2261: `ix_alert_event_rule_subject_open` becomes a
-  UNIQUE partial index (one open `alert_event` per rule, subject type
-  and subject). Duplicate open events are resolved first, keeping the
-  earliest-fired. Downgrade restores the non-unique index; the resolved
-  duplicates stay resolved.
-- `e2b9c46f1a83` — #2277, widens `alert_event.subject_id` from
-  VARCHAR(64) to VARCHAR(128). Catalogue-only, no rewrite. Downgrade
-  deletes events whose subject id is longer than 64 (only conformity
-  events written by this release) and narrows it back.
 - `d3a7f19c52e8` — #2112, data only: `dns_server.notes` equal to exactly
   `agent v2026.04.14.1` becomes empty. Downgrade does nothing.
 - `a2078c5e1d90` — #2078, adds nullable `dns_server.agent_version`
@@ -1752,6 +1898,16 @@ the formatter handles the rest.
   non-NULL rows; existing rows stay NULL. Downgrade restores the
   non-unique index and drops the column; the resolved duplicates stay
   resolved.
+- `f6a2d81c3e57` — #2124 / #2123: stored `dns_blocklist.block_mode =
+  'refused'` rows become `'nxdomain'` (what the agent already served);
+  adds nullable `dns_blocklist.feed_parse_skipped` (JSONB, no backfill:
+  NULL means not recorded) and `dns_blocklist_exception.source`
+  (`manual` | `feed`, server default `manual`). Downgrade drops both
+  columns and leaves the `refused` rewrite in place.
+- `e2b9c46f1a83` — #2277, widens `alert_event.subject_id` from
+  VARCHAR(64) to VARCHAR(128). Catalogue-only, no rewrite. Downgrade
+  deletes events whose subject id is longer than 64 (only conformity
+  events written by this release) and narrows it back.
 
 ## 1.0.0-beta.1 — 2026-10-21
 
@@ -7339,16 +7495,6 @@ notes on GitHub carry the full upgrade checklist.
 
 ### Migrations
 
-- `b4d81f2e6a93` — #2261: `ix_alert_event_rule_subject_open` becomes a
-  UNIQUE partial index (one open `alert_event` per rule, subject type
-  and subject). Duplicate open events are resolved first, keeping the
-  earliest-fired. Also adds the nullable
-  `alert_event.delivery_pending_since` with a partial index on its
-  non-NULL rows; existing rows stay NULL. Downgrade restores the
-  non-unique index and drops the column; the resolved duplicates stay
-  resolved.
-- `d3a7f19c52e8` — #2112, data only: `dns_server.notes` equal to exactly
-  `agent v2026.04.14.1` becomes empty. Downgrade does nothing.
 - `b8e41c7a2d95` — #1817, data + server default:
   `dns_server_options.allow_recursion` rows that are exactly `["any"]`
   (or empty) become the local + private networks default, the column

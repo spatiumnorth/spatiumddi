@@ -118,6 +118,14 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
         "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
     },
+    # #2124: only a sinkhole list's entries change (they carry its
+    # ``sinkhole_ip``), and these fixtures have none, so their digests are
+    # 12's. The sinkhole bytes are pinned in
+    # test_dns_agent_bundle_blocklist_stream_1662.py.
+    13: {
+        "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
+        "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
+    },
 }
 
 
