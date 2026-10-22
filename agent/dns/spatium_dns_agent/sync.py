@@ -10,7 +10,6 @@ from __future__ import annotations
 import shutil
 import threading
 import time
-import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -43,20 +42,21 @@ from .config_apply import (
 )
 from .drivers.base import DriverBase, HeldZone
 from .fetch import get_config
+from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
 from .oom_watch import OomWatch, is_oom_status
 
 log = structlog.get_logger(__name__)
 
-# #2042 — names this agent PROCESS on every config poll. The control plane
-# stamps it on each op it ships, so when a replacement process polls, an op
-# still in flight to the previous one (paged into a long-poll the API held for
-# an agent that is gone) is recognised as undelivered and shipped again at
-# once, instead of after the 5-minute unacknowledged reset. Per process, not
-# per ``Sync``: a re-bootstrap keeps the heartbeat and its unsent acks, so the
-# ops this process received are still its own. A header, so an older control
-# plane ignores it.
-AGENT_INSTANCE_HEADER = "X-Spatium-Agent-Instance"
-AGENT_INSTANCE = uuid.uuid4().hex
+# #2042 / #2044 — ``AGENT_INSTANCE`` (imported from ``instance``) names this
+# process on every config poll; re-exported here for older callers.
+
+# #2044 — set on the 409 the control plane answers when ANOTHER live agent
+# process owns this server identity (a cloned VM or a copied state dir keeps
+# the agent_id). Only the most recent process is served; this one keeps
+# serving its cached config and asks again on a slow backoff, taking the
+# server back by itself once the other one stops polling.
+DUPLICATE_INSTANCE_HEADER = "X-Spatium-Duplicate-Agent-Instance"
+DUPLICATE_INSTANCE_BACKOFF = 30.0
 
 
 def _touch_ready_marker(state_dir: Path) -> None:
@@ -522,7 +522,8 @@ class SyncLoop:
     def _boot_hold_fallback(self, failed_etag: str | None = None) -> None:
         """No usable bundle from the control plane while the cache is held.
 
-        Reached offline (unreachable, or not answering 200), when the control
+        Reached offline (unreachable, or not answering 200 — a 401/404 too,
+        while ``reauthenticate`` registers again, #2182), when the control
         plane is serving the held bundle itself and that bundle is
         quarantined, and (``failed_etag``) when the control plane's own bundle
         failed to apply: the hold set the live tree aside, so without this the
@@ -938,6 +939,16 @@ class SyncLoop:
                 status=resp.status_code,
                 reason="token_invalid" if resp.status_code == 401 else "server_missing",
             )
+            # #2182 — during a #2019 boot hold nothing is serving, and
+            # ``reauthenticate`` can back off for up to 5 min before it
+            # registers. The control plane is unusable meanwhile, so the held
+            # cache serves under the offline rules (#5), through the same
+            # ``_boot_hold_fallback`` the unreachable path takes (it declines a
+            # condemned bundle). Nothing was fetched, so ``current.json`` is
+            # still the held bundle; the fresh 200 forced below then goes
+            # through the normal path, re-rendering only if its structural
+            # etag differs from what the fallback put live.
+            self._boot_hold_fallback()
             # #2052 — re-register in this thread; do NOT stop it. Stopping
             # made the supervisor exit the container and take the daemon down.
             reauthenticate(self.cfg, self.token_ref, headers["Authorization"][7:])
@@ -945,6 +956,24 @@ class SyncLoop:
             # and resends the startup reports to the new row
             # (``_on_reregistered``), whichever thread registered.
             self._current_etag = None
+            return
+        if resp.status_code == 409 and resp.headers.get(DUPLICATE_INSTANCE_HEADER):
+            # #2044 — not a re-registration case: a new token would not change
+            # which process owns the row. Loud, because this agent now serves
+            # a configuration that no longer changes.
+            try:
+                detail = resp.json().get("detail")
+            except ValueError:
+                detail = None
+            log.error(
+                "sync_duplicate_agent_instance",
+                instance=AGENT_INSTANCE,
+                detail=detail,
+                retry_in_seconds=DUPLICATE_INSTANCE_BACKOFF,
+            )
+            self._boot_hold_fallback()
+            # An Event wait, not a sleep: a stop request ends it at once.
+            self._stop.wait(DUPLICATE_INSTANCE_BACKOFF)
             return
         if resp.status_code != 200:
             log.warning("sync_unexpected_status", status=resp.status_code)

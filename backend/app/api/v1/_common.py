@@ -17,6 +17,10 @@ from __future__ import annotations
 import uuid
 
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.audit import AuditLog
+from app.models.auth import User
 
 
 class StatusResponse(BaseModel):
@@ -51,3 +55,34 @@ class BulkDeleteResponse(BaseModel):
 
 
 __all__ = ["BulkDeleteResponse", "StatusResponse"]
+
+
+def add_trigger_audit(
+    db: AsyncSession,
+    user: User,
+    *,
+    resource_type: str,
+    resource_id: object,
+    resource_display: str,
+    action: str = "trigger",
+    new_value: dict | None = None,
+) -> None:
+    """Stage the audit row for an operator-triggered background job (#2303).
+
+    The work itself runs on a Celery worker, where the reconcilers can only
+    attribute their own rows to ``system``; this row is what records WHO asked.
+    Caller commits it before enqueueing so it is durable before the response
+    returns (non-negotiable #4).
+    """
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action=action,
+            resource_type=resource_type,
+            resource_id=str(resource_id),
+            resource_display=resource_display,
+            new_value=new_value,
+        )
+    )
