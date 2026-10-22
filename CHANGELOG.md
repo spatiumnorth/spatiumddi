@@ -128,6 +128,8 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A slot upgrade stopped in its first moments no longer stays "in-flight" (#2424).** The runner wrote the in-flight state before arming the trap that records a failure on an abrupt exit, so a stop landing in between left the upgrade reading in-flight with nothing to clear it. The trap is now armed first.
+
 - **A refused request to a superadmin-only route is now audited (#2304).**
   `require_permission` has always written a `denied` audit row when it
   refuses; the `SuperAdmin` dependency and the per-router
