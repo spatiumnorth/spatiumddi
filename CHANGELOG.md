@@ -128,6 +128,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A blocked name answered SERVFAIL after ~10 s when its upstream
+  lookup failed (#2427).** The BIND9 `response-policy` statement
+  (global and per-view, agent and control-plane template) lacked
+  `qname-wait-recurse no`, so BIND resolved the blocked name first
+  and did not rewrite a failed lookup - the names a blocklist most
+  wants to answer (dead, sinkholed, broken upstream) were the ones
+  that timed out, and the query also leaked upstream. QNAME-trigger
+  rules now answer at once. IP and NSDNAME triggers still recurse by
+  nature.
+
 - **Renaming or deleting a TSIG key that something still cites stopped
   the whole DNS group (#2282).** `key <name>` is cited from ACL entries,
   view match lists, the group's address-match options and `also_notify`,
