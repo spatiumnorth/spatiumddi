@@ -1055,7 +1055,8 @@ records the kill depends on how the container is killed (#2018):
   its last word in place, and that must not hold a recovered server down.
   The times compared are the kubelet's and the control plane's, so a node
   clock far off moves the 10-minute recovery by the same amount. The DHCP
-  (Kea) container is group-killed the same way and is not covered yet. A plain Helm install (umbrella
+  (Kea) container is group-killed the same way and is covered the same
+  way (`docs/features/DHCP.md` 4d, #2023). A plain Helm install (umbrella
   chart) has no supervisor, so there the pod's last state
   (`kubectl get pod … -o jsonpath='{.status.containerStatuses[0].lastState}'`)
   is the only record; setting the kubelet's `singleProcessOOMKill: true`
