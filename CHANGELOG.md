@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Fleet showed a silent appliance's last report as current, and nothing
+  alerted on the silence (#2259).** Role chips and the Service health
+  table now grey out, with a "no heartbeat for X" badge, once
+  `last_seen_at` is older than about three heartbeat intervals. A new
+  default-on `appliance_heartbeat_stale` alert (warning after 5 min,
+  critical after 30, auto-resolving) covers control-plane and observer
+  nodes no other rule watched, and `find_appliance_fleet` reports
+  `heartbeat_stale`. The `no_lanwide_control_plane_ports` conformity check
+  now returns warn for stale or unverified nodes and not applicable when
+  no appliance reports, instead of counting them as PASS.
+
 - **A rate-limit counter could be left without an expiry and throttle an IP
   or user forever (#2294).** The login, E911 self-query, step-up and
   network-tools limiters did `INCR` and then a separate `EXPIRE`; a crash,

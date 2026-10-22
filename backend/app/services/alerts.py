@@ -392,6 +392,16 @@ _NODE_PRESSURE_RULE_NAME = "Node under sustained resource pressure"
 _CLUSTER_DNS_RULE_NAME = "Cluster DNS degraded"
 _APPLIANCE_STORAGE_RULE_NAME = "Appliance storage redundancy degraded"
 
+# Appliance heartbeat silence (#2259). Subject = the appliance. The
+# supervisor heartbeats every ~30 s; the Fleet UI greys its reported-state
+# chips after ~3 missed beats (90 s), but an ALERT waits longer so a normal
+# reboot / slot upgrade (30-120 s of silence) does not page anyone. Fixed
+# rather than operator-tunable, same as the other infrastructure rules.
+RULE_TYPE_APPLIANCE_HEARTBEAT_STALE = "appliance_heartbeat_stale"
+_APPLIANCE_HEARTBEAT_STALE_AFTER = timedelta(minutes=5)
+_APPLIANCE_HEARTBEAT_CRITICAL_AFTER = timedelta(minutes=30)
+_APPLIANCE_HEARTBEAT_RULE_NAME = "Appliance heartbeat lost"
+
 
 # Issue #46 — planned-decommission awareness. Subject = subnet. Fires
 # when a subnet's ``decom_date`` falls within ``threshold_days`` (default
@@ -671,6 +681,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
         RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
+        RULE_TYPE_APPLIANCE_HEARTBEAT_STALE,
         RULE_TYPE_DECOM_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
@@ -4188,6 +4199,71 @@ async def _matching_agent_bundle_render_failed_subjects(
     return matches
 
 
+async def _matching_appliance_heartbeat_stale_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for approved
+    appliances whose supervisor has stopped heartbeating (#2259).
+
+    Every other appliance rule reads the LAST reported state, so a node
+    whose supervisor died keeps looking healthy on every one of them. The
+    only signal that is not itself a last-reported value is the age of
+    ``last_seen_at``. DNS / DHCP roles were covered indirectly by
+    ``server_unreachable``; a control-plane member or observer-only node
+    raised nothing at all.
+
+    Skipped: revoked rows, rows that are not ``approved`` (a pending node
+    has never been expected to heartbeat) and rows with ``last_seen_at IS
+    NULL`` (never heartbeated — an orphan from an aborted pairing, not a
+    node that went silent). The subject id is the appliance UUID (36
+    chars, inside ``alert_event.subject_id``'s VARCHAR(64)). Resolves on
+    its own: the next heartbeat moves ``last_seen_at`` and the node drops
+    out of the match set.
+    """
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        Appliance,
+    )
+
+    cutoff = now - _APPLIANCE_HEARTBEAT_STALE_AFTER
+    rows = (
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                    Appliance.revoked_at.is_(None),
+                    Appliance.last_seen_at.is_not(None),
+                    Appliance.last_seen_at < cutoff,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out: list[tuple[str, str, str, str]] = []
+    for a in rows:
+        seen = a.last_seen_at
+        assert seen is not None  # noqa: S101 - filtered above
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=UTC)
+        silent = now - seen
+        minutes = int(silent.total_seconds() // 60)
+        sev = "critical" if silent >= _APPLIANCE_HEARTBEAT_CRITICAL_AFTER else "warning"
+        out.append(
+            (
+                str(a.id),
+                a.hostname,
+                f"Appliance {a.hostname} has not heartbeated for {minutes} min "
+                f"(last seen {seen.isoformat()}). Its role and service health "
+                "shown in Fleet is the last report, not current state.",
+                sev,
+            )
+        )
+    return out
+
+
 async def _matching_firewall_apply_stalled_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -5284,6 +5360,42 @@ async def seed_appliance_storage_alert_rule() -> None:
                     "state. Auto-resolves when redundancy is restored."
                 ),
                 rule_type=RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
+                severity="warning",
+                enabled=True,
+            )
+        )
+        await session.commit()
+
+
+async def seed_appliance_heartbeat_alert_rule() -> None:
+    """Seed the #2259 rule, ENABLED by default.
+
+    Needs no configuration and cannot false-fire on an install with no
+    appliances (Compose / plain k8s have none). Keyed on ``name``; an
+    operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _APPLIANCE_HEARTBEAT_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_APPLIANCE_HEARTBEAT_RULE_NAME,
+                description=(
+                    "Fires when an approved appliance's supervisor has not "
+                    "heartbeated for 5 minutes (critical after 30). Fleet shows "
+                    "each node's LAST reported role and service health, so a "
+                    "node whose supervisor died keeps looking healthy; this is "
+                    "the alarm for the silence itself, and covers control-plane "
+                    "and observer-only nodes that no DNS/DHCP reachability rule "
+                    "watches. Auto-resolves when heartbeats resume."
+                ),
+                rule_type=RULE_TYPE_APPLIANCE_HEARTBEAT_STALE,
                 severity="warning",
                 enabled=True,
             )
@@ -7287,6 +7399,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_APPLIANCE_STORAGE_DEGRADED:
                 storage_hits = await _matching_appliance_storage_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in storage_hits]
+                subject_type = "appliance"
+            elif rule.rule_type == RULE_TYPE_APPLIANCE_HEARTBEAT_STALE:
+                silent_nodes = await _matching_appliance_heartbeat_stale_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in silent_nodes]
                 subject_type = "appliance"
             elif rule.rule_type == RULE_TYPE_FIREWALL_APPLY_STALLED:
                 stalled = await _matching_firewall_apply_stalled_subjects(db, rule, now)
