@@ -1917,7 +1917,8 @@ confirmation gates and pg advisory locks held through commit:
 - `POST /ipam/spaces/{id}/find-free` — walks the IPBlock tree for
   unallocated CIDRs of the requested prefix length. Optional
   `parent_block_id` scope (Find Free… on the block detail
-  pre-restricts to that block) and a `min_free_addresses` filter.
+  pre-restricts to that block) and a `min_free_addresses` filter. Opened from a block, the dialog's
+  title, hint and empty state say it searches that block, not the space.
   Service layer in `app.services.ipam.free_space`.
 
 - `POST /ipam/subnets/{id}/split/preview` + `/commit` — break a

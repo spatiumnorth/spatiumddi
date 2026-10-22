@@ -13529,6 +13529,7 @@ export function BlockDetailView({
         <FindFreeModal
           space={space}
           defaultBlockId={block.id}
+          defaultBlockLabel={block.network}
           onClose={() => setShowFindFree(false)}
           onPickCidr={(cidr) => {
             setFreeRangePreset({
