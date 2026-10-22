@@ -128,6 +128,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Bulk edit's "clear DNS zone" removes the records (#2172).** In Bulk
+  edit IPs, setting the DNS zone to empty (`dns_zone_id: ""`) asked the
+  sync for an update with no zone, which means "work out a zone". So
+  each address's records moved into the subnet's zone, or, with no
+  subnet zone, were published again where they already were, and the
+  request reported success. A bulk clear now runs the same clear as
+  single Edit with zone None, through one shared helper: it removes the
+  address's forward A/AAAA in its zone and any extra zone, its PTR and
+  its aliases, queues a delete for each, sets `forward_zone_id` to null
+  and empties `extra_zone_ids`. Leaving the extra zones set (which
+  single Edit used to do) meant the next Sync DNS, the scheduled
+  auto-sync or any later edit published the record there again. An
+  address with nothing published is left as it is. The response gains
+  `dns_cleared`, the addresses whose records were removed. A subnet
+  with a forward zone of its own still claims the host, so Sync DNS
+  offers the record in the subnet's zone after a clear, as before.
+
 - **Technitium DNS Server 15.4.0 → 15.6.2 (#2238).** The
   `dns-technitium` image is built on the upstream image, now pinned at
   15.6.2 by tag and digest. Upstream's 15.5.0 – 15.6.2 fix
