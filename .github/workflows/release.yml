@@ -108,46 +108,71 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "→ ${VERSION} at ${SHA::7}: previous release ${PREV_TAG:-<none>}, becomes latest: ${MAKE_LATEST}"
 
+      # #2431 — PRs add changelog.d/ fragments instead of editing
+      # CHANGELOG.md, and release prep folds them into the section this tag
+      # publishes (``make changelog``). A fragment still in the tree means
+      # the fold was skipped, so the notes below would silently miss those
+      # entries. Refused before an hour of CI waiting and image builds.
+      - name: Require the changelog fragments to be folded
+        run: python3 scripts/changelog_assemble.py --pending
+
       - name: Require CI to have passed on this commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           SHA=$(git rev-parse HEAD)
+          export SHA REPO
           # The tag is normally pushed right after the release-prep PR
           # merges, while main's CI for that commit is still running, so
           # wait for it rather than failing. An hour covers the full
           # backend suite with room to spare.
+          #
+          # #2429 — "CI passed" means the FULL backend suite passed on this
+          # exact commit. A push to main may report success with the 12
+          # shards skipped, resting on the merged PR's run of the identical
+          # tree; that is sound for merging, but a release never rests on it
+          # alone. ci-full-suite-passed.sh asks for a run on this SHA whose
+          # latest attempt carries the backend-full-suite marker (or a push
+          # run from before the markers existed, which always ran the suite).
           deadline=$((SECONDS + 3600))
           while :; do
-            runs=$(gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&event=push&per_page=20" \
-                     --jq '.workflow_runs[] | "\(.id)\t\(.status)\t\(.conclusion // "")\t\(.html_url)"')
-            if awk -F '\t' '$2 == "completed" && $3 == "success" { f = 1 } END { exit !f }' <<< "$runs"; then
-              echo "✓ CI passed on ${SHA::7}"
-              exit 0
-            fi
-            pending=0
-            if awk -F '\t' 'NF && $2 != "completed" { f = 1 } END { exit !f }' <<< "$runs"; then
-              pending=1
-            fi
-            # No run yet: give GitHub a few minutes to queue the push run.
-            if [ -z "$runs" ] && [ "$SECONDS" -lt 300 ]; then
-              pending=1
-            fi
-            if [ "$pending" -eq 1 ] && [ "$SECONDS" -lt "$deadline" ]; then
-              echo "… CI on ${SHA::7} has not finished; checking again in 60 s"
-              sleep 60
-              continue
-            fi
+            rc=0
+            .github/scripts/ci-full-suite-passed.sh || rc=$?
+            case "$rc" in
+              0)
+                echo "✓ CI passed on ${SHA::7}"
+                exit 0
+                ;;
+              2)
+                if [ "$SECONDS" -lt "$deadline" ]; then
+                  echo "… CI on ${SHA::7} has not finished; checking again in 60 s"
+                  sleep 60
+                  continue
+                fi
+                ;;
+              4)
+                # No run yet: give GitHub a few minutes to queue the push run.
+                if [ "$SECONDS" -lt 300 ]; then
+                  echo "… no CI run on ${SHA::7} yet; checking again in 60 s"
+                  sleep 60
+                  continue
+                fi
+                ;;
+              3)
+                echo "::error::CI on ${SHA::7} passed with the backend shards skipped (its tree was tested on the merged PR's head, #2429, or in the merge queue, #2431, without a full-suite run of this exact commit). A release needs the full suite on this exact commit."
+                echo "Start a full run on the tag, wait for it to pass, then re-run this workflow:"
+                echo "  gh workflow run ci.yml --repo ${REPO} --ref ${VERSION}"
+                echo "  gh run list --repo ${REPO} --workflow ci.yml --event workflow_dispatch --limit 1"
+                exit 1
+                ;;
+            esac
             echo "::error::CI has not passed on ${SHA::7}, so this commit cannot be released."
-            if [ -n "$runs" ]; then
-              echo "ci.yml runs for this commit (id, status, conclusion):"
-              printf '%s\n' "$runs"
-              echo "A run cancelled by a later push to main can be re-run with 'gh run rerun <id>'; then re-run this workflow."
-            else
-              echo "ci.yml never ran on this commit as a push to main."
-            fi
+            echo "A run cancelled by a later push to main can be re-run with 'gh run rerun <id>', or a full run started with"
+            echo "  gh workflow run ci.yml --repo ${REPO} --ref ${VERSION}"
+            echo "then re-run this workflow."
             exit 1
           done
 

@@ -20,11 +20,15 @@ from __future__ import annotations
 from app.services.conformity.engine import (
     evaluate_due_policies,
     evaluate_policy,
+    resolve_orphaned_policy_alerts,
+    resolve_policy_alerts,
 )
 from app.services.conformity.seeder import seed_builtin_conformity_policies
 
 __all__ = [
     "evaluate_due_policies",
     "evaluate_policy",
+    "resolve_orphaned_policy_alerts",
+    "resolve_policy_alerts",
     "seed_builtin_conformity_policies",
 ]

@@ -203,24 +203,26 @@ async def _fixture(db: AsyncSession, *, views: bool) -> DNSServer:
 # ``options.allow_recursion`` to a BIND9 bundle on top of 8's NOTIFY fields.
 # And again at 10 (#1817), whose ``allow_recursion`` default is local +
 # private networks. The "views" pin moved at 11 (#1706): the group zone is no
-# longer shipped beside each view's own zone.
+# longer shipped beside each view's own zone. Both moved at 12 (#2157): a
+# BIND9 bundle's RPZ zones carry ``rpz_sha256``. Both moved again at 13
+# (#2124): the sinkhole list's entries carry its ``sinkhole_ip``.
 # The gzip bytes are deliberately not pinned: deflate's output is a property of
 # the zlib build, not of the render (the desk's pin, taken in another image,
 # does not reproduce in the dev image for the identical body). The test pins
 # them against ``compress_body`` of the same body in the same process.
 PINNED_AT_1C00A7E4: dict[str, dict[str, str]] = {
     "plain": {
-        "body_sha256": "2fda63e82db47780f3c2f5d72bfacf718c534647b6104ea2d41182a00b462786",
-        "etag": "sha256:64b897a8dc975ae53edb4513e8788ccc97b9f081808e66f5493a70f2df229674",
+        "body_sha256": "0410ba2141e07cd6c49bd2498e13ae83c7ae6fe1a8a1946376ccf673f4ccadde",
+        "etag": "sha256:54d57ac259551587d8f1866da4e0d09eb3edeed529f71fbbf0963285e6031c0f",
         "structural_etag": (
-            "sha256:f112538119847abfd80fa18923eec67ff527204d8af3668dd6a71a38aef0b647"
+            "sha256:4732d578a780487ef3138e4ec4ccf8a1fb323e447779a8e58211c50c43f1a587"
         ),
     },
     "views": {
-        "body_sha256": "505014ceebd98a9cbe2d4614e77324b9bbfebef907da7c231a4322c8a48f2603",
-        "etag": "sha256:80bec85335698702464bcb18d7d8b116424e6adf7e14235c6d9d5d8ccbec7cf1",
+        "body_sha256": "f33a687807fbdaabeb32118e7cd530abd03270c3c01afc31343efda0b39abb92",
+        "etag": "sha256:5de09d1a8aaaf0059282e830ebe4d3b332a976edd16fbc7f7b759a5b759e97f1",
         "structural_etag": (
-            "sha256:3bbdde64940616ef52b9589565741b531e4063c4076498c6582b508127ebb47a"
+            "sha256:3039a3a2d73221d3a99885a91e5680443332c6c07baf98ff9540836412df11d0"
         ),
     },
 }
@@ -473,18 +475,19 @@ async def _tricky_fixture(db: AsyncSession, *, view_only: bool) -> DNSServer:
 
 # ``_tricky_fixture`` rendered by origin/main's renderer (c36b6c91, before
 # #1662): body sha256, ETag, structural ETag. Re-pinned at RENDERER_REVISION 8
-# (#1523), 9 (#1786), 10 (#1817) and 11 (#1706; the False pin only), as
-# ``PINNED_AT_1C00A7E4`` above.
+# (#1523), 9 (#1786), 10 (#1817), 11 (#1706; the False pin only) and 12
+# (#2157, ``rpz_sha256``) and 13 (#2124 — the sinkhole list's
+# ``sinkhole_ip``; the False pin only), as ``PINNED_AT_1C00A7E4`` above.
 PINNED_TRICKY_AT_MAIN: dict[bool, tuple[str, str, str]] = {
     False: (
-        "dbfe07df07de4182b0624b0f52e8be70de81ec5e7e8141aa53f6b2b5b448d83f",
-        "sha256:b7b566b44135d37249c9735fe8cbcb9589c968239646ede041b26f26fda91c58",
-        "sha256:f3486cb9c1fca17783a4f7304fd36125f2539ff45d526256a527c0841c6364e3",
+        "13837f78a7e012f4e445b780244f2d8d48083fcaa25c10126ed3d66566313ae0",
+        "sha256:96b6c8a31d13b8c801efdb913989011d32cda5eebb608ecc9dc570f8c63b97df",
+        "sha256:c1bc7e9c699b3543c6d0930ac7b7d103bd7ac219e19770a4287965c58cd45a01",
     ),
     True: (
-        "56b2a4a38a166f1a0aaa6b2aefc247bdbb483947398ac7531c44f4c7e36d817e",
-        "sha256:eb82f008611a2e60708f5737c56e527c7f2a6e02dc0b7e8b80b62ca13c220a79",
-        "sha256:fe8fdaf5cb32e9779c07699e12e2558c9df66bf1a03fd5299309510fb7fdf467",
+        "95bdf52d38cda23f3a3ae79f29384ebb3f72aff5f03187f768c520ffcef03cd8",
+        "sha256:1e694a1a39bf785caa26fe383a6af06f6cae7694ed1832ea7a52a7cfcfdd7e2c",
+        "sha256:3516f72ebc226dd83db1cbd8b56f514c8acf024058bfa091256ffc39c566fe43",
     ),
 }
 
