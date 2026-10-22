@@ -65,6 +65,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-storage-action.path \
             spatiumddi-removable-reload.path \
             spatiumddi-removable-boot.service \
+            spatiumddi-optin-services-boot.service \
             spatium-firewall-reload.path \
             spatiumddi-firewall-revert.timer \
             spatiumddi-image-prune.timer \
@@ -348,6 +349,10 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-lldp-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.service"
+# #2376 — starts snmpd / lldpd at boot when the operator has SNMP / LLDP on.
+# Their enable links live in the /etc overlay upper, which PID 1 has not
+# loaded at boot; see the unit.
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-optin-services-boot.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-syslog-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-syslog-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-syslog-reload.service"
