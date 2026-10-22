@@ -529,13 +529,19 @@ class RedisReclaim:
     they are not counted again); ``nodes``: the hostnames the reclaimed
     claims were pinned to; ``sources``: per reclaimed claim, whether the
     bound PV's node affinity (``pv``) or the scheduler's selected-node
-    annotation (``annotation``) decided it was stranded."""
+    annotation (``annotation``) decided it was stranded; ``error``: why the
+    sweep stopped, quoting the start of the answer's body when it was
+    refused; ``error_kind``: the same without the body (the request, and
+    its status when the sweep has it), set wherever ``error`` can quote
+    one. The heartbeat logs a failure once per kind, and an apiserver can
+    answer every tick with another body (review of #2433)."""
 
     reclaimed: list[str] = field(default_factory=list)
     error: str | None = None
     terminating: list[str] = field(default_factory=list)
     nodes: list[str] = field(default_factory=list)
     sources: dict[str, str] = field(default_factory=dict)
+    error_kind: str = ""
 
     def __iter__(self):
         # ``reclaimed, err = ...``, the shape #590's callers unpack.
@@ -640,7 +646,7 @@ def reclaim_stranded_redis_storage(
         # Owed, not evicted this tick: only while the Node list lacks the name.
         listed, nodes_err = cluster_node_names()
         if listed is None:
-            return RedisReclaim(error=nodes_err)
+            return RedisReclaim(error=nodes_err, error_kind="list nodes")
         forced |= owed - set(listed)
     live: set[str] | None = None
     if not forced:
@@ -649,7 +655,10 @@ def reclaim_stranded_redis_storage(
         except (RuntimeError, OSError) as exc:
             return RedisReclaim(error=str(exc))
         if status != 200:
-            return RedisReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
+            return RedisReclaim(
+                error=f"kubeapi status {status}: {resp[:200]!r}",
+                error_kind=f"list Pending pods: status {status}",
+            )
         try:
             pending = json.loads(resp).get("items") or []
         except (ValueError, AttributeError):
@@ -658,7 +667,7 @@ def reclaim_stranded_redis_storage(
             return RedisReclaim()
         listed, nodes_err = cluster_node_names()
         if listed is None:
-            return RedisReclaim(error=nodes_err)
+            return RedisReclaim(error=nodes_err, error_kind="list nodes")
         live = set(listed)
 
     try:
@@ -666,7 +675,10 @@ def reclaim_stranded_redis_storage(
     except (RuntimeError, OSError) as exc:
         return RedisReclaim(error=str(exc))
     if status != 200:
-        return RedisReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
+        return RedisReclaim(
+            error=f"kubeapi status {status}: {resp[:200]!r}",
+            error_kind=f"list claims: status {status}",
+        )
     try:
         items = json.loads(resp).get("items", [])
     except (ValueError, AttributeError):
@@ -680,7 +692,7 @@ def reclaim_stranded_redis_storage(
             continue
         pinned, source, pin_err = _pvc_pinned_hostnames(pvc)
         if pin_err:
-            out.error = f"{name}: {pin_err}"
+            out.error, out.error_kind = f"{name}: {pin_err}", f"read the volume of {name}"
             break
         # Stranded: every hostname the volume is pinned to is gone, i.e. one
         # the caller evicted, or (on a sweep) one the Node list no longer has.
@@ -700,6 +712,7 @@ def reclaim_stranded_redis_storage(
                 break
             if status not in (200, 202, 404):
                 out.error = f"kubeapi status {status}: {resp[:200]!r}"
+                out.error_kind = f"delete claim {name}: status {status}"
                 break
             if status != 404:  # 404: gone between the list and the delete
                 out.reclaimed.append(name)
@@ -719,6 +732,7 @@ def reclaim_stranded_redis_storage(
                 break
             if status not in (200, 202, 404):
                 out.error = f"pod {pod}: kubeapi status {status}: {resp[:200]!r}"
+                out.error_kind = f"delete pod {pod}: status {status}"
                 break
     out.nodes = sorted(gone)
     return out

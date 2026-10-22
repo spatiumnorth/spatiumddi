@@ -349,12 +349,16 @@ _mirror_claims_owed: dict[str, dict] = {}
 # ticks. The hostnames a failed sweep still owes, handed back next tick (as
 # ``_stranded_pending`` is for Postgres) and freed there while the Node list
 # still lacks them, so an outage drops no eviction and a node that rejoined
-# under the name keeps its replica; and the failures logged since the last
-# clean sweep, so one that repeats tick after tick is logged once. A restart
-# forgets both, and the sweep needs neither to converge: it finds a stranded
-# claim from the Node list.
+# under the name keeps its replica; and the kinds of failure logged since the
+# last clean sweep (the request and its status, never the answer's body), so
+# one that repeats tick after tick is logged once. A restart forgets both, and
+# the sweep needs neither to converge: it finds a stranded claim from the Node
+# list.
 _redis_stranded_pending: set[str] = set()
 _redis_failures_logged: set[str] = set()
+# Review of #2433: the most kinds kept between clean sweeps. One more starts
+# them over, so the set cannot grow with an outage, however long.
+_REDIS_FAILURE_KINDS_KEPT = 8
 
 
 class _ReplaceHold:
@@ -520,7 +524,8 @@ def _reclaim_stranded_redis(evicted_now: list[str], log: structlog.stdlib.BoundL
     claim pinned to a node that is no longer a Node
     (``k8s_api.reclaim_stranded_redis_storage``). A claim is logged as
     reclaimed once, on the tick its DELETE lands; a failure is logged once
-    per kind, until a sweep comes back clean."""
+    per kind (the request and its status, never the answer's body), until a
+    sweep comes back clean."""
     from . import k8s_api  # noqa: PLC0415
 
     out = k8s_api.reclaim_stranded_redis_storage(
@@ -545,11 +550,18 @@ def _reclaim_stranded_redis(evicted_now: list[str], log: structlog.stdlib.BoundL
             # only when the PV is gone)
             affinity_source=dict(out.sources),
         )
-    if out.error is not None and out.error not in _redis_failures_logged:
-        _redis_failures_logged.add(out.error)
+    # Review of #2433: keyed on the kind, not the error text, which quotes the
+    # answer's body; an error that quotes none is its own kind.
+    kind = out.error_kind or out.error
+    if kind is not None and kind not in _redis_failures_logged:
+        if len(_redis_failures_logged) >= _REDIS_FAILURE_KINDS_KEPT:
+            _redis_failures_logged.clear()
+        _redis_failures_logged.add(kind)
         log.warning(
             "supervisor.heartbeat.redis_storage_reclaim_failed",
             error=out.error,
+            # what this line stands for until a sweep comes back clean
+            kind=kind,
             owed=sorted(_redis_stranded_pending),
         )
 

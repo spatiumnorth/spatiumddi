@@ -8,3 +8,10 @@
   and the replica resynced from the master. An owed name is now freed
   only while the Node list still lacks it; the names evicted on the
   heartbeat itself still go at once, as before.
+- **A Redis reclaim failure is logged once however the apiserver
+  words it (#2404).** The seed logged a failed sweep once per error
+  text, and the text quoted the answer's body, so a body that changed
+  from one heartbeat to the next was logged every time and the texts
+  it kept grew until a sweep succeeded. It now logs once per request
+  and status, names that kind in the line, and keeps at most eight
+  kinds.
