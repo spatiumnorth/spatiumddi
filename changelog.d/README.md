@@ -23,10 +23,16 @@ under `## Unreleased`, starting with a `### <Section>` heading:
 
 Sections: `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`,
 `Security`, `Migrations`, `Breaking`. One fragment may use several.
-Don't start a wrapped line with `#<number>`: the release-notes formatter
-reads it as a heading.
+Indent wrapped lines as in CHANGELOG.md: a line starting with `#` in
+column 0 is refused, because the release-notes formatter reads it as a
+heading. Lines inside a fenced code block are left alone.
+
+Nothing else belongs in this directory: a subdirectory, a dotfile or a
+file not named `<issue>-<slug>.md` fails the check, the fold and the
+release gate rather than being skipped.
 
 CI validates every fragment (`scripts/changelog_assemble.py --check`).
-At release prep, `make changelog` folds them into `## Unreleased` and
-deletes them; `release.yml` refuses a tag whose tree still has any. See
-`docs/DEVELOPMENT.md`, "Changelog fragments".
+At release prep, `make changelog` folds them into `## Unreleased`, at
+the top of each section with the newest issue first (as CHANGELOG.md
+already reads), and deletes them; `release.yml` refuses a tag whose
+tree still has any. See `docs/DEVELOPMENT.md`, "Changelog fragments".

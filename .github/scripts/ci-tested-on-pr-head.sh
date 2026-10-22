@@ -98,6 +98,11 @@ is_sha "$BEFORE" || no "BEFORE is not a commit id (a new branch, or a forced pus
 command -v gh >/dev/null 2>&1 || no "gh is not installed"
 command -v jq >/dev/null 2>&1 || no "jq is not installed"
 
+# The merge-queue trust predicate and the marker lookup, shared with
+# ci-full-suite-passed.sh.
+# shellcheck source=ci-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/ci-lib.sh" || no "cannot load ci-lib.sh"
+
 tmp="$(mktemp -d)" || no "cannot create a temp dir"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -106,16 +111,13 @@ trap 'rm -rf "$tmp"' EXIT
 merge_queue_run() {
   gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&event=merge_group&status=completed&per_page=30" \
     > "$tmp/mq-runs.json" 2>/dev/null || return 1
-  local now cands id attempt marker n
+  local now cands id attempt
   now="$(date -u +%s)" || return 1
   cands="$(jq -r --arg sha "$SHA" --arg repo "$REPO" --argjson now "$now" \
-                --argjson max "$MAX_RUN_AGE_SECONDS" '
+                --argjson max "$MAX_RUN_AGE_SECONDS" "$CI_MERGE_QUEUE_RUN_JQ"'
       [ .workflow_runs[]
-        | select(.head_sha == $sha and .event == "merge_group"
-                 and .status == "completed" and .conclusion == "success"
-                 and ((.head_branch // "") | startswith("gh-readonly-queue/main/"))
-                 and (.repository.full_name // "") == $repo
-                 and (.head_repository.full_name // "") == $repo)
+        | select(.head_sha == $sha and merge_queue_run($repo)
+                 and .status == "completed" and .conclusion == "success")
         | (.created_at | fromdateiso8601) as $c
         | select($c <= $now and ($now - $c) <= $max)
         | {id, run_attempt, c: $c} ]
@@ -123,11 +125,7 @@ merge_queue_run() {
   [ -n "$cands" ] || return 1
   while IFS=$'\t' read -r id attempt; do
     [[ "$id" =~ ^[0-9]+$ && "$attempt" =~ ^[0-9]+$ ]] || continue
-    marker="backend-full-suite-attempt-${attempt}"
-    gh api "repos/${REPO}/actions/runs/${id}/artifacts?name=${marker}" > "$tmp/mq-art.json" 2>/dev/null || continue
-    n="$(jq --arg n "$marker" '[.artifacts[] | select(.name == $n and .expired == false)] | length' \
-           "$tmp/mq-art.json" 2>/dev/null)" || continue
-    if [ "$n" -ge 1 ] 2>/dev/null; then
+    if ci_run_has_artifact "$id" "$(ci_full_suite_marker "$attempt")" unexpired; then
       echo "skip shards: the merge queue's CI run $id (attempt $attempt) passed the full backend suite on exactly ${SHA:0:12}" >&2
       echo "merge_group run=$id attempt=$attempt"
       return 0
@@ -198,12 +196,10 @@ candidates="$(jq -r --arg h "$head" --arg br "$head_ref" --arg repo "$REPO" \
   || no "no successful pull_request CI run of PR #$pr's head in the $((MAX_RUN_AGE_SECONDS / 3600)) h before it merged"
 while IFS=$'\t' read -r id attempt; do
   [[ "$id" =~ ^[0-9]+$ && "$attempt" =~ ^[0-9]+$ ]] || continue
-  marker="backend-full-suite-attempt-${attempt}"
-  gh api "repos/${REPO}/actions/runs/${id}/artifacts?name=${marker}" > "$tmp/art.json" 2>/dev/null \
-    || no "could not list the artifacts of run $id"
-  n="$(jq --arg n "$marker" '[.artifacts[] | select(.name == $n and .expired == false)] | length' \
-         "$tmp/art.json" 2>/dev/null)" || no "unexpected reply listing the artifacts of run $id"
-  if [ "$n" -ge 1 ] 2>/dev/null; then
+  rc=0
+  ci_run_has_artifact "$id" "$(ci_full_suite_marker "$attempt")" unexpired || rc=$?
+  [ "$rc" -ne 2 ] || no "could not list the artifacts of run $id (or an unexpected reply)"
+  if [ "$rc" -eq 0 ]; then
     echo "skip shards: tree identical to PR #$pr head ${head:0:12}, whose CI run $id (attempt $attempt) passed the full backend suite" >&2
     echo "pr=$pr head=$head run=$id attempt=$attempt"
     exit 0

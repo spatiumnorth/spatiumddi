@@ -93,9 +93,8 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # #2431 — a merge-group run diffs the group's own range: main as
-          # the queue found it .. the temporary branch's head.
-          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          # #2431 — the merge group's head: the temporary branch's commit.
+          # (``merge_group.base_sha`` is deliberately not used — see below.)
           MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           # #2429 — the push's own commit ids and repository, consumed only
           # by ci-tested-on-pr-head.sh, which validates their shape.
@@ -133,30 +132,45 @@ jobs:
           fi
 
           # #2431 — a merge-group run takes the same path filter as a PR
-          # (#813), over the range the group adds to main: the commits of
-          # every entry ahead of this one as well as its own, because the
-          # verdict is for that whole tree. Fail safe: any doubt about the
-          # range — a malformed id, a head that is not the commit checked
-          # out, a base the head does not descend from — runs everything.
-          # It never NARROWS (#1020): the ``select`` step below only narrows
-          # on pull_request, so a backend-relevant group always runs the
-          # full suite. The queue is the last gate before main, and its full
-          # run is what lets the push to main skip the shards.
+          # (#813), over everything the group's tree adds to main: the
+          # commits of every entry ahead of this one as well as its own,
+          # because the verdict is for that whole tree.
+          #
+          # The base is ``git merge-base origin/main HEAD`` with main freshly
+          # fetched, NOT ``merge_group.base_sha``. GitHub documents that field
+          # only loosely, and for an entry behind others in the queue it may
+          # name the previous entry's temporary commit rather than main — a
+          # diff from there would cover this entry's commit alone and could
+          # skip the shards for a tree whose backend changes came in with an
+          # entry ahead of it. The merge base with main is right either way:
+          # each queue branch is built on main, so main as of the group's
+          # creation is an ancestor of the head; if main has since advanced
+          # (an earlier group merged — that is, a fast-forward to an ancestor
+          # of this head) the base moves up with it, and anything else can only
+          # widen the diff, which is the safe direction.
+          #
+          # Fail safe: a malformed head, a head that is not the commit checked
+          # out, a failed fetch or no merge base all run everything. It never
+          # NARROWS (#1020): the ``select`` step below only narrows on
+          # pull_request, so a backend-relevant group always runs the full
+          # suite. The queue is the last gate before main, and its full run is
+          # what lets the push to main skip the shards.
           if [ "$EVENT" = "merge_group" ]; then
             sha_re='^[0-9a-f]{40}$'
-            if ! [[ "$MG_BASE_SHA" =~ $sha_re && "$MG_HEAD_SHA" =~ $sha_re ]]; then
-              echo "::warning::merge group base/head missing or malformed — running the full backend suite"
+            if ! [[ "$MG_HEAD_SHA" =~ $sha_re ]] || [ "$MG_HEAD_SHA" != "$SHA" ]; then
+              echo "::warning::merge group head '$MG_HEAD_SHA' is malformed or not the checked-out commit — running the full backend suite"
               echo "backend=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            if [ "$MG_HEAD_SHA" != "$SHA" ] \
-               || ! git cat-file -e "${MG_BASE_SHA}^{commit}" 2>/dev/null \
-               || ! git merge-base --is-ancestor "$MG_BASE_SHA" "$MG_HEAD_SHA" 2>/dev/null; then
-              echo "::warning::merge group range $MG_BASE_SHA..$MG_HEAD_SHA does not check out — running the full backend suite"
+            if ! git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main \
+               || ! mg_base="$(git merge-base refs/remotes/origin/main "$MG_HEAD_SHA")" \
+               || ! [[ "$mg_base" =~ $sha_re ]]; then
+              echo "::warning::no merge base between main and the merge group head — running the full backend suite"
               echo "backend=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            BASE_SHA="$MG_BASE_SHA"
+            echo "merge group: diffing ${mg_base} (merge base with main) ... ${MG_HEAD_SHA}"
+            BASE_SHA="$mg_base"
             HEAD_SHA="$MG_HEAD_SHA"
           # The daily schedule and a manual dispatch exist to run everything.
           elif [ "$EVENT" != "pull_request" ]; then
@@ -166,8 +180,8 @@ jobs:
           fi
 
           # Three dots: changes on the head branch since the merge base, not
-          # everything main has moved on by. (For a merge group the base is an
-          # ancestor of the head, so this is the group's own commits.)
+          # everything main has moved on by. (For a merge group the base is
+          # already the merge base with main.)
           #
           # ``--no-renames`` is load-bearing. With rename detection on (the
           # default) ``git mv backend/thing.py docs/thing.md`` reports ONLY

@@ -42,19 +42,21 @@ REPO="${REPO:-}"
 [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { say "SHA is not a commit id"; exit 1; }
 [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { say "REPO is not owner/name"; exit 1; }
 
+# The merge-queue trust predicate and the marker lookup, shared with
+# ci-tested-on-pr-head.sh.
+# shellcheck source=ci-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/ci-lib.sh" || { say "cannot load ci-lib.sh"; exit 1; }
+
 tmp="$(mktemp -d)" || { say "cannot create a temp dir"; exit 1; }
 trap 'rm -rf "$tmp"' EXIT
 
 gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&per_page=50" > "$tmp/runs.json" 2>/dev/null \
   || { say "could not list ci.yml runs for ${SHA::7}"; exit 1; }
-rows="$(jq -r --arg sha "$SHA" --arg repo "$REPO" '
+rows="$(jq -r --arg sha "$SHA" --arg repo "$REPO" "$CI_MERGE_QUEUE_RUN_JQ"'
     .workflow_runs[]
     | select(.head_sha == $sha
              and (.event == "push" or .event == "schedule" or .event == "workflow_dispatch"
-                  or (.event == "merge_group"
-                      and ((.head_branch // "") | startswith("gh-readonly-queue/main/"))
-                      and (.repository.full_name // "") == $repo
-                      and (.head_repository.full_name // "") == $repo)))
+                  or merge_queue_run($repo)))
     | [.id, .event, .status, (.conclusion // "none"), .run_attempt, .created_at, .html_url] | @tsv' \
     "$tmp/runs.json" 2>/dev/null)" || { say "unexpected reply listing ci.yml runs"; exit 1; }
 
@@ -63,10 +65,17 @@ if [ -z "$rows" ]; then
   exit 4
 fi
 
-# Does the run whose artifacts are in $tmp/art.json carry artifact $1?
-# Expired artifacts are still listed by name, which is all this needs.
+# Does run $id carry artifact $1? Expired artifacts are still listed by
+# name, which is all this needs. An API error or an unexpected reply is a
+# failure of the gate, never a "no".
 has() {
-  jq -e --arg n "$1" 'any(.artifacts[]; .name == $n)' "$tmp/art.json" >/dev/null 2>&1
+  local rc=0
+  ci_run_has_artifact "$id" "$1" any || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    say "could not list the artifacts of run $id"
+    exit 1
+  fi
+  [ "$rc" -eq 0 ]
 }
 
 pending=0
@@ -80,9 +89,7 @@ while IFS=$'\t' read -r id event status conclusion attempt created url; do
     continue
   fi
   [ "$conclusion" = "success" ] || continue
-  gh api "repos/${REPO}/actions/runs/${id}/artifacts?per_page=100" > "$tmp/art.json" 2>/dev/null \
-    || { say "could not list the artifacts of run $id"; exit 1; }
-  if has "backend-full-suite-attempt-${attempt}"; then
+  if has "$(ci_full_suite_marker "$attempt")"; then
     say "✓ the full backend suite passed on ${SHA::7} in $event run $id (attempt $attempt): $url"
     exit 0
   fi

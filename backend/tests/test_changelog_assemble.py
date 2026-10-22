@@ -3,10 +3,12 @@
 PRs add ``changelog.d/<issue>-<slug>.md`` instead of editing CHANGELOG.md, so
 two queued PRs never conflict on the same ``## Unreleased`` spot. Release prep
 folds the fragments in, and release.yml refuses a tag that still carries one
-(``--pending``). What matters here: entries land under the right section of
-``## Unreleased`` and nowhere else, earlier releases are untouched, a bad
-fragment is refused before anything is written, and nothing is deleted unless
-the fold was written.
+(``--pending``). What matters here: entries land at the top of the right section of
+``## Unreleased`` (newest issue first, as CHANGELOG.md reads) and nowhere
+else, earlier releases are untouched, a bad fragment — or anything in
+changelog.d/ the fold would skip — is refused before anything is written, a
+changelog with no ``## Unreleased`` is refused rather than given one, and
+nothing is deleted unless the fold was written.
 """
 
 from __future__ import annotations
@@ -71,13 +73,13 @@ def _unreleased(text: str) -> str:
     return text[start : text.index("## 1.0.0")]
 
 
-def test_entries_append_to_their_section_in_unreleased() -> None:
+def test_entries_go_to_the_top_of_their_section_in_unreleased() -> None:
     frag = "### Fixed\n\n- **New fix (#10).** Body\n  wrapped.\n"
     out = ca.assemble(CHANGELOG, [("10-new-fix.md", frag)])
     unrel = _unreleased(out)
     assert (
-        "### Fixed\n\n- **Existing fix (#2).** Body.\n\n"
-        "- **New fix (#10).** Body\n  wrapped.\n\n### Migrations"
+        "### Fixed\n\n- **New fix (#10).** Body\n  wrapped.\n\n"
+        "- **Existing fix (#2).** Body.\n\n### Migrations"
     ) in unrel
     # Earlier releases and the preamble are byte-identical.
     assert out[out.index("## 1.0.0") :] == CHANGELOG[CHANGELOG.index("## 1.0.0") :]
@@ -90,10 +92,30 @@ def test_one_fragment_may_fill_several_sections() -> None:
         "### Migrations\n\n- `bbbbbbbbbbbb` — #11, new migration.\n"
     )
     unrel = _unreleased(ca.assemble(CHANGELOG, [("11-x.md", frag)]))
-    assert "- **Existing fix (#2).** Body.\n\n- **Fix (#11).** Body.\n\n### Migrations" in unrel
-    assert unrel.rstrip().endswith(
-        "- `aaaaaaaaaaaa` — #3, existing migration.\n\n- `bbbbbbbbbbbb` — #11, new migration."
-    )
+    assert "### Fixed\n\n- **Fix (#11).** Body.\n\n- **Existing fix (#2).** Body." in unrel
+    assert (
+        "### Migrations\n\n- `bbbbbbbbbbbb` — #11, new migration.\n\n"
+        "- `aaaaaaaaaaaa` — #3, existing migration."
+    ) in unrel
+
+
+def test_several_fragments_fold_newest_issue_first() -> None:
+    frags = [
+        ("30-c.md", "### Fixed\n\n- **C (#30).** x\n"),
+        ("9-a.md", "### Fixed\n\n- **A (#9).** x\n"),
+    ]
+    unrel = _unreleased(ca.assemble(CHANGELOG, frags))
+    assert (
+        "### Fixed\n\n- **C (#30).** x\n\n- **A (#9).** x\n\n- **Existing fix (#2).** Body."
+    ) in unrel
+
+
+def test_fragment_paths_are_newest_issue_first(tmp_path: pathlib.Path) -> None:
+    d = tmp_path / "changelog.d"
+    d.mkdir()
+    for name in ("900-b.md", "1000-a.md", "95-c.md", "README.md"):
+        (d / name).write_text("### Fixed\n\n- x\n")
+    assert [p.name for p in ca.fragment_paths(d)] == ["1000-a.md", "900-b.md", "95-c.md"]
 
 
 def test_a_missing_section_is_created_in_canonical_order() -> None:
@@ -108,19 +130,51 @@ def test_a_missing_section_is_created_in_canonical_order() -> None:
     assert unrel.index("### Added") < unrel.index("### Changed") < unrel.index("### Fixed")
 
 
-def test_a_changelog_without_unreleased_gets_one_above_the_first_release() -> None:
+def test_a_changelog_without_unreleased_is_refused() -> None:
+    """After the rename, a fold would file the entries under that release."""
     text = CHANGELOG.replace(_unreleased(CHANGELOG), "")
-    out = ca.assemble(text, [("14-x.md", "### Fixed\n\n- **F (#14).** B.\n")])
-    assert out.index("## Unreleased") < out.index("## 1.0.0")
-    assert "## Unreleased\n\n### Fixed\n\n- **F (#14).** B.\n\n## 1.0.0" in out
+    with pytest.raises(ca.FragmentError) as err:
+        ca.assemble(text, [("14-x.md", "### Fixed\n\n- **F (#14).** B.\n")])
+    assert "no '## Unreleased'" in str(err.value)
+    # With nothing to fold there is nothing to refuse.
+    assert ca.assemble(text, []) == text
 
 
-def test_fragments_fold_in_issue_number_order(tmp_path: pathlib.Path) -> None:
+def test_headings_inside_a_code_fence_are_content() -> None:
+    frag = (
+        "### Changed\n\n- **Docs (#15).** Example:\n\n  ```markdown\n"
+        "  ### Fixed\n## not a release\n#123 not a heading\n  ```\n"
+    )
+    out = ca.parse_fragment("15-x.md", frag)
+    assert list(out) == ["Changed"]
+    assert "## not a release" in out["Changed"]
+
+
+def test_an_indented_issue_reference_is_allowed() -> None:
+    """format_release_notes.py only reads column-0 hashes as headings."""
+    out = ca.parse_fragment("15-x.md", "### Fixed\n\n- **A (x).** see\n  #1234 for why\n")
+    assert out["Fixed"][-1] == "  #1234 for why"
+
+
+@pytest.mark.parametrize(
+    "stray", [".gitkeep", ".hidden-1-x.md", "sub/", "notes.txt", "Fix-thing.md", "12_x.md"]
+)
+def test_anything_but_readme_and_fragments_in_the_directory_is_refused(
+    tmp_path: pathlib.Path, stray: str
+) -> None:
     d = tmp_path / "changelog.d"
     d.mkdir()
-    for name in ("900-b.md", "1000-a.md", "95-c.md", "README.md", ".gitkeep"):
-        (d / name).write_text("### Fixed\n\n- x\n")
-    assert [p.name for p in ca.fragment_paths(d)] == ["95-c.md", "900-b.md", "1000-a.md"]
+    (d / "1-a.md").write_text("### Fixed\n\n- x\n")
+    if stray.endswith("/"):
+        (d / stray.rstrip("/")).mkdir()
+        (d / stray.rstrip("/") / "2-b.md").write_text("### Fixed\n\n- y\n")
+    else:
+        (d / stray).write_text("### Fixed\n\n- y\n")
+    found, problems = ca.scan(d)
+    assert [p.name for p in found] == ["1-a.md"]
+    assert len(problems) == 1 and stray.rstrip("/") in problems[0]
+    with pytest.raises(ca.FragmentError):
+        ca.fragment_paths(d)
 
 
 @pytest.mark.parametrize(
@@ -132,7 +186,8 @@ def test_fragments_fold_in_issue_number_order(tmp_path: pathlib.Path) -> None:
         ("15-x.md", "", "no '### <Section>' heading"),
         ("15-x.md", "### Fixed\n\n- a\n\n### Fixed\n\n- b\n", "appears twice"),
         ("15-x.md", "## 1.0.1\n\n### Fixed\n\n- a\n", "only '### <Section>'"),
-        ("15-x.md", "### Fixed\n\n- **A (x).** see\n  #1234 for why\n", "must not start with"),
+        ("15-x.md", "### Fixed\n\n- **A (x).** see\n#1234 for why\n", "may start a line"),
+        ("15-x.md", "### Fixed\n\n- a\n```\n### Fixed\n", "never closed"),
         ("Fix-thing.md", "### Fixed\n\n- a\n", "name must be"),
         ("15_x.md", "### Fixed\n\n- a\n", "name must be"),
         ("15-x.txt", "### Fixed\n\n- a\n", "name must be"),
@@ -147,8 +202,7 @@ def test_a_bad_fragment_is_refused(name: str, text: str, why: str) -> None:
 def test_one_bad_fragment_refuses_the_whole_fold() -> None:
     with pytest.raises(ca.FragmentError) as err:
         ca.assemble(
-            CHANGELOG,
-            [("16-ok.md", "### Fixed\n\n- ok\n"), ("17-bad.md", "### Nope\n\n- x\n")],
+            CHANGELOG, [("16-ok.md", "### Fixed\n\n- ok\n"), ("17-bad.md", "### Nope\n\n- x\n")]
         )
     assert "17-bad.md" in str(err.value)
     assert "16-ok.md" not in str(err.value)
@@ -229,6 +283,30 @@ def test_cli_pending_is_release_yml_gate(tree: pathlib.Path) -> None:
     for p in (tree / "changelog.d").glob("2*.md"):
         p.unlink()
     assert _run(tree, "--pending").returncode == 0
+
+
+@pytest.mark.parametrize("mode", [(), ("--check",), ("--pending",), ("--dry-run",)])
+def test_cli_a_stray_file_fails_every_mode(tree: pathlib.Path, mode: tuple[str, ...]) -> None:
+    for p in (tree / "changelog.d").glob("2*.md"):
+        p.unlink()
+    sub = tree / "changelog.d" / "drafts"
+    sub.mkdir()
+    (sub / "24-hidden.md").write_text("### Fixed\n\n- hidden\n")
+    result = _run(tree, *mode)
+    assert result.returncode == 1, result.stdout
+    assert "drafts/" in result.stderr
+    assert (tree / "CHANGELOG.md").read_text() == CHANGELOG
+    assert (sub / "24-hidden.md").exists()
+
+
+def test_cli_refuses_without_unreleased_and_deletes_nothing(tree: pathlib.Path) -> None:
+    renamed = CHANGELOG.replace("## Unreleased", "## 1.0.1 — 2026-11-03")
+    (tree / "CHANGELOG.md").write_text(renamed)
+    result = _run(tree)
+    assert result.returncode == 1
+    assert "no '## Unreleased'" in result.stderr
+    assert (tree / "CHANGELOG.md").read_text() == renamed
+    assert (tree / "changelog.d" / "20-a.md").exists()
 
 
 def test_cli_pending_with_no_directory_passes(tmp_path: pathlib.Path) -> None:
