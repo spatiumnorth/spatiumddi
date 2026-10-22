@@ -2097,6 +2097,16 @@ whose `(name, record_type)` collides with a managed row is skipped; only
 external-only names are mirrored. Zone-management + DNSSEC RRs (SOA, apex
 NS, RRSIG/NSEC*/DNSKEY/CDS/CDNSKEY, private-type 65534) are never ingested.
 
+**Audit.** Every batch that adds or removes mirror records writes one
+`dns.record.external_ingest` audit row on the zone (not one per record, so
+a churning writer cannot flood the log): the added records in `new_value`,
+the removed ones in `old_value`, with counts and the posting server, names
+capped at 50 per batch. Mirror rows are hard-deleted when the writer
+withdraws them, since a restorable copy of a record the writer removed
+would be wrong; the audit row is the history. The agent never ships an
+empty set after a failed AXFR, so an empty report is a real withdrawal and
+is applied (and audited), not floor-guarded.
+
 **P1 limitation:** live multi-server propagation of an ingested record
 across every server in a group happens on the next full re-render, not
 instantly (ingested rows aren't re-shipped as per-server record ops). The

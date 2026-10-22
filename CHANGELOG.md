@@ -150,6 +150,96 @@ the formatter handles the rest.
   build. PowerDNS was not affected: it restarts `pdns_server` when
   `pdns.conf` changes. Technitium has no query-log toggle yet (#742).
 
+- **Starting a fleet upgrade, forcing a block-sync reconcile and
+  syncing an integration now record who did it (#2303).** All three
+  enqueue a worker task whose own audit rows say `system`, so "who
+  started the rolling upgrade" or "who forced this firewall push"
+  existed only in structlog. Each route now writes an audit row
+  attributed to the caller before the response returns:
+  `upgrade.start_requested` on the upgrade run, `reconcile` on the
+  block-sync target (not written for `?preview=true`), and `sync` on the
+  Cloud, Docker, Kubernetes, NetBird, OPNsense, Palo Alto, Fortinet,
+  Meraki, Proxmox, Tailscale and UniFi target. The worker's own rows
+
+- **DNS records mirrored from an external RFC 2136 writer are audited
+  (#2302).** An agent's `ingested-records` batch created and hard-deleted
+  `ddns_external` mirror records (an AD DC registering and deregistering
+  hosts) with no audit row, so they appeared and vanished with no history.
+  Each batch that adds or removes records now writes one
+  `dns.record.external_ingest` row on the zone naming them (added in
+  `new_value`, removed in `old_value`, capped at 50 per batch).
+
+- **Changing the Copilot tool catalog left no audit row (#2300).**
+  `PUT /ai/tools/catalog` is the switch that turns on the tools
+  that are default-off because they expose secrets, write broadly or
+  call off-prem, and it committed with no record of who flipped it.
+  It now writes one `audit_log` row in the same transaction, listing
+  the tools it enabled and the tools it disabled (a diff, not the
+  whole catalog). A write that changes nothing writes no row.
+
+- **Acknowledging, suppressing or deleting a captured internal error
+  left no audit row (#2301).** The three Diagnostics routes mutated or
+  hard-deleted the error with nothing in `audit_log`, so a fault (or
+  the exception an exploit attempt tripped) could be silenced or
+  erased without a trace. Each now writes one `internal_error` audit
+  row in the same transaction, carrying the fingerprint, exception
+  class and, for suppress, the hours and expiry. There are no bulk
+  endpoints. Re-acknowledging an already-acknowledged error changes
+  nothing and writes nothing.
+
+- **The wake calendar sync deleted today's holiday for schedules west
+  of UTC, so the fleet woke on it (#2305).** The sync kept events from
+  the worker's UTC date onward and deleted every stored span outside
+  that, but the gate judges the schedule's local date. For a schedule in
+  America/Los_Angeles, a refresh after 00:00 UTC removed the 20th's
+  holiday while it was still the 20th locally: a `skip_on_event`
+  schedule fired, and an `only_on_event` one silently skipped. The sync
+  now starts its horizon at the earliest local today among the
+  schedules attached to the calendar (DST-aware, never later than the
+  UTC date), or the UTC-12 date when none is attached.
+
+- **Deleting a site no longer silently deletes its E911 site-default
+  binding (#2298).** The binding is `ON DELETE CASCADE`, so a site delete
+  (single or bulk) removed the fallback emergency location for every
+  phone on it with no warning. Both now answer 409 naming the site and the
+  ERL, until the binding is removed under Network > E911 > Bindings; bulk
+  delete is all-or-nothing.
+
+- **The Audit page "Chain verified" badge now checks the newest audit
+  rows, not the oldest (#2297).** It verified the first 1,000 rows ever
+  written, so once an install passed 1,000 rows, tampering with recent
+  history still showed green. `GET /audit/integrity` takes
+  `newest=true` with `max_rows` to verify the latest window, anchored
+  on the row before it, and reports `first_seq` / `last_seq` /
+  `partial`; the badge tooltip states the range it covered and that the
+  nightly verify walks the whole chain.
+
+- **Sync DNS commit counted an address as created when nothing was
+  written (#2352).** Every address named in `create_for_ip_ids` (and
+  every record-linked address in `update_record_ids`) was counted as
+  created / updated, and written to the `dns-sync` audit row, even when
+  its A and PTR already existed and no DNS op was queued. The commit
+  now counts only addresses it queued ops for, so an address already in
+  sync reads as unchanged and writes no audit row, at subnet, block and
+  space scope alike. Also fixed on the way: a block-scope commit that
+  did write something answered 422 ("cannot be stored as sent"), because
+  its audit row was handed the CIDR as an object rather than a string.
+
+- **Timezone shifts in MAC-block expiry, the lease-history Since picker
+  and date-only terms (#2260).** Editing a DHCP MAC block fed its UTC
+  `expires_at` to a local `datetime-local` input and re-parsed it as
+  local on save, so every save moved the expiry by the browser's UTC
+  offset (a quarantine block could lift hours early east of UTC); the
+  lease-history Since picker had the same fault. Both now convert
+  through shared helpers in `lib/localTime.ts`. Circuit and service
+  term dates and an operator-entered Tailscale token expiry rendered a
+  day early west of UTC, and a term read "expired" on its last day.
+  Dates now parse as local calendar days and the end date is inclusive.
+  The `circuit_term_expiring` / `service_term_expiring` alerts say
+  "term expires today" on the last day, and the Network dashboard no
+  longer counts a circuit as past its term until the day after. A
+  source-scanning vitest guard fails on the old patterns.
+
 - **Webhook subscriptions could be created, repointed, deleted and
   have deliveries retried with no audit row (#2293).** All four routes
   now write one `audit_log` row in the mutation's transaction. The row
