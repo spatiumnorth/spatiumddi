@@ -1005,7 +1005,10 @@ hand-picked set, or `all_matching=true` with the report filter to
 deprecate every matching row in one shot (capped at `MAX_BULK_DEPRECATE`
 = 5000; the response `capped` flag tells the operator to re-run for the
 remainder). System placeholders and DHCP mirrors are skipped even if an
-id slips through. The page lives at **Stale IPs** in the sidebar.
+id slips through. **Deprecating does not free the address (#2421):** a
+`deprecated` row is a retained record, so it still counts as allocated on
+its subnet and Next available never offers it. Delete the row to give the
+address back. The page lives at **Stale IPs** in the sidebar.
 
 **Hygiene alert.** A `stale_ip_count` alert rule fires when any subnet
 holds at least `threshold_percent` (re-used as a raw count) allocated
