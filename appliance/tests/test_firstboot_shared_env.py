@@ -31,7 +31,6 @@ FIRSTBOOT = (BIN / "spatiumddi-firstboot").read_text(encoding="utf-8")
 # must seed it from the operator's Time-source answer, not the default pool.
 SHARED = {
     "APPLIANCE_MODE",
-    "APPLIANCE_VERSION",
     "APPLIANCE_HOSTNAME",
     "APPLIANCE_HOST_IPS",
     "INITIAL_NTP_SERVERS",
@@ -83,6 +82,20 @@ def test_no_shared_variable_is_left_on_the_api_alone() -> None:
     assert not (SHARED & set(api_env)), sorted(SHARED & set(api_env))
 
 
+def test_appliance_version_is_a_value_of_its_own_not_a_shared_env_entry() -> None:
+    """#2176: a cluster Rolling Upgrade holds the version with ``image.tag`` in
+    the control chart's HelmChartConfig until every node runs the target. A
+    HelmChartConfig replaces a list whole, so as a ``sharedEnv`` entry the
+    version could not be held, and the seed's re-render on its new slot rolled
+    the api, worker and beat mid-run. The chart appends ``applianceVersion`` to
+    the same env as APPLIANCE_VERSION (charts-render-check.sh renders it)."""
+    vals = _values()
+    assert "APPLIANCE_VERSION" not in _names(vals.get("sharedEnv"))
+    assert "APPLIANCE_VERSION" not in _names(vals["api"].get("env"))
+    assert "applianceVersion" in vals
+    assert isinstance(vals["applianceVersion"], str)
+
+
 def test_appliance_version_is_stamped_from_the_slot_release_file(tmp_path) -> None:
     """#2004: the pods got no APPLIANCE_VERSION. Executes firstboot's real
     version-stamping block against a fake release file, then the real render,
@@ -118,11 +131,11 @@ def test_appliance_version_is_stamped_from_the_slot_release_file(tmp_path) -> No
             ["bash", "-c", script], capture_output=True, text=True, check=True
         ).stdout
         vals = yaml.safe_load(yaml.safe_load(out)["spec"]["valuesContent"])
-        return {e["name"]: e["value"] for e in vals["sharedEnv"]}
+        return vals["applianceVersion"]
 
-    assert render("2026.10.16-1")["APPLIANCE_VERSION"] == "2026.10.16-1"
-    assert render("1.0.0")["APPLIANCE_VERSION"] == "1.0.0"  # upgrade / rollback
-    assert render(None)["APPLIANCE_VERSION"] == ""  # unknown, not a made-up value
+    assert render("2026.10.16-1") == "2026.10.16-1"
+    assert render("1.0.0") == "1.0.0"  # upgrade / rollback
+    assert render(None) == ""  # unknown, not a made-up value
     # A release file without the key reads as unknown even though the .env
     # reconcile earlier in firstboot left APPLIANCE_VERSION set in the shell.
-    assert render("", inherited="0.1.0")["APPLIANCE_VERSION"] == ""
+    assert render("", inherited="0.1.0") == ""

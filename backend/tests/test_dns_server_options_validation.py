@@ -112,13 +112,40 @@ def test_also_notify_is_not_an_address_match_list(bad: str):
         ("forward_policy", "only", "sometimes"),
         ("dnssec_validation", "auto", "maybe"),
         ("notify_enabled", "explicit", "yes; recursion yes"),
-        ("query_log_channel", "syslog", "file; stderr"),
+        ("query_log_channel", "file", "file; stderr"),
         ("query_log_severity", "debug 3", "loud"),
     ],
 )
 def test_bare_token_options_take_only_their_grammar(field: str, good: str, bad: str):
     assert _ok(field, good) == good
     assert _bad(field, bad).value == bad
+
+
+@pytest.mark.parametrize("channel", ["syslog", "stderr"])
+def test_query_log_channel_other_than_file_is_refused(channel: str):
+    # #2265: the shipper tails the file channel; syslog / stderr would
+    # leave the DNS Queries tab empty.
+    assert _bad("query_log_channel", channel).value == channel
+
+
+@pytest.mark.parametrize("severity", ["notice", "warning", "error", "critical"])
+def test_query_log_severity_that_drops_every_query_is_refused(severity: str):
+    # named logs queries at info; a channel threshold above it drops them.
+    assert _bad("query_log_severity", severity).value == severity
+
+
+@pytest.mark.parametrize("severity", ["info", "debug", "debug 2", "dynamic"])
+def test_query_log_severity_that_keeps_queries_is_accepted(severity: str):
+    assert _ok("query_log_severity", severity) == severity
+
+
+def test_query_log_file_may_not_move_off_the_shipper_path():
+    assert _bad("query_log_file", "/var/log/named/other.log").field == "query_log_file"
+
+
+def test_query_log_print_time_may_not_be_turned_off():
+    assert _bad("query_log_print_time", False).field == "query_log_print_time"
+    assert _ok("query_log_print_time", True) is True
 
 
 def test_query_log_path_must_be_a_plain_file_under_the_log_dir():
@@ -239,7 +266,7 @@ async def test_a_value_stored_before_the_gate_does_not_block_an_unrelated_save(
     assert r.json()["rrl_window"] == 20
 
     # Changing it is checked like any other new value.
-    r = await client.put(url, json={"query_log_file": "/srv/other.log"}, headers=headers)
+    r = await client.put(url, json={"query_log_file": "/var/log/named/other.log"}, headers=headers)
     assert r.status_code == 422, r.text
     assert r.json()["detail"]["field"] == "query_log_file"
 
