@@ -1,10 +1,14 @@
 """Conformity audit PDF — auditor-facing export.
 
-Generated synchronously by the export endpoint. Reads the latest
-``ConformityResult`` per (policy, resource) tuple and renders a
-single PDF organised by framework. Each policy section lists pass /
-warn / fail / not_applicable counts and enumerates failing rows
-with the diagnostic JSON pretty-printed beneath.
+Generated synchronously by the export endpoint. Reports the CURRENT
+state — the most recent evaluation pass of each ENABLED policy
+(``services.conformity.current``, #2278) — and renders a single PDF
+organised by framework. The header states that scope and every policy
+section carries the time its pass ran, because "current" here means
+"as of that pass", not "as of the moment the PDF was generated". Each
+policy section lists pass / warn / fail / not_applicable counts and
+enumerates failing rows with the diagnostic JSON pretty-printed
+beneath.
 
 PDF integrity hint: a SHA-256 hash of every result row's id+status
 is included in the footer so an auditor can detect post-hoc edits.
@@ -35,38 +39,11 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
-from sqlalchemy import desc, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.conformity import ConformityPolicy, ConformityResult
-
-# ── Aggregation helpers ─────────────────────────────────────────────
-
-
-async def _latest_results_per_policy(
-    db: AsyncSession,
-    *,
-    policy_ids: Iterable[str] | None = None,
-) -> dict[str, list[ConformityResult]]:
-    """Return ``{policy_id: [latest result per resource]}``.
-
-    The query pulls every result joined to its policy, then dedupes
-    in-Python keeping the newest per ``(policy_id, resource_kind,
-    resource_id)``. Avoids a window-function dialect dependency.
-    """
-    q = select(ConformityResult).order_by(desc(ConformityResult.evaluated_at))
-    if policy_ids:
-        q = q.where(ConformityResult.policy_id.in_(list(policy_ids)))
-    rows = (await db.execute(q)).scalars().all()
-    seen: set[tuple[str, str, str]] = set()
-    grouped: dict[str, list[ConformityResult]] = {}
-    for r in rows:
-        key = (str(r.policy_id), r.resource_kind, r.resource_id)
-        if key in seen:
-            continue
-        seen.add(key)
-        grouped.setdefault(str(r.policy_id), []).append(r)
-    return grouped
+from app.services.conformity.current import current_results
 
 
 def _esc(value: object) -> str:
@@ -128,19 +105,36 @@ async def generate_conformity_pdf(
     instead of PDF bytes, and fails silently apart from a
     ``coroutine was never awaited`` warning.
     """
-    pol_q = select(ConformityPolicy)
+    framework = framework or None
+    # Enabled policies only: a disabled policy's last pass describes a
+    # check nobody runs any more, which is not evidence of anything.
+    pol_q = select(ConformityPolicy).where(ConformityPolicy.enabled.is_(True))
+    disabled_q = (
+        select(func.count())
+        .select_from(ConformityPolicy)
+        .where(ConformityPolicy.enabled.is_(False))
+    )
     if framework:
         pol_q = pol_q.where(ConformityPolicy.framework == framework)
+        disabled_q = disabled_q.where(ConformityPolicy.framework == framework)
     policies = sorted(
         (await db.execute(pol_q)).scalars().all(),
         key=lambda p: (p.framework, p.reference or "", p.name),
     )
+    disabled_count = int((await db.execute(disabled_q)).scalar() or 0)
 
-    by_policy = await _latest_results_per_policy(
-        db, policy_ids=[str(p.id) for p in policies] or None
-    )
-    all_rows: list[ConformityResult] = [r for rows in by_policy.values() for r in rows]
+    # The framework filter goes into the query itself. The previous
+    # ``policy_ids=[...] or None`` turned a filter matching no policy
+    # into "no filter", printing every framework's results (and hashing
+    # them) under a heading that named one.
+    all_rows: list[ConformityResult] = await current_results(db, framework=framework)
+    by_policy: dict[str, list[ConformityResult]] = {}
+    for r in all_rows:
+        by_policy.setdefault(str(r.policy_id), []).append(r)
+    for rows in by_policy.values():
+        rows.sort(key=lambda r: (r.resource_display, r.resource_id))
     integrity = _result_hash(all_rows)
+    pass_times = [p.last_evaluated_at for p in policies if p.last_evaluated_at is not None]
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -166,10 +160,24 @@ async def generate_conformity_pdf(
     story.append(
         Paragraph(
             f"Generated {now.isoformat()} UTC · "
-            f"{len(policies)} policies · {len(all_rows)} latest results",
+            f"{len(policies)} enabled policies · {len(all_rows)} current results",
             small,
         )
     )
+    scope = (
+        "Scope: each enabled policy's most recent evaluation pass. A target "
+        "deleted or moved out of a policy's scope after that pass is still "
+        "shown until the policy next runs; one deleted or moved out before "
+        "it is not. "
+    )
+    if pass_times:
+        scope += (
+            f"Passes in this report ran between {min(pass_times).isoformat()} "
+            f"and {max(pass_times).isoformat()}. "
+        )
+    if disabled_count:
+        scope += f"{disabled_count} disabled policies are excluded."
+    story.append(Paragraph(_esc(scope.strip()), small))
     if framework:
         story.append(Paragraph(f"Framework filter: {_esc(framework)}", small))
     story.append(Spacer(1, 0.2 * inch))
@@ -177,7 +185,7 @@ async def generate_conformity_pdf(
     if not policies:
         story.append(
             Paragraph(
-                "No conformity policies are configured. Enable a "
+                "No enabled conformity policies. Enable a "
                 "built-in policy under Administration → Conformity "
                 "to populate this report.",
                 body,
@@ -245,6 +253,17 @@ async def generate_conformity_pdf(
                 Paragraph(
                     f"Severity: {_esc(policy.severity)} · check: {_esc(policy.check_kind)}"
                     f" · target: {_esc(policy.target_kind)}",
+                    small,
+                )
+            )
+            story.append(
+                Paragraph(
+                    (
+                        f"Results as of: {_esc(policy.last_evaluated_at.isoformat())}"
+                        if policy.last_evaluated_at is not None
+                        else "Not evaluated since it was created or last re-scoped"
+                        " — no current results."
+                    ),
                     small,
                 )
             )

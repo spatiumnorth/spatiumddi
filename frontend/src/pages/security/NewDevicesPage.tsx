@@ -24,7 +24,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Pager } from "@/components/ui/pager";
 import { errMsg, inputCls } from "@/pages/dhcp/_shared";
-import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const PAGE_SIZE = 100;
@@ -102,8 +102,12 @@ export function NewDevicesPage() {
 
   // #601 — the "also quarantine upstream" affordance in the block modal
   // only makes sense when the active block-sync module is enabled.
-  const { enabled: moduleEnabled } = useFeatureModules();
-  const blockSyncEnabled = moduleEnabled("security.block_sync");
+  const blockSyncEnabled = useModuleOn("security.block_sync");
+  // #2134 — the DHCP half of Block writes dhcp_mac_block rows, which only
+  // exist while core.dhcp is on. With it off the action survives only as the
+  // upstream quarantine (when block-sync is on), and is hidden otherwise.
+  const dhcpOn = useModuleOn("core.dhcp");
+  const canBlock = dhcpOn || blockSyncEnabled;
 
   const summaryQ = useQuery({
     queryKey: ["new-devices", "summary"],
@@ -384,17 +388,19 @@ export function NewDevicesPage() {
             >
               Add to allowlist
             </HeaderButton>
-            <HeaderButton
-              icon={Ban}
-              variant="destructive"
-              onClick={() => {
-                setActionError(null);
-                setShowBlock(true);
-              }}
-              {...writeGate}
-            >
-              Block
-            </HeaderButton>
+            {canBlock && (
+              <HeaderButton
+                icon={Ban}
+                variant="destructive"
+                onClick={() => {
+                  setActionError(null);
+                  setShowBlock(true);
+                }}
+                {...writeGate}
+              >
+                {dhcpOn ? "Block" : "Quarantine upstream"}
+              </HeaderButton>
+            )}
           </div>
         </div>
       )}
@@ -529,8 +535,9 @@ export function NewDevicesPage() {
           onError={(m) => setActionError(m)}
         />
       )}
-      {showBlock && (
+      {showBlock && canBlock && (
         <BlockSelectedModal
+          dhcpOn={dhcpOn}
           sightings={selectedRows}
           blockSyncEnabled={blockSyncEnabled}
           onClose={() => setShowBlock(false)}
@@ -864,12 +871,14 @@ function AddSelectedToAllowlistModal({
 // ── Block selected MACs across DHCP server groups ─────────────────────
 function BlockSelectedModal({
   sightings,
+  dhcpOn,
   blockSyncEnabled,
   onClose,
   onDone,
   onError,
 }: {
   sightings: NewDeviceSighting[];
+  dhcpOn: boolean;
   blockSyncEnabled: boolean;
   onClose: () => void;
   onDone: (notice?: string) => void;
@@ -886,13 +895,22 @@ function BlockSelectedModal({
           newDeviceApi.block({
             mac_address: s.mac_address,
             reason: reason.trim() || undefined,
-            block_upstream: blockUpstream || undefined,
+            block_upstream: blockUpstream || !dhcpOn || undefined,
           }),
         ),
       );
-      const failed = results.filter((r) => r.status === "rejected").length;
-      if (failed > 0)
-        throw new Error(`${failed} of ${sightings.length} failed to block`);
+      const rejected = results.filter(
+        (r): r is PromiseRejectedResult => r.status === "rejected",
+      );
+      if (rejected.length > 0)
+        // Carry the server's reason: with DHCP off a refusal (no permission,
+        // no armed target) is the whole answer, not a partial failure.
+        throw new Error(
+          `${rejected.length} of ${sightings.length} failed to block: ${errMsg(
+            rejected[0].reason,
+            "unknown error",
+          )}`,
+        );
       // Summarise the upstream outcome so the operator knows whether the
       // L2 quarantine landed or is waiting on a second approver.
       let upstreamCreated = 0;
@@ -916,7 +934,10 @@ function BlockSelectedModal({
   });
 
   return (
-    <Modal title="Block MACs" onClose={onClose}>
+    <Modal
+      title={dhcpOn ? "Block MACs" : "Quarantine MACs upstream"}
+      onClose={onClose}
+    >
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -925,9 +946,19 @@ function BlockSelectedModal({
         className="space-y-3"
       >
         <p className="text-sm text-muted-foreground">
-          Block {sightings.length} MAC
-          {sightings.length === 1 ? "" : "s"} in <strong>every</strong> DHCP
-          server group. Blocked devices can't obtain a lease.
+          {dhcpOn ? (
+            <>
+              Block {sightings.length} MAC
+              {sightings.length === 1 ? "" : "s"} in <strong>every</strong> DHCP
+              server group. Blocked devices can't obtain a lease.
+            </>
+          ) : (
+            <>
+              Quarantine {sightings.length} MAC
+              {sightings.length === 1 ? "" : "s"} upstream (UniFi block-sta) on
+              armed block-sync targets. May queue for two-person approval.
+            </>
+          )}
         </p>
         <div className="max-h-32 overflow-auto rounded-md border bg-muted/30 p-2">
           {sightings.map((s) => (
@@ -942,7 +973,7 @@ function BlockSelectedModal({
           value={reason}
           onChange={(e) => setReason(e.target.value)}
         />
-        {blockSyncEnabled && (
+        {dhcpOn && blockSyncEnabled && (
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
               type="checkbox"
@@ -973,7 +1004,7 @@ function BlockSelectedModal({
             disabled={mut.isPending}
             className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
           >
-            {mut.isPending ? "Blocking…" : "Block"}
+            {mut.isPending ? "Blocking…" : dhcpOn ? "Block" : "Quarantine"}
           </button>
         </div>
       </form>
