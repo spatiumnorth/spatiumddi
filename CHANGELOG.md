@@ -128,6 +128,28 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Turning BIND9 query logging on or off now takes effect without
+  restarting named (#2249).** `rndc reconfig` never applies the
+  `querylog` switch: a named that started with query logging off
+  stayed off after the agent rendered the `queries` category, and one
+  that started with it on kept logging after it was removed. #914 fixed
+  the same thing for `responselog` but believed query logging followed
+  its category on reload; it only does when named starts. So enabling
+  query logging on a running server reported success and logged
+  nothing, and with response logging on the control plane dropped
+  every response line as an orphan, leaving the DNS Queries tab empty
+  until the daemon restarted. The agent now renders `querylog yes;`
+  when query logging is on and, after each structural reload, runs
+  `rndc querylog on|off` alongside `rndc responselog on|off`, read back
+  off the config it just swapped in. A group with query logging off
+  renders the same `named.conf` as before, and the control-plane
+  `named.conf` preview mirrors the new statement. A new live check,
+  `agent/dns/tests/live_query_log_check.py`, toggles both switches on a
+  running BIND 9.20 through the agent's real reload path and asserts
+  `rndc status` and the lines named writes; it runs in the DNS image
+  build. PowerDNS was not affected: it restarts `pdns_server` when
+  `pdns.conf` changes. Technitium has no query-log toggle yet (#742).
+
 - **A node staging an upgrade could stall its own etcd until k3s restarted
   (#1804).** The node keeps serving while it writes the new slot, and the
   write was buffered: hundreds of MB of the 8 GiB image piled up in the page

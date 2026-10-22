@@ -2476,19 +2476,23 @@ query. That volume is why the query log is capped at a 24 h window in
 the first place, so treat this as a troubleshooting switch rather than a
 permanent setting on a busy resolver.
 
-> **`rndc reconfig` does not apply `responselog`.** Verified against
-> BIND 9.20.26: with `responselog yes;` in a freshly-swapped config and
-> a clean reconfig, `rndc status` still reported
-> `response logging is OFF`. It is a live switch, like `querylog`, and
-> reconfig deliberately
-> preserves whatever the running server was last told. Query logging
-> escapes this only by accident of BIND's own defaulting — with no
-> `querylog` statement it follows the presence of the `queries`
-> category, which a reload does pick up. The agent therefore issues an
-> explicit `rndc responselog on|off` after each structural reload,
-> reading the desired state back off the config it just swapped in.
-> Without that the toggle would appear to work and produce not one line
-> until the daemon was next restarted.
+> **`rndc reconfig` applies neither `querylog` nor `responselog`.**
+> Both are live switches, and reconfig deliberately preserves whatever
+> the running server was last told. Verified against BIND 9.20: with
+> `responselog yes;` in a freshly-swapped config and a clean reconfig,
+> `rndc status` still reported `response logging is OFF` (#914); and a
+> named started with query logging off stayed off after a reconfig that
+> added the `queries` category, with or without `querylog yes;`, and
+> one started with it on stayed on after a reconfig that removed it
+> (#2249). Without a `querylog` statement BIND decides query logging from
+> the `queries` category only when named *starts*. So the agent renders
+> `querylog yes;` when query logging is on, and after each structural
+> reload issues an explicit `rndc querylog on|off` and
+> `rndc responselog on|off`, reading the desired state back off the
+> config it just swapped in. Without that, both toggles would appear to
+> work and change nothing until the daemon was next restarted; with
+> response logging on, every response line would also be dropped as an
+> orphan, because its query line never arrives.
 
 ### 21.3 Which drivers fill it
 
