@@ -37,6 +37,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServer, DNSZone
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.tasks._interval_gate import interval_skip
 
 logger = structlog.get_logger(__name__)
 
@@ -67,14 +68,9 @@ async def _run_sync() -> dict[str, Any]:
 
             now = datetime.now(UTC)
             interval = timedelta(minutes=max(1, ps.dns_pull_from_server_interval_minutes))
-            if ps.dns_pull_from_server_last_run_at is not None:
-                elapsed = now - ps.dns_pull_from_server_last_run_at
-                if elapsed < interval:
-                    return {
-                        "status": "skipped",
-                        "reason": "interval_not_elapsed",
-                        "wait_seconds": int((interval - elapsed).total_seconds()),
-                    }
+            skip = interval_skip(now, ps.dns_pull_from_server_last_run_at, interval)
+            if skip is not None:
+                return skip
 
             zones = list((await db.execute(select(DNSZone))).scalars().all())
 

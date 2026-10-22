@@ -65,6 +65,7 @@ from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.ownership import Customer, Site
 from app.models.vlans import VLAN, Router
 from app.models.vrf import VRF
+from app.services.router_naming import pick_unique_router_name
 
 from .canonical import (
     ConflictAction,
@@ -999,23 +1000,40 @@ _LEGACY_ROUTER_NAMES: tuple[str, ...] = ("NetBox import",)
 async def _ensure_router(db: AsyncSession, name: str) -> Router:
     """Find-or-create the synthetic router VLANs hang off (UNIQUE name).
 
-    Matches the requested ``name`` first, then any legacy alias, so renaming
-    the default no longer orphans a router an earlier import already created
-    (and leaves the imported VLANs hanging off a duplicate).
+    Matches the requested ``name`` first, then its ``(NetBox)``-suffixed
+    form, then any legacy alias, so renaming the default no longer orphans
+    a router an earlier import already created (and leaves the imported
+    VLANs hanging off a duplicate). Adopting an operator Router of that
+    name is deliberate — the operator typed it into the import form.
+
+    A Router an integration owns (``unifi_controller_id`` set) is never
+    adopted: the UniFi reconciler deletes VLANs on its Router that UniFi
+    does not report, so it would delete every VLAN this import hung off
+    it. Its name is taken, so the new router gets a suffixed one (#2140).
     """
     seen: set[str] = set()
-    for candidate in (name, *_LEGACY_ROUTER_NAMES):
+    for candidate in (name, f"{name} (NetBox)", *_LEGACY_ROUTER_NAMES):
         if candidate in seen:
             continue
         seen.add(candidate)
         existing = (
-            (await db.execute(select(Router).where(Router.name == candidate).limit(1)))
+            (
+                await db.execute(
+                    select(Router)
+                    .where(Router.name == candidate)
+                    .where(Router.unifi_controller_id.is_(None))
+                    .limit(1)
+                )
+            )
             .scalars()
             .first()
         )
         if existing is not None:
             return existing
-    row = Router(name=name, description="Synthetic router for NetBox-imported VLANs")
+    row = Router(
+        name=await pick_unique_router_name(db, name, tag="NetBox"),
+        description="Synthetic router for NetBox-imported VLANs",
+    )
     db.add(row)
     await db.flush()
     await db.commit()

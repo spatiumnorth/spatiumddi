@@ -27,6 +27,12 @@ until every node reports the target, then moves them once (mzac's call on
   the seed's firstboot re-render no longer moves them. The pins are
   re-asserted before every node: the seed supervisor's own overrides write
   the control chart's HelmChartConfig as a read then a PATCH.
+* The control chart's ``applianceVersion`` (APPLIANCE_VERSION in the api,
+  worker and beat env, #2004) is pinned with them, to the version the
+  control plane runs (#2176). The same re-render moves it with the slot,
+  and a pod template that changes rolls those pods whatever their image:
+  holding the tag alone still rolled the control plane mid-run, on the old
+  image, and shut down the worker the drive runs on.
 * The appliance chart cannot be pinned that way (the seed's supervisor
   rewrites that HelmChartConfig whole on every heartbeat), so the hold goes
   to the supervisors instead. Every member's heartbeat carries it
@@ -34,7 +40,7 @@ until every node reports the target, then moves them once (mzac's call on
   nothing to that chart until the hold ends. The nodes still on the old
   slot keep writing it, so it keeps its old chart AND its old tag.
 * When the drive has seen every node pass its health gate, :func:`flip`
-  removes both pins and ends the hold in one step. The flip rolls the
+  removes every pin and ends the hold in one step. The flip rolls the
   worker the drive runs on, so the rest of the run (:func:`settle`, the
   verify) moves to a worker that already runs the target.
 
@@ -79,6 +85,13 @@ PINS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("spatium-bootstrap", ("global", "imageTag")),
     ("spatium-control", ("image", "tag")),
 )
+
+# #2176 — and the control chart's value for APPLIANCE_VERSION in the api,
+# worker and beat env (#2004), which the seed's firstboot renders from its
+# slot on the same boot as the tag. Held to the version the control plane
+# runs, not to the tag: on a nightly the two differ (``nightly-YYYYMMDD``
+# against ``0.0.0-nightly-YYYYMMDD+<sha>``).
+VERSION_PIN: tuple[str, tuple[str, ...]] = ("spatium-control", ("applianceVersion",))
 
 PROGRESS_KEY = "shared_tags"
 MODE_HOLD = "hold"
@@ -250,12 +263,31 @@ def drop_value(values_yaml: str, path: tuple[str, ...]) -> str:
     return yaml.safe_dump(doc, sort_keys=True, default_flow_style=False) if doc else ""
 
 
-def _apply_pins(tag: str | None) -> tuple[bool, str | None]:
-    """Set every pin to ``tag``, or remove every pin when ``tag`` is None.
+def _pin_edits(
+    tag: str | None, version: str | None
+) -> dict[str, list[tuple[tuple[str, ...], str | None]]]:
+    """Each chart's (key, value) edits: every tag pin to ``tag`` and the
+    version pin to ``version``, or every key removed (value None) when
+    ``tag`` is None. A ``version`` of None with a tag leaves the version key
+    as it is: a hold whose record names no version, placed by a drive from
+    before #2176, pins its tags only, as that drive did."""
+    edits: dict[str, list[tuple[tuple[str, ...], str | None]]] = {}
+    for name, path in PINS:
+        edits.setdefault(name, []).append((path, tag))
+    if tag is None or version is not None:
+        name, path = VERSION_PIN
+        edits.setdefault(name, []).append((path, None if tag is None else version))
+    return edits
+
+
+def _apply_pins(tag: str | None, version: str | None = None) -> tuple[bool, str | None]:
+    """Set every tag pin to ``tag`` and the version pin to ``version``, or
+    remove every pin when ``tag`` is None (:func:`_pin_edits`).
 
     Idempotent: a HelmChartConfig already in the wanted state is not
-    written, so helm-controller re-renders nothing."""
-    for name, path in PINS:
+    written, so helm-controller re-renders nothing. One write per chart, so
+    the control chart's tag and version move in one helm revision."""
+    for name, pins in _pin_edits(tag, version).items():
         try:
             status, body = k8s.get_helmchartconfig(name, namespace=CHART_NAMESPACE)
         except k8s.KubeapiUnavailableError as exc:
@@ -267,7 +299,9 @@ def _apply_pins(tag: str | None) -> tuple[bool, str | None]:
         current = ""
         if status == 200 and body is not None:
             current = (body.get("spec") or {}).get("valuesContent") or ""
-        wanted = drop_value(current, path) if tag is None else set_value(current, path, tag)
+        wanted = current
+        for path, value in pins:
+            wanted = drop_value(wanted, path) if value is None else set_value(wanted, path, value)
         if status == 200 and wanted == current:
             continue
         ok, err = k8s.upsert_helmchartconfig(name, wanted, namespace=CHART_NAMESPACE)
@@ -276,8 +310,9 @@ def _apply_pins(tag: str | None) -> tuple[bool, str | None]:
         logger.info(
             "upgrade_shared_tag_pin_written",
             chart=name,
-            key=".".join(path),
+            key=",".join(".".join(path) for path, _value in pins),
             tag=tag,
+            version=version if name == VERSION_PIN[0] else None,
         )
     return True, None
 
@@ -339,7 +374,10 @@ async def ensure_hold(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
         held_tag = str(record.get("from_tag") or "")
         if not held_tag:
             return StepOutcome(ok=False, mode=MODE_HOLD, error="the hold records no tag")
-        ok, err = _apply_pins(held_tag)
+        # The version the hold was placed with, never this process's now:
+        # the record is what every drive of the run re-asserts.
+        held_version = record.get("from_version")
+        ok, err = _apply_pins(held_tag, None if held_version is None else str(held_version))
         return StepOutcome(ok=ok, mode=MODE_HOLD, error=err, retryable=not ok and _transient(err))
 
     nodes = [str(n) for n in (run.plan or {}).get("node_order") or []]
@@ -351,11 +389,15 @@ async def ensure_hold(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
         return StepOutcome(ok=True, mode=MODE_LEGACY)
 
     from_tag = settings.version
+    # #2176 — the version the control plane reports (APPLIANCE_VERSION, ""
+    # when unknown), held with the tag: an unknown one is held as unknown.
+    from_version = settings.appliance_version or ""
     _store(
         run,
         {
             "mode": MODE_HOLD,
             "from_tag": from_tag,
+            "from_version": from_version,
             "to_tag": run.target_version,
             "nodes": nodes,
             "placed_at": _now_iso(),
@@ -370,11 +412,12 @@ async def ensure_hold(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
             other_record["released_at"] = _now_iso()
             other_record["release_reason"] = f"superseded:{run.id}"
             _store(other, other_record)
-    ok, err = _apply_pins(from_tag)
+    ok, err = _apply_pins(from_tag, from_version)
     logger.info(
         "upgrade_shared_tag_hold_placed",
         run_id=str(run.id),
         from_tag=from_tag,
+        from_version=from_version,
         to_tag=run.target_version,
         ok=ok,
         error=err,
@@ -383,7 +426,7 @@ async def ensure_hold(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
         ok=ok,
         mode=MODE_HOLD,
         error=err,
-        detail={"from_tag": from_tag},
+        detail={"from_tag": from_tag, "from_version": from_version},
         retryable=not ok and _transient(err),
     )
 
@@ -484,7 +527,7 @@ async def flip(db: AsyncSession, run: SystemUpgradeRun) -> StepOutcome:
     """End the hold: the run's last change to the cluster.
 
     Records the workloads that run the old tag (what :func:`settle` waits
-    for), removes both pins (removes the keys: a pin left set to the target
+    for), removes every pin (removes the keys: a pin left set to the target
     would outlive the run and stop a later per-node upgrade's firstboot
     from moving the control plane), marks the hold released, which frees
     the supervisors to write the appliance chart, and wakes them.
@@ -661,6 +704,7 @@ __all__ = [
     "PROGRESS_KEY",
     "RELEASE_NAMESPACE",
     "StepOutcome",
+    "VERSION_PIN",
     "carries_tag",
     "drop_value",
     "ensure_hold",

@@ -34,10 +34,9 @@ import structlog
 from fastapi import APIRouter, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, SuperAdmin
 from app.core.content_disposition import content_disposition
 from app.core.demo_mode import forbid_in_demo_mode
-from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.services.support_bundle import generate
@@ -83,17 +82,6 @@ class BundlePreviewOut(BaseModel):
     warning: str
 
 
-def _require_superadmin(user: Any) -> None:
-    if not is_effective_superadmin(user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "Support bundles are superadmin-only: one archive carries "
-                "platform logs, configuration shape and an audit tail."
-            ),
-        )
-
-
 def _check_unscrubbed(body: BundleRequest) -> None:
     if body.scrubbed:
         return
@@ -124,10 +112,9 @@ def _audit(user: Any, scrubbed: bool, action: str) -> AuditLog:
 
 @router.post("/preview", response_model=BundlePreviewOut)
 async def preview_support_bundle(
-    body: BundleRequest, db: DB, current_user: CurrentUser
+    body: BundleRequest, db: DB, current_user: SuperAdmin
 ) -> BundlePreviewOut:
     """Dry run — what a bundle generated right now would contain."""
-    _require_superadmin(current_user)
     # Gated like the download it precedes. The preview is not a summary:
     # it returns an excerpt of the real activity log plus the whole file
     # inventory, so leaving it open on a shared demo instance would read
@@ -163,10 +150,9 @@ async def preview_support_bundle(
     responses={200: {"description": "The support-bundle archive"}},
 )
 async def download_support_bundle(
-    body: BundleRequest, db: DB, current_user: CurrentUser
+    body: BundleRequest, db: DB, current_user: SuperAdmin
 ) -> Response:
     """Generate and return the archive."""
-    _require_superadmin(current_user)
     forbid_in_demo_mode()
     _check_unscrubbed(body)
 
@@ -191,14 +177,13 @@ class DecodeMapOut(BaseModel):
 
 
 @router.post("/decode-map", response_model=DecodeMapOut)
-async def support_bundle_decode_map(db: DB, current_user: CurrentUser) -> DecodeMapOut:
+async def support_bundle_decode_map(db: DB, current_user: SuperAdmin) -> DecodeMapOut:
     """Synthetic → real, so support's answers can be acted on.
 
     Kept out of the archive on purpose. The mapping is regenerated here
     rather than stored: it is deterministic per install, so a token from
     an earlier bundle resolves the same way.
     """
-    _require_superadmin(current_user)
     forbid_in_demo_mode()
 
     result = await generate(db, scrubbed=True)

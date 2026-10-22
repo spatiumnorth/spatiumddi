@@ -49,6 +49,7 @@ import {
 import { useNavigate } from "react-router-dom";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
@@ -5700,6 +5701,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   <ConfigApplyChip server={s} />
                   <SpoolChip server={s} />
                   <DaemonStateChip server={s} />
+                  <DuplicateAgentChip server={s} />
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {s.host}:{s.port}
@@ -7677,11 +7679,19 @@ function OptionsTab({ groupId }: { groupId: string }) {
               auto — validate using built-in managed keys (recommended)
             </option>
             <option value="yes">
-              yes — validate; trust anchors must be configured manually
+              yes — validate; only against trust anchors added via the API
+              (BIND9)
             </option>
             <option value="no">no — do not validate DNSSEC signatures</option>
           </select>
         </Field>
+        {(opts?.dnssec_warnings?.length ?? 0) > 0 && (
+          <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+            {opts?.dnssec_warnings?.map((w) => (
+              <p key={w}>{w}</p>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className={card}>
@@ -9465,6 +9475,24 @@ function ZonesTab({
  * de-assigned groups get woken too (the endpoint unions old and new
  * affected groups before publishing the config wake).
  */
+/** Rules the last adblock refresh could not enforce (#2123); 0 when the
+ *  counts were never recorded. */
+function feedSkippedTotal(l: DNSBlockList): number {
+  const s = l.feed_parse_skipped;
+  return s ? s.regex + s.modifier + s.badfilter + s.malformed : 0;
+}
+
+function feedSkippedTitle(l: DNSBlockList): string {
+  const s = l.feed_parse_skipped;
+  if (!s) return "";
+  return (
+    `The last refresh skipped ${feedSkippedTotal(l)} feed rule(s) DNS cannot ` +
+    `enforce: ${s.regex} regex, ${s.modifier} with unsupported modifiers ` +
+    `($domain=, $third-party, …), ${s.badfilter} $badfilter, ` +
+    `${s.malformed} not a plain ||name^ rule.`
+  );
+}
+
 function BlocklistScopeModal({
   list,
   group,
@@ -10095,6 +10123,14 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         view: {viewName.get(id)}
                       </span>
                     ))}
+                    {feedSkippedTotal(l) > 0 && (
+                      <span
+                        className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600"
+                        title={feedSkippedTitle(l)}
+                      >
+                        {feedSkippedTotal(l)} rules not enforced
+                      </span>
+                    )}
                     <span className="ml-auto text-xs text-muted-foreground">
                       {l.entry_count} entries
                     </span>
@@ -10318,7 +10354,6 @@ function BlocklistModal({
             >
               <option value="nxdomain">nxdomain</option>
               <option value="sinkhole">sinkhole</option>
-              <option value="refused">refused</option>
             </select>
           </Field>
         </div>
@@ -10330,6 +10365,10 @@ function BlocklistModal({
               onChange={(e) => setSinkholeIp(e.target.value)}
               placeholder="0.0.0.0"
             />
+            <p className="mt-1 text-xs text-muted-foreground">
+              Blocked names answer with this address. Blank answers 0.0.0.0 and
+              ::; an IPv4 address replaces 0.0.0.0 and an IPv6 one replaces ::.
+            </p>
           </Field>
         )}
         <div className="grid grid-cols-2 gap-3">
@@ -10581,6 +10620,9 @@ function BlocklistDetail({
             <span className="text-destructive"> ({list.last_sync_error})</span>
           )}
         </p>
+      )}
+      {feedSkippedTotal(list) > 0 && (
+        <p className="text-xs text-amber-600">{feedSkippedTitle(list)}</p>
       )}
 
       {/* Blocked domains (the list itself) */}

@@ -85,6 +85,15 @@ auth:
 # APPLIANCE_MODE / hostname / host IPs live here. Same shape as ``api.env``.
 sharedEnv: []
 
+# #2004 / #2176 — the appliance's version, appended to the api, worker and beat
+# env as APPLIANCE_VERSION (``settings.appliance_version``: what system/info and
+# /version report). A value of its own rather than a ``sharedEnv`` entry, so a
+# cluster Rolling Upgrade can hold it with ``image.tag`` in the HelmChartConfig
+# until every node runs the target: a HelmChartConfig pins a scalar, but
+# replaces a list whole. Empty (the default, and every install that is not an
+# appliance) renders no APPLIANCE_VERSION, which the api reads as unknown.
+applianceVersion: ""
+
 api:
   replicas: 2
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
