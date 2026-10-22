@@ -21,13 +21,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPT = (
     Path(__file__).parent.parent / "mkosi.extra" / "usr" / "local" / "bin" / "spatium-etcd-evict"
 )
 
 # `list <store>` prints the store's members as k3s's /db/info does; `remove <id>`
 # drops the member from BOTH stores (one cluster, seen from two nodes) unless
-# told to refuse.
+# told to refuse. FAKE_ANSWER is an error etcd answers after that, and
+# FAKE_NOT_APPLIED keeps the removal from happening behind it. FAKE_TOMBSTONE is
+# the file k3s writes when a peer tells its etcd that this member was removed.
 FAKE = r"""
 import json, os, sys
 if sys.argv[1] == "list":
@@ -41,16 +45,25 @@ else:
     open(log, "a").write(f"remove {mid}\n")
     if os.environ.get("FAKE_REFUSE"):
         print("grpc-status 9: etcdserver: unhealthy cluster"); sys.exit(1)
-    for store in (os.environ["FAKE_LOCAL"], os.environ["FAKE_SURVIVOR"]):
-        st = json.load(open(store))
-        if not st.get("frozen"):
-            st["members"] = [m for m in st["members"] if m["ID"] != mid]
-        json.dump(st, open(store, "w"))
+    if not os.environ.get("FAKE_NOT_APPLIED"):
+        for store in (os.environ["FAKE_LOCAL"], os.environ["FAKE_SURVIVOR"]):
+            st = json.load(open(store))
+            if not st.get("frozen"):
+                st["members"] = [m for m in st["members"] if m["ID"] != mid]
+            json.dump(st, open(store, "w"))
+        if os.environ.get("FAKE_TOMBSTONE"):
+            open(os.environ["FAKE_TOMBSTONE"], "w").close()
+    if os.environ.get("FAKE_ANSWER"):
+        print(os.environ["FAKE_ANSWER"]); sys.exit(1)
 """
 
 SEED = {"ID": 8674559146448320794, "name": "ddipg-seed-964d1931"}
 ME = {"ID": 12000000000000000002, "name": "ddipg-member-1-7f072fd9"}
 OTHER = {"ID": 18446744073709551557, "name": "ddipg-member-2-7d1c4ad1"}
+
+# What MemberRemove answered when a member removed itself and its etcd shut down
+# first (#2394): etcd's ErrStopped, after the change was proposed.
+SERVER_STOPPED = "grpc-status 14: etcdserver: server stopped"
 
 
 def _run(
@@ -61,6 +74,9 @@ def _run(
     survivor_down: bool = False,
     refuse: bool = False,
     local_unreadable: bool = False,
+    answer: str = "",
+    applied: bool = True,
+    tombstone: bool = False,
 ) -> tuple[int, list[str], bool, str]:
     k3s = tmp_path / "k3s-server"
     (k3s / "db" / "etcd").mkdir(parents=True)
@@ -98,6 +114,9 @@ def _run(
         "FAKE_SURVIVOR": str(survivor),
         "FAKE_LOG": str(removals),
         "FAKE_REFUSE": "1" if refuse else "",
+        "FAKE_ANSWER": answer,
+        "FAKE_NOT_APPLIED": "" if applied else "1",
+        "FAKE_TOMBSTONE": str(k3s / "db" / "etcd" / "tombstone") if tombstone else "",
     }
     r = subprocess.run(
         [sys.executable, str(SCRIPT), "--leave-self"],
@@ -157,3 +176,84 @@ def test_an_unreadable_own_list_removes_nothing(tmp_path: Path) -> None:
     assert rc == 1
     assert removed == []
     assert not stopped
+
+
+# ---- an error answer for this node's own member (#2394) --------------------------
+#
+# The member removes itself through its own etcd. A peer that has applied the
+# removal rejects this etcd's traffic, k3s writes its tombstone and closes etcd,
+# and the MemberRemove call, still waiting for this node to apply the change,
+# answers `server stopped`. The member is gone; the answer says nothing either way.
+
+
+def test_a_removal_answered_server_stopped_goes_on_once_the_survivor_confirms(
+    tmp_path: Path,
+) -> None:
+    rc, removed, stopped, log = _run(tmp_path, answer=SERVER_STOPPED)
+    assert rc == 0, log
+    assert removed == ["remove", str(ME["ID"])]
+    assert stopped
+    assert "server stopped" in log
+    assert "no longer lists" in log
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        # grpc_error(): no gRPC status at all, so etcd never took the call.
+        "no grpc-status in etcd's answer (HTTP 415)",
+        # etcd's strict reconfiguration check, which refuses before proposing.
+        "grpc-status 9: etcdserver: re-configuration failed due to not enough started members",
+        "grpc-status 14: etcdserver: unhealthy cluster",
+    ],
+)
+def test_an_answer_given_before_anything_was_proposed_still_refuses_at_once(
+    tmp_path: Path, answer: str
+) -> None:
+    rc, removed, stopped, log = _run(tmp_path, answer=answer, applied=False)
+    assert rc == 1
+    assert removed == ["remove", str(ME["ID"])]
+    assert not stopped
+    assert "could not remove" in log
+
+
+@pytest.mark.parametrize("tombstone", [False, True])
+def test_an_error_answer_is_refused_while_the_survivor_still_lists_the_member(
+    tmp_path: Path, tombstone: bool
+) -> None:
+    """A survivor that answers is the verdict: the leave is refused, k3s was
+    stopped, and the caller starts it again. A tombstone does not overrule it."""
+    rc, _, stopped, log = _run(
+        tmp_path, answer=SERVER_STOPPED, survivor_frozen=True, tombstone=tombstone
+    )
+    assert rc == 1
+    assert stopped
+    assert "did not confirm" in log
+
+
+def test_an_error_answer_with_no_survivor_and_no_tombstone_is_refused(tmp_path: Path) -> None:
+    """Nothing shows the member gone. Wiping a node whose member may still vote is
+    the #1541 harm, which can cost the seed its quorum; refusing costs this node a
+    rejoin. The runner cannot tell this from a removal that applied and left no
+    trace, so it refuses both."""
+    rc, _, stopped, log = _run(
+        tmp_path, answer=SERVER_STOPPED, applied=False, survivor_down=True
+    )
+    assert rc == 1
+    assert stopped
+    assert "not wiping" in log
+
+
+def test_an_error_answer_with_no_survivor_goes_on_when_k3s_left_its_tombstone(
+    tmp_path: Path,
+) -> None:
+    """k3s writes db/etcd/tombstone only when a peer rejects this etcd because it
+    has applied the member's removal: a committed removal, whatever the call
+    answered."""
+    rc, removed, stopped, log = _run(
+        tmp_path, answer=SERVER_STOPPED, survivor_down=True, tombstone=True
+    )
+    assert rc == 0, log
+    assert removed == ["remove", str(ME["ID"])]
+    assert stopped
+    assert "tombstone" in log
