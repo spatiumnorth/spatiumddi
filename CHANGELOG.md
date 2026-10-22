@@ -128,6 +128,32 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A Postgres failover no longer stops a rolling upgrade for ten
+  minutes (#2177).** One refused database connection during a
+  CloudNativePG failover crashed the drive: its two Celery retries
+  both landed within about a second, and the drive kept its Lease, so
+  the run sat in `running` with nothing driving it until the Lease
+  expired (600 s) and the orphan sweep re-drove it. If the database
+  came back sooner, the crash failed the node instead. Now a step that
+  loses its database connection rolls back and retries in place for
+  up to 90 s, so the node carries on where it was; the commit of the
+  slot-image stamp is part of its step, so a stamp lost to the outage
+  is written again. A connection lost outside a step (the run row's
+  own writes) releases the drive's Lease first and retries the drive
+  after 5, 10, 15, 30 and 30 s; the retry takes the Lease over at
+  once and resumes from `progress.per_node`. Only connection errors
+  are retried (refused, reset, timed out, closed, server shutting
+  down, a demoted primary), and a refused or timed-out socket counts
+  only when the database driver raised it: from a kubeapi or Redis
+  call it still fails the run at once, as does any other error. A
+  slot stamp whose commit landed but was never acknowledged is still
+  treated as this run's fresh stamp, and a long wait step that rides
+  out one failover gets a fresh budget for a later one (three at
+  most). A drive that gives up leaves the run `running` with the Lease
+  free, so the orphan sweep re-drives it within a couple of minutes,
+  and the crash handler now releases the Lease even when it cannot
+  write the row.
+
 - **Fleet showed a silent appliance's last report as current, and nothing
   alerted on the silence (#2259).** Role chips and the Service health
   table now grey out, with a "no heartbeat for X" badge, once
