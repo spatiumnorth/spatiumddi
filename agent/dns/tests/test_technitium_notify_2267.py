@@ -95,7 +95,7 @@ def test_the_options_call_sent_carries_the_notify_fields() -> None:
         return _Resp()
 
     drv._call = _call  # type: ignore[method-assign]
-    drv._note_apply_failure = lambda msg: pytest.fail(msg)  # type: ignore[method-assign]
+    drv._note_apply_failure = pytest.fail  # type: ignore[method-assign]
     p = _payload(notify_enabled="explicit", also_notify=["10.0.0.1", "10.0.0.2"])
     assert drv._apply_zone_options("tok", "example.test", p) is True
     assert sent[0]["path"] == "zones/options/set"
