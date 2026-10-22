@@ -52,6 +52,7 @@ from app.services.backup.targets.base import (
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    describe_exc,
     safe_filename,
 )
 
@@ -205,7 +206,7 @@ class FtpDestination(BackupDestination):
                 client.connect(host=host, port=port)
                 client.login(config["username"], config["password"])
         except Exception as exc:  # noqa: BLE001
-            raise BackupDestinationError(f"FTP connect failed: {exc}") from exc
+            raise BackupDestinationError(f"FTP connect failed: {describe_exc(exc)}") from exc
 
         passive = (config.get("passive") or "true").strip().lower() != "false"
         client.set_pasv(passive)
@@ -260,7 +261,7 @@ class FtpDestination(BackupDestination):
                             path=tmp,
                             error=str(cleanup_exc),
                         )
-                raise BackupDestinationError(f"FTP write failed: {exc}") from exc
+                raise BackupDestinationError(f"FTP write failed: {describe_exc(exc)}") from exc
             finally:
                 self._close(client)
 
@@ -321,7 +322,7 @@ class FtpDestination(BackupDestination):
                             )
                         )
             except Exception as exc:  # noqa: BLE001
-                raise BackupDestinationError(f"FTP listing failed: {exc}") from exc
+                raise BackupDestinationError(f"FTP listing failed: {describe_exc(exc)}") from exc
             finally:
                 self._close(client)
             rows.sort(key=lambda r: r.created_at, reverse=True)
@@ -340,7 +341,7 @@ class FtpDestination(BackupDestination):
                 client.retrbinary(f"RETR {remote}", buf.write)
                 return buf.getvalue()
             except Exception as exc:  # noqa: BLE001
-                raise BackupDestinationError(f"FTP read failed: {exc}") from exc
+                raise BackupDestinationError(f"FTP read failed: {describe_exc(exc)}") from exc
             finally:
                 self._close(client)
 
@@ -359,7 +360,7 @@ class FtpDestination(BackupDestination):
                 # 550 = file not found ⇒ idempotent
                 if msg.startswith("550"):
                     return
-                raise BackupDestinationError(f"FTP delete failed: {exc}") from exc
+                raise BackupDestinationError(f"FTP delete failed: {describe_exc(exc)}") from exc
             finally:
                 self._close(client)
 

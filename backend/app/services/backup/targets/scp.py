@@ -63,6 +63,7 @@ from app.services.backup.targets.base import (
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    describe_exc,
     safe_filename,
 )
 
@@ -255,7 +256,7 @@ class ScpDestination(BackupDestination):
             client.connect(**connect_kwargs)
         except Exception as exc:  # noqa: BLE001
             client.close()
-            raise BackupDestinationError(f"SSH connect failed: {exc}") from exc
+            raise BackupDestinationError(f"SSH connect failed: {describe_exc(exc)}") from exc
         return client
 
     async def write(
@@ -275,7 +276,7 @@ class ScpDestination(BackupDestination):
                 try:
                     sftp = _open_sftp(client)
                 except Exception as exc:  # noqa: BLE001
-                    raise BackupDestinationError(f"SFTP write failed: {exc}") from exc
+                    raise BackupDestinationError(f"SFTP write failed: {describe_exc(exc)}") from exc
                 try:
                     # Atomic rename: write to .tmp then rename so a
                     # crashed transfer doesn't leave a half-archive
@@ -302,7 +303,7 @@ class ScpDestination(BackupDestination):
                             path=tmp,
                             error=str(cleanup_exc),
                         )
-                    raise BackupDestinationError(f"SFTP write failed: {exc}") from exc
+                    raise BackupDestinationError(f"SFTP write failed: {describe_exc(exc)}") from exc
                 finally:
                     sftp.close()
             finally:
@@ -324,7 +325,9 @@ class ScpDestination(BackupDestination):
                         f"remote_path {remote_path!r} not found on host"
                     ) from exc
                 except Exception as exc:  # noqa: BLE001
-                    raise BackupDestinationError(f"SFTP listdir failed: {exc}") from exc
+                    raise BackupDestinationError(
+                        f"SFTP listdir failed: {describe_exc(exc)}"
+                    ) from exc
                 finally:
                     sftp.close()
             finally:
@@ -363,7 +366,7 @@ class ScpDestination(BackupDestination):
                 except FileNotFoundError as exc:
                     raise BackupDestinationError(f"archive {safe!r} not found at {remote}") from exc
                 except Exception as exc:  # noqa: BLE001
-                    raise BackupDestinationError(f"SFTP read failed: {exc}") from exc
+                    raise BackupDestinationError(f"SFTP read failed: {describe_exc(exc)}") from exc
                 finally:
                     sftp.close()
             finally:
@@ -384,7 +387,9 @@ class ScpDestination(BackupDestination):
                 except FileNotFoundError:
                     return  # idempotent
                 except Exception as exc:  # noqa: BLE001
-                    raise BackupDestinationError(f"SFTP delete failed: {exc}") from exc
+                    raise BackupDestinationError(
+                        f"SFTP delete failed: {describe_exc(exc)}"
+                    ) from exc
                 finally:
                     sftp.close()
             finally:

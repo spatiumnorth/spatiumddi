@@ -128,6 +128,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A backup destination that times out now says so instead of
+  storing an empty reason (#2402).** A WebDAV target whose server
+  accepted the connection and never answered failed the run with
+  `WebDAV PUT failed: ` and nothing after the colon, because httpx's
+  timeout exceptions carry no text. That string is what the target's
+  `last_run_error` and the Run now answer show. The error now names
+  the exception type and, for a timeout, says the destination timed
+  out. The same fallback covers the other destination drivers that
+  built their message from the exception text (WebDAV, HTTPS PUT, S3,
+  GCS, Azure Blob, FTP, SCP, SMB).
 - **A trial slot on slow storage is no longer reverted because the
   image check judged k3s's import while it was still running
   (#2109).** Before it commits a trial slot, firstboot checks that
