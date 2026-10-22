@@ -7611,6 +7611,7 @@ async def _apply_dns_sync(
         ips_res = await db.execute(q)
         # Cache subnets so we don't re-fetch per IP in the same subnet.
         subnet_cache: dict[uuid.UUID, Subnet | None] = {}
+        wrote_ip_ids: set[uuid.UUID] = set()
         # Batch the forward/reverse ops per zone so an agentless Windows-DNS
         # primary takes one WinRM round trip per zone, matching the delete
         # branch below (issue #341).
@@ -7630,9 +7631,17 @@ async def _apply_dns_sync(
                     # #2118 — an address whose own A / AAAA alias already
                     # serves its name is skipped there, not refused, so its
                     # missing PTR is still written.
+                    # #2352 — count only an address the sync wrote for: ops
+                    # queued in the batch collector. One whose records already
+                    # exist as desired queues nothing and counts as unchanged.
+                    collector = _dns_op_collector.get()
+                    ops_before = len(collector) if collector is not None else 0
                     await _sync_dns_record(
                         db, ip, sn, action="create", strict=True, skip_own_alias=True
                     )
+                    if collector is not None and len(collector) == ops_before:
+                        continue
+                    wrote_ip_ids.add(ip.id)
                     if ip.id in body.create_for_ip_ids:
                         created += 1
                     else:
@@ -7659,6 +7668,8 @@ async def _apply_dns_sync(
                 f"{fip.address}: DNS create failed — "
                 f"{getattr(op_row, 'last_error', None) or 'unknown'}"
             )
+            if fip.id not in wrote_ip_ids:
+                continue
             if fip.id in body.create_for_ip_ids:
                 created = max(0, created - 1)
             elif fip.id in ip_ids_to_sync:
@@ -7892,7 +7903,7 @@ async def dns_sync_commit_block(
                 "dns-sync",
                 "block",
                 str(block.id),
-                block.network,
+                str(block.network),
                 new_value={
                     "created": created,
                     "updated": updated,

@@ -112,6 +112,21 @@ jobs:
             --entrypoint python3 \
             ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_axfr_check.py
 
+      # Issue #2249 — toggling query / response logging on a RUNNING named,
+      # through the agent's real render + reload path. `rndc reconfig`
+      # applies neither switch, so this is the only proof the explicit
+      # `rndc querylog|responselog on|off` after each reload took effect;
+      # asserted on `rndc status` and on the lines named writes. Runs as
+      # `spatium`, like the agent: named started as root drops the
+      # capabilities it would need to write the spatium-owned directories.
+      - name: Query-logging toggle check (bind9)
+        if: matrix.flavor == 'bind9'
+        run: |
+          docker run --rm --user spatium \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumnorth/dns-bind9:pr-scan /checks/live_query_log_check.py
+
       - name: Trivy scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
