@@ -128,6 +128,25 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Renaming or deleting a TSIG key that something still cites stopped
+  the whole DNS group (#2282).** `key <name>` is cited from ACL entries,
+  view match lists, the group's address-match options and `also_notify`,
+  and zone `allow_query` / `allow_transfer` / `also_notify`. Renaming or
+  deleting the key left an undefined symbol in `named.conf`, so
+  `named-checkconf` failed, the agent declined the bundle and the group
+  stopped converging. Both now answer 409 naming every referrer; an
+  uncited key still renames and deletes freely. Deleting a key also
+  reports how many zone dynamic-update grants it took with it (the
+  `X-Removed-Update-Grants` header and the audit row). As defence in
+  depth, the bundle drops any `key <name>` element whose key it does not
+  define (logged as `dns_bundle_entry_dropped_undefined_key`), so a
+  reference stored before this guard cannot break the group. That drop
+  never widens access: an access list it empties, or that loses a
+  negated `!key` element, ships as `none` rather than empty, because
+  every renderer reads an empty list as "unset" (`any`, or inherit the
+  server's). Key names compare as BIND compares them, case-insensitively
+  and with or without the trailing dot.
+
 - **Conformity alerts open, close and page again (#2277).** Two
   defects. A conformity alert against a subnet, IP address, DNS zone,
   DHCP scope or multicast group never opened: its subject id is 80 to

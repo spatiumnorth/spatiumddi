@@ -779,6 +779,7 @@ DDNS is safe to call repeatedly. If the resolved hostname matches what's already
 ### Security
 
 - RFC 2136 updates to BIND9 use TSIG signing (key stored Fernet-encrypted).
+- A TSIG key that an ACL, view, server option or zone still cites as `key <name>` cannot be renamed or deleted (409, naming each referrer); remove the references first. The bundle also drops any `key <name>` it does not define, so a stale reference cannot stop the group converging; an access list that empties (or loses a `!key` negation) that way ships as `none`, never as an empty list that would read as unset (#2282).
 - WinRM calls to Windows DNS go over HTTPS with cert validation by default.
 - The DDNS service itself never touches manual IPAM allocations (it gates on `auto_from_lease=True` before doing anything).
 
