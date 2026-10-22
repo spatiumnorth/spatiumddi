@@ -207,8 +207,11 @@ def operator_hint(category: str) -> str:
         )
     if category == CATEGORY_DRAIN_STUCK:
         return (
-            "Drain timed out — a workload pod blocked eviction. Check "
-            "PodDisruptionBudgets + per-pod status; once unblocked, abort + "
+            "Drain timed out — a workload pod blocked eviction, or was evicted "
+            "but never left the node (the step's error counts both; a node "
+            "whose kubelet is down removes nothing, #1804). Check "
+            "PodDisruptionBudgets, per-pod status and the node's Ready "
+            "condition; once unblocked, abort + "
             "plan a fresh run (drain doesn't auto-retry mid-run). "
             "The new slot is already staged and armed for this node's next "
             "boot (#1463), so an unplanned reboot boots it."

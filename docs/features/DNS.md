@@ -991,6 +991,34 @@ the factor falls with it). So 582k entries x 2 zones is about 3.9 GB and
 needs a node with 8 GiB or more; one list on a group with no views is about
 half that.
 
+**That peak is paid only when a list changed (#2157).** The control plane
+ships a content hash with each RPZ zone, and the agent records it beside the
+zone file it wrote (`<zone>.db.sha256`). An apply whose hash matches, such
+as removing a forward zone or editing a group option, hard-links the file it
+already serves into the new tree instead of rendering it: no serialisation,
+no bytes written, no `named-checkzone` run, and no reload of that zone in
+named. Only a zone whose entries, exceptions or block mode changed is
+rendered and reloaded, so "about 3 kB per entry while an apply is in flight"
+counts the lists that changed in that apply, not every list on every apply.
+The backup tree the last-known-good revert uses (`rendered.prev`) shares
+those files' inodes, so an unchanged list costs no extra disk there either.
+The first apply after upgrading renders and reloads every RPZ zone once:
+there is no recorded hash to match yet, and the zone's SOA serial now
+derives from its content. After that, only changed lists are touched.
+
+**Worked example: one popular catalog feed.** The catalog's AdGuard DNS
+filter was about 186k entries when this was written; the count moves with
+every upstream update. On a group with no views that is one RPZ zone, so by
+the rule of thumb above it needs about 400 MB + 186,000 x 3 kB, roughly
+1 GB, while an apply is in flight; with one view it is two zones and roughly
+1.5 GB. These are estimates from the rule, not a measurement of that list.
+Either way they are well over the `512Mi` in the chart's
+`dnsAgents.servers[].resources` example, so copying that example and
+subscribing to a single well-known list is likely to get the agent
+OOM-killed mid-apply. Treat `512Mi` as a figure for a group with no
+blocklists, and size the limit from the rule above before you subscribe.
+Entry counts are on each list after its first sync.
+
 Where to change it:
 
 - Appliance: `dnsBind9.resources` on the role chart, as a HelmChartConfig
@@ -1027,7 +1055,8 @@ records the kill depends on how the container is killed (#2018):
   its last word in place, and that must not hold a recovered server down.
   The times compared are the kubelet's and the control plane's, so a node
   clock far off moves the 10-minute recovery by the same amount. The DHCP
-  (Kea) container is group-killed the same way and is not covered yet. A plain Helm install (umbrella
+  (Kea) container is group-killed the same way and is covered the same
+  way (`docs/features/DHCP.md` 4d, #2023). A plain Helm install (umbrella
   chart) has no supervisor, so there the pod's last state
   (`kubectl get pod … -o jsonpath='{.status.containerStatuses[0].lastState}'`)
   is the only record; setting the kubelet's `singleProcessOOMKill: true`
@@ -1457,9 +1486,9 @@ Zone permissions are assignable to groups via the standard Permission model, sam
 DDNS_DEFAULT_TTL=300
 DDNS_GRACE_PERIOD_SECONDS=60   # how long to keep record after lease expiry
 
-# Blocking lists
-BLOCKLIST_UPDATE_INTERVAL_HOURS=24
-BLOCKLIST_SINKHOLE_IP=0.0.0.0
+# Blocking lists have no environment variables: the refresh interval and the
+# sinkhole IP are per list, in the database (the list's refresh interval and
+# its `sinkhole_ip`).
 
 # BIND9 TSIG (global default — per-server keys stored in DB encrypted)
 BIND_TSIG_ALGORITHM=hmac-sha256
@@ -2084,6 +2113,16 @@ whose `(name, record_type)` collides with a managed row is skipped; only
 external-only names are mirrored. Zone-management + DNSSEC RRs (SOA, apex
 NS, RRSIG/NSEC*/DNSKEY/CDS/CDNSKEY, private-type 65534) are never ingested.
 
+**Audit.** Every batch that adds or removes mirror records writes one
+`dns.record.external_ingest` audit row on the zone (not one per record, so
+a churning writer cannot flood the log): the added records in `new_value`,
+the removed ones in `old_value`, with counts and the posting server, names
+capped at 50 per batch. Mirror rows are hard-deleted when the writer
+withdraws them, since a restorable copy of a record the writer removed
+would be wrong; the audit row is the history. The agent never ships an
+empty set after a failed AXFR, so an empty report is a real withdrawal and
+is applied (and audited), not floor-guarded.
+
 **P1 limitation:** live multi-server propagation of an ingested record
 across every server in a group happens on the next full re-render, not
 instantly (ingested rows aren't re-shipped as per-server record ops). The
@@ -2438,19 +2477,23 @@ query. That volume is why the query log is capped at a 24 h window in
 the first place, so treat this as a troubleshooting switch rather than a
 permanent setting on a busy resolver.
 
-> **`rndc reconfig` does not apply `responselog`.** Verified against
-> BIND 9.20.26: with `responselog yes;` in a freshly-swapped config and
-> a clean reconfig, `rndc status` still reported
-> `response logging is OFF`. It is a live switch, like `querylog`, and
-> reconfig deliberately
-> preserves whatever the running server was last told. Query logging
-> escapes this only by accident of BIND's own defaulting — with no
-> `querylog` statement it follows the presence of the `queries`
-> category, which a reload does pick up. The agent therefore issues an
-> explicit `rndc responselog on|off` after each structural reload,
-> reading the desired state back off the config it just swapped in.
-> Without that the toggle would appear to work and produce not one line
-> until the daemon was next restarted.
+> **`rndc reconfig` applies neither `querylog` nor `responselog`.**
+> Both are live switches, and reconfig deliberately preserves whatever
+> the running server was last told. Verified against BIND 9.20: with
+> `responselog yes;` in a freshly-swapped config and a clean reconfig,
+> `rndc status` still reported `response logging is OFF` (#914); and a
+> named started with query logging off stayed off after a reconfig that
+> added the `queries` category, with or without `querylog yes;`, and
+> one started with it on stayed on after a reconfig that removed it
+> (#2249). Without a `querylog` statement BIND decides query logging from
+> the `queries` category only when named *starts*. So the agent renders
+> `querylog yes;` when query logging is on, and after each structural
+> reload issues an explicit `rndc querylog on|off` and
+> `rndc responselog on|off`, reading the desired state back off the
+> config it just swapped in. Without that, both toggles would appear to
+> work and change nothing until the daemon was next restarted; with
+> response logging on, every response line would also be dropped as an
+> orphan, because its query line never arrives.
 
 ### 21.3 Which drivers fill it
 
