@@ -4381,6 +4381,10 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
                     continue
                 sub.block_id = block.id
                 reparented_subnets.append(str(sub.network))
+    # The new block rolls up the subnets it just adopted (and any it carved);
+    # without this it reads 0 / 0 until the hourly recount (#2412).
+    await db.flush()
+    await _update_block_utilization(db, block.id)
     db.add(
         _audit(
             current_user,
