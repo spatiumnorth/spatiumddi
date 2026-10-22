@@ -108,6 +108,14 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "→ ${VERSION} at ${SHA::7}: previous release ${PREV_TAG:-<none>}, becomes latest: ${MAKE_LATEST}"
 
+      # #2431 — PRs add changelog.d/ fragments instead of editing
+      # CHANGELOG.md, and release prep folds them into the section this tag
+      # publishes (``make changelog``). A fragment still in the tree means
+      # the fold was skipped, so the notes below would silently miss those
+      # entries. Refused before an hour of CI waiting and image builds.
+      - name: Require the changelog fragments to be folded
+        run: python3 scripts/changelog_assemble.py --pending
+
       - name: Require CI to have passed on this commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -154,7 +162,7 @@ jobs:
                 fi
                 ;;
               3)
-                echo "::error::CI on ${SHA::7} passed with the backend shards skipped (its tree was tested on the merged PR's head, #2429). A release needs the full suite on this exact commit."
+                echo "::error::CI on ${SHA::7} passed with the backend shards skipped (its tree was tested on the merged PR's head, #2429, or in the merge queue, #2431, without a full-suite run of this exact commit). A release needs the full suite on this exact commit."
                 echo "Start a full run on the tag, wait for it to pass, then re-run this workflow:"
                 echo "  gh workflow run ci.yml --repo ${REPO} --ref ${VERSION}"
                 echo "  gh run list --repo ${REPO} --workflow ci.yml --event workflow_dispatch --limit 1"

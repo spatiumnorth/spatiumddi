@@ -1,4 +1,4 @@
-.PHONY: charts-lint perf-test versions-check versions-upstream workflow-shell-check image-upgrade-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
+.PHONY: charts-lint perf-test versions-check versions-upstream workflow-shell-check image-upgrade-check changelog changelog-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
         openapi \
         lint-untyped-routes \
         lint-untyped-routes-baseline \
@@ -85,6 +85,8 @@ help:
 	@echo "  make versions-upstream  Current-vs-latest table for every pinned component"
 	@echo "  make workflow-shell-check  Refuse \$$? captured after a bare command under set -e"
 	@echo "  make image-upgrade-check   Refuse a shipped image that never upgrades its packages"
+	@echo "  make changelog-check    Validate the changelog.d/ fragments (part of make ci)"
+	@echo "  make changelog          Release prep: fold changelog.d/ into CHANGELOG.md, delete them"
 	@echo "  make appliance      Build the OS-appliance qcow2 (Phase 1 — Debian 13 amd64)"
 	@echo "  make appliance-iso  Wrap the Phase 1 raw image as a hybrid USB/CD ISO (Phase 2)"
 	@echo ""
@@ -400,7 +402,7 @@ lint-untyped-routes-baseline: $(UNTYPED_LIST)
 
 FORCE:
 
-ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test versions-check workflow-shell-check image-upgrade-check
+ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test versions-check workflow-shell-check image-upgrade-check changelog-check
 	@echo ""
 	@echo "✓ All CI checks passed — safe to push."
 
@@ -463,6 +465,21 @@ versions-upstream:
 workflow-shell-check:
 	@echo "→ Workflow shell-status linter (matches .github/workflows/ci.yml)"
 	@python3 scripts/lint_workflow_shell.py
+
+# Changelog fragments (merge queue). A PR adds one file under changelog.d/
+# instead of editing CHANGELOG.md, so no two PRs conflict on the same
+# ``## Unreleased`` spot — a merge queue removes any entry that conflicts.
+# ``changelog-check`` validates the fragments (same check CI's Backend Lint
+# job runs). ``changelog`` is a RELEASE-PREP step: it folds every fragment
+# into ``## Unreleased`` and deletes them, and must run before that section
+# is renamed to the release version — release.yml refuses a tag whose tree
+# still carries a fragment. Stdlib-only, no container.
+changelog-check:
+	@echo "→ Changelog fragment linter (matches .github/workflows/ci.yml)"
+	@python3 scripts/changelog_assemble.py --check
+
+changelog:
+	@python3 scripts/changelog_assemble.py
 
 # Shipped-image package-upgrade guard (#1088). Every published image must
 # upgrade its base image's own packages AND declare the snapshot ARG that lets

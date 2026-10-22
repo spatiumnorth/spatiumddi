@@ -396,6 +396,20 @@ else notifies. Both consumers — the impact-map lookup and
 `.github/scripts/latest-main-artifact.sh`, which never accepts a
 `pull_request` run's. Pinned by `backend/tests/test_ci_tested_on_pr_head.py`.
 
+**Through the merge queue (#2431) the proof is stronger, and checked
+first.** When a merge group lands, GitHub fast-forwards `main` to the very
+commit the queue's `merge_group` run tested, so the script first looks for a
+successful `merge_group` run of `ci.yml` on exactly the pushed SHA, from a
+`gh-readonly-queue/main/` branch of this repository, at most 24 h old, whose
+latest attempt published `backend-full-suite-attempt-<n>`. Commit identity
+needs no PR lookup and no tree comparison, and it holds for a group of
+several commits landing as one push (which the PR path refuses). A
+docs-only group skips its shards (#813) and publishes no marker, so its push
+runs the suite. Anything that does not qualify falls through to the PR path
+above. Such a push run uploads
+`backend-skipped-tested-in-merge-queue-attempt-<n>`, and the release gate
+accepts the `merge_group` run itself as the full run of the tagged commit.
+
 ### What a new endpoint needs
 
 Per [`CONTRIBUTING.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/CONTRIBUTING.md), every new API endpoint needs
@@ -462,6 +476,7 @@ Three of the four events have distinct jobs:
 | Event | Runs | Why |
 |---|---|---|
 | **Pull request** | `ci.yml` (backend shards gated on change detection — see below), the per-image builds (single-arch + **Trivy**, path-filtered to their own `agent/<name>/**`), `agent-e2e.yml` (path-filtered to `agent/**` + `charts/spatiumddi/**` — it installs the control plane from the `:latest` release images, so a `backend/` or `frontend/` change cannot reach the cluster it tests; #1021), plus two GitHub-managed CodeQL runs that are not workflow files: **CodeQL** (default setup: actions, JS/TS, Python) and **CodeQL - Code Quality** (JS/TS, Python — the source of the bot review threads that must be resolved before merge). | Where correctness is gated. Nothing merges without it. |
+| **Merge queue** (`merge_group`, #2431) | `ci.yml` only. All nine required checks come from it; the per-image Trivy builds, `agent-e2e.yml`, CodeQL and Code Quality do not run here, so they must be green on the PR before it is enqueued. | The queue merges only what this run passed, on `main` + every entry ahead + the PR. The backend shards use the PR path filter over everything the group's head adds to `main` — diffed from `git merge-base origin/main <head>`, not from the event's `merge_group.base_sha`, which GitHub documents only loosely and which for a later entry may be the previous entry's temporary commit — and never narrow. Any doubt (a failed fetch, no merge base, a head that is not the checked-out commit) runs everything. |
 | **Push to `main`** | `ci.yml`, `docs-publish.yml`, `build-appliance-builder.yml` | Post-merge safety net + the two things that must be *published* from `main`. |
 | **Release tag** | `release.yml` only | Builds and publishes every image multi-arch, the chart, and the appliance ISO — after three gates (#1226): the tag is on `main` and `ci.yml` passed on it; each image is built once, pushed by digest, and both architectures pass Trivy + `trivy-gate.sh` before that digest is tagged; and `:latest` moves last, once the GitHub release exists. |
 | **Schedule** | `nightly.yml`, `trivy-scheduled.yml`, `prune-release-assets.yml` | Work that is about *elapsed time*, not about a change. |
@@ -821,6 +836,72 @@ multi-arch fan-out happens in CI on a tagged release.
   closes the first.
 - **Run `make ci` before pushing**, and `make test` for any
   behavioral change.
+- **Add a changelog fragment; don't edit `CHANGELOG.md`.** See below.
+
+### Changelog fragments
+
+Every PR used to add its entry at the top of `### Fixed` under
+`## Unreleased`, so any two open PRs conflicted on that spot, and the merge
+queue removes an entry that conflicts with the one ahead of it. Each PR now
+adds one new file, `changelog.d/<issue>-<slug>.md`, written exactly as the
+entry would read under `## Unreleased` and starting with a section heading:
+
+```markdown
+### Fixed
+
+- **One-line summary (#1234).** Body, hard-wrapped at ~70 characters.
+
+### Migrations
+
+- `abcdef012345` — #1234, what the migration does.
+```
+
+Sections are `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`,
+`Security`, `Migrations` and `Breaking`; one fragment may use several. The
+issue number leads the name so fragments fold in issue order, and the slug
+keeps two PRs for one issue apart. A line starting with `#` in column 0 is
+refused (the release-notes formatter reads it as a heading); indent wrapped
+lines as usual, and lines inside a fenced code block are left alone.
+Nothing but `README.md` and such fragments may live in `changelog.d/`: a
+subdirectory, a dotfile or a misnamed file fails the check, the fold and the
+release gate, because the fold would otherwise skip it. CI's Backend Lint
+job validates the directory (`make changelog-check`, also part of
+`make ci`), and the `changes` job warns on a PR that edits `CHANGELOG.md`
+directly.
+
+**Release prep folds them.** `make changelog` (`scripts/changelog_assemble.py`)
+puts each fragment's entries at the **top** of the matching section of
+`## Unreleased`, newest issue first, matching the newest-first order the
+file already has. It creates a missing section in the order above, then
+deletes the fragments; `--dry-run` prints the result without changing
+anything. Run it **before** renaming `## Unreleased` to the release version
+(it refuses to run when there is no `## Unreleased`, rather than file the
+entries under a release they did not ship in), and commit the result in the
+release-prep PR. `release.yml` publishes the notes from `CHANGELOG.md`
+and refuses a tag whose tree still has a fragment
+(`changelog_assemble.py --pending`), so a skipped fold fails the release
+early instead of publishing notes with entries missing.
+
+### The merge queue
+
+Once the `merge_queue` rule is on `protect-main`, `gh pr merge N` adds a PR
+to the queue rather than merging it. The queue builds each entry on a
+`gh-readonly-queue/main/pr-N-<sha>` branch (`main` + every entry ahead +
+this PR), runs `ci.yml` there (`merge_group`), and merges the group when the
+required checks pass. A PR is never updated with `main`, so its head stays
+the commit QA walked. Things to know:
+
+- **Only `ci.yml` runs on the queue's branch.** Trivy image builds,
+  `agent-e2e.yml`, CodeQL and Code Quality run on the PR only, so wait for
+  them there before enqueuing.
+- **A failing entry is removed, and every entry behind it is rebuilt.** A
+  flaky test at the front of the queue costs a full run for each entry
+  behind it.
+- **Enqueue migration PRs one at a time.** Two migrations in one group give
+  the second entry two Alembic heads, which fails every backend shard.
+  Re-point the second migration at the first after the first merges.
+- **A new push to a queued PR removes it from the queue.** Re-enqueue after
+  the new head's checks pass.
 
 ### Pre-PR checklist
 
@@ -829,6 +910,7 @@ multi-arch fan-out happens in CI on a tagged release.
 - [ ] Mutations write to `audit_log` before returning
 - [ ] New endpoints have success / unauthorized / validation-error tests
 - [ ] Alembic migration included if models changed (and it's expand/contract-safe)
+- [ ] A `changelog.d/<issue>-<slug>.md` fragment, not an edit to `CHANGELOG.md`
 - [ ] `k8s/base/` + `k8s/README.md` updated if a service or its env changed
 - [ ] Matching MCP tools added for any new REST surface
 - [ ] Third-party components added to the root `NOTICE` if you bundled any
