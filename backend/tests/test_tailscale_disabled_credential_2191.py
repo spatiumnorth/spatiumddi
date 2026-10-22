@@ -9,7 +9,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.dashboards.integrations import IntegrationTargetRow, _cap_rows
+import app.api.v1.dashboards.integrations as integrations_dash
 from app.services.integration_credentials import credential_status
 from app.services.tailscale.client import AUTH_REJECTED_PREFIX
 
@@ -62,8 +62,10 @@ async def test_page_api_dashboard_and_mcp_agree_on_a_disabled_rejected_tenant(
     assert states[str(live.id)] == "rejected"
 
 
-def _row(i: int, state: str | None = None, err: str | None = None) -> IntegrationTargetRow:
-    return IntegrationTargetRow(
+def _row(
+    i: int, state: str | None = None, err: str | None = None
+) -> integrations_dash.IntegrationTargetRow:
+    return integrations_dash.IntegrationTargetRow(
         id=str(i),
         display=f"t{i}",
         sync_interval_seconds=60,
@@ -76,7 +78,7 @@ def _row(i: int, state: str | None = None, err: str | None = None) -> Integratio
 
 
 def test_cap_names_problem_rows_first_even_past_the_cap(monkeypatch) -> None:
-    import app.api.v1.dashboards.integrations as mod  # noqa: PLC0415
+    mod = integrations_dash
 
     monkeypatch.setattr(mod, "_TARGET_LIMIT", 3)
     rows = [_row(i, "ok") for i in range(4)] + [
@@ -86,15 +88,19 @@ def test_cap_names_problem_rows_first_even_past_the_cap(monkeypatch) -> None:
         _row(13, None, err="boom"),
         _row(14, "expired"),
     ]
-    out = [r.id for r in _cap_rows(rows)]
+    out = [r.id for r in integrations_dash._cap_rows(rows)]
     assert out == ["10", "11", "13", "14"]  # all problems, none healthy, no disabled
-    assert [r.id for r in _cap_rows(rows[:4] + [_row(10, "rejected")])] == ["10", "0", "1"]
+    assert [r.id for r in integrations_dash._cap_rows(rows[:4] + [_row(10, "rejected")])] == [
+        "10",
+        "0",
+        "1",
+    ]
 
 
 def test_problem_rows_are_hard_capped_and_counted_in_full(monkeypatch) -> None:
     """200 failing targets must not become a 200-row card (#2192): the rows
     stop at ``_PROBLEM_TARGET_LIMIT`` and the panel counts carry the truth."""
-    import app.api.v1.dashboards.integrations as mod  # noqa: PLC0415
+    mod = integrations_dash
 
     now = datetime(2026, 10, 18, tzinfo=UTC)
 
