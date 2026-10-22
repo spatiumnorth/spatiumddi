@@ -125,9 +125,12 @@ async def test_move_leaves_an_appliance_assigned_elsewhere_alone_by_hostname(
     src = await _group(db_session, "default")
     dst = await _group(db_session, "internal")
     elsewhere = await _group(db_session, "elsewhere")
+    await db_session.commit()
+    # Registered before the appliance points elsewhere: an appliance's agent
+    # with no row registers into the appliance's group, not AGENT_GROUP (#2190).
+    srv_id = await _register(client, monkeypatch, "default")
     appliance = await _appliance(db_session, elsewhere)
     await db_session.commit()
-    srv_id = await _register(client, monkeypatch, "default")
     aid, elsewhere_id = appliance.id, elsewhere.id
     src_id, dst_id = src.id, dst.id
 
