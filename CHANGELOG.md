@@ -128,6 +128,33 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A trial slot on slow storage is no longer reverted because the
+  image check judged k3s's import while it was still running
+  (#2109).** Before it commits a trial slot, firstboot checks that
+  k3s imported every baked image tarball. It waited 120 s for the
+  kubelet, took a kubelet that answers to mean k3s's start-up import
+  was over, and then touched every tarball it could not yet see as
+  imported so k3s would import it again. On a node whose import
+  outlasted that wait, it touched the tarball k3s was importing at
+  that moment, which made k3s import it a second time, gave up before
+  that import ended, and left a healthy slot uncommitted, so the
+  next reboot reverted it. The kubelet is not the signal even on a
+  fast node: k3s starts it once its import queue is empty, while the
+  last tarball is still being imported (seen on a real k3s v1.36.4:
+  the kubelet started 8 s before the last import ended, and the old
+  check made k3s import that tarball twice). The check now asks
+  whether a process holds a baked tarball open, which k3s does for
+  exactly as long as it imports it. It waits while one is open, never
+  touches one that is, and judges once none is. It waits at most what
+  is left of firstboot's 10-minute start timeout, and if k3s is still
+  importing then it reports that and does not commit, rather than
+  calling an unfinished import a missing image, and names the Fleet
+  action (Approve trial) that keeps the slot once the import is over.
+  An open tarball is recognised by its inode rather than its path, so
+  a tarball k3s opened under another name (a bind mount, a symlinked
+  directory) still counts as being imported. On a node whose import
+  finished long ago it judges at once, as before.
+
 - **A DNS server holding its cached config after a crash no longer
   stays dark while the control plane answers but cannot send a
   bundle (#2241).** After named dies on a bundle, the #2019 hold asks
