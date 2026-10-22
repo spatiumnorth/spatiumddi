@@ -28,9 +28,9 @@ on:
   # and no ruleset knows the difference.
 
 # Keyed on the event as well as the ref (#2429), so the daily full run on
-# main and a push to main never cancel each other: the push run is the one
-# release.yml waits for, and the scheduled run is the one that refreshes the
-# test-impact map. A push and a pull_request never share a ref, so for those
+# main, a dispatched full run and a push to main never cancel each other:
+# release.yml may wait on any of them, and the scheduled run is the one that
+# refreshes the test-impact map. A push and a pull_request never share a ref, so for those
 # two this is the same grouping as before.
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
@@ -97,9 +97,10 @@ jobs:
           # runs the full suite, UNLESS its tree is exactly one a green PR run
           # already put through the full suite (#2429). The script fails
           # safe: any doubt at all is a non-zero exit and the full suite.
-          # The aggregator still reports success, so release.yml's "CI passed
-          # on this commit" gate (#1226) is satisfied by a run that rests on
-          # the identical tree's PR run.
+          # The aggregator still reports success, with a skip marker; a
+          # release never rests on such a run — release.yml's gate (#1226)
+          # requires a full-suite marker on the tagged commit itself, which a
+          # workflow_dispatch run (never skipped: only a push asks) provides.
           if [ "$EVENT" = "push" ]; then
             if tested="$(.github/scripts/ci-tested-on-pr-head.sh)"; then
               echo "→ $tested — the 12 shards will be skipped"
@@ -154,11 +155,14 @@ jobs:
       # .github/scripts/select_impacted_tests.py. The answer is "all" whenever
       # the map is missing or any changed path is outside what the map can
       # speak for (migrations, config, data files, conftest, import-only
-      # modules such as models, anything in the must-run manifest). Push to
-      # main always runs everything — that is the safety net that makes a
-      # wrong selection recoverable rather than lost, the same contract #813
-      # relies on. Nothing in this step may fail the job: every error path
-      # lands on "all".
+      # modules such as models, anything in the must-run manifest). A
+      # narrowed PR run publishes no ``backend-full-suite`` marker, so its
+      # push to main never qualifies for the #2429 skip and runs everything —
+      # that is the safety net that makes a wrong selection recoverable
+      # rather than lost, the same contract #813 relies on. (Only a PR run
+      # that itself passed the full suite lets its push skip the shards.)
+      # Nothing in this step may fail the job: every error path lands on
+      # "all".
       - id: select
         name: Which backend tests can this change set affect?
         if: steps.detect.outputs.backend == 'true'
@@ -171,24 +175,15 @@ jobs:
           if [ "$EVENT" = "pull_request" ]; then
             map_dir="$RUNNER_TEMP/impact-map"
             mkdir -p "$map_dir"
-            # Newest successful main run that published a map. A green run can
-            # lack one (the aggregator builds it only when every shard ran, and
-            # since #2429 most pushes to main skip the shards), so look back
-            # across the three main-only events, newest first. The event filter
-            # is load-bearing: a fork PR's run executes the fork's workflow and
-            # can report head_branch "main", so a pull_request run's artifact
-            # must never be read here. ``gh`` is preinstalled on ubuntu-latest.
-            candidates="$(for ev in push schedule workflow_dispatch; do
-                            gh run list --workflow CI --branch main --event "$ev" \
-                              --status success --limit 10 --json databaseId,createdAt \
-                              --jq '.[] | "\(.createdAt)\t\(.databaseId)"' 2>/dev/null || true
-                          done | sort -r | cut -f2 | head -n 15)"
-            for run_id in $candidates; do
-              if gh run download "$run_id" -n test-impact-map -D "$map_dir" 2>/dev/null; then
-                echo "test-impact map from main run $run_id"
-                break
-              fi
-            done
+            # Newest map a successful main run (push, schedule or dispatch)
+            # published, found by artifact name rather than by walking runs:
+            # since #2429 most pushes skip the shards and publish none. The
+            # script never accepts a pull_request run's artifact — a fork PR's
+            # run executes the fork's workflow and can report head_branch
+            # "main". ``gh`` and ``jq`` are preinstalled on ubuntu-latest.
+            if run_id="$(.github/scripts/latest-main-artifact.sh test-impact-map "$map_dir")"; then
+              echo "test-impact map from main run $run_id"
+            fi
             tests="$(python3 .github/scripts/select_impacted_tests.py \
                        --changed "$RUNNER_TEMP/changed-files.txt" \
                        --map "$map_dir/test-impact-map.json")" || tests=all
@@ -484,6 +479,7 @@ jobs:
     if: always()
     steps:
       - name: All shards passed
+        id: verdict
         env:
           SHARDS: ${{ needs.backend-test-shard.result }}
           BACKEND_RELEVANT: ${{ needs.changes.outputs.backend }}
@@ -491,6 +487,13 @@ jobs:
           TESTS: ${{ needs.changes.outputs.tests }}
         run: |
           set -euo pipefail
+          # #2429 — what this ATTEMPT's verdict rests on, published below as a
+          # per-attempt marker artifact. ci-tested-on-pr-head.sh reads the
+          # ``full-suite`` marker of a PR run's latest attempt as the proof the
+          # full suite passed; ci-full-suite-passed.sh (release.yml's gate)
+          # reads both, so a release never rests on a skipped-shards run.
+          marker_dir="$RUNNER_TEMP/backend-marker"
+          mkdir -p "$marker_dir"
 
           if [ "$SHARDS" = "skipped" ]; then
             # Only an explicit "false" justifies a skip. An empty value means
@@ -505,6 +508,8 @@ jobs:
               tested-on-pr-head)
                 # #2429 — the ``changes`` log names the PR, head and run.
                 echo "::notice title=Backend tests already passed on the PR head (#2429)::this commit's tree is identical to a PR head whose CI run passed the full backend suite — 12 shards skipped"
+                echo "shards skipped: tree tested on a PR head ($GITHUB_SHA, attempt $GITHUB_RUN_ATTEMPT)" > "$marker_dir/backend-suite.txt"
+                echo "marker=skipped-tested-on-pr-head" >> "$GITHUB_OUTPUT"
                 ;;
               no-backend-change)
                 echo "no backend-relevant files changed — 12 shards skipped (#813)"
@@ -523,8 +528,23 @@ jobs:
           fi
           if [ "$TESTS" != all ]; then
             echo "::notice title=Backend tests narrowed (#1020)::this PR ran only the test files its diff can affect: $TESTS — the full suite runs on merge to main"
+          else
+            echo "full suite: all 12 shards passed ($GITHUB_SHA, attempt $GITHUB_RUN_ATTEMPT)" > "$marker_dir/backend-suite.txt"
+            echo "marker=full-suite" >> "$GITHUB_OUTPUT"
           fi
           echo "all 12 backend test shards passed"
+
+      # #2429 — the per-attempt marker. Named by attempt so a re-run can never
+      # inherit an earlier attempt's verdict: readers look up the name for the
+      # run's LATEST attempt. 90 days, so release.yml can still read it for a
+      # tag cut well after the merge.
+      - name: Upload backend-suite marker
+        if: steps.verdict.outputs.marker != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-${{ steps.verdict.outputs.marker }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/backend-marker/backend-suite.txt
+          retention-days: 90
 
       # #1019 — assemble the full durations picture from the shards' uploads.
       # Only when EVERY shard succeeded AND the run was not narrowed (#1020):

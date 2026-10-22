@@ -19,28 +19,44 @@
 #   1. The push added exactly one commit: BEFORE is SHA's only parent. A
 #      direct push, a multi-commit rebase merge or a merge commit fails.
 #   2. GitHub records exactly one PR, merged into main, whose merge commit
-#      IS this SHA.
+#      IS this SHA, and whose head branch lives in this repository. A fork
+#      PR is refused: its run executed the fork's copy of the workflow.
 #   3. That PR's head H (fetched by its pull ref) has the same tree as SHA,
 #      and contains BEFORE — so H was up to date with main when it merged,
 #      and the run's test merge was a no-op on H's tree.
-#   4. ci.yml has a ``pull_request`` run on head H whose conclusion is
-#      ``success`` and that uploaded the ``test-durations`` artifact. The
-#      aggregator uploads that artifact only when all 12 shards succeeded on
-#      the FULL suite, so its presence is the proof the run was neither
-#      narrowed (#1020) nor shard-skipped (#813). A narrowed PR run keeps
-#      relying on this push run to catch what it did not select, so it must
-#      never be skipped here.
+#   4. A ``pull_request`` run of ci.yml on exactly H, from the PR's own head
+#      branch in this repository, concluded ``success``, was created before
+#      the merge and no more than MAX_RUN_AGE_SECONDS before it, and its
+#      LATEST attempt published the unexpired marker
+#      ``backend-full-suite-attempt-<run_attempt>``. The aggregator uploads
+#      that marker only when all 12 shards passed the FULL suite in that
+#      attempt's view, so a narrowed (#1020) or shard-skipped (#813) run
+#      never qualifies, and neither does a marker an earlier attempt left.
+#      A narrowed PR run keeps relying on this push run to catch what it did
+#      not select, so it must never be skipped here.
+#
+#      The run is tied to the PR by head SHA + head branch + head repository
+#      rather than by the run's ``pull_requests`` array, because GitHub
+#      clears that array once the PR merges (observed on run 39771722974,
+#      PR #2379) — at the only moment this script ever asks.
 #
 # Inputs (environment, never interpolated into code): SHA, BEFORE, REPO.
-# Needs ``gh`` with GH_TOKEN (contents, pull-requests and actions read) and
-# a checkout with full history (fetch-depth: 0).
+# Needs ``gh`` with GH_TOKEN (contents, pull-requests and actions read),
+# ``jq``, and a checkout with full history (fetch-depth: 0). Every API reply
+# is fetched as raw JSON and filtered here with jq, so the filters are the
+# ones the tests exercise.
 #
-# stdout on exit 0: one line, ``pr=<N> head=<sha> run=<id>``.
+# stdout on exit 0: one line, ``pr=<N> head=<sha> run=<id> attempt=<n>``.
 # stderr: the reason for the verdict either way.
 #
 # Pinned by backend/tests/test_ci_tested_on_pr_head.py.
 
 set -uo pipefail
+
+# The PR run must be this recent at merge time. The merge train re-runs CI
+# after merging main into each PR, so a fresh run normally exists; an old
+# one is not trusted to describe today's runners, services and images.
+MAX_RUN_AGE_SECONDS=86400
 
 no() {
   echo "full suite: $*" >&2
@@ -59,6 +75,10 @@ is_sha "$SHA" || no "SHA is not a commit id"
 is_sha "$BEFORE" || no "BEFORE is not a commit id (a new branch, or a forced push)"
 [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || no "REPO is not owner/name"
 command -v gh >/dev/null 2>&1 || no "gh is not installed"
+command -v jq >/dev/null 2>&1 || no "jq is not installed"
+
+tmp="$(mktemp -d)" || no "cannot create a temp dir"
+trap 'rm -rf "$tmp"' EXIT
 
 # 1. Exactly one new commit, with exactly one parent.
 parents="$(git rev-list --parents -n 1 "$SHA" 2>/dev/null)" || no "cannot read $SHA"
@@ -67,16 +87,21 @@ read -r -a fields <<< "$parents"
 [ "${fields[1]}" = "$BEFORE" ] || no "the push added more than one commit"
 
 # 2. The PR this commit is the merge of.
-prs="$(gh api "repos/${REPO}/commits/${SHA}/pulls" \
-         --jq '.[] | [.number, .head.sha, (.merge_commit_sha // ""), .base.ref, (.merged_at // "")] | @tsv' \
-         2>/dev/null)" || no "could not list the PRs for $SHA"
-match="$(awk -F '\t' -v sha="$SHA" '$3 == sha && $4 == "main" && $5 != ""' <<< "$prs")"
-[ -n "$match" ] || no "$SHA is not the merge commit of a PR into main"
-[ "$(wc -l <<< "$match")" -eq 1 ] || no "more than one PR claims $SHA"
-pr="$(cut -f1 <<< "$match")"
-head="$(cut -f2 <<< "$match")"
+gh api "repos/${REPO}/commits/${SHA}/pulls" > "$tmp/pulls.json" 2>/dev/null \
+  || no "could not list the PRs for $SHA"
+match="$(jq -r --arg sha "$SHA" '
+    [ .[] | select(.merged_at != null and .merge_commit_sha == $sha and .base.ref == "main") ]
+    | if length == 1 then .[0] | [.number, .head.sha, (.head.ref // "-"), (.head.repo.full_name // "-"), .merged_at] | @tsv
+      else empty end' "$tmp/pulls.json" 2>/dev/null)" \
+  || no "unexpected reply listing the PRs for $SHA"
+[ -n "$match" ] || no "$SHA is not the merge commit of exactly one PR into main"
+# Every field is non-empty (absent ones are "-"): tab is IFS whitespace, so
+# an empty field would collapse and shift the rest.
+IFS=$'\t' read -r pr head head_ref head_repo merged_at <<< "$match"
 [[ "$pr" =~ ^[0-9]+$ ]] || no "unexpected PR number"
 is_sha "$head" || no "unexpected PR head"
+[ "$head_repo" = "$REPO" ] || no "PR #$pr comes from another repository ($head_repo); its run used that copy of the workflow"
+[ "$head_ref" != "-" ] || no "PR #$pr has no head branch"
 
 # 3. Same tree, and the head was up to date with main.
 ref="refs/ci-tested/pr-head"
@@ -90,22 +115,36 @@ tree_head="$(git rev-parse --verify --quiet "${head}^{tree}")" || no "no tree fo
 git merge-base --is-ancestor "$BEFORE" "$head" 2>/dev/null \
   || no "PR #$pr's head did not contain main when it merged"
 
-# 4. A green PR run on exactly that head that ran the full backend suite.
-runs="$(gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${head}&event=pull_request&per_page=30" \
-          --jq '.workflow_runs[] | [.id, .head_sha, .event, .status, (.conclusion // "")] | @tsv' \
-          2>/dev/null)" || no "could not list ci.yml runs for $head"
-ids="$(awk -F '\t' -v h="$head" \
-         '$2 == h && $3 == "pull_request" && $4 == "completed" && $5 == "success" { print $1 }' \
-         <<< "$runs")"
-[ -n "$ids" ] || no "no successful pull_request CI run on PR #$pr's head"
-for id in $ids; do
-  [[ "$id" =~ ^[0-9]+$ ]] || continue
-  n="$(gh api "repos/${REPO}/actions/runs/${id}/artifacts?name=test-durations" \
-         --jq '[.artifacts[] | select(.name == "test-durations")] | length' 2>/dev/null)" || continue
+# 4. A recent green PR run on exactly that head, from that branch, whose
+#    latest attempt ran the full backend suite.
+gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${head}&event=pull_request&status=completed&per_page=30" \
+  > "$tmp/runs.json" 2>/dev/null || no "could not list ci.yml runs for $head"
+candidates="$(jq -r --arg h "$head" --arg br "$head_ref" --arg repo "$REPO" \
+                 --arg merged "$merged_at" --argjson max "$MAX_RUN_AGE_SECONDS" '
+    ($merged | fromdateiso8601) as $m
+    | [ .workflow_runs[]
+        | select(.head_sha == $h and .event == "pull_request"
+                 and .status == "completed" and .conclusion == "success"
+                 and .head_branch == $br
+                 and (.head_repository.full_name // "") == $repo)
+        | (.created_at | fromdateiso8601) as $c
+        | select($c < $m and ($m - $c) <= $max)
+        | {id, run_attempt, c: $c} ]
+    | sort_by(-.c) | .[] | "\(.id)\t\(.run_attempt)"' "$tmp/runs.json" 2>/dev/null)" \
+  || no "unexpected reply listing ci.yml runs for $head"
+[ -n "$candidates" ] \
+  || no "no successful pull_request CI run of PR #$pr's head in the $((MAX_RUN_AGE_SECONDS / 3600)) h before it merged"
+while IFS=$'\t' read -r id attempt; do
+  [[ "$id" =~ ^[0-9]+$ && "$attempt" =~ ^[0-9]+$ ]] || continue
+  marker="backend-full-suite-attempt-${attempt}"
+  gh api "repos/${REPO}/actions/runs/${id}/artifacts?name=${marker}" > "$tmp/art.json" 2>/dev/null \
+    || no "could not list the artifacts of run $id"
+  n="$(jq --arg n "$marker" '[.artifacts[] | select(.name == $n and .expired == false)] | length' \
+         "$tmp/art.json" 2>/dev/null)" || no "unexpected reply listing the artifacts of run $id"
   if [ "$n" -ge 1 ] 2>/dev/null; then
-    echo "skip shards: tree identical to PR #$pr head ${head:0:12}, whose CI run $id passed the full backend suite" >&2
-    echo "pr=$pr head=$head run=$id"
+    echo "skip shards: tree identical to PR #$pr head ${head:0:12}, whose CI run $id (attempt $attempt) passed the full backend suite" >&2
+    echo "pr=$pr head=$head run=$id attempt=$attempt"
     exit 0
   fi
-done
-no "PR #$pr's green run(s) on that head did not run the full backend suite (narrowed or shards skipped)"
+done <<< "$candidates"
+no "PR #$pr's green run(s) on that head did not run the full backend suite in their latest attempt (narrowed, shards skipped, or the marker expired)"

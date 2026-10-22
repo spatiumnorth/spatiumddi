@@ -359,23 +359,42 @@ than half the time. The `changes` job now asks
 when **all** of these are established:
 
 - the push added one single-parent commit, and GitHub records exactly one
-  PR merged into `main` whose merge commit it is;
+  PR merged into `main` whose merge commit it is, from a branch in this
+  repository (a fork PR's run used the fork's copy of the workflow);
 - that PR's head has the identical tree and contains the previous `main`
   (so the PR run's test merge was a no-op on the head's tree);
-- a `pull_request` run of `ci.yml` on exactly that head concluded `success`
-  and published the `test-durations` artifact — which the aggregator does
-  only when all twelve shards passed the **full** suite. A narrowed (#1020)
-  or shard-skipped (#813) PR run never qualifies, so the push run stays the
-  safety net that catches what the narrowed run did not select.
+- a `pull_request` run of `ci.yml` on exactly that head, from the PR's head
+  branch, concluded `success`, was created before the merge and at most
+  24 h before it, and its **latest attempt** published the unexpired
+  `backend-full-suite-attempt-<n>` marker. The `Backend — Tests` aggregator
+  uploads that marker only when all twelve shards passed the **full**
+  suite, so a narrowed (#1020) or shard-skipped (#813) PR run never
+  qualifies, and the push run stays the safety net that catches what the
+  narrowed run did not select. (The run cannot be tied to the PR through
+  its `pull_requests` array: GitHub clears it when the PR merges.)
 
 Anything else — an API error, a tree mismatch, a forced or multi-commit
-push — runs the full suite. `Backend — Tests` still reports success on a
-skip (with a notice naming why), so release.yml's "CI passed on this
-commit" gate is satisfied by a run resting on the identical tree's PR run.
+push — runs the full suite. A skipped run reports `Backend — Tests` green
+with a notice and uploads a `backend-skipped-tested-on-pr-head-attempt-<n>`
+marker.
+
+**A release never rests on a skipped run.** release.yml's gate asks
+`.github/scripts/ci-full-suite-passed.sh` for a `ci.yml` run on the tagged
+commit itself whose latest attempt carries the full-suite marker (or a push
+run from before the markers existed, which always ran the suite). If the
+commit's only green run skipped the shards, the gate fails and prints the
+command that produces one — `gh workflow run ci.yml --ref <tag>`. A
+dispatched run cannot skip: only a `push` consults the skip script.
+
 Because those pushes no longer produce the test-impact map or the
 durations artifact, a **daily scheduled** full run on `main` (and
 `workflow_dispatch`) produces both; it has its own concurrency group, so a
-merge never cancels it. Pinned by `backend/tests/test_ci_tested_on_pr_head.py`.
+merge never cancels it. A failing scheduled run shows red on `main`, and
+GitHub emails the user who last changed the workflow's `cron` line; nothing
+else notifies. Both consumers — the impact-map lookup and
+`make test-durations` — find the newest artifact by name through
+`.github/scripts/latest-main-artifact.sh`, which never accepts a
+`pull_request` run's. Pinned by `backend/tests/test_ci_tested_on_pr_head.py`.
 
 ### What a new endpoint needs
 
