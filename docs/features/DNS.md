@@ -381,7 +381,8 @@ DNSTrustAnchor
   added_at, added_by
 ```
 
-- **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors go in `managed-keys {}` or `trust-anchors {}`
+- **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors are rendered as a top-level `trust-anchors { ... };` statement (`static-key` / `initial-key`, flags 257, protocol 3; DNSKEY anchors only, no DS), shipped in the bundle so adding or removing one re-renders `named.conf` (#2266). `yes` with no anchor validates nothing in BIND 9.20, so the options response carries a `dnssec_warnings` entry (advisory, never a 422); `auto` uses the built-in root anchor
+- **PowerDNS / Technitium / agentless drivers:** have no equivalent, so adding a trust anchor to a group with such a server is a 422. Values are validated (zone name, algorithm 1-255, key tag, base64 key) because they land verbatim in `named.conf`
 - The root DNSSEC trust anchor (ICANN KSK) is pre-loaded automatically when `dnssec_validation: auto`
 - UI shows DNSSEC chain validation status for each zone
 
@@ -778,6 +779,7 @@ DDNS is safe to call repeatedly. If the resolved hostname matches what's already
 ### Security
 
 - RFC 2136 updates to BIND9 use TSIG signing (key stored Fernet-encrypted).
+- A TSIG key that an ACL, view, server option or zone still cites as `key <name>` cannot be renamed or deleted (409, naming each referrer); remove the references first. The bundle also drops any `key <name>` it does not define, so a stale reference cannot stop the group converging; an access list that empties (or loses a `!key` negation) that way ships as `none`, never as an empty list that would read as unset (#2282).
 - WinRM calls to Windows DNS go over HTTPS with cert validation by default.
 - The DDNS service itself never touches manual IPAM allocations (it gates on `auto_from_lease=True` before doing anything).
 
@@ -829,15 +831,59 @@ DNSBlockListException
 ### Supported List Formats
 - **Hosts file** (`0.0.0.0 ads.example.com`)
 - **Domain list** (one domain per line)
-- **AdBlock format** (`||ads.example.com^`)
+- **AdBlock format** (`||ads.example.com^`). What the parser does with the
+  rest of the syntax ([#2123](https://github.com/spatiumnorth/spatiumddi/issues/2123)):
+  - `@@||name^` becomes an **exception** on the list (source `feed`),
+    re-synced by every refresh. An exception you add by hand is never
+    removed by a refresh. A feed's `@@` rule applies to **the feed's own
+    list only**: it carves a name out of that feed's own blocks (for
+    example `@@||cdn.ads.example^` under `||ads.example^`), and it never
+    unblocks a name that your manual list, or any other list on the same
+    group or view, blocks exactly, through a wildcard, or anywhere under
+    it. Such a feed exception is still stored and listed, but has no
+    effect. An exception you add by hand applies to every list on the
+    group or view, as before. Adding or editing one that the feed already
+    lists makes it yours, and so makes it group-wide too: that is the
+    operator's call, not the feed's.
+  - `$important` is kept as a plain block, and still beats a plain `@@`
+    for the same name in the feed (that is what it means), so that
+    exception is not stored.
+  - `$badfilter` disables the rule it names; neither becomes an entry.
+  - Any other modifier (`$domain=`, `$third-party`, `$client=`,
+    `$dnstype=`, `$denyallow=`, …) **skips the rule**. Most of them narrow
+    a rule, and DNS cannot express that, so keeping the bare name would
+    block more than the feed asked for.
+  - Regex rules (`/…/`), paths (`||host/ads`), a `*` inside a name and
+    other non-`||name^` rules are skipped.
+
+  Skipped rules are counted by category (regex / modifier / badfilter /
+  malformed), stored on the list as `feed_parse_skipped`, and shown on the
+  list as "N rules not enforced". Every `||name^` rule means "this name and
+  its subdomains", so an adblock feed on a list set to apex-only logs the
+  same override warning a `*.`-prefixed feed does (#894).
 
 ### Block Response Modes
 
 | Mode | DNS Response | Use Case |
 |---|---|---|
-| `nxdomain` | NXDOMAIN | Cleanest; some clients retry on NXDOMAIN |
-| `sinkhole` | Returns configured IP (e.g., 0.0.0.0) | Can serve a block page |
-| `refused` | REFUSED | Strict policy environments |
+| `nxdomain` | NXDOMAIN | Cleanest, fails fast |
+| `sinkhole` | An A and an AAAA record: the list's `sinkhole_ip`, else `0.0.0.0` and `::` | Fails fast, or points clients at a block page |
+
+`sinkhole` is rendered as RPZ local data. An IPv4 `sinkhole_ip` replaces
+`0.0.0.0` and an IPv6 one replaces `::`; the other family keeps the
+unspecified address, so both lookups fail at once. Before
+[#2124](https://github.com/spatiumnorth/spatiumddi/issues/2124) the agent
+rendered `sinkhole` as `rpz-drop`, which sends **no response**, so every
+blocked lookup waited out the client's resolver timeout. On Technitium a
+sinkhole without an address is `AnyAddress` (Technitium's name for
+`0.0.0.0` / `::`); with one it is `CustomAddress` with that address and
+the other family's unspecified address.
+
+There is **no `refused` mode**, deliberately. BIND's RPZ has no action that answers
+REFUSED (its actions are NXDOMAIN, NODATA, PASSTHRU, DROP, TCP-only and
+local data), so the API refuses `refused` with a 422. It used to be
+accepted and was served as NXDOMAIN; upgrading rewrites stored `refused`
+lists to `nxdomain`, which changes nothing they answer.
 
 ### BIND9 Implementation
 - Uses a `Response Policy Zone (RPZ)` — an industry-standard BIND9 feature
@@ -898,7 +944,7 @@ The rendered config puts the RPZ inside the matching view only:
 ```
 view "guest" {
     match-clients { 10.20.0.0/16; };
-    response-policy { zone "spatium-blocklist-guest.rpz"; } break-dnssec yes;
+    response-policy { zone "spatium-blocklist-guest.rpz"; } break-dnssec yes qname-wait-recurse no;
     ...
 };
 ```

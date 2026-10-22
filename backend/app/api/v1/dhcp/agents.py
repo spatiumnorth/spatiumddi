@@ -21,6 +21,7 @@ from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
@@ -1186,6 +1187,7 @@ async def agent_lease_events(
     from app.services.feature_modules import is_module_enabled
 
     server, _ = auth
+    server_id = str(server.id)
     # #1077 — a replay of a batch already committed writes nothing. Claimed
     # before any write so the receipt and the rows share one transaction.
     if not await claim_batch(
@@ -1308,7 +1310,28 @@ async def agent_lease_events(
                 # Backfill legacy rows created before scope stamping (#844).
                 lease.scope_id = _scope_for_ip(ev.ip_address)
         upserted += 1
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # #2262 — the lease-identity unique indexes. A unique violation here
+        # means another request for this server inserted the same lease
+        # between our SELECT and this INSERT (a timed-out snapshot page still
+        # running server-side while the tailer posts its next batch). The
+        # global handler would answer 409, which the agent's spool classifies
+        # as REJECTED and drops the whole batch with it. Answer 503 instead:
+        # the agent retries, the retry finds the committed row and updates
+        # it, and the receipt claimed above rolls back with this transaction
+        # so the retry is not mistaken for a duplicate.
+        if str(getattr(exc.orig, "sqlstate", "") or "") != "23505":
+            raise
+        # ``server`` is expired by the failed flush; log the id read up front.
+        await db.rollback()
+        logger.info("dhcp_lease_events_identity_race", server=server_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A concurrent lease report for this server landed first; retry.",
+            headers={"Retry-After": "1"},
+        ) from exc
 
     # Bulk-load the existing IPAM mirror rows. Keyed by (subnet_id, address)
     # so overlapping ranges across spaces stay disambiguated (subnets were

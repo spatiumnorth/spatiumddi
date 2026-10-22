@@ -10,6 +10,13 @@ Two complements to the per-account lockout (#71):
   ``jti`` so a captured (challenge + TOTP) pair can't be replayed inside
   the 5-minute token TTL (#7).
 
+* ``mfa_challenge_spent`` / ``record_mfa_challenge_failure`` — a
+  wrong-code budget per MFA challenge: after ``MFA_CHALLENGE_FAIL_MAX``
+  wrong codes the challenge is dead and a fresh one needs the password
+  again. Fails open like the other login throttles; the per-account
+  budget on the user row (``account_lockout.MFA_FAIL_MAX``) is the bound
+  that holds without Redis.
+
 * ``stepup_password_blocked`` / ``record_stepup_password_failure`` — a
   per-ACCOUNT budget on wrong answers to an in-session step-up (MFA
   enrolment, disable, recovery-code regeneration; #1241). Those checks run
@@ -63,6 +70,10 @@ _LOGIN_RL_WINDOW_SECONDS = 60
 # Matches create_mfa_challenge_token's _MFA_TOKEN_TTL_MINUTES (5 min) —
 # once the challenge JWT expires the used-marker is moot.
 _MFA_USED_TTL_SECONDS = 5 * 60
+
+# Wrong codes one MFA challenge accepts before it is spent and the sign-in
+# has to start again from the password.
+MFA_CHALLENGE_FAIL_MAX = 3
 
 # 5 wrong step-up answers / 15 min / account (#1241). A person mistyping
 # gets several goes; a script guessing a password from a stolen session
@@ -189,7 +200,7 @@ async def mfa_challenge_consume(jti: str | None) -> bool:
     blocking a legitimate MFA login during a Redis outage."""
     if not jti:
         return True
-    key = f"mfa_challenge:{jti}:used"
+    key = _mfa_challenge_used_key(jti)
     try:
         r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         try:
@@ -202,6 +213,62 @@ async def mfa_challenge_consume(jti: str | None) -> bool:
     except Exception as exc:  # noqa: BLE001 — never block MFA on a Redis blip
         logger.warning("mfa_replay_guard_redis_unavailable", error=str(exc))
         return True
+
+
+def _mfa_challenge_used_key(jti: str) -> str:
+    return f"mfa_challenge:{jti}:used"
+
+
+def _mfa_challenge_fail_key(jti: str) -> str:
+    return f"mfa_challenge:{jti}:fails"
+
+
+async def mfa_challenge_spent(jti: str | None) -> bool:
+    """True when the challenge has already been redeemed or has used up its
+    wrong-code budget. Checked before the code, so a spent challenge learns
+    nothing from another guess.
+
+    Fails open (False) when ``jti`` is missing or Redis is unavailable; the
+    per-account budget on the user row still bounds guessing then."""
+    if not jti:
+        return False
+    try:
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            if await r.exists(_mfa_challenge_used_key(jti)):
+                return True
+            fails = await r.get(_mfa_challenge_fail_key(jti))
+            return fails is not None and int(fails) >= MFA_CHALLENGE_FAIL_MAX
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — the DB-side budget is the hard bound
+        logger.warning("mfa_challenge_budget_redis_unavailable", error=str(exc))
+        return False
+
+
+async def record_mfa_challenge_failure(jti: str | None) -> bool:
+    """Count one wrong code against this challenge. Returns True iff the
+    challenge is now spent, in which case it is also marked used so it can
+    never be redeemed. Best-effort, like ``mfa_challenge_spent``."""
+    if not jti:
+        return False
+    key = _mfa_challenge_fail_key(jti)
+    try:
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            # Open the window before the INCR (which keeps the TTL) so the
+            # counter can never be left without an expiry.
+            await r.set(key, 0, ex=_MFA_USED_TTL_SECONDS, nx=True)
+            count = int(await r.incr(key))
+            if count >= MFA_CHALLENGE_FAIL_MAX:
+                await r.set(_mfa_challenge_used_key(jti), "1", ex=_MFA_USED_TTL_SECONDS)
+                return True
+            return False
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — the DB-side budget is the hard bound
+        logger.warning("mfa_challenge_budget_redis_unavailable", error=str(exc))
+        return False
 
 
 class StepupThrottleUnavailable(Exception):

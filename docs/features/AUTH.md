@@ -119,6 +119,33 @@ session alone doesn't prove and an SSO account has no local password.
   exchanges the pre-token via `POST /auth/login/mfa` for the
   real `{access_token, refresh_token}` pair. Backup codes are
   invalidated on use.
+- **MFA attempt limits**: `POST /auth/login/mfa` checks three bounds
+  before it looks at the code, and a TOTP code and a backup code are
+  treated the same by all three.
+  - **Account lockout (#71).** A locked account gets the same 403 as at
+    `/auth/login`, so a correct code cannot finish the sign-in or clear
+    the lock. Wrong codes count towards the lockout counter like wrong
+    passwords.
+  - **Per-account MFA budget**, on whether or not lockout is enabled:
+    5 wrong codes within 15 minutes (`MFA_FAIL_MAX` /
+    `MFA_FAIL_WINDOW_MINUTES` in `app/services/account_lockout.py`) and
+    the MFA step answers 429 with `Retry-After` until 15 minutes after
+    the last counted failure. Refused attempts are not counted, so
+    waiting is enough. It is stored on the user row
+    (`mfa_failed_count`, `mfa_last_failed_at`), read under a row lock,
+    and so holds when Redis is unavailable. A successful sign-in or an
+    admin unlock (`POST /users/{id}/unlock`) resets it.
+  - **Per-challenge budget.** One pre-token accepts at most 3 wrong
+    codes (`MFA_CHALLENGE_FAIL_MAX` in `app/core/auth_throttle.py`) and
+    is single-use on success; after either, sign-in starts again at the
+    password. This one is kept in Redis and is skipped when Redis is
+    down; the per-account budget is the bound that still applies.
+
+  Refusals are audited as `login` / `failure` rows with reason
+  `account_locked`, `mfa_attempts_exhausted` or `mfa_challenge_spent`,
+  and the wrong code that uses up the per-account budget also writes an
+  `account.mfa_attempts_exhausted` row. No code, recovery code or
+  pre-token is ever written to the audit log or the logs.
 - **Disable**: a user clears their own MFA via `POST /auth/mfa/disable`
   (local users supply their password AND a current TOTP code;
   password-less external-auth users supply just the current TOTP code).

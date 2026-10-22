@@ -2885,6 +2885,9 @@ export const auditApi = {
 export interface BackupManifest {
   format?: string;
   format_version?: number;
+  /** "custom" (pg_dump custom format) or "plain" (SQL text). An
+   *  Exclude-secrets archive is plain, at format_version 2 (#2201). */
+  dump_format?: "custom" | "plain";
   app_version?: string;
   schema_version?: string | null;
   hostname?: string;
@@ -2920,6 +2923,13 @@ export interface BackupManifestPreviewResponse {
   manifest: BackupManifest;
   archive_bytes: number;
   format_recognised: boolean;
+  /** The dump format the restore will act on, resolved server-side by
+   *  the restore's own helper; null when the archive does not say. Absent
+   *  from a server older than #2201. */
+  dump_format?: "custom" | "plain" | null;
+  /** True only for a custom-format dump — the one shape the API accepts
+   *  a selective restore of. */
+  selective_restore_supported?: boolean;
 }
 
 export const backupApi = {
@@ -3031,6 +3041,10 @@ export interface BackupTargetConfigField {
   required: boolean;
   description: string | null;
   secret: boolean;
+  /** The value is lines (a PEM key, known_hosts, one header per line):
+   *  render a textarea, never an `<input>`, which folds each line break
+   *  into a space (#2199). Absent from a server older than that. */
+  multiline?: boolean;
 }
 
 export interface BackupTargetKind {
@@ -5576,6 +5590,8 @@ export interface DNSServerOptions {
   technitium_warnings?: string[];
   // #2128: stored forwarders pinned to port 53 in an encrypted group.
   forwarder_warnings?: string[];
+  // #2266: dnssec_validation "yes" with no trust anchor validates nothing.
+  dnssec_warnings?: string[];
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the
@@ -6869,10 +6885,20 @@ export interface DNSBlockList {
   last_sync_status: string | null;
   last_sync_error: string | null;
   entry_count: number;
+  /** Rules the last adblock refresh could not enforce, by category (#2123).
+   *  null = not recorded (no adblock refresh yet, or another feed format). */
+  feed_parse_skipped: DNSBlockListFeedSkipped | null;
   created_at: string;
   modified_at: string;
   applied_group_ids: string[];
   applied_view_ids: string[];
+}
+
+export interface DNSBlockListFeedSkipped {
+  regex: number;
+  modifier: number;
+  badfilter: number;
+  malformed: number;
 }
 
 export interface DNSBlockListEntry {
@@ -6897,6 +6923,8 @@ export interface DNSBlockListException {
   list_id: string;
   domain: string;
   reason: string;
+  /** manual | feed — a feed row is the feed's own `@@` rule (#2123). */
+  source: string;
   created_at: string;
 }
 
@@ -11012,6 +11040,10 @@ export interface IntegrationsDashboardPanel {
   stale_count: number;
   error_count: number;
   warning_count: number;
+  // #2192 — over every target, not the capped `targets` list.
+  problem_count?: number;
+  credential_dead_count?: number;
+  credential_expiring_count?: number;
   targets: IntegrationsDashboardTargetRow[];
 }
 export interface IntegrationsDashboardErrorRow {
@@ -15376,7 +15408,9 @@ export type CredentialState =
   | "expiring"
   | "expired"
   | "rejected"
-  | "unknown";
+  | "unknown"
+  // #2191 — the target is switched off; its last rejection is history.
+  | "disabled";
 
 export interface TailscaleTenant {
   id: string;

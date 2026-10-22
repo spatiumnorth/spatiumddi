@@ -1015,12 +1015,29 @@ once — they serve different audiences.
 Operator-authored rules stored in the `alert_rule` table. The
 evaluator (`backend/app/services/alerts.py:evaluate_all`) runs on a
 60 s Celery beat tick; `POST /api/v1/alerts/evaluate` forces an
-immediate pass. Each match opens an `alert_event` row (partial
-index on `(rule_id, subject_type, subject_id) WHERE resolved_at IS
-NULL` keeps dedup O(1)); events resolve automatically when the
-subject clears. Delivery reuses the **Audit Event Forwarding**
-syslog + webhook targets — one SIEM destination for both audit and
-alerts.
+immediate pass. Each match opens an `alert_event` row (a UNIQUE
+partial index on `(rule_id, subject_type, subject_id) WHERE
+resolved_at IS NULL` keeps dedup O(1) and allows one open event per
+rule and subject); events resolve automatically when the subject
+clears. Delivery reuses the **Audit Event Forwarding** syslog +
+webhook targets — one SIEM destination for both audit and alerts.
+
+A pass is built to fail safely (#2261). Each rule runs in its own
+savepoint, so a rule whose query errors or times out is logged as
+`alert_rule_eval_failed` and skipped while the rest of the pass
+completes. Events are delivered only **after** the pass commits them,
+so a failed or retried pass never pages for an event that is not in
+the database. A queued delivery is stamped on the event
+(`delivery_pending_since`) and claimed by a committed conditional
+update before it is sent, so no two senders ever send it. A worker
+killed between the commit and the send leaves the stamp set; every
+pass ends by re-sending any delivery stamped more than 10 minutes
+earlier (`alert_redelivering_stranded`), unless the event has since
+resolved or its rule was disabled. Passes are
+serialised by an advisory lock; a pass that starts while another is
+running (a slow tick, a Celery retry, or **Evaluate now**) logs
+`alert_evaluate_skipped_locked` and returns zero counts. The
+conformity evaluator follows the same rules.
 
 Rule types shipped today:
 
@@ -1057,6 +1074,20 @@ transition on a (policy, resource) pair opens an `AlertEvent` row
 against the named alert rule with `subject_type="conformity"` so
 operators see drift in the same dashboard. Configure the wiring in
 the policy edit modal at `/admin/conformity`.
+
+The conformity engine, not the alert evaluator, closes these events
+(#2277). An open event resolves when its (policy, resource) next
+evaluates `pass` or `not_applicable`, when the resource is deleted or
+drops out of the policy's target filter, when the policy is disabled
+or deleted, and at its next evaluation once the policy's alert rule is
+cleared or switched (a failure still in progress then pages once on
+the new rule). A `warn` result or a check that raised holds the event
+open. The resolved
+event's `last_observed_value.resolution` says why (`passed`,
+`not_applicable`, `out_of_scope`, `policy_disabled`, `policy_deleted`,
+`alert_rule_changed`). A later re-failure opens a new event and pages
+again. An event you resolve by hand while the resource is still failing
+stays resolved until the resource passes and then fails again.
 
 ### 9.1a BGP prefix-hijack monitoring (#527)
 
