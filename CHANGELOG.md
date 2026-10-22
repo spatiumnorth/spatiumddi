@@ -128,6 +128,65 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A zone's own export re-imported as a delete + create of every MX,
+  SRV, CNAME, NS, PTR and TXT record (#2187).** The record API stores a
+  name target without its trailing dot, relative to the zone, but the
+  zone-file writer forced a dot on it (`mail` became the absolute
+  `mail.`), and the import diff compared the value text exactly. The
+  writer now writes targets as stored (`$ORIGIN` makes the file read
+  them the same way) and quotes TXT through the shared driver helper,
+  and the diff compares names absolute and case-folded and TXT in one
+  quoted form, so exporting a zone and importing it back plans nothing
+  under `replace` or `merge`.
+
+- **A replayed grant no longer re-points an address's IPAM row to the
+  client that already released it (#2391).** After an agent restart
+  the lease file is re-sent, so an old client's grant (and release) of
+  an address can arrive after a new client holds it. #1318 kept the
+  replayed release from deleting the row, but the grant still wrote the
+  old client's MAC, hostname and lease onto it, and re-activated the old
+  lease. A grant older than another client's live lease on the same
+  address (compared on the lease start Kea reports), or one whose lease
+  ends later in the same batch, is now ignored. A newer grant, a
+  renewal, or a real new client updates the row as before.
+
+- **A Postgres failover no longer stops a rolling upgrade for ten
+  minutes (#2177).** One refused database connection during a
+  CloudNativePG failover crashed the drive: its two Celery retries
+  both landed within about a second, and the drive kept its Lease, so
+  the run sat in `running` with nothing driving it until the Lease
+  expired (600 s) and the orphan sweep re-drove it. If the database
+  came back sooner, the crash failed the node instead. Now a step that
+  loses its database connection rolls back and retries in place for
+  up to 90 s, so the node carries on where it was; the commit of the
+  slot-image stamp is part of its step, so a stamp lost to the outage
+  is written again. A connection lost outside a step (the run row's
+  own writes) releases the drive's Lease first and retries the drive
+  after 5, 10, 15, 30 and 30 s; the retry takes the Lease over at
+  once and resumes from `progress.per_node`. Only connection errors
+  are retried (refused, reset, timed out, closed, server shutting
+  down, a demoted primary), and a refused or timed-out socket counts
+  only when the database driver raised it: from a kubeapi or Redis
+  call it still fails the run at once, as does any other error. A
+  slot stamp whose commit landed but was never acknowledged is still
+  treated as this run's fresh stamp, and a long wait step that rides
+  out one failover gets a fresh budget for a later one (three at
+  most). A drive that gives up leaves the run `running` with the Lease
+  free, so the orphan sweep re-drives it within a couple of minutes,
+  and the crash handler now releases the Lease even when it cannot
+  write the row.
+
+- **Fleet showed a silent appliance's last report as current, and nothing
+  alerted on the silence (#2259).** Role chips and the Service health
+  table now grey out, with a "no heartbeat for X" badge, once
+  `last_seen_at` is older than about three heartbeat intervals. A new
+  default-on `appliance_heartbeat_stale` alert (warning after 5 min,
+  critical after 30, auto-resolving) covers control-plane and observer
+  nodes no other rule watched, and `find_appliance_fleet` reports
+  `heartbeat_stale`. The `no_lanwide_control_plane_ports` conformity check
+  now returns warn for stale or unverified nodes and not applicable when
+  no appliance reports, instead of counting them as PASS.
+
 - **A rate-limit counter could be left without an expiry and throttle an IP
   or user forever (#2294).** The login, E911 self-query, step-up and
   network-tools limiters did `INCR` and then a separate `EXPIRE`; a crash,

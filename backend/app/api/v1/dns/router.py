@@ -9092,6 +9092,7 @@ async def _diff_zone_file(
         view_id=body.view_id,
         view_names=view_names,
         replace=replace,
+        zone_name=zone.name,
     )
     apply_cname_rule(diff, existing, replace=replace)
     return diff
