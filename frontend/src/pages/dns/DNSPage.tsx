@@ -6434,7 +6434,7 @@ function SubnetPickerModal({
 
 // ── ACLs Tab ──────────────────────────────────────────────────────────────────
 
-function AclsTab({ groupId }: { groupId: string }) {
+export function AclsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   const { can } = useDnsGrants();
   const [showCreate, setShowCreate] = useState(false);
@@ -6447,6 +6447,9 @@ function AclsTab({ groupId }: { groupId: string }) {
   const [newDesc, setNewDesc] = useState("");
   const [newEntries, setNewEntries] = useState("");
   const [error, setError] = useState("");
+  // #2444 — the server refuses a delete of an ACL that another ACL or a zone
+  // cites (409); the reason is shown in the dialog, which stays open.
+  const [deleteError, setDeleteError] = useState("");
 
   const { data: acls = [] } = useQuery({
     queryKey: ["dns-acls", groupId],
@@ -6466,7 +6469,12 @@ function AclsTab({ groupId }: { groupId: string }) {
   });
   const delMut = useMutation({
     mutationFn: (id: string) => dnsApi.deleteAcl(groupId, id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-acls", groupId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-acls", groupId] });
+      setConfirmDelete(null);
+    },
+    onError: (e: ApiError) =>
+      setDeleteError(formatApiError(e, "Failed to delete the ACL")),
   });
 
   function createAcl(e: React.FormEvent) {
@@ -6573,7 +6581,10 @@ function AclsTab({ groupId }: { groupId: string }) {
               </div>
               <button
                 className="h-7 w-7 flex items-center justify-center rounded opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive disabled:opacity-0"
-                onClick={() => setConfirmDelete(acl)}
+                onClick={() => {
+                  setDeleteError("");
+                  setConfirmDelete(acl);
+                }}
                 title="Delete ACL"
                 {...permissionGate(
                   can("delete", "dns_group"),
@@ -6606,17 +6617,27 @@ function AclsTab({ groupId }: { groupId: string }) {
           confirmLabel="Delete ACL"
           tone="destructive"
           onClose={() => setConfirmDelete(null)}
+          loading={delMut.isPending}
           onConfirm={() => {
+            setDeleteError("");
             delMut.mutate(confirmDelete.id);
-            setConfirmDelete(null);
           }}
           message={
-            <p className="text-sm">
-              Any view or zone referencing{" "}
-              <span className="font-mono">{confirmDelete.name}</span> by name
-              will stop resolving it — check the Views tab before removing an
-              ACL that is in use.
-            </p>
+            <div className="space-y-2">
+              <p className="text-sm">
+                An ACL that another ACL, a view or a zone still cites by name
+                cannot be deleted — the server refuses it, and the reason is
+                shown here. Remove the references first.
+              </p>
+              {deleteError && (
+                <p
+                  role="alert"
+                  className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-sm text-destructive"
+                >
+                  {deleteError}
+                </p>
+              )}
+            </div>
           }
         />
       )}
