@@ -461,6 +461,7 @@ DNSServerOptions.allow_notify: list[str]        -- who may send NOTIFY to this s
 ```
 
 - **BIND9:** `notify yes|explicit|master-only|no;` + `also-notify { ... };` + `allow-notify { ... };`
+- **Technitium (agent-managed, #2267):** `notify` + `notifyNameServers` on each Primary / Secondary zone. `yes` is the zone's NS set plus the also-notify list; `explicit` only the list; `no` nothing; `master-only` / `primary-only` as `yes` on a Primary and nothing on a Secondary. A zone's own value overrides the group's. Technitium's list takes bare IP addresses, so an `also_notify` entry with a port, key or hostname is refused with a 422, and so is `allow_notify` (a Technitium secondary accepts NOTIFY only from its own primaries).
 - Notify settings can be overridden per-zone (the zone model inherits from server defaults)
 - `also_notify` is useful when secondaries are stealth (not listed in zone NS records)
 - `allow_notify` on secondaries controls which primaries are trusted to trigger a zone transfer

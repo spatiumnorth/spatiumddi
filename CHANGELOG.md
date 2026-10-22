@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The Technitium agent ignored every NOTIFY setting (#2267).** `notify
+  no` (a stealth primary) still notified the zone's NS hosts, because
+  Technitium defaults to `ZoneNameServers`, and also-notify targets were
+  never notified. The agent now sets each Primary / Secondary zone's
+  `notify` + `notifyNameServers` from the group's settings, with a zone's
+  own `notify_enabled` / `also_notify` overriding them: `yes` is the NS
+  set plus the also-notify list, `explicit` only the list, `no` nothing.
+  Technitium notifies bare IP addresses only and has no allow-notify, so a
+  Technitium group now refuses an `also_notify` entry with a port, key or
+  hostname and any `allow_notify` with a 422 that names the field.
+
 - **A feature-module verdict cached under another catalog no longer
   answers for this one (#2395).** `get_enabled_modules` kept its
   5 s verdict whatever catalog it was resolved against, so a lookup
