@@ -361,12 +361,21 @@ evaluation. Put anything the Celery side reads in ``sharedEnv`` (values.yaml),
 not in ``api.env``. ``.github/scripts/chart-shared-env.py`` fails a render
 where one of the three lacks a variable another carries from this list.
 
+``applianceVersion`` (#2004, #2176) is appended to the same list as
+APPLIANCE_VERSION. It is a value of its own so that a cluster Rolling Upgrade
+can hold it with ``image.tag``: a HelmChartConfig can pin a scalar, never one
+entry of a list.
+
 The slot-image mirror client env is a separate helper
 (``spatiumddi.slotImageMirrorClientEnv``) because beat never talks to the
 mirror and has no use for its shared secret.
 */}}
 {{- define "spatiumddi.sharedEnv" -}}
-{{- with .Values.sharedEnv }}
+{{- $env := .Values.sharedEnv | default list }}
+{{- with .Values.applianceVersion }}
+{{- $env = append $env (dict "name" "APPLIANCE_VERSION" "value" (toString .)) }}
+{{- end }}
+{{- with $env }}
 {{- toYaml . }}
 {{- end }}
 {{- end -}}
