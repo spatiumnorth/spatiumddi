@@ -19,7 +19,7 @@ each identity. The downgrade drops the two indexes; the deleted duplicates
 carried nothing the kept row does not, so they are not restored.
 
 Revision ID: e4b8c2d17a95
-Revises: d3a7f19c52e8
+Revises: e4c9b2a17f60
 Create Date: 2026-10-20 10:00:00.000000
 """
 
@@ -28,7 +28,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "e4b8c2d17a95"
-down_revision = "d3a7f19c52e8"
+down_revision = "e4c9b2a17f60"
 branch_labels = None
 depends_on = None
 

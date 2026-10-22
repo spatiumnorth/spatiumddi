@@ -44,6 +44,7 @@ from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.container_oom import effective_daemon_report, fresh_role_health
 from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.agents.ingest_receipt import (
     BatchId,
@@ -55,6 +56,7 @@ from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.ownership import owning_appliance_for_dhcp_server
 from app.services.appliance.resolver import resolver_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.appliance.ssh import ssh_bundle
@@ -1101,7 +1103,26 @@ async def agent_heartbeat(
     # #1067 — the daemon state (the DHCP agent ships it as ``daemon`` and, from
     # the same dict, the top-level ``status``; ``daemon`` is the source). Same
     # gap as the DNS side: declared, accepted, never read.
-    apply_reported_daemon_state(server, body.daemon, agent_kind="dhcp", server_id=str(server.id))
+    # #2023 — on the appliance the kubelet kills the whole dhcp-kea container
+    # when Kea reaches its memory limit, the agent with it, so the restarted
+    # agent reports ``ok`` over a kill it never saw. The supervisor carries the
+    # kubelet's ``OOMKilled`` on its heartbeat; while that kill is current it is
+    # the daemon state, whatever the agent says (the DNS handler's #2018 rule).
+    now_utc = datetime.now(UTC)
+    appliance = await owning_appliance_for_dhcp_server(db, server)
+    daemon_report, daemon_stamp = effective_daemon_report(
+        body.daemon,
+        fresh_role_health(appliance, now_utc),
+        server.driver,
+        now_utc,
+    )
+    apply_reported_daemon_state(
+        server,
+        daemon_report,
+        agent_kind="dhcp",
+        server_id=str(server.id),
+        now=min(daemon_stamp, now_utc),
+    )
 
     for ack in body.ops_ack:
         op_id = ack.get("op_id")

@@ -48,6 +48,7 @@ from app.models.audit import AuditLog
 from app.models.dhcp import DHCPServer
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.tasks._interval_gate import FAST_BEAT_JITTER_TOLERANCE, interval_skip
 
 logger = structlog.get_logger(__name__)
 
@@ -80,14 +81,11 @@ async def _run_pull() -> dict[str, Any]:
             # Minimum 10 s — beat only ticks that often, and we don't want to
             # hammer the WinRM endpoint harder than that by accident.
             interval = timedelta(seconds=max(10, ps.dhcp_pull_leases_interval_seconds))
-            if ps.dhcp_pull_leases_last_run_at is not None:
-                elapsed = now - ps.dhcp_pull_leases_last_run_at
-                if elapsed < interval:
-                    return {
-                        "status": "skipped",
-                        "reason": "interval_not_elapsed",
-                        "wait_seconds": int((interval - elapsed).total_seconds()),
-                    }
+            skip = interval_skip(
+                now, ps.dhcp_pull_leases_last_run_at, interval, FAST_BEAT_JITTER_TOLERANCE
+            )
+            if skip is not None:
+                return skip
 
             # #2262 — claim the interval BEFORE pulling, atomically. The stamp
             # used to be written only at the end of the pass, so a pull slower
