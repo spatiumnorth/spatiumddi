@@ -1967,6 +1967,8 @@ export const ipamApi = {
         updated_count: number;
         not_found: string[];
         skipped: string[];
+        /** With ``dns_zone_id: ""``: the addresses whose records were removed. */
+        dns_cleared: string[];
       }>(`/ipam/addresses/bulk-edit`, data)
       .then((r) => r.data),
   backfillReverseZonesSpace: (spaceId: string) =>
@@ -5481,6 +5483,14 @@ export interface DNSServer {
   daemon_status_since: string | null;
   /** #1067 — derived; render from this, see `DaemonStateFields`. */
   daemon_not_serving: boolean | null;
+  /** #2044 — a second live agent process is polling as this server (a
+   * cloned VM or a copied state dir keeps the agent_id) and is being
+   * refused; only the most recent process is served. `false` with the other
+   * three `null` when no episode is current. */
+  duplicate_agent: boolean;
+  duplicate_agent_since: string | null;
+  duplicate_agent_last_at: string | null;
+  duplicate_agent_ip: string | null;
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;

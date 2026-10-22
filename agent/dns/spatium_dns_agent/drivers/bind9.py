@@ -57,7 +57,7 @@ NAMED_CONF_SKELETON = """\
     dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
     check-integrity no;
-{max_cache_size}{response_log}{forwarders}{notify_block}{response_policy}{rate_limit}
+{max_cache_size}{query_log}{response_log}{forwarders}{notify_block}{response_policy}{rate_limit}
 }};
 statistics-channels {{
     inet 127.0.0.1 port 8053 allow {{ 127.0.0.1; }};
@@ -127,6 +127,25 @@ def _render_logging_block(opts: dict[str, Any]) -> str:
     if bool(opts.get("response_log_enabled")):
         block += _RESPONSE_LOG_CATEGORY
     return block + "};\n"
+
+
+def _render_query_log_option(opts: dict[str, Any]) -> str:
+    """``querylog yes;`` inside ``options``, or nothing (issue #2249).
+
+    Without the statement BIND decides query logging from the presence
+    of a ``queries`` logging category, but only when named STARTS: the
+    flag is a runtime switch that ``rndc reconfig`` never touches,
+    statement or no statement (verified against BIND 9.20.29). Rendering
+    it makes a fresh start agree with what the operator asked for
+    without leaning on that defaulting, and gives
+    ``Bind9Driver._sync_logging_runtime`` an explicit marker in the
+    swapped-in config to read the desired state back from. Omitted when
+    query logging is off, so a group with it off renders a byte-identical
+    named.conf.
+    """
+    if bool(opts.get("query_log_enabled")):
+        return "    querylog yes;\n"
+    return ""
 
 
 def _render_response_log_option(opts: dict[str, Any]) -> str:
@@ -1820,6 +1839,7 @@ class Bind9Driver(DriverBase):
             response_policy=response_policy_block,
             rate_limit=_render_rate_limit_block(opts),
             max_cache_size=_render_max_cache_size(caches=_resolver_cache_count(bundle)),
+            query_log=_render_query_log_option(opts),
             response_log=_render_response_log_option(opts),
             logging_block=logging_block,
             tsig_include=tsig_include,
@@ -2757,7 +2777,7 @@ class Bind9Driver(DriverBase):
                 before = {**self._serving_serials(base, rest), **frozen}
                 self._reload_rendered_zones(base, changed, already_frozen=frozen.keys())
                 still_frozen.clear()
-                self._sync_response_log_runtime(base)
+                self._sync_logging_runtime(base)
                 self._verify_zones_loaded(base, changed, before, rendered)
                 return
             error = _first_line(res.stderr, res.stdout)
@@ -3044,55 +3064,59 @@ class Bind9Driver(DriverBase):
             )
         log.info("bind9_zones_verified", zones=total, selective=only is not None)
 
-    def _sync_response_log_runtime(self, base: list[str]) -> None:
-        """Assert named's runtime response-logging state after a reconfig.
+    def _sync_logging_runtime(self, base: list[str]) -> None:
+        """Assert named's runtime query + response logging after a reconfig.
 
-        ``rndc reconfig`` does NOT apply ``responselog`` (issue #914,
-        verified against BIND 9.20.26): the freshly-swapped named.conf
-        said ``responselog yes;``, the reconfig succeeded, and
-        ``rndc status`` still reported ``response logging is OFF``. It is
-        a live switch, like ``querylog``, and reconfig deliberately
-        preserves whatever the running server was last told rather than
-        stamping the file's value over an operator's ``rndc`` override.
+        ``rndc reconfig`` applies neither ``querylog`` nor ``responselog``.
+        Both are live switches that reconfig deliberately leaves as the
+        running server was last told, rather than stamping the file's value
+        over an operator's ``rndc`` override. Verified against BIND 9.20:
 
-        Query logging escapes this only by accident of BIND's own
-        defaulting — with no ``querylog`` statement, it follows the
-        presence of the ``queries`` logging category, which the reload
-        does pick up. Response logging does not follow its category the
-        same way, so without this the operator gets a toggle that
-        rewrites named.conf, passes ``named-checkconf``, reloads cleanly
-        and produces not one line until the daemon is next restarted.
+        * ``responselog`` (issue #914, 9.20.26): the swapped-in config said
+          ``responselog yes;``, the reconfig succeeded, and ``rndc status``
+          still reported ``response logging is OFF``.
+        * ``querylog`` (issue #2249, 9.20.29): the same, in both
+          directions. A named started with query logging off stays off
+          after a reconfig that adds the ``queries`` category, with or
+          without ``querylog yes;``; one started with it on stays on after
+          a reconfig that removes both. The #914 version of this method
+          claimed query logging followed its category on reload. It does
+          so only at startup, so enabling query logging on a running server
+          logged nothing until named restarted, and with response logging
+          on the control plane dropped every response line as an orphan.
 
         The desired state is read back off the config we just swapped in
         rather than threaded down from the bundle, so it cannot disagree
         with what named is actually running — the same reason #899 and
         #734 assert on the rendered config rather than the stored row.
 
-        Best effort: a failure leaves the config-file value to take
-        effect at the next restart, which is strictly better than the
-        pre-#914 behaviour, so it is logged rather than raised.
+        Best effort: a failure leaves the config-file value to take effect
+        at the next restart, so it is logged rather than raised.
         """
         conf = self.state_dir / self.rendered_dir_name / "named.conf"
         try:
-            desired = "responselog yes;" in conf.read_text()
+            text = conf.read_text()
         except OSError as exc:
-            log.warning("rndc_responselog_conf_unreadable", error=str(exc))
+            log.warning("rndc_logging_conf_unreadable", error=str(exc))
             return
-        res = subprocess.run(
-            [*base, "responselog", "on" if desired else "off"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if res.returncode != 0:
-            # An older named has no ``responselog`` command at all, which
-            # is a legitimate reason to land here — hence warning, not
-            # error, and no exception.
-            log.warning(
-                "rndc_responselog_failed",
-                desired=desired,
-                stderr=res.stderr.strip(),
+        for switch in ("querylog", "responselog"):
+            marker = re.search(rf"^\s*{switch}\s+yes\s*;", text, re.MULTILINE)
+            desired = marker is not None
+            res = subprocess.run(
+                [*base, switch, "on" if desired else "off"],
+                capture_output=True,
+                text=True,
+                check=False,
             )
+            if res.returncode != 0:
+                # An older named has no ``responselog`` command at all, which
+                # is a legitimate reason to land here — hence warning, not
+                # error, and no exception.
+                log.warning(
+                    f"rndc_{switch}_failed",
+                    desired=desired,
+                    stderr=res.stderr.strip(),
+                )
 
     def rendered_zone_views(self) -> list[tuple[str, str | None]]:
         """``(zone_name, view_name)`` for every zone file we just rendered.
