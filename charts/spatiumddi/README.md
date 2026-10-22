@@ -209,6 +209,46 @@ dhcpAgents:
       hostNetwork: true
 ```
 
+### GitOps with `helm template` (Argo CD)
+
+Controllers that render the chart with `helm template` instead of
+installing it, such as Argo CD, need two adjustments. Flux's
+`HelmRelease` performs a real Helm install, so it needs neither.
+
+**The migrate Job.** Its name carries `.Release.Revision` so each
+`helm upgrade` creates a fresh Job, since a Job's pod template is
+immutable. Under `helm template` the revision is always `1`, so the Job is
+`<release>-migrate-r1` on every sync, and the first image bump fails with
+`spec.template: field is immutable` until the old Job is deleted by hand.
+Make it a sync hook instead, so it is deleted and recreated on every sync:
+
+```yaml
+migrate:
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+```
+
+Alembic is idempotent, so re-running it on every sync is safe, and a hook
+no longer counts towards the application's sync status. Plain
+`helm install` / `helm upgrade` ignore these annotations.
+
+**Generated secrets.** The chart generates its secrets on first install
+and keeps them across upgrades with `lookup()`. `helm template` has no
+cluster to look in, so `lookup()` returns nothing and every render
+generates new values. The controller then sees a changed Secret on every
+sync, and applying it rotates the application key and database password
+under a running install. Pre-create the secrets and point the chart at
+them:
+
+| Value | Secret must carry |
+|-------|-------------------|
+| `auth.existingSecret` | `secret-key` (and optionally `metrics-token`) |
+| `postgresql.auth.existingSecret` | `password`. With `postgresql.kind: cnpg`, the Secret must be type `kubernetes.io/basic-auth` with both `username` and `password`, because CNPG bootstraps the database user from it |
+| `redis.auth.existingSecret` | `redis-password` (only when `redis.auth.enabled=true`) |
+| `dnsAgents.agentKey.existingSecret` | `DNS_AGENT_KEY` (when `dnsAgents.enabled`) |
+| `dhcpAgents.agentKey.existingSecret` | `SPATIUM_AGENT_KEY` (when `dhcpAgents.enabled`) |
+
 ## Values reference
 
 ### Top-level
@@ -258,7 +298,8 @@ dhcpAgents:
 | `worker.concurrency` | `4` |  |
 | `worker.queues` | `"ipam,dns,dhcp,default,bundles"` |  |
 | `beat.*` | see values.yaml | Singleton scheduler |
-| `migrate.enabled` | `true` | Alembic Job as pre-install/pre-upgrade hook |
+| `migrate.enabled` | `true` | Alembic Job, a regular Job named per revision (`<release>-migrate-r<revision>`), not a Helm hook |
+| `migrate.annotations` | `{}` | Annotations on the Job object (not its pod). For GitOps, see below |
 | `ingress.*` | disabled |  |
 
 ### Dependencies
@@ -290,7 +331,11 @@ Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
 DHCP Service, which is otherwise random. Only useful for a relay that can
 forward to a non-standard port: most, including `ip helper-address`, send
 to UDP/67 only, so use LoadBalancer or `hostNetwork` for those),
-`hostNetwork` (DHCP only), and `resources`.
+`hostNetwork` (DHCP only), `resources`, and, on DNS servers,
+`nodeSelector` and `tolerations`. DNS agents only *prefer* separate nodes,
+so after a node drain an agent can reschedule next to another one and stay
+there. Pin each server to a node (`nodeSelector: { kubernetes.io/hostname:
+node-a }`) to keep one agent per node behind a shared address.
 
 ## Upgrade
 
@@ -300,8 +345,11 @@ helm upgrade ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
   --namespace spatiumddi --reuse-values
 ```
 
-The migrate Job runs as a `pre-upgrade` hook, so Alembic applies
-before the new API pods roll out.
+The migrate Job is a regular Job named per revision, not a Helm hook. Each
+upgrade creates a new one, and the api, worker and beat pods wait for the
+schema in their `wait-for-migrate` init containers, so Alembic applies
+before the new pods start serving. Under `helm template` (GitOps), see
+[GitOps with `helm template`](#gitops-with-helm-template-argo-cd).
 
 ### Sentinel ghost entries clear themselves on upgrade
 

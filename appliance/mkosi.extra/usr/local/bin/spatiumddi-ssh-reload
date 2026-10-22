@@ -21,7 +21,8 @@
 #   1. LOCKOUT-SAFETY refuse — password auth off + zero authorized keys →
 #      abort + log, do NOT apply (host-side mirror of the server guard).
 #   2. Stage authorized_keys + sshd drop-in to /tmp.
-#   3. ``sshd -t -f <staged combined>`` config check; abort on fail.
+#   3. ``sshd -t -f <staged combined>`` config check; abort on fail. Runs
+#      through validate_sshd_config, which recreates /run/sshd first (#2054).
 #   4. Privileged-port in-use check for the configured port.
 #   5. Atomic install:
 #        ~admin/.ssh/authorized_keys   (0600, dir 0700, owned admin)
@@ -33,8 +34,9 @@
 #   7. Apply to sshd: restart ssh.service under socket activation (a reload
 #      re-execs sshd, which cannot bind the port ssh.socket holds, #1632),
 #      re-binding ssh.socket first when the port changed (rolled back, with
-#      the firewall fragment, if it cannot bind); otherwise reload. Success
-#      = the unit is active afterwards.
+#      the firewall fragment, if it cannot bind); otherwise reload, or start
+#      ssh.service when it is down (#2054). Success = the unit is active
+#      afterwards.
 #   8. Write the hash sidecar + the per-host applied key-count sidecar.
 #
 # Apply flow when disabled (the pristine default: password auth on, no
@@ -249,6 +251,20 @@ reload_sshd() {
         return 0
     fi
     # No socket activation: sshd listens by itself, a reload re-execs cleanly.
+    # A reload cannot START a failed or stopped unit ("not active, cannot
+    # reload"), so a down ssh.service is started instead: that is the repair
+    # this save exists to make (#2054). ssh.socket is inactive here when an
+    # operator stopped it or it hit its trigger limit.
+    if ! systemctl is-active --quiet ssh.service 2>/dev/null; then
+        if systemctl restart ssh.service >/dev/null 2>&1 \
+            && active_after_settle ssh.service; then
+            echo "  ✓ ssh.service started (it was not running)"
+            return 0
+        fi
+        echo "  ✗ ssh.service did not start"
+        systemctl status ssh.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+        return 1
+    fi
     if systemctl reload ssh.service >/dev/null 2>&1 \
         || systemctl reload sshd.service >/dev/null 2>&1; then
         if active_after_settle ssh.service; then
@@ -307,6 +323,23 @@ echo "  hash:       ${HASH:-<empty>}"
 echo "  ssh_port:   ${SSH_PORT:-22}"
 echo "  pw_auth:    ${PW_AUTH:-1}"
 echo "  ak_len:     ${AK_LEN:-0}"
+
+# sshd -t needs the privilege-separation directory. On Debian that is
+# /run/sshd, which ssh.service creates as its RuntimeDirectory (root:root
+# 0755, RuntimeDirectoryPreserve=no) and removes when the unit stops or
+# fails -- so while ssh.service is down, `sshd -t` fails on the missing
+# directory and the restart that would repair the unit is never reached
+# (#2054). Create it the way the unit would. systemd adopts an existing
+# directory and re-applies its mode when it next starts the unit, so this
+# does not fight RuntimeDirectory management.
+validate_sshd_config() {
+    local conf="$1" log="$2"
+    local privsep="${SSHD_PRIVSEP_DIR:-/run/sshd}"
+    if [ ! -d "$privsep" ]; then
+        mkdir -p "$privsep" && chmod 0755 "$privsep" || true
+    fi
+    sshd -t -f "$conf" >"$log" 2>&1
+}
 
 fail() {
     echo "  ✗ $1"
@@ -368,7 +401,7 @@ PYEOF
         trap 'rm -f "$BODY_TMP" "$AK_TMP" "$SSHD_TMP" "$TEST_CONF"; rm -rf "$STAGE_DIR"' EXIT
         grep -iE '^[[:space:]]*HostKey' /etc/ssh/sshd_config > "$TEST_CONF" 2>/dev/null || true
         cat "$STAGE_DIR/spatiumddi.conf" >> "$TEST_CONF"
-        if ! sshd -t -f "$TEST_CONF" >/tmp/spatium-sshd-validate.log 2>&1; then
+        if ! validate_sshd_config "$TEST_CONF" /tmp/spatium-sshd-validate.log; then
             echo "  ✗ sshd -t failed for staged config:"
             sed 's/^/      /' /tmp/spatium-sshd-validate.log
             fail "sshd config validation failed"

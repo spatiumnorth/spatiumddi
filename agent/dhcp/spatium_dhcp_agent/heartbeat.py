@@ -5,18 +5,26 @@ from __future__ import annotations
 import os
 import random
 import threading
+import time
 from typing import Any
 
 import httpx
 import structlog
 
 from . import __version__, kea_ctrl
+from .bootstrap import reauthenticate
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
+from .ha_tls import AGENT_CAPABILITIES
+from .oom_watch import OomWatch
 from .spool import SpoolManager
 
 log = structlog.get_logger(__name__)
+
+# How long a control plane that refused ``capabilities`` (it predates the
+# field) is left alone before the field is offered again.
+CAPABILITIES_RETRY_SECONDS = 600.0
 
 
 class HeartbeatClient:
@@ -30,6 +38,9 @@ class HeartbeatClient:
         self.token_ref = token_ref
         self._stop = threading.Event()
         self.daemon_status: dict[str, Any] = {}
+        # #2023 — the supervisor sets this. A standing OOM record outranks
+        # ``daemon_status`` on the wire (see ``_wire_daemon``).
+        self.oom_watch: OomWatch | None = None
         # #882 — set by SyncLoop (constructed after this object, assigns itself
         # in). Rides the heartbeat's ``config`` field so the control plane can
         # tell a Kea that is up but running a REVERTED config apart from one
@@ -49,6 +60,14 @@ class HeartbeatClient:
         # model is ``extra="forbid"`` and predates #1077. Dropping the field
         # keeps the agent's liveness signal alive across the version skew.
         self._spool_field_unsupported = False
+        # Same skew handling for ``capabilities``, with one difference: it is
+        # what opens the HA peer-credential gate, so the field is offered
+        # again every CAPABILITIES_RETRY_SECONDS rather than dropped for the
+        # life of the process. During a rolling upgrade this agent can come up
+        # while an older api pod still answers, and the control plane is then
+        # upgraded under it without the agent re-registering — a latched drop
+        # would keep the gate shut until something restarted the agent.
+        self._capabilities_retry_at = 0.0
 
     def stop(self) -> None:
         self._stop.set()
@@ -77,16 +96,29 @@ class HeartbeatClient:
             self._kea_version_cached = kea_ctrl.version_get(self.cfg.kea_control_socket)
         return self._kea_version_cached
 
+    def _wire_daemon(self) -> dict[str, Any]:
+        """The ``daemon`` field to send: an OOM record (#2023) when one
+        stands, else the sync loop's own status.
+
+        An overlay rather than a ``daemon_status`` assignment because the sync
+        loop writes ``{"status": "ok"}`` after every good reload, and a Kea
+        that was just killed reloads fine: an assignment would be erased on the
+        next apply, and an apply succeeding says nothing about whether Kea then
+        survives its config."""
+        oom = self.oom_watch.daemon_status() if self.oom_watch is not None else None
+        return oom if oom is not None else self.daemon_status
+
     def send_once(self) -> None:
         # Drain queued op acks (queued by SyncLoop when bundle includes pending_ops).
         ops_ack: list[dict] = []
         while self.pending_acks:
             ops_ack.append(self.pending_acks.pop(0))
+        daemon = self._wire_daemon()
         body: dict[str, Any] = {
             "agent_version": __version__,
             "pid": os.getpid(),
-            "status": self.daemon_status.get("status", "ok"),
-            "daemon": self.daemon_status,
+            "status": daemon.get("status", "ok"),
+            "daemon": daemon,
             # #882 — last config-apply verdict. The server's request model has
             # declared a ``config`` field since the beginning; until now the
             # DHCP agent never sent one and the handler never read one.
@@ -101,6 +133,8 @@ class HeartbeatClient:
             # treat that as "unknown", never as "old".
             "kea_version": self._kea_version(),
         }
+        if time.monotonic() >= self._capabilities_retry_at:
+            body["capabilities"] = list(AGENT_CAPABILITIES)
         if self.spool_manager is not None and not self._spool_field_unsupported:
             try:
                 body["spool"] = self.spool_manager.status()
@@ -111,6 +145,7 @@ class HeartbeatClient:
         # supervisor's heartbeat (one producer instead of three).
         # The DHCP service container drops the host bind mounts in C1
         # so it can no longer read those signals anyway.
+        sent_token = self.token_ref[0]
         try:
             with self._client() as c:
                 resp = c.post(
@@ -118,6 +153,21 @@ class HeartbeatClient:
                     json=body,
                     headers={"Authorization": f"Bearer {self.token_ref[0]}"},
                 )
+                if (
+                    resp.status_code == 422
+                    and "capabilities" in body
+                    and "capabilities" in resp.text
+                ):
+                    log.warning("heartbeat_capabilities_field_unsupported")
+                    self._capabilities_retry_at = (
+                        time.monotonic() + CAPABILITIES_RETRY_SECONDS
+                    )
+                    body.pop("capabilities")
+                    resp = c.post(
+                        "/api/v1/dhcp/agents/heartbeat",
+                        json=body,
+                        headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                    )
                 if resp.status_code == 422 and "spool" in body and "spool" in resp.text:
                     log.warning("heartbeat_spool_field_unsupported")
                     self._spool_field_unsupported = True
@@ -135,11 +185,11 @@ class HeartbeatClient:
                     save_token(self.cfg.state_dir, rotated)
                     log.info("dhcp_agent_token_rotated")
             elif resp.status_code in (401, 404):
-                # Token invalidated or server row deleted — clear token and
-                # exit so supervisor restarts the container (→ re-bootstrap).
+                # Token invalidated or server row deleted (#2052): re-register
+                # from the PSK in this thread. Stopping it made the supervisor
+                # exit the container and take Kea down with the agent.
                 log.warning("heartbeat_will_rebootstrap", status=resp.status_code)
-                save_token(self.cfg.state_dir, "")
-                self._stop.set()
+                reauthenticate(self.cfg, self.token_ref, sent_token)
             else:
                 log.warning("heartbeat_failed", status=resp.status_code)
         except httpx.HTTPError as e:

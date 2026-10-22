@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings as _app_settings
 from app.core.crypto import decrypt_dict, decrypt_str
 from app.models.event_subscription import EventOutbox, EventSubscription
+from app.services.audit_redact import redact_audit_payload
 
 logger = structlog.get_logger(__name__)
 
@@ -84,7 +85,13 @@ async def _deliver_one(
     """POST one outbox row. Returns ``(status_code | None, error | None)``."""
     import json as _json
 
-    body_bytes = _json.dumps(row.payload, separators=(",", ":"), default=str).encode("utf-8")
+    # ``_serialize_audit`` redacts on the way into the outbox (#2015); this
+    # second pass covers rows queued before that, and any future writer of
+    # the outbox. Idempotent, and on a copy — the outbox row is unchanged.
+    payload = row.payload
+    if isinstance(payload, dict):
+        payload = redact_audit_payload(payload)
+    body_bytes = _json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
     ts = str(int(time.time()))
     headers: dict[str, str] = {
         "Content-Type": "application/json",

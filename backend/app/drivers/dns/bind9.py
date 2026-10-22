@@ -24,6 +24,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoes
 
 from app.core.dns_names import strip_control_chars
 from app.drivers.dns._axfr import resolve_server_address
+from app.drivers.dns._forwarders import bind_zone_forwarders, bind_zone_tls_statement
 from app.drivers.dns._txt import quote_txt as _quote_txt
 from app.drivers.dns.base import (
     ConfigBundle,
@@ -142,6 +143,38 @@ def _redirect_rdata(target: str) -> str | None:
     return f"{'AAAA' if ip.version == 6 else 'A'} {ip}"
 
 
+#: What a ``sinkhole`` list answers with when it names no address of a
+#: family (#2124): the unspecified address, as every DNS sinkhole does.
+DEFAULT_SINKHOLE_V4 = "0.0.0.0"
+DEFAULT_SINKHOLE_V6 = "::"
+
+
+def _sinkhole_rdatas(sinkhole_ip: str | None) -> tuple[str, ...]:
+    """RPZ local data for a ``sinkhole`` entry: an A *and* an AAAA (#2124).
+
+    The list's ``sinkhole_ip`` replaces the default of its own family and
+    the other family keeps the unspecified address, so both lookups fail
+    fast. A value that is not an IP address falls back to the defaults
+    rather than reaching the rdata, where BIND would refuse the whole zone.
+
+    Mirrors ``sinkhole_rdatas`` in the DNS agent's BIND9 driver — the two
+    implement one contract and must not diverge (#878).
+    """
+    v4, v6 = DEFAULT_SINKHOLE_V4, DEFAULT_SINKHOLE_V6
+    text = str(sinkhole_ip).strip() if sinkhole_ip is not None else ""
+    if text:
+        try:
+            ip = ipaddress.ip_address(text)
+        except ValueError:
+            pass  # unusable: answer with the defaults, as the agent does
+        else:
+            if ip.version == 6:
+                v6 = str(ip)
+            else:
+                v4 = str(ip)
+    return (f"A {v4}", f"AAAA {v6}")
+
+
 def _render_update_clause(zone: ZoneData) -> str:
     """Coarse ``allow-update`` or fine ``update-policy`` clause for the
     preview / agentless render path (issue #641). Operator entries only —
@@ -183,6 +216,15 @@ def _render_update_clause(zone: ZoneData) -> str:
         elif e.match_kind == "tsig_key" and e.tsig_key_name:
             items.append(f'key "{e.tsig_key_name}";')
     return f"allow-update {{ {' '.join(items)} }};" if items else ""
+
+
+def _zone_forward_view(zone: ZoneData) -> dict[str, Any]:
+    """The bundle-shaped mapping ``_forwarders`` reads, from a ``ZoneData``."""
+    return {
+        "forwarders": list(zone.forwarders),
+        "forward_transport": zone.forward_transport,
+        "forward_tls_hostname": zone.forward_tls_hostname,
+    }
 
 
 class BIND9Driver(DNSDriver):
@@ -228,6 +270,16 @@ class BIND9Driver(DNSDriver):
         # zone name appears once per view, so a name-only key would collapse
         # the copies and drop all but one view's stanza from the preview.
         zone_stanzas = {(z.view_name, z.name): self.render_zone_config(z) for z in zones}
+        # One ``tls`` statement per upstream hostname a TLS forward zone uses
+        # (#2121), rendered above ``options`` exactly as the agent does.
+        zone_tls_hosts = {
+            host
+            for z in zones
+            if z.zone_type == "forward"
+            for host in [bind_zone_forwarders(_zone_forward_view(z))[1]]
+            if host
+        }
+        zone_tls_statements = "".join(bind_zone_tls_statement(h) for h in sorted(zone_tls_hosts))
 
         return tmpl.render(
             server_id=str(server_id),
@@ -244,6 +296,7 @@ class BIND9Driver(DNSDriver):
             blocklists=blocklists,
             dnssec_policies=dnssec_policies,
             zone_stanzas=zone_stanzas,
+            zone_tls_statements=zone_tls_statements,
             # Issue #50 — this preview renders from ``ServerOptions`` alone,
             # which carries the operator's intent but not the cert material
             # (that only exists in the agent-facing bundle). Assume the cert
@@ -258,7 +311,21 @@ class BIND9Driver(DNSDriver):
     def render_zone_config(self, zone: ZoneData) -> str:
         env = _env()
         tmpl = env.get_template("zone.stanza.j2")
-        return tmpl.render(zone=zone, update_clause=_render_update_clause(zone))
+        forwarder_tokens: list[str] = []
+        if zone.zone_type == "forward":
+            # Same helper as the agent (#2121), so a forward zone renders the
+            # ZONE's transport, and ``ip@port`` renders as ``ip port n``
+            # rather than the unloadable ``ip@port`` the template emitted
+            # verbatim. A zone the agent would skip (no usable forwarder, or a
+            # transport BIND cannot speak) renders nothing here either.
+            forwarder_tokens, _host, refusal = bind_zone_forwarders(_zone_forward_view(zone))
+            if refusal or not forwarder_tokens:
+                return ""
+        return tmpl.render(
+            zone=zone,
+            update_clause=_render_update_clause(zone),
+            forwarder_tokens=forwarder_tokens,
+        )
 
     def render_zone_file(self, zone: ZoneData, records: list[RecordData]) -> str:
         env = _env()
@@ -317,13 +384,19 @@ class BIND9Driver(DNSDriver):
                 rewrite = _redirect_rdata(e.target)
                 if rewrite is None:
                     continue
-                rdata = rewrite
-            elif e.block_mode == "sinkhole" and e.sinkhole_ip:
-                rdata = f"A {e.sinkhole_ip}"
-            elif e.block_mode == "refused":
-                rdata = "CNAME rpz-drop."
-            else:  # nxdomain (default)
-                rdata = "CNAME ."
+                rdatas: tuple[str, ...] = (rewrite,)
+            elif e.block_mode == "sinkhole":
+                # A + AAAA local data, whether or not the list names an
+                # address (#2124). This used to need ``sinkhole_ip`` set and
+                # otherwise fell through to NXDOMAIN, while the agent
+                # rendered ``rpz-drop`` — two renderers, two policies.
+                rdatas = _sinkhole_rdatas(e.sinkhole_ip)
+            else:  # nxdomain, and a legacy ``refused`` (#2124)
+                # BIND's RPZ has no REFUSED action. ``refused`` used to
+                # render ``rpz-drop`` here and NXDOMAIN on the agent; the
+                # API no longer accepts it and migration rewrote stored
+                # rows to ``nxdomain``, which is what the agent served.
+                rdatas = ("CNAME .",)
             # A wildcard entry emits `*.<domain>` *in addition to* the bare
             # name: an RPZ wildcard matches subdomains ONLY, so a
             # `*.example.com`-only rule leaves the apex resolving. Same two
@@ -331,9 +404,9 @@ class BIND9Driver(DNSDriver):
             # row is wildcard, so emitting only the star would stop blocking
             # the very domain the feed names.
             seen.add(dom)
-            rendered.append(f"{dom} IN {rdata}")
+            rendered.extend(f"{dom} IN {rdata}" for rdata in rdatas)
             if e.is_wildcard:
-                rendered.append(f"*.{dom} IN {rdata}")
+                rendered.extend(f"*.{dom} IN {rdata}" for rdata in rdatas)
 
         # Fixed SOA serial derived from blocklist size keeps this deterministic.
         serial = max(1, len(blocklist.entries))

@@ -338,10 +338,10 @@ def run(cfg: AgentConfig) -> int:
                         note="start_daemon spawned nothing (no rendered config yet); "
                         "the sync loop launches the daemon after the first bundle",
                     )
-        # If any critical thread died (e.g. the sync loop dropped its
-        # token after a 401/404 and self-stopped), exit so the container
-        # orchestrator restarts us — bootstrap then re-registers from
-        # PSK with a fresh empty token cache.
+        # If any critical thread died, exit so the container orchestrator
+        # restarts us. A 401/404 is not a death: the sync and heartbeat
+        # threads re-register in process (#2052), so the daemon serving from
+        # cache is never taken down for one.
         dead = [t.name for t in threads if not t.is_alive()]
         if dead and not stopping.is_set():
             log.error("dns_agent_thread_died", threads=dead)

@@ -520,11 +520,50 @@ def delete_node(name: str) -> tuple[bool, str | None]:
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+@dataclass
+class RedisReclaim:
+    """What one Redis sweep did (#2404). ``reclaimed``: the claims whose
+    DELETE landed this sweep; ``terminating``: claims an earlier sweep
+    deleted that pvc-protection still holds (their pod DELETE is retried,
+    they are not counted again); ``nodes``: the hostnames the reclaimed
+    claims were pinned to; ``sources``: per reclaimed claim, whether the
+    bound PV's node affinity (``pv``) or the scheduler's selected-node
+    annotation (``annotation``) decided it was stranded."""
+
+    reclaimed: list[str] = field(default_factory=list)
+    error: str | None = None
+    terminating: list[str] = field(default_factory=list)
+    nodes: list[str] = field(default_factory=list)
+    sources: dict[str, str] = field(default_factory=dict)
+
+    def __iter__(self):
+        # ``reclaimed, err = ...``, the shape #590's callers unpack.
+        yield self.reclaimed
+        yield self.error
+
+
+_REDIS_CLAIM_MARK = "-redis-"
+_PENDING_PODS_QUERY = f"?fieldSelector={quote('status.phase=Pending')}"
+
+
+def _waits_on_redis_claim(pod: dict) -> bool:
+    """A Pending pod that mounts a ``-redis-`` claim. A stranded claim's
+    replica always is one: the scheduler cannot place it."""
+    if ((pod or {}).get("status") or {}).get("phase") != "Pending":
+        return False
+    for volume in ((pod or {}).get("spec") or {}).get("volumes") or []:
+        claim = ((volume or {}).get("persistentVolumeClaim") or {}).get("claimName")
+        if _REDIS_CLAIM_MARK in str(claim or ""):
+            return True
+    return False
+
+
 def reclaim_stranded_redis_storage(
-    node: str, namespace: str = "spatium"
-) -> tuple[list[str], str | None]:
+    evicted_nodes: str | Iterable[str] = (), namespace: str = "spatium"
+) -> RedisReclaim:
     """Delete Redis PVCs (and their Pending consumer pods) stranded on a
-    just-deleted node — returns (reclaimed_pvc_names, error).
+    node that no longer exists. Returns a :class:`RedisReclaim`, which
+    unpacks as ``(reclaimed_pvc_names, error)``.
 
     #590 — local-path PVs are node-affine, so evicting a dead node
     permanently strands every ReadWriteOnce PVC provisioned on it: the
@@ -547,46 +586,120 @@ def reclaim_stranded_redis_storage(
     :func:`reclaim_stranded_postgres_storage` (#1058). The PVC goes first
     (pvc-protection holds it until its pod is gone), then the pod — the
     StatefulSet then recreates both and the provisioner lands the new PV
-    on a live node."""
+    on a live node.
+
+    #2404: level-triggered, like the Postgres reclaim (#1058). #590 ran
+    this once, on the tick whose Node DELETE succeeded, keyed on the name
+    it was given, and nothing looked again: the eviction loop skips a name
+    it has handled for as long as the backend lists it, and the backend
+    stops listing it once etcd drops the member. An error answer on that
+    tick, a Node removed any other way, or a name sent in another form than
+    the claim's annotation left the claim stranded for good (on a fresh
+    three-node cluster, Redis still ran two of three 37 minutes after a
+    replace). The seed calls it on every tick now:
+
+    * ``evicted_nodes``: the names the caller deleted this tick, and any a
+      failed sweep left owed (a bare name is one node). They are
+      authoritative, as for Postgres: their claims go at once, with no
+      Node read (the DELETE is milliseconds old and the Node can still be
+      listed).
+    * otherwise one read, the namespace's Pending pods. Only while a pod
+      that mounts a ``-redis-`` claim is Pending does the sweep read the
+      Node list, and it reclaims each claim whose every pinned hostname
+      the list no longer carries. NotReady is not gone: a claim whose node
+      is still a Node is left alone, because that node can come back with
+      its data.
+
+    Where a claim lives is read as for Postgres and the mirror
+    (:func:`_pvc_pinned_hostnames`): the bound PV's node affinity, the
+    selected-node annotation only when there is no PV, and a PV read that
+    fails is an error, never a guess. A claim an earlier sweep deleted is
+    reported ``terminating``, not reclaimed again, and its pod DELETE is
+    retried."""
+    names = [evicted_nodes] if isinstance(evicted_nodes, str) else list(evicted_nodes)
+    # #1757: k3s registers the host's name lowercased, as delete_node sends it.
+    forced = {str(n).strip().rstrip(".").lower() for n in names if n} - {""}
     base = f"/api/v1/namespaces/{quote(namespace)}"
+    live: set[str] | None = None
+    if not forced:
+        try:
+            status, resp = _request("GET", f"{base}/pods{_PENDING_PODS_QUERY}")
+        except (RuntimeError, OSError) as exc:
+            return RedisReclaim(error=str(exc))
+        if status != 200:
+            return RedisReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
+        try:
+            pending = json.loads(resp).get("items") or []
+        except (ValueError, AttributeError):
+            return RedisReclaim(error="unparseable pod list")
+        if not any(_waits_on_redis_claim(pod) for pod in pending):
+            return RedisReclaim()
+        listed, nodes_err = cluster_node_names()
+        if listed is None:
+            return RedisReclaim(error=nodes_err)
+        live = set(listed)
+
     try:
         status, resp = _request("GET", f"{base}/persistentvolumeclaims")
-    except RuntimeError as exc:
-        return [], str(exc)
+    except (RuntimeError, OSError) as exc:
+        return RedisReclaim(error=str(exc))
     if status != 200:
-        return [], f"kubeapi status {status}: {resp[:200]!r}"
+        return RedisReclaim(error=f"kubeapi status {status}: {resp[:200]!r}")
     try:
         items = json.loads(resp).get("items", [])
-    except ValueError:
-        return [], "unparseable PVC list"
-    reclaimed: list[str] = []
+    except (ValueError, AttributeError):
+        return RedisReclaim(error="unparseable PVC list")
+    out = RedisReclaim()
+    gone: set[str] = set()
     for pvc in items:
         meta = pvc.get("metadata") or {}
         name = str(meta.get("name") or "")
-        anns = meta.get("annotations") or {}
-        if "-redis-" not in name:
+        if _REDIS_CLAIM_MARK not in name:
             continue
-        if anns.get("volume.kubernetes.io/selected-node") != node:
+        pinned, source, pin_err = _pvc_pinned_hostnames(pvc)
+        if pin_err:
+            out.error = f"{name}: {pin_err}"
+            break
+        # Stranded: every hostname the volume is pinned to is gone, i.e. one
+        # the caller evicted, or (on a sweep) one the Node list no longer has.
+        if not pinned or not all(
+            host in forced or (live is not None and host not in live) for host in pinned
+        ):
             continue
-        try:
-            status, resp = _request(
-                "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}"
-            )
-        except RuntimeError as exc:
-            return reclaimed, str(exc)
-        if status not in (200, 202, 404):
-            return reclaimed, f"kubeapi status {status}: {resp[:200]!r}"
+        if meta.get("deletionTimestamp"):
+            out.terminating.append(name)
+        else:
+            try:
+                status, resp = _request(
+                    "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}"
+                )
+            except (RuntimeError, OSError) as exc:
+                out.error = str(exc)
+                break
+            if status not in (200, 202, 404):
+                out.error = f"kubeapi status {status}: {resp[:200]!r}"
+                break
+            if status != 404:  # 404: gone between the list and the delete
+                out.reclaimed.append(name)
+                out.sources[name] = source
+                gone |= pinned
         # volumeClaimTemplate name is the prefix: data-<pod-name>. Delete
         # the Pending pod so the StatefulSet recreates it against a fresh
-        # claim (an existing pod keeps referencing the deleted PVC).
+        # claim (an existing pod keeps referencing the deleted PVC). A
+        # refusal is reported, so the heartbeat keeps the node owed and the
+        # next tick retries it; a pod that is already gone (404) is the goal.
         pod = name.partition("-")[2]
         if pod:
             try:
-                _request("DELETE", f"{base}/pods/{quote(pod)}")
-            except RuntimeError:
-                pass  # pod may not exist; the PVC reclaim is what matters
-        reclaimed.append(name)
-    return reclaimed, None
+                status, resp = _request("DELETE", f"{base}/pods/{quote(pod)}")
+            except (RuntimeError, OSError) as exc:
+                out.error = f"pod {pod}: {exc}"
+                break
+            if status not in (200, 202, 404):
+                out.error = f"pod {pod}: kubeapi status {status}: {resp[:200]!r}"
+                break
+    out.nodes = sorted(gone)
+    return out
 
 
 # #1541 — the slot-image mirror's claim, stranded on an evicted node.
@@ -1938,6 +2051,44 @@ def patch_node_labels(
     if status in (200, 201):
         return True, None
     return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
+def daemonset_template_env(
+    name: str,
+    *,
+    env_name: str,
+    namespace: str = "spatium",
+    timeout: float = 5.0,
+) -> tuple[bool | None, str | None, str | None]:
+    """``(exists, value, error)``: the literal ``env_name`` of a DaemonSet's pod
+    TEMPLATE, i.e. what a pod scheduled onto a node right now would start with.
+
+    #2190 — the role apply reads this before it labels a node for a role, so a
+    label flip cannot start a pod from the previous chart revision's values.
+    ``exists`` is ``False`` on a 404 (nothing to schedule from) and ``None``
+    when the read failed (``error`` says why). ``value`` is the first literal
+    ``value`` any container sets for ``env_name``, ``None`` when none does."""
+    path = f"/apis/apps/v1/namespaces/{quote(namespace)}/daemonsets/{quote(name)}"
+    try:
+        status, body = _request("GET", path, timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        return None, None, str(exc)
+    if status == 404:
+        return False, None, None
+    if status != 200:
+        return None, None, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None, None, "unparseable daemonset"
+    if not isinstance(doc, dict):
+        return None, None, "unparseable daemonset"
+    pod_spec = ((doc.get("spec") or {}).get("template") or {}).get("spec") or {}
+    for container in pod_spec.get("containers") or []:
+        for env in (container or {}).get("env") or []:
+            if (env or {}).get("name") == env_name and "value" in env:
+                return True, str(env.get("value") or ""), None
+    return True, None, None
 
 
 def count_nodes(timeout: float = 5.0) -> tuple[int, int, str | None]:

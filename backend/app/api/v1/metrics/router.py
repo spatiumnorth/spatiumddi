@@ -20,12 +20,14 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
+from app.core.permissions import require_any_resource_permission, require_resource_permission
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
+from app.services.feature_modules import require_module
 
 router = APIRouter()
 
@@ -133,7 +135,17 @@ def _validate_window(window: str) -> None:
         )
 
 
-@router.get("/dns/timeseries", response_model=DNSTimeseries)
+# Each series reads the same grants as the server it describes: DNS server
+# traffic needs what the ``/dns`` router needs, DHCP traffic what the DHCP
+# server routes need.
+@router.get(
+    "/dns/timeseries",
+    response_model=DNSTimeseries,
+    dependencies=[
+        Depends(require_module("core.dns")),
+        Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record")),
+    ],
+)
 async def dns_timeseries(
     db: DB,
     _: CurrentUser,
@@ -192,7 +204,14 @@ async def dns_timeseries(
     return DNSTimeseries(window=window, bucket_seconds=bucket_s, points=points)
 
 
-@router.get("/dhcp/timeseries", response_model=DHCPTimeseries)
+@router.get(
+    "/dhcp/timeseries",
+    response_model=DHCPTimeseries,
+    dependencies=[
+        Depends(require_module("core.dhcp")),
+        Depends(require_resource_permission("dhcp_server")),
+    ],
+)
 async def dhcp_timeseries(
     db: DB,
     _: CurrentUser,

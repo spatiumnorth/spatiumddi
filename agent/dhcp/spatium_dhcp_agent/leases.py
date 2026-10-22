@@ -54,6 +54,7 @@ from typing import Any
 import httpx
 import structlog
 
+from .bootstrap import reauth_generation
 from .config import AgentConfig
 from .lease_snapshot import LeaseSnapshot
 from .push import CPPoster, disabled_spool, drain_for, late_bound
@@ -212,6 +213,13 @@ class LeaseWatcher:
         # and a lease untouched since Kea's last LFC is only in the .2 file.
         self.snapshot.request("agent_start")
         self.snapshot_v6.request("agent_start")
+        # #2052 — a re-registration in process lands on a NEW server row
+        # whose lease table is empty (the old row's leases went with it). A
+        # container restart used to cover that with the ``agent_start``
+        # snapshot above; now the watcher asks for one when it sees the
+        # generation move.
+        self._reauth_gen = reauth_generation()
+        self._reregistered = False
 
     def stop(self) -> None:
         self._stop.set()
@@ -301,6 +309,10 @@ class LeaseWatcher:
             self._recovered = False
             self.snapshot.request("control_plane_recovered")
             self.snapshot_v6.request("control_plane_recovered")
+        if self._reregistered:
+            self._reregistered = False
+            self.snapshot.request("agent_reregistered")
+            self.snapshot_v6.request("agent_reregistered")
         self.snapshot.step()
         self.snapshot_v6.step()
 
@@ -344,6 +356,10 @@ class LeaseWatcher:
 
     def tick(self) -> None:
         """One loop iteration: tail, flush, replay, snapshot."""
+        gen = reauth_generation()
+        if gen != self._reauth_gen:
+            self._reauth_gen = gen
+            self._reregistered = True
         self._tail(self.cfg.kea_lease_file, _parse_row, "_pending")
         self._tail(self.cfg.kea_lease_file_v6, _parse_row_v6, "_pending_v6")
         buffered = len(self._pending) + len(self._pending_v6)

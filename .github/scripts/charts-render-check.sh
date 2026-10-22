@@ -61,7 +61,8 @@
 #                      frontend retire first at one replica too, where the
 #                      blocking term rides on the OUTGOING pods (#1541).
 #   shared-env       — dedicated umbrella render: api, worker and beat all carry
-#                      every variable in ``sharedEnv``; api and worker carry
+#                      every variable in ``sharedEnv``, and APPLIANCE_VERSION
+#                      from ``applianceVersion`` (#2176); api and worker carry
 #                      the slot-image mirror URL / secret, beat and the mirror
 #                      itself do not (#1826).
 #                      The appliance's APPLIANCE_MODE reached only the api, so
@@ -310,13 +311,14 @@ render umbrella-shared-env "$UMBRELLA" \
     --set sharedEnv[0].name=APPLIANCE_MODE --set-string sharedEnv[0].value=true \
     --set sharedEnv[1].name=APPLIANCE_HOSTNAME --set sharedEnv[1].value=node1 \
     --set sharedEnv[2].name=APPLIANCE_HOST_IPS --set sharedEnv[2].value=10.0.0.1 \
-    --set sharedEnv[3].name=INITIAL_NTP_SERVERS --set sharedEnv[3].value=ntp.example
-echo "── shared env (umbrella, #1826)"
+    --set sharedEnv[3].name=INITIAL_NTP_SERVERS --set sharedEnv[3].value=ntp.example \
+    --set-string applianceVersion=0.0.0-nightly-20261019+abcdef1
+echo "── shared env (umbrella, #1826, #2176)"
 python3 "$ROOT/.github/scripts/chart-shared-env.py" \
     --expect VERSION --expect SECRET_KEY --expect DATABASE_URL --expect REDIS_URL \
     --expect CELERY_BROKER_URL \
     --expect APPLIANCE_MODE --expect APPLIANCE_HOSTNAME --expect APPLIANCE_HOST_IPS \
-    --expect INITIAL_NTP_SERVERS \
+    --expect INITIAL_NTP_SERVERS --expect APPLIANCE_VERSION \
     --expect-on api:SLOT_IMAGE_MIRROR_URL --expect-on api:SLOT_IMAGE_MIRROR_SECRET \
     --expect-on worker:SLOT_IMAGE_MIRROR_URL --expect-on worker:SLOT_IMAGE_MIRROR_SECRET \
     --absent beat:SLOT_IMAGE_MIRROR_SECRET \

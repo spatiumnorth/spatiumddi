@@ -1909,7 +1909,70 @@ def test_blocking_payload_prefers_custom_address_when_modes_disagree() -> None:
         )
     )
     assert out["blocking_type"] == "CustomAddress"
-    assert out["custom_addresses"] == ["10.0.0.1"]
+    # The v4 address, plus the v6 unspecified address so AAAA answers too
+    # (#2124 — the same answer the BIND9 renderer gives).
+    assert out["custom_addresses"] == ["10.0.0.1", "::"]
+
+
+def test_blocking_payload_sinkhole_without_an_address_is_any_address() -> None:
+    """#2124 — a sinkhole list with no per-entry target was CustomAddress
+    with nothing in it, which the apply step turns into NxDomain: the
+    sinkhole silently became a different mode. AnyAddress is Technitium's
+    name for 0.0.0.0 / ::, the BIND9 renderer's default."""
+    out = _blocking_payload(
+        _bl([{"domain": "b.test", "action": "block", "block_mode": "sinkhole"}])
+    )
+    assert out["blocking_type"] == "AnyAddress"
+    assert out["custom_addresses"] == []
+
+
+def test_blocking_payload_sinkhole_reads_the_lists_address() -> None:
+    """The list's ``sinkhole_ip`` (shipped since #2124) is the answer."""
+    v4 = _blocking_payload(
+        _bl(
+            [
+                {
+                    "domain": "b.test",
+                    "action": "block",
+                    "block_mode": "sinkhole",
+                    "sinkhole_ip": "192.0.2.53",
+                }
+            ]
+        )
+    )
+    assert v4["blocking_type"] == "CustomAddress"
+    assert v4["custom_addresses"] == ["192.0.2.53", "::"]
+    v6 = _blocking_payload(
+        _bl(
+            [
+                {
+                    "domain": "b.test",
+                    "action": "block",
+                    "block_mode": "sinkhole",
+                    "sinkhole_ip": "2001:db8::53",
+                }
+            ]
+        )
+    )
+    assert v6["custom_addresses"] == ["0.0.0.0", "2001:db8::53"]
+
+
+def test_blocking_payload_drops_an_unusable_sinkhole_address() -> None:
+    """Technitium would refuse the whole settings call over a bad address."""
+    out = _blocking_payload(
+        _bl(
+            [
+                {
+                    "domain": "b.test",
+                    "action": "block",
+                    "block_mode": "sinkhole",
+                    "sinkhole_ip": "not-an-ip",
+                }
+            ]
+        )
+    )
+    assert out["blocking_type"] == "AnyAddress"
+    assert out["custom_addresses"] == []
 
 
 def test_blocking_payload_collapses_per_view_lists() -> None:
@@ -3845,17 +3908,23 @@ def test_primary_converted_to_forwarder_gets_every_upstream_then_writes_nothing(
          "dns.internal"),
         # No hostname: nothing to validate against, left as written.
         ("9.9.9.9", {"forward_transport": "tls"}, "9.9.9.9"),
+        # #2121: an explicit @53 is plain DNS, never upgraded to DoT.
+        ("100.100.100.100@53",
+         {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"},
+         "100.100.100.100:53"),
+        ("100.100.100.100@53",
+         {"forward_transport": "https", "forward_tls_hostname": "dns.quad9.net"},
+         "100.100.100.100:53"),
     ],
 )
-def test_zone_forwarders_inherit_the_group_encrypted_transport(
+def test_zone_forwarders_follow_the_zone_transport(
     entry: str, options: dict[str, Any], expected: str
 ) -> None:
-    """BIND9 applies the group's forward transport to per-zone upstreams
-    (#50) and the Options tab says so; a plain-IP Technitium zone upstream in
-    a DoT group used to go out as cleartext UDP."""
+    """A forward zone's upstreams take the ZONE's own transport (#2121).
+    ``options`` here is the zone dict as the bundle ships it."""
     from spatium_dns_agent.drivers.technitium import _forwarder_protocol, _zone_forwarder
 
-    out = _zone_forwarder(entry, options)
+    out = _zone_forwarder(entry, {"name": "f.test.", "type": "forward", **options})
     assert out == expected
     if "://" not in entry and "://" in out:
         assert _forwarder_protocol(out) == _FORWARDER_PROTOCOLS_FOR_TEST[
@@ -3865,12 +3934,55 @@ def test_zone_forwarders_inherit_the_group_encrypted_transport(
 _FORWARDER_PROTOCOLS_FOR_TEST = {"tls": "Tls", "https": "Https", "quic": "Quic"}
 
 
-def test_render_pairs_zone_forwarders_with_the_group_tls_name(tmp_path: Path) -> None:
+_DOT_GROUP = {"forward_transport": "tls", "forward_tls_hostname": "cloudflare-dns.com",
+              "forwarders": ["1.1.1.1", "1.0.0.1"]}
+
+
+def test_render_pairs_zone_forwarders_with_the_zone_tls_name(tmp_path: Path) -> None:
+    """A TLS zone is paired with ITS hostname, not the group's (#2121)."""
     calls = _apply_with_calls(
         tmp_path,
-        {"zones": [{"name": "f.test.", "type": "forward", "forwarders": ["9.9.9.9"]}],
-         "options": {"forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net",
-                     "forwarders": ["9.9.9.9"]}},
+        {"zones": [{"name": "f.test.", "type": "forward", "forwarders": ["9.9.9.9"],
+                    "forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"}],
+         "options": _DOT_GROUP},
+    )
+    create = [c for c in calls if c[2] == "zones/create" and c[3].get("zone") == "f.test"][0]
+    assert create[3]["forwarder"] == "tls://dns.quad9.net (9.9.9.9)"
+    assert create[3]["protocol"] == "Tls"
+
+
+@pytest.mark.parametrize(
+    "zone_extra",
+    [
+        # Bundle from a control plane older than #2121: no key at all.
+        {},
+        {"forward_transport": "do53", "forward_tls_hostname": None},
+    ],
+)
+def test_a_do53_zone_in_a_dot_group_forwards_plain_dns(
+    tmp_path: Path, zone_extra: dict[str, Any]
+) -> None:
+    """The tailnet case (#2121): the group forwards to Cloudflare over DoT and
+    a forward zone points at Tailscale's MagicDNS, which answers plain DNS on
+    53 only. The zone must NOT inherit the group's DoT."""
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [{"name": "example-tailnet.ts.net.", "type": "forward",
+                    "forwarders": ["100.100.100.100"], **zone_extra}],
+         "options": _DOT_GROUP},
+    )
+    create = [c for c in calls if c[2] == "zones/create"
+              and c[3].get("zone") == "example-tailnet.ts.net"][0]
+    assert create[3]["forwarder"] == "100.100.100.100"
+    assert create[3]["protocol"] == "Udp"
+
+
+def test_a_tls_zone_in_a_do53_group_forwards_over_tls(tmp_path: Path) -> None:
+    calls = _apply_with_calls(
+        tmp_path,
+        {"zones": [{"name": "f.test.", "type": "forward", "forwarders": ["9.9.9.9"],
+                    "forward_transport": "tls", "forward_tls_hostname": "dns.quad9.net"}],
+         "options": {"forwarders": ["10.0.0.1"]}},
     )
     create = [c for c in calls if c[2] == "zones/create" and c[3].get("zone") == "f.test"][0]
     assert create[3]["forwarder"] == "tls://dns.quad9.net (9.9.9.9)"
@@ -4423,3 +4535,26 @@ def test_forwarder_stale_delete_of_a_gone_record_is_not_a_failure(tmp_path: Path
     d._apply_failures = []
     d._sync_forwarder_records("t", "f.test", [("192.0.2.53", "Udp", 0)], None)
     assert d._apply_failures == []
+
+
+def test_blocking_payload_keeps_a_name_another_list_blocks_and_a_feed_excepts() -> None:
+    """#2123 / #2124: the control plane ships only the feed carve-outs no
+    other list blocks (``c.feed.test``). The operator's ``x.example.test``,
+    which an AdGuard-style feed ``@@``-excepts, is NOT in the exceptions, so
+    it stays in the blocked set and out of the allowed one."""
+    out = _blocking_payload(
+        _bl(
+            [
+                {"domain": "x.example.test", "action": "block", "block_mode": "nxdomain"},
+                {
+                    "domain": "feed.test",
+                    "action": "block",
+                    "block_mode": "nxdomain",
+                    "is_wildcard": True,
+                },
+            ],
+            ["c.feed.test"],
+        )
+    )
+    assert "x.example.test" in out["blocked"]
+    assert out["allowed"] == ["c.feed.test"]

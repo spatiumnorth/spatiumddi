@@ -96,6 +96,17 @@ spec:
                     app.kubernetes.io/name: {{ include "spatiumddi.name" $root }}
                     app.kubernetes.io/component: dns-agent
                 topologyKey: kubernetes.io/hostname
+      {{- /* Per-server placement. The spread above is only preferred, so
+             after a node drain an agent moves and stays co-located; pin a
+             server to a node (kubernetes.io/hostname) to keep one per node. */}}
+      {{- with $server.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $server.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with $root.Values.image.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

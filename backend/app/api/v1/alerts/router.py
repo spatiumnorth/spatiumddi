@@ -22,8 +22,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, select, update
 
-from app.api.deps import DB, CurrentUser
-from app.core.permissions import is_effective_superadmin
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.update_nulls import resolve_update_changes
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
@@ -305,14 +304,6 @@ class EvaluateResponse(BaseModel):
 # ── Rules ──────────────────────────────────────────────────────────────────
 
 
-def _require_superadmin(current_user: CurrentUser) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Superadmin required to manage alerts",
-        )
-
-
 @router.get("/rules", response_model=list[AlertRuleResponse])
 async def list_rules(db: DB, current_user: CurrentUser) -> list[AlertRule]:
     res = await db.execute(select(AlertRule).order_by(AlertRule.name))
@@ -320,18 +311,29 @@ async def list_rules(db: DB, current_user: CurrentUser) -> list[AlertRule]:
 
 
 @router.get("/rule-types", response_model=list[RuleTypeSpec])
-async def list_rule_types(current_user: CurrentUser) -> list[RuleTypeSpec]:
+async def list_rule_types(db: DB, current_user: CurrentUser) -> list[RuleTypeSpec]:
     """Every rule type, its label, and the parameters its evaluator reads (#1997).
 
     Same access as listing rules: any authenticated user. The editor renders
     from this instead of a hand-kept list that had drifted to 23 of ~64.
+
+    A type whose feature module is off is left out (#2130): the evaluator
+    never runs it (``_RULE_TYPE_MODULE``), so offering it would let an
+    operator create a rule that can never fire. Rules already stored keep
+    working and stay listed by ``GET /rules``.
     """
-    return build_catalogue()
+    from app.services import feature_modules
+
+    enabled = await feature_modules.get_enabled_modules(db)
+    return [
+        spec
+        for spec in build_catalogue()
+        if (mod := alert_service.rule_type_module(spec.rule_type)) is None or mod in enabled
+    ]
 
 
 @router.post("/rules", response_model=AlertRuleResponse, status_code=status.HTTP_201_CREATED)
-async def create_rule(body: AlertRuleCreate, db: DB, current_user: CurrentUser) -> AlertRule:
-    _require_superadmin(current_user)
+async def create_rule(body: AlertRuleCreate, db: DB, current_user: SuperAdmin) -> AlertRule:
     rule = AlertRule(**body.model_dump())
     db.add(rule)
     await db.flush()  # column-default id must exist before the audit row reads it (#2006)
@@ -366,9 +368,8 @@ async def get_rule(rule_id: uuid.UUID, db: DB, current_user: CurrentUser) -> Ale
 
 @router.patch("/rules/{rule_id}", response_model=AlertRuleResponse)
 async def update_rule(
-    rule_id: uuid.UUID, body: AlertRuleUpdate, db: DB, current_user: CurrentUser
+    rule_id: uuid.UUID, body: AlertRuleUpdate, db: DB, current_user: SuperAdmin
 ) -> AlertRule:
-    _require_superadmin(current_user)
     rule = await db.get(AlertRule, rule_id)
     if rule is None:
         raise HTTPException(status_code=404, detail="Rule not found")
@@ -436,8 +437,7 @@ async def update_rule(
 
 
 @router.delete("/rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_rule(rule_id: uuid.UUID, db: DB, current_user: CurrentUser) -> None:
-    _require_superadmin(current_user)
+async def delete_rule(rule_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
     rule = await db.get(AlertRule, rule_id)
     if rule is None:
         raise HTTPException(status_code=404, detail="Rule not found")
@@ -499,14 +499,13 @@ async def list_events(
 
 
 @router.post("/events/{event_id}/resolve", response_model=AlertEventResponse)
-async def resolve_event(event_id: uuid.UUID, db: DB, current_user: CurrentUser) -> AlertEvent:
+async def resolve_event(event_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> AlertEvent:
     """Manually mark an event resolved. Useful to silence a known-good
     alert while the underlying metric is still above threshold.
 
     Superadmin only, like the rule writes: for transition-once rules a
     resolve dismisses the signal for good. Audited.
     """
-    _require_superadmin(current_user)
     event = await db.get(AlertEvent, event_id)
     if event is None:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -533,7 +532,7 @@ async def resolve_event(event_id: uuid.UUID, db: DB, current_user: CurrentUser) 
 
 
 @router.post("/evaluate", response_model=EvaluateResponse)
-async def evaluate_now(db: DB, current_user: CurrentUser) -> EvaluateResponse:
+async def evaluate_now(db: DB, current_user: SuperAdmin) -> EvaluateResponse:
     """Run the evaluator pass immediately.
 
     Handy for "did that rule I just created fire?" workflows — skips
@@ -541,6 +540,5 @@ async def evaluate_now(db: DB, current_user: CurrentUser) -> EvaluateResponse:
     run, just synchronous. Superadmin only: a pass delivers to the
     configured syslog / webhook / SMTP targets.
     """
-    _require_superadmin(current_user)
     result = await alert_service.evaluate_all(db)
     return EvaluateResponse(**result)

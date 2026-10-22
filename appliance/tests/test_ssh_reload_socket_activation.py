@@ -45,7 +45,10 @@ fi
 case "$1 ${2:-}" in
   "daemon-reload "*) exit 0 ;;
   "cat ssh.socket") exit 0 ;;
-  "reload ssh.service")
+  "reload ssh.service"|"reload sshd.service")
+    # systemd refuses to reload a unit that is not running (verified on
+    # trixie: "ssh.service is not active, cannot reload.", exit 1).
+    [ -f "$S/ssh.service.active" ] || { echo "ssh.service is not active, cannot reload." >&2; exit 1; }
     # sshd re-execs on SIGHUP; under socket activation it cannot bind and dies,
     # but ExecReload (sshd -t; kill -HUP) has already exited 0.
     if [ -f "$S/ssh.socket.active" ]; then rm -f "$S/ssh.service.active"; fi
@@ -130,7 +133,8 @@ def _run(
 
 
 def _calls(state: Path) -> list[str]:
-    return (state / "calls").read_text().splitlines()
+    calls = state / "calls"
+    return calls.read_text().splitlines() if calls.exists() else []
 
 
 def test_socket_activated_apply_leaves_the_service_active(tmp_path: Path) -> None:
@@ -291,9 +295,9 @@ def test_restore_nft_fragment_removes_a_fragment_that_did_not_exist(tmp_path: Pa
 
 def test_callers_no_longer_swallow_the_result() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
-    assert "reload_sshd || true" not in text, (
-        "a failed sshd apply must fail the trigger so the hash sidecar stays unwritten"
-    )
+    assert (
+        "reload_sshd || true" not in text
+    ), "a failed sshd apply must fail the trigger so the hash sidecar stays unwritten"
     # Both callers put the firewall back when the socket went back.
     assert text.count('[ "$SOCK_ROLLED_BACK" = 1 ] && restore_nft_fragment') == 2
 
@@ -304,3 +308,248 @@ def test_the_listener_moves_only_after_the_firewall_loaded() -> None:
     nft_gate = enabled.index("if ! nft_reload; then")
     assert nft_gate < enabled.index('install -o root -g root -m 0644 "$SSHD_TMP" "$SSHD_DROPIN"')
     assert nft_gate < enabled.index('sync_socket_listen "$PORT"')
+
+
+# --- #2054: a save must repair a failed or stopped ssh.service -------------
+#
+# ssh.service owns /run/sshd as its RuntimeDirectory (RuntimeDirectoryMode=0755,
+# RuntimeDirectoryPreserve unset = no), so systemd removes it whenever the unit
+# stops or fails. sshd -t refuses to run without it. Verified on trixie
+# (openssh-server 1:10.0p1-7+deb13u4, systemd 257):
+#
+#   dir absent,   valid conf   -> "Missing privilege separation directory:
+#                                  /run/sshd", exit 255
+#   dir 0755 root, valid conf  -> exit 0
+#   dir 0775/0777/non-root     -> "/run/sshd must be owned by root and not
+#                                  group or world-writable.", exit 255
+#   dir present, invalid conf  -> "Bad configuration option: ...", exit 255
+#
+# The stub below reproduces those answers, so these tests exercise the real
+# failure, not a guess at it.
+
+SSHD_STUB = r"""#!/bin/bash
+d="$SSHD_PRIVSEP_DIR"
+[ -d "$d" ] || { echo "Missing privilege separation directory: $d" >&2; exit 255; }
+m=$(stat -c %a "$d")
+if [ "$(stat -c %u "$d")" != "$(id -u)" ] || [ $(( 8#$m & 8#022 )) -ne 0 ]; then
+  echo "$d must be owned by root and not group or world-writable." >&2; exit 255
+fi
+if grep -q BadDirective "$3"; then
+  echo "$3: line 1: Bad configuration option: BadDirective" >&2; exit 255
+fi
+exit 0
+"""
+
+# The call site as it was before #2054: sshd -t straight off, no privsep dir.
+PRE_2054_CALL = 'sshd -t -f "$TEST_CONF" >/tmp/spatium-sshd-validate.log 2>&1'
+POST_2054_CALL = 'validate_sshd_config "$TEST_CONF" /tmp/spatium-sshd-validate.log'
+
+
+def _validate(tmp_path: Path, body: str) -> tuple[subprocess.CompletedProcess[str], Path]:
+    bindir = tmp_path / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    sshd = bindir / "sshd"
+    sshd.write_text(SSHD_STUB, encoding="utf-8")
+    sshd.chmod(0o755)
+    conf = tmp_path / "test.conf"
+    conf.write_text(body, encoding="utf-8")
+    privsep = tmp_path / "run-sshd"  # absent: ssh.service is failed
+    text = SCRIPT.read_text(encoding="utf-8")
+    m = re.search(r"^validate_sshd_config\(\) \{\n.*?^\}\n", text, re.S | re.M)
+    assert m, "validate_sshd_config not found in the shipped script"
+    proc = subprocess.run(
+        [
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            f'{m.group(0)}\nif validate_sshd_config "{conf}" "{tmp_path}/v.log"; '
+            "then echo VALID; else echo INVALID; fi",
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": f"{bindir}:/usr/bin:/bin",
+            "SSHD_PRIVSEP_DIR": str(privsep),
+        },
+        check=False,
+    )
+    return proc, privsep
+
+
+def test_validation_works_while_the_privsep_dir_is_absent(tmp_path: Path) -> None:
+    proc, privsep = _validate(tmp_path, "Port 22\n")
+    assert "VALID" in proc.stdout.split(), proc.stdout + proc.stderr
+    assert privsep.is_dir()
+    assert oct(privsep.stat().st_mode & 0o777) == "0o755"
+
+
+def test_invalid_config_is_still_refused_without_the_privsep_dir(tmp_path: Path) -> None:
+    proc, _ = _validate(tmp_path, "BadDirective yes\n")
+    assert proc.stdout.split() == ["INVALID"], proc.stdout + proc.stderr
+
+
+def test_the_runner_validates_through_the_helper() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert POST_2054_CALL in text
+    assert PRE_2054_CALL not in text
+    assert len(re.findall(r"^\s*(?:if ! )?sshd -t", text, re.M)) == 1  # the helper's own
+
+
+# --- the whole runner, end to end -----------------------------------------
+#
+# The runner hardcodes /etc, /var, /run and /tmp. Re-root those under tmp_path and put
+# stubs for systemctl / sshd / nft / ss / install on PATH; everything else
+# (python3, flock, getent, mktemp, sed) is real. The systemctl stub is the
+# state-file model above, so "the restart was reached" is read off the unit
+# state it ends in.
+
+NFT_STUB = "#!/bin/bash\nexit 0\n"
+SS_STUB = "#!/bin/bash\nexit 0\n"
+# install(1) without -o/-g, so the runner works as an unprivileged test user.
+INSTALL_STUB = r"""#!/bin/bash
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in -o|-g) shift 2 ;; *) args+=("$1"); shift ;; esac
+done
+exec /usr/bin/install "${args[@]}"
+"""
+
+AUTHORIZED_KEY = (
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl t@x\n"
+)
+
+
+def _run_runner(
+    tmp_path: Path,
+    sshd_conf: str,
+    *,
+    socket: bool,
+    service: bool,
+    pre_2054: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    import getpass
+
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    bindir = tmp_path / "bin"
+    for d in (root, state, bindir):
+        d.mkdir(parents=True, exist_ok=True)
+    for name, body in (
+        ("systemctl", STUB),
+        ("sshd", SSHD_STUB),
+        ("nft", NFT_STUB),
+        ("ss", SS_STUB),
+        ("install", INSTALL_STUB),
+    ):
+        (bindir / name).write_text(body, encoding="utf-8")
+        (bindir / name).chmod(0o755)
+    if socket:
+        (state / "ssh.socket.active").touch()
+    if service:
+        (state / "ssh.service.active").touch()
+
+    user = getpass.getuser()
+    home = tmp_path / "home"
+    (root / "var/lib/spatium-state").mkdir(parents=True)
+    (root / "var/lib/spatium-state/spatium-config.yaml").write_text(
+        f"admin_user: {user}\n", encoding="utf-8"
+    )
+    (root / "etc/ssh/sshd_config.d").mkdir(parents=True)
+    rs = root / "var/lib/spatiumddi/release-state"
+    rs.mkdir(parents=True)
+    ak = AUTHORIZED_KEY.encode()
+    (rs / "ssh-config-pending").write_bytes(
+        b"enabled\nfeedface\n22\n[]\n1\n" + str(len(ak)).encode() + b"\n" + ak + sshd_conf.encode()
+    )
+    # /run/sshd is ABSENT: systemd removed it when ssh.service stopped.
+    (root / "run").mkdir()
+    (root / "tmp").mkdir()
+
+    text = SCRIPT.read_text(encoding="utf-8")
+    if pre_2054:
+        assert POST_2054_CALL in text
+        text = text.replace(POST_2054_CALL, PRE_2054_CALL)
+    # /tmp too: the runner uses fixed log names there, which another user's
+    # earlier run would leave unwritable.
+    # One pass: tmp_path itself lives under /tmp.
+    text = re.sub(r'(?<=[\s"=<>])/(etc|var|run|tmp)/', lambda m: f"{root}{m.group(0)}", text)
+    # The admin's home comes from getent; keep it inside tmp_path.
+    text = text.replace(
+        'AK_FILE="$ADMIN_HOME/.ssh/authorized_keys"', f'AK_FILE="{home}/.ssh/authorized_keys"'
+    )
+    runner = tmp_path / "spatiumddi-ssh-reload"
+    runner.write_text(text, encoding="utf-8")
+    proc = subprocess.run(
+        ["bash", str(runner)],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": f"{bindir}:/usr/local/bin:/usr/bin:/bin",
+            "STATE": str(state),
+            "SSHD_PRIVSEP_DIR": str(root / "run/sshd"),
+            "SSH_SETTLE_SECONDS": "0",
+        },
+        check=False,
+    )
+    log = root / "var/log/spatiumddi/ssh-reload.log"
+    proc.stdout += log.read_text(encoding="utf-8") if log.exists() else ""
+    return proc, state, root
+
+
+def test_a_save_restarts_a_failed_socket_activated_service(tmp_path: Path) -> None:
+    proc, state, root = _run_runner(
+        tmp_path, "PasswordAuthentication yes\n", socket=True, service=False
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "ssh config applied" in proc.stdout, proc.stdout
+    assert "restart ssh.service" in _calls(state)
+    assert (state / "ssh.service.active").exists()
+    assert (root / "var/lib/spatiumddi/release-state/ssh-config-hash").read_text() == "feedface\n"
+    assert (root / "run/sshd").is_dir()
+
+
+def test_negative_control_the_pre_2054_runner_never_reaches_the_restart(
+    tmp_path: Path,
+) -> None:
+    # Same host state, the call site as it was before #2054.
+    proc, state, root = _run_runner(
+        tmp_path, "PasswordAuthentication yes\n", socket=True, service=False, pre_2054=True
+    )
+    assert proc.returncode == 1
+    assert "Missing privilege separation directory" in proc.stdout
+    assert "sshd config validation failed" in proc.stdout
+    assert "restart ssh.service" not in _calls(state)
+    assert not (state / "ssh.service.active").exists()
+    assert not (root / "var/lib/spatiumddi/release-state/ssh-config-hash").exists()
+
+
+def test_a_save_starts_a_stopped_service_without_socket_activation(tmp_path: Path) -> None:
+    # ssh.socket inactive (stopped by hand, or past its trigger limit): a reload
+    # cannot start a unit that is not running, so the runner starts it.
+    proc, state, _ = _run_runner(
+        tmp_path, "PasswordAuthentication yes\n", socket=False, service=False
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "restart ssh.service" in _calls(state)
+    assert "reload ssh.service" not in _calls(state)
+    assert (state / "ssh.service.active").exists()
+
+
+def test_a_running_service_without_socket_activation_is_still_reloaded(
+    tmp_path: Path,
+) -> None:
+    proc, state, _ = _run_runner(
+        tmp_path, "PasswordAuthentication yes\n", socket=False, service=True
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "reload ssh.service" in _calls(state)
+    assert "restart ssh.service" not in _calls(state)
+
+
+def test_an_invalid_config_is_refused_while_the_service_is_down(tmp_path: Path) -> None:
+    proc, state, root = _run_runner(tmp_path, "BadDirective yes\n", socket=True, service=False)
+    assert proc.returncode == 1
+    assert "Bad configuration option: BadDirective" in proc.stdout
+    assert "restart ssh.service" not in _calls(state)
+    assert not (root / "etc/ssh/sshd_config.d/spatiumddi.conf").exists()

@@ -733,6 +733,8 @@ DHCPClientClass
 
 Classes are referenced by pool `class_restriction` field. The DHCP driver translates these to server-native syntax.
 
+The reference is by name, and Kea accepts a name it does not define (the pool then matches nobody), so the API guards it (#2285): renaming or deleting a class, or deleting a device policy, is refused with a 409 while a pool in the group (or another class's `member()` test) still names it; a pool naming a class that does not exist is a 422. A dangling restriction that still reaches a bundle is rendered as stored (fail closed, never opened to every client) and logged as `dhcp_pool_restricted_to_undefined_class` when the set of dangling references changes.
+
 ### Address family (#1229, #1295)
 
 Kea runs one daemon per family, and a class goes only into the daemons its
@@ -1077,6 +1079,51 @@ drain the queue faster.
 *What is left.* The re-sends at 1024 and 4096 match the kernel's drops on
 Kea's raw socket in those runs: 1,042 and 505. Those drops are counted:
 they are `socket_drop` (above).
+
+## 4d. An OOM-killed Kea is reported (#2023)
+
+Kea runs under the dhcp-kea container's memory limit. When it reaches
+that limit the container is killed and restarted into the same config,
+and without a record that is a crash loop in which every surface reads
+healthy between kills. The kill is now reported as the daemon state
+`degraded` with an `oom_killed:` reason, which the control plane reads
+as **not serving**: the red chip on the server row and the default-on
+**Agent daemon not serving** alert (five-minute grace, the same rule
+the DNS side uses; no new rule or column). An unreported state stays
+NULL (unknown), never "no OOM".
+
+How the kill is seen depends on the deployment:
+
+- **Appliance (Kubernetes / k3s).** The kubelet sets
+  `memory.oom.group` on every container, so Kea and the DHCP agent die
+  together and the agent can write nothing. The supervisor reports the
+  container's last termination (`OOMKilled`) in `role_health`, and the
+  control plane stamps it onto the live Kea row (the most recently seen
+  of the rows the appliance owns), over the restarted agent's `ok`,
+  timed from the kill. It counts for 10 minutes after the container is
+  back up, and only while the supervisor is heartbeating (15 minutes).
+- **Docker Compose.** Docker kills the one largest process, so the agent
+  survives. It samples the container cgroup's `oom_kill` counter
+  (`memory.events`, or `memory.oom_control` on cgroup v1) once a
+  second, persists a record in its state dir (`daemon_oom.json`) and
+  reports it on every heartbeat, over the sync loop's own `ok`. The
+  record clears when the counter has been still for 10 minutes. The
+  counter says a process in the container was OOM-killed, not which one,
+  and Kea is not the only candidate: the agent's own `kea-dhcpX -t`
+  config preflight loads the whole config, and radvd runs there too. So
+  a move is recorded only when Kea did not survive it, read from Kea's
+  pid files (`/run/kea/kea-dhcp{4,6}.kea-dhcp{4,6}.pid`): a pid gone, or
+  changed since the previous second, is a killed Kea. Both daemons alive
+  under the same pids means something else was killed; the agent logs
+  `dhcp_oom_kill_not_kea` and reports nothing, because Kea is serving.
+  Unreadable pid files prove nothing either way, so the kill is reported,
+  worded as unconfirmed. If the agent itself is the victim nothing is
+  recorded: the entrypoint takes the container down with it.
+- **Plain Helm install (umbrella chart)** group-kills like the
+  appliance but has no supervisor, so only the pod's last state
+  (`kubectl get pod ... -o jsonpath='{.status.containerStatuses[0].lastState}'`)
+  records it. The kubelet's `singleProcessOOMKill: true` (Kubernetes
+  1.32+) restores the single-process kill and the agent's own record.
 
 ---
 
@@ -1505,7 +1552,9 @@ Kea's HA hook parses peer URLs with Boost asio, which only accepts IP literals �
 
 HA is configured on the server group, not a separate page. Edit the group under the DHCP tab, pick mode (`hot-standby` / `load-balancing`), tune the heartbeat / max-response / max-ack / max-unacked fields if the defaults don't fit your network, and make sure each Kea member has its **HA Peer URL** filled in (the server-level field) — typically `http://<host>:8000/` on the SpatiumDDI-shipped image. The HA hook renders automatically once the group has two Kea peers with non-empty URLs. Removing a server from the group or clearing its URL drops the hook on the next config push.
 
-**On appliances, the firewall opens the HA listener to the pair (#1167).** The host `input` chain is `policy drop`, and nothing used to open the HA port, so two appliances in one HA group could not reach each other. The control plane now works out, for each appliance in a rendered HA group, the port in its own member's `ha_peer_url` (80 / 443 when the URL names none) and the addresses of the group's other Kea members. A partner's address is the IP literal in its URL, else the node IPs of the appliance running it, else the address its agent last connected from. The rule is scoped to those addresses and never opened to `any`: Kea's HA API is unauthenticated unless you configure TLS or basic auth, and it accepts lease updates. It follows the same readiness rule as the HA hook, so the port is open exactly while Kea listens on it. A change reaches the firewall on the appliance's next heartbeat, within about 30 s. The Fleet → Firewall effective view shows the rule as `role:dhcp-ha`.
+**On appliances, the firewall opens the HA listener to the pair (#1167).** The host `input` chain is `policy drop`, and nothing used to open the HA port, so two appliances in one HA group could not reach each other. The control plane now works out, for each appliance in a rendered HA group, the port in its own member's `ha_peer_url` (80 / 443 when the URL names none) and the addresses of the group's other Kea members. A partner's address is the IP literal in its URL, else the node IPs of the appliance running it, else the address its agent last connected from. The rule is scoped to those addresses and never opened to `any`: the HA API accepts lease updates, and a group whose peer credential is not yet active (below) runs it without authentication. It follows the same readiness rule as the HA hook, so the port is open exactly while Kea listens on it. A change reaches the firewall on the appliance's next heartbeat, within about 30 s. The Fleet → Firewall effective view shows the rule as `role:dhcp-ha`.
+
+**HA peers authenticate to each other with a generated per-group credential.** Every server group holds its own CA and peer certificate, generated by the control plane and never shown or returned. Once every Kea member of the group runs an agent that supports it, both members render it into the HA hook (`trust-anchor` / `cert-file` / `key-file`, `require-client-certs`) and the peer URLs switch to `https` on the same port, so each HA listener accepts only its own group's partner. Until then — a pair part-way through an upgrade — the group keeps its current HA configuration, and both members switch together when the last one upgrades. The group shows `ha_peer_auth_active` when it is in use. A superadmin can replace the credential with `POST /api/v1/dhcp/server-groups/{id}/ha-peer-credential/rotate`; the members re-render within seconds and HA reconnects. Details, including why Kea's `basic-auth-user` is not used, are in [DHCP drivers → HA peer authentication](../drivers/DHCP_DRIVERS.md#ha-peer-authentication).
 
 ---
 
@@ -1559,7 +1608,7 @@ Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`]
 |---|---|---|
 | `dhcp_pull_leases_enabled` | off | Master toggle. |
 | `dhcp_pull_leases_interval_seconds` | 15 | How often to poll each agentless server, in seconds. Floor is 10 (matching the beat tick). Operators who don't need sub-minute freshness can raise it to 60 / 300 / etc to reduce WinRM load. |
-| `dhcp_pull_leases_last_run_at` | — | Populated after each pass; visible in Settings. |
+| `dhcp_pull_leases_last_run_at` | — | Claimed when a pass **starts** (#2262), so a pass slower than the beat tick is not started again while it runs; visible in Settings. |
 
 > **Windows DHCP has no streaming primitive.** The lease audit log (`DhcpSrvLog-<Day>.log`) and `Get-DhcpServerv4Lease` are the only real windows into the running service, and both are pull-based. WinRM itself is request/response — `Get-Content -Wait` does exist in PowerShell but it holds the HTTPS connection open indefinitely and can't flush partial output back through `pywinrm.run_ps`, so true push-style streaming would require an agent process on the DC that POSTs events back to SpatiumDDI. Short-interval polling is the practical upper bound without adding that complexity.
 
@@ -1567,9 +1616,11 @@ Per poll:
 
 1. Enumerate agentless DHCP servers (`DHCPServer.driver in AGENTLESS_DRIVERS`).
 2. For each, call `driver.get_leases(server)` over WinRM.
-3. Upsert the lease into `DHCPLease` by `(server_id, ip_address)`.
+3. Upsert the lease into `DHCPLease` by `(server_id, ip_address)`. One pull per server runs at a time: the scheduled pass and the manual Sync share a per-server Postgres advisory lock, so a server another pull is already reconciling is skipped for that pass (#2262). If an address already carries more than one row (left by overlapping pulls before that lock existed), the pull keeps the most recently seen row and deletes the rest instead of failing.
 4. If the lease's IP falls inside a known subnet, mirror it into `IPAddress` with `status="dhcp"` and `auto_from_lease=True`.
 5. **Absence-delete** — any active `DHCPLease` row for this server whose IP didn't appear in the wire response is deleted, along with its mirrored `auto_from_lease=True` IPAM row. The Windows DHCP driver only returns *currently-active* leases, so absence from the response is the server's way of saying "that lease is gone" (admin purged it, client released it, etc.). Before this fix, deleted-on-server leases persisted in our DB indefinitely because `pull_leases` was upsert-only and the time-based cleanup sweep only looked at `expires_at`. The response adds two counters — `removed` (lease rows dropped) and `ipam_revoked` (IPAM mirrors cleaned up alongside) — both surface in the scheduled-task audit row and the manual sync modal.
+**Failures are visible on the server row (#2306).** When a server's scheduled pull raises, the reason is stored on `dhcp_server.last_sync_error` (with `last_sync_error_at`) and the server list shows an amber **Sync failing** chip; the next successful pull clears it. `status` is not used for this because the health probe rewrites it every cycle.
+
 6. The existing time-based `dhcp_lease_cleanup` sweep still handles leases that drift past `expires_at` between polls (e.g. when lease pull is disabled). The two mechanisms overlap harmlessly.
 
 **Scope absence** — not yet deleted. If an operator removes a scope on the Windows server, the `DHCPScope` row stays in SpatiumDDI's DB until deleted via the UI. Scope-absence cleanup is tracked separately.
@@ -1577,6 +1628,8 @@ Per poll:
 ### 15.4 Manual "Sync Leases" button
 
 Agentless DHCP servers have a **Sync Leases** button on the server detail header that runs the same lease pull immediately without waiting for the scheduled task. Useful after adding a new server, or when debugging a new lease. From the **subnet detail**, a `[Sync ▾]` dropdown with a **DHCP** entry fans out `POST /dhcp/servers/{id}/sync-leases` across every unique server backing a scope in that subnet and opens a result modal with per-server counters (active / refreshed / new / removed / IPAM revoked + any errors).
+
+While the scheduled pull (or another Sync) is reconciling the same server, `sync-leases` answers **409** rather than running a second pull alongside it; try again once that pass finishes (#2262).
 
 `sync-leases` is an agentless-only operation — agent-based Kea streams lease events continuously and converges scope/config via the ConfigBundle long-poll, so there is nothing to pull. As of `2026.06.25-1` (#453) calling it against an agent-based server is **no longer a 400**: the endpoint returns a no-op `SyncLeasesResponse` with an explanatory `note` (and nudges the agent to re-poll its config so the scope definition converges immediately), rendered as an info line in both the subnet sync modal and the server-detail banner.
 

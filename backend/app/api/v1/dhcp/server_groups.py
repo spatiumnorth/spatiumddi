@@ -39,6 +39,7 @@ from app.services.appliance.group_names import (
 )
 from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp import windows_failover_manage as fo_manage
+from app.services.dhcp.ha_peer_auth import peer_auth_ready, rotate_credential
 from app.services.dhcp.windows_failover_report import group_failover_report
 
 router = APIRouter(
@@ -163,6 +164,12 @@ class GroupResponse(BaseModel):
     # Member servers rolled up so the UI can render a group detail page
     # without a second round-trip. Empty when nothing's registered.
     servers: list[ServerSummary] = []
+    # The HA peer credential itself is never returned. ``set`` says the group
+    # holds one; ``active`` says it is rendered — i.e. the group is an HA
+    # group and every Kea member's agent supports it. ``set`` without
+    # ``active`` on an HA group means a member still runs an older agent.
+    ha_peer_credential_set: bool = False
+    ha_peer_auth_active: bool = False
     created_at: datetime
     modified_at: datetime
 
@@ -187,6 +194,10 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
         kea_thread_pool_size=g.kea_thread_pool_size,
         kea_packet_logging=g.kea_packet_logging,
         kea_member_count=len(kea),
+        ha_peer_credential_set=bool(g.ha_peer_credential_encrypted),
+        ha_peer_auth_active=len(kea) >= 2
+        and all(s.ha_peer_url for s in kea)
+        and peer_auth_ready(g, kea),
         servers=[
             ServerSummary(
                 id=s.id,
@@ -495,6 +506,35 @@ async def update_group(
         resource_display=g.name,
         changed_fields=list(changes.keys()),
         new_value=body.model_dump(mode="json", exclude_none=True),
+    )
+    await db.commit()
+    await db.refresh(g)
+    return _group_to_response(g)
+
+
+@router.post("/{group_id}/ha-peer-credential/rotate", response_model=GroupResponse)
+async def rotate_ha_peer_credential(group_id: uuid.UUID, db: DB, user: SuperAdmin) -> GroupResponse:
+    """Replace the credential the group's Kea HA peers authenticate with.
+
+    A new CA and peer certificate are generated; the next bundle carries them
+    to every member, so the ETag shifts and each agent re-renders its HA hook.
+    The members switch within seconds of each other (the group channel is
+    woken); in that window their HA connection drops and recovers, well inside
+    ``max-response-delay``. The credential is never returned or audited.
+    """
+    g = await db.get(DHCPServerGroup, group_id)
+    if g is None:
+        raise HTTPException(status_code=404, detail="Server group not found")
+    rotate_credential(g)
+    collect_wake(dhcp_group_channel(g.id))
+    write_audit(
+        db,
+        user=user,
+        action="rotate",
+        resource_type="dhcp_server_group",
+        resource_id=str(g.id),
+        resource_display=g.name,
+        changed_fields=["ha_peer_credential"],
     )
     await db.commit()
     await db.refresh(g)

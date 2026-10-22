@@ -1,10 +1,13 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { humanTime } from "../network/_shared";
+import { primaryNsError } from "@/lib/primary-ns";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { blocklistPayload, serverApiPortField } from "@/lib/formPayloads";
 import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { ZoneSerialsLine } from "./ZoneSerialsLine";
 import { ListReadError } from "@/components/ui/list-read-error";
 import {
   Globe,
@@ -47,6 +50,7 @@ import {
 import { useNavigate } from "react-router-dom";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
@@ -54,6 +58,7 @@ import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
 import { DelegationModal } from "./DelegationModal";
 import { DynamicUpdateAclModal } from "./DynamicUpdateAclModal";
 import { ZoneTemplateModal } from "./ZoneTemplateModal";
+import { ZoneSpreadsheetImportModal } from "./ZoneSpreadsheetImportModal";
 import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { PoolsView } from "./PoolsView";
@@ -112,8 +117,20 @@ import {
   type ResolverPreset,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
-import { fqdnError, recordOwnerError, zoneKindForName } from "@/lib/dnsNames";
+import {
+  DNS_TTL_MAX,
+  fqdnError,
+  parseTtlInput,
+  recordOwnerError,
+  zoneKindForName,
+} from "@/lib/dnsNames";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
+import {
+  ZONE_FORWARD_TRANSPORT_LABELS,
+  type ZoneForwardTransport,
+  zoneTransportError,
+  zoneTransportOptions,
+} from "@/lib/zone-forward-transport";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
@@ -779,12 +796,20 @@ function ImportZoneModal({
   );
   const [preview, setPreview] = useState<DNSImportPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // #2167 — the import works on the shared records only (no view picker), so
+  // a group with split-horizon views says so before anything is replaced.
+  const { data: views } = useQuery({
+    queryKey: ["dns-views", groupId],
+    queryFn: () => dnsApi.listViews(groupId),
+  });
+  const hasViews = (views?.length ?? 0) > 0;
 
   const previewMut = useMutation({
     mutationFn: () =>
       dnsApi.importZonePreview(groupId, zone.id, {
         zone_file: zoneFile,
         zone_name: zone.name,
+        conflict_strategy: strategy,
       }),
     onSuccess: (data) => {
       setPreview(data);
@@ -882,21 +907,29 @@ function ImportZoneModal({
           <select
             className={inputCls}
             value={strategy}
-            onChange={(e) =>
-              setStrategy(e.target.value as "merge" | "replace" | "append")
-            }
+            onChange={(e) => {
+              setStrategy(e.target.value as "merge" | "replace" | "append");
+              setPreview(null);
+            }}
           >
             <option value="merge">
               Merge — add new, update changed, keep existing
             </option>
             <option value="replace">
-              Replace — make the zone match the file exactly
+              Replace — also delete records the file omits
             </option>
             <option value="append">
               Append — only add records that do not exist
             </option>
           </select>
         </Field>
+
+        <p className="text-xs text-muted-foreground">
+          Records owned by IPAM, a DNS pool, an integration, an ACME challenge
+          or a dynamic-update client are never changed or deleted.
+          {hasViews &&
+            " This group has split-horizon views: the import works on the shared records (those with no view) only, and leaves every view's records alone."}
+        </p>
 
         {error && (
           <div className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
@@ -923,6 +956,20 @@ function ImportZoneModal({
               "Unchanged",
               preview.unchanged,
               "text-muted-foreground",
+            )}
+            {preview.skipped.length > 0 && (
+              <details className="rounded border" open>
+                <summary className="cursor-pointer px-2 py-1 text-xs font-medium text-amber-600">
+                  Left alone ({preview.skipped.length})
+                </summary>
+                <ul className="max-h-40 overflow-auto px-2 py-1 text-xs">
+                  {preview.skipped.map((s, i) => (
+                    <li key={i} className="break-all">
+                      {s}
+                    </li>
+                  ))}
+                </ul>
+              </details>
             )}
           </div>
         )}
@@ -2555,9 +2602,9 @@ export function ZoneModal({
     queryFn: () => dnsApi.listGroups(),
     staleTime: 30_000,
   });
-  const technitiumApi = (
-    groupList?.find((g) => g.id === groupId)?.server_drivers ?? []
-  ).includes("technitium_api");
+  const groupDrivers =
+    groupList?.find((g) => g.id === groupId)?.server_drivers ?? [];
+  const technitiumApi = groupDrivers.includes("technitium_api");
   // Client-side FQDN check (create only — the name is locked on edit).
   const nameErr = !zone && name.trim() ? fqdnError(name) : null;
   // #986 — TLD scope hint under the name field. Classified server-side so
@@ -2585,6 +2632,30 @@ export function ZoneModal({
     (zone?.forwarders ?? []).join(", "),
   );
   const [forwardOnly, setForwardOnly] = useState(zone?.forward_only ?? true);
+  // #2121 — the zone's OWN upstream transport, default plain DNS. The
+  // group's forward transport applies to its resolver forwarders only.
+  const [forwardTransport, setForwardTransport] =
+    useState<ZoneForwardTransport>(zone?.forward_transport ?? "do53");
+  const [forwardTlsHostname, setForwardTlsHostname] = useState(
+    zone?.forward_tls_hostname ?? "",
+  );
+  const transportChoices = zoneTransportOptions(groupDrivers);
+  // A stored transport this group can no longer offer stays visible.
+  if (!transportChoices.includes(forwardTransport)) {
+    transportChoices.push(forwardTransport);
+  }
+  const transportErr = zoneTransportError(
+    forwardTransport,
+    forwardTlsHostname,
+    groupDrivers,
+  );
+  // The API holds an edit to the transport only when the transport or its
+  // hostname changes, so a zone stored before the check stays editable; the
+  // form shows the problem but blocks the save on the same terms.
+  const transportChanged =
+    !zone ||
+    forwardTransport !== (zone.forward_transport ?? "do53") ||
+    forwardTlsHostname.trim() !== (zone.forward_tls_hostname ?? "");
   // Secondary / stub primaries (issue #336) — the master IPs (ip or
   // ip@port) this zone transfers FROM. Only shown / submitted for
   // secondary + stub types.
@@ -2603,6 +2674,13 @@ export function ZoneModal({
     staleTime: 60_000,
   });
   const [error, setError] = useState("");
+  // #2075 — a Primary NS that is not a host name is refused, as the API does.
+  // On edit only a changed value is held to it (the API's rule too): a zone
+  // stored before the check re-sends its value on every save, and an edit to
+  // its TTL must still go through. Such a value is flagged, not blocked.
+  const primaryNsErr = technitiumApi ? null : primaryNsError(primaryNs);
+  const primaryNsBlocks =
+    primaryNsErr !== null && (!zone || primaryNs !== (zone.primary_ns ?? ""));
 
   const mut = useMutation({
     mutationFn: (d: Record<string, unknown>) =>
@@ -2619,6 +2697,21 @@ export function ZoneModal({
   function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
+    // Both checks run, so a zone wrong in two ways names both reasons at
+    // once instead of making the operator fix one to discover the other.
+    const problems: string[] = [];
+    // #2075 — a Primary NS that is not a host name stops BIND loading the
+    // zone; a stored legacy value saved unchanged is let through (flagged).
+    if (primaryNsBlocks && primaryNsErr) problems.push(primaryNsErr);
+    // #2073 / #2074 — the hidden field (technitium_api) keeps its default.
+    const zoneTtl = parseTtlInput(ttl);
+    if (zoneTtl === null || typeof zoneTtl === "string") {
+      problems.push(`Default TTL ${zoneTtl ?? "is required"}`);
+    }
+    if (problems.length > 0 || typeof zoneTtl !== "number") {
+      setError(`${problems.join("; ")}.`);
+      return;
+    }
     const payload: Record<string, unknown> = {
       name,
       zone_type: zoneType,
@@ -2626,7 +2719,7 @@ export function ZoneModal({
       view_id: viewId || null,
       primary_ns: primaryNs,
       admin_email: adminEmail,
-      ttl: parseInt(ttl, 10),
+      ttl: zoneTtl,
       color,
       domain_id: domainId,
       customer_id: customerId,
@@ -2645,8 +2738,17 @@ export function ZoneModal({
         setError("Forward zones need at least one forwarder IP");
         return;
       }
+      if (transportErr && transportChanged) {
+        setError(transportErr);
+        return;
+      }
       payload.forwarders = fwds;
       payload.forward_only = forwardOnly;
+      payload.forward_transport = forwardTransport;
+      // The hostname field is hidden on plain DNS; a value left in it from
+      // an earlier choice is not the operator's intent for this save.
+      payload.forward_tls_hostname =
+        forwardTransport === "do53" ? null : forwardTlsHostname.trim() || null;
     }
     if (zoneType === "secondary" || zoneType === "stub") {
       const masters = mastersText
@@ -2760,6 +2862,41 @@ export function ZoneModal({
                 </option>
               </select>
             </Field>
+            <Field label="Upstream transport">
+              <select
+                className={inputCls}
+                value={forwardTransport}
+                onChange={(e) =>
+                  setForwardTransport(e.target.value as ZoneForwardTransport)
+                }
+              >
+                {transportChoices.map((t) => (
+                  <option key={t} value={t}>
+                    {ZONE_FORWARD_TRANSPORT_LABELS[t]}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <p className="text-[11px] text-muted-foreground">
+              This zone&apos;s own setting. It does not follow the group&apos;s
+              forwarder transport: an internal resolver such as an AD domain
+              controller or Tailscale&apos;s 100.100.100.100 answers plain DNS
+              only. An entry with an explicit <code>@53</code> is always sent as
+              plain DNS.
+            </p>
+            {forwardTransport !== "do53" && (
+              <Field label="TLS hostname (the upstream certificate's name)">
+                <input
+                  className={inputCls}
+                  value={forwardTlsHostname}
+                  onChange={(e) => setForwardTlsHostname(e.target.value)}
+                  placeholder="dns.quad9.net"
+                />
+              </Field>
+            )}
+            {transportErr && (
+              <p className="text-xs text-destructive">{transportErr}</p>
+            )}
           </div>
         )}
         {(zoneType === "secondary" || zoneType === "stub") && (
@@ -2815,7 +2952,20 @@ export function ZoneModal({
                 value={primaryNs}
                 onChange={(e) => setPrimaryNs(e.target.value)}
                 placeholder="ns1.example.com."
+                aria-invalid={primaryNsBlocks || undefined}
               />
+              {primaryNsErr &&
+                (primaryNsBlocks ? (
+                  <p className="text-xs text-destructive mt-0.5">
+                    {primaryNsErr}
+                  </p>
+                ) : (
+                  <p className="text-xs text-amber-600 dark:text-amber-400 mt-0.5">
+                    {primaryNsErr}. Stored before this was checked; a BIND9
+                    server serves the zone&apos;s first NS record (or
+                    ns1.&lt;zone&gt;) in its place. Change it to a host name.
+                  </p>
+                ))}
             </Field>
             <Field label="Admin Email">
               <input
@@ -2831,6 +2981,10 @@ export function ZoneModal({
           {!technitiumApi && (
             <Field label="Default TTL (seconds)">
               <input
+                type="number"
+                min={0}
+                max={DNS_TTL_MAX}
+                step={1}
                 className={inputCls}
                 value={ttl}
                 onChange={(e) => setTtl(e.target.value)}
@@ -3018,11 +3172,16 @@ function RecordModal({
       setError("SRV records require priority, weight, and port.");
       return;
     }
+    const recordTtl = parseTtlInput(ttl);
+    if (typeof recordTtl === "string") {
+      setError(`TTL ${recordTtl}.`);
+      return;
+    }
     mut.mutate({
       name,
       record_type: type,
       value,
-      ttl: ttl ? parseInt(ttl, 10) : null,
+      ttl: recordTtl,
       // Only send the structured fields the type actually uses, so the API
       // never sees a stray weight/port on a non-SRV record.
       priority: usesPriority && priority !== "" ? parseInt(priority, 10) : null,
@@ -3186,6 +3345,10 @@ function RecordModal({
         <div className="grid grid-cols-2 gap-3">
           <Field label="TTL (leave blank for zone default)">
             <input
+              type="number"
+              min={0}
+              max={DNS_TTL_MAX}
+              step={1}
               className={inputCls}
               value={ttl}
               onChange={(e) => setTtl(e.target.value)}
@@ -3287,15 +3450,20 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   const total = state.servers.length;
   if (total === 0) return null;
   const reported = state.servers.filter((s) => s.current_serial !== null);
+  // #2042 — a server with an unacknowledged op for the zone is not in sync,
+  // even when the serial it reported matches.
   const inSync = state.servers.filter(
-    (s) => s.current_serial === state.target_serial,
+    (s) => s.current_serial === state.target_serial && !s.pending_ops,
   );
   const tooltip = state.servers
     .map((s) =>
       s.current_serial === null
         ? `${s.server_name}: not reported`
         : `${s.server_name}: serial ${s.current_serial}` +
-          (s.current_serial !== state.target_serial ? " (drift)" : ""),
+          (s.current_serial !== state.target_serial ? " (drift)" : "") +
+          (s.pending_ops
+            ? ` (${s.pending_ops} change${s.pending_ops === 1 ? "" : "s"} not yet applied)`
+            : ""),
     )
     .join("\n");
 
@@ -3398,7 +3566,8 @@ function MoveZoneModal({
       preview.acl_names_lost.length > 0 ||
       preview.key_names_lost.length > 0 ||
       !!preview.technitium_api_refusal ||
-      !!preview.tsig_algorithm_refusal);
+      !!preview.tsig_algorithm_refusal ||
+      !!preview.forward_transport_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -3462,6 +3631,11 @@ function MoveZoneModal({
             {preview.tsig_algorithm_refusal && (
               <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
                 {preview.tsig_algorithm_refusal}
+              </div>
+            )}
+            {preview.forward_transport_refusal && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                {preview.forward_transport_refusal}
               </div>
             )}
             {preview.acl_names_lost.length > 0 && (
@@ -3626,6 +3800,7 @@ function ZoneDetailView({
   const [showMoveZone, setShowMoveZone] = useState(false);
   const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
+  const [showSheetImport, setShowSheetImport] = useState(false);
   const [showRecFilters, setShowRecFilters] = useState(false);
   const [recFilter, setRecFilter] = useState({ name: "", type: "", value: "" });
   // Server-side pagination + search (#455): a large zone (20k+ records) no
@@ -3648,6 +3823,32 @@ function ZoneDetailView({
       filename ??
       `${zone.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.zone`;
     downloadBlob(data, name, "text/dns");
+  };
+
+  // #2139 — the records as a spreadsheet, and a blank template.
+  const handleSheetExport = async (format: "csv" | "xlsx") => {
+    const { data, filename } = await dnsApi.exportZoneRecords(
+      group.id,
+      zone.id,
+      format,
+    );
+    downloadBlob(
+      data,
+      filename ??
+        `dns-zone-${zone.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.${format}`,
+    );
+  };
+  const handleSheetTemplate = async () => {
+    const { data, filename } = await dnsApi.zoneImportTemplate(
+      group.id,
+      zone.id,
+      "csv",
+    );
+    downloadBlob(
+      data,
+      filename ??
+        `dns-zone-template-${zone.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.csv`,
+    );
   };
 
   // Per-server zone-serial drift pill — agents POST their loaded serial
@@ -4087,7 +4288,7 @@ function ZoneDetailView({
                     },
                     {
                       key: "import",
-                      label: "Import",
+                      label: "Import zone file",
                       icon: Upload,
                       onSelect: () => setShowImport(true),
                       ...permissionGate(
@@ -4097,9 +4298,41 @@ function ZoneDetailView({
                     },
                     {
                       key: "export",
-                      label: "Export",
+                      label: "Export zone file",
                       icon: Download,
                       onSelect: handleExport,
+                    },
+                    {
+                      key: "import-sheet",
+                      label: "Import CSV / XLSX",
+                      icon: Upload,
+                      onSelect: () => setShowSheetImport(true),
+                      title:
+                        "Bulk-edit records from a spreadsheet: preview the adds, changes and deletes, then import",
+                      ...permissionGate(
+                        can("write", "dns_record"),
+                        NEEDS_RECORD_WRITE,
+                      ),
+                    },
+                    {
+                      key: "export-csv",
+                      label: "Export CSV",
+                      icon: Download,
+                      onSelect: () => handleSheetExport("csv"),
+                    },
+                    {
+                      key: "export-xlsx",
+                      label: "Export XLSX",
+                      icon: Download,
+                      onSelect: () => handleSheetExport("xlsx"),
+                    },
+                    {
+                      key: "sheet-template",
+                      label: "Download template",
+                      icon: FileText,
+                      onSelect: handleSheetTemplate,
+                      title:
+                        "A blank CSV with the columns and one example per common record type (example rows are ignored on import)",
                     },
                   ]
             }
@@ -4266,6 +4499,35 @@ function ZoneDetailView({
                   {zone.forward_only
                     ? "Queries are sent only to the forwarders. If they all fail, BIND returns SERVFAIL — it never falls back to recursion."
                     : "Queries are sent to the forwarders first. If they all fail, BIND falls back to normal recursion via the root servers."}
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded border bg-card px-4 py-3 text-sm">
+              <div className="text-xs font-medium text-muted-foreground">
+                Upstream transport
+              </div>
+              <div className="mt-1">
+                <span className="font-mono">
+                  {
+                    ZONE_FORWARD_TRANSPORT_LABELS[
+                      zone.forward_transport ?? "do53"
+                    ]
+                  }
+                </span>
+                {zone.forward_transport &&
+                  zone.forward_transport !== "do53" && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Certificate checked against{" "}
+                      <span className="font-mono">
+                        {zone.forward_tls_hostname ?? "—"}
+                      </span>
+                      .
+                    </p>
+                  )}
+                <p className="mt-1 text-xs text-muted-foreground">
+                  The zone&apos;s own setting; the group&apos;s forwarder
+                  transport does not apply to it.
                 </p>
               </div>
             </div>
@@ -4974,6 +5236,13 @@ function ZoneDetailView({
           onClose={() => setShowImport(false)}
         />
       )}
+      {showSheetImport && (
+        <ZoneSpreadsheetImportModal
+          groupId={group.id}
+          zone={zone}
+          onClose={() => setShowSheetImport(false)}
+        />
+      )}
       {confirmDelete && (
         <DeleteZoneDialog
           zoneName={zone.name}
@@ -5362,12 +5631,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   </span>
                 ) : null,
             )}
-            <span className="ml-auto text-muted-foreground">
-              Zone serials:{" "}
-              {zones.length === 0
-                ? "no zones"
-                : `${zones.length} zone${zones.length === 1 ? "" : "s"} · all servers assumed consistent (per-server serials arrive in Wave 3)`}
-            </span>
+            <ZoneSerialsLine zoneCount={zones.length} servers={servers} />
           </div>
         </div>
       )}
@@ -5438,6 +5702,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   <ConfigApplyChip server={s} />
                   <SpoolChip server={s} />
                   <DaemonStateChip server={s} />
+                  <DuplicateAgentChip server={s} />
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {s.host}:{s.port}
@@ -5453,7 +5718,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   {s.last_sync_at &&
                     ` · synced ${new Date(s.last_sync_at).toLocaleDateString()}`}
                   {s.last_health_check_at &&
-                    ` · health ${new Date(s.last_health_check_at).toLocaleTimeString()}`}
+                    ` · health ${humanTime(s.last_health_check_at)}`}
                 </p>
               </div>
             </div>
@@ -7186,6 +7451,22 @@ function OptionsTab({ groupId }: { groupId: string }) {
         </div>
       )}
 
+      {/* Stored forwarders pinned to port 53 in a group that forwards
+          encrypted (#2128): saved before the refusal, they render as TLS to
+          port 53 and never answer. */}
+      {(opts?.forwarder_warnings?.length ?? 0) > 0 && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          <p className="font-medium">These forwarders cannot answer:</p>
+          <ul className="mt-1 list-disc pl-4">
+            {opts?.forwarder_warnings?.map((w) => (
+              <li key={w} className="break-words">
+                {w}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       <div className={card}>
         <div className="flex items-center justify-between">
           <h4 className={cardTitle}>
@@ -7399,11 +7680,19 @@ function OptionsTab({ groupId }: { groupId: string }) {
               auto — validate using built-in managed keys (recommended)
             </option>
             <option value="yes">
-              yes — validate; trust anchors must be configured manually
+              yes — validate; only against trust anchors added via the API
+              (BIND9)
             </option>
             <option value="no">no — do not validate DNSSEC signatures</option>
           </select>
         </Field>
+        {(opts?.dnssec_warnings?.length ?? 0) > 0 && (
+          <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+            {opts?.dnssec_warnings?.map((w) => (
+              <p key={w}>{w}</p>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className={card}>
@@ -7782,11 +8071,12 @@ function OptionsTab({ groupId }: { groupId: string }) {
           {forwardTransport !== "do53" && (
             <>
               <p className="text-xs text-muted-foreground">
-                Applies to the forwarders configured above, and to per-zone
-                forwarders. Forwarders default to port 853 unless one pins its
-                own. BIND has no client-side HTTP or QUIC transport, so the
-                https and quic options are rejected for a group containing a
-                BIND9 server — use a Technitium-only group for those.
+                Applies to the forwarders configured above only. A conditional
+                forward zone has its own transport, set on the zone. Forwarders
+                default to port 853 unless one pins its own. BIND has no
+                client-side HTTP or QUIC transport, so the https and quic
+                options are rejected for a group containing a BIND9 server — use
+                a Technitium-only group for those.
               </p>
               {forwardTransport === "tls" && (
                 <label className="flex items-center gap-2 cursor-pointer text-sm">
@@ -8051,39 +8341,6 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 </span>
               </span>
             </label>
-            <Field label="Log channel">
-              <select
-                className={selCls}
-                value={queryLogChannel}
-                onChange={(e) => {
-                  setQueryLogChannel(e.target.value);
-                  setDirty(true);
-                }}
-              >
-                <option value="file">
-                  file — write to a log file (rotated by BIND)
-                </option>
-                <option value="syslog">
-                  syslog — send to local syslog (daemon facility)
-                </option>
-                <option value="stderr">
-                  stderr — write to container stderr (visible via docker logs)
-                </option>
-              </select>
-            </Field>
-            {queryLogChannel === "file" && (
-              <Field label="Log file path (inside container)">
-                <input
-                  className={inputCls}
-                  value={queryLogFile}
-                  onChange={(e) => {
-                    setQueryLogFile(e.target.value);
-                    setDirty(true);
-                  }}
-                  placeholder="/var/log/named/queries.log"
-                />
-              </Field>
-            )}
             <Field label="Severity">
               <select
                 className={selCls}
@@ -8099,19 +8356,20 @@ function OptionsTab({ groupId }: { groupId: string }) {
                 <option value="debug">
                   debug — very verbose; for troubleshooting only
                 </option>
-                <option value="notice">notice — only notable events</option>
-                <option value="warning">warning — warnings and above</option>
-                <option value="error">error — errors only</option>
               </select>
             </Field>
             <p className="text-xs text-muted-foreground">
               Logs the <code>queries</code> and <code>query-errors</code>{" "}
-              categories. View with{" "}
-              <code className="font-mono">docker logs</code> (stderr) or{" "}
+              categories to <code className="font-mono">{queryLogFile}</code>{" "}
+              inside the DNS container, which is the file the Logs page&apos;s
+              DNS Queries tab reads. The channel and path are fixed for that
+              reason, and so is the severity floor: named logs queries at{" "}
+              <code>info</code>, so anything quieter would empty the tab. View
+              raw with{" "}
               <code className="font-mono">
                 docker exec &lt;dns-container&gt; tail -f {queryLogFile}
-              </code>{" "}
-              (file).
+              </code>
+              .
             </p>
           </>
         )}
@@ -9218,6 +9476,24 @@ function ZonesTab({
  * de-assigned groups get woken too (the endpoint unions old and new
  * affected groups before publishing the config wake).
  */
+/** Rules the last adblock refresh could not enforce (#2123); 0 when the
+ *  counts were never recorded. */
+function feedSkippedTotal(l: DNSBlockList): number {
+  const s = l.feed_parse_skipped;
+  return s ? s.regex + s.modifier + s.badfilter + s.malformed : 0;
+}
+
+function feedSkippedTitle(l: DNSBlockList): string {
+  const s = l.feed_parse_skipped;
+  if (!s) return "";
+  return (
+    `The last refresh skipped ${feedSkippedTotal(l)} feed rule(s) DNS cannot ` +
+    `enforce: ${s.regex} regex, ${s.modifier} with unsupported modifiers ` +
+    `($domain=, $third-party, …), ${s.badfilter} $badfilter, ` +
+    `${s.malformed} not a plain ||name^ rule.`
+  );
+}
+
 function BlocklistScopeModal({
   list,
   group,
@@ -9848,6 +10124,14 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         view: {viewName.get(id)}
                       </span>
                     ))}
+                    {feedSkippedTotal(l) > 0 && (
+                      <span
+                        className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600"
+                        title={feedSkippedTitle(l)}
+                      >
+                        {feedSkippedTotal(l)} rules not enforced
+                      </span>
+                    )}
                     <span className="ml-auto text-xs text-muted-foreground">
                       {l.entry_count} entries
                     </span>
@@ -10071,7 +10355,6 @@ function BlocklistModal({
             >
               <option value="nxdomain">nxdomain</option>
               <option value="sinkhole">sinkhole</option>
-              <option value="refused">refused</option>
             </select>
           </Field>
         </div>
@@ -10083,6 +10366,10 @@ function BlocklistModal({
               onChange={(e) => setSinkholeIp(e.target.value)}
               placeholder="0.0.0.0"
             />
+            <p className="mt-1 text-xs text-muted-foreground">
+              Blocked names answer with this address. Blank answers 0.0.0.0 and
+              ::; an IPv4 address replaces 0.0.0.0 and an IPv6 one replaces ::.
+            </p>
           </Field>
         )}
         <div className="grid grid-cols-2 gap-3">
@@ -10334,6 +10621,9 @@ function BlocklistDetail({
             <span className="text-destructive"> ({list.last_sync_error})</span>
           )}
         </p>
+      )}
+      {feedSkippedTotal(list) > 0 && (
+        <p className="text-xs text-amber-600">{feedSkippedTitle(list)}</p>
       )}
 
       {/* Blocked domains (the list itself) */}

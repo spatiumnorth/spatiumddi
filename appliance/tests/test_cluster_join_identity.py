@@ -255,3 +255,318 @@ def test_identity_entries_list_matches_this_test(tmp_path: Path) -> None:
     proc = _run(_env(tmp_path, t), 'printf "%s\\n" $K3S_IDENTITY_ENTRIES')
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.split() == list(IDENTITY_ENTRIES)
+
+
+# #2049 — a backup keeps the image store it took only while the join or leave
+# that set it aside can still roll back onto it. Each store is a full copy of
+# every baked image (4-6 GiB), and the newest three backups used to keep
+# one each: a member that formed, left and was promoted again then carried
+# four stores on /var while its join imported the fourth, and on the
+# recommended 40 GiB disk that crossed the kubelet's DiskPressure floor.
+
+
+def _fresh_start(t: dict[str, Path], tag: str) -> None:
+    """What the k3s started after a wipe writes: a store of its own, an
+    import cache describing it, and an identity of its own."""
+    (t["agent"] / "containerd" / "io.containerd.content.v1.content").mkdir(parents=True)
+    (t["agent"] / "images" / ".cache.json").write_text(IMPORT_CACHE)
+    (t["agent"] / "client-kubelet.crt").write_text(f"kubelet-{tag}")
+    for entry in ("db", "tls", "cred"):
+        (t["server"] / entry).mkdir()
+    (t["server"] / "db" / "state.db").write_text(f"etcd-{tag}")
+    for entry in ("token", "agent-token", "node-token"):
+        (t["server"] / entry).write_text(f"K10{tag}::{entry}")
+    t["node_pw"].write_text(f"nodepw-{tag}")
+    t["kubeconfig"].write_text(f"kubeconfig-{tag}")
+
+
+def _wipe(env: dict[str, str], suffix: str) -> Path:
+    proc = _run(env, f'backup_and_wipe_identity {suffix} > "$SPATIUM_RELEASE_STATE/bak_path"')
+    assert proc.returncode == 0, proc.stderr
+    return Path((Path(env["SPATIUM_RELEASE_STATE"]) / "bak_path").read_text().strip())
+
+
+def test_only_the_newest_backup_keeps_its_image_store(tmp_path: Path) -> None:
+    """A join, then a leave: the join's backup gives its store up when the
+    leave sets the next one aside, and keeps every identity entry."""
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    first = _wipe(env, "pre-join")
+    _fresh_start(t, "member")
+    second = _wipe(env, "pre-leave")
+
+    assert not (first / "agent" / "containerd").exists(), (
+        "an older backup still holds a whole image store no rollback will ask for"
+    )
+    assert not (first / "agent-images-cache.json").exists(), (
+        "the import cache must go with the store it describes"
+    )
+    for entry in IDENTITY_ENTRIES:
+        assert (first / f"server-{entry}").exists(), f"{entry} left the older backup"
+    assert (first / "server-token").read_text() == "K10self::server:ownsecret"
+    assert (first / "agent" / "client-kubelet.crt").read_text() == "kubelet"
+    assert (first / "node-password").read_text() == "nodepw"
+    assert (first / "k3s.yaml").read_text() == "kubeconfig"
+
+    assert (second / "agent" / "containerd" / "io.containerd.content.v1.content").is_dir()
+    assert (second / "agent-images-cache.json").read_text() == IMPORT_CACHE
+
+
+def test_the_pruned_set_holds_one_image_store_at_most(tmp_path: Path) -> None:
+    """Four wipes: the newest three backups are kept (#555) and only the
+    newest of them still holds a store."""
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    baks = []
+    for i, suffix in enumerate(("a", "b", "c", "d")):
+        if i:
+            _fresh_start(t, suffix)
+        baks.append(_wipe(env, suffix))
+
+    kept = sorted(Path(env["SPATIUM_RELEASE_STATE"]).glob("k3s-identity.*.*"))
+    assert set(kept) == set(baks[1:]), "the newest three backups are kept"
+    with_store = [b for b in kept if (b / "agent" / "containerd").exists()]
+    assert with_store == [baks[-1]]
+
+
+def test_a_settled_join_or_leave_drops_every_image_store(tmp_path: Path) -> None:
+    """Once the operation ended well no rollback is left, so its own backup
+    gives the store up too; the identity stays for manual recovery."""
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    bak = _wipe(env, "pre-join")
+    proc = _run(env, "_drop_backup_image_stores")
+    assert proc.returncode == 0, proc.stderr
+
+    assert not (bak / "agent" / "containerd").exists()
+    assert not (bak / "agent-images-cache.json").exists()
+    for entry in IDENTITY_ENTRIES:
+        assert (bak / f"server-{entry}").exists(), f"{entry} left the backup"
+    assert "dropped the image store from identity backup" in proc.stderr
+
+
+def test_restore_of_a_backup_without_its_store_reimports(tmp_path: Path) -> None:
+    """A backup restored after its store went keeps the live store and leaves
+    no import cache, so the next start re-imports the baked tarballs."""
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    proc = _run(
+        env,
+        'bak="$(backup_and_wipe_identity pre-join)"\n'
+        'mkdir -p "$SPATIUM_K3S_AGENT_DIR/containerd/live"\n'
+        'printf \'%s\' \'{"airgap.tar": {"size": 5}}\' '
+        '> "$SPATIUM_K3S_AGENT_DIR/images/.cache.json"\n'
+        "_drop_backup_image_stores\n"
+        'restore_identity "$bak"',
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    assert (t["agent"] / "containerd" / "live").is_dir(), "the live store was taken"
+    assert not (t["agent"] / "images" / ".cache.json").exists()
+    assert (t["server"] / "token").read_text() == "K10self::server:ownsecret"
+
+
+def _function(name: str) -> str:
+    text = SCRIPT.read_text()
+    start = text.index(f"\n{name}() {{")
+    return text[start : text.index("\n}\n", start)]
+
+
+def test_every_settled_exit_drops_the_image_stores() -> None:
+    """Each `ready` of do_join and the `left` of do_leave drops the stores
+    BEFORE it writes the state: write_state is a plain `>` onto /var, and on a
+    full disk it would leave the sidecar empty and the row `joining`. No
+    failure exit drops one (a rollback, or manual recovery, may still want
+    it); the #1052 registered branch drops it on entry instead, tested below."""
+    for name, settled, count in (
+        ("do_join", 'write_state ready "$server_url"', 3),
+        ("do_leave", 'write_state left ""', 1),
+    ):
+        body = _function(name)
+        assert body.count(settled) == count, name
+        for head in body.split(settled)[:-1]:
+            last_line = head.rstrip().splitlines()[-1].strip()
+            assert last_line == "_drop_backup_image_stores", (name, last_line)
+        for tail in body.split("write_state failed")[1:]:
+            assert "_drop_backup_image_stores" not in tail.split("exit 1")[0], name
+
+
+# The rm -rf above runs as root, so it must never reach outside a backup
+# this runner took — least of all the live store.
+
+
+def test_a_symlinked_backup_is_never_followed(tmp_path: Path) -> None:
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    rs = Path(env["SPATIUM_RELEASE_STATE"])
+    rs.mkdir(parents=True, exist_ok=True)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "agent" / "containerd").mkdir(parents=True)
+    (rs / "k3s-identity.pre-join.1").symlink_to(elsewhere)
+    real = rs / "k3s-identity.pre-leave.2"
+    real.mkdir()
+    (real / "agent").symlink_to(t["agent"])
+
+    proc = _run(env, "_drop_backup_image_stores")
+    assert proc.returncode == 0, proc.stderr
+    assert (elsewhere / "agent" / "containerd").is_dir(), "followed a symlinked backup"
+    assert (t["agent"] / "containerd" / "io.containerd.content.v1.content").is_dir(), (
+        "removed the LIVE image store through a symlinked agent/"
+    )
+
+
+def test_the_live_store_is_never_dropped(tmp_path: Path) -> None:
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    bak = Path(env["SPATIUM_RELEASE_STATE"]) / "k3s-identity.pre-join.1"
+    (bak / "agent").mkdir(parents=True)
+    (bak / "agent" / "containerd").symlink_to(t["agent"] / "containerd")
+
+    proc = _run(env, "_drop_backup_image_stores")
+    assert proc.returncode == 0, proc.stderr
+    assert (t["agent"] / "containerd" / "io.containerd.content.v1.content").is_dir()
+    assert "it is the live image store" in proc.stderr
+
+
+JOIN_CONFIRM = "SPATIUMDDI-CLUSTER-JOIN-CONFIRM-V1"
+LEAVE_CONFIRM = "SPATIUMDDI-CLUSTER-LEAVE-CONFIRM-V1"
+
+
+def _old_backup_with_store(env: dict[str, str]) -> Path:
+    """A backup a previous, settled join or leave left behind with its
+    store — what a node upgraded from a build before #2049 carries."""
+    old = Path(env["SPATIUM_RELEASE_STATE"]) / "k3s-identity.pre-leave.100"
+    (old / "agent" / "containerd" / "old-layers").mkdir(parents=True)
+    (old / "agent-images-cache.json").write_text(IMPORT_CACHE)
+    (old / "server-token").write_text("K10old::server:secret")
+    return old
+
+
+def _drive(
+    tmp_path: Path,
+    t: dict[str, Path],
+    mode: str,
+    *,
+    ready: str,
+    registered: bool = False,
+) -> tuple[int, str, list[str]]:
+    """Run do_join / do_leave for real against the tmp tree, with k3s,
+    systemctl and the etcd runner stubbed. ``ready`` is the answer each
+    successive wait_ready gives ("0" Ready, "1" not). Every write_state
+    and wait_ready records which backups still hold a store at that moment."""
+    env = _env(tmp_path, t)
+    rs = Path(env["SPATIUM_RELEASE_STATE"])
+    rs.mkdir(parents=True, exist_ok=True)
+    if mode == "join":
+        (rs / "cluster-join-pending").write_text(
+            f"{JOIN_CONFIRM}\nhttps://10.0.0.1:6443\nK10seed::server:secret\n"
+        )
+    else:
+        (rs / "cluster-leave-pending").write_text(f"{LEAVE_CONFIRM}\n")
+    k3s_config = tmp_path / "config.yaml"
+    k3s_config.write_text("cluster-init: true\n")
+    evict = tmp_path / "evict"
+    evict.write_text("#!/bin/sh\nexit 0\n")
+    evict.chmod(0o755)
+    events = tmp_path / "events"
+    answers = " ".join(ready)
+    driver = f"""
+        source "{SCRIPT}"
+        stores() {{
+            local d out=""
+            for d in "$IDENTITY_BAK_ROOT".*.*; do
+                [ -e "$d/agent/containerd" ] && out="$out $(basename "$d")"
+            done
+            printf '%s' "${{out# }}"
+        }}
+        eval "orig_$(declare -f write_state)"
+        write_state() {{ echo "state $1 [$(stores)]" >> "{events}"; orig_write_state "$@"; }}
+        answers=({answers})
+        n=0
+        wait_ready() {{
+            echo "wait [$(stores)]" >> "{events}"
+            local a="${{answers[$n]:-1}}"; n=$((n + 1)); return "$a"
+        }}
+        systemctl() {{ :; }}
+        clean_k3s_runtime() {{ :; }}
+        clear_stale_pod_routes() {{ :; }}
+        rerender_bootstrap_manifests() {{ :; }}
+        restore_bootstrap_sentinel() {{ :; }}
+        _k3s_log_since() {{ :; }}
+        node_registered_with_cluster_etcd() {{ return {0 if registered else 1}; }}
+        do_{mode}
+    """
+    env.update(
+        {
+            "SPATIUM_K3S_CONFIG": str(k3s_config),
+            "SPATIUM_K3S_DROPIN_DIR": str(tmp_path / "dropin"),
+            "SPATIUM_ETCD_EVICT": str(evict),
+            "SPATIUM_ETCD_CONFIG_FILE": str(tmp_path / "no-etcd-config"),
+            "SPATIUM_ETCD_MEMBER_SIDECAR": str(tmp_path / "no-member-marker"),
+        }
+    )
+    proc = subprocess.run(
+        ["bash", "-c", driver], env=env, capture_output=True, text=True, check=False
+    )
+    lines = events.read_text().splitlines() if events.exists() else []
+    return proc.returncode, proc.stderr, lines
+
+
+def test_a_join_drops_old_stores_before_it_writes_anything(tmp_path: Path) -> None:
+    """QA's question on #2049: on a /var already out of space, write_state is
+    a plain ``>`` onto it. The settled backups give their stores up first."""
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    old = _old_backup_with_store(env)
+    rc, err, events = _drive(tmp_path, t, "join", ready="0")
+    assert rc == 0, err
+    assert events[0] == "state joining []", events
+    assert not (old / "agent" / "containerd").exists()
+    assert (old / "server-token").read_text() == "K10old::server:secret"
+    assert events[-1] == "state ready []", "a Ready join keeps no store"
+
+
+def test_a_failed_join_rolls_back_onto_its_own_store(tmp_path: Path) -> None:
+    """The one rollback there is: the store this join set aside comes back,
+    with the import cache that describes it."""
+    t = _tree(tmp_path)
+    (t["agent"] / "containerd" / "io.containerd.content.v1.content" / "blob").write_text("x")
+    env = _env(tmp_path, t)
+    _old_backup_with_store(env)
+    rc, err, events = _drive(tmp_path, t, "join", ready="1")
+    assert rc == 1, err
+    waits = [e for e in events if e.startswith("wait")]
+    assert len(waits) == 1 and "pre-join" in waits[0], (
+        "the new backup lost its store while the rollback could still want it"
+    )
+    assert (t["agent"] / "containerd" / "io.containerd.content.v1.content" / "blob").read_text() == "x"
+    assert (t["agent"] / "images" / ".cache.json").read_text() == IMPORT_CACHE
+    assert (t["server"] / "token").read_text() == "K10self::server:ownsecret"
+    assert events[-1].startswith("state failed")
+
+
+def test_a_registered_join_drops_its_store_before_the_long_wait(tmp_path: Path) -> None:
+    """#1052's branch never rolls back, so the joiner waiting on Ready does
+    not also carry a second image store."""
+    t = _tree(tmp_path)
+    rc, err, events = _drive(tmp_path, t, "join", ready="10", registered=True)
+    assert rc == 0, err
+    waits = [e for e in events if e.startswith("wait")]
+    assert len(waits) == 2
+    assert "pre-join" in waits[0]
+    assert waits[1] == "wait []", waits
+    assert events[-1] == "state ready []"
+
+
+def test_a_leave_drops_old_stores_first_and_its_own_once_left(tmp_path: Path) -> None:
+    t = _tree(tmp_path)
+    env = _env(tmp_path, t)
+    old = _old_backup_with_store(env)
+    rc, err, events = _drive(tmp_path, t, "leave", ready="0")
+    assert rc == 0, err
+    assert events[0] == "state leaving []", events
+    assert "pre-leave." in events[1] and "pre-leave.100" not in events[1], (
+        "the leave's own backup keeps its store until the leave has settled"
+    )
+    assert events[-1] == "state left []"
+    assert not (old / "agent" / "containerd").exists()

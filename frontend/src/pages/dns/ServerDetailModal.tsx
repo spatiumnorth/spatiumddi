@@ -29,10 +29,16 @@ import {
   YAxis,
 } from "recharts";
 import { Modal } from "@/components/ui/modal";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { formatBucket } from "@/lib/chart-time";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import {
   dnsApi,
@@ -83,6 +89,11 @@ export function ServerDetailModal({
 }) {
   const [tab, setTab] = useState<Tab>("overview");
   const [showPauseModal, setShowPauseModal] = useState(false);
+  // Pause and resume are superadmin-only routes; ask the same.
+  const maintenanceGate = permissionGate(
+    usePermissions().isSuperadmin,
+    NEEDS_SUPERADMIN,
+  );
   const qc = useQueryClient();
   const isBind9 = server.driver === BIND9_DRIVER;
 
@@ -145,6 +156,7 @@ export function ServerDetailModal({
                 onClick={() => resumeMut.mutate()}
                 disabled={resumeMut.isPending}
                 className="inline-flex items-center gap-1 rounded border border-emerald-600/40 bg-emerald-500/10 px-2 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-400"
+                {...maintenanceGate}
               >
                 <Play className="h-3 w-3" />
                 {resumeMut.isPending ? "Resuming…" : "Resume"}
@@ -154,6 +166,7 @@ export function ServerDetailModal({
                 type="button"
                 onClick={() => setShowPauseModal(true)}
                 className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                {...maintenanceGate}
               >
                 <Pause className="h-3 w-3" />
                 Pause
@@ -285,6 +298,7 @@ function OverviewTab({
       <DaemonStateBanner server={server} />
       <div className="flex flex-wrap gap-1.5 empty:hidden">
         <SpoolChip server={server} />
+        <DuplicateAgentChip server={server} />
       </div>
       <div className="grid grid-cols-2 gap-3">
         <OverviewInfo server={server} />
@@ -308,6 +322,15 @@ function OverviewInfo({ server }: { server: DNSServer }) {
         value={server.roles.length === 0 ? "—" : server.roles.join(", ")}
       />
       <InfoCard label="Agent ID" value={server.agent_id ?? "—"} mono />
+      <InfoCard
+        label="Agent version"
+        value={
+          server.is_agentless
+            ? "n/a (agentless)"
+            : (server.agent_version ?? "unknown")
+        }
+        mono
+      />
       <InfoCard
         label="Pending approval"
         value={server.pending_approval ? "yes" : "no"}
@@ -527,7 +550,17 @@ function ZoneRow({ z }: { z: DNSPerServerZoneStateEntry }) {
         {fmtRelative(z.reported_at)}
       </td>
       <td className="px-3 py-1.5">
-        <div className="flex items-center justify-center">{indicator}</div>
+        <div
+          className="flex items-center justify-center"
+          title={
+            // #2042 — the serials can match while a change is still queued.
+            z.pending_ops
+              ? `${z.pending_ops} change${z.pending_ops === 1 ? "" : "s"} not yet applied`
+              : undefined
+          }
+        >
+          {indicator}
+        </div>
       </td>
     </tr>
   );

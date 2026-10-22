@@ -27,6 +27,2179 @@ the formatter handles the rest.
 
 ### Added
 
+- **A zone's records export and import as CSV / XLSX, for bulk
+  editing in a spreadsheet (#2139).** The zone's Data menu gains
+  Export CSV, Export XLSX, Download template and Import CSV / XLSX,
+  beside the zone file. One row per record, with `priority` / `weight`
+  / `port`, `view` and `comment` as their own columns and the record's
+  `id` so a re-import edits the same record: a row with an `id`
+  updates that record (a rename included), a row without one matches
+  by view, name, type and value, or is added. Merge (default) never
+  deletes; replace deletes what the sheet does not list and needs the
+  zone's name typed back. Every row runs the record API's own checks
+  and a bad one is a per-row error with its row number; the commit
+  refuses the whole file while any remain. Records IPAM or an
+  integration owns are never changed or deleted; CNAME-rule clashes
+  are skipped with the reason, as in the zone-file import. Cells are
+  escaped against formula injection on export and read as text on
+  import. The commit goes out as record ops on one serial bump through
+  the zone-file import's own path, and is audited. The template's
+  example rows carry `id=EXAMPLE` and are ignored on import. REST:
+  `GET …/zones/{id}/export?format=csv|xlsx`,
+  `GET …/zones/{id}/import/template`,
+  `POST …/zones/{id}/import/spreadsheet/{preview,commit}`. New
+  read-only Copilot tool `export_dns_zone_records`, default on; no
+  import tool, by decision (#13). See `docs/features/DNS.md` §9.
+  A sheet cannot store one record twice: two identical new rows, or an
+  edit that turns a record into a copy of another, is a row error, as
+  the record API's 409 (#1230). A name ending in a dot is absolute, as
+  in a zone file (`www.example.com.` is `www`; a name outside the zone
+  is an error), where the record API alone would have stored
+  `www.example.com.example.com.`. A record whose TTL predates the #2073
+  bounds re-imports with its TTL as it is. Uploads are bounded before
+  they are parsed (an XLSX at 100 MB uncompressed, 100,000 rows read
+  at all), a CSV may be UTF-16 (Excel's "Unicode text"), and a corrupt
+  or entity-expanding sheet is a 422 rather than a 500. On an agentless
+  group, a change the provider has not taken yet is shown in the import
+  dialog instead of the dialog closing as if it were clean.
+
+- **NAT mappings can be turned off: they are now the `ipam.nat`
+  feature module (#2100).** Settings → Features has a NAT mappings
+  entry. Off, it removes the IPAM → NAT Mappings sidebar entry, the
+  Dashboard's NAT card and its count query, and the NAT tab, NAT
+  badges and mappings dialog on subnet and IP detail, and the
+  `/api/v1/ipam/nat-mappings` routes answer 404. The address list
+  reports `nat_mapping_count` as 0 without querying for it. Turning
+  it back on restores everything: the mappings are hidden, never
+  deleted, and disabling is allowed while they exist. The PAN-OS,
+  Fortinet and Meraki mirrors keep writing their NAT rows while it is
+  off, so turning it on shows a current picture.
+  The module ships **off** on a fresh install, but **an install that
+  already has NAT mappings keeps seeing them after upgrade**. No
+  `feature_module` row is seeded, which #1069 forbids. Instead a module
+  may now declare `default_on_if_rows_in`: with no operator override
+  it resolves on exactly when that table holds a row. An operator's
+  choice in Settings → Features always wins, in either direction. Two
+  consequences follow from "on when there is data". On a fresh install,
+  a firewall mirror's first NAT rule turns the surface on. And deleting
+  the last mapping turns it off again unless it was enabled explicitly.
+  The NAT Mappings page then says the feature is off and links to
+  Settings → Features, rather than leaving a page whose requests 404,
+  and the sidebar follows at once.
+  The check is a one-row probe, run only while no override exists, at
+  most once per worker per 5 s module-cache refresh, and the
+  feature-modules list the UI resolves from uses the same derivation
+  as the route gate, so the sidebar and the API cannot disagree.
+
+- **The Helm chart's migrate Job takes annotations, so it works under
+  GitOps (#2114).** Under `helm template`, which is how Argo CD and
+  similar tools render a chart, the Helm revision is always 1. The
+  migrate Job was therefore always `<release>-migrate-r1`, and since a
+  Job's pod template cannot change, the first sync after an image bump
+  failed with `field is immutable` until the old Job was deleted by
+  hand. New `migrate.annotations` (empty by default) sets annotations on
+  the Job; with Argo CD's `hook: Sync` and
+  `hook-delete-policy: BeforeHookCreation` the Job is recreated and
+  re-run on every sync. The chart README gains a GitOps section, which
+  also covers pre-creating the secrets `helm template` would otherwise
+  regenerate on every render, and no longer describes the migrate Job as
+  a pre-upgrade hook. `k8s/README.md` shows the same fix as a kustomize
+  patch for the plain manifests.
+
+- **Per-server `nodeSelector` and `tolerations` for DNS agents in the
+  Helm chart (#2114).** DNS agents only prefer separate nodes, so after
+  a node drain an agent could reschedule next to another one and stay
+  there. Each `dnsAgents.servers[]` entry now accepts `nodeSelector` and
+  `tolerations`, so a server can be pinned to a node to keep one agent
+  per node behind a shared address. Both are unset by default and the
+  chart renders unchanged.
+
+### Changed
+
+- **Helm 4.3.0 -> 4.3.1 and Swagger UI 5.33.1 -> 5.34.0.** Both
+  are within-major bumps of build/docs tooling. Helm 4.3.1 is a
+  patch (a CRD-establishment wait under `HookOnlyStrategy`, a linter
+  update); it is the CLI CI and `make charts-lint` use, and nothing
+  ships it. The vendored `/api/docs` bundle is re-vendored
+  byte-for-byte from the 5.34.0 `swagger-ui-dist` npm tarball
+  (integrity checked); 5.34.0 adds searching operations by path and
+  OpenAPI 3.2 `additionalOperations`, with no change to the
+  initializer API.
+
+### Fixed
+
+- **A node's hard loss no longer leaves a surviving node's heartbeat stale
+  past the demote guard (#1805).** Every heartbeat reached the api through
+  its Service, and so does every DNS and DHCP agent and the frontend's
+  `/api` proxy. The Service spread their connections over every api pod. A
+  lost node's api pod stays listed until the node reads NotReady, about
+  40 s, so a heartbeat that landed on it waited out its whole 40 s timeout.
+  Two in a row left a healthy node 97 s without a heartbeat. On the
+  appliance the api Service now sets `trafficDistribution: PreferSameNode`:
+  each node's callers use the api pod on their own node while it is ready,
+  and every api pod only while it is not. firstboot's control-plane values
+  and the supervisor's `spatium-control` HelmChartConfig both set it, so a
+  fresh install, a grown cluster and an upgraded one all carry it. The
+  umbrella chart's new `api.service.trafficDistribution` defaults to `""`,
+  which renders the api Service as before on your own Kubernetes; the field
+  is rendered on Kubernetes 1.34 and later.
+
+- **A node's return no longer rolls CoreDNS out twice (#1753).** k3s
+  force re-applies its bundled `coredns.yaml` at every server start. That
+  put the CoreDNS pod template's tolerations back to k3s's own two entries.
+  The supervisor's HA shape had added a 20 s fast-evict pair to them, so the
+  template changed (rollout one), and the seed's next heartbeat patched the
+  pair back in (rollout two). Each rollout replaced every CoreDNS pod.
+  Lookups in flight to the replaced pods stalled, enough to put Redis
+  Sentinel into TILT once more at each return. With one CoreDNS replica on
+  every node (#1718), a fast eviction has nowhere to put the evicted pod.
+  The HA shape now keeps k3s's own tolerations, so k3s's re-apply changes
+  nothing and a node's return replaces no CoreDNS pod. An existing cluster
+  drops the fast-evict pair in one rollout when it upgrades.
+
+- **After a node's hard loss, Redis fails over in seconds again, not
+  80–100 s (#1718).** Until a lost node reads NotReady (about 40 s), its
+  CoreDNS pod stays a ready endpoint of the cluster DNS Service. About half
+  of every other node's lookups went to it and stalled for the resolver's
+  whole timeout. Redis Sentinel resolves its peers' names inside its event
+  loop, so each stall put the surviving sentinels into TILT, where they act
+  on nothing until 30 s after the last stall. The failover waited for the
+  dead endpoint to leave, plus the TILT period: 77 s in our drill, 78–102 s
+  in the issue. The supervisor now runs one CoreDNS replica on every node
+  (it was capped at two). It also sets `trafficDistribution:
+  PreferSameNode` on the kube-dns Service, so each node resolves through
+  its own replica and a lost node takes only its own pods' DNS with it. A
+  single-node appliance keeps the stock shape.
+
+- **A heartbeat that never reached the control plane is sent again after
+  5 s, not after the whole 30 s interval (part of #1805).** Such a
+  heartbeat is one whose lookup or connection went to a lost node, or that
+  met an empty api Service while the api waited for Redis. On a node loss,
+  two failures in a row left a healthy node's heartbeat about 100 s old.
+  That is past the 90 s after which the demote guard and the Fleet tab
+  call a voter unhealthy. The supervisor now sends such a heartbeat again
+  after 5 s, doubling the wait while failures continue, up to the
+  interval. A heartbeat the control plane answered is paced as before.
+
+- **A failing Windows DHCP lease pull now shows on the server row
+  (#2306).** The scheduled pull recorded a failure only in the audit
+  log, so a server whose lease cmdlet kept failing stayed green and
+  read "synced 10:04:12" for weeks. A pull that returns any error, an
+  access-denied lease read included, and a partial one with the failing
+  part named, is a failing pull, whether the scheduled task or the
+  manual Sync leases ran it. The error is now stored on the
+  server (`last_sync_error`, `last_sync_error_at`, returned by the
+  DHCP server API), shown as an amber **Sync failing** chip with the
+  reason on hover, and cleared by the next successful pull. The DHCP
+  and DNS server rows, DNS pools and pool members also show a relative
+  age ("3d ago") instead of a time of day with no date. Migration
+  `e2b6f81d4a37`.
+
+- **A zone's own export re-imported as a delete + create of every MX,
+  SRV, CNAME, NS, PTR and TXT record (#2187).** The record API stores a
+  name target without its trailing dot, relative to the zone, but the
+  zone-file writer forced a dot on it (`mail` became the absolute
+  `mail.`), and the import diff compared the value text exactly. The
+  writer now writes targets as stored (`$ORIGIN` makes the file read
+  them the same way) and quotes TXT through the shared driver helper,
+  and the diff compares names absolute and case-folded and TXT in one
+  quoted form, so exporting a zone and importing it back plans nothing
+  under `replace` or `merge`.
+
+- **A replayed grant no longer re-points an address's IPAM row to the
+  client that already released it (#2391).** After an agent restart
+  the lease file is re-sent, so an old client's grant (and release) of
+  an address can arrive after a new client holds it. #1318 kept the
+  replayed release from deleting the row, but the grant still wrote the
+  old client's MAC, hostname and lease onto it, and re-activated the old
+  lease. A grant older than another client's live lease on the same
+  address (compared on the lease start Kea reports), or one whose lease
+  ends later in the same batch, is now ignored. A newer grant, a
+  renewal, or a real new client updates the row as before.
+
+- **A Postgres failover no longer stops a rolling upgrade for ten
+  minutes (#2177).** One refused database connection during a
+  CloudNativePG failover crashed the drive: its two Celery retries
+  both landed within about a second, and the drive kept its Lease, so
+  the run sat in `running` with nothing driving it until the Lease
+  expired (600 s) and the orphan sweep re-drove it. If the database
+  came back sooner, the crash failed the node instead. Now a step that
+  loses its database connection rolls back and retries in place for
+  up to 90 s, so the node carries on where it was; the commit of the
+  slot-image stamp is part of its step, so a stamp lost to the outage
+  is written again. A connection lost outside a step (the run row's
+  own writes) releases the drive's Lease first and retries the drive
+  after 5, 10, 15, 30 and 30 s; the retry takes the Lease over at
+  once and resumes from `progress.per_node`. Only connection errors
+  are retried (refused, reset, timed out, closed, server shutting
+  down, a demoted primary), and a refused or timed-out socket counts
+  only when the database driver raised it: from a kubeapi or Redis
+  call it still fails the run at once, as does any other error. A
+  slot stamp whose commit landed but was never acknowledged is still
+  treated as this run's fresh stamp, and a long wait step that rides
+  out one failover gets a fresh budget for a later one (three at
+  most). A drive that gives up leaves the run `running` with the Lease
+  free, so the orphan sweep re-drives it within a couple of minutes,
+  and the crash handler now releases the Lease even when it cannot
+  write the row.
+
+- **Fleet showed a silent appliance's last report as current, and nothing
+  alerted on the silence (#2259).** Role chips and the Service health
+  table now grey out, with a "no heartbeat for X" badge, once
+  `last_seen_at` is older than about three heartbeat intervals. A new
+  default-on `appliance_heartbeat_stale` alert (warning after 5 min,
+  critical after 30, auto-resolving) covers control-plane and observer
+  nodes no other rule watched, and `find_appliance_fleet` reports
+  `heartbeat_stale`. The `no_lanwide_control_plane_ports` conformity check
+  now returns warn for stale or unverified nodes and not applicable when
+  no appliance reports, instead of counting them as PASS.
+
+- **A rate-limit counter could be left without an expiry and throttle an IP
+  or user forever (#2294).** The login, E911 self-query, step-up and
+  network-tools limiters did `INCR` and then a separate `EXPIRE`; a crash,
+  timeout or dropped connection between the two left a counting key with no
+  TTL that never reset (a whole office NAT locked out of login, a phone that
+  never got a location again). The step-up claim's `SET NX EX` then `INCR`
+  had the same gap if the key expired in between. All four now use one
+  atomic script that sets the expiry whenever the key has none, so a
+  TTL-less key is also repaired by its next hit. Limits, window start and
+  fail-open / fail-closed behaviour on a Redis error are unchanged.
+
+- **A DNS bundle render that kills its worker is no longer requeued
+  forever (#2271).** `render_dns_bundle` runs with the global late-ack +
+  reject-on-worker-lost, so a render the OOM killer took down was handed to
+  the next worker, which died the same way, with nothing recorded because
+  the process never reached its failure handler. Each delivery of one render
+  message is now counted in Redis (kombu's `redelivered` is only a boolean);
+  past 3 deliveries the render is abandoned, logged as
+  `dns_agent_bundle_render_abandoned` and recorded as `failed` on the server
+  row, and the 30 s sweep's 5-minute failed-backoff paces the next attempt.
+  With Redis unreachable the bound is skipped and the render runs.
+
+- **Query-log severity and print-* settings now reach named.conf
+  (#2265).** The Options UI let operators pick the log channel, file,
+  severity and print flags, and the BIND9 agent rendered a hard-coded
+  channel regardless. Severity (`info` / `debug [N]` / `dynamic`) and
+  `print-category` / `print-severity` are now rendered, in the agent and
+  the control-plane template. The channel and path stay fixed at
+  `/var/log/named/queries.log`, which the DNS Queries shipper tails, so
+  syslog / stderr / another path, a severity above `info` (it would drop
+  every query line) and `print-time` off are refused with a 422, and the
+  channel / path fields are gone from the UI. Default groups render
+  byte-identically.
+
+- **The Technitium agent ignored every NOTIFY setting (#2267).** `notify
+  no` (a stealth primary) still notified the zone's NS hosts, because
+  Technitium defaults to `ZoneNameServers`, and also-notify targets were
+  never notified. The agent now sets each Primary / Secondary zone's
+  `notify` + `notifyNameServers` from the group's settings, with a zone's
+  own `notify_enabled` / `also_notify` overriding them: `yes` is the NS
+  set plus the also-notify list, `explicit` only the list, `no` nothing.
+  Technitium notifies bare IP addresses only and has no allow-notify, so a
+  Technitium group now refuses an `also_notify` entry with a port, key or
+  hostname and any `allow_notify` with a 422 that names the field.
+
+- **A feature-module verdict cached under another catalog no longer
+  answers for this one (#2395).** `get_enabled_modules` kept its
+  5 s verdict whatever catalog it was resolved against, so a lookup
+  made while the shipped defaults were in force (a task finishing
+  after the test fixtures were torn down) made the next test's
+  sweep read a default-off module as disabled and fire nothing,
+  which flaked `test_sweep_gated_off_writes_skip_run_and_restamps`
+  on a CI shard. The cache now remembers the catalog it resolved
+  against and re-resolves when that changes. No production
+  behaviour change.
+
+- **A cluster rolling upgrade no longer rolls the control plane, and
+  leaves the run with nothing driving it, when the seed boots its new
+  slot (#2176).** The run holds the shared image tags until every node
+  runs the target (#1710), but the seed's firstboot also writes its
+  slot's version into the control chart as `APPLIANCE_VERSION` (#2004),
+  and that alone changed the api, worker and beat pod templates: they
+  rolled on every node, still on the old image, the worker running the
+  drive was shut down, and the run sat `running` until the drive's
+  Lease ran out (600 s) and the orphan sweep picked it up again. The
+  version is now a value of its own in the control chart
+  (`applianceVersion`, no longer a `sharedEnv` entry), and the run pins
+  it with the tags, to the version the control plane reports, until the
+  flip moves both in one step. The pods still report the version they
+  run once the run has flipped. A roll from a version without this fix
+  still rolls the control plane once, at the seed's boot.
+
+- **A blocked name answered SERVFAIL after ~10 s when its upstream
+  lookup failed (#2427).** The BIND9 `response-policy` statement
+  (global and per-view, agent and control-plane template) lacked
+  `qname-wait-recurse no`, so BIND resolved the blocked name first
+  and did not rewrite a failed lookup - the names a blocklist most
+  wants to answer (dead, sinkholed, broken upstream) were the ones
+  that timed out, and the query also leaked upstream. QNAME-trigger
+  rules now answer at once. IP and NSDNAME triggers still recurse by
+  nature.
+
+- **Renaming or deleting a TSIG key that something still cites stopped
+  the whole DNS group (#2282).** `key <name>` is cited from ACL entries,
+  view match lists, the group's address-match options and `also_notify`,
+  and zone `allow_query` / `allow_transfer` / `also_notify`. Renaming or
+  deleting the key left an undefined symbol in `named.conf`, so
+  `named-checkconf` failed, the agent declined the bundle and the group
+  stopped converging. Both now answer 409 naming every referrer; an
+  uncited key still renames and deletes freely. Deleting a key also
+  reports how many zone dynamic-update grants it took with it (the
+  `X-Removed-Update-Grants` header and the audit row). As defence in
+  depth, the bundle drops any `key <name>` element whose key it does not
+  define (logged as `dns_bundle_entry_dropped_undefined_key`), so a
+  reference stored before this guard cannot break the group. That drop
+  never widens access: an access list it empties, or that loses a
+  negated `!key` element, ships as `none` rather than empty, because
+  every renderer reads an empty list as "unset" (`any`, or inherit the
+  server's). Key names compare as BIND compares them, case-insensitively
+  and with or without the trailing dot.
+
+- **Conformity alerts open, close and page again (#2277).** Two
+  defects. A conformity alert against a subnet, IP address, DNS zone,
+  DHCP scope or multicast group never opened: its subject id is 80 to
+  89 characters and `alert_event.subject_id` was VARCHAR(64), so the
+  insert failed and took the whole policy pass with it, results and
+  `last_evaluated_at` included. Only `platform` policies could alert.
+  And no conformity alert ever closed: #1578 took them away from the
+  alert evaluator and the conformity engine never resolved its own. A
+  fixed target, a deleted one or a disabled policy stayed red, and
+  because the event was still open, a later re-failure did not page.
+  The engine now resolves an event when its resource next evaluates
+  `pass` or `not_applicable`, when the resource is deleted or leaves the
+  policy's scope, and when the policy is disabled or deleted (from the
+  REST API, the copilot, and a once-a-minute sweep that catches any
+  other path). Clearing or switching the policy's alert rule closes
+  the old rule's events at its next evaluation, and a failure still
+  in progress pages once on the new rule. `warn` and a check that
+  raised keep the event open.
+  A re-failure after the engine closed the event opens a new one and
+  pages; an event an operator resolved by hand while the resource is
+  still failing is not re-paged, as before.
+
+  earliest-fired. Downgrade restores the non-unique index; the resolved
+  duplicates stay resolved.
+
+- **A DNS blocklist set to `sinkhole` answers with the sinkhole address
+  instead of dropping the query, and `refused` is retired (#2124).** The
+  agent rendered `sinkhole` as `CNAME rpz-drop.`, which makes named send
+  no response, so every blocked lookup hung for the client's resolver
+  timeout (seconds per lookup, per retry) instead of failing fast. The
+  list's `sinkhole_ip` was never shipped to the agent at all, while the
+  control-plane renderer emitted `A <ip>` only when one was set and
+  rendered `refused` as `rpz-drop`: two renderers, two policies. Both now
+  render `sinkhole` as RPZ local data, an `A` and an `AAAA`: the list's
+  address replaces `0.0.0.0` (IPv4) or `::` (IPv6), and the other family
+  keeps the unspecified address. Verified with `named-checkzone` and a
+  live `named` 9.20: `A 0.0.0.0`, `AAAA ::` and the configured addresses
+  come back at once. On Technitium a sinkhole with no address is now
+  `AnyAddress` (it used to become `NxDomain`), and one with an address is
+  `CustomAddress` with it. BIND's RPZ has no action that answers REFUSED,
+  so `block_mode: "refused"` is now a 422 that says so (a deliberate
+  decision: accepting it and storing `nxdomain` would be the same silent
+  substitution this fixes); stored `refused`
+  lists become `nxdomain`, which is what the agent always served them.
+  `sinkhole_ip` must now be an IP address (a bad legacy value renders the
+  default rather than breaking the zone), and the catalog subscribe
+  endpoint validates `block_mode`, which it did not before.
+
+- **The adblock feed parser keeps `@@` exceptions, honours `$badfilter`
+  and no longer widens narrowing rules into blocks (#2123).** It read only
+  `||` lines and cut each rule at the first `^`, `$` or `/`. So
+  `@@||name^` exceptions were dropped (the name stayed blocked by any
+  broader rule), `||name^$badfilter` (which disables a rule) became a
+  block, and `$domain=`, `$third-party`, `$client=` and similar rules,
+  which narrow a block DNS cannot narrow, became unconditional blocks.
+  Now `@@` rules become the list's exceptions (marked `source: feed` and
+  re-synced on each refresh; exceptions you add stay yours). A feed's
+  `@@` applies to that feed's own list only: it carves a name out of the
+  feed's own blocks and never unblocks a name your manual list, or any
+  other list on the same group or view, blocks. Exceptions you add by
+  hand still apply to every list, and adding or editing one the feed
+  already lists makes it yours, and so group-wide. `$important` is a plain block that still beats a plain `@@` for
+  the same name, a `$badfilter` rule drops the rule it names, and a
+  rule with any other modifier is skipped. Regex rules, path rules and
+  other rules that are not `||name^` are skipped too. Each skipped rule is
+  counted by category, stored as `feed_parse_skipped` on the list, shown
+  on the list as "N rules not enforced" and returned by
+  `list_dns_blocklists`. Adblock rules now count towards the #894
+  "apex-only list overrides a wildcard feed" warning, since `||name^`
+  means the name and its subdomains.
+
+  Bundles without a blocklist are byte-identical. With #2124 below,
+  `RENDERER_REVISION` is 13.
+
+- **DNSSEC trust anchors reach BIND9, so `dnssec-validation yes`
+  validates something (#2266).** Anchors added with
+  `POST /groups/{id}/options/trust-anchors` were stored and listed
+  but never shipped or rendered; with `yes` BIND 9.20 validates
+  nothing without one. The bundle now carries them (BIND9 groups
+  only, and only when there are any, so a group without anchors
+  keeps a byte-identical `named.conf` and etag) and the agent
+  renders a top-level `trust-anchors { ... };` statement with
+  `static-key` / `initial-key` (DNSKEY anchors; DS anchors are not
+  stored). Checked with `named-checkconf` on BIND 9.20. The values
+  are validated at the API, as they land verbatim in `named.conf`,
+  and adding an anchor to a group with a PowerDNS, Technitium or
+  agentless server is a 422 naming the driver. The options response
+  gains an advisory `dnssec_warnings` entry (shown on the DNS
+  Options tab) for `yes` with no anchor on a BIND9 group.
+
+- **The backup target form keeps the line breaks of a multi-line
+  field (#2199).** Every destination field was a one-line input, and
+  an input turns each line break into a space. So an SCP private key
+  reached paramiko as one line ("not a valid OPENSSH private key
+  file"), a two-host known_hosts became one entry, and a second HTTPS
+  header folded into the first one's value. The destination catalog
+  (`GET /backup/targets/kinds`) now marks each field whose value is
+  lines `multiline`: SCP's private key and known_hosts, HTTPS PUT's
+  extra headers and GCS's service-account JSON. The form renders
+  those as textareas, masked for the secret ones with a Show toggle,
+  and sends the value unchanged. Editing a target without retyping
+  its key still keeps the stored key. The API now refuses (422) a
+  PEM key whose BEGIN and END lines arrive on one line, naming the
+  lost line breaks rather than leaving paramiko to call it an invalid
+  key. Azure Blob's Connection string help no longer calls the
+  one-line portal string "multi-line".
+
+- **The Manual restore card no longer offers a selective restore of
+  an Exclude-secrets archive (#2201).** The card decided whether an
+  archive could be restored selectively from `format_version == 2`,
+  and every archive is version 2, including an Exclude-secrets one,
+  whose database dump is plain SQL. The API refuses a selective
+  restore of a plain dump, and that refusal stays: a selective restore
+  filters pg_restore's custom format by table, which plain SQL cannot
+  be. So the card enabled Apply for a request that always failed. The
+  manifest preview (`POST /backup/manifest-preview`) now returns the
+  `dump_format` the restore resolves, from the same helper the restore
+  uses, and `selective_restore_supported`. The card reads them, keeps
+  Apply disabled for a selective restore of a plain archive, and says
+  why. A full restore of the same archive is still offered.
+
+- **A demoted member whose etcd stops before answering its own removal
+  now finishes its leave (#2394).** When a member removes itself
+  through its own etcd, a peer that has applied the removal can reject
+  that etcd's traffic before the member has applied the change itself:
+  k3s then closes etcd, and the removal call answers
+  `etcdserver: server stopped` though the member is gone.
+  `spatium-etcd-evict --leave-self` read any error as "not removed"
+  and refused the leave at once, before it asked the node it joined.
+  k3s restarted, found its removal tombstone, wiped its etcd data and
+  rejoined as a new voter, and the row read `failed`. Seen once in
+  nine three-node demote drills. An error answer for the node's own
+  member now stops k3s and goes to the same check as an accepted one:
+  the node it joined decides, and a survivor that answers and still
+  lists the member still refuses the leave. Only an error that shows
+  etcd never acted on the call refuses at once, with k3s left running:
+  curl failing before it sent the call (it could not connect, or TLS
+  failed), no gRPC status, or the strict reconfiguration check's
+  refusal. When no survivor can be reached after an error answer, the
+  leave goes on only if k3s left its tombstone (it writes one only
+  once a peer has applied the member's removal); without one, nothing
+  shows the member gone, and the leave is refused rather than wiping a
+  node whose member may still vote.
+
+- **A slot upgrade stopped in its first moments no longer stays "in-flight" (#2424).** The runner wrote the in-flight state before arming the trap that records a failure on an abrupt exit, so a stop landing in between left the upgrade reading in-flight with nothing to clear it. The trap is now armed first.
+
+- **A refused request to a superadmin-only route is now audited (#2304).**
+  `require_permission` has always written a `denied` audit row when it
+  refuses; the `SuperAdmin` dependency and the per-router
+  `_require_superadmin` helpers (backup and restore drills, factory reset,
+  support bundle, diagnostics, alert rules, pairing codes, upgrade images,
+  appliance fleet, audit-forward and InfluxDB targets, branding) answered
+  403 and wrote nothing, so probing them with a low-privilege token was
+  invisible to the Dashboard security panel and to a SIEM fed by audit
+  forwarding. They now share one dependency that records the refusal the
+  same way (`action` access on `superadmin`). The status code stays 403;
+  the refusal text of those routes is now the generic "Superadmin
+  required". The imperative checks on `?permanent=true` deletes and in the
+  approval engine's risky operations, which cannot take a dependency, use
+  a separate synchronous `ensure_superadmin` and are not audited.
+
+- **Switching an appliance from BIND9 to PowerDNS and to a new DNS group
+  in one save could leave two server rows, with the new group's zones
+  REFUSED (#2190).** The supervisor labelled the node for the new engine
+  before it wrote the new chart values, so the engine's DaemonSet, which
+  already existed with the previous `AGENT_GROUP`, started a pod in the old
+  group seconds before helm-controller rolled the new one. That pod
+  registered a second row in the old group and its cached token kept it
+  there. The supervisor now writes the values first and sets a role label
+  only once that engine's DaemonSet carries the assigned group (waiting up
+  to 30 s, then leaving it to the next heartbeat, at most 5 minutes). And
+  registration no longer trusts the pod's env for an appliance's agent: a
+  new agent whose hostname is one approved appliance's, running its current
+  engine, registers into the appliance's assigned group and adopts the
+  appliance's row there, taking that row's agent id. A row found by agent
+  id is still never moved (#934).
+
+- **One failing alert rule no longer re-pages every alert in the pass,
+  every minute (#2261).** The alert evaluator ran every rule in one
+  transaction and delivered each new event as soon as it opened, before
+  the single commit at the end. A rule whose query failed (a SQL error,
+  or a slow DNS-threat matcher hitting the task's command timeout)
+  aborted that transaction, so the commit discarded every event the
+  pass had already sent: the pages went out, nothing appeared under
+  /alerts, and the next tick (plus Celery's three autoretries) sent
+  them again. Now each rule runs in its own savepoint, so a failing
+  rule rolls back only itself, and nothing is delivered until the
+  events are committed; a pass that fails before its commit has sent
+  nothing, and one that fails after it finds its events already open
+  and does not re-send them. Each queued delivery is claimed before it
+  is sent, so it is never sent twice, and one a worker died before
+  sending is re-sent by a later pass once it is ten minutes old, unless
+  the event has resolved or its rule is disabled. Passes are
+  serialised by an advisory lock (an overlapping pass, including
+  "Evaluate now", returns zero counts), and at most one event per
+  rule and subject can be open: the index is now unique, and the
+  migration resolves any duplicates already stored, keeping the
+  earliest. The conformity engine had the same shape and gets the same
+  fix: a check that raises a database error no longer loses every
+  policy's results and `last_evaluated_at` (so policies no longer re-run
+  and re-page every minute), and its alerts, including "evaluate now",
+  are sent only after they are stored. The audit-chain and schema-check
+  tasks commit their alert before delivering it too, and a resumed
+  upgrade run that fails again resolves its previous failure alert
+  before opening the new one.
+
+- **Overlapping DHCP lease pulls no longer duplicate a lease and stop
+  that server's pull for good (#2262).** The Windows DHCP / FortiGate
+  lease pull stamped its interval only at the end of a pass and took
+  no lock, so a pass slower than the 10 s beat tick was started again
+  while it ran, and the manual Sync Leases raced it too. Both passes
+  inserted the same new lease, and from then on every pull of that
+  server failed on that address, leaving leases and IPAM `dhcp`
+  mirrors stale until someone deleted the row by hand. The scheduled
+  pass now claims its interval when it starts, the scheduled pass and
+  the manual Sync share a per-server lock (a Sync that hits it answers
+  409), the insert is an upsert, and a pull that meets an address with
+  two rows keeps the newest and carries on, so an install wedged today
+  recovers on its next pull. Migration `e4b8c2d17a95` deletes existing
+  duplicates (keeping the most recently seen row) and adds unique
+  indexes on the lease identity: (server, address, MAC) for DHCPv4,
+  (server, address, DUID, IAID) for DHCPv6. Not on (server, address)
+  alone, because the Kea lease-event path keeps one row per client on
+  an address on purpose (#1318). If two Kea lease reports for one
+  server insert the same new lease at once, the later one now answers
+  `503` so the agent retries it and it lands as an update, rather than
+  a `409` that the agent would treat as a rejection and drop with the
+  rest of its batch.
+
+- **Agents no longer report a config apply of `ok` before they have applied anything (#2258).** The DNS, DHCP and looking-glass agents sent a default `ok` with no etag on every heartbeat until their first apply, so a fresh agent whose `/config` fetch never succeeded showed a green chip and never fired `agent_config_rejected`, and a server move's reset to unknown (#934) was undone within one heartbeat. The agents now send an empty block until something has applied, and the control plane treats `ok` without an etag as unknown (NULL), which also covers older agents still in the field.
+
+- **A disabled Tailscale tenant no longer reads "Token rejected", and
+  the Integrations card always names tenants with a credential problem
+  (#2191, #2192).** A tenant whose last sync got a 401 and was then
+  disabled kept its red chip on the Tailscale page, in
+  `GET /tailscale/tenants` and in `list_tailscale_targets`, while its
+  alert and the dashboard chips had cleared. One shared rule in
+  `credential_status` now gives such a tenant the state `disabled` on
+  all of them; the page greys its last error as "Last error
+  (disabled)". The Integrations dashboard cards used to name only
+  their first three targets, so a rejected tenant beyond them was
+  counted and never named. Targets with a credential problem or a sync
+  error are now listed first, ahead of healthy ones, even past three;
+  this covers every integration card, and the IPAM-tab panel orders
+  the same way. The list stays bounded: a card names up to eight
+  problem targets and says "+N more with problems" for the rest, and
+  the dashboard API returns at most 50 problem rows per integration.
+  Its counts ("N token expired", the new `problem_count`) are now
+  taken over every target rather than the trimmed row list, which
+  used to undercount past 20 targets.
+
+- **A trial slot on slow storage is no longer reverted because the
+  image check judged k3s's import while it was still running
+  (#2109).** Before it commits a trial slot, firstboot checks that
+  k3s imported every baked image tarball. It waited 120 s for the
+  kubelet, took a kubelet that answers to mean k3s's start-up import
+  was over, and then touched every tarball it could not yet see as
+  imported so k3s would import it again. On a node whose import
+  outlasted that wait, it touched the tarball k3s was importing at
+  that moment, which made k3s import it a second time, gave up before
+  that import ended, and left a healthy slot uncommitted, so the
+  next reboot reverted it. The kubelet is not the signal even on a
+  fast node: k3s starts it once its import queue is empty, while the
+  last tarball is still being imported (seen on a real k3s v1.36.4:
+  the kubelet started 8 s before the last import ended, and the old
+  check made k3s import that tarball twice). The check now asks
+  whether a process holds a baked tarball open, which k3s does for
+  exactly as long as it imports it. It waits while one is open, never
+  touches one that is, and judges once none is. It waits at most what
+  is left of firstboot's 10-minute start timeout, and if k3s is still
+  importing then it reports that and does not commit, rather than
+  calling an unfinished import a missing image, and names the Fleet
+  action (Approve trial) that keeps the slot once the import is over.
+  An open tarball is recognised by its inode rather than its path, so
+  a tarball k3s opened under another name (a bind mount, a symlinked
+  directory) still counts as being imported. On a node whose import
+  finished long ago it judges at once, as before.
+
+- **A DNS server holding its cached config after a crash no longer
+  stays dark while the control plane answers but cannot send a
+  bundle (#2241).** After named dies on a bundle, the #2019 hold asks
+  the control plane for a fresh one before starting it, and serves
+  the cache at once only when the control plane cannot be reached. A
+  control plane that answers but cannot render (renders OOM-killed or
+  killed at their time limit at scale, a long-poll that only ever ends
+  in 304) never counted as unreachable, so in the #2240 scale lab five
+  servers with valid caches stayed dark for about 3.5 hours. Once the
+  hold has lasted `AGENT_BOOT_HOLD_MAX_WAIT_S` seconds (default 600)
+  with nothing applied, the control plane now counts as unreachable:
+  the agent logs `bootstrap_hold_max_wait_elapsed_applying_cache`,
+  serves the cache under the offline rules and keeps syncing, and the
+  control plane's bundle is applied normally when it arrives, as a
+  reload of the daemon the fallback started. A bundle named was seen
+  dying on twice is never re-applied by this timer, not even on its
+  quarantine backoff: only a different last-known-good may serve (one
+  with no recorded etag does not count, since nothing says it is not
+  the same bundle), and with none the server stays down. A held cache
+  that fails to apply hands over to the last-known-good once, not on
+  every poll. The server row shows the wait in
+  the hold's `no_previous` reason, then `ok` once the cache serves.
+
+- **The MFA step of sign-in honours account lockout and has its own
+  attempt budget.** `POST /auth/login/mfa` now refuses a locked account
+  with the same 403 `/login` gives it, before checking the code, so a
+  correct code can no longer complete a sign-in or clear the lock.
+  Wrong codes (TOTP or recovery) still count towards the lockout
+  counter, and also against a per-account MFA budget that applies
+  whether or not lockout is enabled: 5 wrong codes in 15 minutes and
+  the MFA step answers 429 with `Retry-After` until 15 minutes after the
+  last one. The budget lives on the user row, so it holds when Redis is
+  unavailable, and attempts are read under a row lock so concurrent
+  ones are counted one at a time. Each MFA challenge also accepts at
+  most 3 wrong codes; after that, and after a successful sign-in, it is
+  spent and sign-in starts again at the password. A successful sign-in
+  or an admin unlock resets the budget. Refusals are audited as
+  `login` failures (`account_locked`, `mfa_attempts_exhausted`,
+  `mfa_challenge_spent`), and using up the budget writes an
+  `account.mfa_attempts_exhausted` row. See `docs/features/AUTH.md`.
+
+- **Deleting a Kubernetes cluster, Tailscale tenant or NetBird instance
+  left its DNS names served (#2288).** The mirrored zone and records go
+  with the target through a database CASCADE, which the bundle-dirty
+  listener cannot see, so every agent kept answering them until some
+  unrelated change re-rendered the group. The three delete handlers now
+  mark the affected groups' bundles dirty and wake their agents before the
+  delete, the same path the reconcilers' own ORM retraction relies on.
+
+- **Two DNS agents running as one server no longer pass record
+  changes back and forth until they fail (#2044).** Since #2042 a
+  DNS agent's config poll takes back a record change still in flight
+  to a different agent process, which is right when that process is
+  gone. With two processes live on one server identity at once (a
+  cloned VM that kept its `agent_id`, two containers given one state
+  directory), each one's polls took the change back from the other,
+  and it bounced between them, one retry each time, until its eight
+  attempts were spent. The control plane now records which agent
+  process owns each server. A process it has never seen takes over at
+  once, so replacing an agent works as before. The process it
+  replaced is refused with 409 if it polls again while the owner is
+  still polling: it logs `sync_duplicate_agent_instance`, keeps
+  serving its cached config, does not re-register, and retries every
+  30 s, taking the server back by itself once the owner has been
+  silent for 5 minutes. A long-poll whose process lost ownership
+  while it waited ships nothing. Refusals that last over 2 minutes
+  show a **Duplicate agent** chip on the server, with the address the
+  refused agent polled from, and raise the new default-on
+  `dns_agent_duplicate_instance` alert ("Two DNS agents on one
+  server"); both clear 10 minutes after the extra agent stops. The
+  2-minute wait keeps an overlapping rollout, whose old pod polls
+  once more before it exits, from alarming. The `find_dns_servers`
+  copilot tool reports `duplicate_agent`. The refused agent's
+  heartbeats still count for liveness and op acks, but its daemon,
+  config-apply and spool reports no longer reach the server row, so
+  they cannot flap it against the owner's or raise (or hide) an
+  `agent_config_rejected` alert; the agent now names its process on
+  heartbeats too. The rule is seeded once, by the migration, so
+  deleting it is final. Agents too old to send an instance id are
+  never refused.
+
+- **IPAM to DNS auto-sync at a 1-minute interval ran every 2 minutes
+  (#2346).** Beat fires every 60 s, but the task stamps its last run from
+  a clock read a variable fraction of a second into the run, so two
+  consecutive beats were often a hair under the interval apart and the
+  gate answered `interval_not_elapsed` with `wait_seconds: 0`, pushing the
+  run out a whole tick. The gate now treats a run as due once the interval
+  is within a few seconds of elapsed (5 s on the 60 s beat, 2 s on the 10 s
+  DHCP lease-pull beat), in one shared helper. The same gate in the DNS
+  pull-from-server, DHCP lease pull, reverse-DNS sweep and OUI refresh
+  tasks gets the same fix. A run well inside the interval still skips.
+
+- **The rolling-upgrade Plan's Kea HA version-skew check sees appliance
+  HA pairs (#2179).** `kea_ha_version_skew` picked Kea servers by
+  `dhcp_server.deployment_kind = 'appliance'`, which no DHCP agent has
+  sent since #170 moved the deployment kind onto the supervisor's
+  `appliance` row. So on every appliance cluster it answered "No Kea HA
+  pairs on appliance nodes", whatever pairs ran there, and never gave the
+  warning it exists for: an HA pair already split across Kea majors, or
+  about to be split by a node-at-a-time roll. A server now counts as on an
+  appliance when an approved appliance whose supervisor reports
+  `deployment_kind = 'appliance'` owns it, by the `appliance_id` foreign
+  key or by the agent's host matching the appliance's hostname
+  (`orchestrated_server_condition` in `services/appliance/ownership.py`).
+  The PowerDNS LMDB migration check, which had worked around the same trap
+  with its own query, uses the same rule, so the two cannot drift again; it
+  no longer counts a row claimed only by a pending or docker-hosted
+  appliance's hostname. The HA test now runs over every Kea member of a
+  group, as the config renderer does, so a pair whose partner is a docker
+  agent is reported, with that partner named as one this upgrade does not
+  touch, and a group whose third member has no peer URL is not called a
+  pair. The check still compares the Kea version each agent reads off its
+  daemon, still only warns, and still ignores a pair with no appliance
+  member. No other upgrade check filtered on a server row's
+  `deployment_kind`.
+
+- **A UniFi controller named like an existing Router now syncs (#2140).**
+  Router names are unique, and the UniFi reconciler created its Router
+  under the controller's name without checking. An operator who had
+  already created a Router named after their gateway got a
+  `uq_router_name` violation on every sync, and no network, subnet, VLAN
+  or client was ever mirrored. The reconciler now takes the first free
+  name in `<name> (UniFi)`, `<name> (UniFi 2)`, …, chosen by query rather
+  than by catching the failed insert, logs the choice and records it in
+  the sync's audit row. It still never adopts the operator's Router:
+  ownership stays keyed on the controller id, because the reconciler
+  deletes VLANs on the Router it owns and would delete the operator's.
+  Once created, the Router keeps its name, so later syncs are
+  idempotent. The NetBox importer's synthetic Router had the inverse
+  problem: it adopted any Router of the requested name, including one a
+  UniFi controller owns, whose next sync would delete every imported
+  VLAN. It now skips integration-owned Routers and takes a
+  `(NetBox)`-suffixed name instead. Adopting an operator's Router by
+  name is unchanged, since the operator typed that name into the import.
+  No other integration creates Routers.
+
+- **An integration sync that crashes now says so on the integration
+  (#2141).** All eleven integration mirrors write `last_sync_error` and
+  `last_synced_at` in the same transaction as the mirror itself, so when
+  a sync raised rather than failing cleanly, the rollback discarded
+  those too. The card, the Integrations dashboard and the IPAM
+  dashboard panel showed a configured integration that had never
+  synced, with no reason. And because the per-target interval keys on
+  `last_synced_at`, the target was retried on every 30 s beat tick
+  instead of on its own interval. The sweeps and the Sync Now tasks now
+  roll the partial sync back as before, then record the error, the
+  attempt time and an error audit row in a transaction of their own,
+  so the error appears on the card and in the dashboard's recent
+  errors, and the target backs off to its interval. Active block sync
+  does the same for `last_block_sync_error`. The recorded text is the
+  driver's message only: a database error's SQL and bound parameters,
+  which can include encrypted credential columns, are dropped, as are a
+  password or token in a URL an HTTP error echoes and the row Postgres
+  prints for a NOT NULL violation. One target's crash still never stops
+  the others.
+
+- **An OOM-killed Kea is reported, so the server row reads not
+  serving and the alert fires (#2023).** The DHCP side of #2018. When
+  Kea reached the dhcp-kea container's memory limit the container was
+  killed and restarted into the same config, and the DHCP server row
+  read ok through every kill: the DHCP agent kept no OOM record, and on
+  the appliance the kubelet kills the whole container, agent included.
+  The appliance supervisor already reported the kubelet's `OOMKilled`
+  for `dhcp-kea`; the control plane now maps it onto the live Kea row
+  (from the supervisor heartbeat and over the restarted agent's `ok`,
+  timed from the kill), as the DNS side does. On Docker Compose the
+  DHCP agent now reads the container cgroup's `oom_kill` counter and,
+  when Kea's pid files show Kea did not survive the kill (the config
+  preflight or radvd can be the victim instead, and Kea is then still
+  serving), keeps a record across restarts and reports it on the
+  heartbeat ahead of the sync loop's own `ok`. Either way the row reads not serving and the
+  existing default-on Agent daemon not serving alert fires; no new
+  column, rule or migration. A plain Helm install has no supervisor and
+  is not covered (see DHCP.md 4d).
+
+- **A DNS agent holding its cached config at startup now serves it
+  while it re-registers (#2182).** During a #2019 boot hold (the daemon
+  died on the cached bundle, so the agent asks the control plane before
+  starting it), a 401 or 404 re-registers in process, and that can back
+  off for up to 5 minutes with named not running at all. The held cache
+  now serves meanwhile, under the same rules as an unreachable control
+  plane: a bundle the daemon was watched dying on twice is still not
+  re-applied, except on the quarantine's backoff. Nothing is fetched,
+  so the cache is applied as it is offline, and once the agent is
+  registered the control plane's bundle takes over through the normal
+  path, re-rendering only if it differs. The DHCP and looking-glass
+  agents have no boot hold (they apply their cache at startup), so the
+  gap was DNS-only.
+
+- **Bulk edit's "clear DNS zone" removes the records (#2172).** In Bulk
+  edit IPs, setting the DNS zone to empty (`dns_zone_id: ""`) asked the
+  sync for an update with no zone, which means "work out a zone". So
+  each address's records moved into the subnet's zone, or, with no
+  subnet zone, were published again where they already were, and the
+  request reported success. A bulk clear now runs the same clear as
+  single Edit with zone None, through one shared helper: it removes the
+  address's forward A/AAAA in its zone and any extra zone, its PTR and
+  its aliases, queues a delete for each, sets `forward_zone_id` to null
+  and empties `extra_zone_ids`. Leaving the extra zones set (which
+  single Edit used to do) meant the next Sync DNS, the scheduled
+  auto-sync or any later edit published the record there again. An
+  address with nothing published is left as it is. The response gains
+  `dns_cleared`, the addresses whose records were removed. A subnet
+  with a forward zone of its own still claims the host, so Sync DNS
+  offers the record in the subnet's zone after a clear, as before.
+
+- **Technitium DNS Server 15.4.0 → 15.6.2 (#2238).** The
+  `dns-technitium` image is built on the upstream image, now pinned at
+  15.6.2 by tag and digest. Upstream's 15.5.0 – 15.6.2 fix
+  vulnerabilities in Technitium itself, which Trivy cannot see (it
+  scans OS packages and libraries, not the application): cache
+  poisoning by an out-of-bailiwick DNAME and by off-path CNAME
+  injection; a DNSSEC validation bypass through out-of-bailiwick DS
+  records in referrals; a 4,096:1 amplification through CNAME and
+  delegation hops; an authorization bypass in which the `ptr` option
+  on Add / Update / Delete Record wrote PTRs in reverse zones the user
+  had no rights to; an out-of-memory crash on certain responses,
+  unbounded DoH/3 buffering, a persistent DoS against a chosen domain
+  and a UDP receive loop driven by empty packets; stored XSS; a
+  zone-name validation bypass in Clone Zone and DNS Client import; a
+  session-token prefix oracle that let a user recover every active
+  session's token; two admin-API CPU DoS issues (password iteration
+  count, zone-name filter regex); log injection through the login
+  API; and a missing zone-boundary check that let a user with write
+  access to one zone change records in a sub-zone on the same server.
+  Taken under the 1.0 freeze as a security fix; the `versions.json`
+  hold stays for later non-security minors.
+  Both drivers and the importer were checked against the 15.5 / 15.6
+  API changes and exercised against a live 15.6.2. Neither driver
+  uses the `ptr` option (SpatiumDDI writes its PTRs as records in the
+  reverse zone), both authenticate with a permanent API token, and
+  every response shape they parse is unchanged. Two changes needed
+  adapting:
+  **The agentless driver's Test connection no longer trusts the
+  health check to prove the token.** From 15.5 Technitium answers
+  `dnsClient/healthCheck` without any session for a request from
+  loopback, so behind a reverse proxy on the Technitium host a
+  revoked or mistyped token read as "Authenticated". The zone listing
+  that follows now decides: a rejected token there fails the test.
+  **The agent skips a parent's record at the apex of a hosted child
+  two or more labels down.** 15.6.2 refuses it ("The domain name
+  'a.b.example.com' does not belong to the zone: example.com"), where
+  15.4.0 accepted it; one label down (`kid.example.com`) is still
+  written. The child zone on the same daemon answers that name either
+  way, so the agent now logs `technitium_record_shadowed_by_child_zone`
+  and leaves the zone's apply status `ok` instead of reporting a
+  refused record on every render (the #1712 rule, extended). A record
+  written there before the upgrade is no longer listed or served from
+  the parent side on 15.6.2. The agentless driver reports the same
+  refusal as a failed record op rather than, as on 15.4.0, filing the
+  record in the child zone.
+
+- **Turning BIND9 query logging on or off now takes effect without
+  restarting named (#2249).** `rndc reconfig` never applies the
+  `querylog` switch: a named that started with query logging off
+  stayed off after the agent rendered the `queries` category, and one
+  that started with it on kept logging after it was removed. #914 fixed
+  the same thing for `responselog` but believed query logging followed
+  its category on reload; it only does when named starts. So enabling
+  query logging on a running server reported success and logged
+  nothing, and with response logging on the control plane dropped
+  every response line as an orphan, leaving the DNS Queries tab empty
+  until the daemon restarted. The agent now renders `querylog yes;`
+  when query logging is on and, after each structural reload, runs
+  `rndc querylog on|off` alongside `rndc responselog on|off`, read back
+  off the config it just swapped in. A group with query logging off
+  renders the same `named.conf` as before, and the control-plane
+  `named.conf` preview mirrors the new statement. A new live check,
+  `agent/dns/tests/live_query_log_check.py`, toggles both switches on a
+  running BIND 9.20 through the agent's real reload path and asserts
+  `rndc status` and the lines named writes; it runs in the DNS image
+  build. PowerDNS was not affected: it restarts `pdns_server` when
+  `pdns.conf` changes. Technitium has no query-log toggle yet (#742).
+
+- **A node staging an upgrade could stall its own etcd until k3s restarted
+  (#1804).** The node keeps serving while it writes the new slot, and the
+  write was buffered: hundreds of MB of the 8 GiB image piled up in the page
+  cache and flushed ahead of etcd's WAL fdatasync, which then waited for
+  seconds. On the node holding the cluster's leases the controller-manager
+  missed its renewal and k3s exited in the middle of the write, taking the
+  node's kubelet down until it came back (and longer when the restart landed
+  after the stage had refreshed the image tarballs, which k3s re-imports
+  before it starts the kubelet). The slot write now bypasses the page cache
+  (`dd oflag=direct iflag=fullblock`), so etcd waits behind one 4 MiB block
+  at most, and the image download, which lands on the same filesystem as
+  etcd's WAL, is flushed to disk every 16 MiB as it arrives instead of
+  piling up 300-400 MB to flush when the write begins. The write is also
+  paced to 32 MiB/s: where a cluster's members share a disk (VMs on one host
+  or one datastore), a direct write at the disk's full speed slowed every
+  member's etcd at once and the cluster's leases were lost on each node that
+  held them. Paced, the 8 GiB write takes about 4.5 minutes, with the node
+  serving throughout.
+
+- **A rolling upgrade's drain that timed out said "0 pod(s) still present"
+  while every pod was still on the node (#1804).** The count was the
+  evictions refused in the drain's last cycle, not the pods left on the
+  node. A node whose kubelet is down accepts every eviction and removes
+  nothing, so it timed out reporting none. The error now counts the pods
+  the last poll still found, says how many evictions were refused and how
+  many were accepted but never removed, and the step detail lists them
+  (`remaining`, `not_removed`). The drain-stuck hint says to check the
+  node's Ready condition as well as PodDisruptionBudgets.
+
+- **The BIND9 agent no longer rewrites every RPZ zone file on every
+  structural apply (#2157).** Removing a forward zone or editing a group
+  option re-serialised every blocklist from scratch: ~11 MB per catalog
+  list per agent, written again on every replica of its volume, with the
+  previous copy deleted from `rendered.prev` at the same time. The
+  control plane now ships a content hash with each RPZ zone
+  (`rpz_sha256`, BIND9 bundles only), and the agent records it beside
+  the file it wrote. When the hash matches, the file it already serves
+  is hard-linked into the new tree (copied, if the volume refuses
+  links): nothing is serialised or written, the zone is not checked or
+  reloaded, and the backup tree shares the inode, so it costs no extra
+  disk. Only a list that changed is rendered and reloaded. The #882
+  revert takes the previous bundle's zone back from `rendered.prev` the
+  same way, with its mtime refreshed, because named skips `rndc reload`
+  of a zone whose file is older than its last load. Every write into a
+  rendered tree now lands as a new inode (temp file and rename): a write
+  through a hard-linked name would change the backup too, and the one
+  place that did so, putting the live copy back over a zone
+  `named-checkzone` refused, now copies. The RPZ SOA serial derives
+  from the content instead of being a constant 1, so a changed zone's
+  load is verified like any other zone's. A file is flushed to disk
+  before its hash is recorded beside it, since a reused file is never
+  checked again, and the hash files are left out of the rendered-config
+  snapshot the agent uploads. A bundle from an older control
+  plane carries no hash and renders every time, as before. The first
+  apply after upgrading renders and reloads every RPZ zone once.
+  Bundles without a blocklist are byte-identical; `RENDERER_REVISION`
+  is 12.
+
+- **The looking-glass image's GoBGP builder moves to Go 1.27.3.** Go 1.27.2's `crypto/x509` carries CVE-2026-111943 (HIGH), and Go static-links its standard library into the binary, so only a rebuild with the fixed toolchain clears it. The nightly's Trivy gate failed on it.
+
+- **Starting a fleet upgrade, forcing a block-sync reconcile and
+  syncing an integration now record who did it (#2303).** All three
+  enqueue a worker task whose own audit rows say `system`, so "who
+  started the rolling upgrade" or "who forced this firewall push"
+  existed only in structlog. Each route now writes an audit row
+  attributed to the caller before the response returns:
+  `upgrade.start_requested` on the upgrade run, `reconcile` on the
+  block-sync target (not written for `?preview=true`), and `sync` on the
+  Cloud, Docker, Kubernetes, NetBird, OPNsense, Palo Alto, Fortinet,
+  Meraki, Proxmox, Tailscale and UniFi target. The worker's own rows
+
+- **DNS records mirrored from an external RFC 2136 writer are audited
+  (#2302).** An agent's `ingested-records` batch created and hard-deleted
+  `ddns_external` mirror records (an AD DC registering and deregistering
+  hosts) with no audit row, so they appeared and vanished with no history.
+  Each batch that adds or removes records now writes one
+  `dns.record.external_ingest` row on the zone naming them (added in
+  `new_value`, removed in `old_value`, capped at 50 per batch).
+
+- **Changing the Copilot tool catalog left no audit row (#2300).**
+  `PUT /ai/tools/catalog` is the switch that turns on the tools
+  that are default-off because they expose secrets, write broadly or
+  call off-prem, and it committed with no record of who flipped it.
+  It now writes one `audit_log` row in the same transaction, listing
+  the tools it enabled and the tools it disabled (a diff, not the
+  whole catalog). A write that changes nothing writes no row.
+
+- **Acknowledging, suppressing or deleting a captured internal error
+  left no audit row (#2301).** The three Diagnostics routes mutated or
+  hard-deleted the error with nothing in `audit_log`, so a fault (or
+  the exception an exploit attempt tripped) could be silenced or
+  erased without a trace. Each now writes one `internal_error` audit
+  row in the same transaction, carrying the fingerprint, exception
+  class and, for suppress, the hours and expiry. There are no bulk
+  endpoints. Re-acknowledging an already-acknowledged error changes
+  nothing and writes nothing.
+
+- **The wake calendar sync deleted today's holiday for schedules west
+  of UTC, so the fleet woke on it (#2305).** The sync kept events from
+  the worker's UTC date onward and deleted every stored span outside
+  that, but the gate judges the schedule's local date. For a schedule in
+  America/Los_Angeles, a refresh after 00:00 UTC removed the 20th's
+  holiday while it was still the 20th locally: a `skip_on_event`
+  schedule fired, and an `only_on_event` one silently skipped. The sync
+  now starts its horizon at the earliest local today among the
+  schedules attached to the calendar (DST-aware, never later than the
+  UTC date), or the UTC-12 date when none is attached.
+
+- **Deleting a site no longer silently deletes its E911 site-default
+  binding (#2298).** The binding is `ON DELETE CASCADE`, so a site delete
+  (single or bulk) removed the fallback emergency location for every
+  phone on it with no warning. Both now answer 409 naming the site and the
+  ERL, until the binding is removed under Network > E911 > Bindings; bulk
+  delete is all-or-nothing.
+
+- **The Audit page "Chain verified" badge now checks the newest audit
+  rows, not the oldest (#2297).** It verified the first 1,000 rows ever
+  written, so once an install passed 1,000 rows, tampering with recent
+  history still showed green. `GET /audit/integrity` takes
+  `newest=true` with `max_rows` to verify the latest window, anchored
+  on the row before it, and reports `first_seq` / `last_seq` /
+  `partial`; the badge tooltip states the range it covered and that the
+  nightly verify walks the whole chain.
+
+- **Sync DNS commit counted an address as created when nothing was
+  written (#2352).** Every address named in `create_for_ip_ids` (and
+  every record-linked address in `update_record_ids`) was counted as
+  created / updated, and written to the `dns-sync` audit row, even when
+  its A and PTR already existed and no DNS op was queued. The commit
+  now counts only addresses it queued ops for, so an address already in
+  sync reads as unchanged and writes no audit row, at subnet, block and
+  space scope alike. Also fixed on the way: a block-scope commit that
+  did write something answered 422 ("cannot be stored as sent"), because
+  its audit row was handed the CIDR as an object rather than a string.
+
+- **Timezone shifts in MAC-block expiry, the lease-history Since picker
+  and date-only terms (#2260).** Editing a DHCP MAC block fed its UTC
+  `expires_at` to a local `datetime-local` input and re-parsed it as
+  local on save, so every save moved the expiry by the browser's UTC
+  offset (a quarantine block could lift hours early east of UTC); the
+  lease-history Since picker had the same fault. Both now convert
+  through shared helpers in `lib/localTime.ts`. Circuit and service
+  term dates and an operator-entered Tailscale token expiry rendered a
+  day early west of UTC, and a term read "expired" on its last day.
+  Dates now parse as local calendar days and the end date is inclusive.
+  The `circuit_term_expiring` / `service_term_expiring` alerts say
+  "term expires today" on the last day, and the Network dashboard no
+  longer counts a circuit as past its term until the day after. A
+  source-scanning vitest guard fails on the old patterns.
+
+- **Webhook subscriptions could be created, repointed, deleted and
+  have deliveries retried with no audit row (#2293).** All four routes
+  now write one `audit_log` row in the mutation's transaction. The row
+  carries name, enabled, event types, limits, header names and
+  `secret_set` / `headers_set` flags; the HMAC secret and header values
+  never appear, and the URL is reduced to scheme and host (the path
+  is where receiver credentials live), with `url_changed` /
+  `secret_rotated` flags on update. Delivery attempts by the worker stay
+  unaudited: they are telemetry visible in the deliveries list.
+- **Deleting a site no longer turns its geo-scoped DNS pool members into
+  answers for every client (#2292).** `dns_pool_member.site_id` is SET NULL,
+  and a member with no site and no CIDRs is the unscoped default, so a member
+  meant for site-A clients began answering everyone. Site delete and bulk
+  delete now return 409 naming the pools and members that reference the site
+  (this does not cover E911 bindings, #2298). Independently, a member linked
+  to a site whose last subnet was unlinked now serves nobody instead of
+  falling back to default.
+
+- **Deleting an armed block-sync target left its blocks enforced on the
+  device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
+  delete handlers removed the push rows without lifting anything, so
+  the blocks stayed on the firewall or controller with no record in
+  SpatiumDDI. Delete now answers 409 while block sync is armed ("disarm
+  first", which lifts the blocks), and also while unlifted push rows
+  remain; `?force=true` bypasses the latter only. The delete modals say
+  so.
+
+- **The conformity summary and PDF report only the current state
+  (#2278).** Both read every `conformity_result` row ever written and
+  kept the newest per (policy, resource), so a target deleted or moved
+  out of a policy's scope (no longer `pci_scope`, say) was never
+  evaluated again and its last `fail` counted forever, in the
+  dashboard and in the auditor-facing PDF. Disabled policies' results
+  counted too, and every Dashboard, Conformity and Platform Insights
+  load pulled the whole history into the api. They now report each
+  enabled policy's most recent evaluation pass, selected in SQL on the
+  existing `(policy_id, evaluated_at)` index, so a target leaves at
+  the policy's next pass and the read is bounded by policies × current
+  targets. Editing what a policy checks, from the API or the Copilot,
+  clears its last pass until it runs again (the beat task then runs it on its next tick, unless it
+  is on-demand only). The PDF states this scope, prints when each
+  policy's pass ran and how many disabled policies it leaves out, and
+  a framework filter that matches no policy now gives an empty report
+  instead of every framework's results. The Copilot's
+  `get_conformity_summary`, which counted every history row, reports
+  the same numbers as the dashboard.
+
+- **Renaming or deleting a client class, or deleting a device policy,
+  left pools restricted to a class that no longer existed (#2285).**
+  A pool's `class_restriction` is a plain name, Kea accepts a name it
+  does not define, and the pool then matches nobody, with the config
+  applying cleanly and nothing reporting an error. Renaming or deleting
+  a client class, or deleting a device policy, is now a 409 naming the
+  pools (and any other class whose `member()` test uses the name) that
+  still reference it. A pool create or update naming a class that does
+  not exist in the group is a 422 instead of being stored; Kea's
+  built-ins (`KNOWN`, `UNKNOWN`, ...) and generated PXE / phone classes
+  still pass. If a dangling reference reaches the config anyway (a
+  disabled or empty device policy, an import), the restriction is kept
+  rather than dropped, so a quarantine pool never opens to every
+  client, and the bundle build logs (once per change, not per long-poll)
+  `dhcp_pool_restricted_to_undefined_class`.
+
+- **The PCI "no admin ports" conformity check fails a host with an
+  admin port open, instead of passing every scanned host (#2257).** The
+  `no_open_ports` check read `open_ports` from the nmap scan summary, a
+  key the nmap parser never wrote, so it found no open ports and passed
+  any host with a scan in the window: the built-in PCI-DSS 1.4.4 policy
+  reported PASS for a host with 22 and 3389 open, and that result went
+  into the compliance PDF. It now reads the scan's port list and fails
+  on any forbidden port in state `open`. For a CIDR scan it reads the
+  target's own entry, never the first host's. **Expect results to
+  change** when the policy is enabled: hosts that passed can now fail,
+  or warn where the scan cannot answer: no parsed summary, no result
+  for the address (a CIDR sweep leaves out hosts that did not answer),
+  a host that was not `up`, a forbidden port nmap reported only as
+  `open|filtered`, or a forbidden port the scan never probed (a
+  ping-only `subnet_sweep`, or a `-p` list that leaves it out: nmap
+  lists only ports in a non-default state, so an absent port is not a
+  closed one). The nmap summary also records the `address` its
+  single-host fields describe, so a sweep where one other host answered
+  is no longer mistaken for the target, and the `scanned_ports` nmap
+  says it probed.
+
+- **Logs → DNS Queries and DHCP Activity rows open in full (#2246).**
+  The grids cut the client, qname and raw columns off at one line, and
+  the rest was only a hover tooltip, which cannot be selected or
+  copied, does not work on touch, and is clipped for long lines. Each
+  row now starts with a details button that opens every field
+  untruncated: the timestamp in full ISO plus local time, client
+  `ip#port` and view, qname / qtype / qclass, the result, the answer
+  count, flags, and the raw line in a wrapping block with a Copy
+  button. The result uses the grid's wording: NODATA for NOERROR with
+  no answers, and "not recorded" when response logging is off, never
+  NOERROR (#914). A DNS row's details also offer Filter by client and
+  Filter by qname. DHCP rows show severity, log code, MAC, IP,
+  transaction id and raw the same way.
+
+- **`docs/PRIVACY.md` listed the RDAP lookups as per-click only (#2280).**
+  Domain, ASN and RPKI ROA refreshes also run from an hourly Beat tick,
+  and a Domain row is re-queried every 24 h by default. They now sit in
+  §3.3 with their trigger, cadence, default and payload. Nothing is
+  default-on on a fresh install (no rows, no calls), but Domains have no
+  feature module, so creating one arms the schedule; the ASN and ROA
+  tasks do not check `network.asn`. Docs only, no behaviour change.
+
+- **A DoT group's forwarder pinned to port 53 is refused, and the
+  DNS docs lose two unused variables (#2128, #2125).** In a group
+  forwarding over TLS, `10.0.0.1@53` rendered as `port 53 tls ...`,
+  a TLS handshake against a plaintext port that can never work. The
+  group options save now answers 422 naming the entry. Only entries
+  the request adds are checked (all of them when it switches the
+  group to an encrypted transport), so a value stored earlier does
+  not block an unrelated save. Such a stored entry still renders as
+  before (it fails closed: no cleartext leaves a DoT group, and BIND
+  tries the other forwarders), and the options page now lists it in
+  a warning (`forwarder_warnings` on the options GET). `053` counts
+  as 53. A do53 group is unaffected, and a forward zone's explicit
+  `@53` still renders plain. `DNS.md` no
+  longer lists `BLOCKLIST_UPDATE_INTERVAL_HOURS` and
+  `BLOCKLIST_SINKHOLE_IP`, which nothing reads (refresh interval and
+  sinkhole IP are per list), and section 8.0 gains a worked example:
+  by its rule of thumb, one catalog feed (AdGuard DNS filter, ~186k
+  entries) needs roughly 1 GB, about double the `512Mi` in the
+  chart's example, whose comment now points there.
+
+- **DHCP and DNS off now also stop the API routes that live outside
+  `/dhcp` and `/dns` (#2136, #2134, #2129).** With `core.dhcp` off,
+  `POST /logs/dhcp-activity`, `POST /logs/dhcp-audit`,
+  `GET /metrics/dhcp/timeseries` and the IPAM `effective-dhcp` reads
+  (space, block, subnet) answer 404 like `/dhcp/*`; with `core.dns`
+  off, `POST /logs/dns-queries`, `POST /logs/dns-queries/analytics`
+  and `GET /metrics/dns/timeseries` do. The agent routers stay
+  ungated, and the shared `/logs/sources` and `/logs/agent-sources`
+  lists leave out the servers of a module that is off (`/logs/query`
+  answers 404 for them). `POST /new-devices/block` with DHCP off is
+  refused (422) when it would only write DHCP blocks, and otherwise
+  skips the DHCP half and does the upstream quarantine, refusing with
+  the reason (403 without `manage_block_sync`, 409 with no armed
+  target) rather than answering 200 having done nothing; on New
+  Devices the action is hidden when neither DHCP nor active block
+  sync is on, and reads
+  "Quarantine upstream" when only block sync is. The DNS Threat
+  module-off notice now names Features & Integrations and links it
+  (superadmin only; others are told to ask an administrator), and says
+  where per-group query logging is turned on.
+
+- **A nightly reports one version string everywhere** (#2111).
+  `GET /api/v1/version` read `nightly-YYYYMMDD` (the image tag) while
+  the agents, supervisor and appliance said
+  `0.0.0-nightly-YYYYMMDD+<sha>`. The api now reports the latter, taking
+  the sha from the build's own `APP_VERSION` stamp (new build arg on the
+  api image, already passed by nightly.yml), so the two compare equal.
+  Releases are untouched; `settings.version` stays the image tag, which
+  upgrades still use to pull images.
+
+- **Upgraded installs no longer show the stale `agent v2026.04.14.1`
+  note on DNS servers** (#2112). A data migration clears `notes` only
+  where it is exactly that literal, so operator text is never touched.
+
+- **Backup page and branding title show the API's reason and stop
+  offering what is refused** (#2203, #2204, #2200, #2202, #2205).
+  A refused archive preview, restore or drill schedule now shows the
+  API's `detail` instead of "Request failed with status code N", and a
+  target's Run now / Test connection / Delete, which showed nothing at
+  all when refused, now show it too. A non-superadmin (every backup,
+  drill and factory-reset route is superadmin-only) sees a permission
+  notice with the backup controls disabled, and Restore Drills /
+  Destinations say a refused read was refused rather than "No backup
+  targets configured". The page's copy names no destination kind
+  instead of four of the ten (or one); Add target's Kind list is the
+  authority. The Manual restore warning follows the chosen mode
+  (selective replaces only the ticked sections). The API now refuses an
+  Application title over 255 characters or an External URL over 500
+  with a 422 naming the field (it used to reach the database and come
+  back as the catch-all "cannot be stored as sent"), the inputs stop at
+  those lengths, and a refused settings save shows the API's reason.
+
+- **Tailscale warns before its 90-day API token expires, and alerts
+  when it has (#2138).** Tailscale caps an API access token at 90
+  days; when it lapsed, every sync got HTTP 401, the mirror stopped
+  updating and nothing said so. Each tenant now records
+  `api_key_expires_at`, read from Tailscale's keys endpoint
+  (`GET /api/v2/tailnet/{tailnet}/keys/{keyId}`, the key id taken from
+  the `tskey-api-<keyId>-…` token) when the token is tested, saved or
+  replaced, and again once a day. When Tailscale can't say, the tenant
+  form takes a "Token expires on" date instead, pre-filled with 90
+  days from today; a date read from Tailscale always replaces it, and
+  a failed read never clears a stored one. The `secret_expiring` alert
+  rule now covers these tokens (`tailscale_tenant:<id>` subjects, its
+  usual threshold and severity escalation) and fires **critical** for
+  a tenant whose last sync got HTTP 401, whatever date is recorded. A
+  red or amber chip shows the state on the Tailscale page and on both
+  dashboard integration surfaces; on the Tailscale page it opens the
+  tenant form to replace the token. `list_tailscale_targets` returns
+  the expiry and the credential state. The token is never logged or
+  returned.
+
+- **Upgrading adds an enabled `secret_expiring` alert rule, so existing
+  installs may start alerting on credentials that were expiring all
+  along (#2138).** The rule was only ever created by hand, so on a
+  default install no expiring credential alerted at all. The upgrade
+  adds "Credential expiring or rejected" (warning, 30 days, escalating
+  to critical as expiry nears). It covers Tailscale API tokens and also
+  supervisor certificates, API tokens with an expiry and the Let's
+  Encrypt Web UI certificate, so after the upgrade an install may start
+  alerting on any of those that expire within 30 days. It is not added
+  when a `secret_expiring` rule already exists. It is added once, by the
+  migration, so if you delete it, it stays deleted.
+
+- **Testing a Tailscale tenant with a new, unsaved key no longer
+  clears the stored key's sync error (#2138).** Replacing the key does
+  clear an HTTP 401 error, since it belonged to the old key.
+
+- **A zone-file import in replace mode no longer deletes records IPAM
+  or an integration owns, and works on one view (#2167).** Replace
+  deleted every record the file lacked, including an IP address's host
+  record and its aliases (IPAM kept showing records that were gone)
+  and the records a DNS pool, Tailscale, NetBird or a Kubernetes
+  cluster maintains, ACME challenge records, and the records an AD
+  domain controller or DHCP server registered in the live zone through
+  dynamic updates (#641) — which a replace removed from the server
+  too; merge also rewrote their TTLs. Those rows are now
+  left alone and listed under `skipped` with the reason, using the
+  same ownership rule as the spreadsheet import (#2139), which now
+  protects the dynamic-update records too and no longer calls an ACME
+  record IPAM's. The import
+  also honours the `view_id` it already accepted and silently ignored:
+  it matches, updates and deletes only records in that view (or, with
+  no view, only the shared records), creates new ones there, and never
+  touches another scope. A view-scoped replace keeps the shared
+  records, which serve every view; a shared import does not create a
+  shared copy of a record that exists only in views, since it would
+  appear in views that deliberately lack it. Records left out of scope
+  are counted per view in `skipped`. Twins with the same name, type
+  and value are now all matched, rather than one of them being
+  neither kept nor deleted. A `view_id` from another server group is a
+  422. The import dialog has no view picker, so in a group with views it
+  now says that it works on the shared records only, and the Replace
+  option no longer promises to make the zone match the file exactly.
+
+- **A zone's records export and import as CSV / XLSX, for bulk
+  editing in a spreadsheet (#2139).** The zone's Data menu gains
+  Export CSV, Export XLSX, Download template and Import CSV / XLSX,
+  beside the zone file. One row per record, with `priority` / `weight`
+  / `port`, `view` and `comment` as their own columns and the record's
+  `id` so a re-import edits the same record: a row with an `id`
+  updates that record (a rename included), a row without one matches
+  by view, name, type and value, or is added. Merge (default) never
+  deletes; replace deletes what the sheet does not list and needs the
+  zone's name typed back. Every row runs the record API's own checks
+  and a bad one is a per-row error with its row number; the commit
+  refuses the whole file while any remain. Records IPAM or an
+  integration owns are never changed or deleted; CNAME-rule clashes
+  are skipped with the reason, as in the zone-file import. Cells are
+  escaped against formula injection on export and read as text on
+  import. The commit goes out as record ops on one serial bump through
+  the zone-file import's own path, and is audited. The template's
+  example rows carry `id=EXAMPLE` and are ignored on import. REST:
+  `GET …/zones/{id}/export?format=csv|xlsx`,
+  `GET …/zones/{id}/import/template`,
+  `POST …/zones/{id}/import/spreadsheet/{preview,commit}`. New
+  read-only Copilot tool `export_dns_zone_records`, default on; no
+  import tool, by decision (#13). See `docs/features/DNS.md` §9.
+  A sheet cannot store one record twice: two identical new rows, or an
+  edit that turns a record into a copy of another, is a row error, as
+  the record API's 409 (#1230). A name ending in a dot is absolute, as
+  in a zone file (`www.example.com.` is `www`; a name outside the zone
+  is an error), where the record API alone would have stored
+  `www.example.com.example.com.`. A record whose TTL predates the #2073
+  bounds re-imports with its TTL as it is. Uploads are bounded before
+  they are parsed (an XLSX at 100 MB uncompressed, 100,000 rows read
+  at all), a CSV may be UTF-16 (Excel's "Unicode text"), and a corrupt
+  or entity-expanding sheet is a 422 rather than a 500. On an agentless
+  group, a change the provider has not taken yet is shown in the import
+  dialog instead of the dialog closing as if it were clean.
+
+- **Deleting a DNS or DHCP server row no longer takes its daemon down
+  with it (#2052).** The agent's woken config poll answers 404 once the
+  row is gone, and on a 401 or 404 the DNS, DHCP and looking-glass agents
+  dropped their token and stopped the sync thread. The supervisor's
+  dead-thread watch then exited the container, so named stopped answering
+  for 2-13 s (Kea about 1 s) until the restarted container re-registered,
+  which is the opposite of what non-negotiable #5 and the #1939 note say.
+  The agents now re-register from the PSK in the same thread
+  (`bootstrap.reauthenticate`, serialised so the sync loop and the
+  heartbeat register once) and keep polling; the daemon never stops and
+  serves from its cached config throughout. A control plane that is down
+  or a wrong PSK backs off (jittered, capped at 5 min) instead of
+  spinning or exiting, and a token refused again straight after it was
+  minted (two agents sharing one agent id off a cloned state dir) waits
+  5 s, doubling to 5 min, before each further re-registration — the pacing
+  the orchestrator's restart back-off used to supply. The re-registered
+  agent appears as a new server row, and gets what a restart used to send
+  it at startup: the DNS agent re-reports its zone serials (the highest it
+  has served, not the last structural render's), its DNSSEC state and its
+  rendered config, and the DHCP agent snapshots Kea's lease table to it —
+  without which the new row's leases would stay empty until each client
+  renewed. This happens whichever thread re-registered, since the
+  structural etag carries no server id and the new row's bundle
+  re-renders nothing.
+
+- **Sync DNS no longer lists an address's host A as missing when its
+  own A alias already serves the name (#2118).** Since #2117 a rename
+  onto an address's own alias skips the host record, because the alias
+  answers for the name. Drift ignored alias rows, so it still listed
+  that A as missing, and applying the sync (or auto-sync, every
+  interval) reported the refusal in its errors. Drift now treats the
+  name as satisfied when one of the address's own alias rows of the same
+  type already holds it in that zone, compared case-insensitively. A
+  different address's alias, or an AAAA alias for an A, does not count,
+  and the PTR is still expected. The same holds for an AAAA host record
+  and an AAAA alias, and in each extra zone the address publishes to.
+  Applying the sync for an address that also lacks its PTR used to stop
+  at the same refusal, so the PTR was never written; the apply now skips
+  the zone the alias serves and writes the PTR. A CNAME alias at the
+  name is still refused.
+
+- **The IP table can hide its "N free, click to allocate" rows
+  (#2137).** On a very large or integration-mirrored subnet (a
+  Tailscale `100.64.0.0/10` holding a few dozen nodes) nearly every
+  row was a green gap bar, and "click to allocate" invited a manual
+  allocation the overlay would never honour. Edit Subnet gains
+  "Free-range rows in the address table" (Default / Show / Hide,
+  stored as nullable `subnet.show_free_ranges`) and the table header
+  gains a "Hide free ranges" checkbox beside "Hide network/broadcast",
+  remembered per subnet for the session. Default when the subnet has no
+  setting: hidden for an integration-owned subnet (new read-only
+  `integration_owner` on the subnet response) and for anything larger
+  than a /16 IPv4 (shorter than /48 IPv6, where gap rows are not drawn
+  today); an explicit value always wins. Display only: Total /
+  Allocated / Utilization, the Allocate IP button and Next available
+  are unchanged. The `get_subnet_summary` copilot tool reports
+  `show_free_ranges` and `integration_owner`.
+
+- **A DNS record change made while an agent is replaced reaches the new
+  agent at once, not five minutes later (#2042).** When a DNS agent is
+  replaced (its pod rolls after a slot upgrade, a container restarts),
+  the API went on holding the old agent's config long-poll, and nothing
+  noticed its client had gone. A record created in the next few seconds
+  was paged into that poll, marked in flight and written to a
+  connection nobody read, so the new agent never got it and the record
+  was not served until the 5-minute unacknowledged-op reset sent it
+  again. The agent now names its process on every config poll, each
+  shipped op records which process it went to and when its poll
+  started, and a poll from a different process returns any op still in
+  flight to its predecessor to the queue and ships it on that poll. Only
+  a poll that started after the one that shipped the op may take it
+  back, so the departed agent's leftover poll never takes an op from
+  its replacement. A long-poll whose client has
+  disconnected also rolls its page back instead of committing it. An
+  agent that predates this change still recovers through the 5-minute
+  reset. Separately, a zone's server state no longer reads in sync
+  while a server has a change for that zone it has not acknowledged:
+  an agent starting from its cached bundle reports the serial it
+  serves, which can match the target while a record is still
+  undelivered. Both server-state views gain a `pending_ops` count, and
+  the zone sync pill names the unapplied changes.
+
+- **Kea HA peers authenticate to each other with a generated per-group
+  credential.** Every DHCP server group now holds its own CA and peer
+  certificate for the HA hook's dedicated listener (`:8000`),
+  generated by the control plane, stored Fernet-encrypted and never
+  returned by the API (`ha_peer_credential_set` /
+  `ha_peer_auth_active` on the group say whether one exists and whether
+  it is in use). The agents render it as `trust-anchor` / `cert-file` /
+  `key-file` with `require-client-certs`, so each listener refuses a
+  client without a certificate from its own group, and the peer URLs
+  switch to `https`. Kea's `basic-auth-user` was not used: in Kea 3.0 the
+  HA hook sends it but its own listener never checks it. Rollout is
+  gated: the credential is rendered only once every Kea member of a group
+  reports the new `ha_peer_tls` capability on its heartbeat, so a pair
+  mid-upgrade keeps its current HA config and both members switch
+  together when the last one upgrades; a node rolled back to an older
+  agent closes the gate again. A superadmin replaces it with
+  `POST /dhcp/server-groups/{id}/ha-peer-credential/rotate`. Existing
+  groups get one from migration `c8e1f5a92d47`.
+
+- **Support bundle: a PEM private key is redacted through its END line.**
+  The pattern matched only the `-----BEGIN … PRIVATE KEY-----` line, so a
+  key that reached a bundle section lost its header and kept its base64
+  body. The whole block is now replaced; a block with no END line still
+  loses its BEGIN line, as before.
+
+- **nginx 1.31.6 → 1.31.7-alpine (#2161)** for the frontend image and the
+  appliance landing page, which the bake array and chart values carry as
+  well, so all five copies move together.
+
+- **Allocate IP no longer drops an alias that another record already
+  holds (#2122).** Allocate IP and next-IP skipped, without a word, an
+  alias whose zone, name and type another record already held: the
+  request succeeded and the alias did not exist. Both now answer 409
+  naming the alias and what holds it (an alias or the host record of
+  another address, or an operator record), as adding a single alias
+  from Edit IP does, and nothing is written: no address row, no host
+  record, no other alias. Names compare case-insensitively. Adding an
+  alias the address already has is a no-op that returns it with 200, for
+  a CNAME as well as an A, rather than a 409, and is not audited as a
+  create.
+  The same alias given twice in one request is written once.
+
+- **Upgrade note for #2121: a forward zone's own transport needs
+  upgraded agents.** An agent from before this release ignores the
+  zone's `forward_transport` and `forward_tls_hostname` and forwards
+  every forward zone the way the group forwards: over the group's
+  transport, checked against the group's certificate name. So until
+  the DNS agents (BIND9 and Technitium) are upgraded, a zone whose
+  transport or hostname differs from the group's does not get it. In a
+  DoT group, a zone on plain DNS still goes out over TLS and fails
+  against a Do53-only upstream, as before this release; a DoT zone
+  with another provider's hostname (a group on `cloudflare-dns.com`, a
+  zone forwarding to Quad9 as `dns.quad9.net`) fails certificate
+  verification, and every name in the zone SERVFAILs. In a plain-DNS
+  group, a zone set to DoT is still forwarded in plaintext. Upgrade
+  the DNS agents before giving a zone a transport or hostname different
+  from its group's. A zone that matches its group works on old and new
+  agents alike.
+
+- **The zone move preview reports a forward transport the target group
+  cannot serve (#2121 follow-up).** Moving a forward zone to another
+  server group (#935) re-checks the zone's own `forward_transport`
+  against the target: a DoH or DoQ zone cannot land on a BIND9 group,
+  and a TLS zone cannot land on Windows DNS. Only the commit refused
+  that; the preview said nothing, so the operator learned of it after
+  filling in the move. The preview now returns the refusal as
+  `forward_transport_refusal`, shown in the move dialog with the move
+  blocked, and in the `preview_dns_zone_move` Copilot tool. The preview
+  and the commit run the same check that zone create and update run, so
+  they cannot disagree. The 422 for a forward zone whose forwarders
+  present two TLS certificate names now names the zone, its forwarders
+  and its `forward_tls_hostname`, rather than repeating the group-level
+  wording that said one hostname applies to "the whole group".
+
+- **Copilot and MCP network tools share the Tools page's per-user rate
+  limit.** The `/api/v1/tools/*` routes cap each user at 20 on-prem
+  probes and 8 off-prem lookups per minute. The copilot and MCP tools
+  that run the same probes (`network_ping`, `network_traceroute`,
+  `network_dig`, `forward_dns`, `reverse_dns`, `network_port_test`,
+  `network_tls_cert`, `lookup_mac_vendor`, `ping_host`, `tls_cert_check`)
+  and off-prem lookups (`network_whois`, `lookup_whois_ip` / `_asn` /
+  `_domain`, `find_ct_log_entries`) had no limit.
+  Each now declares its budget with `rate_limit=` on `register_tool`, and
+  `ToolRegistry.call` spends it from the same per-user Redis counter the
+  REST route uses, so a user has one budget whichever surface they use.
+  A call past the budget does not run; it returns a refusal naming the
+  limit and the wait, which MCP marks `isError`. As on the REST routes,
+  the limit is not enforced while Redis is unreachable. A call the tool's
+  permission refuses, or whose arguments fail validation, spends nothing. A
+  test walks every function each tool reaches and fails any tool that
+  sends traffic without declaring a budget or a recorded exemption.
+
+- **An address can no longer be named after one of its own aliases
+  (#2106).** Renaming an address onto its own A / AAAA alias left two
+  identical rows at the name, and deleting the alias afterwards queued
+  a delete for an RR the host record still claimed, so the host's own
+  record vanished from the served zone while IPAM still showed it. A
+  CNAME alias there put a CNAME beside the host's address record. The
+  edit, the extra-zone edit and the bulk DNS-zone change now answer
+  409, in the wording of the alias CNAME rule (#2080), naming the
+  alias; nothing is written. Creating an A / AAAA alias at the
+  address's own host name is refused the same way. Background paths
+  (DDNS, lease mirrors, integrations, importers) do not fail and write
+  no duplicate: on an A / AAAA alias they retract the old name and log
+  `ipam_dns_record_skipped_own_alias`, which leaves the zone as a
+  correct rename would (the alias already answers the new name, and the
+  PTR names it); on a CNAME alias they keep the existing CNAME skip,
+  which also retracts the PTR. A duplicate that already exists is left
+  as it is.
+
+- **A record op the split-horizon render retires is stamped like
+  any applied op (#2108).** In a DNS group with views, the bundle
+  render retires a server's queued record ops as `applied`, but
+  `retire_queued_ops` set only the state: `applied_at` stayed NULL,
+  `attempts` 0 and `updated_at` at creation, so
+  `GET /dns/servers/{id}/pending-ops` reported an applied op with no
+  time and no attempt for every record change. It now goes through
+  `_mark_applied`, the helper the dispatch path uses, so the op
+  reads `applied_at` and `updated_at` set, has any earlier error and
+  retry time cleared, and counts one more attempt (the render
+  delivered it once).
+
+- **Turning DNS off hides DNS everywhere and stops the `/dns` calls
+  that 404ed (#2135).** The DNS counterpart of #2130: `core.dns` hid
+  the DNS sidebar but left DNS pickers, panels and reads elsewhere.
+  Every one is now gated on `ready && enabled("core.dns")` through
+  the shared `useModuleOn` hook: the IPAM zone pickers (Add, Edit and
+  Bulk-edit IP, Bulk allocate), DNS aliases, the DNS column, the
+  Sync DNS entries and drift banner, the DNS and DDNS tabs of the
+  space / block / subnet dialogs, the IP detail zones and DNS
+  linkage, the DNS server group pickers on all eleven integration
+  forms, the Subnet Planner and IPAM Templates pickers, Services
+  (DNS zone resources), API tokens (zone binding), the Domain
+  detail Linked DNS Zones tab, the Cutover plan DNS half, Fleet's
+  DNS roles and group, the Logs DNS tabs and the four Settings DNS
+  sections. A stored value (a template's DNS group, an
+  integration's `dns_group_id`) is never cleared by saving a form
+  that no longer shows it. The Logs page keeps a valid default tab
+  with DNS off (DHCP Activity) and with both off (Event Log), and a
+  hard reload waits for the module set before mounting a tab that
+  reads `/dns`. Backend: the Fleet role assignment (REST and the
+  Copilot's `assign_appliance_role`) refuses a newly added DNS role
+  with a 422 while `core.dns` is off. An appliance that already
+  holds one can still be re-saved or have it removed, and the DNS
+  agent routers stay outside the module gate on purpose. Swapping to
+  another DNS engine is refused too, since it brings up a new DNS
+  service. The IPAM Templates DDNS tab now needs both DHCP and DNS,
+  as the IPAM dialogs' DDNS tab does.
+
+- **An API token bound to specific DNS zones or subnets only reaches
+  the Operator Copilot / MCP tools that narrow their answers to those
+  zones or subnets.** The tools' permission check looks at the resource
+  type, so a token bound to one zone cleared it for every DNS tool, and
+  the tools that list server groups, servers, views or query rates, or
+  count IPAM resources estate-wide, answered as though the token were
+  unbound. The tool registry now refuses an instance-bound token any
+  tool that does not declare `honours_token_binding`, for `tools/list`,
+  MCP `tools/call` and in-app chat alike, the same structural floor the
+  REST routers have. The tools that do declare it (zone and record
+  lists, per-zone DNSSEC / drift / update-ACL reads, the IPAM space /
+  block / subnet / address reads, tag lookup and global search) already
+  filter or gate on the bound instances, and a test pins the list and
+  checks each one against a second zone and subnet. The IPAM tools that
+  accept a space or block by name resolve it only within the binding, so a
+  name outside it reads as not found. Sessions and unbound tokens are
+
+- **Dashboard rollups and the DNS / DHCP traffic series read with the
+  caller's own grants.** `GET /metrics/dns/timeseries` now needs `read` on a
+  DNS type (`dns_group` / `dns_zone` / `dns_record`, as the `/dns` routes do)
+  and `GET /metrics/dhcp/timeseries` needs `read` on `dhcp_server`; both
+  previously answered any signed-in account. The Network and Integrations
+  dashboard tabs need `read` on at least one of the types they summarise and
+  fill only the panels the caller can read — an integration's panel and its
+  recent reconciler errors appear only with `read` on that integration — and
+  say so instead of loading forever when the role covers none of them; the
+  DNS query-rate and DHCP traffic cards likewise say the data is unavailable
+  rather than "No data yet". The tag autocomplete (`GET /tags/keys`,
+  `/tags/values`) offers only tags from tables the caller can read. The
+  built-in Viewer (`read *`) sees everything it saw before. A new guard test
+  walks the route table and fails for any `GET` route with no permission
+  dependency unless it is listed with the reason (pre-sign-in, agent or token
+  authenticated, own rows, static reference data, or checked in the handler);
+  see `docs/PERMISSIONS.md`.
+
+- **The IPAM bulk-delete dialog kept describing what was submitted after
+  an approval policy took it (#2046).** With a `delete:subnet` approval
+  policy, bulk-deleting two subnets showed "2 of 2 submitted for
+  approval." under a dialog that now read "This will move 0 empty blocks
+  to Trash." and "I understand 0 empty Blocks will be moved to Trash.",
+  because the page clears its selection when the requests are filed and
+  the dialog recounted from it. The space and block views now freeze the
+  selection when the dialog opens, and the delete sends that same frozen
+  list, so the confirm describes exactly what goes out. A delete that
+  actually runs still closes the dialog and clears the selection as
+  before. A retry after a partial failure now resends only the items that
+  failed; it used to resend the ones already in Trash too, which came back
+  as fresh failures.
+
+- **A forward zone no longer inherits the group's DNS-over-TLS, so a
+  plain-DNS upstream such as Tailscale's 100.100.100.100 resolves again
+  (#2121).** When a server group forwarded over DoT (#50), every
+  conditional forward zone in it was forced onto DoT too: the zone's
+  queries went to port 853 over TLS, checked against the group
+  provider's certificate name. A forward zone usually points at
+  something internal that answers plain DNS on port 53 only (Tailscale
+  MagicDNS, an AD domain controller, a cloud VPC resolver), so every
+  name in it failed, and an explicit `@53` still got TLS appended. The
+  transport is now the zone's own setting: `forward_transport` on the
+  zone (`do53` by default, `tls`, plus `https` / `quic` on a
+  Technitium-only group) with `forward_tls_hostname`, on the zone API,
+  the add / edit forward-zone form, the zone detail and the
+  `list_dns_zones` Copilot tool. The group's transport now applies to
+  the group's resolver forwarders only. A TLS zone gets its own BIND
+  `tls` statement with its own `remote-hostname`; an entry with an
+  explicit `@53` is always plain DNS, on BIND9 and Technitium. The API
+  refuses an encrypted zone with no hostname, a transport a server in
+  the group cannot speak, an encrypted zone whose forwarders span two
+  certificate names (the #877 rule), and a plain-DNS zone pointed at an
+  encrypted-only upstream. The control-plane config preview renders
+  zone forwarders through the same helper as the agent, which also
+  fixes it emitting `ip@port` verbatim as an unloadable `1.1.1.1@53;`.
+  **Behaviour change:** the upgrade sets every existing forward zone to
+  plain DNS, including zones in groups that forward over TLS today. A
+  zone that really did want DoT must be switched back on the zone, with
+  its TLS hostname. That includes any forward zone pointed at a resolver
+  that answers only over TLS (Mullvad, or an internal DoT-only
+  resolver): it stops resolving at the upgrade until its transport is
+  set back to DNS-over-TLS, and the API now refuses to save a catalogued
+  encrypted-only upstream on plain DNS. **The fix is in the DNS agent:** an agent older than
+  this release ignores the zone's transport and keeps inheriting the
+  group's, so upgrade the DNS agents with the control plane. A new agent
+  talking to an older control plane treats every forward zone as plain
+  DNS. A zone on plain DNS ships no transport in the agent bundle, so a
+  group that does not use the setting keeps its bundle etag across the
+  upgrade and no agent reloads for it.
+
+- **The BIND9 importer reads zones declared with their class
+  (#2099).** `zone "x" IN { ... };` is valid BIND, and it is how
+  RHEL's and Fedora's stock `named.conf` writes every zone, but the
+  parser allowed nothing between the quoted name and the brace, so
+  such a zone was skipped without a word, as was every zone inside
+  `view "v" IN { ... };`. A config written that way was refused as
+  having no zone declarations. An optional class (`IN`, `CHAOS`, `CH`,
+  `HESIOD`, `HS`, any case, with any whitespace or comments around it)
+  is now accepted for zones and views, and a zone inherits its view's
+  class. Zones of a class other than `IN` are not imported as if they
+  were internet-class data: each is listed in the preview's warnings
+  as skipped, naming its class, and a config with nothing but such
+  zones is refused with that reason.
+  Accepting the class also made RHEL's stock
+  `zone "." IN { type hint; … };` readable, and the importer used to map `type hint` to
+  a primary zone: importing it would have made the target group
+  authoritative for the root and broken every recursive lookup it
+  answers. `hint`, `mirror`, `redirect`, `static-stub` and
+  `delegation-only` zones are now skipped with a warning. The
+  importer also no longer drops things without a word: a `zone`
+  block it cannot read (an unquoted name, say) and every `include`
+  it does not follow are named in the preview's warnings, and
+  unbalanced braces refuse the upload instead of silently dropping
+  every zone after the fault. The zone walk is linear now; it
+  re-sliced the config once per zone, which made a 50,000-zone
+  `named.conf` take several seconds.
+
+- **Sync DNS reads an address in every zone it publishes to
+  (#2107).** An address with extra zones has its host record in its
+  forward zone and in each extra zone IPAM authors, but the drift
+  check compared every forward record with the forward zone alone. A
+  correct record in an extra zone read as mismatched, and one that had
+  gone missing from an extra zone was never reported. Each address is
+  now checked in all of its zones, using the same zone list the sync
+  writes, so a correct record is in sync, a missing one is listed as
+  missing in its zone, and a wrong one as mismatched with that zone
+  named. A zone IPAM does not author still takes no record. In the
+  Sync DNS dialog, an address missing its record in more than one zone
+  now lists one row per zone, each ticked on its own; the rows used to
+  share a key, so they toggled together.
+
+- **IPAM now says why a host named `gateway` gets no forward DNS
+  record (#2101).** The rule is deliberate (every subnet's placeholder
+  row is named `gateway`, so publishing them would collide on
+  `gateway.<zone>`), but nothing in the GUI said so. The IP row's DNS
+  column shows "forward DNS skipped" with the explanation as its
+  tooltip instead of a bare dash, and the create, edit, allocate and IP
+  detail views show the same note when the hostname is exactly
+  `gateway` (advisory, saving is still allowed; typed input is matched
+  the way the API stores it, so `Gateway` or `gateway.` shows it too). The Sync DNS modal
+  explains each stale reason in plain words instead of the raw code and
+  no longer says a `default-gateway-name` record's address is gone. A
+  row whose records Sync DNS is about to delete no longer reads "in
+  sync" (stale items now carry an optional `ip_id`), and a stale
+  record with no zone no longer renders a dangling dot. The record
+  behaviour is unchanged: no forward record, PTR still published.
+
+- **Turning DHCP off now hides DHCP everywhere, and stops the `/dhcp/*`
+  calls that 404ed (#2130).** `core.dhcp` hid the DHCP sidebar but left
+  DHCP tabs, columns, settings and pickers across IPAM, Logs, Settings,
+  Dashboard and Admin, and several of them still called `/dhcp/*` and
+  failed. With DHCP off: the subnet DHCP Pools tab, the DHCP Pool column,
+  the DHCP and DDNS tabs and device-profiling toggle in the Space / Block /
+  Subnet dialogs, the Logs DHCP Activity and DHCP Audit tabs (a
+  `?tab=dhcp-activity` link lands on DNS Queries), Settings DHCP Defaults /
+  DHCP Lease Sync / Device Profiling, the Subnet Planner, IPAM Templates
+  and Services DHCP pickers, the Fleet DHCP role chip, the Cutover DHCP
+  pickers, and the DHCP rule types in the alert editor are gone, and none of
+  them reads `/dhcp/*`. The agent bootstrap keys stay. `dhcp` and
+  `static_dhcp` are no longer offered as an IP status, but an address that
+  already has one still shows it and keeps it when you edit something else.
+  A hard reload used to fire one `/dhcp` read before the module list had
+  loaded (Dashboard on the DHCP tab, Import defaulting to DHCP); both now
+  wait for it, and a `?tab=dhcp-activity` link on a hard reload waits too
+  rather than flashing DNS Queries first. Adding the `dhcp` role to a Fleet
+  appliance while DHCP is off is refused with a 422 naming `core.dhcp` (it
+  used to be accepted and the agent was then refused at register); an
+  appliance that already holds the role can still be re-saved, and the
+  Copilot's `assign_appliance_role` (preview and apply) follows the same
+  rule. An existing alert rule of a hidden type keeps its stored parameters
+  and says why they cannot be edited. DDNS settings are hidden with it: they
+  only act on DHCP leases (`apply_ddns_for_lease`), never on static
+  allocations. Not done here: the New Devices block action, the `/dhcp`
+  direct-URL notice (#2129), label-only mentions, and the `core.dns` pass.
+
+- **Integration sync-interval fields no longer read `1h` as 1
+  second, or turn a cleared field into the default (#2110).** The
+  sync interval on the PAN-OS, UniFi, Meraki, Cloud, Docker,
+  Tailscale, OPNsense, Kubernetes, NetBird, FortiGate and Proxmox
+  forms, the network device poll interval and SNMP timeout, and
+  the DNS pool health-check interval and timeout all read
+  themselves with `parseInt(...) || N`. They now go through one
+  `parseSecondsInput` (`lib/seconds.ts`, the reader `parseTtlInput`
+  delegates to): a whole number within the API's own bounds, `1e3`
+  is 1000, anything else is refused with the reason and nothing is
+  sent. An empty field is refused as required, because omitting it
+  on an edit means "unchanged" and the default would have silently
+  rewritten it. Bounds are the API's: 30 s (60 s for Cloud), `>= 0`
+  for device polling, 10..3600 and 1..60 for the pool check.
+
+- **Editing an IP no longer renames or deletes its own A aliases, and
+  the alias lists no longer show a host record as an alias (#2084).**
+  An address's A/AAAA aliases and its own host records are both
+  auto-generated rows tied to the address, so the DNS sync loaded the
+  aliases as the host record: an edit or rename could rewrite an alias
+  into the host name (leaving the real host missing or duplicated), an
+  alias in a zone the host does not publish to was deleted, and giving
+  an address the default `gateway` name deleted every alias. The
+  mirror image was in the alias lists (`GET /addresses/{id}/aliases`,
+  `GET /subnets/{id}/aliases`, the per-address alias count): they told
+  an alias from the host only by `ip.dns_record_id`, so a host record
+  published into an extra zone was listed and counted as an alias and
+  could be deleted through the alias endpoint (now 409). A new
+  `dns_record.ip_alias` column says what a row is; every alias writer
+  sets it and the sync, the three lists, alias delete and the DNS
+  drift check read it. The drift check no longer reports an alias as a
+  mismatched host record. The upgrade marks the aliases already stored:
+  an A / AAAA named like the address's hostname in its forward zone or
+  an extra zone stays the host record (extra-zone ids compared as
+  UUIDs, whatever case they were sent in), and where the address's
+  linked record sits in a zone, a second row at the same name, left by
+  renaming an address onto its own alias, stays an alias. A host
+  record left in an extra zone under an old name becomes an alias: it
+  keeps answering and can be deleted from the alias list.
+
+- **Registering a DNS agent no longer deadlocks against the render of
+  its first bundle (#2031).** The worker's bundle store wrote the
+  server row in two UPDATEs, and Postgres re-runs a row's foreign-key
+  checks on a second UPDATE of a version the transaction itself wrote,
+  so the render's second write took `FOR KEY SHARE` on the server's
+  group (and appliance) row. Registration's SOA-timer switch held the
+  group row `FOR UPDATE` and, marking the group's bundles at commit,
+  queued for the server row behind the render's first write: 40P01.
+  The switch lost, logged `dns_group_soa_timers_failed` and only ran
+  again at the agent's first heartbeat. The store now writes the server
+  row in one statement, so the render never waits on a parent row (this
+  also covers a group rename and an appliance role save, which hold
+  those rows `FOR UPDATE` for a reason a lock strength cannot change),
+  and the switch locks the group and its zones `FOR NO KEY UPDATE`, the
+  strength of the write it makes.
+
+- **A zone's Primary NS must be a host name, or it is refused (#2075).**
+  The zone dialog stored `ns_1.<zone>.` or a 64-character label as typed
+  and answered 201; the BIND9 agent then wrote it as the SOA MNAME, named's
+  check-names refused the zone, and the server row went `reverted` with the
+  zone never served. A single label such as `ns1` was stored too, and served
+  as a name at the root rather than under the zone. Zone create (REST and the
+  dialog), the Copilot's `create_dns_zone` and the zone importers now apply
+  the host-name rule: letters, digits and hyphens, at most 63 per label and
+  253 in all, at least two labels, trailing dot optional; empty still means
+  "use the zone's NS". A zone **update** refuses only a changed value, so a
+  zone stored before this stays editable by a save that re-sends it (the
+  dialog shows a warning under the field until it is changed). The importer leaves an
+  unservable source MNAME unset and says so in the commit warnings. On BIND9
+  a stored value of that kind no longer stops the group: the agent serves the
+  zone's first apex NS record, or the `ns1.<zone>` placeholder, as the SOA
+  primary name and logs `unusable_field`. The responsible-person name is
+  unchanged, since a mailbox is not a host.
+
+- **Allocate IP no longer stores a hostname whose name in its zone
+  passes 253 characters (#2072).** A 243-character hostname is valid
+  alone, but IPAM publishes `<hostname>.<zone>`, and the length cap
+  only looked at the hostname. The allocate answered 201, the A record
+  was queued, and BIND refused both the forward zone and the reverse
+  zone holding the PTR ("ran out of space"), so every later change to
+  either waited behind it. The limit is now applied to the whole name
+  (253 characters of dotted form, 255 octets on the wire, each label
+  63 at most) by one shared helper in `core/dns_names.py`. Allocate IP,
+  edit IP, bulk allocate and bulk edit DNS zone answer 422 naming
+  `hostname` and the length it would reach, storing nothing. The DNS
+  record API and the copilot apply it to a record's owner and to a
+  CNAME / MX / NS / SRV / PTR / DNAME target too. A subnet's Sync DNS
+  lists the address under its errors instead of counting it as synced.
+  DDNS, importers and DHCP static reservations never fail a lease or a
+  batch: they publish nothing for the over-long name, retract the A and
+  PTR an earlier name had published, and log `ipam_dns_name_too_long`.
+  The Allocate IP dialog shows the same reason as you type. Nothing is
+  ever truncated. A record already stored too long holds back only its
+  own zones on the agent, as before; shorten the hostname or delete the
+  record to release them.
+
+- **A DNS import no longer stores a CNAME beside other data, or at the
+  zone apex (#2089).** The record API refuses both (#1381); the importers
+  stored them anyway, so the server then refused the zone (BIND's "CNAME
+  and other data", PowerDNS's "Conflicts with pre-existing RRset") while
+  the import reported success. The zone-file import into an existing zone
+  and the BIND9, Windows, PowerDNS, Technitium and cloud importers now
+  apply the same rule, through the shared `cname_conflict` module. The
+  preview lists each record that will not be imported, with its reason
+  (`skipped` on the zone-file preview, a warning on the others), and the
+  commit skips it and says so in its result; the rest of the import still
+  lands. A clash within the imported set keeps the non-CNAME data and drops
+  the CNAME (the first of several CNAMEs is kept); a clash with a record
+  already in the zone keeps the existing record. Records are compared per
+  view, a record with no view counting in every view. The zone-file preview
+  now takes `conflict_strategy` (default `merge`, so an older client is
+  unaffected), since a `replace` frees the names of the records it deletes.
+  Records in the trash do not count; IPAM-generated records do. A record the
+  commit already drops for a control character no longer costs the CNAME at
+  its name its place. The Copilot's import preview says how many records will
+  not be imported, and its commit reports them.
+
+- **Bulk allocate refuses a hostname template whose names are not host
+  names (#2071).** `web{n}-` produced `web1-` / `web2-` and
+  `web{n:_}` produced `web1_000`; preview and commit accepted them, the
+  A records were written and BIND's check-names refused the forward and
+  reverse zones. Preview and commit now check every generated name with
+  the host-label rule the single Allocate IP path uses
+  (`core/dns_names`), store it lower-cased as that path does, and answer
+  422 naming the offending names, creating nothing. Token format specs
+  are limited to the ones the dialog's live preview renders identically —
+  plain, `d`, `x`, `X`, each optionally zero-padded (`{n:03d}`,
+  `{oct4:03d}`) — so `{n:_}`, `{n:,}`, `{n:5d}` and conversions are
+  refused, and the iterator start must be 0 to 999,999,999 (a negative
+  start zero-padded differently in the browser). The dialog now parses
+  and renders templates exactly as the server does and checks every name
+  in the range, and a shared vectors file is run by both a backend test
+  and a vitest so the two cannot drift. `{oct1}`–`{oct4}` now honour a
+  padding spec instead of silently ignoring it (multicast name templates
+  too). Also fixed on the way: Python's `$` matches before a trailing
+  newline, so a label ending in `\n` passed every host and record-owner
+  name check; the label rules now anchor with `\Z`.
+
+- **The DNS server shows the version its agent actually runs
+  (#2078).** The DNS agent registered with a literal
+  `"2026.04.14.1"` that nothing rewrote, and the control plane
+  seeded the operator's `notes` with it (`agent v2026.04.14.1`)
+  and kept no version anywhere else; the heartbeat's
+  `agent_version` was accepted and dropped. The agent now sends
+  its stamped release, the register and heartbeat handlers store
+  it in a new `dns_server.agent_version`, the server response
+  carries it, the server detail dialog shows it (unknown when
+  never reported, n/a for an agentless driver), and the
+  `find_dns_servers` copilot tool reports it. `notes` is no
+  longer seeded by the agent; existing rows keep whatever note
+  they have. An agent of an earlier release still registers with
+  the old literal, which is ignored rather than stored, so it
+  never overwrites the real version that agent's heartbeat
+  reports. Migration `a2078c5e1d90`.
+
+- **Three more TTL fields no longer read `1h` as 1 second (#2086).**
+  The IPAM DDNS TTL override (on a new or edited subnet), the IPAM
+  template's DDNS TTL and the DNS pool TTL read the field with
+  `parseInt`, which keeps the leading digits: `1h` and `1e3` were both
+  saved as 1. They now use the same reading as the zone and record
+  dialogs (#2085): a whole number of seconds, `1e3` is 1000, anything
+  else is refused with the reason and nothing is sent. A blank DDNS
+  override still means inherit. The pool TTL is checked against the
+  API's own 1 to 86400, and a cleared pool field is now refused as
+  required instead of being saved as 30 without a word.
+
+- **A zone or record TTL outside RFC 2181's range is refused with a
+  422 instead of stored (#2073).** Add Zone with Default TTL `-1`
+  answered 201 and saved it, and the BIND9 agent then refused the
+  zone for a bad TTL, so it was never served. The zone `ttl`, a
+  record's `ttl` and the IPAM / IPAM-template `ddns_ttl` (which
+  stamps every DDNS record) are now bounded to 0..2147483647 on
+  create and update, like the SOA timers already were, and the 422
+  names the field. The importers store a servable value rather than
+  what the source said: a record TTL outside the range inherits the
+  zone's, and a zone TTL or SOA timer outside it takes the default
+  (a TTL past 2147483647 would not fit the column and failed the
+  commit). A TTL stored
+  negative before this fix is not rewritten, but no longer reaches a
+  server: the agent bundle ships the zone with a `$TTL` of 3600 and
+  the record inheriting it, and record updates send it as inherit.
+  Edit the row to clear it. The Add/Edit Zone and record dialogs
+  take a number and refuse anything that is not a whole number in
+  range with a reason; they used to send `parseInt` of the text, so
+  `1h` went out as 1 (#2074), and `1e3`, which a number field
+  accepts, would have too.
+
+- **An `A` alias can be added to an IPv6 address again (#2081).**
+  `POST /ipam/addresses/{id}/aliases` with an `A` alias on an IPv6
+  address wrote the AAAA record the alias follows the address family
+  into, then looked the new row up by the requested type `A`, found
+  nothing, answered 409 and rolled the write back, so the alias could
+  never be added there. The lookup now uses the type that was written,
+  from the same helper the writer and the CNAME-rule check use.
+  The alias lists and the per-address alias count matched only
+  CNAME and A, so a stored AAAA alias was missing from them; they
+  match AAAA now. Allocate and next-IP were not affected. `AAAA` is
+  still refused as an alias type (422), so an IPv4 address can never
+  get one.
+
+- **An IP's DNS alias no longer breaks the CNAME-and-other-data rule
+  (#2080).** An alias given when allocating an IP (Allocate IP,
+  Allocate next IP) or added with `POST /ipam/addresses/{id}/aliases`
+  went straight into the zone without the check the DNS record API has
+  run since #1381. A CNAME alias on a name that already held an A (or
+  the IP's own host name, or another alias in the same request), an
+  A / AAAA alias on a name that was already a CNAME, and a CNAME alias
+  at the apex were all stored, and BIND then refused the whole zone,
+  so the agent stayed on its last good config. The alias path now asks
+  the same shared check, before anything is written, in every view:
+  409 for a clash, 422 for a CNAME at the apex, with the DNS API's
+  message. An A alias on an IPv6 address is checked as the AAAA it is
+  written as, and a clash inside one request names both sides (for
+  example the address's own AAAA record). An alias stored before this
+  fix is not removed: BIND holds back only the zone it is in (#1403),
+  the server reports it through the `agent_config_rejected` alert, and
+  deleting the alias (`DELETE /ipam/addresses/{id}/aliases/{record_id}`)
+  releases the zone.
+
+- **The DNS and DHCP server detail modals offered Pause and Resume to
+  a user the API refuses (#2076).** Both routes take a superadmin, and
+  the server rows already showed the buttons disabled with "Requires
+  superadmin"; the detail modal opened from the same row did not, so a
+  DNS or DHCP Editor clicked Pause, typed a reason, and only then got
+  a 403. The modals now use the same gate as the rows.
+
+- **An IPAM alias named `under_score` (type A) is refused, not written
+  into a zone BIND will not load (#2070).** Allocate IP, Allocate next
+  IP and the Add alias endpoint stored the name and wrote the record;
+  the BIND9 agent then refused the whole zone under check-names and held
+  every later change in it. An alias now passes the DNS record API's own
+  owner-name checks (`validate_record_owner` and BIND's check-names rule
+  for its type), so an A or AAAA alias must be a host name and the
+  request answers 422 naming the alias. A CNAME alias keeps the
+  underscore, as in the DNS API. The alias is stored in the form the
+  checks passed (lower-cased, an internationalized name as its `xn--`
+  A-label), and an alias whose name inside its zone passes 253
+  characters is refused before anything is written. An alias stored
+  before this release still holds its zone back:
+  `GET /api/v1/diagnostics/name-conformance` (or the Copilot's
+  `find_nonconforming_names`) lists it, and deleting it from the
+  address's aliases releases the zone.
+
+- **On PowerDNS, a record target with no trailing dot no longer stops
+  its zone converging, and the record API refuses new ones (#2060).**
+  PowerDNS refuses a CNAME / PTR / MX / NS / SRV / SVCB / HTTPS / NAPTR /
+  ALIAS / DNAME target written without its trailing dot (`422 Not in
+  expected format`), and it applies a zone change as one transaction.
+  The record API stored such a value as typed, so one dot-less row made
+  its record op fail on every retry until it was marked `failed`, and
+  made PowerDNS refuse the zone's whole structural update (no other
+  change to that zone was applied, and the server reported a partial
+  apply) or, for a new zone, refuse to create the zone at all. The
+  agent now qualifies a dot-less target against the zone, which is what
+  a BIND9 server serves for the same row, so rows that already exist
+  (an importer's included) are served on upgrade. A zone PowerDNS still
+  refuses for any other reason is retried piecemeal (halved until the
+  refused record sets are isolated, so one bad record in a large zone
+  costs a few dozen requests, not one per record set), so only the
+  refused record set is left out and named in the server's apply
+  status. Such a zone is not reported as in sync by that server even
+  though its serial moved, so the per-server sync status agrees with the
+  apply status. On a PowerDNS group, creating or editing a record with
+  a dot-less target is now a 422 that shows the two names it could
+  mean (`db1.example.com.`, or `db1.example.com.<zone>.`), on the REST
+  create, edit and bulk-create paths and in the Copilot. Other drivers
+  are unchanged.
+
+### Security
+
+- **Group membership changes are now bounded by the same privilege
+  ceiling as role attachment.** A group's roles, and its live
+  time-bound grants, are what its members hold, so adding a member,
+  removing one and deleting the group now need the caller to be able
+  to grant those permissions themselves, exactly as attaching a role
+  already did. A permission held only through a live time-bound grant
+  no longer counts towards that ceiling anywhere (roles, groups or new
+  grants), so it cannot be turned into access that outlives the grant.
+  Only a superadmin can change the membership of a group
+  carrying a wildcard (`*`) permission. The same ceiling now bounds
+  detaching a role from a group, changing or deleting an existing
+  role, and revoking a wildcard time-bound grant. Resending a group's unchanged
+  member list (as the edit form does) is not a membership change, so
+  renaming or describing a group is unaffected. Superadmins are
+  unaffected throughout.
+  **No change may leave the install without an active superadmin.**
+  Disabling, un-flagging or deleting a user, removing the last
+  superadmin from a group, detaching or editing the wildcard role,
+  and deleting that group or role now answer 409 when nobody active
+  would be left. A superadmin through a time-bound grant alone does
+  not count, since the grant expires.
+  Refusals from both checks write a `denied` audit row, as a
+  permission refusal does. External sign-in (LDAP / OIDC / SAML /
+  RADIUS / TACACS+) still syncs group membership from the identity
+  provider's group mappings, which only a superadmin can configure.
+
+- **Forwarded audit events are redacted the way the audit API
+  redacts them (#2015).** #2014 redacted an audit entry's
+  `old_value`, `new_value` and `error_detail` on read, for the API,
+  the Audit page and the copilot, but the forwarding path still sent
+  them verbatim. Every syslog, webhook and SMTP target now gets the
+  same redaction, applied in the one function every forwarded event
+  passes through, so a new target kind cannot skip it. The typed-event
+  webhooks get it too, both when an event is queued and when it is
+  sent, so events queued before the upgrade are covered. So does the
+  copilot's backup-history tool, which returned those fields raw.
+  Redaction works on a copy: the stored audit row is unchanged. The
+  audit PDF and the support bundle never carried these fields and are
+  unchanged.
+  **Behaviour change for collectors:** a forwarded value under a
+  credential-shaped key now arrives as `[redacted]`, as it already
+  does on the Audit page. That includes names a collector may have
+  indexed, such as `tsig_key_name`. Booleans and integers are kept,
+  so `smtp_password_set: true` still arrives as is. Two field names
+  join the credential-name rules on every surface: `*_enc` (SNMP v3
+  pass-phrase ciphertext) and `service_account_json` (the Google
+  Cloud DNS key file). Both were already caught by value shape.
+
+### Migrations
+
+- `d3a7f19c52e8` — #2112, data only: `dns_server.notes` equal to exactly
+  `agent v2026.04.14.1` becomes empty. Downgrade does nothing.
+- `a2078c5e1d90` — #2078, adds nullable `dns_server.agent_version`
+  (String(64)); no backfill, NULL means the agent has not reported one.
+- `b3d7f1a82c54` — #2084, schema + data: adds
+  `dns_record.ip_alias` (NOT NULL, default false) and backfills it.
+  Among auto-generated CNAME / A / AAAA rows tied to an address, an
+  A / AAAA named like the address's hostname in its forward or an extra
+  zone (or the row `ip_address.dns_record_id` names) stays false; the
+  rest are aliases. Downgrade drops the column.
+- `c4f8a2e61d37` — #2121, schema + data: adds
+  `dns_zone.forward_transport` (String(10), NOT NULL, server default
+  `'do53'`) and nullable `dns_zone.forward_tls_hostname`
+  (String(255)). The server default is the backfill: every existing
+  zone, including a forward zone in a group that forwards over TLS,
+  becomes `do53`. Downgrade drops both columns.
+- `c8e1f5a92d47` — `dhcp_server_group.ha_peer_credential_encrypted`
+  (Fernet-encrypted Kea HA peer credential), backfilled with a freshly
+  generated credential for every existing group, and
+  `dhcp_server.agent_capabilities` (JSONB, NULL until the agent's first
+  heartbeat). Nothing is rendered from the credential until every Kea
+  member of a group reports `ha_peer_tls`. Downgrade drops both columns.
+- `e3b7c19f5a42` — #2042: `dns_record_op.dispatched_to`, a nullable
+  string naming the agent process an op was last shipped to, and
+  `dns_record_op.dispatched_poll_at`, when the long-poll that shipped it
+  started. No backfill: NULL means not recorded and is never read as
+  "another agent". Downgrade drops both columns.
+- `c4a8e1f26d93` — #2137: `subnet.show_free_ranges`, a nullable
+  boolean. No backfill: NULL means "use the default rule". Downgrade
+  drops the column.
+- `c8e2a5f71d39` — #2138: `tailscale_tenant.api_key_expires_at`
+  (nullable timestamp) and `api_key_expiry_source` (nullable string,
+  `api` or `operator`, checked by a constraint). No backfill: NULL
+  means unknown until the next test, save or daily refresh reads it.
+  Also inserts the "Credential expiring or rejected" `secret_expiring`
+  alert rule, enabled, unless a rule of that type or name already
+  exists. Downgrade drops the constraint and both columns and leaves
+  the rule in place.
+- `f4c2a8e61b93` — #2044: six nullable `dns_server` columns.
+  `agent_instance` and `agent_instance_seen_at` name the agent process
+  that owns the server and when it last polled;
+  `agent_instances_displaced` (JSONB) lists the processes it replaced;
+  `duplicate_agent_first_at`, `duplicate_agent_last_at` and
+  `duplicate_agent_ip` describe the current duplicate-agent episode. No
+  backfill: the first agent to poll becomes the owner. Also inserts the
+  `dns_agent_duplicate_instance` alert rule ("Two DNS agents on one
+  server", enabled) when no rule of that type or name exists; it is
+  not seeded at startup, so an operator who deletes it keeps it
+  deleted. Downgrade drops the six columns and leaves the rule.
+- `e4c9b2a17f60` — adds `user.mfa_failed_count` (Integer, NOT NULL,
+  server default 0) and nullable `user.mfa_last_failed_at`, the
+  per-account wrong-code budget for the MFA sign-in step. Downgrade
+  drops both.
+- `e4b8c2d17a95` — #2262: deletes duplicate `dhcp_lease` rows (same
+  server, address and MAC, or same server, address, DUID and IAID),
+  keeping the most recently seen, then adds the partial unique indexes
+  `uq_dhcp_lease_server_ip_mac` (`WHERE duid IS NULL`) and
+  `uq_dhcp_lease_server_ip_duid` (`WHERE duid IS NOT NULL`, NULLS NOT
+  DISTINCT). Downgrade drops the indexes; the deleted duplicates are not
+  restored.
+- `b4d81f2e6a93` — #2261: `ix_alert_event_rule_subject_open` becomes a
+  UNIQUE partial index (one open `alert_event` per rule, subject type
+  and subject). Duplicate open events are resolved first, keeping the
+  earliest-fired. Also adds the nullable
+  `alert_event.delivery_pending_since` with a partial index on its
+  non-NULL rows; existing rows stay NULL. Downgrade restores the
+  non-unique index and drops the column; the resolved duplicates stay
+  resolved.
+- `f6a2d81c3e57` — #2124 / #2123: stored `dns_blocklist.block_mode =
+  'refused'` rows become `'nxdomain'` (what the agent already served);
+  adds nullable `dns_blocklist.feed_parse_skipped` (JSONB, no backfill:
+  NULL means not recorded) and `dns_blocklist_exception.source`
+  (`manual` | `feed`, server default `manual`). Downgrade drops both
+  columns and leaves the `refused` rewrite in place.
+- `e2b9c46f1a83` — #2277, widens `alert_event.subject_id` from
+  VARCHAR(64) to VARCHAR(128). Catalogue-only, no rewrite. Downgrade
+  deletes events whose subject id is longer than 64 (only conformity
+  events written by this release) and narrows it back.
+
+## 1.0.0-beta.1 — 2026-10-21
+
+# ⚠️ Please don't roll back to 2026.10.02-1
+
+> **Once you have upgraded to this release, do not go back to
+> 2026.10.02-1 or any earlier release.** Take a database backup before
+> you upgrade. This release adds 21 database migrations, and
+> 2026.10.02-1 cannot run on the result: its migrate step fails with
+> `Can't locate revision`, and its api, worker and beat wait for that
+> step forever. A slot rollback or a Fleet boot change onto a release
+> that cannot run on the database is refused (#1227), but a Compose or
+> Helm redeploy of an older tag is not checked. If you must go back,
+> restore the backup you took before the upgrade alongside the older
+> release.
+
+**This is the first SemVer release, and it is a beta.** 1.0.0-beta.1
+is the build the seven-node scale lab ran (nightly-2026.10.17), cut
+as the first tag on the road to 1.0.0: 297 commits since
+2026.10.02-1, almost all of them fixes for defects that only show up
+on a real estate, a real appliance fleet, or an upgrade. It is a
+GitHub pre-release, so no install is offered it in-product, and
+`:latest` and `/releases/latest/download/` stay on 2026.10.02-1 until
+1.0.0. Install it from its GitHub release page, by its version.
+**Security:** 35
+fixes, most of them from the pre-1.0 security review: Operator Copilot
+and MCP tools now enforce the caller's permissions, resource-scoped
+API tokens are held to their subnet or zone on every route and in
+search, every appliance gets its own SSH host keys, a local
+unprivileged account on the appliance can no longer become root, and
+the last credentials stored in clear (group TSIG keys, webhook URLs
+and headers) are encrypted at rest. **Multi-node appliances:** the
+rolling upgrade now runs on a multi-node cluster (#1445), and demote,
+promote, replace, partition and Redis-master loss were walked until
+they converge. **DNS:** recursive BIND9 groups are no longer open
+resolvers by default (#1817), DNSSEC is refused where two servers
+would sign with different keys (#1762), PowerDNS and Technitium were
+brought to parity on serials, SOA, TTLs, NOTIFY, transfers and record
+syntax, and the agentless `technitium_api` driver is marked
+experimental for 1.0. **Scale:** the DNS agent stops holding large
+bundles and blocklists in memory several times over. **RBAC:** the
+DNS Editor and DHCP Editor roles grant the writes they always
+promised, and read-only users are no longer offered writes the API
+would refuse. Plus scheduled-backup alerts on by default, a working
+reverse-proxy topology, and one new copilot tool (`get_backup_health`).
+
+**Why beta.1 and not beta.2:** some planning pages call this release
+"Beta 2". There was never a public beta 1 under CalVer, so the SemVer
+line starts here, at 1.0.0-beta.1. The plan from here is
+1.0.0-beta.2 around 3 November, 1.0.0-rc.1 on 17 November, then
+1.0.0.
+
+**Before you upgrade:** install 2026.10.02-1 first if you are on
+anything older, since it is the bridge that ranks SemVer above
+CalVer (#1195, #1207, #1286). Expect each appliance's SSH host key to
+change once (GHSA-vvh9-6gfw-wphp). Rotate each DNS group's TSIG key
+after the upgrade (#1364). A recursive BIND9 group whose clients use
+public or CGNAT addresses loses recursion until they are added to
+`allow_recursion` (#1817). API clients that mint tokens or make
+superadmins must send a step-up answer (#1355, #1412). The DNS Editor
+and DHCP Editor roles grant more than before (#1861). The release
+notes on GitHub carry the full upgrade checklist.
+
+### Added
+
 - **Alerts when a scheduled backup fails or stops running, on by
   default (#1262).** A failed scheduled backup used to write an audit
   row and nothing else, so on a default install a nightly backup could
@@ -83,6 +2256,98 @@ the formatter handles the rest.
   "Scheduled Trivy scan: fixable CVEs in shipped images".
 
 ### Fixed
+
+- **The DNS group's Health line reports what the servers say
+  (#2077).** DNS, a server group, Servers read "all servers assumed
+  consistent (per-server serials arrive in Wave 3)" whatever the
+  servers reported, even while one had refused a zone. It now comes
+  from each server's own zone-state rollup: in sync on N servers, or
+  how many servers are behind, refused zones, or have not reported
+  every zone yet. A server that has not reported is never counted as
+  in sync.
+
+- **A rolling upgrade no longer fails on one kubeapi request its
+  shared-tag hold could not land (#2028).** The hold (#1710) pins the
+  shared charts' image tag before each node and removes the pins at the
+  end, a few kubeapi requests each time, and any one of them refused or
+  unanswered (a k3s server answers 503 `apiserver not ready` while it
+  restarts) failed the whole run: before the first node, with the
+  cluster on two versions at a re-assert, or with every node already on
+  the target at the flip. Such a step is now tried again every 15 s,
+  with Halt, Abort and the Lease read between tries, as #1713 does for
+  the Lease. No node starts and no tag moves until it lands, and the
+  run fails on it, with the same error, only after 300 s of failures.
+  Only an answer a later try can change is retried (no answer, a 5xx,
+  408, 409 or 429); a 403 or 422 still fails the run at once.
+
+- **A demoted member promoted again rejoins instead of sitting
+  `joining` on a full disk (#2049).** Every join and leave set the
+  node's k3s identity aside, and with it containerd's whole image
+  store (4-6 GiB); the newest three backups were kept whole. One
+  demote then promote left a 40 GiB member with three stores in
+  backups beside the one its join was importing, the kubelet went into
+  DiskPressure, the supervisor pod was refused, and nothing reported
+  the join. A backup now keeps its image store only while the join
+  that took it can still roll back onto it: the stores of earlier,
+  settled joins and leaves are dropped before the runner writes
+  anything to /var, a join that registered with the seed's etcd
+  drops its own before its long wait for Ready (that branch never
+  rolls back), and a join or leave that settles drops it before
+  reporting. The identity in every backup is kept for manual
+  recovery. A node already carrying three full backups gets the
+  space back on its first join or leave after the upgrade. Found
+  and first fixed by the QA desk.
+
+- **Fleet no longer reports `ssh: retrying` forever after managed SSH is
+  turned off (#2053).** The supervisor's fire-state reader stripped the
+  leading tab of an empty-hash line (`\t1\t<iso>`, written when a plane
+  is turned off), so the fields shifted left, attempts read as the hash
+  and never matched the runner's empty applied sidecar. It now strips
+  only the line ending and parses the empty hash faithfully; the same
+  reader serves every host-config plane (SNMP, NTP, APT, LLDP, syslog,
+  resolver, firewall, timezone, console mode, removable). The appliance
+  console's own copy of the reader had the same bug and reported the
+  plane `retrying` on the dashboard and the health screen; it is fixed
+  too, and its plane list, which had fallen behind by three planes (APT,
+  console mode, removable), now matches the supervisor's, pinned by a
+  test. Two related cases also no longer stick at `retrying`: a config
+  that failed to apply and was then reverted to what the host already
+  runs, and a failed timezone change followed by clearing the timezone.
+  And an "off" that fails to apply now backs off like any other failed
+  apply, instead of re-firing on every heartbeat.
+
+- **IPAM no longer adopts a PTR whose target lacks the trailing dot
+  where that target is served relative to the zone (#2045).** Since
+  #1890 an allocation adopts an operator's identical record instead of
+  writing its own, and for a PTR it also matched the target with the
+  trailing dot removed. The record API stores a value as typed, and
+  BIND9, both Technitium drivers and Windows over RFC 2136 serve a
+  dot-less target relative to the reverse zone, so `db1.example.com`
+  answered `db1.example.com.<reverse zone>.`: IPAM adopted the wrong
+  record, wrote no PTR, and Sync DNS reported nothing missing. The
+  adoption match and the Sync DNS check now compare a PTR target the way
+  the zone's servers serve it. A dot-less target is still adopted where
+  every server in the group takes it as the absolute name (the cloud
+  providers, Windows over WinRM), because writing a second copy there is
+  a duplicate the provider can refuse. The comparison is now also
+  case-insensitive, so `DB1.Example.com.` is adopted rather than
+  duplicated. When IPAM declines a dot-less operator PTR it logs
+  `ipam_ptr_relative_operator_record`; the operator's record stays, and
+  the reverse lookup answers both names until it is fixed or deleted.
+  A/AAAA adoption is unchanged; CNAME, MX and NS are not adopted by this
+  code.
+
+- **Saving SSH settings now repairs a failed or stopped ssh.service
+  (#2054).** The runner validated the staged config with `sshd -t`
+  before restarting, but `sshd -t` needs `/run/sshd`, which is
+  ssh.service's own runtime directory and is removed when the unit
+  stops or fails. With the unit down the check failed and the restart
+  that would have fixed it was never reached, so only a reboot
+  recovered. The runner now creates the directory (root:root 0755,
+  as the unit does) before validating; an invalid config is still
+  refused. And when ssh.socket is not active, a down ssh.service is
+  now started rather than reloaded, since systemd refuses to reload a
+  unit that is not running.
 
 - **The Fleet upgrade dialog no longer promises a re-write and a
   reboot for a node already on the chosen release (#2068).** It said
@@ -526,59 +2791,6 @@ the formatter handles the rest.
   `exclude_unset`.
 
 - **A zone served under an SOA serial of 2^31 or more no longer fails to store (#1975).** Serials are unsigned 32-bit (0..4294967295), but `dns_zone.last_serial`, `dns_server_zone_state.current_serial` and `dns_record_op.target_serial` were signed `INTEGER`, so such a serial could not be written ("value out of int32 range") and the agent zone-state report was refused with a 422, leaving the Zone Sync pill unable to show convergence. All three are `BIGINT` now, the zone-state report accepts exactly 0..4294967295 (anything else is a 422), and the serial increment past 4294967295 wraps to 1 (RFC 1982; it skips 0 the way BIND's own `increment` does, because 0 is the "never seeded" value that every renderer serves as 1). It used to produce 4294967296, which is not a valid SOA serial.
-
-- **A node's hard loss no longer leaves a surviving node's heartbeat stale
-  past the demote guard (#1805).** Every heartbeat reached the api through
-  its Service, and so does every DNS and DHCP agent and the frontend's
-  `/api` proxy. The Service spread their connections over every api pod. A
-  lost node's api pod stays listed until the node reads NotReady, about
-  40 s, so a heartbeat that landed on it waited out its whole 40 s timeout.
-  Two in a row left a healthy node 97 s without a heartbeat. On the
-  appliance the api Service now sets `trafficDistribution: PreferSameNode`:
-  each node's callers use the api pod on their own node while it is ready,
-  and every api pod only while it is not. firstboot's control-plane values
-  and the supervisor's `spatium-control` HelmChartConfig both set it, so a
-  fresh install, a grown cluster and an upgraded one all carry it. The
-  umbrella chart's new `api.service.trafficDistribution` defaults to `""`,
-  which renders the api Service as before on your own Kubernetes; the field
-  is rendered on Kubernetes 1.34 and later.
-
-- **A node's return no longer rolls CoreDNS out twice (#1753).** k3s
-  force re-applies its bundled `coredns.yaml` at every server start. That
-  put the CoreDNS pod template's tolerations back to k3s's own two entries.
-  The supervisor's HA shape had added a 20 s fast-evict pair to them, so the
-  template changed (rollout one), and the seed's next heartbeat patched the
-  pair back in (rollout two). Each rollout replaced every CoreDNS pod.
-  Lookups in flight to the replaced pods stalled, enough to put Redis
-  Sentinel into TILT once more at each return. With one CoreDNS replica on
-  every node (#1718), a fast eviction has nowhere to put the evicted pod.
-  The HA shape now keeps k3s's own tolerations, so k3s's re-apply changes
-  nothing and a node's return replaces no CoreDNS pod. An existing cluster
-  drops the fast-evict pair in one rollout when it upgrades.
-
-- **After a node's hard loss, Redis fails over in seconds again, not
-  80–100 s (#1718).** Until a lost node reads NotReady (about 40 s), its
-  CoreDNS pod stays a ready endpoint of the cluster DNS Service. About half
-  of every other node's lookups went to it and stalled for the resolver's
-  whole timeout. Redis Sentinel resolves its peers' names inside its event
-  loop, so each stall put the surviving sentinels into TILT, where they act
-  on nothing until 30 s after the last stall. The failover waited for the
-  dead endpoint to leave, plus the TILT period: 77 s in our drill, 78–102 s
-  in the issue. The supervisor now runs one CoreDNS replica on every node
-  (it was capped at two). It also sets `trafficDistribution:
-  PreferSameNode` on the kube-dns Service, so each node resolves through
-  its own replica and a lost node takes only its own pods' DNS with it. A
-  single-node appliance keeps the stock shape.
-
-- **A heartbeat that never reached the control plane is sent again after
-  5 s, not after the whole 30 s interval (part of #1805).** Such a
-  heartbeat is one whose lookup or connection went to a lost node, or that
-  met an empty api Service while the api waited for Redis. On a node loss,
-  two failures in a row left a healthy node's heartbeat about 100 s old.
-  That is past the 90 s after which the demote guard and the Fleet tab
-  call a voter unhealthy. The supervisor now sends such a heartbeat again
-  after 5 s, doubling the wait while failures continue, up to the
-  interval. A heartbeat the control plane answered is paced as before.
 
 - **Disabling a DNS pool now removes its records, and a pool TTL change
   lands immediately (#1974).** `update_pool` never reconciled and
@@ -5601,6 +7813,21 @@ the formatter handles the rest.
   key to `dns_zone` (`ON DELETE SET NULL`) with an index. Set on every op
   queued from now on. No backfill: an older op cannot say which view's
   zone it belonged to, so NULL stays. Downgrade drops the column.
+- `b3c71e9a4d25` — #1364, expand only: adds
+  `dns_server_group.tsig_key_secret_encrypted` and fills it from
+  `tsig_key_secret` with `encrypt_str` (so it needs `SECRET_KEY`). The
+  plaintext column is kept, unread, and the next release drops it.
+- `cd10b699d988` — #1337: `audit_log.auth_source` and
+  `user_session.auth_source` widened to 255. Catalogue-only, no table
+  rewrite. Downgrade narrows them back and refuses while a longer
+  value is stored.
+- `d27e1d8716bd` — #1579, expand only: adds
+  `event_subscription.headers_encrypted` and fills it from `headers`
+  with `encrypt_dict`. The plaintext column is kept, unread, and the
+  next release drops it.
+- `a9c3e5f71b28` — #1827, data only: a builtin `control-plane`
+  firewall rule, `tcp/19443` from cluster peers (seq 50), for
+  frr-k8s's webhook. Idempotent (`ON CONFLICT DO NOTHING`).
 
 ## 2026.10.02-1 — 2026-10-02
 

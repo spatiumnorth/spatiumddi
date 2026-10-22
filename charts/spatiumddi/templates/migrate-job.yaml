@@ -17,6 +17,12 @@
 # Old Jobs (and their pods, with TTL) are garbage-collected by
 # ``ttlSecondsAfterFinished`` below — operators don't have to clean up
 # revisions manually.
+{{- /* #2114: ``helm template`` (Argo CD, and any tool that renders the chart
+       rather than installing it) always sees .Release.Revision = 1, so the
+       name never changes and the first image bump hits "field is
+       immutable". ``migrate.annotations`` lets those deployments make the
+       Job a sync hook that is deleted and recreated on every sync. A template
+       comment, not a YAML one, so the default render stays byte-identical. */}}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -24,6 +30,10 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "migrate") .) | nindent 4 }}
+  {{- with .Values.migrate.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   backoffLimit: {{ .Values.migrate.backoffLimit }}
   ttlSecondsAfterFinished: {{ .Values.migrate.ttlSecondsAfterFinished | default 600 }}

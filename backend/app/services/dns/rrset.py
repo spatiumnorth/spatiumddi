@@ -71,7 +71,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dns import DNSRecord, DNSZone
+from app.models.dns import ZONE_DEFAULT_TTL, DNSRecord, DNSZone, servable_ttl
 
 # Ops that describe an RRset. Everything else on the record-op queue is
 # zone-level (``dnssec_sign`` / ``dnssec_unsign`` / ``dnssec_rollover``) and
@@ -243,8 +243,11 @@ def _rrset_payload(members: list[dict[str, Any]], zone_ttl: int | None) -> dict[
     an RRset has ONE TTL, so members that disagree resolve to the lowest — the
     conservative direction, since it only shortens caching.
     """
-    default_ttl = 3600 if zone_ttl is None else zone_ttl
-    ttls = [default_ttl if m.get("ttl") is None else m["ttl"] for m in members]
+    # #2073 — a TTL stored negative before the API bounded it counts as unset.
+    zone_default = servable_ttl(zone_ttl)
+    default_ttl = ZONE_DEFAULT_TTL if zone_default is None else zone_default
+    stored = [servable_ttl(m.get("ttl")) for m in members]
+    ttls = [default_ttl if t is None else t for t in stored]
     return {
         "ttl": min(ttls) if ttls else default_ttl,
         "members": [{k: v for k, v in m.items() if k not in ("ttl", "id")} for m in members],

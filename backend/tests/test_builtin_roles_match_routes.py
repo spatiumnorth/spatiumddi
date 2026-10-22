@@ -73,6 +73,9 @@ PROMISES: dict[str, list[tuple[str, str]]] = {
         ("PUT", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}"),
         ("DELETE", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/import/commit"),
+        # #2139 — the spreadsheet import edits records the way the zone-file
+        # import does, so it is the same promise.
+        ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/import/spreadsheet/commit"),
         # records
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/records"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/records/bulk-create"),
@@ -167,6 +170,7 @@ OPEN_DNS_DHCP_WRITES: frozenset[tuple[str, str]] = frozenset(
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/records/bulk-delete"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/delegate-from-parent"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/import/preview"),
+        ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/import/spreadsheet/preview"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/sync-with-server"),
         ("POST", f"{_DNS}/tools/propagation-check"),
     }

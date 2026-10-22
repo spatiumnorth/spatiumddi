@@ -620,6 +620,42 @@ def read_backup_manifest(archive_bytes: bytes) -> dict[str, Any]:
     return manifest
 
 
+def resolve_dump_format(manifest: dict[str, Any], names: set[str]) -> str | None:
+    """``"plain"`` / ``"custom"`` for an archive, or None when neither
+    the manifest nor the member names say.
+
+    The manifest's ``dump_format`` wins; an archive that pre-dates the
+    field is sniffed by member name (``database.dump`` → custom,
+    ``database.sql`` → plain). ``format_version`` says nothing about it:
+    every archive since Phase 2a is version 2, an *Exclude secrets* one
+    included, and that one is plain SQL (#2201). The restore and the
+    manifest preview both answer through here, so the console's "can this
+    be restored selectively?" and the restore's refusal cannot disagree.
+    """
+    declared = manifest.get("dump_format")
+    if declared in ("plain", "custom"):
+        return str(declared)
+    if "database.dump" in names:
+        return "custom"
+    if "database.sql" in names:
+        return "plain"
+    return None
+
+
+def preview_backup_archive(archive_bytes: bytes) -> tuple[dict[str, Any], str | None]:
+    """``(manifest, dump_format)`` without inflating the dump. For the
+    restore preview: the manifest as :func:`read_backup_manifest` reads
+    it, plus the dump format the restore will act on (None when the
+    archive does not say — the restore then refuses it outright)."""
+    manifest = read_backup_manifest(archive_bytes)
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as zf:
+            names = set(zf.namelist())
+    except _MALFORMED_MANIFEST_ERRORS as exc:
+        raise BackupArchiveError(f"archive is malformed: {exc}") from exc
+    return manifest, resolve_dump_format(manifest, names)
+
+
 def extract_archive_members(
     archive_bytes: bytes,
 ) -> tuple[dict[str, Any], bytes, str, bytes]:
@@ -646,13 +682,9 @@ def extract_archive_members(
                 raise BackupArchiveError("manifest.json is not a JSON object")
             # Format detection — manifest field if present,
             # otherwise fall back to member-name sniffing.
-            declared = manifest.get("dump_format")
-            if declared in ("plain", "custom"):
-                dump_format = declared
-            elif "database.dump" in names:
-                dump_format = "custom"
-            elif "database.sql" in names:
-                dump_format = "plain"
+            resolved = resolve_dump_format(manifest, names)
+            if resolved is not None:
+                dump_format = resolved
             else:
                 raise BackupArchiveError(
                     "archive is missing the database dump member "

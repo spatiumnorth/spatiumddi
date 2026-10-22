@@ -14,6 +14,7 @@
  * operator types so they see the rendered hostnames before posting.
  */
 
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useEffect, useMemo, useState } from "react";
 import {
   useMutation,
@@ -45,34 +46,13 @@ import {
   ipamApi,
   type Subnet,
 } from "@/lib/api";
-
-const BULK_TEMPLATE_RE = /\{(n|oct[1-4])(?::([^}]+))?\}/g;
-const HOSTNAME_LABEL_RE = /^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$/;
-
-function expandTemplate(
-  template: string,
-  ip: string,
-  n: number,
-  v6: boolean,
-): string {
-  const octets = v6 ? [] : ip.split(".");
-  return template.replace(
-    BULK_TEMPLATE_RE,
-    (_match, token: string, fmt: string | undefined) => {
-      if (token === "n") {
-        if (!fmt) return String(n);
-        // Support {n:03d} (zero-pad), {n:x} (hex), {n:X} (upper hex).
-        const padMatch = /^0?(\d+)d$/.exec(fmt);
-        if (padMatch) return String(n).padStart(Number(padMatch[1]), "0");
-        if (fmt === "x") return n.toString(16);
-        if (fmt === "X") return n.toString(16).toUpperCase();
-        return String(n);
-      }
-      const idx = Number(token[3]) - 1;
-      return octets[idx] ?? "";
-    },
-  );
-}
+import {
+  expandTemplate,
+  hostLabelError,
+  storedHostname,
+  templateFormatError,
+  templateStartError,
+} from "@/lib/bulk-allocate-template";
 
 function ipToBigInt(ip: string): bigint | null {
   if (ip.includes(":")) {
@@ -221,7 +201,11 @@ export function BulkAllocateModal({
   const [statusValue, setStatusValue] = useState("allocated");
   const [description, setDescription] = useState("");
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
-  const [createDnsRecords, setCreateDnsRecords] = useState(true);
+  const [createDnsRecordsChoice, setCreateDnsRecords] = useState(true);
+  // #2135 — with core.dns off there is no zone to read and no record to
+  // create: the choice is hidden and the request asks for none.
+  const dnsOn = useModuleOn("core.dns");
+  const createDnsRecords = dnsOn && createDnsRecordsChoice;
   const [onCollision, setOnCollision] = useState<"skip" | "abort">("skip");
 
   const [serverError, setServerError] = useState<string | null>(null);
@@ -244,6 +228,7 @@ export function BulkAllocateModal({
       queryKey: ["dns-zones", gId],
       queryFn: () => dnsApi.listZones(gId),
       staleTime: 60_000,
+      enabled: dnsOn,
     })),
   });
   const allGroupZones: DNSZone[] = zoneQueries
@@ -271,8 +256,12 @@ export function BulkAllocateModal({
 
   // Client-side live preview: shows the first few rendered hostnames as
   // the operator types so they see the template effect before posting.
-  // Errors are silent — the real validation happens server-side.
+  // Names are normalized as the server stores them; a name it would refuse
+  // is reported by `hostnameError` below, which gates Preview.
   const livePreview = useMemo(() => {
+    // The template as sent (buildBody trims it), so the preview and the
+    // check below see the same string the server renders.
+    const template = hostnameTemplate.trim();
     const startInt = ipToBigInt(rangeStart);
     const endInt = ipToBigInt(rangeEnd);
     if (startInt === null || endInt === null || endInt < startInt) return null;
@@ -284,11 +273,8 @@ export function BulkAllocateModal({
       const ipStr = bigIntToIp(startInt + BigInt(i), v6);
       samples.push({
         ip: ipStr,
-        hostname: expandTemplate(
-          hostnameTemplate,
-          ipStr,
-          templateStart + i,
-          v6,
+        hostname: storedHostname(
+          expandTemplate(template, ipStr, templateStart + i, v6),
         ),
       });
     }
@@ -300,34 +286,39 @@ export function BulkAllocateModal({
       });
       samples.push({
         ip: lastIp,
-        hostname: expandTemplate(
-          hostnameTemplate,
-          lastIp,
-          templateStart + total - 1,
-          v6,
+        hostname: storedHostname(
+          expandTemplate(template, lastIp, templateStart + total - 1, v6),
         ),
       });
     }
     return { total, samples };
   }, [rangeStart, rangeEnd, hostnameTemplate, templateStart, v6]);
 
-  // Quick local validation: does the rendered hostname match RFC 1035?
-  // Server enforces the same rule; this just gives instant feedback.
+  // Local validation of EVERY generated name with the server's rule, so the
+  // form refuses what the server would (and the live preview above shows the
+  // same names the server stores).
   const hostnameError = useMemo(() => {
+    const template = hostnameTemplate.trim();
+    const startErr = templateStartError(templateStart);
+    if (startErr) return startErr;
     const startInt = ipToBigInt(rangeStart);
-    if (startInt === null) return null;
-    const probe = expandTemplate(
-      hostnameTemplate,
-      rangeStart,
-      templateStart,
-      v6,
-    );
-    if (!probe) return "Template is empty";
-    if (!HOSTNAME_LABEL_RE.test(probe)) {
-      return `Renders to '${probe}' — must match ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$`;
+    const endInt = ipToBigInt(rangeEnd);
+    if (startInt === null || !template) return null;
+    const fmt = templateFormatError(template);
+    if (fmt) return fmt;
+    const total =
+      endInt !== null && endInt >= startInt
+        ? Math.min(Number(endInt - startInt + 1n), 1024)
+        : 1;
+    for (let i = 0; i < total; i++) {
+      const ipStr = bigIntToIp(startInt + BigInt(i), v6);
+      const err = hostLabelError(
+        expandTemplate(template, ipStr, templateStart + i, v6),
+      );
+      if (err) return `#${i + 1} (${ipStr}): ${err}`;
     }
     return null;
-  }, [rangeStart, hostnameTemplate, templateStart, v6]);
+  }, [rangeStart, rangeEnd, hostnameTemplate, templateStart, v6]);
 
   const buildBody = (): BulkAllocateRequest => ({
     range_start: rangeStart.trim(),
@@ -554,40 +545,42 @@ export function BulkAllocateModal({
             />
           </div>
 
-          <div className="rounded-md border bg-muted/30 p-3">
-            <label className="flex cursor-pointer items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={createDnsRecords}
-                onChange={(e) => setCreateDnsRecords(e.target.checked)}
-              />
-              <span>Create DNS records (forward A/AAAA + reverse PTR)</span>
-            </label>
-            {createDnsRecords && availableZones.length > 0 && (
-              <div className="mt-2">
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  Forward zone
-                </label>
-                <select
-                  className={inputCls}
-                  value={dnsZoneId}
-                  onChange={(e) => setDnsZoneId(e.target.value)}
-                >
-                  {availableZones.map((z) => (
-                    <option key={z.id} value={z.id}>
-                      {z.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-            {createDnsRecords && availableZones.length === 0 && (
-              <p className="mt-1 text-xs text-muted-foreground">
-                No DNS zones are pinned to this subnet — A records will fall
-                through to the effective default zone if one exists.
-              </p>
-            )}
-          </div>
+          {dnsOn && (
+            <div className="rounded-md border bg-muted/30 p-3">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={createDnsRecords}
+                  onChange={(e) => setCreateDnsRecords(e.target.checked)}
+                />
+                <span>Create DNS records (forward A/AAAA + reverse PTR)</span>
+              </label>
+              {createDnsRecords && availableZones.length > 0 && (
+                <div className="mt-2">
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    Forward zone
+                  </label>
+                  <select
+                    className={inputCls}
+                    value={dnsZoneId}
+                    onChange={(e) => setDnsZoneId(e.target.value)}
+                  >
+                    {availableZones.map((z) => (
+                      <option key={z.id} value={z.id}>
+                        {z.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {createDnsRecords && availableZones.length === 0 && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  No DNS zones are pinned to this subnet — A records will fall
+                  through to the effective default zone if one exists.
+                </p>
+              )}
+            </div>
+          )}
 
           {livePreview && (
             <div className="rounded-md border bg-muted/20 p-3">

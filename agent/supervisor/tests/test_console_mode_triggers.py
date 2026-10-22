@@ -134,3 +134,14 @@ def test_successful_apply_clears_the_health_entry(guarded: Path) -> None:
     (guarded / "verbose-boot-pending").unlink()
     (guarded / "verbose-boot-applied").write_text("1\n")  # runner succeeded
     assert appliance_state.read_host_config_health() == {}
+
+
+def test_reverting_after_a_failed_apply_clears_the_health_entry(guarded: Path) -> None:
+    """(#2053) text_console fails on a fresh box; the operator goes back to
+    dashboard, which the box already runs. Nothing fires again for "1", so
+    its ledger must not leave the plane 'retrying' forever."""
+    assert appliance_state.maybe_fire_console_mode("text_console") is True
+    (guarded / "verbose-boot-pending").unlink()  # runner ran and failed
+    assert "console_mode" in appliance_state.read_host_config_health()
+    assert appliance_state.maybe_fire_console_mode("dashboard") is False
+    assert appliance_state.read_host_config_health() == {}

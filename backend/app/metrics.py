@@ -45,7 +45,7 @@ AUTH_TOKEN_USAGE = Counter(
 # the worker is another process and this registry is the api's.
 AGENT_BUNDLE_SERVED = Counter(
     "spatiumddi_agent_bundle_served_total",
-    "Agent config long-poll answers by outcome (full / not_modified)",
+    "Agent config long-poll answers by outcome (full / not_modified / client_gone)",
     ["family", "outcome"],
 )
 AGENT_BUNDLE_INLINE_RENDERS = Counter(

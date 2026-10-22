@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -22,3 +23,13 @@ def agent_cfg(tmp_path: Path) -> AgentConfig:
         insecure_skip_tls_verify=True,
         state_dir=tmp_path,
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_reauth_state() -> Iterator[None]:
+    """#2052 — re-registration pacing is process-wide; tests start clean."""
+    from spatium_dns_agent import bootstrap
+
+    bootstrap._reset_reauth_state()
+    yield
+    bootstrap._reset_reauth_state()

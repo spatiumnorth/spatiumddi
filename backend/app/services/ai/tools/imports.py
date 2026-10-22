@@ -59,6 +59,8 @@ async def find_dns_import_preview(
     gate = _superadmin_gate(user)
     if gate is not None:
         return gate
+    from app.services.dns_import.cname_check import count_cname_warnings  # noqa: PLC0415
+
     try:
         preview = await _dns_import_pull(db, args)
     except ValueError as exc:
@@ -68,6 +70,9 @@ async def find_dns_import_preview(
         "zone_count": len(preview.zones),
         "total_records": preview.total_records,
         "conflict_count": len(preview.conflicts),
+        # #2089 — records the commit will skip under the CNAME rule; counted
+        # here because ``warnings`` below is truncated.
+        "records_not_imported": count_cname_warnings(preview.warnings),
         "zones": [
             {
                 "name": z.name,

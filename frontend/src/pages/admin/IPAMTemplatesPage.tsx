@@ -11,7 +11,9 @@ import {
   type IPAMTemplateUpdate,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { parseTtlInput } from "@/lib/dnsNames";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { useModuleOn } from "@/hooks/useModuleOn";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -44,7 +46,8 @@ interface TemplateForm {
   children: ChildEntryForm[];
 }
 
-const EMPTY: TemplateForm = {
+// eslint-disable-next-line react-refresh/only-export-components -- exported for its test
+export const EMPTY: TemplateForm = {
   name: "",
   description: "",
   applies_to: "subnet",
@@ -84,7 +87,8 @@ function formFromTemplate(t: IPAMTemplate): TemplateForm {
   };
 }
 
-function toCreatePayload(form: TemplateForm): IPAMTemplateCreate {
+// eslint-disable-next-line react-refresh/only-export-components -- exported for its test
+export function toCreatePayload(form: TemplateForm): IPAMTemplateCreate {
   let tags: Record<string, unknown> = {};
   let cfs: Record<string, unknown> = {};
   try {
@@ -116,7 +120,11 @@ function toCreatePayload(form: TemplateForm): IPAMTemplateCreate {
       }),
     };
   }
-  const ttl = form.ddns_ttl ? parseInt(form.ddns_ttl, 10) : null;
+  // #2086 — "1h" is refused, never saved as 1; blank means no override.
+  const ttl = parseTtlInput(form.ddns_ttl);
+  if (typeof ttl === "string") {
+    throw new Error(`TTL override ${ttl}. Leave blank for the zone default.`);
+  }
   return {
     name: form.name.trim(),
     description: form.description,
@@ -155,13 +163,21 @@ function TemplateEditor({
   const [form, setForm] = useState<TemplateForm>(initial);
   const [tab, setTab] = useState<TabKey>("general");
 
+  // #2135 — no DNS server groups to pick, no DNS zone or DDNS settings to
+  // edit, while core.dns is off. The stored values stay in the form state
+  // and are sent back unchanged on save.
+  const dnsOn = useModuleOn("core.dns");
   const dnsGroupsQ = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
+    enabled: dnsOn,
   });
+  // #2130 — no DHCP server groups to pick while core.dhcp is off.
+  const dhcpOn = useModuleOn("core.dhcp");
   const dhcpGroupsQ = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
+    enabled: dhcpOn,
   });
 
   function set<K extends keyof TemplateForm>(key: K, v: TemplateForm[K]) {
@@ -214,24 +230,28 @@ function TemplateEditor({
               ["ddns", "DDNS"],
               ["children", "Child layout"],
             ] as [TabKey, string][]
-          ).map(([k, label]) => {
-            const disabled = k === "children" && form.applies_to !== "block";
-            return (
-              <button
-                key={k}
-                type="button"
-                onClick={() => !disabled && setTab(k)}
-                disabled={disabled}
-                className={`-mb-px border-b-2 px-3 py-1.5 text-sm transition-colors ${
-                  tab === k
-                    ? "border-primary text-foreground"
-                    : "border-transparent text-muted-foreground hover:text-foreground"
-                } ${disabled ? "opacity-40 cursor-not-allowed" : ""}`}
-              >
-                {label}
-              </button>
-            );
-          })}
+          )
+            // DDNS is DHCP updating DNS: it needs both modules, as the
+            // IPAM dialogs' DDNS tab does (#2135).
+            .filter(([k]) => (dnsOn && dhcpOn) || k !== "ddns")
+            .map(([k, label]) => {
+              const disabled = k === "children" && form.applies_to !== "block";
+              return (
+                <button
+                  key={k}
+                  type="button"
+                  onClick={() => !disabled && setTab(k)}
+                  disabled={disabled}
+                  className={`-mb-px border-b-2 px-3 py-1.5 text-sm transition-colors ${
+                    tab === k
+                      ? "border-primary text-foreground"
+                      : "border-transparent text-muted-foreground hover:text-foreground"
+                  } ${disabled ? "opacity-40 cursor-not-allowed" : ""}`}
+                >
+                  {label}
+                </button>
+              );
+            })}
         </div>
 
         {tab === "general" && (
@@ -307,52 +327,58 @@ function TemplateEditor({
               />
             </div>
             <div className="grid grid-cols-2 gap-4">
+              {dnsOn && (
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    DNS server group
+                  </label>
+                  <select
+                    value={form.dns_group_id}
+                    onChange={(e) => set("dns_group_id", e.target.value)}
+                    className={inputCls}
+                  >
+                    <option value="">— none —</option>
+                    {(dnsGroupsQ.data ?? []).map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {dhcpOn && (
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    DHCP server group
+                  </label>
+                  <select
+                    value={form.dhcp_group_id}
+                    onChange={(e) => set("dhcp_group_id", e.target.value)}
+                    className={inputCls}
+                  >
+                    <option value="">— none —</option>
+                    {(dhcpGroupsQ.data ?? []).map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
+            {dnsOn && (
               <div>
                 <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  DNS server group
+                  Default DNS zone (optional)
                 </label>
-                <select
-                  value={form.dns_group_id}
-                  onChange={(e) => set("dns_group_id", e.target.value)}
-                  className={inputCls}
-                >
-                  <option value="">— none —</option>
-                  {(dnsGroupsQ.data ?? []).map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.name}
-                    </option>
-                  ))}
-                </select>
+                <input
+                  value={form.dns_zone_id}
+                  onChange={(e) => set("dns_zone_id", e.target.value)}
+                  placeholder="zone UUID — operator can leave blank"
+                  className={`${inputCls} font-mono text-xs`}
+                />
               </div>
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  DHCP server group
-                </label>
-                <select
-                  value={form.dhcp_group_id}
-                  onChange={(e) => set("dhcp_group_id", e.target.value)}
-                  className={inputCls}
-                >
-                  <option value="">— none —</option>
-                  {(dhcpGroupsQ.data ?? []).map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                Default DNS zone (optional)
-              </label>
-              <input
-                value={form.dns_zone_id}
-                onChange={(e) => set("dns_zone_id", e.target.value)}
-                placeholder="zone UUID — operator can leave blank"
-                className={`${inputCls} font-mono text-xs`}
-              />
-            </div>
+            )}
           </div>
         )}
 
@@ -558,6 +584,8 @@ function ReapplyConfirmModal({
 }
 
 export function IPAMTemplatesPage() {
+  const dhcpOn = useModuleOn("core.dhcp");
+  const dnsOn = useModuleOn("core.dns");
   // #1341 — a read-only user is offered no write it would be refused:
   // the router asks write (delete) on 'manage_ipam_templates'.
   const perms = usePermissions();
@@ -735,8 +763,8 @@ export function IPAMTemplatesPage() {
               <tr>
                 <th className="px-3 py-2">Name</th>
                 <th className="px-3 py-2">Applies to</th>
-                <th className="px-3 py-2">DNS group</th>
-                <th className="px-3 py-2">DHCP group</th>
+                {dnsOn && <th className="px-3 py-2">DNS group</th>}
+                {dhcpOn && <th className="px-3 py-2">DHCP group</th>}
                 <th className="px-3 py-2">Children</th>
                 <th className="px-3 py-2">Applied</th>
                 <th className="px-3 py-2 text-right">Actions</th>
@@ -776,12 +804,16 @@ export function IPAMTemplatesPage() {
                   <td className="px-3 py-2 text-xs">
                     {APPLIES_TO_LABEL[t.applies_to]}
                   </td>
-                  <td className="px-3 py-2 text-xs font-mono">
-                    {t.dns_group_id ? t.dns_group_id.slice(0, 8) : "—"}
-                  </td>
-                  <td className="px-3 py-2 text-xs font-mono">
-                    {t.dhcp_group_id ? t.dhcp_group_id.slice(0, 8) : "—"}
-                  </td>
+                  {dnsOn && (
+                    <td className="px-3 py-2 text-xs font-mono">
+                      {t.dns_group_id ? t.dns_group_id.slice(0, 8) : "—"}
+                    </td>
+                  )}
+                  {dhcpOn && (
+                    <td className="px-3 py-2 text-xs font-mono">
+                      {t.dhcp_group_id ? t.dhcp_group_id.slice(0, 8) : "—"}
+                    </td>
+                  )}
                   <td className="px-3 py-2 text-xs">
                     {t.child_layout?.children?.length ?? 0}
                   </td>

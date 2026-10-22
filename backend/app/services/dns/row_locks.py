@@ -28,6 +28,16 @@ here keep the same ascending order.
 
 A row deleted under a waiting lock is not returned (READ COMMITTED skips it),
 so a caller that locks before it writes never updates a row that is gone.
+
+The server row's PARENTS — its group and appliance — come before all of it: a
+transaction that locks one of them and then marks the server's bundle takes the
+parent first and the server row at commit. So nothing that holds the server row
+may then wait on a parent (#2031). The trap is implicit: Postgres re-runs a
+row's foreign-key checks on an UPDATE of a version the transaction itself wrote
+(a second UPDATE of the row), taking ``FOR KEY SHARE`` on every parent. The
+bundle store therefore writes the server row in one statement, and a lock on a
+parent that only writes non-key columns is ``FOR NO KEY UPDATE``, which an FK
+check never waits for.
 """
 
 from __future__ import annotations

@@ -35,6 +35,10 @@ tls spatium-upstream-tls {
     protocols { TLSv1.2; TLSv1.3; };
 };
 {%- endif %}
+{#- A TLS forward zone's own upstream statement (#2121), one per hostname. #}
+{%- if zone_tls_statements %}
+{{ zone_tls_statements }}
+{%- endif %}
 
 options {
     directory "/var/cache/bind";
@@ -59,6 +63,13 @@ options {
     blackhole { {% for a in options.blackhole %}{{ a }}; {% endfor %}};
     {%- endif %}
     dnssec-validation {{ options.dnssec_validation }};
+    {#- Explicit query-logging switch (issue #2249), mirroring the agent
+        renderer. Without it BIND decides query logging from the
+        ``queries`` category only when named starts; ``rndc reconfig``
+        never changes it, so the agent asserts it with ``rndc querylog``. #}
+    {%- if options.query_log_enabled %}
+    querylog yes;
+    {%- endif %}
     {#- Per-query RCODE logging (issue #914). Gated on query logging too:
         the response lines are routed to ``queries_channel``, which only
         exists inside the query-log block below, and the agent shipper
@@ -136,17 +147,15 @@ dnssec-policy "{{ p.name }}" {
 {%- if options.query_log_enabled %}
 logging {
     channel queries_channel {
-        {%- if options.query_log_channel == "file" %}
-        file "{{ options.query_log_file }}" versions 5 size 50m;
-        {%- elif options.query_log_channel == "syslog" %}
-        syslog daemon;
-        {%- else %}
-        stderr;
-        {%- endif %}
-        severity {{ options.query_log_severity }};
+        {#- Always a file at the path the agent's shipper tails (#2265); the
+            channel / path are not operator-settable. A severity above
+            ``info`` would drop every query line, so it falls back. #}
+        file "/var/log/named/queries.log" versions 5 size 50m;
+        {%- set qsev = (options.query_log_severity or "info")|lower %}
+        severity {{ qsev if (qsev == "dynamic" or qsev == "debug" or qsev.startswith("debug ")) else "info" }};
         print-category {{ "yes" if options.query_log_print_category else "no" }};
         print-severity {{ "yes" if options.query_log_print_severity else "no" }};
-        print-time {{ "yes" if options.query_log_print_time else "no" }};
+        print-time yes;
     };
     category queries { queries_channel; };
     category query-errors { queries_channel; };
@@ -209,7 +218,7 @@ view "{{ view.name }}" {
     {%- endif %}
     recursion {{ "yes" if view.recursion else "no" }};
     {%- if view_bls %}
-    response-policy { {% for bl in view_bls %}zone "{{ bl.rpz_zone_name }}"; {% endfor %}} break-dnssec yes;
+    response-policy { {% for bl in view_bls %}zone "{{ bl.rpz_zone_name }}"; {% endfor %}} break-dnssec yes qname-wait-recurse no;
     {%- endif %}
 {%- for zone in zones %}
 {%- if zone.view_name == view.name %}

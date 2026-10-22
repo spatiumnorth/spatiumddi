@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
@@ -26,6 +26,7 @@ import {
   type BackupTargetUpdate,
 } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
 
 /**
@@ -69,9 +70,8 @@ export function BackupTargetsSection() {
         <div>
           <h2 className="text-sm font-semibold">Scheduled targets</h2>
           <p className="text-xs text-muted-foreground">
-            Build backups on a cron schedule and write them to a local volume, a
-            network share or an object store. Add target lists every destination
-            kind this build supports.
+            Build backups on a cron schedule and write them to a destination.
+            Add target lists every destination kind this build supports.
           </p>
         </div>
         <button
@@ -90,13 +90,14 @@ export function BackupTargetsSection() {
           Loading…
         </div>
       ) : targetsQ.isError ? (
-        <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-          Failed to load backup targets.
+        <div className="rounded-md border border-dashed px-3 py-2 text-xs">
+          <ListReadError error={targetsQ.error} what="backup targets" />
         </div>
       ) : (targetsQ.data ?? []).length === 0 ? (
         <div className="rounded-md border border-dashed px-3 py-4 text-center text-xs text-muted-foreground">
           No backup targets configured. Click <strong>Add target</strong> to
-          schedule a recurring backup to a local volume.
+          schedule a recurring backup; its <strong>Kind</strong> list shows
+          every destination it can write to.
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
@@ -281,6 +282,25 @@ function TargetRow({
           />
         </div>
       </div>
+      {/* A refused request (403, 404, 409 …) never reaches the ``data``
+          panels below; show the API's reason (#2203). */}
+      {(
+        [
+          [runMut, "run failed"],
+          [testMut, "test failed"],
+          [deleteMut, "delete failed"],
+        ] as const
+      ).map(([m, fallback]) =>
+        m.isError ? (
+          <div
+            key={fallback}
+            className="border-t bg-destructive/5 px-3 py-1.5 text-xs text-destructive"
+          >
+            <ServerCrash className="mr-1 inline h-3.5 w-3.5" />
+            {formatApiError(m.error, fallback)}
+          </div>
+        ) : null,
+      )}
       {testMut.data && (
         <div
           className={`border-t px-3 py-1.5 text-xs ${
@@ -915,20 +935,39 @@ function TargetFormModal({
                 required={f.required && !isSecretInEdit}
                 help={f.description}
               >
-                <input
-                  type={f.type === "password" || f.secret ? "password" : "text"}
-                  value={config[f.name] ?? ""}
-                  onChange={(e) =>
-                    setConfig({ ...config, [f.name]: e.target.value })
-                  }
-                  placeholder={
-                    isSecretInEdit
-                      ? "(set — leave empty to keep, type to replace)"
-                      : undefined
-                  }
-                  autoComplete={f.secret ? "new-password" : undefined}
-                  className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                />
+                {f.multiline ? (
+                  // A PEM key, a known_hosts file or one header per line:
+                  // an <input> folds every line break into a space, so the
+                  // value is a textarea and goes out byte for byte (#2199).
+                  <MultilineConfigField
+                    name={f.name}
+                    masked={f.type === "password" || f.secret}
+                    value={config[f.name] ?? ""}
+                    onChange={(v) => setConfig({ ...config, [f.name]: v })}
+                    placeholder={
+                      isSecretInEdit
+                        ? "(set — leave empty to keep, type to replace)"
+                        : undefined
+                    }
+                  />
+                ) : (
+                  <input
+                    type={
+                      f.type === "password" || f.secret ? "password" : "text"
+                    }
+                    value={config[f.name] ?? ""}
+                    onChange={(e) =>
+                      setConfig({ ...config, [f.name]: e.target.value })
+                    }
+                    placeholder={
+                      isSecretInEdit
+                        ? "(set — leave empty to keep, type to replace)"
+                        : undefined
+                    }
+                    autoComplete={f.secret ? "new-password" : undefined}
+                    className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  />
+                )}
               </Field>
             );
           })}
@@ -1215,5 +1254,68 @@ function Field({
       {children}
       {help && <p className="mt-1 text-[11px] text-muted-foreground">{help}</p>}
     </label>
+  );
+}
+
+/**
+ * A config value made of lines. A secret one is masked until the operator
+ * asks to see it — a textarea has no ``type="password"``, so the mask is
+ * ``-webkit-text-security`` (Chromium, Safari, and Firefox since 114).
+ * While masked it also behaves like a password input in the ways CSS
+ * cannot: copy, cut and drag out are refused, and password managers are
+ * told to leave it alone. The value itself is never touched: whatever is
+ * typed or pasted, line breaks included, is what the form sends.
+ */
+function MultilineConfigField({
+  name,
+  masked,
+  value,
+  onChange,
+  placeholder,
+}: {
+  name: string;
+  masked: boolean;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) {
+  const [revealed, setRevealed] = useState(false);
+  const hidden = masked && !revealed;
+  return (
+    <div className="space-y-1">
+      <textarea
+        name={name}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        rows={masked ? 6 : 4}
+        spellCheck={false}
+        autoCapitalize="off"
+        autoCorrect="off"
+        autoComplete="off"
+        wrap="off"
+        data-masked={hidden ? "true" : "false"}
+        data-lpignore="true"
+        data-1p-ignore="true"
+        data-bwignore="true"
+        onCopy={hidden ? (e) => e.preventDefault() : undefined}
+        onCut={hidden ? (e) => e.preventDefault() : undefined}
+        onDragStart={hidden ? (e) => e.preventDefault() : undefined}
+        style={
+          hidden ? ({ WebkitTextSecurity: "disc" } as CSSProperties) : undefined
+        }
+        className="w-full rounded-md border bg-background px-3 py-1.5 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+      />
+      {masked && (
+        <button
+          type="button"
+          onClick={() => setRevealed((r) => !r)}
+          aria-pressed={revealed}
+          className="text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+        >
+          {revealed ? "Hide" : "Show"}
+        </button>
+      )}
+    </div>
   );
 }

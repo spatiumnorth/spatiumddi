@@ -134,10 +134,40 @@ on inactive.
 5. **Privilege ceiling on role / group edits (#400 C4).** When a non-superadmin
    creates or edits a role's permission set (or assigns roles to a group), every
    permission they add must be one they *themselves* effectively hold —
-   `user_has_permission(editor, entry)` must pass for each entry in the new set.
-   This stops, say, an IPAM editor from minting a `{*, *}` role and assigning it
-   to their own group to escalate. Superadmins (either path in the section
-   above) are exempt by rule 1.
+   `user_has_permission(editor, entry)` must pass for each entry in the new set,
+   and no entry may carry a wildcard (`*`). The editor must hold each entry
+   through a static role: a permission held only through a live time-bound
+   grant is not one they can grant onward, or a grant meant to lapse could be
+   turned into a role, a membership or a longer grant that does not. This
+   stops, say, an IPAM editor from
+   minting a `{*, *}` role and assigning it to their own group to escalate.
+   Superadmins (either path in the section above) are exempt by rule 1.
+
+   A group's roles, plus its live time-bound grants, are what its members hold,
+   so the same ceiling bounds every change to who holds them:
+
+   - **adding or removing a member** — against every role the group carries
+     (the ones it keeps and the ones the same edit attaches) and its live
+     time-bound grants. Resending the unchanged member list is not a change;
+   - **detaching a role** from a group, **deleting a group**, **changing or
+     deleting a role** (its current permissions as well as the new ones), and
+     **revoking a wildcard time-bound grant** (revoking any other grant only
+     narrows access, so a group admin may do it).
+
+   So only a superadmin can change the membership of a group that carries a
+   wildcard permission. A refusal is a 403 with a `denied` audit row.
+   Group membership synced from an identity provider at sign-in is not bounded
+   by this: it follows the provider group mappings, which only a superadmin
+   configures.
+6. **At least one active superadmin.** Any change that would leave no active
+   superadmin — through the `is_superadmin` flag or a `{*, *}` role — is refused
+   with 409 and a `denied` audit row: disabling, un-flagging or deleting a user;
+   removing a member from, detaching a role from, or deleting a group; changing
+   or deleting a role. A superadmin who holds `{*, *}` only through a time-bound
+   grant does not count, since the grant lapses on its own; so revoking such a
+   grant is never refused by this rule. The check and the change it guards run
+   under one advisory lock, so two concurrent changes cannot each remove one of
+   the last two superadmins.
 
 ### Bulk deletes need `delete`
 
@@ -232,6 +262,36 @@ if not user_has_permission(current_user, "write", "subnet", subnet.id):
 ```
 
 See `backend/app/core/permissions.py` for the full API.
+
+### Every read route declares its permission
+
+A `GET` route that takes only `CurrentUser` answers every signed-in account,
+whatever its role grants. So every `GET` route carries a permission
+dependency — a `require_*permission` factory or `SuperAdmin` — unless it is
+listed in `NO_PERMISSION_DEPENDENCY` in
+`backend/tests/test_get_routes_declare_permission.py` with the reason: it is
+reachable before sign-in, it is authenticated by something other than a user
+session (an agent JWT, a signed download URL, a feed token), it returns only
+the caller's own rows, it serves static reference data or settings the UI
+shell needs, or the handler checks the permission itself. That test walks the
+served route table and fails for a new unlisted route, and for a listed route
+that has since gained a dependency.
+
+A rollup over several resource types (the Network and Integrations dashboard
+tabs, the DNS / DHCP traffic series) needs `read` on at least one of the types
+it summarises, and fills only the panels whose type the caller can read, so it
+never shows more than the resources' own routes would. The tag autocomplete
+(`GET /tags/keys`, `/tags/values`) follows the same rule per table: it offers
+tags only from the tables whose rows the caller can read, and an empty list
+when there are none.
+
+## Refusals are audited
+
+Every 403 the permission gates produce leaves a `denied` audit row, including a
+refusal from a route that takes `SuperAdmin` (recorded as `access` on
+`superadmin`, #2304). A handler that is superadmin-only must take the `SuperAdmin`
+dependency rather than check `is_effective_superadmin` and raise by hand, or its
+refusal is invisible to the audit log and the security dashboard.
 
 ## The console mirrors the server, it does not enforce
 

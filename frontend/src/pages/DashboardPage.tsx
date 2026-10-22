@@ -103,6 +103,7 @@ import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 import { HA_V4_ONLY_NOTE } from "@/lib/dhcpHa";
 import { activityTone } from "@/lib/activity-tone";
@@ -112,6 +113,8 @@ import {
   partialApplyDetail,
 } from "@/lib/configApply";
 import { WidgetErrorBoundary } from "@/components/WidgetErrorBoundary";
+import { CredentialChip } from "@/components/CredentialChip";
+import { cardTargets } from "@/lib/credential-chip";
 
 /**
  * Dashboard — the home page.
@@ -1422,12 +1425,15 @@ export function DashboardPage() {
   // fall back to Overview so we don't render a panel against a 404'd
   // endpoint.
   useEffect(() => {
-    if (!tabVisible(tab)) {
+    // ``ready``: before the module set loads ``enabled`` answers true, so
+    // a persisted ``dhcp`` tab is neither reset nor — see the panel guards
+    // below — mounted against a module that may turn out to be off (#2130).
+    if (ready && !tabVisible(tab)) {
       setTab("overview");
       localStorage.setItem("dashboard-tab", "overview");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, enabled]);
+  }, [tab, enabled, ready]);
 
   // IPAM
   const { data: spaces } = useQuery({
@@ -1440,10 +1446,14 @@ export function DashboardPage() {
   });
 
   // NAT mapping count — cheap (single page=1, per_page=1 just for total).
+  // Behind the ``ipam.nat`` module (#2100): the route 404s while it is off,
+  // and the card below goes with it.
+  const natOn = useModuleOn("ipam.nat");
   const { data: natTotal } = useQuery({
     queryKey: ["nat-mappings", "count"],
     queryFn: () => natApi.list({ page: 1, per_page: 1 }).then((r) => r.total),
     staleTime: 60_000,
+    enabled: natOn,
   });
 
   // Platform settings drive the utilization filter (excludes /30, /31,
@@ -2175,19 +2185,19 @@ export function DashboardPage() {
         )}
 
         {/* ── DNS query rate (DNS tab only) ──────────────────────────── */}
-        {tab === "dns" && (
+        {tab === "dns" && dnsOn && (
           <WidgetErrorBoundary title="DNS query rate">
             <DNSQueryRateCard dnsServers={allDnsServers} />
           </WidgetErrorBoundary>
         )}
 
         {/* ── DHCP pools + traffic (DHCP tab only) ───────────────────── */}
-        {tab === "dhcp" && (
+        {tab === "dhcp" && dhcpOn && (
           <WidgetErrorBoundary title="DHCP pools">
-            <DhcpPoolPressure />
+            <DhcpPoolPressure dhcpOn={dhcpOn} />
           </WidgetErrorBoundary>
         )}
-        {tab === "dhcp" && (
+        {tab === "dhcp" && dhcpOn && (
           <WidgetErrorBoundary title="DHCP traffic">
             <DHCPTrafficCard dhcpServers={dhcpServers} />
           </WidgetErrorBoundary>
@@ -2264,13 +2274,15 @@ export function DashboardPage() {
               </div>
             </div>
 
-            <KpiCard
-              label="NAT mappings"
-              value={natTotal ?? "—"}
-              sub={natTotal === 0 ? "none configured" : "operator-curated"}
-              icon={Plug}
-              to="/ipam/nat"
-            />
+            {natOn && (
+              <KpiCard
+                label="NAT mappings"
+                value={natTotal ?? "—"}
+                sub={natTotal === 0 ? "none configured" : "operator-curated"}
+                icon={Plug}
+                to="/ipam/nat"
+              />
+            )}
 
             <KpiCard
               label="Capacity headroom"
@@ -2463,7 +2475,7 @@ export function DashboardPage() {
         )}
 
         {/* ── DNS tab: Server list ──────────────────────────────────── */}
-        {tab === "dns" && allDnsServers.length > 0 && (
+        {tab === "dns" && dnsOn && allDnsServers.length > 0 && (
           <div className="rounded-lg border bg-card">
             <div className="flex items-center justify-between border-b px-4 py-2.5">
               <div className="flex items-center gap-2">
@@ -2504,7 +2516,7 @@ export function DashboardPage() {
             </div>
           </div>
         )}
-        {tab === "dns" && allDnsServers.length === 0 && (
+        {tab === "dns" && dnsOn && allDnsServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
             <Globe2 className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
             <p className="text-sm font-medium">No DNS servers registered</p>
@@ -2577,7 +2589,7 @@ export function DashboardPage() {
             )}
           </div>
         )}
-        {tab === "dhcp" && dhcpServers.length === 0 && (
+        {tab === "dhcp" && dhcpOn && dhcpServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
             <Server className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
             <p className="text-sm font-medium">No DHCP servers registered</p>
@@ -2999,11 +3011,13 @@ function ServerRow({
  * offered to a client and a reserved one is *supposed* to fill up, so
  * either would render as a red exhaustion bar for behaving correctly.
  */
-function DhcpPoolPressure() {
+function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
   const { data, isLoading, isError } = useQuery({
     queryKey: ["dhcp-pool-occupancy", "fleet"],
     queryFn: () => dhcpApi.fleetPoolOccupancy(8),
     refetchInterval: 60_000,
+    // Belt and braces with the caller's ``dhcpOn`` guard (#2130).
+    enabled: dhcpOn,
   });
 
   // A failed fetch must not render as "no pools configured" — that is the
@@ -3771,7 +3785,9 @@ function IntegrationsPanel({
             ) : (
               <div className="overflow-x-auto">
                 <div className="min-w-[520px] divide-y">
-                  {tailscaleTenants.map((t) => (
+                  {cardTargets(tailscaleTenants, tailscaleTenants.length, {
+                    maxProblems: tailscaleTenants.length,
+                  }).shown.map((t) => (
                     <IntegrationRow
                       key={t.id}
                       to={`/tailscale`}
@@ -3786,6 +3802,15 @@ function IntegrationsPanel({
                       lastSyncError={t.last_sync_error}
                       intervalSeconds={t.sync_interval_seconds}
                       enabled={t.enabled}
+                      badge={
+                        t.enabled ? (
+                          <CredentialChip
+                            state={t.credential_state}
+                            daysLeft={t.credential_days_left}
+                            expiresAt={t.api_key_expires_at}
+                          />
+                        ) : null
+                      }
                     />
                   ))}
                 </div>
@@ -3897,11 +3922,14 @@ function IntegrationRow({
   lastSyncWarning,
   intervalSeconds,
   enabled,
+  badge,
 }: {
   to: string;
   name: string;
   subtitle: string;
   meta: string;
+  // #2138 — e.g. a credential-expiry chip; rendered after the name.
+  badge?: React.ReactNode;
   lastSyncedAt: string | null;
   lastSyncError: string | null;
   // Optional — only integrations that compute non-fatal findings pass it.
@@ -3927,6 +3955,7 @@ function IntegrationRow({
       <span className="w-28 truncate font-semibold" title={name}>
         {name}
       </span>
+      {badge}
       <span
         className="w-48 truncate font-mono text-muted-foreground"
         title={subtitle}
@@ -4519,11 +4548,20 @@ function ConformityPanel() {
 //     soon (left), circuit alerts + orphan services + overlay
 //     impact (right).
 function NetworkPanel() {
-  const { data, isLoading } = useQuery<NetworkDashboardSummary>({
+  const { data, isLoading, isError } = useQuery<NetworkDashboardSummary>({
     queryKey: ["dashboards", "network"],
     queryFn: () => dashboardsApi.networkSummary(),
     refetchInterval: 60_000,
   });
+
+  if (isError) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        Network signals are unavailable. Your role may not include read access
+        to ASNs, circuits, services or overlays.
+      </div>
+    );
+  }
 
   if (isLoading || !data) {
     return (
@@ -4811,11 +4849,20 @@ function NetworkKpi({
 // Overview tab (the legacy one is per-target chips, this one is the
 // rollup-driven tab body).
 function IntegrationsDashboardTabPanel() {
-  const { data, isLoading } = useQuery<IntegrationsDashboardSummary>({
+  const { data, isLoading, isError } = useQuery<IntegrationsDashboardSummary>({
     queryKey: ["dashboards", "integrations"],
     queryFn: () => dashboardsApi.integrationsSummary(),
     refetchInterval: 30_000,
   });
+
+  if (isError) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        Integration health is unavailable. Your role may not include read access
+        to any integration.
+      </div>
+    );
+  }
 
   if (isLoading || !data) {
     return (
@@ -4892,13 +4939,32 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
   // #797 — a warned target syncs on time and without error but isn't
   // producing what it was configured to produce, so it must not read as
   // green here while the IPAM-tab panel shows it amber.
+  // #2138 — a credential about to lapse is a warning even while every sync
+  // is still green; an expired / rejected one is as bad as an error.
+  // #2192 — prefer the server's counts: `panel.targets` is a capped list.
+  const credentialDead =
+    panel.credential_dead_count ??
+    panel.targets.filter(
+      (t) =>
+        t.credential_state === "expired" || t.credential_state === "rejected",
+    ).length;
+  const credentialExpiring =
+    panel.credential_expiring_count ??
+    panel.targets.filter((t) => t.credential_state === "expiring").length;
   const tone: Tone =
-    panel.error_count > 0
+    panel.error_count > 0 || credentialDead > 0
       ? "bad"
-      : panel.stale_count > 0 || panel.warning_count > 0
+      : panel.stale_count > 0 ||
+          panel.warning_count > 0 ||
+          credentialExpiring > 0
         ? "warn"
         : "good";
   const cls = TONE_CLASS[tone];
+  // #2192 — problem targets are always named, ahead of healthy ones.
+  const cardRows = cardTargets(panel.targets, 3, {
+    total: panel.target_count,
+    problemTotal: panel.problem_count,
+  });
   return (
     <div className="rounded-lg border bg-card p-3">
       <div className="flex items-center justify-between">
@@ -4938,19 +5004,42 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
             </span>
           </>
         )}
+        {credentialDead > 0 && (
+          <>
+            {" · "}
+            <span className="text-red-600 dark:text-red-400">
+              {credentialDead} token expired
+            </span>
+          </>
+        )}
+        {credentialExpiring > 0 && (
+          <>
+            {" · "}
+            <span className="text-amber-600 dark:text-amber-400">
+              {credentialExpiring} token expiring
+            </span>
+          </>
+        )}
       </p>
       {panel.targets.length > 0 && (
         <ul className="mt-2 space-y-1 text-[11px]">
-          {panel.targets.slice(0, 3).map((t) => (
+          {cardRows.shown.map((t) => (
             <li
               key={t.id}
               className="flex items-baseline justify-between gap-2"
             >
-              <span
-                className="truncate"
-                title={t.last_sync_warning ?? t.display}
-              >
-                {t.display}
+              <span className="flex min-w-0 items-baseline gap-1.5">
+                <span
+                  className="truncate"
+                  title={t.last_sync_warning ?? t.display}
+                >
+                  {t.display}
+                </span>
+                <CredentialChip
+                  state={t.credential_state}
+                  daysLeft={t.credential_days_left}
+                  expiresAt={t.credential_expires_at}
+                />
               </span>
               <span
                 className={cn(
@@ -4967,9 +5056,14 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
               </span>
             </li>
           ))}
-          {panel.targets.length > 3 && (
+          {cardRows.hiddenProblems > 0 && (
+            <li className="text-[10px] text-red-600 dark:text-red-400">
+              + {cardRows.hiddenProblems} more with problems
+            </li>
+          )}
+          {cardRows.hidden > 0 && (
             <li className="text-[10px] text-muted-foreground">
-              + {panel.targets.length - 3} more
+              + {cardRows.hidden} more
             </li>
           )}
         </ul>

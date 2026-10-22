@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, get_current_user
 from app.config import settings
+from app.core.versions import canonical_version
 from app.db import get_db
 from app.models.auth import User
 from app.models.settings import PlatformSettings
@@ -115,7 +116,7 @@ async def get_version(db: DB, current_user: MaybeUser) -> VersionResponse:
         # /admin/settings is opened). Report the runtime version and
         # leave everything else empty — no fabricated state.
         return VersionResponse(
-            version=settings.version,
+            version=canonical_version(settings.version, settings.app_version),
             latest_version=None,
             update_available=False,
             latest_release_url=None,
@@ -125,7 +126,7 @@ async def get_version(db: DB, current_user: MaybeUser) -> VersionResponse:
             **_appliance_fields(authenticated),
         )
     return VersionResponse(
-        version=settings.version,
+        version=canonical_version(settings.version, settings.app_version),
         latest_version=ps.latest_version,
         update_available=ps.update_available,
         latest_release_url=ps.latest_release_url,

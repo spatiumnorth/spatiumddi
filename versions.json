@@ -97,7 +97,7 @@
     },
 
     "helm": {
-      "version": "v4.3.0",
+      "version": "v4.3.1",
       "pinned_in": [
         { "path": "Makefile", "match": "alpine/helm:{version_no_v}", "count": 1 },
         { "path": ".github/workflows/ci.yml", "match": "version: {version}", "count": 1 },
@@ -254,7 +254,7 @@
     },
 
     "nginx": {
-      "version": "1.31.6-alpine",
+      "version": "1.31.7-alpine",
       "pinned_in": [
         { "path": "frontend/Dockerfile", "match": "FROM nginx:{version}", "count": 1 },
         { "path": "charts/spatiumddi-appliance/values.yaml", "match": "tag: {version}", "count": 1 },
@@ -359,9 +359,9 @@
     },
 
     "technitium": {
-      "version": "15.4.0",
-      "hold": "1.0 feature freeze (2026-09-28 until 1.0.0 ships): 15.4.0 -> 15.5.x is a minor release, not a patch, and the freeze takes only bug and security fixes. Move it after 1.0.0, tag and digest together.",
-      "digest": "sha256:df7d90ef0f7b6fff6916d291a7022cd902290cc31c3141d4158b6c375a641b41",
+      "version": "15.6.2",
+      "hold": "1.0 feature freeze (2026-09-28 until 1.0.0 ships): the freeze takes only bug and security fixes. 15.4.0 -> 15.6.2 was taken under the freeze as a security fix (#2238: cache poisoning, a DNSSEC validation bypass, an authorization bypass via the record `ptr` option, a session-token oracle and several DoS fixes in Technitium itself, none of which Trivy can see). Hold any further NON-security minor until after 1.0.0; a security release moves the same way #2238 did. Always move tag and digest together.",
+      "digest": "sha256:eb48ac5c135f4ab936b536f74f853d53e15ab39ef37fdbc9598a089b90d9f245",
       "pinned_in": [
         {
           "path": "agent/dns/images/technitium/Dockerfile",
@@ -538,7 +538,7 @@
       "note": "Alpine-packaged daemon (#1240). The Dockerfile pins a FLOOR (`>=`), not an exact version: `apk add` takes whatever the Alpine index ships at or above it, and the nightly rebuilds the package layer daily (APK_SNAPSHOT). The floor is the version to raise when a CVE lands -- it is also what busts a cached `apk add` layer -- and the upstream check (kind alpine-package, on the branch of the `alpine` component) reports when Alpine ships a newer build, including an -rN rebuild."
     },
     "swagger-ui": {
-      "version": "5.33.1",
+      "version": "5.34.0",
       "pinned_in": [
         { "path": "backend/app/static/api-docs/README.md", "match": "swagger-ui-dist@{version}", "count": 2 },
         {

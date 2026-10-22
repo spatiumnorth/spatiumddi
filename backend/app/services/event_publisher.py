@@ -46,6 +46,7 @@ from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services.after_commit_dispatch import dispatch
+from app.services.audit_redact import redact_audit_value
 
 logger = structlog.get_logger(__name__)
 
@@ -262,8 +263,11 @@ def _serialize_audit(row: AuditLog, event_type: str) -> dict[str, Any]:
         },
         "action": row.action,
         "result": row.result,
-        "old_value": row.old_value,
-        "new_value": row.new_value,
+        # Redacted as the audit API redacts them (#2009 / #2015): this
+        # body is persisted in ``event_outbox`` and POSTed to a receiver
+        # outside the box. The stored audit row itself is not modified.
+        "old_value": redact_audit_value(row.old_value),
+        "new_value": redact_audit_value(row.new_value),
         "changed_fields": list(row.changed_fields or []),
     }
 

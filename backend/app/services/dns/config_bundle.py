@@ -285,6 +285,8 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             view_name=view_name,
             forwarders=tuple(z.forwarders or ()),
             forward_only=bool(z.forward_only),
+            forward_transport=z.forward_transport or "do53",
+            forward_tls_hostname=z.forward_tls_hostname,
             masters=tuple(z.masters or ()),
             dnssec_enabled=bool(z.dnssec_enabled),
             dnssec_policy_name=_zone_policy_name(z),
@@ -299,7 +301,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         if not has_views:
             # No views in the group — flat render with every record
             # (the historical behaviour, byte-for-byte).
-            zones.append(_zone_data(z, tuple(_record_data(r) for r in all_records), None))
+            # A member scoped to a site with no subnets serves nobody (#2292).
+            flat = (r for r in all_records if str(r.pool_member_id) not in geo.unreachable_members)
+            zones.append(_zone_data(z, tuple(_record_data(r) for r in flat), None))
             continue
 
         # Split-horizon (issue #24) composed with geo steering (#530).

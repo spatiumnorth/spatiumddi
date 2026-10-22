@@ -52,6 +52,7 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.backup import BackupTarget, RestoreDrill
 from app.services.ai.tools.base import register_tool
+from app.services.audit_redact import redact_audit_value
 
 
 def _superadmin_gate(user: User) -> dict[str, Any] | None:
@@ -352,8 +353,9 @@ async def find_backup_audit_history(
             "resource_type": r.resource_type,
             "resource_display": r.resource_display,
             "result": r.result,
-            "error_detail": r.error_detail,
-            "new_value": r.new_value,
+            # Redacted as the audit API redacts them (#2009 / #2015).
+            "error_detail": redact_audit_value(r.error_detail),
+            "new_value": redact_audit_value(r.new_value),
         }
         for r in rows
     ]

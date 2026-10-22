@@ -21,6 +21,7 @@ import {
   type RestoreDrillAssertion,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { ListEmpty } from "@/components/ui/list-read-error";
 
 /**
  * Restore Drills section on the Backup admin page (issue #702).
@@ -229,9 +230,11 @@ export function RestoreDrillsSection() {
           </div>
         ) : targets.length === 0 ? (
           <div className="px-4 py-6 text-sm text-muted-foreground">
-            No backup targets configured yet. Add one on the{" "}
-            <strong>Destinations</strong> tab — drills verify the archives a
-            target has already written.
+            <ListEmpty error={targetsQ.error} what="backup targets">
+              No backup targets configured yet. Add one on the{" "}
+              <strong>Destinations</strong> tab — drills verify the archives a
+              target has already written.
+            </ListEmpty>
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -534,7 +537,7 @@ function ScheduleDrillModal({
 
         {save.isError && (
           <p className="text-xs text-rose-600 dark:text-rose-400">
-            {(save.error as Error).message}
+            {formatApiError(save.error)}
           </p>
         )}
 

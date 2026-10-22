@@ -134,7 +134,7 @@ export function DNSQueryRateCard({
   const [win, setWin] = useState<MetricsWindow>("24h");
   const [serverId, setServerId] = useState<string>(ALL_SERVERS);
   const scopedId = serverId === ALL_SERVERS ? undefined : serverId;
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError } = useQuery({
     queryKey: ["metrics", "dns", win, scopedId ?? ""],
     queryFn: () =>
       metricsApi.dnsTimeseries({ window: win, server_id: scopedId }),
@@ -202,6 +202,11 @@ export function DNSQueryRateCard({
         {isLoading ? (
           <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
             Loading…
+          </div>
+        ) : isError ? (
+          <div className="text-xs text-muted-foreground">
+            DNS query rate is unavailable. Your role may not include read access
+            to DNS.
           </div>
         ) : !hasData ? (
           <div className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
@@ -286,7 +291,7 @@ export function DHCPTrafficCard({
   const [serverId, setServerId] = useState<string>(ALL_SERVERS);
   const scopedId =
     pinnedServerId ?? (serverId === ALL_SERVERS ? undefined : serverId);
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError } = useQuery({
     queryKey: ["metrics", "dhcp", win, scopedId ?? ""],
     queryFn: () =>
       metricsApi.dhcpTimeseries({ window: win, server_id: scopedId }),
@@ -346,6 +351,11 @@ export function DHCPTrafficCard({
         {isLoading ? (
           <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
             Loading…
+          </div>
+        ) : isError ? (
+          <div className="text-xs text-muted-foreground">
+            DHCP traffic is unavailable. Your role may not include read access
+            to DHCP servers.
           </div>
         ) : !hasData ? (
           <div className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">

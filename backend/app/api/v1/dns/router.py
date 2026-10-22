@@ -9,18 +9,35 @@ import uuid
 import zipfile
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import DB, CurrentUser, SuperAdmin, require_superadmin
+from app.api.deps import DB, CurrentUser, SuperAdmin, ensure_superadmin
 from app.api.pagination import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE,
@@ -41,7 +58,9 @@ from app.core.dns_names import (
     bind_check_names_error,
     contains_control_chars,
     contains_zonefile_unsafe,
+    primary_ns_error,
     validate_fqdn,
+    validate_hostname,
     validate_record_owner,
 )
 from app.core.permissions import (
@@ -53,7 +72,7 @@ from app.core.permissions import (
     token_scoped_resource_ids,
     user_has_permission,
 )
-from app.core.responses import DnsZoneResponse, ZipResponse
+from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
 from app.core.update_nulls import resolve_update_changes
 from app.drivers._winrm import validate_transport
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
@@ -69,12 +88,15 @@ from app.drivers.dns.windows import test_winrm_credentials
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.dns import (
+    DEFAULT_ALLOW_QUERY_CACHE,
     DEFAULT_ALLOW_RECURSION,
+    DNS_TTL_MAX,
     DNSSEC_ALGORITHMS,
     ZONE_DEFAULT_EXPIRE,
     ZONE_DEFAULT_MINIMUM,
     ZONE_DEFAULT_REFRESH,
     ZONE_DEFAULT_RETRY,
+    ZONE_DEFAULT_TTL,
     DNSAcl,
     DNSAclEntry,
     DNSKey,
@@ -101,6 +123,7 @@ from app.services.appliance.group_names import (
 )
 from app.services.approvals.gate import gate_or_execute
 from app.services.dns import dnssec_signers, technitium_api_scope
+from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
     APEX_CNAME_DETAIL,
@@ -117,11 +140,18 @@ from app.services.dns.delegation import (
     preview_to_dict,
 )
 from app.services.dns.name_scope import classify_zone_name, zone_kind_for_name
+from app.services.dns.name_targets import (
+    absolute_target_error,
+    dotless_target,
+    dotless_target_error,
+    group_needs_absolute_targets,
+)
 from app.services.dns.named_conf_validation import (
     ADDRESS_MATCH_LIST_OPTIONS,
     AclCycleError,
     ViewValidationError,
     is_name_reference,
+    key_reference,
     order_acls_for_render,
     validate_acl_entries,
     validate_acl_name,
@@ -139,6 +169,7 @@ from app.services.dns.record_ops import (
     enqueue_record_op,
     enqueue_record_ops_batch,
     enqueue_record_ops_bulk,
+    queued_op_counts,
     record_op_payload,
 )
 from app.services.dns.resolver_presets import (
@@ -160,6 +191,9 @@ from app.services.dns.server_move import (
 from app.services.dns.technitium_options import (
     allow_transfer_problem as technitium_transfer_problem,
 )
+from app.services.dns.technitium_options import (
+    also_notify_problem as technitium_also_notify_problem,
+)
 from app.services.dns.technitium_options import refusals as technitium_option_refusals
 from app.services.dns.technitium_options import stored_warnings as technitium_stored_warnings
 from app.services.dns.tld_registry import (
@@ -177,6 +211,7 @@ from app.services.dns.tld_registry import (
 )
 from app.services.dns.tsig import group_key_names, rotate_group_tsig_key
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
+from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
@@ -190,12 +225,16 @@ from app.services.dns.zone_templates import (
     validate_params,
 )
 from app.services.dns_io import (
+    ParsedRecord,
     RecordChange,
+    ZoneDiff,
     ZoneParseError,
+    apply_cname_rule,
     diff_records,
     parse_zone_file,
     write_zone_file,
 )
+from app.services.dns_io import spreadsheet as sheet_io
 from app.services.feature_modules import require_module
 from app.services.soft_delete import (
     SoftDeleteBatch,
@@ -566,6 +605,19 @@ class ServerUpdate(BaseModel):
         return v
 
 
+def _duplicate_agent_fields(s: DNSServer) -> dict[str, Any]:
+    """#2044 — the server row's duplicate-agent fields, all empty unless an
+    episode is current (one reading, shared with the alert)."""
+    if not duplicate_agent_active(s):
+        return {}
+    return {
+        "duplicate_agent": True,
+        "duplicate_agent_since": s.duplicate_agent_first_at,
+        "duplicate_agent_last_at": s.duplicate_agent_last_at,
+        "duplicate_agent_ip": s.duplicate_agent_ip,
+    }
+
+
 class ServerResponse(BaseModel):
     id: uuid.UUID
     group_id: uuid.UUID
@@ -592,6 +644,8 @@ class ServerResponse(BaseModel):
     agent_id: uuid.UUID | None
     last_seen_at: datetime | None
     last_seen_ip: str | None
+    # #2078 — the agent's own version; NULL = never reported (UNKNOWN).
+    agent_version: str | None = None
     last_config_etag: str | None
     pending_approval: bool
     is_primary: bool
@@ -625,6 +679,16 @@ class ServerResponse(BaseModel):
     # ``config_apply_status`` reports at #882's severity. ``null`` — never
     # reported.
     daemon_not_serving: bool | None = None
+    # #2044 — a second live agent process is polling as this server (a cloned
+    # VM or a copied state dir keeps the agent_id) and is being refused: only
+    # the most recent process is served record ops. Derived
+    # (``agent_instance.duplicate_active``), as the
+    # ``dns_agent_duplicate_instance`` alert reads it. ``duplicate_agent_ip``
+    # is where the refused process last polled from.
+    duplicate_agent: bool = False
+    duplicate_agent_since: datetime | None = None
+    duplicate_agent_last_at: datetime | None = None
+    duplicate_agent_ip: str | None = None
     # #1111 — the stored agent config bundle: what the long-poll serves and
     # when it was rendered, whether the newest render is behind the changes
     # made since (watermark < dirty_seq), how many renders this server has
@@ -674,6 +738,7 @@ class ServerResponse(BaseModel):
             agent_id=s.agent_id,
             last_seen_at=s.last_seen_at,
             last_seen_ip=s.last_seen_ip,
+            agent_version=s.agent_version,
             last_config_etag=s.last_config_etag,
             pending_approval=s.pending_approval,
             is_primary=s.is_primary,
@@ -688,6 +753,7 @@ class ServerResponse(BaseModel):
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
             daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
+            **_duplicate_agent_fields(s),
             bundle_etag=s.bundle_etag,
             bundle_built_at=s.bundle_built_at,
             bundle_rendered_by=s.bundle_rendered_by,
@@ -739,6 +805,40 @@ class TrustAnchorCreate(BaseModel):
     key_tag: int
     public_key: str
     is_initial_key: bool = True
+
+    # All four land verbatim inside a ``trust-anchors { ... };`` statement in
+    # named.conf (#2266), so each is held to what BIND can parse: a malformed
+    # value would not break one anchor, it would make ``named-checkconf``
+    # reject the file and stop the whole group converging (#876 / #899).
+    @field_validator("zone_name")
+    @classmethod
+    def validate_anchor_zone(cls, v: str) -> str:
+        v = v.strip()
+        if v in (".", ""):
+            return "."
+        return validate_fqdn(v, field="zone_name")
+
+    @field_validator("algorithm")
+    @classmethod
+    def validate_anchor_algorithm(cls, v: int) -> int:
+        if not 1 <= v <= 255:
+            raise ValueError("algorithm must be a DNSSEC algorithm number (1-255)")
+        return v
+
+    @field_validator("key_tag")
+    @classmethod
+    def validate_anchor_key_tag(cls, v: int) -> int:
+        if not 0 <= v <= 65535:
+            raise ValueError("key_tag must be between 0 and 65535")
+        return v
+
+    @field_validator("public_key")
+    @classmethod
+    def validate_anchor_public_key(cls, v: str) -> str:
+        compact = "".join(v.split())
+        if not compact or not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", compact):
+            raise ValueError("public_key must be the base64 DNSKEY public key")
+        return compact
 
 
 class TrustAnchorResponse(BaseModel):
@@ -957,6 +1057,12 @@ class ServerOptionsResponse(BaseModel):
     # Stored values a Technitium server in this group will not apply (#1763).
     # Empty for a group with no agent-managed Technitium server.
     technitium_warnings: list[str] = Field(default_factory=list)
+    # Stored group forwarders that cannot work with the group's transport,
+    # saved before the #2128 refusal. Advisory: the save is not refused.
+    forwarder_warnings: list[str] = Field(default_factory=list)
+    # DNSSEC validation that cannot work as configured (#2266): ``yes`` with
+    # no trust anchor on a BIND9 group validates nothing. Advisory only.
+    dnssec_warnings: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -1127,8 +1233,27 @@ def _validate_masters_format(v: list[str] | None) -> list[str]:
 # serves, so it moves the serial (update_zone).
 _ZONE_FILE_TIMER_FIELDS = ("ttl", "refresh", "retry", "expire", "minimum")
 # RFC 2181 section 8 bounds a TTL at 2^31 - 1; it is also the column's (int4).
-# BIND refuses a zone whose SOA carries a negative timer, so one never reaches it.
-_SOA_TIMER_MAX = 2**31 - 1
+# BIND refuses a zone whose SOA carries a negative timer, or a negative $TTL or
+# record TTL (#2073), so one never reaches it.
+_SOA_TIMER_MAX = DNS_TTL_MAX
+
+
+def _validate_zone_forward_transport(v: str | None) -> str | None:
+    if v is not None and v not in VALID_FORWARD_TRANSPORTS:
+        raise ValueError(f"forward_transport must be one of {sorted(VALID_FORWARD_TRANSPORTS)}")
+    return v
+
+
+def _validate_zone_forward_tls_hostname(v: str | None) -> str | None:
+    """A forward zone's upstream certificate name (#2121), or None.
+
+    It is interpolated into ``remote-hostname "…";`` by the BIND renderers,
+    so it must be a host name and nothing else. Empty is the UI's "cleared
+    the field" shape and reads as None.
+    """
+    if v is None or not v.strip():
+        return None
+    return validate_hostname(v, field="forward_tls_hostname")
 
 
 class ZoneCreate(BaseModel):
@@ -1138,7 +1263,7 @@ class ZoneCreate(BaseModel):
     # #1310 — omitted ⇒ ``resolved_zone_kind``: a primary zone's is taken
     # from its name.
     kind: str | None = None
-    ttl: int = 3600
+    ttl: int = Field(ZONE_DEFAULT_TTL, ge=0, le=_SOA_TIMER_MAX)
     refresh: int = Field(ZONE_DEFAULT_REFRESH, ge=0, le=_SOA_TIMER_MAX)
     retry: int = Field(ZONE_DEFAULT_RETRY, ge=0, le=_SOA_TIMER_MAX)
     expire: int = Field(ZONE_DEFAULT_EXPIRE, ge=0, le=_SOA_TIMER_MAX)
@@ -1160,6 +1285,11 @@ class ZoneCreate(BaseModel):
     # ignored otherwise.
     forwarders: list[str] = []
     forward_only: bool = True
+    # The forward zone's OWN upstream transport (#2121), default plain DNS.
+    # The group's ``forward_transport`` applies to its resolver forwarders
+    # only. ``forward_tls_hostname`` is required for an encrypted transport.
+    forward_transport: str = "do53"
+    forward_tls_hostname: str | None = Field(default=None, max_length=255)
     # Secondary / stub primaries (issue #336). Required + non-empty when
     # ``zone_type`` in {secondary, stub}; ignored otherwise. Each entry is
     # an ``ip`` or ``ip@port`` string — the IP that this zone AXFRs from.
@@ -1181,6 +1311,16 @@ class ZoneCreate(BaseModel):
     @classmethod
     def validate_masters(cls, v: list[str]) -> list[str]:
         return _validate_masters_format(v)
+
+    @field_validator("forward_transport")
+    @classmethod
+    def validate_forward_transport(cls, v: str) -> str:
+        return _validate_zone_forward_transport(v) or "do53"
+
+    @field_validator("forward_tls_hostname")
+    @classmethod
+    def validate_forward_tls_hostname(cls, v: str | None) -> str | None:
+        return _validate_zone_forward_tls_hostname(v)
 
     @model_validator(mode="after")
     def require_masters_for_secondary(self) -> ZoneCreate:
@@ -1223,8 +1363,8 @@ class ZoneCreate(BaseModel):
 
     @field_validator("primary_ns", "admin_email")
     @classmethod
-    def validate_soa_fields(cls, v: str) -> str:
-        return _validate_soa_field(v)
+    def validate_soa_fields(cls, v: str, info: ValidationInfo) -> str:
+        return _validate_soa_field(v, field=info.field_name)
 
 
 class ZoneUpdate(BaseModel):
@@ -1232,7 +1372,7 @@ class ZoneUpdate(BaseModel):
     view_id: uuid.UUID | None = None
     zone_type: str | None = None
     kind: str | None = None
-    ttl: int | None = None
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     refresh: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     retry: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     expire: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
@@ -1257,6 +1397,9 @@ class ZoneUpdate(BaseModel):
     dynamic_update_enabled: bool | None = None
     forwarders: list[str] | None = None
     forward_only: bool | None = None
+    # #2121 — the forward zone's own upstream transport (see ZoneCreate).
+    forward_transport: str | None = None
+    forward_tls_hostname: str | None = Field(default=None, max_length=255)
     # Secondary / stub primaries (issue #336). Validated against the
     # effective zone_type in the handler (the new value may come from this
     # same payload or stay as-is on the existing row).
@@ -1277,6 +1420,9 @@ class ZoneUpdate(BaseModel):
     @classmethod
     def validate_soa_fields(cls, v: str | None) -> str | None:
         # Optional on update; same injection guard as ZoneCreate (issue #597).
+        # The #2075 host-name rule for primary_ns is applied in update_zone,
+        # to a CHANGED value only: a zone stored before it must stay
+        # editable by a request that re-sends what it holds.
         if v is None:
             return v
         return _validate_soa_field(v)
@@ -1292,6 +1438,16 @@ class ZoneUpdate(BaseModel):
     @classmethod
     def validate_masters(cls, v: list[str] | None) -> list[str] | None:
         return None if v is None else _validate_masters_format(v)
+
+    @field_validator("forward_transport")
+    @classmethod
+    def validate_forward_transport(cls, v: str | None) -> str | None:
+        return _validate_zone_forward_transport(v)
+
+    @field_validator("forward_tls_hostname")
+    @classmethod
+    def validate_forward_tls_hostname(cls, v: str | None) -> str | None:
+        return _validate_zone_forward_tls_hostname(v)
 
     @field_validator("color")
     @classmethod
@@ -1364,6 +1520,9 @@ class ZoneResponse(BaseModel):
     notify_enabled: str | None
     forwarders: list[str]
     forward_only: bool
+    # #2121 — the forward zone's own upstream transport; not the group's.
+    forward_transport: str = "do53"
+    forward_tls_hostname: str | None = None
     masters: list[str]
     # Non-null when the zone was synthesised by the Tailscale Phase 2
     # reconciler. The UI uses this to render a read-only badge and
@@ -1447,7 +1606,8 @@ class RecordCreate(BaseModel):
     name: str
     record_type: str
     value: str
-    ttl: int | None = None
+    # #2073 — null inherits the zone's $TTL.
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     priority: int | None = None
     weight: int | None = None
     port: int | None = None
@@ -1475,7 +1635,8 @@ class RecordCreate(BaseModel):
 class RecordUpdate(BaseModel):
     name: str | None = None
     value: str | None = None
-    ttl: int | None = None
+    # #2073 — null inherits the zone's $TTL.
+    ttl: int | None = Field(None, ge=0, le=_SOA_TIMER_MAX)
     priority: int | None = None
     weight: int | None = None
     port: int | None = None
@@ -1625,7 +1786,7 @@ def _normalize_record_struct_fields(
     return None, None, None
 
 
-def _validate_soa_field(v: str | None) -> str:
+def _validate_soa_field(v: str | None, field: str | None = None) -> str:
     """Reject a zone SOA ``primary_ns`` / ``admin_email`` that could inject.
 
     Both are interpolated raw into the BIND9 SOA line (issue #597 review), so
@@ -1642,6 +1803,12 @@ def _validate_soa_field(v: str | None) -> str:
             "must be a bare domain name — no whitespace, control characters, "
             "or zone-file syntax (e.g. ';' '$' '@')"
         )
+    if field == "primary_ns":
+        # #2075 — a Primary NS BIND's check-names refuses stops the zone
+        # being served at all, so it is a host name or it is not stored.
+        err = primary_ns_error(v)
+        if err is not None:
+            raise ValueError(f"Primary NS (primary_ns) {err}")
     return v
 
 
@@ -1653,6 +1820,19 @@ def _validate_soa_field(v: str | None) -> str:
 # (freeform, quoted at render), the structured types (SVCB / HTTPS / NAPTR /
 # CAA / SSHFP / TLSA / LOC / LUA), and A/AAAA (IP-validated below).
 _HOSTNAME_TARGET_RECORD_TYPES = frozenset({"CNAME", "NS", "PTR", "DNAME", "ALIAS"})
+
+
+async def _enforce_absolute_target(db: DB, zone: DNSZone, record_type: str, value: str) -> None:
+    """422 a name target with no trailing dot on a PowerDNS group (#2060).
+
+    PowerDNS's API refuses the dot-less spelling, and an operator there
+    almost certainly means the absolute name, so the row is refused with both
+    spellings it could have meant rather than stored and served as the
+    relative one. See ``app.services.dns.name_targets``.
+    """
+    err = await absolute_target_error(db, zone.group_id, record_type, value, zone.name)
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
 
 
 def _validate_address_record_value(record_type: str, value: str) -> None:
@@ -3577,7 +3757,15 @@ async def _options_response(
     db: DB, group_id: uuid.UUID, opts: DNSServerOptions
 ) -> ServerOptionsResponse:
     out = ServerOptionsResponse.model_validate(opts)
-    if "technitium" in await _group_driver_names(db, group_id):
+    out.forwarder_warnings = _stored_forwarder_warnings(opts)
+    drivers = await _group_driver_names(db, group_id)
+    if opts.dnssec_validation == "yes" and not opts.trust_anchors and "bind9" in drivers:
+        out.dnssec_warnings.append(
+            "dnssec_validation is 'yes' but no trust anchor is configured: BIND validates "
+            "nothing without one. Add the root (or another) trust anchor, or use 'auto' to "
+            "validate against BIND's built-in root anchor."
+        )
+    if "technitium" in drivers:
         acls = await _group_acl_definitions(db, group_id)
         out.technitium_warnings = technitium_stored_warnings(opts, acls)
         # Zone-level overrides saved before the gate (#1765).
@@ -3713,6 +3901,15 @@ async def _validated_zone_named_conf_fields(
             f"{problem}. Move the Technitium server to its own group, or use addresses, "
             "'!' exclusions, 'key <name>' on its own, or a defined ACL.",
         )
+    if (
+        "also_notify" in cleaned
+        and "technitium" in await _group_driver_names(db, group_id)
+        and (problem := technitium_also_notify_problem(cleaned["also_notify"]))
+    ):
+        raise HTTPException(
+            422,
+            f"This group has a Technitium server, which cannot apply this zone's {problem}.",
+        )
     zone_type = changes.get("zone_type") or (zone.zone_type if zone is not None else None)
     if zone_type != "forward":
         return cleaned
@@ -3785,6 +3982,71 @@ async def _refuse_if_alias_records_lose_resolver(group_id: uuid.UUID, db: DB) ->
         )
 
 
+def _plain_port_forwarders(entries: list[str] | None) -> list[str]:
+    """The entries of ``entries`` that pin port 53 (#2128).
+
+    Compared as a number, not a string: the validator takes any digits, so
+    ``1.2.3.4@053`` is stored as written and BIND reads it as port 53.
+    """
+    out = []
+    for entry in entries or []:
+        port = str(entry).partition("@")[2].strip()
+        if port.isdigit() and int(port) == 53:
+            out.append(entry)
+    return out
+
+
+def _stored_forwarder_warnings(opts: DNSServerOptions) -> list[str]:
+    """Stored group forwarders pinned to port 53 in an encrypted group (#2128).
+
+    A value saved before the refusal below still renders as TLS to port 53,
+    so that forwarder never answers. The renderer is left as it is on
+    purpose: rendering it plain would send cleartext from a group the
+    operator set to an encrypted transport, and dropping it could leave the
+    group with no forwarders. It fails closed (BIND tries the other
+    forwarders), and this makes it visible on the options GET.
+    """
+    if (opts.forward_transport or "do53") == "do53":
+        return []
+    return [
+        f"forwarder {f!r} pins port 53 (plain DNS), but this group forwards over "
+        f"{opts.forward_transport}: it is sent TLS on port 53 and never answers. "
+        "Remove the port or change it to the upstream's encrypted port."
+        for f in _plain_port_forwarders(opts.forwarders)
+    ]
+
+
+def _refuse_plain_port_forwarders_on_encrypted(
+    opts: DNSServerOptions, forwarders_before: list[str], transport_before: str | None
+) -> None:
+    """422 a group forwarder pinned to port 53 when the group forwards encrypted (#2128).
+
+    ``1.2.3.4@53`` rendered as ``port 53 tls …``: a TLS handshake against a
+    plaintext port, which can never work. Refused rather than silently
+    rendered plain, because a group that asked for DoT must not quietly send
+    cleartext. Only entries the request introduces are checked (all of them
+    when it switches the group to an encrypted transport), so a value stored
+    before this check does not block an unrelated save.
+    """
+    if opts.forward_transport == "do53":
+        return
+    now = list(opts.forwarders or [])
+    if transport_before == opts.forward_transport:
+        candidates = [f for f in now if f not in forwarders_before]
+    else:
+        candidates = now
+    bad = _plain_port_forwarders(candidates)
+    if bad:
+        raise HTTPException(
+            422,
+            f"forwarders {', '.join(repr(f) for f in bad)} pin port 53, which is plain "
+            f"DNS, but this group forwards over {opts.forward_transport}: the TLS "
+            "handshake would go to a port that cannot answer it. Drop the "
+            "port (the transport's own default is used, 853 for tls) or set "
+            "forward_transport to do53.",
+        )
+
+
 @router.put("/groups/{group_id}/options", response_model=ServerOptionsResponse)
 async def update_options(
     group_id: uuid.UUID, body: ServerOptionsUpdate, db: DB, current_user: SuperAdmin
@@ -3842,10 +4104,28 @@ async def update_options(
                 + ". Move the Technitium server to its own group, or leave these at "
                 "their defaults.",
             )
+    # #2264: only BIND9 renders ``allow-query-cache``. PowerDNS has no such
+    # setting either, so refuse a changed non-default value rather than store
+    # one the daemon ignores (same rule as the Technitium gate above).
+    if (
+        "allow_query_cache" in changes
+        and list(changes["allow_query_cache"] or []) != list(DEFAULT_ALLOW_QUERY_CACHE)
+        and list(changes["allow_query_cache"] or []) != list(opts.allow_query_cache or [])
+        and "powerdns" in await _group_driver_names(db, group_id)
+    ):
+        raise HTTPException(
+            422,
+            "allow_query_cache: this group has a PowerDNS server, which has no "
+            "cache-access ACL, so the value would be ignored. Move the PowerDNS "
+            "server to its own group, or leave it at its default.",
+        )
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
+    forwarders_before = list(opts.forwarders or [])
+    transport_before = opts.forward_transport
     for k, v in changes.items():
         setattr(opts, k, v)
 
+    _refuse_plain_port_forwarders_on_encrypted(opts, forwarders_before, transport_before)
     await _assert_encrypted_transport_sane(opts, db)
     if resolver_before and not alias_resolver(opts.forwarders, opts.forward_transport):
         await _refuse_if_alias_records_lose_resolver(group_id, db)
@@ -3923,6 +4203,16 @@ async def add_trust_anchor(
     group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
 ) -> DNSTrustAnchor:
     await _require_group(group_id, db)
+    # Only the BIND9 agent renders ``trust-anchors`` (#2266). Storing one for a
+    # group another driver serves would be accepted and ignored.
+    others = sorted(d for d in await _group_driver_names(db, group_id) if d != "bind9")
+    if others:
+        raise HTTPException(
+            422,
+            "Trust anchors are only applied by BIND9; this group has a "
+            + ", ".join(others)
+            + " server, which would ignore them. Use a group of BIND9 servers.",
+        )
     result = await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
     opts = result.scalar_one_or_none()
     if not opts:
@@ -3937,6 +4227,26 @@ async def add_trust_anchor(
         added_by_user_id=current_user.id,
     )
     db.add(anchor)
+    await db.flush()
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="create",
+            resource_type="dns_trust_anchor",
+            resource_id=str(anchor.id),
+            resource_display=f"{anchor.zone_name} (key tag {anchor.key_tag})",
+            new_value={
+                "group_id": str(group_id),
+                "zone_name": anchor.zone_name,
+                "key_tag": anchor.key_tag,
+                "algorithm": anchor.algorithm,
+                "is_initial_key": anchor.is_initial_key,
+            },
+            result="success",
+        )
+    )
     collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(anchor)
@@ -3956,6 +4266,25 @@ async def delete_trust_anchor(
     anchor = result.scalar_one_or_none()
     if not anchor:
         raise HTTPException(status_code=404, detail="Trust anchor not found")
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="delete",
+            resource_type="dns_trust_anchor",
+            resource_id=str(anchor.id),
+            resource_display=f"{anchor.zone_name} (key tag {anchor.key_tag})",
+            old_value={
+                "group_id": str(group_id),
+                "zone_name": anchor.zone_name,
+                "key_tag": anchor.key_tag,
+                "algorithm": anchor.algorithm,
+                "is_initial_key": anchor.is_initial_key,
+            },
+            result="success",
+        )
+    )
     collect_wake(dns_group_channel(group_id))
     await db.delete(anchor)
     await db.commit()
@@ -4060,8 +4389,9 @@ async def _assert_acl_is_unreferenced(
 
     Checks every place a name can be cited: another ACL's entries, any
     view's ``match_clients`` / ``match_destinations`` / ``allow_query`` /
-    ``allow_query_cache``, and the group's server options (``allow_query``,
-    ``allow_recursion``, …).
+    ``allow_query_cache``, the group's server options (``allow_query``,
+    ``allow_recursion``, …) and every zone's ``allow_query`` /
+    ``allow_transfer`` / ``also_notify`` (#2283).
     """
     citing_acls = [
         a.name
@@ -4108,13 +4438,22 @@ async def _assert_acl_is_unreferenced(
         if opts is not None
         else []
     )
-    if not citing_acls and not citing_views and not citing_options:
+    citing_zones = sorted(
+        f"{z.name} {f}"
+        for z in (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id)))
+        .scalars()
+        .all()
+        for f in ("allow_query", "allow_transfer", "also_notify")
+        if any(is_name_reference(str(el)) == acl.name for el in getattr(z, f) or [])
+    )
+    if not citing_acls and not citing_views and not citing_options and not citing_zones:
         return
     cited_by = ", ".join(
         [
             *(f"ACL '{n}'" for n in sorted(citing_acls)),
             *(f"view '{n}'" for n in sorted(citing_views)),
             *(f"server option '{n}'" for n in citing_options),
+            *(f"zone '{n}'" for n in citing_zones),
         ]
     )
     raise HTTPException(
@@ -4416,6 +4755,72 @@ async def generate_tsig_secret(
     return TSIGGenerateSecretResponse(algorithm=algo, secret=_generate_tsig_secret(algo))
 
 
+async def _assert_tsig_key_is_unreferenced(
+    group_id: uuid.UUID, key: DNSTSIGKey, db: DB, *, action: str
+) -> None:
+    """Refuse to rename or delete a TSIG key that something still cites (#2282).
+
+    ``key <name>`` appears in ACL entries, view match lists, the group's
+    address-match options / ``also_notify`` and zone ``allow_*`` /
+    ``also_notify``. Removing the name leaves an undefined symbol:
+    ``named-checkconf`` fails and the agent declines the whole bundle, so the
+    group stops converging. Dynamic-update grants are not listed here — they
+    hold a foreign key, not a name, and a delete reports them separately.
+    """
+    name = key.name
+    # BIND compares key names as DNS names — case-insensitively, with or
+    # without the trailing dot — so a citation of ``Foo.`` still names ``foo``.
+    norm = name.rstrip(".").lower()
+
+    def cites(elements: Any) -> bool:
+        return any(
+            (ref := key_reference(str(el))) is not None and ref.rstrip(".").lower() == norm
+            for el in (elements or [])
+        )
+
+    cited: list[str] = []
+    for a in (
+        await db.execute(
+            select(DNSAcl)
+            .where(DNSAcl.group_id == group_id)
+            .options(selectinload(DNSAcl.entries))
+            .execution_options(populate_existing=True)
+        )
+    ).scalars():
+        if cites([e.value for e in a.entries]):
+            cited.append(f"ACL '{a.name}'")
+    for v in (await db.execute(select(DNSView).where(DNSView.group_id == group_id))).scalars():
+        for f in ("match_clients", "match_destinations", "allow_query", "allow_query_cache"):
+            if cites(getattr(v, f)):
+                cited.append(f"view '{v.name}' {f}")
+    opts = (
+        await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
+    ).scalar_one_or_none()
+    if opts is not None:
+        for f in (*ADDRESS_MATCH_LIST_OPTIONS, "also_notify"):
+            if cites(getattr(opts, f, None)):
+                cited.append(f"server option '{f}'")
+    for z in (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))).scalars():
+        for f in ("allow_query", "allow_transfer", "also_notify"):
+            if cites(getattr(z, f)):
+                cited.append(f"zone '{z.name}' {f}")
+    if not cited:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "field": "name",
+            "value": name,
+            "references": cited,
+            "message": (
+                f"Cannot {action} TSIG key '{name}' — it is still referenced by "
+                f"{', '.join(cited)}. BIND would refuse the whole server group's "
+                f"config with that key undefined. Remove the references first."
+            ),
+        },
+    )
+
+
 @router.get("/groups/{group_id}/tsig-keys", response_model=list[TSIGKeyResponse])
 async def list_tsig_keys(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[TSIGKeyResponse]:
     await _require_group(group_id, db)
@@ -4526,6 +4931,7 @@ async def update_tsig_key(
         )
         if clash.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="Name already in use")
+        await _assert_tsig_key_is_unreferenced(group_id, key, db, action="rename")
     for k, v in changes.items():
         setattr(key, k, v)
     db.add(
@@ -4582,11 +4988,25 @@ async def rotate_tsig_key(
 
 @router.delete("/groups/{group_id}/tsig-keys/{key_id}", status_code=204)
 async def delete_tsig_key(
-    group_id: uuid.UUID, key_id: uuid.UUID, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID, key_id: uuid.UUID, response: Response, db: DB, current_user: SuperAdmin
 ) -> None:
     key = await db.get(DNSTSIGKey, key_id)
     if key is None or key.group_id != group_id:
         raise HTTPException(status_code=404, detail="TSIG key not found")
+    await _assert_tsig_key_is_unreferenced(group_id, key, db, action="delete")
+    # The update-grant rows cascade with the key (fail-closed, but the
+    # operator should hear about it).
+    grants = (
+        (
+            await db.execute(
+                select(DNSZoneUpdateAcl.zone_id).where(DNSZoneUpdateAcl.tsig_key_id == key.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if grants:
+        response.headers["X-Removed-Update-Grants"] = str(len(grants))
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4596,6 +5016,7 @@ async def delete_tsig_key(
             resource_type="dns_tsig_key",
             resource_id=str(key.id),
             resource_display=key.name,
+            new_value={"removed_update_grants": len(grants)} if grants else None,
             result="success",
         )
     )
@@ -4841,6 +5262,59 @@ async def _assert_forward_zone_serviceable(
         )
 
 
+async def _check_zone_forward_transport(
+    group_id: uuid.UUID,
+    changes: dict[str, Any],
+    zone: DNSZone | None,
+    db: DB,
+) -> None:
+    """422 a forward zone's upstream transport the group cannot serve (#2121).
+
+    The transport is the zone's own setting; this checks it against the
+    group's drivers and the zone's own forwarders. Only a forward zone is
+    checked, since no other type renders forwarders. On update (``zone``
+    given) only a change to the type, the forwarders, the transport or the
+    hostname is held to it, so a zone stored before this gate stays editable.
+    The check itself is ``zone_forward_transport_refusal``, which the #935
+    zone move plan runs against the target group as the zone stands.
+    """
+    zone_type = changes.get("zone_type") or (zone.zone_type if zone is not None else "primary")
+    if zone_type != "forward":
+        return
+    transport = changes.get("forward_transport") or (
+        zone.forward_transport if zone is not None else "do53"
+    )
+    hostname = (
+        changes["forward_tls_hostname"]
+        if "forward_tls_hostname" in changes
+        else (zone.forward_tls_hostname if zone is not None else None)
+    )
+    forwarders = list(
+        changes["forwarders"]
+        if changes.get("forwarders") is not None
+        else (zone.forwarders if zone is not None else []) or []
+    )
+    if (
+        zone is not None
+        and zone.zone_type == "forward"
+        and transport == (zone.forward_transport or "do53")
+        and hostname == zone.forward_tls_hostname
+        and forwarders == list(zone.forwarders or [])
+    ):
+        return
+
+    name = changes.get("name") or (zone.name if zone is not None else "")
+    refusal = zone_forward_transport_refusal(
+        zone_name=name,
+        transport=transport,
+        hostname=hostname,
+        forwarders=forwarders,
+        drivers=await _group_driver_names(db, group_id),
+    )
+    if refusal:
+        raise HTTPException(422, refusal)
+
+
 async def _enforce_technitium_api_zone_scope(
     db: DB, group_id: uuid.UUID, changes: dict[str, Any], current: DNSZone | None
 ) -> None:
@@ -4871,6 +5345,7 @@ async def create_zone(
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
+    await _check_zone_forward_transport(group_id, body.model_dump(), None, db)
     existing = await db.execute(
         select(DNSZone).where(
             DNSZone.group_id == group_id,
@@ -5000,6 +5475,9 @@ class ServerZoneStateEntry(BaseModel):
     server_status: str
     current_serial: int | None
     reported_at: datetime | None
+    # #2042 — ops for this zone the server has not acknowledged yet (pending
+    # or in flight). Non-zero means not in sync whatever the serial says.
+    pending_ops: int = 0
 
 
 class ServerZoneStateResponse(BaseModel):
@@ -5044,7 +5522,9 @@ async def get_zone_server_state(
     Servers with no state row yet report ``current_serial=None`` — the
     agent hasn't applied a bundle containing this zone yet. ``in_sync``
     is True when every server that's reported matches the zone's
-    target serial (``DNSZone.last_serial``).
+    target serial (``DNSZone.last_serial``) and none has an unacknowledged
+    op for the zone (#2042): a serial an agent reports from its cached
+    bundle can reach the target while a record op is still undelivered.
     """
     from app.models.dns import DNSServer, DNSServerZoneState  # noqa: PLC0415
 
@@ -5064,6 +5544,8 @@ async def get_zone_server_state(
         s.server_id: s for s in state_res.scalars().all()
     }
 
+    queued = await queued_op_counts(db, server_ids=[s.id for s in servers], zone_names=[zone.name])
+
     entries: list[ServerZoneStateEntry] = []
     all_in_sync = True
     target = int(zone.last_serial or 0)
@@ -5072,6 +5554,7 @@ async def get_zone_server_state(
         st = state_by_server.get(srv.id)
         current = int(st.current_serial) if st else None
         reported = st.reported_at if st else None
+        pending = queued.get((srv.id, zone.name), 0)
         entries.append(
             ServerZoneStateEntry(
                 server_id=srv.id,
@@ -5079,13 +5562,14 @@ async def get_zone_server_state(
                 server_status=srv.status,
                 current_serial=current,
                 reported_at=reported,
+                pending_ops=pending,
             )
         )
         if current is None:
             all_in_sync = False
         else:
             any_reported = True
-            if not _zone_state_in_sync(zone, current, target, srv.driver):
+            if pending or not _zone_state_in_sync(zone, current, target, srv.driver):
                 all_in_sync = False
 
     return ServerZoneStateResponse(
@@ -5207,6 +5691,8 @@ class PerServerZoneStateEntry(BaseModel):
     current_serial: int | None
     reported_at: datetime | None
     in_sync: bool
+    # #2042 — see ``ServerZoneStateEntry.pending_ops``.
+    pending_ops: int = 0
 
 
 class PerServerZoneStateResponse(BaseModel):
@@ -5251,6 +5737,8 @@ async def get_server_zone_state(
         s.zone_id: s for s in state_res.scalars().all()
     }
 
+    queued = await queued_op_counts(db, server_ids=[server.id])
+
     entries: list[PerServerZoneStateEntry] = []
     in_sync_count = 0
     drift_count = 0
@@ -5259,7 +5747,13 @@ async def get_server_zone_state(
         st = state_by_zone.get(z.id)
         target = int(z.last_serial or 0)
         current = int(st.current_serial) if st else None
-        in_sync = current is not None and _zone_state_in_sync(z, current, target, server.driver)
+        pending = queued.get((server.id, z.name), 0)
+        # #2042 — an unacknowledged op is drift whatever the serial says.
+        in_sync = (
+            current is not None
+            and _zone_state_in_sync(z, current, target, server.driver)
+            and not pending
+        )
         if current is None:
             not_reported_count += 1
         elif in_sync:
@@ -5275,6 +5769,7 @@ async def get_server_zone_state(
                 current_serial=current,
                 reported_at=st.reported_at if st else None,
                 in_sync=in_sync,
+                pending_ops=pending,
             )
         )
 
@@ -5592,6 +6087,7 @@ async def update_zone(
             "allow_query",
             "allow_transfer",
             "also_notify",
+            "forward_tls_hostname",
         },
         non_nullable={
             "name",
@@ -5608,6 +6104,7 @@ async def update_zone(
             "auto_tls_probe",
             "dynamic_update_enabled",
             "forward_only",
+            "forward_transport",
             "tags",
         },
     )
@@ -5617,6 +6114,15 @@ async def update_zone(
     # row — so an operator can't flip a zone to secondary without masters,
     # nor empty the masters on an existing secondary.
     _refuse_superadmin_zone_fields(current_user, changes, zone)
+    # #2075 — a Primary NS that is not a host name makes BIND refuse the zone.
+    # Only a changed value is held to it (the #1784 / #1310 rule): the Edit
+    # dialog and a GET-then-PUT client re-send the stored value on every save,
+    # and a row written before this check must not block an edit to its TTL.
+    # The agent renders a fallback for such a row, so keeping it breaks nothing.
+    if "primary_ns" in changes and (changes["primary_ns"] or "") != (zone.primary_ns or ""):
+        ns_err = primary_ns_error(changes["primary_ns"])
+        if ns_err is not None:
+            raise HTTPException(status_code=422, detail=f"Primary NS (primary_ns) {ns_err}")
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
@@ -5628,6 +6134,7 @@ async def update_zone(
         list(changes.get("forwarders", zone.forwarders) or []),
         db,
     )
+    await _check_zone_forward_transport(zone.group_id, changes, zone, db)
     if effective_zone_type in {"secondary", "stub"}:
         effective_masters = changes.get("masters", zone.masters) or []
         if not effective_masters:
@@ -6717,6 +7224,10 @@ class ZoneMovePreviewResponse(BaseModel):
     #: algorithm a target driver cannot use; non-null means the commit
     #: refuses, not waivable by acknowledgement.
     tsig_algorithm_refusal: str | None = None
+    #: #2121 — the forward zone's own upstream transport is one the target
+    #: group cannot serve; non-null means the commit refuses, not waivable
+    #: by acknowledgement.
+    forward_transport_refusal: str | None = None
     warnings: list[str]
     required_acknowledgements: list[str]
 
@@ -6755,6 +7266,7 @@ class ZoneMovePreviewResponse(BaseModel):
             key_names_lost=plan.key_names_lost,
             technitium_api_refusal=plan.technitium_api_refusal,
             tsig_algorithm_refusal=plan.tsig_algorithm_refusal,
+            forward_transport_refusal=plan.forward_transport_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
         )
@@ -6831,6 +7343,9 @@ async def move_zone_commit(
     # the zone would quietly stop forwarding. Refused, not rewritten.
     if zone.zone_type == "forward":
         await _bind9_zone_forwarders(target_group.id, list(zone.forwarders or []), db)
+        # The zone's own transport (#2121) is checked by the move plan
+        # (``forward_transport_refusal``), so the preview reports the same
+        # refusal commit_zone_move raises below.
     source_group_id = zone.group_id
     try:
         plan = await commit_zone_move(
@@ -6928,7 +7443,7 @@ async def delete_zone(
     await _require_zone(group_id, zone_id, db, current_user)
     if permanent:
         # Refused before a change request could be queued for it.
-        require_superadmin(current_user)
+        ensure_superadmin(current_user)
     op = get_operation("delete_zone")
     assert op is not None  # registered at import
     args = DeleteZoneArgs(group_id=group_id, zone_id=zone_id, permanent=permanent)
@@ -7721,6 +8236,7 @@ async def create_record(
         body.record_type, body.priority, body.weight, body.port
     )
     _validate_address_record_value(body.record_type, body.value)
+    await _enforce_absolute_target(db, zone, body.record_type, body.value)
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
     _enforce_bind_check_names(body.record_type, fqdn, body.value, zone.name)
     # #1230 — a client retry (Ansible, a flaky network, a double click) must
@@ -7838,6 +8354,10 @@ async def update_record(
     # blocking edits to legacy data, contrary to the validate-on-write stance.
     if "value" in changes:
         _validate_address_record_value(record.record_type, record.value)
+        # Resubmitting a row's own value (a TTL edit) does not re-judge a row
+        # that predates the rule, as for check-names below.
+        if zone is not None and (record.value or "").strip() != (before_value or "").strip():
+            await _enforce_absolute_target(db, zone, record.record_type, record.value)
     if "name" in changes and zone:
         record.fqdn = f"{record.name}.{zone.name}" if record.name != "@" else zone.name
     # #1378 — what the edit actually changes is checked against BIND's
@@ -8015,7 +8535,7 @@ async def delete_record(
         await db.commit()
         return
 
-    require_superadmin(current_user)
+    ensure_superadmin(current_user)
 
     db.add(
         AuditLog(
@@ -8122,7 +8642,7 @@ async def bulk_delete_records(
     if permanent:
         # Gate BEFORE any wire op is enqueued: a 403 must leave nothing queued
         # for the agent.
-        require_superadmin(current_user)
+        ensure_superadmin(current_user)
 
     res = await db.execute(select(DNSRecord).where(DNSRecord.id.in_(body.record_ids)))
     records = list(res.scalars().all())
@@ -8421,8 +8941,15 @@ async def bulk_create_records(
         return BulkCreateRecordsResponse(created=0, skipped=skipped, target_serial=None)
 
     records: list[DNSRecord] = []
+    needs_absolute = any(
+        dotless_target(r.record_type, r.value) is not None for r in accepted
+    ) and await group_needs_absolute_targets(db, zone.group_id)
     for r in accepted:
         _validate_address_record_value(r.record_type, r.value)
+        if needs_absolute:
+            target_err = dotless_target_error(r.record_type, r.value, zone.name)
+            if target_err is not None:
+                raise HTTPException(status_code=422, detail=f"{r.name}: {target_err}")
         fqdn = f"{r.name}.{zone.name}" if r.name != "@" else zone.name
         _enforce_bind_check_names(r.record_type, fqdn, r.value, zone.name)
         records.append(
@@ -8501,9 +9028,8 @@ class ImportPreviewRequest(BaseModel):
     zone_file: str
     zone_name: str | None = None
     view_id: uuid.UUID | None = None
-
-
-class ImportCommitRequest(ImportPreviewRequest):
+    # The preview needs the strategy to know which existing records survive
+    # (a ``replace`` deletes the ones the file lacks), for the CNAME rule (#2089).
     conflict_strategy: str = "merge"
 
     @field_validator("conflict_strategy")
@@ -8514,6 +9040,10 @@ class ImportCommitRequest(ImportPreviewRequest):
                 f"conflict_strategy must be one of {sorted(VALID_CONFLICT_STRATEGIES)}"
             )
         return v
+
+
+class ImportCommitRequest(ImportPreviewRequest):
+    pass
 
 
 class RecordChangeResponse(BaseModel):
@@ -8537,6 +9067,8 @@ class ImportPreviewResponse(BaseModel):
     unchanged: list[RecordChangeResponse]
     soa_detected: bool
     record_count: int
+    # Records the file carries that are not offered, each with its reason (#2089).
+    skipped: list[str] = Field(default_factory=list)
 
 
 class ImportCommitResponse(BaseModel):
@@ -8553,6 +9085,7 @@ class ImportCommitResponse(BaseModel):
     # not hold all of it yet. Always None for an agent-served zone, whose
     # ops apply asynchronously by design.
     provider_warning: str | None = None
+    skipped: list[str] = Field(default_factory=list)
 
 
 def _resolve_zone_name(body: ImportPreviewRequest, existing_zone: DNSZone | None) -> str:
@@ -8571,6 +9104,39 @@ async def _load_zone_records(zone_id: uuid.UUID, db: DB) -> list[DNSRecord]:
     return list(result.scalars().all())
 
 
+async def _diff_zone_file(
+    db: DB,
+    zone: DNSZone,
+    body: ImportPreviewRequest,
+    parsed: list[ParsedRecord],
+    existing: list[DNSRecord],
+) -> ZoneDiff:
+    """The zone-file import's diff, shared by preview and commit so the two
+    cannot disagree (#2167): scoped to ``body.view_id`` (None = the shared
+    records), with IPAM- and integration-owned rows protected."""
+    views = (
+        (await db.execute(select(DNSView).where(DNSView.group_id == zone.group_id))).scalars().all()
+    )
+    view_names = {v.id: v.name for v in views}
+    if body.view_id is not None and body.view_id not in view_names:
+        raise HTTPException(
+            status_code=422,
+            detail="view_id does not name a view in this zone's server group",
+        )
+    replace = body.conflict_strategy == "replace"
+    diff = diff_records(
+        parsed,
+        existing,
+        zone_default_ttl=zone.ttl,
+        view_id=body.view_id,
+        view_names=view_names,
+        replace=replace,
+        zone_name=zone.name,
+    )
+    apply_cname_rule(diff, existing, replace=replace)
+    return diff
+
+
 def _change_to_response(c: RecordChange) -> RecordChangeResponse:
     return RecordChangeResponse(
         op=c.op,
@@ -8583,6 +9149,42 @@ def _change_to_response(c: RecordChange) -> RecordChangeResponse:
         port=c.port,
         existing_id=c.existing_id,
     )
+
+
+async def _queue_import_ops(
+    db: DB,
+    zone: DNSZone,
+    *,
+    deletes: list[dict[str, Any]],
+    updates: list[DNSRecord],
+    creates: list[DNSRecord],
+) -> tuple[int | None, list[Any], str | None]:
+    """Queue an import's record changes, shared by the zone-file and the
+    spreadsheet import (#1683, #2139). Rows are already written (``deletes``
+    are the payloads of rows already removed, taken before they went).
+
+    One serial bump and one batch for the whole import, as
+    bulk_create_records does. Deletes go first, in the order the agent
+    drains them: a CNAME that replaces an A at one name can only land once
+    the A is gone. Each op carries the RRset as the whole import leaves it
+    (#773), read after the flush. Returns ``(target_serial, op rows,
+    provider warning)``.
+    """
+    if not (creates or updates or deletes):
+        return None, [], None
+    target_serial = bump_zone_serial(zone)
+    await db.flush()
+    ops = [
+        *({"op": "delete", "record": p} for p in deletes),
+        *({"op": "update", "record": record_op_payload(r)} for r in updates),
+        *({"op": "create", "record": record_op_payload(r)} for r in creates),
+    ]
+    op_rows = await enqueue_record_ops_batch(
+        db, zone, [{**o, "target_serial": target_serial} for o in ops]
+    )
+    # #1538 — a change the agentless provider did not take is surfaced,
+    # not audited as a clean success.
+    return target_serial, op_rows, _agentless_batch_warning(op_rows)
 
 
 @router.post(
@@ -8609,7 +9211,7 @@ async def import_zone_preview(
         raise HTTPException(status_code=422, detail=str(exc))
 
     existing = await _load_zone_records(zone_id, db)
-    diff = diff_records(parsed.records, existing, zone_default_ttl=zone.ttl)
+    diff = await _diff_zone_file(db, zone, body, parsed.records, existing)
 
     return ImportPreviewResponse(
         zone_id=zone.id,
@@ -8620,6 +9222,7 @@ async def import_zone_preview(
         unchanged=[_change_to_response(c) for c in diff.unchanged],
         soa_detected=parsed.soa is not None,
         record_count=len(parsed.records),
+        skipped=diff.skipped,
     )
 
 
@@ -8642,8 +9245,15 @@ async def import_zone_commit(
     * ``merge``   — create new, update changed, keep records that are absent
                     from the zone file (additive)
     * ``replace`` — create new, update changed, delete records absent from the
-                    zone file (make the zone match the file exactly)
+                    zone file (the operator-owned records in the import's
+                    scope come to match the file)
     * ``append``  — only create new records; existing records are left alone
+
+    The import works on ONE view scope (#2167): ``view_id``, or the shared
+    records when it is null. Records in other scopes are never changed or
+    deleted, nor are records IPAM, an integration, an ACME challenge or a
+    dynamic-update client owns (``managed_by``); both are reported in
+    ``skipped``.
 
     Auditing: one summary ``AuditLog`` entry is written under
     ``resource_type='dns_zone_import'`` tagged with a ``batch_id``.
@@ -8659,7 +9269,7 @@ async def import_zone_commit(
         raise HTTPException(status_code=422, detail=str(exc))
 
     existing = await _load_zone_records(zone_id, db)
-    diff = diff_records(parsed.records, existing, zone_default_ttl=zone.ttl)
+    diff = await _diff_zone_file(db, zone, body, parsed.records, existing)
 
     # #1861 — the route takes ``write`` on ``dns_record``; a ``replace`` that
     # would remove records also takes ``delete``, as the record DELETE does.
@@ -8709,6 +9319,7 @@ async def import_zone_commit(
             priority=change.priority,
             weight=change.weight,
             port=change.port,
+            view_id=change.view_id,
             created_by_user_id=current_user.id,
         )
         db.add(row)
@@ -8739,28 +9350,9 @@ async def import_zone_commit(
             await db.delete(row)
             deleted += 1
 
-    # One serial bump and one batch for the whole import, as
-    # bulk_create_records does. Deletes go first, in the order the agent
-    # drains them: a CNAME that replaces an A at one name can only land once
-    # the A is gone. Each op carries the RRset as the whole import leaves it
-    # (#773), read after the flush.
-    target_serial: int | None = None
-    provider_warning: str | None = None
-    op_rows: list[Any] = []
-    if create_rows or update_rows or delete_payloads:
-        target_serial = bump_zone_serial(zone)
-        await db.flush()
-        ops = [
-            *({"op": "delete", "record": p} for p in delete_payloads),
-            *({"op": "update", "record": record_op_payload(r)} for r in update_rows),
-            *({"op": "create", "record": record_op_payload(r)} for r in create_rows),
-        ]
-        op_rows = await enqueue_record_ops_batch(
-            db, zone, [{**o, "target_serial": target_serial} for o in ops]
-        )
-        # #1538 — a change the agentless provider did not take is surfaced,
-        # not audited as a clean success.
-        provider_warning = _agentless_batch_warning(op_rows)
+    target_serial, op_rows, provider_warning = await _queue_import_ops(
+        db, zone, deletes=delete_payloads, updates=update_rows, creates=create_rows
+    )
 
     db.add(
         AuditLog(
@@ -8778,6 +9370,7 @@ async def import_zone_commit(
                 "updated": updated,
                 "deleted": deleted,
                 "unchanged": unchanged_count,
+                "skipped": diff.skipped,
                 "target_serial": target_serial,
                 "changes": {
                     "create": [
@@ -8833,6 +9426,7 @@ async def import_zone_commit(
         unchanged=unchanged_count,
         conflict_strategy=body.conflict_strategy,
         provider_warning=provider_warning,
+        skipped=diff.skipped,
     )
 
 
@@ -8935,22 +9529,65 @@ async def sync_zone_with_server_endpoint(
     )
 
 
+# ── Spreadsheet import / export (#2139) ─────────────────────────────────────
+# The format and the import plan live in app.services.dns_io.spreadsheet; the
+# per-row checks are the record API's own (below), and the commit queues its
+# changes through ``_queue_import_ops``, the zone-file import's path.
+
+_SHEET_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+_SHEET_MODES = ("merge", "replace")
+_SPREADSHEET_CONTENT: dict[int | str, dict[str, Any]] = {
+    200: {
+        "description": "Zone file, CSV or XLSX, by ``format``",
+        "content": {"text/csv": {}, sheet_io.XLSX_MEDIA_TYPE: {}},
+    }
+}
+
+
+def _sheet_filename(zone: DNSZone, ext: str, *, template: bool = False) -> str:
+    ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    stem = zone.name.rstrip(".") or "root"
+    kind = "dns-zone-template" if template else "dns-zone"
+    return f"{kind}-{stem}-{ts}.{ext}"
+
+
+def _sheet_response(rows: list[dict[str, Any]], fmt: str, filename: str) -> Response:
+    disposition = {"Content-Disposition": content_disposition(filename)}
+    if fmt == "xlsx":
+        return Response(
+            content=sheet_io.to_xlsx(rows),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers=disposition,
+        )
+    return Response(content=sheet_io.to_csv(rows), media_type="text/csv", headers=disposition)
+
+
+async def _group_views(db: DB, group_id: uuid.UUID) -> list[DNSView]:
+    res = await db.execute(select(DNSView).where(DNSView.group_id == group_id))
+    return list(res.scalars().all())
+
+
 @router.get(
     "/groups/{group_id}/zones/{zone_id}/export",
     # ``response_class`` REPLACES the documented application/json (#921);
     # a ``responses={200: {"content": ...}}`` entry merges with it instead,
-    # leaving the route declaring a JSON body it never produces.
+    # which is what adds the two spreadsheet types to text/dns here.
     response_class=DnsZoneResponse,
-    responses={200: {"description": "Zone file in master-file format"}},
+    responses=_SPREADSHEET_CONTENT,
 )
 async def export_zone(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
     db: DB,
     current_user: CurrentUser,
+    format: Literal["zone", "csv", "xlsx"] = Query(default="zone"),
 ) -> Response:
-    """Return the zone as an RFC 1035 zone file."""
+    """Return the zone as an RFC 1035 zone file (``format=zone``, the default),
+    or its records as a CSV / XLSX sheet for bulk editing (#2139)."""
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    if format in ("csv", "xlsx"):
+        rows = await sheet_io.zone_record_rows(db, zone)
+        return _sheet_response(rows, format, _sheet_filename(zone, format))
     records = await _load_zone_records(zone_id, db)
     text = write_zone_file(zone, records)
     ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
@@ -8959,6 +9596,512 @@ async def export_zone(
         content=text,
         media_type="text/dns",
         headers={"Content-Disposition": content_disposition(filename)},
+    )
+
+
+@router.get(
+    "/groups/{group_id}/zones/{zone_id}/import/template",
+    response_class=CsvResponse,
+    responses={200: {"content": {sheet_io.XLSX_MEDIA_TYPE: {}}}},
+)
+async def zone_import_template(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    format: Literal["csv", "xlsx"] = Query(default="csv"),
+) -> Response:
+    """A blank records sheet: the header row and one example per common type.
+    The examples carry ``id=EXAMPLE``, which import ignores (#2139)."""
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    filename = _sheet_filename(zone, format, template=True)
+    return _sheet_response(sheet_io.template_rows(), format, filename)
+
+
+class SheetRecordChange(BaseModel):
+    row: int | None = None
+    op: str
+    name: str
+    record_type: str
+    value: str
+    ttl: int | None = None
+    priority: int | None = None
+    weight: int | None = None
+    port: int | None = None
+    view: str | None = None
+    comment: str | None = None
+    existing_id: str | None = None
+    changed_fields: list[str] = Field(default_factory=list)
+    # Set on an unchanged row for a record an integration owns (IPAM, a pool):
+    # the import leaves it alone whatever the row says.
+    read_only: bool = False
+
+
+class SheetRowIssue(BaseModel):
+    row: int | None = None
+    reason: str
+    name: str | None = None
+    record_type: str | None = None
+    value: str | None = None
+
+
+class SheetImportPreviewResponse(BaseModel):
+    zone_id: uuid.UUID
+    zone_name: str
+    format: str
+    mode: str
+    row_count: int
+    examples_ignored: int
+    to_create: list[SheetRecordChange]
+    to_update: list[SheetRecordChange]
+    to_delete: list[SheetRecordChange]
+    unchanged: list[SheetRecordChange]
+    # A row with an error blocks the whole commit (never a partial import).
+    errors: list[SheetRowIssue]
+    # Rows / records left alone on purpose, each with its reason.
+    skipped: list[SheetRowIssue]
+
+
+class SheetImportCommitResponse(BaseModel):
+    zone_id: uuid.UUID
+    batch_id: uuid.UUID
+    format: str
+    mode: str
+    created: int
+    updated: int
+    deleted: int
+    unchanged: int
+    skipped: list[SheetRowIssue] = Field(default_factory=list)
+    target_serial: int | None = None
+    provider_warning: str | None = None
+
+
+def _validation_message(exc: ValidationError) -> str:
+    parts = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ()) if p != "__root__")
+        msg = str(err.get("msg", "invalid")).removeprefix("Value error, ")
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(parts)
+
+
+def _same_int(cell: Any, current: int | None) -> bool:
+    """Whether a sheet cell holds *current* (blank is None; ``"300"`` is 300)."""
+    if cell is None or current is None:
+        return cell is None and current is None
+    try:
+        return int(str(cell).strip()) == current
+    except ValueError:
+        return False
+
+
+def _sheet_row_validator(
+    zone: DNSZone, gated: dict[str, str], needs_absolute: bool
+) -> sheet_io.RowValidator:
+    """The record API's checks for one spreadsheet row, as a per-row verdict.
+
+    The same functions ``create_record`` / ``update_record`` call: the
+    ``RecordCreate`` schema (type, the RFC 2181 owner rule, the #2073 TTL
+    bounds), the per-type structured fields (#424), the value checks (#467 /
+    #597), absolute targets on PowerDNS (#2060), and BIND's check-names plus
+    the #2072 lengths (#1378). A refusal becomes the row's error message
+    instead of a 422. For a row that edits an existing record only what it
+    changes is re-judged, as on the record API, so a row that predates a rule
+    can still be re-saved with a new TTL.
+    """
+
+    def check(
+        row: sheet_io.SheetRow, view_id: uuid.UUID | None, target: DNSRecord | None
+    ) -> sheet_io.Candidate | str:
+        rtype = row.type or (target.record_type if target is not None else None)
+        if not row.name and target is None:
+            return "name is required"
+        if not rtype:
+            return "type is required"
+        if row.value is None:
+            return "value is required"
+        name = row.name if row.name is not None else target.name  # type: ignore[union-attr]
+        # A trailing dot makes a name absolute, as in a zone file: it must sit
+        # in this zone, and is stored relative. Without it the name is relative
+        # to the zone, as on the record API. (The record API strips a trailing
+        # dot and keeps the rest, so ``www.example.com.`` typed into a sheet
+        # would otherwise become ``www.example.com.example.com.``.)
+        stripped = name.strip()
+        if stripped.endswith(".") and stripped not in (".", "@."):
+            absolute = stripped.lower()
+            zone_abs = zone.name.lower() if zone.name.endswith(".") else zone.name.lower() + "."
+            if absolute == zone_abs:
+                name = "@"
+            elif absolute.endswith("." + zone_abs):
+                name = stripped[: -(len(zone_abs) + 1)]
+            else:
+                return (
+                    f"name {stripped!r} is not in the zone {zone_abs!r}; give the name "
+                    "relative to the zone, or end it with the zone's name"
+                )
+        # As the record API's update: what the row does not change is not
+        # re-judged, so a record whose TTL predates the #2073 bounds can still
+        # be re-imported with its TTL as it is.
+        ttl = row.ttl
+        keep_ttl = target is not None and _same_int(row.ttl, target.ttl)
+        try:
+            body = RecordCreate(
+                name=name,
+                record_type=rtype,
+                value=row.value,
+                ttl=None if keep_ttl else ttl,
+                priority=row.priority,
+                weight=row.weight,
+                port=row.port,
+                view_id=view_id,
+            )
+        except ValidationError as exc:
+            return _validation_message(exc)
+        if body.record_type in gated:
+            return gated[body.record_type]
+        name_changed = target is None or body.name.lower() != (target.name or "").lower()
+        value_changed = target is None or body.value.strip() != (target.value or "").strip()
+        try:
+            prio, weight, port = _normalize_record_struct_fields(
+                body.record_type, body.priority, body.weight, body.port
+            )
+            if value_changed:
+                _validate_address_record_value(body.record_type, body.value)
+                if needs_absolute:
+                    err = dotless_target_error(body.record_type, body.value, zone.name)
+                    if err is not None:
+                        return err
+            fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
+            if name_changed or value_changed:
+                _enforce_bind_check_names(
+                    body.record_type,
+                    fqdn,
+                    body.value,
+                    zone.name,
+                    check_owner=name_changed,
+                    check_target=value_changed,
+                )
+        except HTTPException as exc:
+            return str(exc.detail)
+        return sheet_io.Candidate(
+            row=row.row,
+            name=body.name,
+            record_type=body.record_type,
+            value=body.value,
+            ttl=target.ttl if keep_ttl and target is not None else body.ttl,
+            priority=prio,
+            weight=weight,
+            port=port,
+            view_id=view_id,
+            view=row.view,
+            comment=row.comment,
+        )
+
+    return check
+
+
+async def _plan_sheet_import(
+    db: DB, zone: DNSZone, file: UploadFile, mode: str
+) -> tuple[str, sheet_io.ImportPlan, dict[uuid.UUID, str]]:
+    if mode not in _SHEET_MODES:
+        raise HTTPException(status_code=422, detail=f"mode must be one of {list(_SHEET_MODES)}")
+    data = await file.read(_SHEET_MAX_UPLOAD_BYTES + 1)
+    if len(data) > _SHEET_MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Upload exceeds {_SHEET_MAX_UPLOAD_BYTES // (1024 * 1024)} MB",
+        )
+    try:
+        fmt, rows = sheet_io.parse_spreadsheet(data, file.filename or "", file.content_type)
+    except sheet_io.SpreadsheetError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    existing = await _load_zone_records(zone.id, db)
+    views = await _group_views(db, zone.group_id)
+    # The async checks run once per distinct type, as bulk_create_records does.
+    gated: dict[str, str] = {}
+    for rtype in sorted({(r.type or "").strip().upper() for r in rows if r.type}):
+        try:
+            await _check_driver_gated_record_type(rtype, zone.group_id, db)
+        except HTTPException as exc:
+            gated[rtype] = str(exc.detail)
+    needs_absolute = any(
+        r.type and r.value and dotless_target(r.type.strip().upper(), r.value) is not None
+        for r in rows
+    ) and await group_needs_absolute_targets(db, zone.group_id)
+
+    plan = sheet_io.plan_import(
+        rows,
+        existing,
+        views_by_name={v.name: v.id for v in views},
+        mode=mode,
+        validate=_sheet_row_validator(zone, gated, needs_absolute),
+    )
+    return fmt, plan, {v.id: v.name for v in views}
+
+
+def _sheet_change(
+    op: str, rec: DNSRecord | sheet_io.Candidate, views: dict[uuid.UUID, str], **extra: Any
+) -> SheetRecordChange:
+    fields: dict[str, Any] = {
+        "op": op,
+        "name": rec.name,
+        "record_type": rec.record_type,
+        "value": rec.value,
+        "ttl": rec.ttl,
+        "priority": rec.priority,
+        "weight": rec.weight,
+        "port": rec.port,
+        "view": views.get(rec.view_id) if rec.view_id else None,
+    }
+    if isinstance(rec, DNSRecord):
+        fields["comment"] = sheet_io.record_comment(rec)
+        fields["existing_id"] = str(rec.id)
+    else:
+        fields["comment"] = rec.comment
+    fields.update(extra)
+    return SheetRecordChange(**fields)
+
+
+def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
+    return SheetRowIssue(
+        row=i.row, reason=i.reason, name=i.name, record_type=i.record_type, value=i.value
+    )
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview",
+    response_model=SheetImportPreviewResponse,
+)
+async def import_zone_spreadsheet_preview(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    file: UploadFile = File(...),
+    mode: str = Form(default="merge"),
+) -> SheetImportPreviewResponse:
+    """Diff a CSV / XLSX records sheet against the zone (#2139). Writes nothing.
+
+    Each row is checked as the record API checks it; a bad row is an entry in
+    ``errors`` with its row number, never a 500. See ``docs/features/DNS.md``
+    for the columns and the match rule.
+    """
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    fmt, plan, views = await _plan_sheet_import(db, zone, file, mode)
+    return SheetImportPreviewResponse(
+        zone_id=zone.id,
+        zone_name=zone.name,
+        format=fmt,
+        mode=mode,
+        row_count=plan.row_count,
+        examples_ignored=plan.examples_ignored,
+        to_create=[_sheet_change("create", c, views, row=c.row) for c in plan.creates],
+        to_update=[
+            _sheet_change(
+                "update",
+                u.candidate,
+                views,
+                row=u.candidate.row,
+                existing_id=str(u.record.id),
+                changed_fields=["view" if f == "view_id" else f for f in u.changed],
+            )
+            for u in plan.updates
+        ],
+        to_delete=[_sheet_change("delete", r, views) for r in plan.deletes],
+        unchanged=[
+            _sheet_change(
+                "unchanged",
+                r,
+                views,
+                row=rownum,
+                read_only=sheet_io.managed_by(r) is not None,
+            )
+            for rownum, r in plan.unchanged
+        ],
+        errors=[_sheet_issue(i) for i in plan.errors],
+        skipped=[_sheet_issue(i) for i in plan.skipped],
+    )
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/commit",
+    response_model=SheetImportCommitResponse,
+    dependencies=[Depends(require_permission("write", "dns_record"))],
+)
+async def import_zone_spreadsheet_commit(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    file: UploadFile = File(...),
+    mode: str = Form(default="merge"),
+    confirm_zone: str | None = Form(default=None),
+) -> SheetImportCommitResponse:
+    """Apply a CSV / XLSX records sheet to the zone in one transaction (#2139).
+
+    Re-plans from the file (the preview is advisory) and refuses the whole
+    file while any row has an error. ``mode=replace`` deletes the records no
+    row matched and needs ``confirm_zone`` typed as the zone's name. Changes
+    are queued as record ops in one batch on one serial bump, like the
+    zone-file import, and audited as one ``dns_zone_import`` row.
+    """
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    if mode == "replace" and (confirm_zone or "").strip().rstrip(".").lower() != (
+        zone.name.rstrip(".").lower()
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "A replace deletes every record the file does not list: type the "
+                f"zone's name ({zone.name.rstrip('.')}) in confirm_zone to go ahead."
+            ),
+        )
+    _reject_if_synthesised_zone(zone, "import")
+    fmt, plan, views = await _plan_sheet_import(db, zone, file, mode)
+    if plan.errors:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    f"{len(plan.errors)} row(s) have errors; nothing was imported. "
+                    "Fix them and preview again."
+                ),
+                "errors": [_sheet_issue(i).model_dump() for i in plan.errors],
+            },
+        )
+    if plan.deletes and not user_has_permission(current_user, "delete", "dns_record"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: need 'delete' on 'dns_record'",
+        )
+
+    batch_id = uuid.uuid4()
+    delete_payloads: list[dict[str, Any]] = []
+    update_rows: list[DNSRecord] = []
+    create_rows: list[DNSRecord] = []
+    audit_changes: dict[str, list[dict[str, Any]]] = {"create": [], "update": [], "delete": []}
+
+    for rec in plan.deletes:
+        # The payload before the row goes: it names the row (#1230).
+        delete_payloads.append(record_op_payload(rec))
+        audit_changes["delete"].append(
+            {"name": rec.name, "type": rec.record_type, "value": rec.value}
+        )
+        await db.delete(rec)
+
+    for u in plan.updates:
+        rec, c = u.record, u.candidate
+        before = record_op_payload(rec)
+        rec.name = c.name
+        rec.fqdn = f"{c.name}.{zone.name}" if c.name != "@" else zone.name
+        rec.value = c.value
+        rec.ttl = c.ttl
+        rec.priority, rec.weight, rec.port = c.priority, c.weight, c.port
+        rec.view_id = c.view_id
+        if "comment" in u.changed:
+            tags = dict(rec.tags or {})
+            if c.comment:
+                tags[sheet_io.COMMENT_TAG] = c.comment
+            else:
+                tags.pop(sheet_io.COMMENT_TAG, None)
+            rec.tags = tags
+        audit_changes["update"].append(
+            {
+                "id": str(rec.id),
+                "name": c.name,
+                "type": c.record_type,
+                "value": c.value,
+                "fields": u.changed,
+            }
+        )
+        if not u.wire_changed:
+            continue  # a comment is ours alone; no server serves it
+        if u.renamed:
+            # #1773 — a rename is delete-at-old-name + create-at-new-name.
+            delete_payloads.append(before)
+            create_rows.append(rec)
+        else:
+            update_rows.append(rec)
+
+    for c in plan.creates:
+        rec = DNSRecord(
+            zone_id=zone.id,
+            view_id=c.view_id,
+            name=c.name,
+            fqdn=f"{c.name}.{zone.name}" if c.name != "@" else zone.name,
+            record_type=c.record_type,
+            value=c.value,
+            ttl=c.ttl,
+            priority=c.priority,
+            weight=c.weight,
+            port=c.port,
+            tags={sheet_io.COMMENT_TAG: c.comment} if c.comment else {},
+            created_by_user_id=current_user.id,
+        )
+        db.add(rec)
+        create_rows.append(rec)
+        audit_changes["create"].append({"name": c.name, "type": c.record_type, "value": c.value})
+
+    # Comment-only edits are written without a serial bump; everything a
+    # server serves goes out as record ops on one bump.
+    await db.flush()
+    target_serial, op_rows, provider_warning = await _queue_import_ops(
+        db, zone, deletes=delete_payloads, updates=update_rows, creates=create_rows
+    )
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="import",
+            resource_type="dns_zone_import",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            new_value={
+                "batch_id": str(batch_id),
+                "source": "spreadsheet",
+                "format": fmt,
+                "mode": mode,
+                "created": len(plan.creates),
+                "updated": len(plan.updates),
+                "deleted": len(plan.deletes),
+                "unchanged": len(plan.unchanged),
+                "skipped": [i.reason for i in plan.skipped],
+                "target_serial": target_serial,
+                "changes": audit_changes,
+            },
+            result="error" if provider_warning else "success",
+        )
+    )
+    collect_wake(dns_group_channel(zone.group_id))
+    await db.commit()
+    # #1539 — agentless ops are dispatched by the commit; read the outcome now.
+    provider_warning = provider_warning or _agentless_batch_warning(op_rows)
+    logger.info(
+        "dns_zone_spreadsheet_import",
+        batch_id=str(batch_id),
+        zone_id=str(zone.id),
+        format=fmt,
+        mode=mode,
+        created=len(plan.creates),
+        updated=len(plan.updates),
+        deleted=len(plan.deletes),
+        target_serial=target_serial,
+    )
+    return SheetImportCommitResponse(
+        zone_id=zone.id,
+        batch_id=batch_id,
+        format=fmt,
+        mode=mode,
+        created=len(plan.creates),
+        updated=len(plan.updates),
+        deleted=len(plan.deletes),
+        unchanged=len(plan.unchanged),
+        skipped=[_sheet_issue(i) for i in plan.skipped],
+        target_serial=target_serial,
+        provider_warning=provider_warning,
     )
 
 

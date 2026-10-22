@@ -178,9 +178,12 @@ def targets_are_relative(server: Any) -> bool:
     ``a.b.<zone>.`` and only a trailing dot makes a name absolute. The
     agentless Windows driver without WinRM credentials (Path A) is one too:
     its writes are RFC 2136 updates parsed against the zone origin.
-    PowerDNS falls through to True as well, but its answer is never
-    consulted: it implements no record pull, so drift and sync never reach
-    a comparison for it (its HTTP API does not read content zone-file style).
+    PowerDNS falls through to True as well. Its HTTP API refuses a dot-less
+    target outright, so its agent qualifies one against the zone (#2060) and
+    serves exactly what BIND9 would; the record API refuses NEW dot-less
+    targets on a PowerDNS group (``app.services.dns.name_targets``). It
+    implements no record pull, so drift and sync never reach a comparison
+    for it.
 
     False for the drivers whose API takes the name as given, so a dot-less
     name holding a dot is already absolute: the cloud providers, and Windows

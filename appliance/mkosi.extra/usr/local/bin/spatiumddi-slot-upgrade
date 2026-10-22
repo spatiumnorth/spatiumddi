@@ -296,10 +296,13 @@ fi
 # don't rename it (the .path unit fires on close-after-write, not on
 # every read) but we do touch a sibling marker + progress. From here on
 # we're in the apply region: arm the abrupt-exit trap and start the
-# liveness ticker (#421).
+# liveness ticker (#421). The trap is armed BEFORE the in-flight stamp
+# (#2424): armed after it, a SIGTERM in between left the state at
+# in-flight with nothing to record the failure. on_exit acts only on an
+# in-flight state, so arming it first changes no other path.
+trap on_exit EXIT
 mark_inflight
 write_progress "queued" "starting slot upgrade"
-trap on_exit EXIT
 start_inflight_ticker
 
 APPLY_ARGS=("apply" "$IMAGE_SRC")

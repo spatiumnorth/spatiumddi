@@ -16,51 +16,61 @@ Two budgets:
 Mirrors :mod:`app.core.auth_throttle`: a fixed-window counter in Redis,
 **fail-open** when Redis is unreachable so a cache blip never bricks the
 tools page. Returned as FastAPI dependency factories — attach one per
-endpoint.
+endpoint, and called directly by the Operator Copilot / MCP tool registry
+(``ToolRegistry.call``) through :func:`consume_budget`, so both surfaces
+spend one budget per user. The numbers live in
+:mod:`app.services.nettools.budgets`.
 """
 
 from __future__ import annotations
-
-from typing import Final
 
 import structlog
 from fastapi import Depends, HTTPException, status
 
 from app.api.deps import CurrentUser
 from app.config import settings
+from app.core.auth_throttle import incr_with_window
 from app.core.redis_client import make_async_redis
 from app.models.auth import User
+from app.services.nettools.budgets import (
+    BUDGETS as _BUDGETS,
+)
+from app.services.nettools.budgets import (
+    WINDOW_SECONDS as _WINDOW_SECONDS,
+)
+from app.services.nettools.budgets import (
+    budget_exceeded_message,
+    budget_key,
+)
 
 logger = structlog.get_logger(__name__)
-
-_WINDOW_SECONDS: Final[int] = 60
-
-# Budget per fixed window, keyed by "bucket" name. The bucket lets us
-# share one window across the on-prem tools while giving the off-prem
-# tools their own tighter counter.
-_BUDGETS: Final[dict[str, int]] = {
-    "default": 20,
-    "offprem": 8,
-}
 
 
 async def _consume(user_id: str, bucket: str) -> bool:
     """Increment the per-user/bucket counter; return True once it exceeds
     the window budget. Fails open (False) when Redis is unavailable."""
     budget = _BUDGETS.get(bucket, _BUDGETS["default"])
-    key = f"nettools_rl:{bucket}:{user_id}"
+    key = budget_key(bucket, user_id)
     try:
         r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
         try:
-            count = await r.incr(key)
-            if count == 1:
-                await r.expire(key, _WINDOW_SECONDS)
+            count = await incr_with_window(r, key, _WINDOW_SECONDS)
             return int(count) > budget
         finally:
             await r.aclose()
     except Exception as exc:  # noqa: BLE001 — throttle must never break the tool
         logger.warning("nettools_rate_limit_redis_unavailable", error=str(exc))
         return False
+
+
+async def consume_budget(user_id: str, bucket: str) -> bool:
+    """Spend one call from ``user_id``'s ``bucket`` window; True once the
+    window is exhausted. The non-FastAPI entry point, used by the copilot
+    tool registry — it is the same counter the REST dependency spends, so
+    the two surfaces share one budget, and it fails open the same way."""
+    if bucket not in _BUDGETS:
+        raise RuntimeError(f"consume_budget: unknown bucket {bucket!r}")
+    return await _consume(user_id, bucket)
 
 
 def rate_limit(bucket: str = "default"):
@@ -79,11 +89,7 @@ def rate_limit(bucket: str = "default"):
         if await _consume(str(current_user.id), bucket):
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=(
-                    f"Rate limit exceeded — max {_BUDGETS[bucket]} "
-                    f"{bucket} network-tool calls per {_WINDOW_SECONDS}s. "
-                    "Wait a moment and retry."
-                ),
+                detail=budget_exceeded_message(bucket),
                 headers={"Retry-After": str(_WINDOW_SECONDS)},
             )
         return current_user
@@ -96,4 +102,4 @@ RateLimitDefault = Depends(rate_limit("default"))
 RateLimitOffprem = Depends(rate_limit("offprem"))
 
 
-__all__ = ["RateLimitDefault", "RateLimitOffprem", "rate_limit"]
+__all__ = ["RateLimitDefault", "RateLimitOffprem", "consume_budget", "rate_limit"]

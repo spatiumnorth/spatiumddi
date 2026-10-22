@@ -18,6 +18,15 @@
 
 set -eu
 
+# #2109 — seconds since boot, and when this run began. The slot-image check
+# near the end may wait for as long as this unit has left of its start
+# timeout, so it can report its own verdict instead of being killed mid-wait.
+FIRSTBOOT_TIMEOUT_S=600   # TimeoutStartSec=10min in spatiumddi-firstboot.service
+uptime_s() {
+    read -r _up _ </proc/uptime && echo "${_up%.*}"
+}
+FIRSTBOOT_T0=$(uptime_s 2>/dev/null || echo 0)
+
 LOG=/var/log/spatiumddi/firstboot.log
 ENV_FILE=/etc/spatiumddi/.env
 
@@ -490,6 +499,8 @@ fi
 # the shared /var and holds whatever the last boot wrote), so a slot upgrade
 # stamps the new version and a rollback the old one: this bootstrap manifest is
 # re-rendered each boot and helm-controller rolls the pods when the value moves.
+# Except while a cluster Rolling Upgrade holds it with the image tag (#2176):
+# then the pods keep the version they run until the run's flip moves both.
 # Empty (not a made-up "0.1.0") when the file is absent: the api reads "" as
 # unknown.
 APPLIANCE_VERSION_VAL=""
@@ -1016,6 +1027,15 @@ spec:
     image:
       tag: "${SPATIUMDDI_VERSION}"
       pullPolicy: IfNotPresent
+    # #2004 — the slot's version. The chart appends it to the api, worker and
+    # beat env as APPLIANCE_VERSION; without it settings.appliance_version is ""
+    # in every control-plane pod, so system/info and /version report unknown.
+    # #2176 — a value of its own beside image.tag, not a sharedEnv entry: a
+    # cluster Rolling Upgrade holds it with the tag in the HelmChartConfig,
+    # which can pin a scalar but replaces a list whole. As a sharedEnv entry,
+    # this render on the seed's new slot rolled the control plane mid-run, on
+    # the held image, and the worker that drives the run with it.
+    applianceVersion: "${APPLIANCE_VERSION_VAL:-}"
     # #1448 — SECRET_KEY lives in a Secret this chart does not own
     # (ensure_app_key_secret creates it), so no helm uninstall can delete it.
     # Both lines carry the marker: _strip_control_app_secret removes them if
@@ -1104,10 +1124,7 @@ spec:
     sharedEnv:
       - name: APPLIANCE_MODE
         value: "true"
-      # #2004 — the slot's version. Without it settings.appliance_version is ""
-      # in every control-plane pod, so system/info and /version report unknown.
-      - name: APPLIANCE_VERSION
-        value: "${APPLIANCE_VERSION_VAL:-}"
+      # (APPLIANCE_VERSION is the applianceVersion value above: #2176.)
       # #1003 item 2 — the installer's Time source answer. Seeds the
       # INITIAL platform_settings.ntp_pool_servers so the #154 chrony
       # plane pushes what the operator typed instead of the platform
@@ -1821,22 +1838,52 @@ fi
 # served no DNS and no DHCP until it was torn down. k3s retries a failed
 # tarball only when the file changes again.
 #
-# ``verify --repair`` waits for k3s's start-up import to finish (the kubelet
-# starts after it). It then checks k3s's own record of what it imported and
-# what containerd holds. Whatever is missing it re-imports through k3s,
-# clearing a stale ingest first. Returns non-zero only when an image is still
-# missing after that. Runs on every boot, and is bounded well inside this
-# unit's start timeout (2 min for the kubelet, 3 for the re-import). The
-# kubelet is up long before this point on any boot that got here.
+# ``verify --repair`` waits for k3s's start-up import to finish, then checks
+# k3s's own record of what it imported and what containerd holds. Whatever is
+# missing it re-imports through k3s, clearing a stale ingest first. Returns
+# non-zero when an image is still missing after that, or when k3s is still
+# importing when the time runs out. Runs on every boot.
+#
+# #2109 — "finished" is that k3s holds no baked tarball open, not that the
+# kubelet answers. The kubelet starts with k3s's last import still running,
+# and on slow storage it did not answer for minutes: the check then judged
+# imports k3s had not finished, touched the tarball it was importing (which
+# restarts that import) and gave up before the second import ended, so a
+# healthy trial slot was not committed and the next reboot reverted it. The
+# check now waits while k3s is importing, for as long as this unit has left
+# of its start timeout, less SLOT_IMAGES_MARGIN_S for the commit after it.
+# The floor is small on purpose: past the budget a short wait still ends in
+# the check's own verdict, where a long one would be cut off by systemd's
+# timeout with the log stopping mid-wait and no reason given.
+SLOT_IMAGES_MARGIN_S=45
+slot_images_budget() {
+    local now budget
+    now=$(uptime_s 2>/dev/null || echo 0)
+    budget=$((FIRSTBOOT_TIMEOUT_S - (now - ${FIRSTBOOT_T0:-0}) - SLOT_IMAGES_MARGIN_S))
+    # a clock that read wrong must not size the wait past the unit's timeout
+    [ "$budget" -le "$FIRSTBOOT_TIMEOUT_S" ] || budget=$FIRSTBOOT_TIMEOUT_S
+    [ "$budget" -ge 10 ] || budget=10
+    echo "$budget"
+}
 check_slot_images() {
     if [ ! -x /usr/local/bin/spatium-k3s-images ]; then
         echo "WARN: /usr/local/bin/spatium-k3s-images is missing — this slot's images were not checked." >&2
         return 0
     fi
-    if /usr/local/bin/spatium-k3s-images verify --repair; then
+    # No budget (it cannot be worked out) leaves the helper's own --max-wait;
+    # an empty one would be an argument error, i.e. a slot never committed.
+    local budget
+    budget=$(slot_images_budget 2>/dev/null) || budget=""
+    if [ -n "$budget" ]; then
+        set -- --max-wait "$budget"
+    else
+        set --
+    fi
+    if /usr/local/bin/spatium-k3s-images verify --repair "$@"; then
         return 0
     fi
-    echo "ERROR: this slot's images are not all in containerd, even after a re-import (above)." >&2
+    echo "ERROR: this slot's images are not all in containerd, even after a re-import, or k3s" >&2
+    echo "       was still importing them when the time ran out (above)." >&2
     return 1
 }
 
@@ -1850,6 +1897,10 @@ slot_images_allow_commit() {
     check_slot_images && return 0
     if is_trial_boot; then
         echo "       trial boot: NOT committing this slot; next reboot reverts." >&2
+        # #2109 — the slot may be healthy and only its import slow. Say how to
+        # keep it once the import is over, before a reboot throws it away.
+        echo "       To keep this slot: once \`spatium-k3s-images verify\` passes, commit it from" >&2
+        echo "       Fleet (Approve trial, on this node's slot) before the next reboot." >&2
         return 1
     fi
     echo "       steady-state boot: nothing to commit; continuing." >&2

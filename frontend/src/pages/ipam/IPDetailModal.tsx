@@ -37,6 +37,8 @@ import {
   type Subnet,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { isDefaultGatewayHostname } from "@/lib/gatewayDns";
+import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
 import { OT_PROTOCOL_LABELS, OT_ROLE_LABELS } from "@/lib/otLabels";
 import { CertsCompactTable } from "@/pages/network/CertificatesPage";
 import {
@@ -47,6 +49,7 @@ import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { IPNetworkTab } from "./IPNetworkTab";
 import { SeenDot } from "./SeenDot";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { RpkiPill } from "@/components/network/bgp-route-table";
 
@@ -124,6 +127,9 @@ export interface IPDetailModalProps {
   address: IPAddress;
   subnet?: Subnet | null;
   zoneNameById?: Record<string, string>;
+  /** Whether the subnet resolves to a forward zone, i.e. whether a
+   *  "gateway" host has a forward record to skip (#2101). */
+  hasForwardZone?: boolean;
   canEdit: boolean;
   onClose: () => void;
   onEdit: () => void;
@@ -148,6 +154,7 @@ export function IPDetailModal({
   address: addr,
   subnet,
   zoneNameById,
+  hasForwardZone,
   canEdit,
   onClose,
   onEdit,
@@ -157,6 +164,12 @@ export function IPDetailModal({
 }: IPDetailModalProps) {
   const { dialogProps, titleProps, dialogStyle, dragHandleProps } =
     useModalDialog(onClose);
+  const dhcpOn = useModuleOn("core.dhcp");
+  // #2100 — the NAT badge goes with the ``ipam.nat`` module.
+  const natOn = useModuleOn("ipam.nat");
+  // #2135 — zones, the DNS linkage and the alias count are DNS state: hidden
+  // while core.dns is off (the stored values are untouched).
+  const dnsOn = useModuleOn("core.dns");
   const zoneNames = zoneNameById ?? {};
 
   // Wake-on-LAN (#533) — self-contained like the "Re-profile now" action.
@@ -441,51 +454,74 @@ export function IPDetailModal({
                 )}
               </span>
             </Field>
-            <Field label="Forward DNS zone">
-              {addr.forward_zone_id ? (
-                <span className="font-mono text-xs">
-                  {/* #516 — zoneNameById is now supplied by the caller (it was
+            {dnsOn && (
+              <Field label="Forward DNS zone">
+                {addr.forward_zone_id ? (
+                  <span className="font-mono text-xs">
+                    {/* #516 — zoneNameById is now supplied by the caller (it was
                       previously never passed, so this always rendered "—").
                       Fall back to the raw id if the map lacks the zone. */}
-                  {zoneNames[addr.forward_zone_id] ?? addr.forward_zone_id}
+                    {zoneNames[addr.forward_zone_id] ?? addr.forward_zone_id}
+                  </span>
+                ) : (
+                  dash(null)
+                )}
+              </Field>
+            )}
+            {dnsOn && (
+              <Field label="Reverse DNS zone">
+                {addr.reverse_zone_id ? (
+                  <span className="font-mono text-xs">
+                    {zoneNames[addr.reverse_zone_id] ?? addr.reverse_zone_id}
+                  </span>
+                ) : (
+                  dash(null)
+                )}
+              </Field>
+            )}
+            {(dnsOn || dhcpOn) && (
+              <Field
+                label={
+                  dnsOn
+                    ? dhcpOn
+                      ? "DNS / DHCP linkage"
+                      : "DNS linkage"
+                    : "DHCP linkage"
+                }
+              >
+                <span className="space-x-2 text-[11px] text-muted-foreground">
+                  {dnsOn && addr.dns_record_id && <span>A-record</span>}
+                  {dhcpOn && addr.dhcp_lease_id && <span>· DHCP lease</span>}
+                  {dhcpOn && addr.static_assignment_id && (
+                    <span>· DHCP static</span>
+                  )}
+                  {!(dnsOn && addr.dns_record_id) &&
+                    !(dhcpOn && addr.dhcp_lease_id) &&
+                    !(dhcpOn && addr.static_assignment_id) &&
+                    dash(null)}
                 </span>
-              ) : (
-                dash(null)
+              </Field>
+            )}
+            {dnsOn &&
+              isDefaultGatewayHostname(addr.hostname) &&
+              (hasForwardZone ?? !!addr.forward_zone_id) && (
+                <div className="sm:col-span-2">
+                  <GatewayHostnameNote />
+                </div>
               )}
-            </Field>
-            <Field label="Reverse DNS zone">
-              {addr.reverse_zone_id ? (
-                <span className="font-mono text-xs">
-                  {zoneNames[addr.reverse_zone_id] ?? addr.reverse_zone_id}
-                </span>
-              ) : (
-                dash(null)
-              )}
-            </Field>
-            <Field label="DNS / DHCP linkage">
-              <span className="space-x-2 text-[11px] text-muted-foreground">
-                {addr.dns_record_id && <span>A-record</span>}
-                {addr.dhcp_lease_id && <span>· DHCP lease</span>}
-                {addr.static_assignment_id && <span>· DHCP static</span>}
-                {!addr.dns_record_id &&
-                  !addr.dhcp_lease_id &&
-                  !addr.static_assignment_id &&
-                  dash(null)}
-              </span>
-            </Field>
           </div>
 
           {/* Counters row */}
-          {((addr.alias_count ?? 0) > 0 ||
-            (addr.nat_mapping_count ?? 0) > 0) && (
+          {((dnsOn && (addr.alias_count ?? 0) > 0) ||
+            (natOn && (addr.nat_mapping_count ?? 0) > 0)) && (
             <div className="flex flex-wrap items-center gap-2 text-[11px]">
-              {(addr.alias_count ?? 0) > 0 && (
+              {dnsOn && (addr.alias_count ?? 0) > 0 && (
                 <span className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400">
                   +{addr.alias_count} alias
                   {addr.alias_count === 1 ? "" : "es"}
                 </span>
               )}
-              {(addr.nat_mapping_count ?? 0) > 0 && (
+              {natOn && (addr.nat_mapping_count ?? 0) > 0 && (
                 <span className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
                   NAT {addr.nat_mapping_count}
                 </span>
@@ -1203,8 +1239,11 @@ function DeviceProfileSection({
   // Passive fingerprint — Phase 2. The endpoint 404s when no MAC or
   // no fingerprint has been observed; treat 404 as "no data" rather
   // than a hard error.
+  // #2130 — fingerprints are read off DHCP traffic; with DHCP off there is
+  // nothing to read, so neither the query nor the panel is shown.
+  const dhcpOn = useModuleOn("core.dhcp");
   const fingerprintQuery = useQuery({
-    enabled: !!addr.mac_address,
+    enabled: !!addr.mac_address && dhcpOn,
     queryKey: ["dhcp-fingerprint", addr.id],
     queryFn: async () => {
       try {
@@ -1265,10 +1304,11 @@ function DeviceProfileSection({
     fingerprintQuery.data?.fingerbank_manufacturer ??
     null;
   const hasPassive =
-    !!passiveType ||
-    !!passiveClass ||
-    !!passiveManufacturer ||
-    !!fingerprintQuery.data;
+    dhcpOn &&
+    (!!passiveType ||
+      !!passiveClass ||
+      !!passiveManufacturer ||
+      !!fingerprintQuery.data);
 
   return (
     <div>
@@ -1388,9 +1428,10 @@ function DeviceProfileSection({
         if (!havePrior && !isScanning) {
           return (
             <p className="text-xs text-muted-foreground italic">
-              No active profile yet. Auto-profiling triggers on a fresh DHCP
-              lease when the subnet's "Device profiling" toggle is enabled, or
-              run one ad-hoc via the button above.
+              No active profile yet.{" "}
+              {dhcpOn
+                ? `Auto-profiling triggers on a fresh DHCP lease when the subnet's "Device profiling" toggle is enabled, or run one ad-hoc via the button above.`
+                : "Run one ad-hoc via the button above."}
             </p>
           );
         }

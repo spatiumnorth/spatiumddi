@@ -32,6 +32,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
 )
 from sqlalchemy import text as sa_text
@@ -105,6 +106,13 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     max_ack_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
     max_unacked_clients: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     auto_failover: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Credential the group's Kea HA peers authenticate to each other with on
+    # the hook's dedicated listener: a Fernet-encrypted JSON object
+    # ``{ca_pem, cert_pem, key_pem}`` (see ``services/dhcp/ha_peer_auth.py``).
+    # Generated on insert by the listener at the bottom of this module, never
+    # returned by the API, rotated by
+    # ``POST /dhcp/server-groups/{id}/ha-peer-credential/rotate``.
+    ha_peer_credential_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     # Kea lease cache (issue #637) — group-wide default, overridable per scope.
     #
@@ -253,6 +261,14 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # status: active | unreachable | syncing | error | pending
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="active")
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #2306 — why the most recent scheduled lease pull failed (agentless
+    # drivers). NULL = the last pull succeeded (or none has run); cleared by
+    # every successful pull. Kept apart from ``status``, which the health
+    # probe owns and rewrites every cycle.
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_sync_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_health_check_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -279,6 +295,10 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         index=True,
     )
     agent_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # What the agent says it can render, from its last heartbeat (e.g.
+    # ``["ha_peer_tls"]``). NULL / missing entry = the agent predates the
+    # feature; an older agent sends nothing and the heartbeat records ``[]``.
+    agent_capabilities: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     # #637 — the running Kea DAEMON's version (e.g. "3.0.3"), distinct from
     # ``agent_version`` (the python agent). Read live off the control socket via
     # ``version-get`` and reported on each heartbeat. The rolling-upgrade
@@ -1108,6 +1128,34 @@ class DHCPLease(UUIDPrimaryKeyMixin, Base):
         Index("ix_dhcp_lease_server_mac", "server_id", "mac_address"),
         Index("ix_dhcp_lease_server_duid", "server_id", "duid"),
         Index("ix_dhcp_lease_state", "state"),
+        # #2262 — one row per lease identity per server, matching
+        # ``agents._lease_identity``: a DHCPv4 lease is (address, MAC), a
+        # DHCPv6 lease (address, DUID, IAID). Deliberately NOT unique on
+        # (server_id, ip_address) alone: the Kea lease-event path keeps one row
+        # per client on an address, because an agent restart replays an old
+        # client's grant and release after the address has moved to a new one
+        # (#1110, #1318). The agentless pull path keeps a single row per address
+        # itself (it overwrites the MAC on supersede) and is serialised per
+        # server; these indexes are what make a race fail as a conflict rather
+        # than as a second row.
+        Index(
+            "uq_dhcp_lease_server_ip_mac",
+            "server_id",
+            "ip_address",
+            "mac_address",
+            unique=True,
+            postgresql_where=sa_text("duid IS NULL"),
+        ),
+        Index(
+            "uq_dhcp_lease_server_ip_duid",
+            "server_id",
+            "ip_address",
+            "duid",
+            "iaid",
+            unique=True,
+            postgresql_where=sa_text("duid IS NOT NULL"),
+            postgresql_nulls_not_distinct=True,
+        ),
         CheckConstraint(
             "mac_address IS NOT NULL OR duid IS NOT NULL", name="ck_dhcp_lease_identity"
         ),
@@ -1530,6 +1578,22 @@ class RARouterAllowlist(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
+
+
+@event.listens_for(DHCPServerGroup, "before_insert")
+def _generate_ha_peer_credential(
+    _mapper: object, _connection: object, target: DHCPServerGroup
+) -> None:
+    """Give every new group its HA peer credential, whichever path creates it.
+
+    Groups are created by the API, by agent registration (``group_name``) and
+    by importers; hooking the insert covers all of them, so no long-poll ever
+    has to write one.
+    """
+    if target.ha_peer_credential_encrypted is None:
+        from app.services.dhcp.ha_peer_auth import encrypted_credential  # noqa: PLC0415
+
+        target.ha_peer_credential_encrypted = encrypted_credential()
 
 
 __all__ = [

@@ -10,6 +10,8 @@ the rule is per-context.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 from app.core.dns_names import (
@@ -17,7 +19,9 @@ from app.core.dns_names import (
     contains_control_chars,
     contains_zonefile_unsafe,
     sanitize_hostname,
+    validate_dns_label,
     validate_fqdn,
+    validate_host_label,
     validate_hostname,
     validate_record_owner,
 )
@@ -264,3 +268,21 @@ def test_sanitize_hostname_respects_length_cap() -> None:
     out = sanitize_hostname(".".join(["label"] * 60))
     assert len(out) <= MAX_NAME_LEN
     assert not out.endswith(".")
+
+
+# #2071 — Python's ``$`` matches before a trailing newline, so a label ending
+# in one passed both label rules; an embedded label is not stripped by the
+# whole-name validators, so ``web1\n.lab`` reached them too.
+@pytest.mark.parametrize(
+    ("validate", "value"),
+    [
+        (validate_host_label, "web1\n"),
+        (validate_dns_label, "web1\n"),
+        (validate_hostname, "web1\n.lab"),
+        (validate_record_owner, "web1\n.lab"),
+        (validate_fqdn, "web1\n.example.com"),
+    ],
+)
+def test_a_label_ending_in_a_newline_is_refused(validate: Callable[..., str], value: str) -> None:
+    with pytest.raises(ValueError):
+        validate(value)

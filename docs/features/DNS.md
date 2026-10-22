@@ -381,7 +381,8 @@ DNSTrustAnchor
   added_at, added_by
 ```
 
-- **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors go in `managed-keys {}` or `trust-anchors {}`
+- **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors are rendered as a top-level `trust-anchors { ... };` statement (`static-key` / `initial-key`, flags 257, protocol 3; DNSKEY anchors only, no DS), shipped in the bundle so adding or removing one re-renders `named.conf` (#2266). `yes` with no anchor validates nothing in BIND 9.20, so the options response carries a `dnssec_warnings` entry (advisory, never a 422); `auto` uses the built-in root anchor
+- **PowerDNS / Technitium / agentless drivers:** have no equivalent, so adding a trust anchor to a group with such a server is a 422. Values are validated (zone name, algorithm 1-255, key tag, base64 key) because they land verbatim in `named.conf`
 - The root DNSSEC trust anchor (ICANN KSK) is pre-loaded automatically when `dnssec_validation: auto`
 - UI shows DNSSEC chain validation status for each zone
 
@@ -460,6 +461,7 @@ DNSServerOptions.allow_notify: list[str]        -- who may send NOTIFY to this s
 ```
 
 - **BIND9:** `notify yes|explicit|master-only|no;` + `also-notify { ... };` + `allow-notify { ... };`
+- **Technitium (agent-managed, #2267):** `notify` + `notifyNameServers` on each Primary / Secondary zone. `yes` is the zone's NS set plus the also-notify list; `explicit` only the list; `no` nothing; `master-only` / `primary-only` as `yes` on a Primary and nothing on a Secondary. A zone's own value overrides the group's. Technitium's list takes bare IP addresses, so an `also_notify` entry with a port, key or hostname is refused with a 422, and so is `allow_notify` (a Technitium secondary accepts NOTIFY only from its own primaries).
 - Notify settings can be overridden per-zone (the zone model inherits from server defaults)
 - `also_notify` is useful when secondaries are stealth (not listed in zone NS records)
 - `allow_notify` on secondaries controls which primaries are trusted to trigger a zone transfer
@@ -483,7 +485,7 @@ DNSServerOptions.blackhole: list[str]           -- queries from these addresses 
 - All values accept BIND9 ACL names (see §3.7), CIDRs, or literals (`any`, `none`, `localhost`, `localnets`)
 - Can be overridden at the **view** level and further overridden at the **zone** level
 - `blackhole` is applied before any ACL processing — matching queries receive no response (useful for DoS mitigation)
-- `allow_query_cache` should be restricted to internal clients on authoritative-only servers (`none`)
+- `allow_query_cache` should be restricted to internal clients on authoritative-only servers (`none`). The group-level value renders on BIND9 only (#2264) and only when it differs from the stored default `["localhost", "localnets"]`; an untouched group leaves BIND's own default (derived from `allow-recursion`). PowerDNS and Technitium have no cache-access ACL, so a non-default value is refused (422) for a group holding one of them.
 
 ### 3.7 DNS ACLs (Named Access Control Lists)
 
@@ -624,7 +626,9 @@ DNSZone
                                   --   zone under in-addr.arpa / ip6.arpa is reverse (#1310)
   ttl (default SOA TTL)
   refresh, retry, expire, minimum (SOA fields)
-  primary_ns, admin_email         (SOA fields)
+  primary_ns, admin_email         (SOA fields; primary_ns is a fully qualified
+                                  --   host name, trailing dot optional, or empty
+                                  --   for "use the zone's NS" (#2075))
   is_auto_generated: bool         -- created automatically for a subnet
   linked_subnet_id (nullable FK)  -- if reverse zone, tied to a subnet
   dnssec_enabled: bool
@@ -776,6 +780,8 @@ DDNS is safe to call repeatedly. If the resolved hostname matches what's already
 ### Security
 
 - RFC 2136 updates to BIND9 use TSIG signing (key stored Fernet-encrypted).
+- A TSIG key that an ACL, view, server option or zone still cites as `key <name>` cannot be renamed or deleted (409, naming each referrer); remove the references first. The bundle also drops any `key <name>` it does not define, so a stale reference cannot stop the group converging; an access list that empties (or loses a `!key` negation) that way ships as `none`, never as an empty list that would read as unset (#2282).
+- An ACL that a view, server option or zone (`allow_query` / `allow_transfer` / `also_notify`) still cites by name cannot be renamed or deleted (409). The bundle drops any ACL name it does not define; an access list emptied that way renders as `none`, never as inherit-the-server (#2283).
 - WinRM calls to Windows DNS go over HTTPS with cert validation by default.
 - The DDNS service itself never touches manual IPAM allocations (it gates on `auto_from_lease=True` before doing anything).
 
@@ -827,15 +833,59 @@ DNSBlockListException
 ### Supported List Formats
 - **Hosts file** (`0.0.0.0 ads.example.com`)
 - **Domain list** (one domain per line)
-- **AdBlock format** (`||ads.example.com^`)
+- **AdBlock format** (`||ads.example.com^`). What the parser does with the
+  rest of the syntax ([#2123](https://github.com/spatiumnorth/spatiumddi/issues/2123)):
+  - `@@||name^` becomes an **exception** on the list (source `feed`),
+    re-synced by every refresh. An exception you add by hand is never
+    removed by a refresh. A feed's `@@` rule applies to **the feed's own
+    list only**: it carves a name out of that feed's own blocks (for
+    example `@@||cdn.ads.example^` under `||ads.example^`), and it never
+    unblocks a name that your manual list, or any other list on the same
+    group or view, blocks exactly, through a wildcard, or anywhere under
+    it. Such a feed exception is still stored and listed, but has no
+    effect. An exception you add by hand applies to every list on the
+    group or view, as before. Adding or editing one that the feed already
+    lists makes it yours, and so makes it group-wide too: that is the
+    operator's call, not the feed's.
+  - `$important` is kept as a plain block, and still beats a plain `@@`
+    for the same name in the feed (that is what it means), so that
+    exception is not stored.
+  - `$badfilter` disables the rule it names; neither becomes an entry.
+  - Any other modifier (`$domain=`, `$third-party`, `$client=`,
+    `$dnstype=`, `$denyallow=`, …) **skips the rule**. Most of them narrow
+    a rule, and DNS cannot express that, so keeping the bare name would
+    block more than the feed asked for.
+  - Regex rules (`/…/`), paths (`||host/ads`), a `*` inside a name and
+    other non-`||name^` rules are skipped.
+
+  Skipped rules are counted by category (regex / modifier / badfilter /
+  malformed), stored on the list as `feed_parse_skipped`, and shown on the
+  list as "N rules not enforced". Every `||name^` rule means "this name and
+  its subdomains", so an adblock feed on a list set to apex-only logs the
+  same override warning a `*.`-prefixed feed does (#894).
 
 ### Block Response Modes
 
 | Mode | DNS Response | Use Case |
 |---|---|---|
-| `nxdomain` | NXDOMAIN | Cleanest; some clients retry on NXDOMAIN |
-| `sinkhole` | Returns configured IP (e.g., 0.0.0.0) | Can serve a block page |
-| `refused` | REFUSED | Strict policy environments |
+| `nxdomain` | NXDOMAIN | Cleanest, fails fast |
+| `sinkhole` | An A and an AAAA record: the list's `sinkhole_ip`, else `0.0.0.0` and `::` | Fails fast, or points clients at a block page |
+
+`sinkhole` is rendered as RPZ local data. An IPv4 `sinkhole_ip` replaces
+`0.0.0.0` and an IPv6 one replaces `::`; the other family keeps the
+unspecified address, so both lookups fail at once. Before
+[#2124](https://github.com/spatiumnorth/spatiumddi/issues/2124) the agent
+rendered `sinkhole` as `rpz-drop`, which sends **no response**, so every
+blocked lookup waited out the client's resolver timeout. On Technitium a
+sinkhole without an address is `AnyAddress` (Technitium's name for
+`0.0.0.0` / `::`); with one it is `CustomAddress` with that address and
+the other family's unspecified address.
+
+There is **no `refused` mode**, deliberately. BIND's RPZ has no action that answers
+REFUSED (its actions are NXDOMAIN, NODATA, PASSTHRU, DROP, TCP-only and
+local data), so the API refuses `refused` with a 422. It used to be
+accepted and was served as NXDOMAIN; upgrading rewrites stored `refused`
+lists to `nxdomain`, which changes nothing they answer.
 
 ### BIND9 Implementation
 - Uses a `Response Policy Zone (RPZ)` — an industry-standard BIND9 feature
@@ -896,7 +946,7 @@ The rendered config puts the RPZ inside the matching view only:
 ```
 view "guest" {
     match-clients { 10.20.0.0/16; };
-    response-policy { zone "spatium-blocklist-guest.rpz"; } break-dnssec yes;
+    response-policy { zone "spatium-blocklist-guest.rpz"; } break-dnssec yes qname-wait-recurse no;
     ...
 };
 ```
@@ -989,6 +1039,34 @@ the factor falls with it). So 582k entries x 2 zones is about 3.9 GB and
 needs a node with 8 GiB or more; one list on a group with no views is about
 half that.
 
+**That peak is paid only when a list changed (#2157).** The control plane
+ships a content hash with each RPZ zone, and the agent records it beside the
+zone file it wrote (`<zone>.db.sha256`). An apply whose hash matches, such
+as removing a forward zone or editing a group option, hard-links the file it
+already serves into the new tree instead of rendering it: no serialisation,
+no bytes written, no `named-checkzone` run, and no reload of that zone in
+named. Only a zone whose entries, exceptions or block mode changed is
+rendered and reloaded, so "about 3 kB per entry while an apply is in flight"
+counts the lists that changed in that apply, not every list on every apply.
+The backup tree the last-known-good revert uses (`rendered.prev`) shares
+those files' inodes, so an unchanged list costs no extra disk there either.
+The first apply after upgrading renders and reloads every RPZ zone once:
+there is no recorded hash to match yet, and the zone's SOA serial now
+derives from its content. After that, only changed lists are touched.
+
+**Worked example: one popular catalog feed.** The catalog's AdGuard DNS
+filter was about 186k entries when this was written; the count moves with
+every upstream update. On a group with no views that is one RPZ zone, so by
+the rule of thumb above it needs about 400 MB + 186,000 x 3 kB, roughly
+1 GB, while an apply is in flight; with one view it is two zones and roughly
+1.5 GB. These are estimates from the rule, not a measurement of that list.
+Either way they are well over the `512Mi` in the chart's
+`dnsAgents.servers[].resources` example, so copying that example and
+subscribing to a single well-known list is likely to get the agent
+OOM-killed mid-apply. Treat `512Mi` as a figure for a group with no
+blocklists, and size the limit from the rule above before you subscribe.
+Entry counts are on each list after its first sync.
+
 Where to change it:
 
 - Appliance: `dnsBind9.resources` on the role chart, as a HelmChartConfig
@@ -1025,7 +1103,8 @@ records the kill depends on how the container is killed (#2018):
   its last word in place, and that must not hold a recovered server down.
   The times compared are the kubelet's and the control plane's, so a node
   clock far off moves the 10-minute recovery by the same amount. The DHCP
-  (Kea) container is group-killed the same way and is not covered yet. A plain Helm install (umbrella
+  (Kea) container is group-killed the same way and is covered the same
+  way (`docs/features/DHCP.md` 4d, #2023). A plain Helm install (umbrella
   chart) has no supervisor, so there the pod's last state
   (`kubectl get pod … -o jsonpath='{.status.containerStatuses[0].lastState}'`)
   is the only record; setting the kubelet's `singleProcessOOMKill: true`
@@ -1276,6 +1355,7 @@ element:
 ### Record Management
 - Bulk import records from zone file (RFC 1035 format)
 - Export zone as standard zone file
+- Export / import records as CSV or XLSX for bulk editing (see below)
 - Record diff view before pushing changes to server
 
 **TTLs on import are compared as effective TTLs (#1727).** A record with no
@@ -1288,6 +1368,137 @@ parser also reports one TTL per RRset (the lowest among its members, which is
 what the RRset is served with), so a member whose file TTL equals its RRset's
 existing lowest effective TTL is unchanged too. Re-importing a zone's own
 export changes nothing.
+
+**A zone-file import works on one view, and never touches owned records
+(#2167).** A zone file carries no view, so the import targets the `view_id`
+it is given, or the shared records (no view) when it is given none. It
+matches, updates and deletes only records in that scope and creates new ones
+there. Records in any other scope are never changed; a replace counts them in
+`skipped` per view. A view-scoped import treats a shared record as already
+present in the view (shared records render in every view), so it neither
+creates a view copy of it nor deletes it: deleting it would remove it from
+every other view as well. A shared import skips a record that exists only in
+views, because a shared copy would render in views that deliberately lack it
+(the widening #935 describes). Records generated by IPAM, rendered by a DNS
+pool, synthesised by Tailscale / NetBird / Kubernetes, written by an ACME
+challenge, or registered in the live zone by a dynamic-update client (an AD
+domain controller, a DHCP server; #641) are never updated or deleted, by
+merge or by replace: they are listed in `skipped` with the reason, with the
+same rule the spreadsheet import uses below. So "replace" makes the file's
+scope match the file for the records the operator owns, not the whole zone.
+The UI has no view picker and imports into the shared records; in a group
+with views it says so.
+
+### Spreadsheet import / export — CSV and XLSX (#2139)
+
+The zone file is right for moving a zone between servers. For editing many
+records at once — renaming twenty hosts, retargeting CNAMEs, loading a new
+zone from an inventory sheet — the zone's **Data ▾** menu also offers
+**Export CSV**, **Export XLSX**, **Download template** and **Import CSV /
+XLSX**. Over REST:
+
+| | |
+|---|---|
+| Export | `GET /api/v1/dns/groups/{gid}/zones/{zid}/export?format=csv\|xlsx` (`format=zone`, the default, is the zone file). File name `dns-zone-<zone>-<YYYYMMDD-HHMMSS>.<ext>`, UTC. Needs read. |
+| Template | `GET …/zones/{zid}/import/template?format=csv\|xlsx` |
+| Import | `POST …/zones/{zid}/import/spreadsheet/preview` then `…/commit`, multipart: `file`, `mode` (`merge` / `replace`), and on a replace commit `confirm_zone`. Needs write on `dns_record`; a replace that deletes also needs delete. |
+
+The zone-file export writes a record target (MX, SRV, CNAME, NS, PTR, DNAME) exactly as stored: a target with no trailing dot stays relative to `$ORIGIN`. Import compares names absolute and case-insensitive, and TXT bare or quoted, so re-importing your own export plans no changes (#2187).
+
+**Columns.** One row per record. The header row is required; column names are
+case-insensitive and `record_type` is accepted for `type`.
+
+| Column | On export | On import |
+|---|---|---|
+| `id` | The record's UUID | Which record the row edits (see below). Blank: match by content or create. `EXAMPLE`: the row is ignored |
+| `name` | Owner, relative to the zone; `@` is the apex | Required for a new record. Relative to the zone, as on the record API, unless it ends in a dot: then it is absolute, as in a zone file, and must be in this zone (`www.example.com.` is `www`; a name outside the zone is an error) |
+| `type` | `A`, `MX`, … | Required. Cannot change on an existing record |
+| `ttl` | Blank when the record inherits the zone's `$TTL` | Blank = inherit |
+| `value` | The rdata, as the record API stores it | Required |
+| `priority` / `weight` / `port` | The model's structured columns: MX uses `priority`, SRV all three | As the record API: SRV needs all three, MX defaults `priority` to 10, any other type takes none |
+| `view` | The split-horizon view's name; blank renders in every view | A view of the zone's group, by name (case-insensitive) |
+| `comment` | The record's `comment` tag | Stored as the `comment` tag (records have no comment column, so a `comment` tag set in the record form *is* this column; clearing the cell removes it). Never reaches a DNS server, so a comment-only change does not bump the serial or queue a record op |
+| `managed` | Why a row is read-only: `ipam`, `pool`, `tailscale`, `netbird`, `kubernetes`, `acme` (a challenge TXT), `ddns` (written into the live zone by a dynamic-update client, #641) | Ignored |
+
+CAA, TLSA, SSHFP, NAPTR, SVCB / HTTPS and the other structured types have no
+columns of their own because the model stores them as one presentation-format
+rdata string; edit them in `value` exactly as the record form takes them
+(`0 issue "letsencrypt.org"`).
+
+**How a row finds its record.** In this order:
+
+1. **`id` set** — that record. It must be a live record in this zone (an
+   unknown id is an error, not a create: clear the cell to add the row as a
+   new record), and its type must match. Every other column may change, so a
+   rename or a new address is an *update* of that record — for the servers, a
+   rename goes out as delete-at-the-old-name plus create-at-the-new one, as an
+   edit in the record form does (#1773).
+2. **`id` blank** — the record with the same view, name (case-insensitive),
+   type and value; of identical twins, the first not already matched. Anything
+   else that differs (TTL, priority, weight, port, comment) is an update.
+   Matching nothing makes the row a new record.
+
+Two rows that resolve to one record make the second an error, and so does a
+row that would leave the zone holding the same record twice — two identical new
+rows, or an edit that turns one record into a copy of another — as the record
+API refuses it with a 409 (#1230). Twins the zone already holds are not
+re-judged by an edit that keeps them what they are (a TTL or a comment). Matching by
+value rather than by `(name, type)` is deliberate: an RRset has several
+members, and keying on the RRset would turn "add a second A record" into
+"replace the first".
+
+**Modes.** **Merge** (the default) adds and updates and never deletes.
+**Replace** also deletes every record no row matched — the same zone-wide
+scope as the export, every view included — so the commit needs the zone's
+name typed back (`confirm_zone`). Deleted records are hard-deleted, as a
+zone-file replace does.
+
+**Validation.** Every row goes through the record API's own checks: the type
+list, the RFC 2181 owner rule, the TTL bounds (#2073), the structured-field
+rules (#424), the per-type value checks (one IP per A / AAAA row, a valid
+target name for CNAME / NS / PTR / DNAME), absolute targets on PowerDNS
+(#2060), BIND's check-names and the full-name lengths (#1378, #2072), and the
+driver-gated types. A row that fails is reported in the preview's `errors` with
+its spreadsheet row number (the header is row 1), never as a 500. **The commit
+refuses the whole file while any row has an error** — nothing is ever half
+imported. Rows the CNAME rule refuses (#2089: a CNAME beside other data, or at
+the apex) are skipped with the reason, as in the zone-file import.
+
+**Records IPAM or an integration owns are read-only here.** A record generated
+by IPAM (`auto_generated`, an address's alias, or linked to an IP), rendered by
+a DNS pool, or synthesised by Tailscale / NetBird / Kubernetes is never changed
+or deleted by a sheet: an unchanged row for one is reported unchanged and
+`read_only`, a changed row is skipped with the reason, and a replace leaves it
+in place and says so. Edit those at their source, or DNS and IPAM disagree.
+
+**Spreadsheet formulas.** Export prefixes any cell starting with `=`, `+`,
+`-`, `@`, a tab or a carriage return with `'`, so a spreadsheet shows it as
+text instead of running it (#523's rule). Import strips that one apostrophe
+back off, so a round trip is exact, and never evaluates anything: a value
+starting with `=` is stored as text. An XLSX is read with cached values only,
+so a formula cell imports as whatever it last calculated to.
+
+**The template** has one example row per common type (A, AAAA, CNAME, MX,
+TXT, SRV), each with `id` set to `EXAMPLE`. Import ignores those rows and
+reports how many it ignored, so rows can be added beneath them and the sheet
+uploaded as it is.
+
+**Commit.** One transaction, one serial bump, one batch of record ops through
+the same path as the zone-file import (#1683), so agents and agentless
+providers receive the changes and the group's agents are woken. One
+`dns_zone_import` audit row carries the counts and every change. A file is
+bounded at 10 MB and 10,000 rows (100,000 read at all, blank ones included),
+and an XLSX at 100 MB uncompressed, checked before the workbook is opened. A
+CSV is read as UTF-8, with or without a BOM, or as UTF-16 when it starts with
+a UTF-16 BOM (Excel's "Unicode text"); an unreadable file or a corrupt sheet
+is a 422, never a 500.
+
+**A record whose TTL predates the #2073 bounds** (negative, say) re-imports
+with its TTL as it is; a row that sets a TTL out of bounds is a row error.
+
+**Copilot.** `export_dns_zone_records` (read-only, enabled by default) returns
+the same rows as the export. There is no import tool: a bulk write is the
+broad-blast-radius shape that non-negotiable #13 keeps off the copilot.
 
 ### Zone Health Indicators
 - Last successful sync timestamp
@@ -1325,9 +1536,9 @@ Zone permissions are assignable to groups via the standard Permission model, sam
 DDNS_DEFAULT_TTL=300
 DDNS_GRACE_PERIOD_SECONDS=60   # how long to keep record after lease expiry
 
-# Blocking lists
-BLOCKLIST_UPDATE_INTERVAL_HOURS=24
-BLOCKLIST_SINKHOLE_IP=0.0.0.0
+# Blocking lists have no environment variables: the refresh interval and the
+# sinkhole IP are per list, in the database (the list's refresh interval and
+# its `sinkhole_ip`).
 
 # BIND9 TSIG (global default — per-server keys stored in DB encrypted)
 BIND_TSIG_ALGORITHM=hmac-sha256
@@ -1584,12 +1795,17 @@ unrelated edit.
 - **`dnssec_validation` enum.** `auto`, `yes`, or `no`.
 - **`notify_enabled` enum.** `yes`, `no`, `explicit`, `master-only` or
   `primary-only`.
-- **`query_log_channel` enum.** `file`, `syslog` or `stderr`.
-- **`query_log_severity`.** `critical`, `error`, `warning`, `notice`,
-  `info`, `dynamic`, `debug` or `debug <level>`.
-- **Paths.** `query_log_file` must be a file under `/var/log/named/` (the
-  directory the agent makes writable and its query-log shipper tails), and
-  `gss_tsig_keytab_path` a file under `/etc/` or `/var/lib/`. Both must be
+- **`query_log_channel` / `query_log_file`.** Fixed: the channel is
+  `file` at `/var/log/named/queries.log`, the file the agent's query-log
+  shipper tails (and the DNS Queries tab reads). Any other channel or path
+  is refused with a 422 (#2265), since it would silently empty that tab.
+- **`query_log_severity`.** `info`, `dynamic`, `debug` or `debug <level>`.
+  named logs queries at `info`, so `notice` and quieter would drop every
+  line and are refused. `query_log_print_category` / `_print_severity`
+  are honoured; `query_log_print_time` must stay on (the shipper reads the
+  timestamp).
+- **Paths.** `gss_tsig_keytab_path` must be a file under `/etc/` or
+  `/var/lib/`. It must be
   absolute, with no `.` or `..` segment, using only letters, digits, `.`,
   `_`, `-` and `/`: the path sits inside `"…"` in `named.conf`.
 
@@ -1952,6 +2168,16 @@ whose `(name, record_type)` collides with a managed row is skipped; only
 external-only names are mirrored. Zone-management + DNSSEC RRs (SOA, apex
 NS, RRSIG/NSEC*/DNSKEY/CDS/CDNSKEY, private-type 65534) are never ingested.
 
+**Audit.** Every batch that adds or removes mirror records writes one
+`dns.record.external_ingest` audit row on the zone (not one per record, so
+a churning writer cannot flood the log): the added records in `new_value`,
+the removed ones in `old_value`, with counts and the posting server, names
+capped at 50 per batch. Mirror rows are hard-deleted when the writer
+withdraws them, since a restorable copy of a record the writer removed
+would be wrong; the audit row is the history. The agent never ships an
+empty set after a failed AXFR, so an empty report is a real withdrawal and
+is applied (and audited), not floor-guarded.
+
 **P1 limitation:** live multi-server propagation of an ingested record
 across every server in a group happens on the next full re-render, not
 instantly (ingested rows aren't re-shipped as per-server record ops). The
@@ -2083,9 +2309,10 @@ See the driver table in §20.4.
 
 With `tls`, forwarders default to port 853 unless an entry pins its own
 (`ip@port`), and each renders with the generated `tls spatium-upstream-tls`
-statement. Per-zone forwarders on `type forward` zones inherit the same
-transport — a group forwarding over DoT shouldn't silently fall back to
-plaintext for its zone-scoped upstreams.
+statement. **The group transport applies to the group's resolver forwarders
+only.** A conditional forward zone has its own transport (§20.3.2); before
+#2121 it inherited this one, which broke every forward zone pointing at a
+plain-DNS upstream as soon as the group switched to DoT.
 
 `forward_tls_verify` (default on) adds `ca-file` + `remote-hostname` for
 strict validation, and the API refuses verification-on without a hostname
@@ -2139,6 +2366,62 @@ Two levels of checking sit on top of it:
 
 Unrecognised addresses carry no opinion at either level. An internal
 resolver or an uncatalogued provider must stay configurable.
+
+### 20.3.2 Forward zones carry their own transport (#2121)
+
+A `type forward` zone's upstream transport is **the zone's own setting**,
+`forward_transport` on the zone (`do53` default, `tls`, plus `https` / `quic`
+on a Technitium-only group), with `forward_tls_hostname` as the name the
+upstream's certificate is checked against. It does not follow the group's
+`forward_transport`.
+
+The reason is the common case. A conditional forwarder usually points at
+something internal that speaks plain DNS on port 53 and nothing else —
+Tailscale's MagicDNS at `100.100.100.100`, an Active Directory domain
+controller, a cloud VPC resolver — and its certificate, if it has one, is not
+the group provider's. Inheriting the group's DoT sent the zone's queries to
+`100.100.100.100:853` over TLS, validated against `cloudflare-dns.com`;
+nothing answers there, and with `forward only` every name in the zone
+SERVFAILed.
+
+Rules, enforced by the API (422) and mirrored in the zone form:
+
+* An encrypted transport requires `forward_tls_hostname`, a host name. A zone
+  is always verified: there is no opportunistic per-zone DoT.
+* `tls` needs every server in the group to be BIND9 or Technitium; `https`
+  and `quic` need every server to be Technitium. Windows DNS and the cloud
+  drivers forward plain DNS only.
+* The #877 rule applies per zone: an encrypted zone whose forwarders span two
+  catalogued upstreams with different certificate names is refused, because
+  one hostname cannot validate both.
+* A `do53` zone pointed at an encrypted-only upstream (Mullvad) is refused.
+
+Rendering. Over TLS a zone's forwarders default to port 853. **An entry with
+an explicit `@53` is always plain DNS**, whatever the zone's transport —
+TLS to port 53 is a handshake nothing answers. On BIND9 each distinct
+hostname gets its own top-level statement, named from the hostname
+(`tls spatium-zone-tls-<name>-<hash> { ca-file …; remote-hostname "<name>"; … };`),
+rendered above `options` so it exists before any zone names it; zones that
+share a provider share the statement. The group's `spatium-upstream-tls`
+is used by the group's forwarders only. A zone BIND9 cannot render
+faithfully (`https` / `quic`, or `tls` with no usable hostname) is skipped
+and logged as `bind9_forward_zone_skipped`, never downgraded to plain DNS or
+to unverified TLS. On Technitium a plain-IP zone forwarder becomes
+`tls://<hostname> (<ip>)` (or the DoH / DoQ form); an entry naming its own
+scheme or port is kept as written.
+
+The agent renderer and the control-plane preview template share one helper
+(`app/drivers/dns/_forwarders.py`, copied byte for byte into the agent), so
+the preview shows what the agent renders — including `ip@port`, which the
+template used to emit verbatim as an unloadable `1.1.1.1@53;`.
+
+**Upgrade.** The migration sets every existing zone to `do53`, including
+forward zones in groups that forward over TLS today. A forward zone that
+really did want DoT must be switched back on the zone, with its hostname.
+The fix is in the **agent**: an agent older than #2121 ignores the zone's
+transport and keeps inheriting the group's, so upgrade the DNS agents along
+with the control plane. A new agent talking to an older control plane reads
+a zone with no transport as plain DNS.
 
 ### 20.4 Driver support
 
@@ -2249,19 +2532,23 @@ query. That volume is why the query log is capped at a 24 h window in
 the first place, so treat this as a troubleshooting switch rather than a
 permanent setting on a busy resolver.
 
-> **`rndc reconfig` does not apply `responselog`.** Verified against
-> BIND 9.20.26: with `responselog yes;` in a freshly-swapped config and
-> a clean reconfig, `rndc status` still reported
-> `response logging is OFF`. It is a live switch, like `querylog`, and
-> reconfig deliberately
-> preserves whatever the running server was last told. Query logging
-> escapes this only by accident of BIND's own defaulting — with no
-> `querylog` statement it follows the presence of the `queries`
-> category, which a reload does pick up. The agent therefore issues an
-> explicit `rndc responselog on|off` after each structural reload,
-> reading the desired state back off the config it just swapped in.
-> Without that the toggle would appear to work and produce not one line
-> until the daemon was next restarted.
+> **`rndc reconfig` applies neither `querylog` nor `responselog`.**
+> Both are live switches, and reconfig deliberately preserves whatever
+> the running server was last told. Verified against BIND 9.20: with
+> `responselog yes;` in a freshly-swapped config and a clean reconfig,
+> `rndc status` still reported `response logging is OFF` (#914); and a
+> named started with query logging off stayed off after a reconfig that
+> added the `queries` category, with or without `querylog yes;`, and
+> one started with it on stayed on after a reconfig that removed it
+> (#2249). Without a `querylog` statement BIND decides query logging from
+> the `queries` category only when named *starts*. So the agent renders
+> `querylog yes;` when query logging is on, and after each structural
+> reload issues an explicit `rndc querylog on|off` and
+> `rndc responselog on|off`, reading the desired state back off the
+> config it just swapped in. Without that, both toggles would appear to
+> work and change nothing until the daemon was next restarted; with
+> response logging on, every response line would also be dropped as an
+> orphan, because its query line never arrives.
 
 ### 21.3 Which drivers fill it
 

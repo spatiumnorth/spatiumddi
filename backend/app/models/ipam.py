@@ -734,6 +734,13 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         Text, nullable=False, default="", server_default=sa_text("''")
     )
 
+    # Presentational (#2137): show the green "N free · click to allocate"
+    # gap rows between allocated addresses. NULL = use the default (off
+    # for integration-owned subnets and anything larger than a /16);
+    # an explicit True / False overrides it. No effect on allocation or
+    # utilization.
+    show_free_ranges: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
     # IPv6 auto-allocation policy (ignored for IPv4 subnets — those use
     # PlatformSettings.ip_allocation_strategy which is sequential /
     # random only). Values:

@@ -1225,12 +1225,19 @@ def _read_fire_state(fire_state_file: Path) -> tuple[str, int, datetime | None]:
     """Read ``<hash>\\t<attempts>\\t<iso>`` → (hash, attempts, when).
     Missing / malformed → ``("", 0, None)``."""
     try:
-        text = fire_state_file.read_text(encoding="utf-8").strip()
+        # Strip only the line ending: a full ``.strip()`` also eats the
+        # leading tab of an EMPTY-hash line (``\t1\t<iso>``), shifting every
+        # field left so attempts parsed as the hash (#2053).
+        text = fire_state_file.read_text(encoding="utf-8").rstrip("\r\n")
     except OSError:
         return "", 0, None
-    parts = text.split("\t")
-    if not parts or not parts[0]:
+    if not text:
         return "", 0, None
+    # Strip each FIELD, never the line: the hash is hex (or empty), the
+    # attempts an int and the time ISO, none of which carries whitespace,
+    # so a hand edit's stray space can't make the time unparseable or the
+    # hash a value no applied sidecar will ever equal.
+    parts = [p.strip() for p in text.split("\t")]
     try:
         attempts = int(parts[1]) if len(parts) > 1 else 0
     except ValueError:
@@ -1330,6 +1337,29 @@ def _write_owner_only(tmp: Path, payload: str) -> None:
         fh.write(payload)
 
 
+def _forget_superseded_fire(trigger_file: Path, applied_hash: str) -> None:
+    """Drop a fire-state ledger that names a config nobody wants any more.
+
+    Reached when the desired config already equals the applied one. If the
+    ledger names a DIFFERENT hash, that fire was superseded — typically a
+    save the runner could not apply, then reverted by the operator to what
+    the host already runs. Nothing will ever fire for it again, so without
+    this ``read_host_config_health`` would compare the dead hash against the
+    applied sidecar on every heartbeat and report the plane ``retrying``
+    until some unrelated save (#2053). Forgetting it costs nothing: no fire
+    is due, so there is no backoff to remember."""
+    fire_state = _fire_state_path(trigger_file)
+    fhash, attempts, when = _read_fire_state(fire_state)
+    if fhash == applied_hash or (not fhash and not attempts and when is None):
+        return  # converged, or never fired
+    try:
+        fire_state.unlink()
+    except OSError:
+        # Best-effort, like every fire-state write: a ledger we could not
+        # remove is retried on the next heartbeat.
+        pass
+
+
 def _fire_host_config(
     trigger_file: Path,
     applied_hash_sidecar: Path,
@@ -1345,6 +1375,7 @@ def _fire_host_config(
     (+ any plane-specific guard, e.g. the SSH lockout refusal)."""
     applied_hash = _read_release_state_line(applied_hash_sidecar) or ""
     if config_hash == applied_hash:
+        _forget_superseded_fire(trigger_file, applied_hash)
         return False  # already applied — idempotent no-op
     if trigger_file.exists():
         return False  # path unit hasn't consumed the last trigger — don't stack
@@ -1387,8 +1418,9 @@ def read_host_config_health() -> dict[str, dict[str, object]]:
     out: dict[str, dict[str, object]] = {}
     for name, trigger, applied_sidecar in _HOST_CONFIG_PLANES:
         fhash, attempts, when = _read_fire_state(_fire_state_path(trigger))
-        if not fhash:
-            continue  # never fired → nothing to report
+        if not fhash and when is None and attempts == 0:
+            continue  # never fired → nothing to report (an empty hash that
+            # WAS fired, i.e. a plane turned off, carries attempts/when)
         applied = _read_release_state_line(applied_sidecar) or ""
         if applied == fhash:
             continue  # last-fired config is applied → healthy, omit
@@ -1716,6 +1748,10 @@ def maybe_fire_timezone(desired_timezone: str | None) -> bool:
     if detect_deployment_kind() != "appliance":
         return False
     if not desired_timezone or not desired_timezone.strip():
+        # No override wanted, so a fire that never landed is moot (#2053).
+        _forget_superseded_fire(
+            _TZ_TRIGGER_FILE, _read_release_state_line(_TZ_APPLIED_HASH_FILE) or ""
+        )
         return False
     desired = desired_timezone.strip()
     # #387 — fire through the shared bounded-retry guard. The "applied
@@ -1784,6 +1820,7 @@ def maybe_fire_console_mode(desired_console_mode: str | None) -> bool:
     except OSError:
         applied = "0"
     if applied == desired:
+        _forget_superseded_fire(_VERBOSE_TRIGGER_FILE, applied)
         return False
     return _fire_host_config(
         _VERBOSE_TRIGGER_FILE, _VERBOSE_APPLIED_FILE, desired, desired + "\n"

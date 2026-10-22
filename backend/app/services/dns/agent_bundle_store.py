@@ -85,7 +85,16 @@ _MAX_ERROR = 2000
 #   stored default is local + private networks (migration b8e41c7a2d95).
 # 11 (#1706): with views, the group's blocklist zone is no longer shipped into
 #   a group whose every view already carries the group's lists in its own.
-RENDERER_REVISION = 11
+# 12 (#2157): a BIND9 bundle's RPZ zones carry ``rpz_sha256``, the content hash
+#   the agent keys its "this RPZ file is unchanged, hard-link it" decision on.
+#   Bundles without a blocklist, and every non-BIND9 bundle, are byte-identical
+#   to 11's, so the re-render this bump forces moves no ETag for them.
+# 13 (#2124): a ``sinkhole`` entry whose list names an address carries
+#   ``sinkhole_ip`` (the agent renders it as A + AAAA local data). It is part
+#   of the entry, so it is inside ``rpz_sha256`` too.
+# 14 (#2264): a BIND9 server's bundle carries a non-default ``allow_query_cache``
+#   (the agent now renders ``allow-query-cache``); unchanged for default groups.
+RENDERER_REVISION = 14
 
 
 def _serves(revision: int | None) -> bool:
@@ -289,6 +298,28 @@ async def store(
         return None
     new_id, built_at = inserted
 
+    # ONE statement for every write to the server row (#2031). A second UPDATE
+    # of a row this transaction already updated re-runs the row's foreign-key
+    # checks even though no key changed (Postgres fires them whenever the old
+    # version is the transaction's own), taking FOR KEY SHARE on the parent
+    # rows — the server's group and appliance. A transaction that holds one of
+    # those FOR UPDATE and then wants the server row (an agent registration's
+    # SOA-timer switch marking the group's bundles at commit, an appliance
+    # role save) queues behind the first UPDATE, and the second then queues
+    # behind it: 40P01. Written once, the row is only ever locked, never
+    # re-checked, so the render never waits on a parent.
+    #
+    # The render counters always move; the mirror columns only move forward
+    # (``advances``), so a slow render that finishes after a newer one cannot
+    # roll the served bundle back.
+    advances = or_(
+        DNSServer.bundle_watermark.is_(None),
+        DNSServer.bundle_watermark <= dirty_watermark,
+    )
+
+    def _if_advancing(value: Any, column: Any) -> Any:
+        return case((advances, value), else_=column)
+
     await db.execute(
         update(DNSServer)
         .where(DNSServer.id == server.id)
@@ -297,31 +328,24 @@ async def store(
             bundle_render_status=RENDER_STATUS_OK,
             bundle_render_error=None,
             bundle_render_at=func.now(),
-        )
-    )
-    await db.execute(
-        update(DNSServer)
-        .where(
-            DNSServer.id == server.id,
-            or_(
-                DNSServer.bundle_watermark.is_(None),
-                DNSServer.bundle_watermark <= dirty_watermark,
+            bundle_watermark=_if_advancing(dirty_watermark, DNSServer.bundle_watermark),
+            bundle_etag=_if_advancing(etag, DNSServer.bundle_etag),
+            bundle_built_at=_if_advancing(built_at, DNSServer.bundle_built_at),
+            bundle_rendered_by=_if_advancing(rendered_by, DNSServer.bundle_rendered_by),
+            bundle_app_version=_if_advancing(app_version, DNSServer.bundle_app_version),
+            bundle_renderer_revision=_if_advancing(
+                RENDERER_REVISION, DNSServer.bundle_renderer_revision
             ),
-        )
-        .values(
-            bundle_watermark=dirty_watermark,
-            bundle_etag=etag,
-            bundle_built_at=built_at,
-            bundle_rendered_by=rendered_by,
-            bundle_app_version=app_version,
-            bundle_renderer_revision=RENDERER_REVISION,
             # Caught up: nothing is waiting. Still behind — changes landed
             # while this render ran — restart the clock from now, so the
             # stalled-render alert measures time without a render landing,
             # not the length of a write storm that renders keep up with.
-            bundle_dirty_at=case(
-                (DNSServer.bundle_dirty_seq <= dirty_watermark, None),
-                else_=func.now(),
+            bundle_dirty_at=_if_advancing(
+                case(
+                    (DNSServer.bundle_dirty_seq <= dirty_watermark, None),
+                    else_=func.now(),
+                ),
+                DNSServer.bundle_dirty_at,
             ),
         )
     )

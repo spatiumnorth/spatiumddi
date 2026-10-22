@@ -1,3 +1,4 @@
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -31,6 +32,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Steps an operator follows in the OPNsense web UI to mint a read-only
@@ -358,9 +360,13 @@ export function OpnsensePage() {
       {del && (
         <DeleteRouterModal
           router={del}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           onConfirm={() => delMut.mutate(del.id)}
           isPending={delMut.isPending}
+          error={delMut.isError ? errMsg(delMut.error, "Delete failed") : null}
         />
       )}
     </div>
@@ -387,9 +393,13 @@ function RouterModal({
   const qc = useQueryClient();
   const editing = !!router;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [name, setName] = useState(router?.name ?? "");
@@ -411,7 +421,7 @@ function RouterModal({
   );
   const [mirrorArp, setMirrorArp] = useState(router?.mirror_arp ?? false);
   const [syncInterval, setSyncInterval] = useState(
-    router?.sync_interval_seconds ?? 60,
+    String(router?.sync_interval_seconds ?? 60),
   );
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
@@ -454,7 +464,7 @@ function RouterModal({
           mirror_dhcp_leases: mirrorDhcpLeases,
           mirror_static_mappings: mirrorStaticMappings,
           mirror_arp: mirrorArp,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (apiSecret) update.api_secret = apiSecret;
@@ -475,7 +485,7 @@ function RouterModal({
         mirror_dhcp_leases: mirrorDhcpLeases,
         mirror_static_mappings: mirrorStaticMappings,
         mirror_arp: mirrorArp,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return opnsenseApi.createRouter(create);
     },
@@ -495,6 +505,17 @@ function RouterModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -663,20 +684,22 @@ function RouterModal({
           <Field label="IPAM space">
             <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
         </div>
 
         <Field label="Sync interval (seconds)" hint="Minimum 30 s.">
@@ -685,7 +708,7 @@ function RouterModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
@@ -765,11 +788,13 @@ function DeleteRouterModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   router: OPNsenseRouter;
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  error?: string | null;
 }) {
   const [checked, setChecked] = useState(false);
   return (
@@ -778,9 +803,11 @@ function DeleteRouterModal({
         <p className="text-sm text-muted-foreground">
           Remove the OPNsense firewall{" "}
           <span className="font-semibold">{router.name}</span>? This only
-          affects SpatiumDDI — nothing on the OPNsense side changes. All IPAM
-          rows mirrored from this firewall (subnets + addresses) will be removed
-          via the FK cascade.
+          affects SpatiumDDI — nothing on the OPNsense side changes. If active
+          block sync is armed, disarm it first (that lifts the pushed blocks
+          from the device); delete is refused while it is armed. All IPAM rows
+          mirrored from this firewall (subnets + addresses) will be removed via
+          the FK cascade.
         </p>
         <label className="flex cursor-pointer items-start gap-2 text-sm">
           <input
@@ -791,6 +818,11 @@ function DeleteRouterModal({
           />
           <span>I understand.</span>
         </label>
+        {error && (
+          <p className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

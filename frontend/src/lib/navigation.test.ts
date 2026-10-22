@@ -61,7 +61,13 @@ describe("module tags on sub-groups are live, not decorative", () => {
     expect(remaining).not.toContain("DNSSEC Policies");
   });
 
-  it("the IPAM sub-group is ungated and never empties", () => {
-    expect(labels(coreIpamNav, new Set()).length).toBe(coreIpamNav.length);
+  it("the IPAM sub-group loses only NAT Mappings when ipam.nat is off (#2100)", () => {
+    const off = labels(coreIpamNav, new Set());
+    expect(off).not.toContain("NAT Mappings");
+    // Everything else under IPAM is ungated, so the heading never empties.
+    expect(off.length).toBe(coreIpamNav.length - 1);
+    expect(labels(coreIpamNav, new Set(["ipam.nat"]))).toContain(
+      "NAT Mappings",
+    );
   });
 });

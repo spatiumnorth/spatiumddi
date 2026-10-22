@@ -1,3 +1,4 @@
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -31,6 +32,8 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { CredentialChip } from "@/components/CredentialChip";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // One-shot snippet operators can paste into the Tailscale admin
@@ -40,9 +43,10 @@ const SETUP_KEY = `# Generate a Tailscale API key:
 #
 # 1. Open https://login.tailscale.com/admin/settings/keys
 # 2. Click "Generate API key…"
-# 3. Set an expiry that matches your operational rotation window
-#    (90 days is the API minimum). Tailscale doesn't support
-#    non-expiring API keys.
+# 3. Set an expiry between 1 and 90 days — 90 is Tailscale's
+#    maximum, and there are no non-expiring API access tokens.
+#    SpatiumDDI reads the expiry back from Tailscale and warns
+#    (alert + chip) 30 days before it lapses.
 # 4. Copy the printed value (starts with "tskey-api-").
 #
 # The key inherits your user's permissions on the tailnet — it can
@@ -174,7 +178,7 @@ export function TailscalePage() {
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1020px] text-xs">
+              <table className="w-full min-w-[1140px] text-xs">
                 <thead>
                   <tr className="border-b bg-muted/30">
                     <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
@@ -191,6 +195,9 @@ export function TailscalePage() {
                     </th>
                     <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
                       Devices
+                    </th>
+                    <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
+                      Token
                     </th>
                     <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
                       Last sync
@@ -237,15 +244,35 @@ export function TailscalePage() {
                         <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
                           {t.device_count ?? "—"}
                         </td>
+                        <td className="whitespace-nowrap px-3 py-2">
+                          <CredentialChip
+                            state={t.credential_state}
+                            daysLeft={t.credential_days_left}
+                            expiresAt={t.api_key_expires_at}
+                            showOk
+                            showUnknown
+                            onClick={
+                              superadminGate.disabled
+                                ? undefined
+                                : () => setEdit(t)
+                            }
+                          />
+                        </td>
                         <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
                           {t.last_synced_at
                             ? new Date(t.last_synced_at).toLocaleString()
                             : "never"}
                           {t.last_sync_error && (
                             <div
-                              className="text-[11px] text-destructive max-w-xs truncate"
+                              className={
+                                t.enabled
+                                  ? "text-[11px] text-destructive max-w-xs truncate"
+                                  : "text-[11px] text-muted-foreground max-w-xs truncate"
+                              }
                               title={t.last_sync_error}
+                              data-testid="tenant-last-error"
                             >
+                              {t.enabled ? "" : "Last error (disabled): "}
                               {t.last_sync_error}
                             </div>
                           )}
@@ -344,9 +371,13 @@ function TenantModal({
   const qc = useQueryClient();
   const editing = !!tenant;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [name, setName] = useState(tenant?.name ?? "");
@@ -364,8 +395,17 @@ function TenantModal({
   );
   const [skipExpired, setSkipExpired] = useState(tenant?.skip_expired ?? true);
   const [syncInterval, setSyncInterval] = useState(
-    tenant?.sync_interval_seconds ?? 60,
+    String(tenant?.sync_interval_seconds ?? 60),
   );
+  // #2138 — operator-entered token expiry (YYYY-MM-DD). Only the fallback:
+  // a date Tailscale reports always wins on the server.
+  const initialExpiresOn =
+    tenant?.api_key_expires_at && tenant.api_key_expiry_source === "operator"
+      ? tenant.api_key_expires_at.slice(0, 10)
+      : "";
+  const [expiresOn, setExpiresOn] = useState(initialExpiresOn);
+  const expiryReadFromApi =
+    editing && !apiKey && tenant?.api_key_expiry_source === "api";
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
 
@@ -403,9 +443,14 @@ function TenantModal({
           cgnat_cidr: cgnatCidr,
           ipv6_cidr: ipv6Cidr,
           skip_expired: skipExpired,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
         };
-        if (apiKey) update.api_key = apiKey;
+        if (apiKey) {
+          update.api_key = apiKey;
+          update.api_key_expires_at = expiresOnToIso(expiresOn);
+        } else if (!expiryReadFromApi && expiresOn !== initialExpiresOn) {
+          update.api_key_expires_at = expiresOnToIso(expiresOn);
+        }
         return tailscaleApi.updateTenant(tenant!.id, update);
       }
       const create: TailscaleTenantCreate = {
@@ -414,12 +459,13 @@ function TenantModal({
         enabled,
         tailnet,
         api_key: apiKey,
+        api_key_expires_at: expiresOnToIso(expiresOn),
         ipam_space_id: spaceId,
         dns_group_id: dnsGroupId || null,
         cgnat_cidr: cgnatCidr,
         ipv6_cidr: ipv6Cidr,
         skip_expired: skipExpired,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
       };
       return tailscaleApi.createTenant(create);
     },
@@ -439,6 +485,17 @@ function TenantModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -511,7 +568,18 @@ function TenantModal({
               type="password"
               className={`${inputCls} font-mono text-[11px]`}
               value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
+              onChange={(e) => {
+                const v = e.target.value;
+                setApiKey(v);
+                // Tailscale's maximum lifetime; the server replaces it with
+                // the real expiry whenever Tailscale reports one. A date
+                // entered for the OLD key says nothing about a new one, so
+                // replacing the key resets it too; clearing the key again
+                // puts the stored date back.
+                if (!v) setExpiresOn(initialExpiresOn);
+                else if (!expiresOn || expiresOn === initialExpiresOn)
+                  setExpiresOn(dateInDays(90));
+              }}
               placeholder={
                 editing && tenant?.api_key_present
                   ? "••• stored — enter to replace"
@@ -546,24 +614,55 @@ function TenantModal({
           )}
         </div>
 
+        {expiryReadFromApi ? (
+          <p className="text-[11px] text-muted-foreground">
+            Token expires{" "}
+            <span className="font-medium text-foreground">
+              {fmtExpiry(
+                tenant!.api_key_expires_at!,
+                tenant!.api_key_expiry_source === "operator",
+              )}
+            </span>{" "}
+            (read from Tailscale). Enter a new API key above to replace it.
+          </p>
+        ) : (
+          <Field
+            label="Token expires on (optional)"
+            hint={
+              testResult?.api_key_expires_at
+                ? `Tailscale reports this token expires ${new Date(testResult.api_key_expires_at).toLocaleDateString()}; that date is used instead.`
+                : "Read from Tailscale when it can be; this date is the fallback. Defaults to 90 days from today, Tailscale's maximum."
+            }
+          >
+            <input
+              type="date"
+              className={inputCls}
+              value={expiresOn}
+              onChange={(e) => setExpiresOn(e.target.value)}
+            />
+          </Field>
+        )}
+
         <div className="grid grid-cols-2 gap-3 border-t pt-3">
           <Field label="IPAM space">
             <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
         </div>
 
         <div className="grid grid-cols-2 gap-3">
@@ -599,7 +698,7 @@ function TenantModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 
@@ -734,6 +833,29 @@ function CopyablePre({ text, label }: { text: string; label: string }) {
       </button>
     </div>
   );
+}
+
+function dateInDays(days: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+// An operator-entered expiry is stored as UTC midnight of the chosen day, so
+// it must render in UTC or it reads a day early west of UTC (#2260). An
+// expiry Tailscale reported is a real instant and renders in local time.
+function fmtExpiry(iso: string, operatorDate: boolean): string {
+  return new Date(iso).toLocaleDateString(
+    undefined,
+    operatorDate ? { timeZone: "UTC" } : undefined,
+  );
+}
+
+// Start of the chosen day, UTC: erring early means warning early.
+function expiresOnToIso(date: string): string | null {
+  return date ? `${date}T00:00:00Z` : null;
 }
 
 const inputCls =

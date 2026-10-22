@@ -243,11 +243,24 @@ async def _apply_update_conformity_policy(
                 f"Built-in policy only accepts {sorted(_CONFORMITY_BUILTIN_MUTABLE)}; "
                 f"rejected: {offending}"
             )
+    from app.services.conformity.current import retire_pass_if_rescoped  # noqa: PLC0415
+
     applied: dict[str, Any] = {}
     for key, value in changes.items():
         if getattr(p, key) != value:
             setattr(p, key, value)
             applied[key] = value
+    if "enabled" in applied and not p.enabled:
+        from app.services.conformity.engine import (  # noqa: PLC0415
+            RESOLUTION_POLICY_DISABLED,
+            resolve_policy_alerts,
+        )
+
+        # #2277 — close the alerts a now-disabled policy left open.
+        await resolve_policy_alerts(db, p.id, reason=RESOLUTION_POLICY_DISABLED)
+    # #2278 — same rule as the REST PATCH: a re-scoped policy's last
+    # pass no longer describes it.
+    retire_pass_if_rescoped(p, applied)
     write_audit(
         db,
         user=user,
@@ -289,12 +302,15 @@ async def _apply_evaluate_conformity_policy(
     db: AsyncSession, user: User, args: EvaluateConformityPolicyArgs
 ) -> dict[str, Any]:
     from app.models.conformity import ConformityPolicy  # noqa: PLC0415
+    from app.services import alerts as alert_service  # noqa: PLC0415
     from app.services.conformity import evaluate_policy  # noqa: PLC0415
 
     p = await db.get(ConformityPolicy, args.policy_id)
     if p is None:
         raise ValueError(f"Conformity policy {args.policy_id} not found")
-    summary = await evaluate_policy(db, p)
+    # #2261 — queue any alert this opens; it pages only after the commit below.
+    with alert_service.defer_deliveries() as pending:
+        summary = await evaluate_policy(db, p)
     write_audit(
         db,
         user=user,
@@ -305,6 +321,7 @@ async def _apply_evaluate_conformity_policy(
         new_value={"via": "ai_proposal", **{k: int(v) for k, v in summary.items()}},
     )
     await db.commit()
+    await alert_service.deliver_deferred(db, pending)
     return {"id": str(p.id), "name": p.name, **{k: int(v) for k, v in summary.items()}}
 
 
@@ -1680,8 +1697,10 @@ async def _dns_import_pull(db: AsyncSession, args: CommitDNSImportArgs) -> Any:
         target_view_id=args.target_view_id,
     )
     from app.services.dns_import.apex_ns import annotate_apex_ns  # noqa: PLC0415
+    from app.services.dns_import.cname_check import annotate_cname_conflicts  # noqa: PLC0415
 
     await annotate_apex_ns(db, preview, args.target_group_id)
+    annotate_cname_conflicts(preview)
     return preview
 
 
@@ -1695,11 +1714,21 @@ def _dns_preview_text(preview: Any, apex_ns_policy: str = "keep") -> str:
             if apex_ns_policy == "replace"
             else "KEPT (the zone stays delegated to the source)"
         )
+    from app.services.dns_import.cname_check import count_cname_warnings  # noqa: PLC0415
+
+    # #2089 — records the commit will not store under the CNAME rule.
+    unsafe = count_cname_warnings(preview.warnings)
     return (
         f"Import {len(preview.zones)} zone(s) / {preview.total_records} record(s) from "
         f"{preview.source}"
         + (f"; {conflicts} conflict(s) will be SKIPPED" if conflicts else "")
         + apex
+        + (
+            f"; {unsafe} record(s) will NOT be imported (a CNAME beside other data, "
+            "or at the zone apex)"
+            if unsafe
+            else ""
+        )
     )
 
 
@@ -1742,6 +1771,9 @@ async def _apply_commit_dns_import(
         "zones_skipped": result.total_zones_skipped,
         "zones_failed": result.total_zones_failed,
         "records_created": result.total_records_created,
+        # #2089 — records dropped rather than stored, each with its reason.
+        "records_skipped": sum(len(z.skipped_records) for z in result.zones),
+        "warnings": list(result.warnings)[:20],
     }
 
 

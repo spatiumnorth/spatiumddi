@@ -24,7 +24,15 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
-from app.core.dns_names import validate_fqdn, validate_hostname, validate_record_owner
+from app.core.dns_names import (
+    MAX_NAME_LEN,
+    bind_check_names_error,
+    name_in_zone_error,
+    validate_fqdn,
+    validate_host_label,
+    validate_hostname,
+    validate_record_owner,
+)
 from app.core.permissions import (
     is_effective_superadmin,
     require_any_resource_or_scoped,
@@ -35,7 +43,7 @@ from app.core.permissions import (
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
-from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
+from app.models.dns import DNS_TTL_MAX, DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import (
     IP_ROLES,
     IP_ROLES_SHARED,
@@ -63,7 +71,12 @@ from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
-from app.services.dns.sync_check import ipam_authors_zone, resolve_reverse_zone
+from app.services.dns.sync_check import (
+    forward_zone_ids_in_order,
+    ipam_authors_zone,
+    resolve_reverse_zone,
+)
+from app.services.feature_modules import is_module_enabled, require_module
 from app.services.ipam.address_set_gate import (
     WritableSetRanges,
     load_writable_set_ranges,
@@ -161,9 +174,13 @@ router.include_router(io_router)
 # rows. Lives under /api/v1/ipam/nat-mappings. Imported here to avoid
 # touching the top-level api/v1/router.py — natural home is alongside
 # the other IPAM tools.
+#
+# Behind the ``ipam.nat`` feature module (#2100): 404 while it is off, the
+# same "not installed" answer every other module gives. The rows are not
+# touched — the firewall mirrors keep writing them regardless.
 from app.api.v1.ipam.nat import router as nat_router  # noqa: E402
 
-router.include_router(nat_router)
+router.include_router(nat_router, dependencies=[Depends(require_module("ipam.nat"))])
 
 # IPAM templates (issue #26) — reusable stamp templates that pre-fill
 # tags / CFs / DNS / DHCP / DDNS settings on block or subnet create.
@@ -1347,6 +1364,214 @@ async def _batched_dns_ops(db: AsyncSession) -> Any:
         _dns_op_collector.reset(token)
 
 
+def _alias_written_type(requested: str, *, is_v6: bool) -> str:
+    """The record type an alias of the REQUESTED type is stored as (#2081).
+
+    An alias of type ``A`` on an IPv6 address is an AAAA: the alias follows
+    the address family. The writer, the CNAME-rule check and the endpoint's
+    follow-up lookup all go through here, so they cannot disagree about the
+    type that lands in the zone.
+    """
+    rtype = requested.upper()
+    return "AAAA" if rtype == "A" and is_v6 else rtype
+
+
+async def _alias_record_at(
+    db: AsyncSession, zone_id: uuid.UUID, name: str, rtype: str
+) -> DNSRecord | None:
+    """A live record already at ``(zone, name, type)``, an alias's own slot.
+
+    Names compare case-insensitively, as DNS does. Rows in every view count,
+    since an alias is a no-view row and renders into all of them.
+    """
+    return (
+        (
+            await db.execute(
+                select(DNSRecord)
+                .where(
+                    DNSRecord.zone_id == zone_id,
+                    func.lower(DNSRecord.name) == name.strip().lower(),
+                    DNSRecord.record_type == rtype,
+                )
+                .order_by(DNSRecord.created_at)
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+def _is_own_alias(rec: DNSRecord, ip_id: uuid.UUID) -> bool:
+    """Whether ``rec`` is an alias the address ``ip_id`` already has."""
+    return bool(rec.ip_alias) and rec.ip_address_id == ip_id
+
+
+async def _alias_duplicate_detail(db: AsyncSession, rec: DNSRecord, rtype: str, fqdn: str) -> str:
+    """The 409 detail for an alias whose record something else holds (#2122)."""
+    article = "an" if rtype.startswith("A") else "a"
+    holder = f"{article} {rtype} record"
+    if rec.ip_address_id is not None:
+        other_ip = await db.get(IPAddress, rec.ip_address_id)
+        if other_ip is not None:
+            role = "an alias of" if rec.ip_alias else "the host record of"
+            holder = f"{article} {rtype} record, {role} address {other_ip.address}"
+    return (
+        f"{fqdn} already holds {holder}, so {article} {rtype} alias there would "
+        "not be created. Pick another alias name, or remove that record first."
+    )
+
+
+async def _assert_alias_cname_rules(
+    db: AsyncSession,
+    subnet: Subnet,
+    aliases: list[Any],
+    *,
+    hostname: str | None,
+    address: Any,
+    zone_id: uuid.UUID | None,
+    own_ip_id: uuid.UUID | None = None,
+) -> None:
+    """Refuse an alias set that would put a CNAME beside other data (#2080),
+    or that repeats a record something else already holds (#2122).
+
+    A name that holds a CNAME holds nothing else (RFC 1034 section 3.6.2,
+    RFC 2181 section 10.1); BIND refuses the whole zone otherwise and the
+    agent stays on its last good config. This is the check the DNS record
+    API runs (``app.services.dns.cname_conflict``, status and message shape
+    included: 422 for a CNAME at the apex, 409 for a clash), applied to
+    every alias before anything is written, in both directions: a CNAME
+    alias onto a name that holds data, and an A / AAAA alias onto a name that
+    is a CNAME. It also covers the IP's own host name and the aliases of the
+    same request, which are not in the database yet. Rows are matched in
+    every view, since an alias is a no-view row and renders into all of them.
+
+    #2122 — an alias whose ``(zone, name, type)`` is already held by another
+    record is refused here too (409, naming the alias and its holder), where
+    the writer used to skip it and report success. An alias the address
+    ``own_ip_id`` already has is not a clash: re-adding it is a no-op. The
+    same alias twice in one request is collapsed to one, since both entries
+    ask for the one record the zone can hold.
+    """
+    from app.services.dns.cname_conflict import (  # noqa: PLC0415
+        APEX_CNAME_DETAIL,
+        describe_cname_conflict,
+        find_cname_conflict,
+        is_apex,
+    )
+
+    if not aliases or not hostname:
+        return
+    effective_zone_id = zone_id or await _resolve_effective_zone(db, subnet)
+    if not effective_zone_id:
+        return
+    zone = await db.get(DNSZone, effective_zone_id)
+    if zone is None or not ipam_authors_zone(zone):
+        return
+    zone_domain = zone.name.rstrip(".")
+    try:
+        is_v6 = isinstance(ipaddress.ip_address(str(address)), ipaddress.IPv6Address)
+    except ValueError:
+        is_v6 = False
+    host_rtype = "AAAA" if is_v6 else "A"
+    # name (lower-cased) -> what the request itself will put there, as
+    # (is_cname, label) pairs; the label names it in the refusal.
+    pending: dict[str, list[tuple[bool, str]]] = {
+        hostname.strip().lower(): [(False, f"the address's own {host_rtype} record")]
+    }
+    seen: set[tuple[str, str]] = set()
+    for al in aliases:
+        rtype = (getattr(al, "record_type", None) or al.get("record_type") or "CNAME").upper()
+        rtype = _alias_written_type(rtype, is_v6=is_v6)
+        name = (getattr(al, "name", None) or al.get("name") or "").strip().rstrip(".")
+        if not name or rtype not in {"CNAME", "A", "AAAA"}:
+            continue
+        # #2122 — the same alias twice in one request is one record.
+        if (name.lower(), rtype) in seen:
+            continue
+        seen.add((name.lower(), rtype))
+        fqdn = f"{name}.{zone_domain}"
+        if rtype == "CNAME" and is_apex(name):
+            raise HTTPException(status_code=422, detail=APEX_CNAME_DETAIL)
+        held = await _alias_record_at(db, effective_zone_id, name, rtype)
+        if held is not None and own_ip_id is not None and _is_own_alias(held, own_ip_id):
+            # The address already has this alias: nothing to write, nothing
+            # to refuse. It still occupies its name for the rest of the request.
+            pending.setdefault(name.lower(), []).append(
+                (rtype == "CNAME", f"{'an' if rtype.startswith('A') else 'a'} {rtype} alias")
+            )
+            continue
+        other = await find_cname_conflict(
+            db, effective_zone_id, view_id=None, name=name, record_type=rtype
+        )
+        if other is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, describe_cname_conflict(rtype, fqdn, other)
+            )
+        if rtype == host_rtype and name.lower() == hostname.strip().rstrip(".").lower():
+            if hostname.strip() != "gateway":
+                # #2106 — the same row as the host's own, written twice.
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    f"{fqdn} is the address's own {host_rtype} record already; "
+                    f"{'an' if rtype.startswith('A') else 'a'} {rtype} alias at the same "
+                    "name would duplicate it, and deleting the alias later would "
+                    "remove the host's record too. Pick another alias name.",
+                )
+        if held is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                await _alias_duplicate_detail(db, held, rtype, fqdn),
+            )
+        is_cname = rtype == "CNAME"
+        what = f"{'an' if rtype.startswith('A') else 'a'} {rtype} alias"
+        siblings = pending.setdefault(name.lower(), [])
+        clash = next((lbl for c, lbl in siblings if is_cname or c), None)
+        if clash is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{fqdn} would hold both {clash} and {what} from this "
+                "request. A CNAME must be the only record at its name (RFC 1034 "
+                "section 3.6.2, RFC 2181 section 10.1); PowerDNS and BIND both "
+                "refuse a zone that breaks this, and the server stops applying it.",
+            )
+        siblings.append((is_cname, what))
+
+
+async def _assert_alias_names_fit(
+    db: AsyncSession,
+    aliases: list[Any],
+    zone_id: uuid.UUID | None,
+) -> None:
+    """422 an alias whose name inside its zone passes 253 characters.
+
+    ``AliasInput`` checks the alias on its own; only here is the zone known.
+    A name longer than a DNS name can carry makes BIND refuse the whole zone
+    ("ran out of space"), so it is refused before anything is written —
+    ``_create_alias_records`` runs after the host record, which an agentless
+    primary has already applied by then. Mirrors that function's skips: no
+    zone, or a zone IPAM does not author, writes no alias, so refuses none.
+    """
+    if not aliases or zone_id is None:
+        return
+    zone = await db.get(DNSZone, zone_id)
+    if zone is None or not ipam_authors_zone(zone):
+        return
+    zone_domain = zone.name.rstrip(".")
+    for al in aliases:
+        fqdn = f"{al.name}.{zone_domain}"
+        if len(fqdn) > MAX_NAME_LEN:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"alias '{al.name}': its name in zone {zone_domain} is "
+                    f"{len(fqdn)} characters, over the {MAX_NAME_LEN} a DNS name "
+                    "can carry. BIND refuses a zone that holds it, which stops "
+                    "the server applying its configuration."
+                ),
+            )
+
+
 async def _create_alias_records(
     db: AsyncSession,
     ip: IPAddress,
@@ -1385,21 +1610,23 @@ async def _create_alias_records(
     for al in aliases:
         rtype = (getattr(al, "record_type", None) or al.get("record_type") or "CNAME").upper()
         # Callers using "A" on an IPv6 primary really mean AAAA; normalise.
-        if rtype == "A" and is_v6:
-            rtype = "AAAA"
+        rtype = _alias_written_type(rtype, is_v6=is_v6)
         name = (getattr(al, "name", None) or al.get("name") or "").strip().rstrip(".")
         if not name or rtype not in {"CNAME", "A", "AAAA"}:
             continue
-        # Skip if a conflicting record already exists for (zone, name, type)
-        dup = await db.execute(
-            select(DNSRecord).where(
-                DNSRecord.zone_id == effective_zone_id,
-                DNSRecord.name == name,
-                DNSRecord.record_type == rtype,
+        # A record already at (zone, name, type): the address's own alias
+        # (re-added, or the same alias twice in one request) is a no-op.
+        # Anything else was refused by ``_assert_alias_cname_rules`` before
+        # any write (#2122); this catches one that appeared since, so the
+        # alias is never dropped while the request reports success.
+        dup = await _alias_record_at(db, effective_zone_id, name, rtype)
+        if dup is not None:
+            if _is_own_alias(dup, ip.id):
+                continue
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                await _alias_duplicate_detail(db, dup, rtype, f"{name}.{zone_domain}"),
             )
-        )
-        if dup.scalar_one_or_none():
-            continue
         value = primary_fqdn if rtype == "CNAME" else str(ip.address)
         rec = DNSRecord(
             zone_id=effective_zone_id,
@@ -1408,6 +1635,7 @@ async def _create_alias_records(
             record_type=rtype,
             value=value,
             auto_generated=True,
+            ip_alias=True,  # #2084 — the marker every alias reader keys on
             ip_address_id=ip.id,
             created_by_user_id=ip.created_by_user_id,
         )
@@ -1522,25 +1750,180 @@ async def _operator_record_twin(
     """
     from app.services.dns.record_identity import find_identical_record  # noqa: PLC0415
 
-    # A PTR target is written with or without its trailing dot by hand.
-    values = {value}
-    if rtype == "PTR":
-        values.add(value.rstrip(".") if value.endswith(".") else value + ".")
-    for candidate in values:
-        found = await find_identical_record(
-            db,
-            zone_id,
-            view_id=None,
-            name=name,
-            record_type=rtype,
-            value=candidate,
-            priority=None,
-            weight=None,
-            port=None,
-        )
-        if found is not None and not found.auto_generated:
-            return found
+    if rtype.upper() == "PTR":
+        return await _operator_ptr_twin(db, zone_id, name=name, value=value)
+    found = await find_identical_record(
+        db,
+        zone_id,
+        view_id=None,
+        name=name,
+        record_type=rtype,
+        value=value,
+        priority=None,
+        weight=None,
+        port=None,
+    )
+    if found is not None and not found.auto_generated:
+        return found
     return None
+
+
+async def _operator_ptr_twin(
+    db: AsyncSession, zone_id: uuid.UUID, *, name: str, value: str
+) -> DNSRecord | None:
+    """The operator-written PTR IPAM's own would duplicate, or None (#2045).
+
+    A PTR is the same record when the servers SERVE the same target: compared
+    case-insensitively, and with a target written without its trailing dot
+    read the way the zone's servers read it. On BIND9, Technitium and Windows
+    Path A ``db1.example.com`` is relative to the reverse zone, so it names
+    ``db1.example.com.<zone>.`` and is not ours: IPAM writes its own PTR
+    beside it, and the operator's wrong one is logged so it can be found. On
+    the cloud providers and Windows Path B the same spelling is the absolute
+    name, and adopting it is what stops a duplicate the provider refuses.
+    """
+    from app.services.dns.record_identity import (  # noqa: PLC0415
+        ptr_target_key,
+        zone_target_readings,
+    )
+
+    readings = await zone_target_readings(db, [zone_id])
+    if zone_id not in readings:
+        return None
+    zone_name, relative = readings[zone_id]
+    want = ptr_target_key(value, zone_name, relative=relative)
+    rows = (
+        (
+            await db.execute(
+                select(DNSRecord).where(
+                    DNSRecord.zone_id == zone_id,
+                    DNSRecord.view_id.is_(None),
+                    func.lower(DNSRecord.name) == name.lower(),
+                    func.upper(DNSRecord.record_type) == "PTR",
+                    DNSRecord.auto_generated.is_(False),
+                    DNSRecord.priority.is_(None),
+                    DNSRecord.weight.is_(None),
+                    DNSRecord.port.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        if ptr_target_key(row.value, zone_name, relative=relative) == want:
+            return row
+    for row in rows:
+        if relative and ptr_target_key(row.value, zone_name, relative=False) == want:
+            # The operator meant our target and left off the trailing dot, so
+            # the servers answer a name under the reverse zone. Not adopted;
+            # IPAM's PTR now stands beside it and the reverse lookup answers
+            # both until the operator fixes or deletes theirs.
+            logger.warning(
+                "ipam_ptr_relative_operator_record",
+                zone=zone_name,
+                name=name,
+                operator_record_id=str(row.id),
+                operator_value=row.value,
+                detail=(
+                    f"PTR {row.value!r} has no trailing dot, so it is served as "
+                    f"{ptr_target_key(row.value, zone_name, relative=True)}; "
+                    f"IPAM wrote {value} beside it"
+                ),
+            )
+    return None
+
+
+def _name_too_long_for_zone(ip: IPAddress, zone_domain: str, strict: bool) -> bool:
+    """True when ``<hostname>.<zone>`` is not a legal DNS name (#2072).
+
+    ``strict`` raises the 422 instead (the request paths); otherwise the
+    caller skips the zone, and this logs why.
+    """
+    err = name_in_zone_error(ip.hostname or "", zone_domain, field="hostname")
+    if err is None:
+        return False
+    if strict:
+        raise HTTPException(status_code=422, detail=err)
+    logger.warning(
+        "ipam_dns_name_too_long",
+        ip=str(ip.address),
+        zone=zone_domain,
+        hostname_length=len(ip.hostname or ""),
+    )
+    return True
+
+
+async def _own_alias_clashes(
+    db: AsyncSession,
+    ip: IPAddress,
+    zone_ids: list[uuid.UUID],
+    forward_rtype: str,
+) -> dict[uuid.UUID, DNSRecord]:
+    """The address's own aliases that sit where its host record would go (#2106).
+
+    An alias is a row of the address too, but not its host record
+    (``ip_alias``, #2084). Naming the address after one of its A / AAAA
+    aliases leaves two identical rows at the name, and deleting the alias
+    then queues a delete for an RR the host record still claims, so the host
+    vanishes from the served zone. A CNAME alias there is a CNAME beside the
+    host's address record. Keyed by zone; a zone whose host record already
+    carries this name is left to the existing row (a duplicate that predates
+    this check is not a reason to retract the host).
+    """
+    if not zone_ids or not ip.hostname or ip.id is None:
+        return {}
+    name = ip.hostname.strip().rstrip(".").lower()
+    res = await db.execute(
+        select(DNSRecord).where(
+            DNSRecord.ip_address_id == ip.id,
+            DNSRecord.auto_generated.is_(True),
+            DNSRecord.ip_alias.is_(True),
+            DNSRecord.zone_id.in_(zone_ids),
+            func.lower(DNSRecord.name) == name,
+            DNSRecord.record_type.in_(["CNAME", forward_rtype]),
+        )
+    )
+    clashes: dict[uuid.UUID, DNSRecord] = {}
+    for alias in res.scalars().all():
+        clashes.setdefault(alias.zone_id, alias)
+    if not clashes:
+        return {}
+    held = await db.execute(
+        select(DNSRecord.zone_id).where(
+            DNSRecord.ip_address_id == ip.id,
+            DNSRecord.auto_generated.is_(True),
+            DNSRecord.ip_alias.is_(False),
+            DNSRecord.record_type.in_(["A", "AAAA"]),
+            DNSRecord.zone_id.in_(list(clashes)),
+            func.lower(DNSRecord.name) == name,
+        )
+    )
+    for zid in held.scalars().all():
+        clashes.pop(zid, None)
+    return clashes
+
+
+def _own_alias_clash_detail(ip: IPAddress, zone: DNSZone, alias: DNSRecord) -> str:
+    """The 409 for naming an address after its own alias, in the #2080 voice."""
+    fqdn = f"{ip.hostname}.{zone.name.rstrip('.')}"
+    host_rtype = "AAAA" if ":" in str(ip.address) else "A"
+    if alias.record_type == "CNAME":
+        what = (
+            f"{fqdn} is already a CNAME alias of this address (to {alias.value}, "
+            f"id {alias.id}), so it can hold no {host_rtype} record"
+        )
+    else:
+        what = (
+            f"{fqdn} is already {'an' if alias.record_type.startswith('A') else 'a'} "
+            f"{alias.record_type} alias of this address (id {alias.id}), so the "
+            f"address's own {host_rtype} record would duplicate it, and deleting the "
+            "alias later would remove the host's record too"
+        )
+    return (
+        f"{what}. Delete the alias first, or pick another hostname. A CNAME must be "
+        "the only record at its name (RFC 1034 section 3.6.2, RFC 2181 section 10.1)."
+    )
 
 
 async def _sync_dns_record(
@@ -1552,6 +1935,8 @@ async def _sync_dns_record(
     ttl: int | None = None,
     *,
     backfill_reverse_zone: bool = True,
+    strict: bool = False,
+    skip_own_alias: bool = False,
 ) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
@@ -1572,6 +1957,19 @@ async def _sync_dns_record(
     ran (or, with ``skip_reverse_zone``, deliberately did not run) the
     reverse-zone step, and the gateway placeholder's sync must not undo the
     opt-out (spatiumddi#1150).
+
+    ``strict=True`` (the request paths) answers a 422 naming ``hostname`` when
+    ``<hostname>.<zone>`` passes the 253-character DNS name limit (#2072);
+    otherwise (DDNS, importers, DHCP statics) the over-long name is skipped
+    and logged, because those paths must not fail a lease or a batch over one
+    row, and the name must not reach a zone BIND would then refuse whole.
+
+    ``skip_own_alias=True`` keeps ``strict`` but skips, rather than refuses,
+    a zone where one of the address's own A / AAAA aliases already holds the
+    hostname, as a background path does (#2106). Sync DNS passes it (#2118):
+    the alias already serves the name, so refusing there would block the rest
+    of the address's sync (a missing PTR) on every apply. A CNAME alias at
+    the name is still refused.
 
     Returns whether the sync had anything to do: False when the row carries
     no hostname, when there is no primary zone and no extra zone to publish
@@ -1651,9 +2049,18 @@ async def _sync_dns_record(
             pass
 
     zone_domain = zone.name.rstrip(".") if zone else ""
-    fqdn = f"{ip.hostname}.{zone_domain}" if zone_domain else None
+    # #2072 — ``<hostname>.<zone>`` past 253 characters is no DNS name, and
+    # BIND refuses the zone holding it and the reverse zone whose PTR names
+    # it. Strict paths 422 here, before anything is written. Otherwise the
+    # primary zone drops out of the desired set below, so a record an earlier
+    # name published there is retracted (as is its PTR, ``fqdn`` being None)
+    # rather than left naming a host the row no longer carries.
+    primary_too_long = bool(zone_domain) and _name_too_long_for_zone(ip, zone_domain, strict)
+    fqdn = f"{ip.hostname}.{zone_domain}" if zone_domain and not primary_too_long else None
     if fqdn:
         ip.fqdn = fqdn
+    elif primary_too_long:
+        ip.fqdn = None
 
     # Forward record type depends on the address family: AAAA for IPv6, A for IPv4.
     try:
@@ -1674,24 +2081,12 @@ async def _sync_dns_record(
     # Desired set of forward zones: primary + extras, deduped, with
     # the primary always first. ``extra_zone_ids`` is JSONB list[str];
     # each entry is a UUID stored as string.
-    desired_zone_ids: list[uuid.UUID] = []
     # #1493 — whether the primary zone's forward record was skipped for a
     # CNAME at the hostname, and whether any forward record was published.
     primary_cname_skip = False
     forward_published = False
-    seen_extras: set[uuid.UUID] = set()
-    if effective_zone_id is not None:
-        desired_zone_ids.append(effective_zone_id)
-        seen_extras.add(effective_zone_id)
-    for raw in ip.extra_zone_ids or []:
-        try:
-            extra_uuid = uuid.UUID(str(raw))
-        except (ValueError, TypeError):
-            continue
-        if extra_uuid in seen_extras:
-            continue
-        seen_extras.add(extra_uuid)
-        desired_zone_ids.append(extra_uuid)
+    # One ordering for this and the drift check (#2107).
+    desired_zone_ids = forward_zone_ids_in_order(effective_zone_id, ip.extra_zone_ids)
 
     # #1633 — IPAM writes a forward record only into a zone it serves as
     # primary, the rule #1419 set for PTRs. A forwarder, a secondary or a stub,
@@ -1706,8 +2101,54 @@ async def _sync_dns_record(
             zone if desired_zone_id == effective_zone_id else await db.get(DNSZone, desired_zone_id)
         )
         if target is not None and ipam_authors_zone(target):
+            if desired_zone_id == effective_zone_id:
+                if primary_too_long:
+                    continue  # #2072 — logged above
+            elif _name_too_long_for_zone(ip, target.name.rstrip("."), strict):
+                continue  # #2072 — an extra zone the name does not fit in
             authored_zone_ids.append(desired_zone_id)
     desired_zone_ids = authored_zone_ids
+
+    # #2106 — a hostname that lands on one of the address's own aliases.
+    # Strict paths refuse it (409, before anything is written); a background
+    # path skips that zone and logs, so no duplicate row is written and no
+    # lease or batch fails over it.
+    if ip.hostname != "gateway":
+        alias_clashes = await _own_alias_clashes(db, ip, desired_zone_ids, forward_rtype)
+        if alias_clashes:
+            # #2118 — Sync DNS skips an A / AAAA alias clash like a background
+            # path, and refuses only a CNAME one.
+            refused = (
+                {z: a for z, a in alias_clashes.items() if a.record_type == "CNAME"}
+                if skip_own_alias
+                else alias_clashes
+            )
+            if strict and refused:
+                first_zone_id, first_alias = next(iter(refused.items()))
+                clash_zone = (
+                    zone
+                    if first_zone_id == effective_zone_id
+                    else await db.get(DNSZone, first_zone_id)
+                )
+                if clash_zone is not None:
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        _own_alias_clash_detail(ip, clash_zone, first_alias),
+                    )
+            # A CNAME alias is left to the #1441 skip in Phase 2, which also
+            # retracts the PTR (#1493: no PTR may name a CNAME) and reports
+            # the skip to the DDNS path. An A / AAAA alias already answers
+            # ``<hostname> -> address``, so dropping the zone retracts only
+            # the old name: DNS ends up as a correct rename would leave it.
+            dup_zones = {z for z, a in alias_clashes.items() if a.record_type != "CNAME"}
+            if dup_zones:
+                logger.warning(
+                    "ipam_dns_record_skipped_own_alias",
+                    address=str(ip.address),
+                    hostname=ip.hostname,
+                    zones=[str(z) for z in dup_zones],
+                )
+                desired_zone_ids = [z for z in desired_zone_ids if z not in dup_zones]
 
     # Fetch any pre-existing auto-generated A/AAAA for this IP across
     # ALL zones — fanout cleanup needs the full picture. The address
@@ -1716,6 +2157,10 @@ async def _sync_dns_record(
         select(DNSRecord).where(
             DNSRecord.ip_address_id == ip.id,
             DNSRecord.auto_generated.is_(True),
+            # #2084 — the host record(s) only: an alias is also an A / AAAA
+            # tied to this address, and must be neither renamed into the host
+            # nor retracted as a zone the host does not publish to.
+            DNSRecord.ip_alias.is_(False),
             DNSRecord.record_type.in_(["A", "AAAA"]),
         )
     )
@@ -2056,6 +2501,11 @@ async def _sync_dns_record(
             # forward zone" (not a mapped column; lives for this request).
             ip._dns_skipped_cname = True  # type: ignore[attr-defined]
             return False
+        if primary_too_long and not forward_published:
+            # #2072 — read by the DDNS path the same way, so it reports the
+            # over-long name, not "no forward zone".
+            ip._dns_skipped_too_long = True  # type: ignore[attr-defined]
+            return False
         return True
     try:
         ip_obj = ipaddress.ip_address(str(ip.address))
@@ -2348,7 +2798,7 @@ class IPSpaceCreate(BaseModel):
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     # Fragile-device probe suppression (#722). Set at any level of the
     # space → block → subnet chain; ORs downward and cannot be
     # overridden from below.
@@ -2398,7 +2848,7 @@ class IPSpaceUpdate(BaseModel):
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     do_not_probe: bool | None = None
     do_not_probe_reason: str | None = None
     vrf_id: uuid.UUID | None = None
@@ -2478,7 +2928,7 @@ class IPBlockCreate(BaseModel):
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     ddns_inherit_settings: bool = True
     # Fragile-device probe suppression (#722) — see IPSpaceCreate.
     do_not_probe: bool = False
@@ -2529,7 +2979,7 @@ class IPBlockUpdate(BaseModel):
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     ddns_inherit_settings: bool | None = None
     do_not_probe: bool | None = None
     do_not_probe_reason: str | None = None
@@ -2641,7 +3091,7 @@ class SubnetCreate(BaseModel):
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     ddns_inherit_settings: bool = True
     # Device profiling — see Subnet model. Default off because nmap is loud.
     auto_profile_on_dhcp_lease: bool = False
@@ -2655,6 +3105,7 @@ class SubnetCreate(BaseModel):
     # still be suppressed by an ancestor, in which case no sweep runs.
     do_not_probe: bool = False
     do_not_probe_reason: str = ""
+    show_free_ranges: bool | None = None  # #2137 — None = default rule
     ipv6_allocation_policy: str = "random"
     # Compliance / classification flags — see Subnet model.
     pci_scope: bool = False
@@ -2805,7 +3256,7 @@ class SubnetUpdate(BaseModel):
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
     ddns_domain_override: DDNSDomainOverride = None
-    ddns_ttl: int | None = None
+    ddns_ttl: int | None = Field(None, ge=0, le=DNS_TTL_MAX)  # #2073
     ddns_inherit_settings: bool | None = None
     auto_profile_on_dhcp_lease: bool | None = None
     auto_profile_preset: str | None = None
@@ -2814,6 +3265,7 @@ class SubnetUpdate(BaseModel):
     discovery_interval_minutes: int | None = None
     do_not_probe: bool | None = None
     do_not_probe_reason: str | None = None
+    show_free_ranges: bool | None = None  # #2137 — explicit null restores default
     ipv6_allocation_policy: str | None = None
     pci_scope: bool | None = None
     hipaa_scope: bool | None = None
@@ -2978,6 +3430,11 @@ class SubnetResponse(BaseModel):
     # per-row would put a hierarchy walk inside every list page.
     do_not_probe: bool = False
     do_not_probe_reason: str = ""
+    # #2137 — the subnet's own choice; None = use the default rule.
+    show_free_ranges: bool | None = None
+    # #2137 — name of the integration mirroring this subnet (kubernetes,
+    # tailscale, …), derived from the ownership FKs; None when operator-owned.
+    integration_owner: str | None = None
     ipv6_allocation_policy: str = "random"
     pci_scope: bool = False
     hipaa_scope: bool = False
@@ -3012,18 +3469,25 @@ class SubnetResponse(BaseModel):
     def _attach_vlan(cls, data: Any) -> Any:
         # When serializing a Subnet ORM instance, enrich with nested `vlan` from `vlan_ref`.
         if isinstance(data, Subnet):
+            from app.services.integration_ownership import owning_integration
+
             vref = getattr(data, "vlan_ref", None)
-            if vref is not None:
+            if vref is None:
                 return {
                     **{c.name: getattr(data, c.name) for c in data.__table__.columns},
-                    "vlan": {
-                        "id": vref.id,
-                        "router_id": vref.router_id,
-                        "router_name": getattr(getattr(vref, "router", None), "name", None),
-                        "vlan_id": vref.vlan_id,
-                        "name": vref.name,
-                    },
+                    "integration_owner": owning_integration(data),
                 }
+            return {
+                **{c.name: getattr(data, c.name) for c in data.__table__.columns},
+                "integration_owner": owning_integration(data),
+                "vlan": {
+                    "id": vref.id,
+                    "router_id": vref.router_id,
+                    "router_name": getattr(getattr(vref, "router", None), "name", None),
+                    "vlan_id": vref.vlan_id,
+                    "name": vref.name,
+                },
+            }
         return data
 
 
@@ -3084,6 +3548,27 @@ class AliasInput(BaseModel):
         if not v:
             raise ValueError("alias name is required")
         return v
+
+    @model_validator(mode="after")
+    def _owner_rule(self) -> "AliasInput":
+        """Apply the DNS record API's owner-name rules to the alias (#2070).
+
+        The same two checks ``POST /dns/.../records`` runs: the RFC 2181
+        owner syntax, then BIND's check-names rule for the record type (an
+        A/AAAA owner must be a host name, so ``under_score`` is refused as
+        an A alias; a CNAME owner may keep an underscore).
+        """
+        owner = validate_record_owner(self.name, field=f"alias '{self.name}'")
+        err = bind_check_names_error(self.record_type, owner, None, origin="")
+        if err is not None:
+            raise ValueError(f"alias '{self.name}': {err}")
+        # Store the name the checks passed, as the record API does: an
+        # internationalized alias becomes its ``xn--`` A-label and the name
+        # is lower-cased. Keeping the raw form would write ``café`` into the
+        # zone, which check-names refuses for an A record even though its
+        # A-label passed.
+        self.name = owner
+        return self
 
 
 def _validate_role(v: Any) -> Any:
@@ -3586,7 +4071,11 @@ async def get_effective_space_dns(
     )
 
 
-@router.get("/spaces/{space_id}/effective-dhcp", response_model=EffectiveDhcpResponse)
+@router.get(
+    "/spaces/{space_id}/effective-dhcp",
+    response_model=EffectiveDhcpResponse,
+    dependencies=[Depends(require_module("core.dhcp"))],
+)
 async def get_effective_space_dhcp(
     space_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> EffectiveDhcpResponse:
@@ -4597,7 +5086,11 @@ async def get_effective_block_dns(
     )
 
 
-@router.get("/blocks/{block_id}/effective-dhcp", response_model=EffectiveDhcpResponse)
+@router.get(
+    "/blocks/{block_id}/effective-dhcp",
+    response_model=EffectiveDhcpResponse,
+    dependencies=[Depends(require_module("core.dhcp"))],
+)
 async def get_effective_block_dhcp(
     block_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> EffectiveDhcpResponse:
@@ -5751,7 +6244,11 @@ async def get_effective_subnet_dns(
     )
 
 
-@router.get("/subnets/{subnet_id}/effective-dhcp", response_model=EffectiveDhcpResponse)
+@router.get(
+    "/subnets/{subnet_id}/effective-dhcp",
+    response_model=EffectiveDhcpResponse,
+    dependencies=[Depends(require_module("core.dhcp"))],
+)
 async def get_effective_subnet_dhcp(
     subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> EffectiveDhcpResponse:
@@ -5904,6 +6401,7 @@ async def update_subnet(
         "site_id",
         "ddns_domain_override",
         "ddns_ttl",
+        "show_free_ranges",  # #2137 — null restores the default
     }
     changes = body.model_dump(exclude_none=True, exclude=exclude_fields)
     changes_for_audit = body.model_dump(mode="json", exclude_none=True, exclude=exclude_fields)
@@ -5947,7 +6445,14 @@ async def update_subnet(
     # Nullable scalars/FKs the operator must be able to clear (#502) — same
     # explicit model_fields_set treatment as decom_date, because exclude_none
     # drops a null and the clear would otherwise be a silent no-op.
-    for _field in ("gateway", "customer_id", "site_id", "ddns_domain_override", "ddns_ttl"):
+    for _field in (
+        "gateway",
+        "customer_id",
+        "site_id",
+        "ddns_domain_override",
+        "ddns_ttl",
+        "show_free_ranges",
+    ):
         if _field in body.model_fields_set:
             _val = getattr(body, _field)
             setattr(subnet, _field, _val)
@@ -6965,6 +7470,8 @@ class _DnsSyncStaleResp(BaseModel):
     name: str
     value: str
     reason: str
+    # Live IPAM row the record hangs off; null for ``ip-deleted`` (#2101).
+    ip_id: uuid.UUID | None = None
 
 
 class DnsSyncPreviewResponse(BaseModel):
@@ -7104,6 +7611,7 @@ async def _apply_dns_sync(
         ips_res = await db.execute(q)
         # Cache subnets so we don't re-fetch per IP in the same subnet.
         subnet_cache: dict[uuid.UUID, Subnet | None] = {}
+        wrote_ip_ids: set[uuid.UUID] = set()
         # Batch the forward/reverse ops per zone so an agentless Windows-DNS
         # primary takes one WinRM round trip per zone, matching the delete
         # branch below (issue #341).
@@ -7117,11 +7625,29 @@ async def _apply_dns_sync(
                     errors.append(f"{ip.address}: parent subnet missing")
                     continue
                 try:
-                    await _sync_dns_record(db, ip, sn, action="create")
+                    # #2072 — strict, so a name too long for its zone is
+                    # reported in ``errors`` instead of counted as synced. The
+                    # refusal comes before anything is written for this IP.
+                    # #2118 — an address whose own A / AAAA alias already
+                    # serves its name is skipped there, not refused, so its
+                    # missing PTR is still written.
+                    # #2352 — count only an address the sync wrote for: ops
+                    # queued in the batch collector. One whose records already
+                    # exist as desired queues nothing and counts as unchanged.
+                    collector = _dns_op_collector.get()
+                    ops_before = len(collector) if collector is not None else 0
+                    await _sync_dns_record(
+                        db, ip, sn, action="create", strict=True, skip_own_alias=True
+                    )
+                    if collector is not None and len(collector) == ops_before:
+                        continue
+                    wrote_ip_ids.add(ip.id)
                     if ip.id in body.create_for_ip_ids:
                         created += 1
                     else:
                         updated += 1
+                except HTTPException as exc:
+                    errors.append(f"{ip.address}: {exc.detail}")
                 except Exception as exc:
                     errors.append(f"{ip.address}: {exc}")
         # #1536 — a batched agentless op that came back ``failed`` was
@@ -7142,6 +7668,8 @@ async def _apply_dns_sync(
                 f"{fip.address}: DNS create failed — "
                 f"{getattr(op_row, 'last_error', None) or 'unknown'}"
             )
+            if fip.id not in wrote_ip_ids:
+                continue
             if fip.id in body.create_for_ip_ids:
                 created = max(0, created - 1)
             elif fip.id in ip_ids_to_sync:
@@ -7375,7 +7903,7 @@ async def dns_sync_commit_block(
                 "dns-sync",
                 "block",
                 str(block.id),
-                block.network,
+                str(block.network),
                 new_value={
                     "created": created,
                     "updated": updated,
@@ -7574,14 +8102,12 @@ async def _alias_counts_for(db: AsyncSession, ips: list[IPAddress]) -> dict[uuid
     if not ips:
         return {}
     ip_ids = [ip.id for ip in ips]
-    primary_ids = {ip.dns_record_id for ip in ips if ip.dns_record_id is not None}
     conds = [
         DNSRecord.ip_address_id.in_(ip_ids),
         DNSRecord.auto_generated.is_(True),
-        DNSRecord.record_type.in_(["CNAME", "A"]),
+        DNSRecord.ip_alias.is_(True),  # #2084
+        DNSRecord.record_type.in_(["CNAME", "A", "AAAA"]),
     ]
-    if primary_ids:
-        conds.append(DNSRecord.id.notin_(primary_ids))
     q = (
         select(DNSRecord.ip_address_id, func.count(DNSRecord.id))
         .where(*conds)
@@ -7723,7 +8249,11 @@ async def _enrich_addresses(db: AsyncSession, rows: list[IPAddress]) -> None:
     page — never the whole matching set — so the bulk lookups stay cheap.
     """
     counts = await _alias_counts_for(db, rows)
-    nat_counts = await _nat_mapping_counts_for(db, rows)
+    # #2100 — with NAT mappings switched off the count is neither shown nor
+    # worth a query; report 0 rather than leak a hidden surface's data.
+    nat_counts = (
+        await _nat_mapping_counts_for(db, rows) if await is_module_enabled(db, "ipam.nat") else {}
+    )
     vendors = await bulk_lookup_vendors(
         db, [str(ip.mac_address) if ip.mac_address else None for ip in rows]
     )
@@ -7896,6 +8426,8 @@ async def create_address(
     # check sees the same forward_zone_id that will land on the row.
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
+    if body.hostname:
+        await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
         warnings = await _check_ip_collisions(
             db,
@@ -7926,6 +8458,14 @@ async def create_address(
         if warnings:
             raise _collision_http_exc(warnings)
 
+    await _assert_alias_cname_rules(
+        db,
+        subnet,
+        body.aliases,
+        hostname=body.hostname,
+        address=body.address,
+        zone_id=explicit_zone,
+    )
     ip = IPAddress(
         subnet_id=subnet_id,
         created_by_user_id=current_user.id,
@@ -7940,7 +8480,7 @@ async def create_address(
         await _record_mac_history(db, ip.id, body.mac_address)
 
     # Sync DNS A record
-    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
+    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
     # User-specified alias records (CNAME / A) tied to this IP
     if body.aliases:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
@@ -8190,6 +8730,32 @@ async def list_mac_history(
 # would be circular. See ``_register_network_context_endpoint`` below.
 
 
+async def _clear_ip_dns_zone(db: AsyncSession, ip: IPAddress, subnet: Subnet) -> bool:
+    """Remove an address's DNS presence: the operator picked "None" as its zone.
+
+    The one clear path, shared by single Edit and Bulk edit (#2172) so the two
+    cannot diverge. It deletes every auto-generated record the row owns — the
+    forward A/AAAA in its zone and in any extra zone, the PTR, and its aliases
+    (#2084) — queueing a delete op for each zone IPAM authors. It then nulls
+    ``forward_zone_id`` and empties ``extra_zone_ids``: with either left set,
+    the next Sync DNS (and the scheduled auto-sync) lists the record missing
+    there and publishes it again, as does a later unrelated edit. A subnet
+    that has a forward zone of its own still claims the host: the address
+    follows it, so Sync DNS offers the record there.
+
+    It must go through ``action="delete"``: an ``"update"`` with
+    ``zone_id=None`` means "resolve a zone", which falls back to the subnet's
+    zone (a move) or the row's own ``forward_zone_id`` (a re-publish in place),
+    and removes nothing (#502, #2172). An address with no records is a no-op.
+
+    Returns whether any record was removed.
+    """
+    removed = await _sync_dns_record(db, ip, subnet, action="delete")
+    ip.forward_zone_id = None
+    ip.extra_zone_ids = []
+    return removed
+
+
 @router.put("/addresses/{address_id}", response_model=IPAddressResponse)
 async def update_address(
     address_id: uuid.UUID, body: IPAddressUpdate, current_user: CurrentUser, db: DB
@@ -8372,18 +8938,26 @@ async def update_address(
         # falls back to the subnet's effective zone (and early-returns on an
         # empty hostname), so it would NOT actually remove the records
         # (#502, and the bot review of the #493 fix).
-        await _sync_dns_record(db, ip, subnet, action="delete")
         if zone_cleared:
-            # Make the removal stick: without this a later unrelated edit
-            # would preserve forward_zone_id and re-create the record.
-            ip.forward_zone_id = None
+            # Also nulls forward_zone_id and empties extra_zone_ids, so the
+            # removal sticks: otherwise Sync DNS, or a later unrelated edit,
+            # would publish the records there again (#2172). The clear wins
+            # over extra_zone_ids sent in the same request.
+            if ip.extra_zone_ids:
+                old["extra_zone_ids"] = list(ip.extra_zone_ids)
+                changes_for_audit["extra_zone_ids"] = []
+            await _clear_ip_dns_zone(db, ip, subnet)
+        else:
+            await _sync_dns_record(db, ip, subnet, action="delete")
     elif subnet and ("hostname" in changes or dns_zone_explicit or extras_changed):
         # zone_cleared is handled above, so an explicit zone here is a real
         # UUID; otherwise preserve the IP's current forward zone (#493).
         zone_id = uuid.UUID(body.dns_zone_id) if dns_zone_explicit else ip.forward_zone_id
-        await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update")
+        await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update", strict=True)
     elif subnet and restoring:
-        await _sync_dns_record(db, ip, subnet, zone_id=ip.forward_zone_id, action="create")
+        await _sync_dns_record(
+            db, ip, subnet, zone_id=ip.forward_zone_id, action="create", strict=True
+        )
 
     # #1628 — keep the DHCP reservation in step with the row: a MAC /
     # hostname change lands on the linked DHCPStaticAssignment, flipping
@@ -8437,30 +9011,36 @@ async def list_aliases(address_id: uuid.UUID, current_user: CurrentUser, db: DB)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
     _enforce_subnet_token_scope(current_user, ip.subnet_id)
-    # Aliases are auto-generated records linked to this IP that aren't the
-    # primary forward A (which is stored separately on ip.dns_record_id).
+    # Aliases are the records marked ``ip_alias`` (#2084): the host record(s),
+    # including one published into an extra zone, are not.
     res = await db.execute(
         select(DNSRecord).where(
             DNSRecord.ip_address_id == ip.id,
             DNSRecord.auto_generated.is_(True),
-            DNSRecord.record_type.in_(["CNAME", "A"]),
+            DNSRecord.ip_alias.is_(True),
+            DNSRecord.record_type.in_(["CNAME", "A", "AAAA"]),
         )
     )
-    out = []
-    for r in res.scalars().all():
-        if ip.dns_record_id is not None and r.id == ip.dns_record_id:
-            continue  # exclude the primary A
-        out.append(r)
-    return out
+    return list(res.scalars().all())
 
 
 @router.post(
     "/addresses/{address_id}/aliases",
     response_model=AliasResponse,
     status_code=status.HTTP_201_CREATED,
+    responses={
+        200: {
+            "model": AliasResponse,
+            "description": "The address already has this alias; it is returned unchanged.",
+        }
+    },
 )
 async def add_alias(
-    address_id: uuid.UUID, body: AliasInput, current_user: CurrentUser, db: DB
+    address_id: uuid.UUID,
+    body: AliasInput,
+    current_user: CurrentUser,
+    db: DB,
+    response: Response,
 ) -> DNSRecord:
     ip = await db.get(IPAddress, address_id)
     if ip is None:
@@ -8485,14 +9065,38 @@ async def add_alias(
                 "records into it."
             ),
         )
+    if ip.hostname:
+        await _assert_alias_names_fit(db, [body], zone_id)
+    await _assert_alias_cname_rules(
+        db,
+        subnet,
+        [body],
+        hostname=ip.hostname,
+        address=ip.address,
+        zone_id=zone_id,
+        own_ip_id=ip.id,
+    )
+    # Find the record by the type that is written: an A alias on an IPv6
+    # address is stored as AAAA (#2081).
+    try:
+        is_v6 = isinstance(ipaddress.ip_address(str(ip.address)), ipaddress.IPv6Address)
+    except ValueError:
+        is_v6 = False
+    written_type = _alias_written_type(body.record_type, is_v6=is_v6)
+    # #2122 — an alias the address already has is returned as it stands,
+    # with 200 rather than 201: nothing is created, so nothing is audited.
+    existing = await _alias_record_at(db, zone_id, body.name, written_type)
+    if existing is not None and _is_own_alias(existing, ip.id):
+        response.status_code = status.HTTP_200_OK
+        return existing
     await _create_alias_records(db, ip, subnet, [body], zone_id=zone_id)
-    # Find the just-created record
     res = await db.execute(
         select(DNSRecord).where(
             DNSRecord.zone_id == zone_id,
             DNSRecord.name == body.name,
-            DNSRecord.record_type == body.record_type,
+            DNSRecord.record_type == written_type,
             DNSRecord.ip_address_id == ip.id,
+            DNSRecord.ip_alias.is_(True),
         )
     )
     rec = res.scalar_one_or_none()
@@ -8534,10 +9138,12 @@ async def delete_alias(
     rec = await db.get(DNSRecord, record_id)
     if rec is None or rec.ip_address_id != ip.id:
         raise HTTPException(status_code=404, detail="Alias not found")
-    if ip.dns_record_id == rec.id:
+    if not rec.ip_alias:
+        # #2084 — a host record (the primary, or one published into an extra
+        # zone) or a PTR is not an alias, whatever the address links to.
         raise HTTPException(
             status_code=409,
-            detail="Can't delete the primary A record — change the IP's hostname or delete the IP instead.",
+            detail="Can't delete the address's own DNS record — change the IP's hostname, its extra zones, or delete the IP instead.",
         )
     zone = await db.get(DNSZone, rec.zone_id)
     if zone is not None:
@@ -8919,7 +9525,20 @@ async def purge_orphans(
 
 _BULK_MAX_IPS = 1024
 _BULK_ALLOC_ALLOWED_STATUSES = frozenset({"allocated", "reserved", "deprecated"})
-_HOSTNAME_LABEL_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,62})$")
+# Token format specs the console's live preview also implements (#2071), for
+# ``{n}`` and ``{oct1}``-``{oct4}`` alike: plain, ``d``, ``x`` / ``X``, each
+# optionally zero-padded to a width of at most 99 (``03``, ``03d``, ``04x``).
+# Anything else renders differently in Python and in the browser (``{n:_}``,
+# ``{n:,}``, ``{oct4:03}`` on a string octet gives ``100``) or pads with spaces
+# (``{n:5d}``), so it is refused instead of previewing one name and storing
+# another. The width cap also stops ``{n:0999999999d}`` allocating a gigabyte
+# per candidate.
+# Matched with ``fullmatch``: ``$`` also matches before a trailing newline,
+# which let ``{n:d\n}`` through to render as the unpadded fallback.
+_BULK_SPEC_RE = re.compile(r"(?:0[1-9][0-9]?)?[dxX]?")
+# Upper bound on the iterator: the browser computes names with IEEE doubles,
+# which stop being exact integers past 2**53, and render 1e21 as ``1e+21``.
+_BULK_TEMPLATE_START_MAX = 999_999_999
 _BULK_TEMPLATE_FIELDS: frozenset[str] = frozenset({"n", "oct1", "oct2", "oct3", "oct4"})
 
 
@@ -8937,6 +9556,40 @@ def _bulk_template_has_token(template: str) -> bool:
         if field_name in _BULK_TEMPLATE_FIELDS:
             return True
     return False
+
+
+def _bulk_template_format_error(template: str) -> str | None:
+    """Reason the template uses a token form the live preview can't mirror."""
+    if not template.isascii():
+        # validate_host_label would IDNA-encode a unicode name to ``xn--…``,
+        # which the console cannot preview; bulk names stay ASCII.
+        return "Template must be ASCII; host names are letters, digits and hyphens."
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError as exc:
+        return f"Template is malformed: {exc}"
+    for _literal, field_name, spec, conversion in parsed:
+        if field_name is None:
+            continue
+        if conversion:
+            return f"Template token {{{field_name}!{conversion}}}: conversions are not supported."
+        if field_name in _BULK_TEMPLATE_FIELDS and not _BULK_SPEC_RE.fullmatch(spec or ""):
+            return (
+                f"Template token {{{field_name}:{spec}}} is not supported; use "
+                f"{{{field_name}}}, {{{field_name}:03d}} (zero-pad), "
+                f"{{{field_name}:x}} or {{{field_name}:X}}."
+            )
+    return None
+
+
+def _bulk_stored_hostname(rendered: str) -> str:
+    """The name bulk allocate stores for one rendered template (#2071).
+
+    Raises ``ValueError`` when the rendering is not a host label. Pinned
+    against the console's copy (``frontend/src/lib/bulk-allocate-template.ts``)
+    by the shared vectors in ``bulk-allocate-template.vectors.json``.
+    """
+    return validate_host_label(rendered, field="hostname")
 
 
 def _expand_bulk_template(
@@ -8958,9 +9611,10 @@ def _expand_bulk_template(
     Replaced by Python's stdlib ``string.Formatter`` parser, which is
     a C-implemented linear-time tokenizer — exactly the grammar we
     want anyway (``{n}`` / ``{n:03d}`` / ``{oct1}``) without the
-    custom regex. Bad format specs degrade to ``str(n)`` rather than
-    raising so preview still renders something the operator can
-    correct."""
+    custom regex. A spec ``format`` refuses degrades to ``str(value)``
+    rather than raising; the IPAM bulk path refuses such specs up front
+    (``_bulk_template_format_error``, #2071), and the multicast path, which
+    has no browser-side preview to disagree with, renders the fallback."""
     octets = str(ip_obj).split(".") if isinstance(ip_obj, ipaddress.IPv4Address) else []
 
     def _value_for(field_name: str) -> str | int | None:
@@ -8968,7 +9622,9 @@ def _expand_bulk_template(
             return n
         if len(field_name) == 4 and field_name.startswith("oct") and field_name[3] in "1234":
             idx = int(field_name[3]) - 1
-            return octets[idx] if 0 <= idx < len(octets) else ""
+            # An int, so ``{oct4:03d}`` pads like ``{n:03d}`` (as a string
+            # octet ``d`` raised and the spec was silently dropped).
+            return int(octets[idx]) if 0 <= idx < len(octets) else ""
         return None  # unknown token — leave literal
 
     formatter = string.Formatter()
@@ -9012,7 +9668,7 @@ class BulkAllocateRequest(BaseModel):
     range_start: str
     range_end: str
     hostname_template: str = Field(min_length=1, max_length=128)
-    template_start: int = 1
+    template_start: int = Field(default=1, ge=0, le=_BULK_TEMPLATE_START_MAX)
     status: str = "allocated"
     description: str | None = None
     dns_zone_id: str | None = None
@@ -9093,15 +9749,36 @@ async def _build_bulk_allocate_candidates(
             detail=f"Range too large ({total} IPs); max {_BULK_MAX_IPS} per call",
         )
 
-    # Validate the template against the first candidate. RFC 1035 label
-    # rules: ≤ 63 chars, alphanumeric + hyphen, no leading hyphen.
-    probe = _expand_bulk_template(body.hostname_template, start, body.template_start)
-    if not probe or not _HOSTNAME_LABEL_RE.match(probe):
+    # Every generated name must be a host label by the rule the single
+    # allocate path applies to each label of its hostname (core/dns_names,
+    # #2071); the stored name is the normalized (lower-cased) one, as there,
+    # so preview == stored.
+    fmt_err = _bulk_template_format_error(body.hostname_template)
+    if fmt_err:
+        raise HTTPException(status_code=422, detail=fmt_err)
+    hostnames: list[str] = []
+    bad_names: list[str] = []
+    bad_count = 0
+    for idx in range(total):
+        ip_obj = ipaddress.ip_address(int(start) + idx)
+        raw = _expand_bulk_template(body.hostname_template, ip_obj, body.template_start + idx)
+        try:
+            hostnames.append(_bulk_stored_hostname(raw))
+        except ValueError as exc:
+            hostnames.append(raw)
+            bad_count += 1
+            if len(bad_names) < 5:
+                bad_names.append(f"#{idx + 1} ({ip_obj}) '{raw}': {exc}")
+    if bad_count:
+        more = f" (and {bad_count - len(bad_names)} more)" if bad_count > len(bad_names) else ""
         raise HTTPException(
             status_code=422,
             detail=(
-                f"Template produces invalid hostname for range_start: '{probe}'. "
-                "Hostnames must match ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$."
+                f"Template produces {bad_count} invalid host name(s): "
+                + "; ".join(bad_names)
+                + more
+                + ". Host names are letters, digits and hyphens, with no leading or "
+                "trailing hyphen, at most 63 characters."
             ),
         )
 
@@ -9125,7 +9802,7 @@ async def _build_bulk_allocate_candidates(
         ip_int = int(start) + idx
         ip_obj = ipaddress.ip_address(ip_int)
         ip_str = str(ip_obj)
-        hostname = _expand_bulk_template(body.hostname_template, ip_obj, body.template_start + idx)
+        hostname = hostnames[idx]
         items.append(
             BulkAllocateItem(
                 address=ip_str,
@@ -9312,7 +9989,9 @@ async def bulk_allocate_commit(
             await db.flush()
 
             if body.create_dns_records:
-                await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
+                await _sync_dns_record(
+                    db, ip, subnet, zone_id=explicit_zone, action="create", strict=True
+                )
 
             db.add(
                 _audit(
@@ -9518,6 +10197,8 @@ async def allocate_next_ip(
     )
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
+    if body.hostname:
+        await _assert_alias_names_fit(db, body.aliases, effective_zone)
     if not body.force:
         warnings = await _check_ip_collisions(
             db,
@@ -9575,6 +10256,14 @@ async def allocate_next_ip(
         if public_warnings:
             raise _collision_http_exc(public_warnings)
 
+    await _assert_alias_cname_rules(
+        db,
+        subnet,
+        body.aliases,
+        hostname=body.hostname,
+        address=chosen,
+        zone_id=explicit_zone,
+    )
     ip = IPAddress(
         subnet_id=subnet_id,
         address=str(chosen),
@@ -9597,7 +10286,7 @@ async def allocate_next_ip(
         await _record_mac_history(db, ip.id, body.mac_address)
 
     # Sync DNS A record
-    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
+    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create", strict=True)
     # User-specified alias records (CNAME / A) tied to this IP
     if body.aliases:
         await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
@@ -10070,7 +10759,7 @@ async def list_subnet_aliases(
 ) -> list[SubnetAliasResponse]:
     """List every user-added DNS alias (CNAME or secondary A) for IPs in this subnet.
 
-    Primary A records (pointed to by ``IPAddress.dns_record_id``) are excluded.
+    The address's own host records are excluded (aliases carry ``ip_alias``, #2084).
     """
     if await db.get(Subnet, subnet_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
@@ -10083,14 +10772,12 @@ async def list_subnet_aliases(
     if not ips:
         return []
     ip_by_id = {ip.id: ip for ip in ips}
-    primary_ids = {ip.dns_record_id for ip in ips if ip.dns_record_id is not None}
     conds = [
         DNSRecord.ip_address_id.in_(list(ip_by_id.keys())),
         DNSRecord.auto_generated.is_(True),
-        DNSRecord.record_type.in_(["CNAME", "A"]),
+        DNSRecord.ip_alias.is_(True),  # #2084
+        DNSRecord.record_type.in_(["CNAME", "A", "AAAA"]),
     ]
-    if primary_ids:
-        conds.append(DNSRecord.id.notin_(primary_ids))
     records = list((await db.execute(select(DNSRecord).where(*conds))).scalars().all())
     out: list[SubnetAliasResponse] = []
     for rec in records:
@@ -10302,8 +10989,9 @@ class IPAddressBulkChanges(BaseModel):
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
     # Apply a forward DNS zone change to every selected IP. Triggers per-row
-    # record reconciliation (create / move / delete) via _sync_dns_record.
-    # Use the empty string ``""`` to clear a zone assignment.
+    # record reconciliation (create / move) via _sync_dns_record. The empty
+    # string ``""`` clears: each address's records are removed and its
+    # ``forward_zone_id`` nulled, as single Edit does for zone None (#2172).
     dns_zone_id: str | None = None
     # Role + reservation TTL — both opt-in like the other bulk fields.
     # Empty string on ``role`` clears (= "no specific role" for the
@@ -10338,6 +11026,9 @@ class IPAddressBulkEditResponse(BaseModel):
     updated_count: int
     not_found: list[uuid.UUID] = []
     skipped: list[uuid.UUID] = []
+    # With ``dns_zone_id: ""``: the updated addresses whose DNS records were
+    # removed. An updated address absent from it had none to remove (#2172).
+    dns_cleared: list[uuid.UUID] = []
 
 
 @router.post("/addresses/bulk-edit", response_model=IPAddressBulkEditResponse)
@@ -10379,6 +11070,8 @@ async def bulk_edit_addresses(
     skipped: list[uuid.UUID] = []
     # Subnets whose utilization must be recomputed after the batch (#509).
     touched_subnets: set[uuid.UUID] = set()
+    # Addresses whose DNS records a zone clear removed (#2172).
+    dns_cleared: list[uuid.UUID] = []
 
     tags_patch = body.changes.tags
     cf_patch = body.changes.custom_fields
@@ -10512,7 +11205,20 @@ async def bulk_edit_addresses(
                         subnet_cache[ip.subnet_id] = subnet
                 if subnet is not None:
                     old["forward_zone_id"] = str(ip.forward_zone_id) if ip.forward_zone_id else None
-                    await _sync_dns_record(db, ip, subnet, zone_id=new_zone_id, action="update")
+                    if new_zone_id is None:
+                        if ip.extra_zone_ids:
+                            old["extra_zone_ids"] = list(ip.extra_zone_ids)
+                        # ``""`` clears (#2172): the same removal single Edit
+                        # runs for zone None. An ``"update"`` with
+                        # ``zone_id=None`` would resolve a zone instead, moving
+                        # the records into the subnet's zone or re-publishing
+                        # them where they are.
+                        if await _clear_ip_dns_zone(db, ip, subnet):
+                            dns_cleared.append(ip.id)
+                    else:
+                        await _sync_dns_record(
+                            db, ip, subnet, zone_id=new_zone_id, action="update", strict=True
+                        )
 
             db.add(
                 _audit(
@@ -10566,6 +11272,7 @@ async def bulk_edit_addresses(
         updated_count=updated,
         not_found=not_found,
         skipped=skipped,
+        dns_cleared=dns_cleared,
     )
 
 

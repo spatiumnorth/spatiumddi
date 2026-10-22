@@ -10,10 +10,12 @@ import httpx
 import structlog
 
 from . import __version__, features
+from .bootstrap import reauthenticate
 from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
 from .drivers.base import DriverBase
+from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
 from .spool import SpoolManager
 
 log = structlog.get_logger(__name__)
@@ -41,7 +43,7 @@ class HeartbeatClient:
         # assigns itself in). Its ``as_dict()`` rides the heartbeat's
         # ``config`` field so the control plane can tell a server that is up
         # but running a REVERTED config apart from one that converged.
-        # Defaults to a healthy ApplyStatus so a heartbeat sent before the
+        # Defaults to an empty ("nothing applied yet", #2258) ApplyStatus so a heartbeat sent before the
         # first sync doesn't report a failure that hasn't happened.
         self.config_apply: ApplyStatus = ApplyStatus()
         self.failed_ops_count = 0
@@ -108,6 +110,14 @@ class HeartbeatClient:
             headers=features.headers(),
         )
 
+    def _auth_headers(self) -> dict[str, str]:
+        # #2044 — the process id, so the control plane can keep a displaced
+        # process's daemon / config reports off the server row.
+        return {
+            "Authorization": f"Bearer {self.token_ref[0]}",
+            AGENT_INSTANCE_HEADER: AGENT_INSTANCE,
+        }
+
     def send_once(self) -> None:
         # #1232 — a snapshot, and only what it holds is removed on success.
         # The sync thread appends acks while this request is in flight, and
@@ -147,12 +157,13 @@ class HeartbeatClient:
         # supervisor's heartbeat (one producer instead of three).
         # The DNS service container drops the host bind mounts in C1
         # so it can no longer read those signals anyway.
+        sent_token = self.token_ref[0]
         try:
             with self._client() as c:
                 resp = c.post(
                     "/api/v1/dns/agents/heartbeat",
                     json=body,
-                    headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                    headers=self._auth_headers(),
                 )
                 if resp.status_code == 422 and "spool" in body and "spool" in resp.text:
                     log.warning("heartbeat_spool_field_unsupported")
@@ -161,7 +172,7 @@ class HeartbeatClient:
                     resp = c.post(
                         "/api/v1/dns/agents/heartbeat",
                         json=body,
-                        headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                        headers=self._auth_headers(),
                     )
             if resp.status_code == 200:
                 data = resp.json()
@@ -172,15 +183,10 @@ class HeartbeatClient:
                     save_token(self.cfg.state_dir, rotated)
                     log.info("dns_agent_token_rotated")
             elif resp.status_code in (401, 404):
-                # Issue #248 — mirror sync.py's 401/404 recovery path.
-                # 401 = token expired / invalid; 404 = the server row
-                # was deleted on the control plane. Both recover by
-                # the same path: drop cached token + stop the thread.
-                # The supervisor's dead-thread watch exits the
-                # container; the next start re-bootstraps from PSK.
-                # Pre-#248 the heartbeat just spam-warned until sync
-                # noticed the same 401 (could be a full heartbeat
-                # interval later).
+                # Issue #248 / #2052 — 401 = token expired / invalid; 404 =
+                # the server row was deleted. Re-register from the PSK in
+                # this thread; stopping it would have the supervisor exit the
+                # container and stop the daemon that is serving from cache.
                 log.warning(
                     "heartbeat_will_rebootstrap",
                     status=resp.status_code,
@@ -188,8 +194,7 @@ class HeartbeatClient:
                         "token_invalid" if resp.status_code == 401 else "server_missing"
                     ),
                 )
-                save_token(self.cfg.state_dir, "")
-                self._stop.set()
+                reauthenticate(self.cfg, self.token_ref, sent_token)
             else:
                 log.warning("heartbeat_failed", status=resp.status_code)
         except httpx.HTTPError as e:

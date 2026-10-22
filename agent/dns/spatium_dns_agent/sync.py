@@ -20,10 +20,12 @@ import structlog
 from . import features
 from .admin_pusher import push_rendered_config
 from .apply_guard import (
+    BOOT_HOLD_MAX_WAIT_SECONDS,
     SETTLE_SECONDS,
     SYNC_FIRST_AFTER_DEATHS,
     ApplyGuard,
 )
+from .bootstrap import reauth_generation, reauthenticate
 from .cache import commit_config, load_config, load_previous_config, save_config
 from .config import AgentConfig
 from .config_apply import (
@@ -40,9 +42,21 @@ from .config_apply import (
 )
 from .drivers.base import DriverBase, HeldZone
 from .fetch import get_config
+from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
 from .oom_watch import OomWatch, is_oom_status
 
 log = structlog.get_logger(__name__)
+
+# #2042 / #2044 — ``AGENT_INSTANCE`` (imported from ``instance``) names this
+# process on every config poll; re-exported here for older callers.
+
+# #2044 — set on the 409 the control plane answers when ANOTHER live agent
+# process owns this server identity (a cloned VM or a copied state dir keeps
+# the agent_id). Only the most recent process is served; this one keeps
+# serving its cached config and asks again on a slow backoff, taking the
+# server back by itself once the other one stops polling.
+DUPLICATE_INSTANCE_HEADER = "X-Spatium-Duplicate-Agent-Instance"
+DUPLICATE_INSTANCE_BACKOFF = 30.0
 
 
 def _touch_ready_marker(state_dir: Path) -> None:
@@ -88,6 +102,11 @@ BOOT_REPORT_MAX_ATTEMPTS = 10
 # answers at once; waiting the long-poll's minute would leave the server dark
 # for a minute longer when it is unreachable.
 BOOT_FETCH_TIMEOUT = 20.0
+
+# #2241 — the clock a startup hold is timed on (``BOOT_HOLD_MAX_WAIT_SECONDS``).
+# Its own name so a test can move it without moving every other monotonic
+# reading in the process (the apply guard's settle window among them).
+_hold_clock = time.monotonic
 
 
 def _ack(op: dict[str, Any], result: str, message: str | None = None) -> dict[str, Any]:
@@ -223,6 +242,8 @@ class SyncLoop:
         # #1725 — the supervisor's; ``None`` in tests that build a loop
         # directly. Only read on a failed apply, to name an OOM kill.
         self.oom_watch = oom_watch
+        # #2052 — the re-registration this loop last caught up with.
+        self._reauth_gen = reauth_generation()
 
         # #2019 — the death-during-apply marker. Read before anything is
         # applied: a process that died with it armed counts a death of the
@@ -238,6 +259,10 @@ class SyncLoop:
         # Whether the last ``_handle_apply_failure`` re-applied the previous
         # bundle (so something is live again), for the hold to read.
         self._revert_landed = False
+        # #2241 — when the hold began (``_hold_clock``), and whether the
+        # max-wait fallback has been announced. See ``_boot_hold_max_wait``.
+        self._boot_hold_since: float | None = None
+        self._boot_hold_max_wait_logged = False
 
         # Preload cached bundle (offline-operation guarantee)
         bundle, etag = load_config(self.cfg.state_dir)
@@ -252,6 +277,7 @@ class SyncLoop:
             if self._guard.condemned(etag) and (died == etag or self._quarantine.etag != etag):
                 self._quarantine.record(etag, self._death_reason(etag, deaths))
             self._begin_boot_hold(bundle, etag, deaths)
+            self._boot_hold_since = _hold_clock()
             return
 
         # #882 — a restart must not re-break the daemon with the same bundle
@@ -456,7 +482,8 @@ class SyncLoop:
                         " (it is quarantined: re-applied only on the backoff)"
                         if self._guard.condemned(etag)
                         else " (re-applied from the cache if the control plane "
-                        "cannot be reached)"
+                        "cannot be reached, or sends no bundle within "
+                        f"{int(BOOT_HOLD_MAX_WAIT_SECONDS)} s)"
                     )
                 ),
             )
@@ -495,7 +522,8 @@ class SyncLoop:
     def _boot_hold_fallback(self, failed_etag: str | None = None) -> None:
         """No usable bundle from the control plane while the cache is held.
 
-        Reached offline (unreachable, or not answering 200), when the control
+        Reached offline (unreachable, or not answering 200 — a 401/404 too,
+        while ``reauthenticate`` registers again, #2182), when the control
         plane is serving the held bundle itself and that bundle is
         quarantined, and (``failed_etag``) when the control plane's own bundle
         failed to apply: the hold set the live tree aside, so without this the
@@ -579,6 +607,89 @@ class SyncLoop:
             )
             if self._bootstrap_apply(bundle, etag, booting_from_previous=False, before_sync=False):
                 self._end_boot_hold()
+
+    def _boot_hold_max_wait(self) -> None:
+        """Serve the held cache once the control plane has had long enough (#2241).
+
+        The hold asks the control plane first and serves the cache only when it
+        cannot be reached. A control plane that answers but cannot produce a
+        bundle (the renders OOM-killed or timed out at scale, a long-poll that
+        only ever ends in 304, a re-registration backing off) never reads as
+        unreachable, and kept the #2240 scale lab's servers dark for hours on a
+        valid cache. Past ``BOOT_HOLD_MAX_WAIT_SECONDS`` it counts as
+        unreachable: every poll from then on goes through the offline fallback,
+        until something is live. Nothing is started here: the apply launches
+        the deferred daemon (#1056), and a bundle that arrives later is applied
+        by the normal path as a reload.
+
+        A bundle the daemon was SEEN to die on twice is never re-applied by
+        this path, not even on the quarantine's backoff: the control plane is
+        reachable, so the operator's fix can still arrive, and a timer must not
+        start a crash loop on the bundle that caused it. Only a different
+        last-known-good may serve; with none the server stays down, and the
+        backoff retry stays where #882 / #2019 put it (an unreachable control
+        plane).
+        """
+        hold = self._boot_hold
+        if hold is None or self._boot_hold_on_previous:
+            return
+        since = self._boot_hold_since
+        if since is None:
+            return
+        waited = _hold_clock() - since
+        if waited < BOOT_HOLD_MAX_WAIT_SECONDS:
+            return
+        etag = hold[1]
+        condemned = self._guard.condemned(etag)
+        usable_previous = not condemned or self._previous_serves_hold(etag)
+        if not condemned:
+            serving = "cache"
+        elif usable_previous:
+            serving = "last_known_good"
+        else:
+            serving = "nothing: the cache is condemned and there is no other last-known-good"
+        if not self._boot_hold_max_wait_logged:
+            self._boot_hold_max_wait_logged = True
+            log.warning(
+                "bootstrap_hold_max_wait_elapsed_applying_cache",
+                etag=etag,
+                waited_s=int(waited),
+                max_wait_s=int(BOOT_HOLD_MAX_WAIT_SECONDS),
+                serving=serving,
+            )
+        if not usable_previous:
+            return
+        self._boot_hold_fallback()
+        if self._boot_hold is not None and self.apply_status.status == STATUS_REVERTED:
+            # The held cache failed to apply and ``_bootstrap_fallback`` put the
+            # last-known-good live instead: the hold is now served by it, as
+            # after the fallback's own last-known-good branch. Without this the
+            # next poll would apply (and reload) the same bundle again.
+            self._boot_hold_on_previous = True
+
+    def _previous_serves_hold(self, held_etag: str) -> bool:
+        """Whether the last-known-good could serve in place of a condemned hold.
+
+        Checked before ``_boot_hold_fallback`` is asked, because when it cannot
+        that method retries the condemned bundle itself once its backoff is
+        due, which the max-wait path must never do. The etag is read first so
+        an unusable ``previous`` is not parsed on every poll.
+
+        A ``previous`` with no etag (a missing or empty ``previous.etag``, as
+        agents upgraded in the field can carry) does not serve: nothing says it
+        is not the condemned bundle itself, and ``_boot_hold_fallback`` would
+        not use it either (it compares the etag with ``failed_etag``, None
+        here) but fall through to retrying the condemned bundle."""
+        cfg_dir = self.cfg.state_dir / "config"
+        etag_path = cfg_dir / "previous.etag"
+        try:
+            prev_etag = etag_path.read_text().strip() if etag_path.exists() else None
+        except OSError:
+            return False
+        if not prev_etag or not self._previous_usable(prev_etag, held_etag):
+            return False
+        prev_bundle, _ = load_previous_config(self.cfg.state_dir)
+        return prev_bundle is not None
 
     def _bootstrap_fallback(
         self, failed_etag: str | None, exc: BaseException, *, before_sync: bool = True
@@ -682,7 +793,7 @@ class SyncLoop:
         if bundle is None:
             return
         self._boot_report_attempts += 1
-        done = self._report_zone_state(bundle, skip={h.zone.lower() for h in self.driver.held_back})
+        done = self._report_zone_state(bundle, skip=self._unconverged_zone_keys())
         if done or self._boot_report_attempts >= BOOT_REPORT_MAX_ATTEMPTS:
             if not done:
                 log.warning(
@@ -700,6 +811,40 @@ class SyncLoop:
             timeout=timeout,
             headers=features.headers(),
         )
+
+    def _on_reregistered(self) -> None:
+        """Resend what a fresh process sends at startup, to the new row (#2052).
+
+        Re-registering after a 404 lands on a NEW server row. A container
+        restart used to give it the cache apply's zone-state report, a DNSSEC
+        state report and the rendered-config push; in process, none of them
+        would be sent until the next structural change — the structural etag
+        carries no server id, so the new row's bundle re-renders nothing, and
+        its zone-state, Config tab and DS state would read empty until then.
+        The serials already reported are forgotten: they were the old row's
+        (a reset control plane may number its zones lower), and the report
+        re-arms them. Nothing here touches the daemon.
+        """
+        self._current_etag = None
+        if self._dnssec_bundle is not None:
+            zones = []
+            for zone in self._dnssec_bundle.get("zones") or []:
+                served = self._reported_serials.get(_zone_key(zone.get("name")))
+                serial = zone.get("serial")
+                if served is not None and (serial is None or _serial_later(served, int(serial))):
+                    # Record ops moved it past the structural apply's serial.
+                    zone = {**zone, "serial": served}
+                zones.append(zone)
+            self._boot_report_bundle = {"zones": zones}
+            self._boot_report_attempts = 0
+        self._reported_serials = {}
+        self._dnssec_reported = None
+        self._dnssec_settle_streak = 0
+        self._dnssec_refresh_at = 0.0
+        try:
+            push_rendered_config(self.cfg, self.token_ref[0])
+        except Exception:
+            log.exception("rendered_config_reregister_push_failed")
 
     def _maybe_settle(self) -> None:
         """Disarm the #2019 marker once the daemon outlived the settle window.
@@ -726,14 +871,24 @@ class SyncLoop:
             log.error("dns_daemon_died_during_config_apply_watched", etag=etag)
 
     def note_orderly_exit(self) -> None:
-        """The process is exiting by choice (SIGTERM, a re-bootstrap): an
-        apply still settling did not kill anything, so it is not a death."""
+        """The process is exiting by choice (SIGTERM, a critical thread
+        ending): an apply still settling did not kill anything, so it is not a
+        death. A 401/404 re-registration does not exit (#2052)."""
         self._guard.disarm()
 
     def _poll_once(self) -> None:
+        gen = reauth_generation()
+        if gen != self._reauth_gen:
+            self._reauth_gen = gen
+            log.info("sync_reregistered_resending_reports")
+            self._on_reregistered()
         self._maybe_settle()
         self._flush_boot_report()
-        headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
+        self._boot_hold_max_wait()
+        headers = {
+            "Authorization": f"Bearer {self.token_ref[0]}",
+            AGENT_INSTANCE_HEADER: AGENT_INSTANCE,
+        }
         # #882 — a quarantined bundle is parked on a 304 by the etag we sent
         # last time, so the only way to give it another attempt is to stop
         # sending that etag. Dropping If-None-Match makes the server answer
@@ -784,10 +939,41 @@ class SyncLoop:
                 status=resp.status_code,
                 reason="token_invalid" if resp.status_code == 401 else "server_missing",
             )
-            from .cache import save_token
-
-            save_token(self.cfg.state_dir, "")
-            self._stop.set()
+            # #2182 — during a #2019 boot hold nothing is serving, and
+            # ``reauthenticate`` can back off for up to 5 min before it
+            # registers. The control plane is unusable meanwhile, so the held
+            # cache serves under the offline rules (#5), through the same
+            # ``_boot_hold_fallback`` the unreachable path takes (it declines a
+            # condemned bundle). Nothing was fetched, so ``current.json`` is
+            # still the held bundle; the fresh 200 forced below then goes
+            # through the normal path, re-rendering only if its structural
+            # etag differs from what the fallback put live.
+            self._boot_hold_fallback()
+            # #2052 — re-register in this thread; do NOT stop it. Stopping
+            # made the supervisor exit the container and take the daemon down.
+            reauthenticate(self.cfg, self.token_ref, headers["Authorization"][7:])
+            # Force a fresh 200. The next poll also sees the generation move
+            # and resends the startup reports to the new row
+            # (``_on_reregistered``), whichever thread registered.
+            self._current_etag = None
+            return
+        if resp.status_code == 409 and resp.headers.get(DUPLICATE_INSTANCE_HEADER):
+            # #2044 — not a re-registration case: a new token would not change
+            # which process owns the row. Loud, because this agent now serves
+            # a configuration that no longer changes.
+            try:
+                detail = resp.json().get("detail")
+            except ValueError:
+                detail = None
+            log.error(
+                "sync_duplicate_agent_instance",
+                instance=AGENT_INSTANCE,
+                detail=detail,
+                retry_in_seconds=DUPLICATE_INSTANCE_BACKOFF,
+            )
+            self._boot_hold_fallback()
+            # An Event wait, not a sleep: a stop request ends it at once.
+            self._stop.wait(DUPLICATE_INSTANCE_BACKOFF)
             return
         if resp.status_code != 200:
             log.warning("sync_unexpected_status", status=resp.status_code)
@@ -866,7 +1052,7 @@ class SyncLoop:
             # roll back the apply (we already serve the new config). A zone
             # held back (#1403) is not serving the serial it was rendered
             # with, so it is left out and keeps the serial it last reported.
-            self._report_zone_state(bundle, skip={h.zone.lower() for h in self.driver.held_back})
+            self._report_zone_state(bundle, skip=self._unconverged_zone_keys())
             # This bundle replaces the one applied at startup, and its report
             # covers the same question.
             self._boot_report_bundle = None
@@ -929,8 +1115,15 @@ class SyncLoop:
             # just reported is the pre-rollover set. Look again soon.
             self._dnssec_settle_streak = 0
             self._dnssec_recheck_soon()
+        # A zone the structural apply left partly refused (#2060) is not
+        # reported converged by an op that landed beside the refusal either.
+        unconverged = self._unconverged_zone_keys()
         self._report_reached_serials(
-            {zone: serial for zone, serial in reached.items() if zone not in failed_zones}
+            {
+                zone: serial
+                for zone, serial in reached.items()
+                if zone not in failed_zones and zone.lower() not in unconverged
+            }
         )
 
         # #882 — we got here with nothing quarantined and nothing to
@@ -1221,6 +1414,24 @@ class SyncLoop:
             "status": "degraded",
             "reason": f"config_apply_{status.status}: {status.error}",
         }
+
+    def _unconverged_zone_keys(self) -> set[str]:
+        """Zones (lowercase, no trailing dot) the live apply did not converge,
+        whose serial is therefore not reported as served (#1403, #2060).
+
+        A zone held back serves an older serial than it was rendered with. A
+        zone whose data the daemon refused in part may serve the NEW serial —
+        PowerDNS applies the rest of such a zone piecemeal, SOA last — with
+        records missing, and reporting that serial would make per-server sync
+        status read "in sync" beside the very refusal the apply status names.
+        Left out, the zone keeps the serial it last reported and reads behind
+        until an apply serves it whole.
+        """
+        keys = {h.zone.rstrip(".").lower() for h in self.driver.held_back}
+        hook = getattr(self.driver, "unconverged_zones", None)
+        if callable(hook):
+            keys |= {str(z).rstrip(".").lower() for z in hook()}
+        return keys
 
     def _report_zone_state(self, bundle: dict[str, Any], skip: set[str] | None = None) -> bool:
         """POST ``{zones: [{zone_name, serial}, ...]}`` after a successful apply.

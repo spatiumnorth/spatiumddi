@@ -90,6 +90,11 @@ scripts/lint_image_upgrades.py
 # whether a tag becomes :latest.
 scripts/release_version.py
 
+# test_changelog_assemble.py loads the script that folds changelog
+# fragments into CHANGELOG.md (#2431): release prep runs it, and
+# release.yml's --pending gate calls it.
+scripts/changelog_assemble.py
+
 # test_format_release_notes.py loads the release-body formatter and pins the
 # two ways it can break a release: notes over GitHub's 125,000-character body
 # limit fail the publish step after every image is built, so they must come
@@ -158,3 +163,9 @@ frontend/default.conf.template
 # proxy's value with $scheme.
 frontend/16-trusted-proxies.envsh
 charts/spatiumddi/templates/frontend-tls-config.yaml
+
+# test_ipam_bulk_allocate_template_vectors_2071.py (#2071) runs the server's
+# bulk-allocate hostname rule over the vectors the console's live preview is
+# tested against; editing them must run the backend half, or the two sides
+# could disagree with only the frontend job noticing.
+frontend/src/lib/bulk-allocate-template.vectors.json

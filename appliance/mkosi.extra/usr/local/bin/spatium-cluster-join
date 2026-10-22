@@ -267,6 +267,9 @@ backup_and_wipe_identity() {
     rm -rf "$CNI_NETWORKS_DIR" 2>/dev/null || true
     log "wiped cluster identity → $bak (k3s binary + airgap images kept)"
     _prune_identity_backups
+    # Only this backup keeps its image store: the join or leave that set
+    # the older ones aside has ended, and no rollback will ask for them.
+    _drop_backup_image_stores "$bak"
     printf '%s\n' "$bak"
 }
 
@@ -372,6 +375,52 @@ _prune_identity_backups() {
         [ -d "$d" ] || continue
         rm -rf "$d" 2>/dev/null || true
         log "pruned stale identity backup: $d"
+    done
+}
+
+# #2049 — an identity backup keeps the image store it took (agent/containerd,
+# with the import cache that describes it) only while the join or leave that
+# set it aside can still roll back onto it. The store is not identity: the
+# baked tarballs under agent/images/ re-import it, and a restore without it
+# re-imports, as a restore without a cache already does. Each store is a full
+# copy of every baked image, 4-6 GiB depending on how the bake saved the
+# layers, and the newest three backups held one each, so a member that
+# formed, left and was promoted again carried four stores on /var while its
+# join imported the fourth. On the 40 GiB disk the docs recommend, /var is
+# about 22.7 GiB, and that crossed the kubelet's nodefs.available<5% floor:
+# DiskPressure rejected the supervisor DaemonSet pod on the joiner, so
+# nothing reported the join and the row sat `joining`.
+#
+# Only one rollback exists: a failed join's restore_identity, onto the backup
+# that same run took. So a store is needed from the moment its backup is taken
+# until that run either rolls back (the store moves back into place) or can no
+# longer roll back — Ready, or registered with the seed's etcd (#1052). Every
+# other store is dead weight, and do_join / do_leave drop them FIRST, before
+# anything writes to /var, so a node that is already out of space gets it back
+# before write_state, the backup's mkdir and the join drop-in need it.
+#
+# $1 names the one backup that keeps its store (none: every backup drops it).
+# This is an rm -rf as root, so it only ever removes a path inside a real
+# backup directory: a backup or its agent/ that is a symlink is skipped (a
+# link could point the removal anywhere, the live store included), and so is
+# anything that IS the live store by inode.
+_drop_backup_image_stores() {
+    local keep="${1:-}" d
+    for d in "$IDENTITY_BAK_ROOT".*.*; do
+        [ -d "$d" ] || continue
+        [ "$d" = "$keep" ] && continue
+        if [ -L "$d" ] || [ -L "$d/agent" ]; then
+            log "NOT dropping the image store under $d: a symlink, not a backup this runner took"
+            continue
+        fi
+        [ -e "$d/agent/containerd" ] || [ -e "$d/agent-images-cache.json" ] || continue
+        if [ "$d/agent/containerd" -ef "$K3S_AGENT_DIR/containerd" ]; then
+            log "NOT dropping $d/agent/containerd: it is the live image store"
+            continue
+        fi
+        rm -rf "${d:?}/agent/containerd" 2>/dev/null || true
+        rm -f "$d/agent-images-cache.json" 2>/dev/null || true
+        log "dropped the image store from identity backup $d (the baked tarballs re-import it)"
     done
 }
 
@@ -624,6 +673,11 @@ do_join() {
         exit 0
     fi
 
+    # #2049 — before anything below writes to /var. Every store already set
+    # aside belongs to a join or leave that has ended, and this join's own
+    # rollback uses only the backup it is about to take.
+    _drop_backup_image_stores
+
     # Validate before we touch anything destructive. #555 — the char class
     # includes ``[`` and ``]`` (``]`` first, ``[`` + ``-`` last per POSIX
     # bracket rules) so an IPv6-literal seed URL like
@@ -658,6 +712,7 @@ do_join() {
         systemctl is-active --quiet k3s || { clean_k3s_runtime; systemctl start k3s || true; }
         if wait_ready "$JOINED_READY_TIMEOUT"; then
             log "JOIN ok — node is Ready as a control-plane member (re-drive, no wipe)"
+            _drop_backup_image_stores
             write_state ready "$server_url"
             mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.done.$(date +%s)" || true
             exit 0
@@ -747,10 +802,13 @@ EOF
     k3s_started_at="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     if systemctl start k3s && wait_ready; then
         log "JOIN ok — node is Ready as a control-plane member"
+        # The identity backup stays for manual recovery (the newest three
+        # are kept); the image store it took goes, as no rollback is left —
+        # before write_state, whose `>` onto a full /var would leave the
+        # sidecar empty and the row `joining` (#2049).
+        _drop_backup_image_stores
         write_state ready "$server_url"
         mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.done.$(date +%s)" || true
-        # Keep the identity backup one boot for safety; a later sweep can
-        # prune ${IDENTITY_BAK_ROOT}.pre-join.* once the operator is happy.
         exit 0
     fi
 
@@ -764,9 +822,14 @@ EOF
     # again, and Fleet -> Replace can evict it cleanly through the seed.
     # Nothing in this branch wipes or restores identity.
     if node_registered_with_cluster_etcd "$k3s_started_at"; then
+        # #2049 — this branch never rolls back, so the store this join set
+        # aside is dead weight from here, and a joiner short of disk is
+        # exactly the one still waiting for Ready.
+        _drop_backup_image_stores
         log "not Ready within ${READY_TIMEOUT}s but this node already joined the seed's etcd — waiting up to ${JOINED_READY_TIMEOUT}s more (a rollback now would strand the seed's quorum, #1052)"
         if wait_ready "$JOINED_READY_TIMEOUT"; then
             log "JOIN ok — node is Ready as a control-plane member (within the joined budget)"
+            _drop_backup_image_stores
             write_state ready "$server_url"
             mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.done.$(date +%s)" || true
             exit 0
@@ -820,6 +883,8 @@ do_leave() {
         mv -f "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.rejected.$(date +%s)" || true
         exit 0
     fi
+    # #2049 — before anything below writes to /var (see do_join).
+    _drop_backup_image_stores
     log "LEAVE: resetting to a single-node seed"
     write_state leaving ""
 
@@ -828,10 +893,12 @@ do_leave() {
     # non-seed members of a three-node cluster (the only demote the odd-count
     # rule allows there) cost the seed its quorum. The runner removes this
     # node's own member while it still votes and stops k3s. It returns 0 once
-    # the member is gone: either a survivor no longer lists it, or etcd
-    # accepted the removal and no survivor could be reached to confirm it in
-    # time (bfbf79d: etcd's acceptance is the removal, so waiting on an
-    # unreachable survivor only strands the leave). etcd-evict.log says which.
+    # the member is gone: either a survivor no longer lists it, or no survivor
+    # could be reached to confirm it in time and etcd accepted the removal
+    # (bfbf79d: etcd's acceptance is the removal, so waiting on an unreachable
+    # survivor only strands the leave) or, after an error answer, k3s left its
+    # tombstone (#2394: this node's etcd can apply its own removal and stop
+    # before it answers). etcd-evict.log says which.
     # 2 means this node joined nobody. Anything else keeps the node as it is:
     # k3s back up, still a member, the leave reported failed.
     "$ETCD_EVICT" --leave-self
@@ -886,6 +953,7 @@ do_leave() {
     clean_k3s_runtime
     if systemctl start k3s && leave_wait_ready; then
         log "LEAVE ok — node is a standalone single-node cluster again"
+        _drop_backup_image_stores
         write_state left ""
         mv -f "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.done.$(date +%s)" || true
         exit 0

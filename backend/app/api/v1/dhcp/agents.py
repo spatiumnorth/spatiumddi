@@ -13,7 +13,7 @@ import ipaddress
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
@@ -21,11 +21,13 @@ from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
+    collect_wake,
     dhcp_wake_channels,
     wake_subscription,
 )
@@ -42,6 +44,7 @@ from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
 from app.services.agents.config_apply import apply_reported_status
+from app.services.agents.container_oom import effective_daemon_report, fresh_role_health
 from app.services.agents.daemon_state import apply_reported_daemon_state
 from app.services.agents.ingest_receipt import (
     BatchId,
@@ -53,6 +56,7 @@ from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.ownership import owning_appliance_for_dhcp_server
 from app.services.appliance.resolver import resolver_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.appliance.ssh import ssh_bundle
@@ -86,6 +90,23 @@ LONGPOLL_POLL_INTERVAL = 2.0
 AGENT_CAPABLE_DRIVERS = frozenset({"kea"})
 
 
+def _record_capabilities(server: DHCPServer, reported: list[str]) -> None:
+    """Store what the agent says it renders; wake its group when that changes.
+
+    The HA peer credential is gated on every Kea member advertising
+    ``ha_peer_tls`` (``services/dhcp/ha_peer_auth.py``), so the moment the last
+    member of a pair upgrades, BOTH members' bundles change. Waking the group
+    channel makes the partner — parked in its long-poll — pick that up now
+    rather than on the safety tick, which keeps the window where one side has
+    switched and the other has not to seconds.
+    """
+    caps = sorted(set(reported))
+    if (server.agent_capabilities or []) == caps and server.agent_capabilities is not None:
+        return
+    server.agent_capabilities = caps
+    collect_wake(*dhcp_wake_channels(server))
+
+
 class AgentRegisterRequest(BaseModel):
     # Bounds mirror the columns these land in (DHCPServer.name/host 255,
     # .driver 50, .agent_fingerprint 128, DHCPServerGroup.name 255) — an
@@ -98,6 +119,11 @@ class AgentRegisterRequest(BaseModel):
     group_name: str | None = Field(default=None, max_length=255)
     fingerprint: str = Field(max_length=128)
     agent_id: str | None = None
+    # What this agent renders (e.g. ``["ha_peer_tls"]``). Optional: an agent
+    # that predates the field registers exactly as before.
+    capabilities: list[Annotated[str, Field(max_length=64)]] | None = Field(
+        default=None, max_length=32
+    )
 
     @field_validator("driver")
     @classmethod
@@ -138,6 +164,13 @@ class AgentHeartbeatRequest(BaseModel):
     # this model is extra="forbid", so an undeclared field would 422 every
     # heartbeat from a current agent.
     kea_version: str | None = None
+    # What this agent renders, e.g. ``["ha_peer_tls"]``. Absent from an agent
+    # that predates the field, which the handler records as "nothing" — so a
+    # node rolled BACK to an older agent closes the HA peer-credential gate
+    # again rather than being left a credential its Kea will not load.
+    capabilities: list[Annotated[str, Field(max_length=64)]] | None = Field(
+        default=None, max_length=32
+    )
     daemon: dict[str, Any] = {}
     # #882 — the agent's last config-apply verdict:
     # ``{status, etag, failed_etag, phase, error}``. See the DNS agent's
@@ -247,6 +280,11 @@ class LeaseEvent(BaseModel):
         elif not self.mac_address:
             raise ValueError("a DHCPv4 lease needs a mac_address")
         return self
+
+
+def _utc(value: datetime) -> datetime:
+    """Treat a naive timestamp as UTC so two lease times always compare."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def _lease_identity(
@@ -503,6 +541,7 @@ async def agent_register(
             agent_approved=not require_approval,
             agent_fingerprint=body.fingerprint,
             agent_version=body.version,
+            agent_capabilities=sorted(set(body.capabilities or [])),
             description=(
                 f"auto-registered agent v{body.version}" if body.version else "auto-registered"
             ),
@@ -520,6 +559,7 @@ async def agent_register(
         server.roles = body.roles
         server.status = "active"
         server.agent_version = body.version
+        _record_capabilities(server, body.capabilities or [])
         server.agent_registered = True
         if server.agent_id is None:
             server.agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
@@ -917,6 +957,18 @@ async def agent_config_longpoll(
                                 "max_response_delay_ms": bundle.failover.max_response_delay_ms,
                                 "max_ack_delay_ms": bundle.failover.max_ack_delay_ms,
                                 "max_unacked_clients": bundle.failover.max_unacked_clients,
+                                # HA peer credential (PEM). Absent until every
+                                # Kea member advertises ``ha_peer_tls``; an
+                                # agent that predates it ignores the key.
+                                "tls": (
+                                    {
+                                        "ca_pem": bundle.failover.tls_ca_pem,
+                                        "cert_pem": bundle.failover.tls_cert_pem,
+                                        "key_pem": bundle.failover.tls_key_pem,
+                                    }
+                                    if bundle.failover.tls_key_pem
+                                    else None
+                                ),
                             }
                             if bundle.failover is not None
                             else None
@@ -1005,6 +1057,7 @@ async def agent_heartbeat(
     # make the HA-skew preflight fall back to "unknown" for no reason.
     if body.kea_version:
         server.kea_version = body.kea_version
+    _record_capabilities(server, body.capabilities or [])
 
     # Phase 8f-2 — persist whatever slot state the agent reported. Only
     # overwrite when the agent actually sent a value (older agents
@@ -1055,7 +1108,26 @@ async def agent_heartbeat(
     # #1067 — the daemon state (the DHCP agent ships it as ``daemon`` and, from
     # the same dict, the top-level ``status``; ``daemon`` is the source). Same
     # gap as the DNS side: declared, accepted, never read.
-    apply_reported_daemon_state(server, body.daemon, agent_kind="dhcp", server_id=str(server.id))
+    # #2023 — on the appliance the kubelet kills the whole dhcp-kea container
+    # when Kea reaches its memory limit, the agent with it, so the restarted
+    # agent reports ``ok`` over a kill it never saw. The supervisor carries the
+    # kubelet's ``OOMKilled`` on its heartbeat; while that kill is current it is
+    # the daemon state, whatever the agent says (the DNS handler's #2018 rule).
+    now_utc = datetime.now(UTC)
+    appliance = await owning_appliance_for_dhcp_server(db, server)
+    daemon_report, daemon_stamp = effective_daemon_report(
+        body.daemon,
+        fresh_role_health(appliance, now_utc),
+        server.driver,
+        now_utc,
+    )
+    apply_reported_daemon_state(
+        server,
+        daemon_report,
+        agent_kind="dhcp",
+        server_id=str(server.id),
+        now=min(daemon_stamp, now_utc),
+    )
 
     for ack in body.ops_ack:
         op_id = ack.get("op_id")
@@ -1120,6 +1192,7 @@ async def agent_lease_events(
     from app.services.feature_modules import is_module_enabled
 
     server, _ = auth
+    server_id = str(server.id)
     # #1077 — a replay of a batch already committed writes nothing. Claimed
     # before any write so the receipt and the rows share one transaction.
     if not await claim_batch(
@@ -1192,11 +1265,40 @@ async def agent_lease_events(
         for lease in existing_leases
     }
 
+    def _superseded(ev: Any, key: tuple[Any, ...]) -> bool:
+        """Is this active event older than another client's live lease? (#2391)
+
+        The agent re-sends its whole lease file after a restart, so an old
+        client's grant can arrive after the address went to a new client.
+        Such a grant is history: applying it would resurrect the old lease
+        and re-point the IPAM mirror (MAC, hostname, DDNS) to the old
+        client. Compared on the lease start Kea reports, so a genuine newer
+        grant — a renewal, or a real new client — is never held back. An
+        event with no start time carries no evidence and is applied.
+        """
+        if ev.state != "active" or ev.starts_at is None:
+            return False
+        ev_start = _utc(ev.starts_at)
+        for other_key, other in lease_by_key.items():
+            if other_key == key or other.state != "active" or other.starts_at is None:
+                continue
+            if norm_ip(str(other.ip_address)) != norm_ip(ev.ip_address):
+                continue
+            if other.expires_at is not None and _utc(other.expires_at) <= now:
+                continue
+            if _utc(other.starts_at) > ev_start:
+                return True
+        return False
+
     # Upsert every DHCPLease first, then a single flush so new rows get
     # their ids before we wire dhcp_lease_id on the IPAM mirror.
     upserted = 0
-    for ev in events:
+    stale: set[int] = set()
+    for idx, ev in enumerate(events):
         key = _lease_identity(ev.ip_address, ev.mac_address, ev.duid, ev.iaid)
+        if _superseded(ev, key):
+            stale.add(idx)
+            continue
         # #428: fall back to ends_at when the agent didn't send a distinct
         # expires_at (Kea ships the same absolute reclaim time as ends_at).
         # Without a non-NULL expires_at the time-based sweep_expired_leases
@@ -1242,7 +1344,28 @@ async def agent_lease_events(
                 # Backfill legacy rows created before scope stamping (#844).
                 lease.scope_id = _scope_for_ip(ev.ip_address)
         upserted += 1
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # #2262 — the lease-identity unique indexes. A unique violation here
+        # means another request for this server inserted the same lease
+        # between our SELECT and this INSERT (a timed-out snapshot page still
+        # running server-side while the tailer posts its next batch). The
+        # global handler would answer 409, which the agent's spool classifies
+        # as REJECTED and drops the whole batch with it. Answer 503 instead:
+        # the agent retries, the retry finds the committed row and updates
+        # it, and the receipt claimed above rolls back with this transaction
+        # so the retry is not mistaken for a duplicate.
+        if str(getattr(exc.orig, "sqlstate", "") or "") != "23505":
+            raise
+        # ``server`` is expired by the failed flush; log the id read up front.
+        await db.rollback()
+        logger.info("dhcp_lease_events_identity_race", server=server_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A concurrent lease report for this server landed first; retry.",
+            headers={"Retry-After": "1"},
+        ) from exc
 
     # Bulk-load the existing IPAM mirror rows. Keyed by (subnet_id, address)
     # so overlapping ranges across spaces stay disambiguated (subnets were
@@ -1277,7 +1400,9 @@ async def agent_lease_events(
         row.last_seen_method = "dhcp"
 
     # ── IPAM mirror pass ────────────────────────────────────────────────
-    for ev in events:
+    for idx, ev in enumerate(events):
+        if idx in stale:
+            continue  # replayed grant of a lease another client has superseded (#2391)
         subnet = subnet_for_ip.get(ev.ip_address)
         if subnet is None:
             continue  # IP not in any known subnet — can't mirror
@@ -1285,6 +1410,11 @@ async def agent_lease_events(
         ipam_row = ipam_by_key.get((subnet.id, norm_ip(ev.ip_address)))
 
         is_active = ev.state == "active"
+        # A grant whose lease ended later in this same batch (a replayed
+        # grant + release) is history too: re-pointing the row would name a
+        # client that no longer holds the address (#2391).
+        if is_active and lease.state != "active":
+            continue
         if is_active:
             if ipam_row is None:
                 candidate = IPAddress(

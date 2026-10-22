@@ -30,13 +30,13 @@ from typing import Any
 import httpx
 import structlog
 
+from .bootstrap import reauth_generation, reauthenticate
 from .cache import (
     commit_config,
     load_config,
     load_previous_config,
     save_config,
     save_rendered_kea,
-    save_token,
 )
 from .config import AgentConfig
 from .config_apply import (
@@ -52,6 +52,7 @@ from .config_apply import (
     Quarantine,
     truncate_error,
 )
+from .ha_tls import materialise as materialise_ha_tls
 from .kea_ctrl import (
     KeaCheckUnavailable,
     KeaConfigRejected,
@@ -161,6 +162,8 @@ class SyncLoop:
         # when the agent is already degraded.
         self._live: tuple[dict[str, Any], str] | None = None
         self._current_etag: str | None = None
+        # #2052 — the re-registration this loop last caught up with.
+        self._reauth_gen = reauth_generation()
         self._consecutive_failures = 0
         self._offline = False
         # #882 — last-known-good revert. ``quarantine`` remembers an etag
@@ -589,7 +592,11 @@ class SyncLoop:
         # names only addresses the host holds now. A stale one would not
         # just miss a socket: kea-dhcp6 refuses the whole config.
         v6_unicast = global_ipv6_addresses()
+        ha_tls_dir = self.cfg.state_dir / "ha-tls"
         try:
+            # The HA peer credential goes to disk first: the config written
+            # below points Kea at these files, and Kea reads them at load.
+            materialise_ha_tls(inner.get("failover"), ha_tls_dir)
             rendered = render_kea(
                 inner,
                 control_socket=str(self.cfg.kea_control_socket),
@@ -597,6 +604,7 @@ class SyncLoop:
                 control_socket_v6=str(self.cfg.kea_control_socket_v6),
                 lease_file_v6=lease_file_v6,
                 v6_unicast=v6_unicast,
+                ha_tls_dir=str(ha_tls_dir),
             )
         except Exception as e:
             # #882 — tag the phase. A render failure never reached Kea, so
@@ -722,6 +730,12 @@ class SyncLoop:
         self._consecutive_failures = 0
 
     def _poll_once(self) -> None:
+        gen = reauth_generation()
+        if gen != self._reauth_gen:
+            # #2052 — another thread re-registered: the row may be new, so
+            # ask it for the whole bundle rather than a 304 on the old etag.
+            self._reauth_gen = gen
+            self._current_etag = None
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
         # #882 — a quarantined bundle is parked on a 304 by the etag we sent
         # last time, so the only way to give it another attempt is to stop
@@ -751,15 +765,17 @@ class SyncLoop:
             return
         if resp.status_code in (401, 404):
             # 401 = token expired/invalid. 404 = server row was deleted on the
-            # control plane (user removed it in the UI); re-register to create
-            # a fresh row rather than 404-looping forever.
+            # control plane. #2052 — re-register in this thread and keep
+            # polling; stopping it made the supervisor exit the container and
+            # take Kea down with the agent.
             log.warning(
                 "sync_will_rebootstrap",
                 status=resp.status_code,
                 reason="token_invalid" if resp.status_code == 401 else "server_missing",
             )
-            save_token(self.cfg.state_dir, "")
-            self._stop.set()
+            reauthenticate(self.cfg, self.token_ref, headers["Authorization"][7:])
+            # Force a fresh 200 for the new row (the apply is etag-gated).
+            self._current_etag = None
             return
         if resp.status_code != 200:
             self._record_failure(f"status:{resp.status_code}")

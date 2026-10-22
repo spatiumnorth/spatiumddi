@@ -61,6 +61,12 @@ class ZoneData:
     # (false — the resolver may fall back to recursion if all forwarders fail).
     forwarders: tuple[str, ...] = ()
     forward_only: bool = True
+    # The forward zone's own upstream transport (#2121) — NOT the group's
+    # ``ServerOptions.forward_transport``, which applies to the group's
+    # resolver forwarders only. ``forward_tls_hostname`` is the upstream
+    # certificate name, required for every encrypted transport.
+    forward_transport: str = "do53"
+    forward_tls_hostname: str | None = None
     # Secondary / stub primaries (issue #336). The master server IPs this
     # zone transfers FROM, as ``ip`` or ``ip@port`` strings. Required +
     # non-empty for ``zone_type`` in {secondary, stub} — the BIND9 renderer
@@ -244,7 +250,7 @@ class TsigKey:
 class BlocklistEntry:
     domain: str
     action: str  # block | redirect | nxdomain
-    block_mode: str  # nxdomain | sinkhole | refused
+    block_mode: str  # nxdomain | sinkhole (``refused`` retired in #2124)
     sinkhole_ip: str | None
     target: str | None
     is_wildcard: bool

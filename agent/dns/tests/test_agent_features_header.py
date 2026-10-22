@@ -10,12 +10,13 @@ agent's first poll, and the heartbeat on every beat.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
 import pytest
 
-from spatium_dns_agent import bootstrap, features
+from spatium_dns_agent import __version__, bootstrap, features
 from spatium_dns_agent.config import AgentConfig
 from spatium_dns_agent.heartbeat import HeartbeatClient
 from spatium_dns_agent.sync import SyncLoop
@@ -29,9 +30,11 @@ def test_register_sends_it_on_the_wire(
     agent_cfg: AgentConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seen: dict[str, str] = {}
+    bodies: list[dict[str, Any]] = []
 
     def answer(request: httpx.Request) -> httpx.Response:
         seen.update(request.headers)
+        bodies.append(json.loads(request.content))
         return httpx.Response(
             200, json={"server_id": "s1", "agent_token": "t1", "pending_approval": False}
         )
@@ -47,6 +50,9 @@ def test_register_sends_it_on_the_wire(
 
     assert seen["x-spatium-agent-features"] == "soa-timers"
     assert seen["x-dns-agent-key"] == "test-key"
+    # #2078 — the build's stamp, not a literal that nothing rewrote.
+    assert bodies[0]["version"] == __version__
+    assert bodies[0]["version"] != "2026.04.14.1"
 
 
 @pytest.mark.parametrize("cls", [HeartbeatClient, SyncLoop], ids=["heartbeat", "config-poll"])

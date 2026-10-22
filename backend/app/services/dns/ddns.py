@@ -302,6 +302,16 @@ async def apply_ddns_for_lease(
             hostname=hostname,
         )
         return False
+    if not published and getattr(ipam_row, "_dns_skipped_too_long", False):
+        # #2072 — the name in its zone passes 253 characters, so nothing was
+        # written. The router logged ``ipam_dns_name_too_long`` at warning.
+        logger.debug(
+            "ddns_skipped_name_too_long",
+            subnet_id=str(subnet.id),
+            ip=str(ipam_row.address),
+            hostname=hostname,
+        )
+        return False
     if not published:
         # spatiumddi#1065 — the sync found no forward zone (no primary, no
         # extras) and enqueued nothing. This used to log ``ddns_applied``

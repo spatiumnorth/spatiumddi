@@ -36,12 +36,12 @@ import httpx
 import structlog
 
 from . import gobgp
+from .bootstrap import reauth_generation, reauthenticate
 from .cache import (
     commit_config,
     load_config,
     load_previous_config,
     save_config,
-    save_token,
 )
 from .config import AgentConfig
 from .config_apply import (
@@ -82,6 +82,8 @@ class SyncLoop:
         self.gobgpd_proc = gobgpd_proc
         self._stop = threading.Event()
         self._current_etag: str | None = None
+        # #2052 — the re-registration this loop last caught up with.
+        self._reauth_gen = reauth_generation()
         # #882 — last-known-good revert. ``quarantine`` remembers an etag
         # whose apply failed so we stop re-rendering it; ``apply_status`` is
         # what the heartbeat reports upward.
@@ -217,6 +219,12 @@ class SyncLoop:
         )
 
     def _poll_once(self) -> None:
+        gen = reauth_generation()
+        if gen != self._reauth_gen:
+            # #2052 — another thread re-registered: the row may be new, so
+            # ask it for the whole bundle rather than a 304 on the old etag.
+            self._reauth_gen = gen
+            self._current_etag = None
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
         # #882 — a quarantined bundle is parked on a 304 by the etag we sent
         # last time, so the only way to give it another attempt is to stop
@@ -242,9 +250,9 @@ class SyncLoop:
             return
         if resp.status_code in (401, 404):
             # 401 = token expired/invalid. 404 = the collector row was
-            # deleted on the control plane. Both recover the same way:
-            # drop the cached token and let the supervisor's dead-thread
-            # detection restart the container -> re-bootstrap from PSK.
+            # deleted on the control plane. #2052 — re-register in this
+            # thread and keep polling; stopping it made the supervisor exit
+            # the container and take the BGP daemon down with the agent.
             log.warning(
                 "lg_sync_will_rebootstrap",
                 status=resp.status_code,
@@ -252,8 +260,8 @@ class SyncLoop:
                     "token_invalid" if resp.status_code == 401 else "collector_missing"
                 ),
             )
-            save_token(self.cfg.state_dir, "")
-            self._stop.set()
+            reauthenticate(self.cfg, self.token_ref, headers["Authorization"][7:])
+            self._current_etag = None
             return
         if resp.status_code != 200:
             log.warning("lg_sync_unexpected_status", status=resp.status_code)

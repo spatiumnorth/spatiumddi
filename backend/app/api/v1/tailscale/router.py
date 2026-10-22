@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -17,7 +17,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
@@ -26,6 +26,15 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.tailscale import TailscaleTenant
+from app.services.dns.bundle_dirty import mark_integration_dns_released
+from app.services.integration_credentials import credential_status
+from app.services.tailscale.client import AUTH_REJECTED_PREFIX, is_auth_rejected
+from app.services.tailscale.token_expiry import (
+    TokenExpiryRead,
+    apply_operator_expiry,
+    apply_read,
+    fetch_token_expiry,
+)
 
 router = APIRouter(
     tags=["tailscale"],
@@ -78,6 +87,9 @@ class TenantBase(BaseModel):
 
 class TenantCreate(TenantBase):
     api_key: str
+    # #2138 — fallback when Tailscale's keys endpoint can't say when the
+    # token expires. A date read from Tailscale always replaces it.
+    api_key_expires_at: datetime | None = None
 
     @field_validator("api_key")
     @classmethod
@@ -97,6 +109,10 @@ class TenantUpdate(BaseModel):
     tailnet: str | None = None
     # Omit / send empty to keep the stored key; non-empty rotates.
     api_key: str | None = None
+    # #2138 — operator-entered token expiry; null clears it. Replacing the
+    # key without sending this resets the expiry to unknown, since the old
+    # key's date says nothing about the new one.
+    api_key_expires_at: datetime | None = None
     ipam_space_id: uuid.UUID | None = None
     dns_group_id: uuid.UUID | None = None
     cgnat_cidr: str | None = None
@@ -114,6 +130,14 @@ class TenantResponse(BaseModel):
     enabled: bool
     tailnet: str
     api_key_present: bool
+    # #2138 — when the access token expires. Null = unknown.
+    api_key_expires_at: datetime | None
+    # "api" (read from Tailscale) | "operator" (typed in) | null.
+    api_key_expiry_source: str | None
+    # ok | expiring | expired | rejected | unknown | disabled — see
+    # app/services/integration_credentials.py.
+    credential_state: str
+    credential_days_left: int | None
     ipam_space_id: uuid.UUID
     dns_group_id: uuid.UUID | None
     cgnat_cidr: str
@@ -141,12 +165,22 @@ class TestConnectionResponse(BaseModel):
     message: str
     tailnet_domain: str | None = None
     device_count: int | None = None
+    # #2138 — the tested token's expiry as Tailscale reports it, or null
+    # with the reason in ``api_key_expiry_note``.
+    api_key_expires_at: datetime | None = None
+    api_key_expiry_note: str | None = None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
 def _to_response(t: TailscaleTenant) -> TenantResponse:
+    cred = credential_status(
+        expires_at=t.api_key_expires_at,
+        rejected=is_auth_rejected(t.last_sync_error),
+        now=datetime.now(UTC),
+        enabled=t.enabled,
+    )
     return TenantResponse(
         id=t.id,
         name=t.name,
@@ -154,6 +188,10 @@ def _to_response(t: TailscaleTenant) -> TenantResponse:
         enabled=t.enabled,
         tailnet=t.tailnet,
         api_key_present=bool(t.api_key_encrypted),
+        api_key_expires_at=t.api_key_expires_at,
+        api_key_expiry_source=t.api_key_expiry_source,
+        credential_state=cred.state,
+        credential_days_left=cred.days_left,
         ipam_space_id=t.ipam_space_id,
         dns_group_id=t.dns_group_id,
         cgnat_cidr=t.cgnat_cidr,
@@ -181,7 +219,8 @@ async def _probe(*, tailnet: str, api_key: str) -> TestConnectionResponse:
             r = await client.get(url, params={"fields": "default"})
             if r.status_code == 401:
                 return TestConnectionResponse(
-                    ok=False, message="HTTP 401 — API key invalid or revoked"
+                    ok=False,
+                    message=f"{AUTH_REJECTED_PREFIX} — API key invalid, expired or revoked",
                 )
             if r.status_code == 403:
                 return TestConnectionResponse(
@@ -219,6 +258,18 @@ async def _probe(*, tailnet: str, api_key: str) -> TestConnectionResponse:
         return TestConnectionResponse(ok=False, message=f"Could not reach Tailscale: {exc}")
     except Exception as exc:  # noqa: BLE001
         return TestConnectionResponse(ok=False, message=str(exc))
+
+
+async def _read_expiry_into(tenant: TailscaleTenant, api_key: str) -> TokenExpiryRead:
+    """Ask Tailscale for the token's expiry and store it when it answers.
+
+    Best-effort: a save never fails because the expiry could not be read —
+    the stored (or operator-entered) value is kept and the chip says
+    "unknown" until a later read succeeds.
+    """
+    read = await fetch_token_expiry(api_key=api_key, tailnet=tenant.tailnet)
+    apply_read(tenant, read)
+    return read
 
 
 async def _validate_bindings(
@@ -293,6 +344,8 @@ async def create_tenant(body: TenantCreate, db: DB, user: SuperAdmin) -> TenantR
         skip_expired=body.skip_expired,
         sync_interval_seconds=body.sync_interval_seconds,
     )
+    apply_operator_expiry(t, body.api_key_expires_at)
+    await _read_expiry_into(t, body.api_key)
     db.add(t)
     await db.flush()
     _audit(
@@ -301,7 +354,13 @@ async def create_tenant(body: TenantCreate, db: DB, user: SuperAdmin) -> TenantR
         action="create",
         tenant_id=t.id,
         tenant_name=t.name,
-        new_value=body.model_dump(mode="json", exclude={"api_key"}),
+        new_value={
+            **body.model_dump(mode="json", exclude={"api_key", "api_key_expires_at"}),
+            "api_key_expires_at": (
+                t.api_key_expires_at.isoformat() if t.api_key_expires_at else None
+            ),
+            "api_key_expiry_source": t.api_key_expiry_source,
+        },
     )
     await db.commit()
     await db.refresh(t)
@@ -322,12 +381,20 @@ async def update_tenant(
     if "ipam_space_id" in changes or "dns_group_id" in changes:
         await _validate_bindings(db, new_ipam, new_dns)
 
+    new_key = changes.get("api_key") or None
     for k, v in changes.items():
-        if k == "api_key":
-            if v:
-                t.api_key_encrypted = encrypt_str(v)
-        else:
-            setattr(t, k, v)
+        if k in ("api_key", "api_key_expires_at"):
+            continue
+        setattr(t, k, v)
+    if new_key:
+        t.api_key_encrypted = encrypt_str(new_key)
+        # The old key's expiry and its 401 say nothing about the new one.
+        apply_operator_expiry(t, changes.get("api_key_expires_at"))
+        if is_auth_rejected(t.last_sync_error):
+            t.last_sync_error = None
+        await _read_expiry_into(t, new_key)
+    elif "api_key_expires_at" in changes:
+        apply_operator_expiry(t, changes["api_key_expires_at"])
 
     _audit(
         db,
@@ -336,7 +403,16 @@ async def update_tenant(
         tenant_id=t.id,
         tenant_name=t.name,
         changed_fields=list(changes.keys()),
-        new_value={k: v for k, v in changes.items() if k != "api_key"},
+        new_value={
+            k: (v.isoformat() if isinstance(v, datetime) else v)
+            for k, v in changes.items()
+            if k != "api_key"
+        }
+        | (
+            {"api_key_expiry_source": t.api_key_expiry_source}
+            if new_key or "api_key_expires_at" in changes
+            else {}
+        ),
     )
     await db.commit()
     await db.refresh(t)
@@ -349,6 +425,8 @@ async def delete_tenant(tenant_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     if t is None:
         raise HTTPException(status_code=404, detail="Tailscale tenant not found")
     _audit(db, user=user, action="delete", tenant_id=t.id, tenant_name=t.name)
+    # #2288 — the DNS rows cascade in the database; mark their groups' bundles dirty.
+    await mark_integration_dns_released(db, own_fk="tailscale_tenant_id", target_id=t.id)
     await db.delete(t)
     await db.commit()
 
@@ -357,10 +435,20 @@ async def delete_tenant(tenant_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     "/tenants/{tenant_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_tenant(tenant_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_tenant(tenant_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     t = await db.get(TailscaleTenant, tenant_id)
     if t is None:
         raise HTTPException(status_code=404, detail="Tailscale tenant not found")
+
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="tailscale_tenant",
+        resource_id=t.id,
+        resource_display=str(getattr(t, "name", None) or t.id),
+        action="sync",
+    )
+    await db.commit()
 
     from app.tasks.tailscale_sync import sync_tenant_now  # noqa: PLC0415
 
@@ -404,13 +492,23 @@ async def test_connection(
     # resolve (unlike the proxmox / unifi / opnsense / docker / k8s LAN
     # integrations). See app/core/ssrf.py.
     result = await _probe(tailnet=tailnet, api_key=api_key)
+    if result.ok:
+        read = await fetch_token_expiry(api_key=api_key, tailnet=tailnet)
+        result.api_key_expires_at = read.expires_at
+        result.api_key_expiry_note = read.note
 
-    if body.tenant_id is not None and result.ok:
+    # Only a test of the STORED key says anything about the stored row: a key
+    # typed into the form but not yet saved must not clear the stored key's
+    # 401 or stamp its expiry onto the tenant.
+    tested_stored_key = body.tenant_id is not None and not body.api_key
+    if tested_stored_key and result.ok:
         stored = await db.get(TailscaleTenant, body.tenant_id)
         if stored is not None:
             stored.tailnet_domain = result.tailnet_domain
             stored.device_count = result.device_count
             stored.last_sync_error = None
+            if result.api_key_expires_at is not None:
+                apply_read(stored, TokenExpiryRead(result.api_key_expires_at))
             await db.commit()
 
     return result

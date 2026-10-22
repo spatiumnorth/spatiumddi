@@ -277,6 +277,13 @@ class FailoverConfig:
     max_response_delay_ms: int = 60000
     max_ack_delay_ms: int = 10000
     max_unacked_clients: int = 5
+    # The group's HA peer credential (PEM), present only once every Kea
+    # member's agent renders it — see ``services/dhcp/ha_peer_auth.py``. Part
+    # of the ETag via ``asdict``, so a rotation (or the gate opening) reaches
+    # every peer. ``repr=False`` keeps the key out of any repr of the bundle.
+    tls_ca_pem: str | None = field(default=None, repr=False)
+    tls_cert_pem: str | None = field(default=None, repr=False)
+    tls_key_pem: str | None = field(default=None, repr=False)
 
 
 @dataclass

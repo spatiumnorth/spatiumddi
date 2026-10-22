@@ -60,7 +60,7 @@ const SECTIONS: {
 ];
 
 export function ImportPage({ initialTab }: { initialTab?: ImportTab }) {
-  const { enabled: moduleEnabled } = useFeatureModules();
+  const { enabled: moduleEnabled, ready } = useFeatureModules();
   const [tab, setTab] = useSessionState<ImportTab>(
     "admin.import.tab",
     initialTab ?? "dhcp",
@@ -74,7 +74,11 @@ export function ImportPage({ initialTab }: { initialTab?: ImportTab }) {
 
   // Only show families whose feature module is enabled; fall back to the
   // first visible family if the stored/initial tab's module is off.
-  const visible = SECTIONS.filter((s) => moduleEnabled(s.module));
+  // ``enabled`` answers true until the module set has loaded, which would
+  // mount the default DHCP importer on a hard reload and fire its /dhcp
+  // reads once before the real state is known (#2130). Nothing is mounted
+  // until ``ready``.
+  const visible = ready ? SECTIONS.filter((s) => moduleEnabled(s.module)) : [];
   const active = visible.find((s) => s.key === tab) ?? visible[0];
 
   return (
@@ -104,7 +108,7 @@ export function ImportPage({ initialTab }: { initialTab?: ImportTab }) {
               </span>
             </button>
           ))}
-          {visible.length === 0 && (
+          {ready && visible.length === 0 && (
             <p className="px-3 py-2 text-xs text-muted-foreground">
               No importers are enabled. Turn them on under Features &
               Integrations.

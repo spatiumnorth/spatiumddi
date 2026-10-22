@@ -10,6 +10,8 @@ import dns.rdataclass
 import dns.rdatatype
 import dns.zone
 
+from app.models.dns import servable_ttl
+
 # Record types SpatiumDDI stores in DNSRecord (matches VALID_RECORD_TYPES in router).
 SUPPORTED_RECORD_TYPES = {
     "A",
@@ -189,7 +191,9 @@ def parse_zone_file(text: str, zone_name: str) -> ParsedZone:
                         name=rel,
                         record_type=rtype_text,
                         value=value,
-                        ttl=int(rdataset.ttl) if rdataset.ttl else None,
+                        # #2073 — dnspython accepts up to 2^32-1; past RFC
+                        # 2181's 2^31-1 (and int4) the record inherits $TTL.
+                        ttl=servable_ttl(int(rdataset.ttl)) if rdataset.ttl else None,
                         priority=pri,
                         weight=wgt,
                         port=prt,

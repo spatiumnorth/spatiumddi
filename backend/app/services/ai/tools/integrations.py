@@ -21,6 +21,7 @@ ORM doesn't surface here).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -41,6 +42,8 @@ from app.models.proxmox import ProxmoxNode
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
 from app.services.ai.tools.base import register_tool
+from app.services.integration_credentials import credential_status
+from app.services.tailscale.client import is_auth_rejected
 
 
 def _common_target_args() -> dict[str, Any]:
@@ -268,9 +271,17 @@ class ListTailscaleTargetsArgs(BaseModel):
     description=(
         "List configured Tailscale tenants (tailnets) that SpatiumDDI "
         "mirrors into IPAM. Each row carries id, name, description, "
-        "enabled flag, ipam_space_id, sync_interval_seconds, and "
-        "last_synced_at. Use for 'which tailnets are connected?' or "
-        "'is Tailscale syncing?'. PAT tokens never appear."
+        "enabled flag, ipam_space_id, sync_interval_seconds, "
+        "last_synced_at, last_sync_error, and the API access token's "
+        "expiry: api_key_expires_at (null = unknown), "
+        "api_key_expiry_source ('api' = read from Tailscale, 'operator' = "
+        "typed in), credential_state (ok / expiring / expired / rejected / "
+        "unknown / disabled — 'rejected' means the last sync got HTTP 401; "
+        "'disabled' means the tenant is off, so its last_sync_error is history "
+        "from before it was switched off, not a live problem) and "
+        "credential_days_left. Tailscale caps these tokens at 90 days. Use "
+        "for 'which tailnets are connected?', 'is Tailscale syncing?' or "
+        "'when does the Tailscale token expire?'. Tokens never appear."
     ),
     args_model=ListTailscaleTargetsArgs,
     category="integrations",
@@ -291,9 +302,16 @@ async def list_tailscale_targets(
         stmt = stmt.where(TailscaleTenant.enabled.is_(args.enabled))
     stmt = stmt.order_by(TailscaleTenant.name.asc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
+    now = datetime.now(UTC)
     out: list[dict[str, Any]] = []
     for r in rows:
         last_synced = getattr(r, "last_synced_at", None)
+        cred = credential_status(
+            expires_at=r.api_key_expires_at,
+            rejected=is_auth_rejected(r.last_sync_error),
+            now=now,
+            enabled=r.enabled,
+        )
         out.append(
             {
                 "id": str(r.id),
@@ -305,6 +323,13 @@ async def list_tailscale_targets(
                 ),
                 "sync_interval_seconds": getattr(r, "sync_interval_seconds", None),
                 "last_synced_at": last_synced.isoformat() if last_synced else None,
+                "last_sync_error": r.last_sync_error,
+                "api_key_expires_at": (
+                    r.api_key_expires_at.isoformat() if r.api_key_expires_at else None
+                ),
+                "api_key_expiry_source": r.api_key_expiry_source,
+                "credential_state": cred.state,
+                "credential_days_left": cred.days_left,
             }
         )
     return out

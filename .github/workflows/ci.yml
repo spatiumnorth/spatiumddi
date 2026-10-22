@@ -5,6 +5,23 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # #2429 — most pushes to main now skip the backend shards (their tree was
+  # already tested on the PR head, see the ``changes`` job), so the two
+  # artifacts only a full main run produces — the test-impact map (#1020)
+  # and the shard durations (#1019) — would stop being refreshed. One full
+  # run a day on main keeps them current; ``workflow_dispatch`` forces one by
+  # hand. Off the top of the hour, like every other cron here.
+  schedule:
+    - cron: "47 4 * * *"
+  workflow_dispatch:
+  # The merge queue (#2431). Each queued PR is built on a temporary
+  # ``gh-readonly-queue/main/pr-N-<sha>`` branch (main + every entry ahead
+  # of it + this PR) and the queue merges only when this workflow posts the
+  # nine checks ``protect-main`` requires on that branch's head. Without
+  # this trigger nothing reports them and every entry times out. All nine
+  # come from this file; no other workflow produces a required check.
+  merge_group:
+    types: [checks_requested]
   # ``paths-ignore`` is deliberately absent. Skipped workflow runs
   # don't post the required check-runs the ``protect-main`` ruleset
   # waits for, so docs-only PRs (CHANGELOG bumps, README polish,
@@ -18,8 +35,15 @@ on:
   # posts a green "Backend — Tests" in seconds rather than minutes,
   # and no ruleset knows the difference.
 
+# Keyed on the event as well as the ref (#2429), so the daily full run on
+# main, a dispatched full run and a push to main never cancel each other:
+# release.yml may wait on any of them, and the scheduled run is the one that
+# refreshes the test-impact map. A push and a pull_request never share a ref, so for those
+# two this is the same grouping as before. A merge-group run's ref is its own
+# ``gh-readonly-queue/main/pr-N-<sha>`` branch, unique per queue entry, so two
+# entries never cancel each other (#2431).
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -44,9 +68,16 @@ jobs:
     permissions:
       contents: read
       # #1020 — to download the test-impact map from the last main run.
+      # #2429 — and to read the merged PR's own CI run and its artifacts.
       actions: read
+      # #2429 — to find the PR a push to main is the merge of.
+      pull-requests: read
     outputs:
       backend: ${{ steps.detect.outputs.backend }}
+      # #2429 — why the shards were skipped when ``backend`` is false:
+      # ``no-backend-change`` (#813) or ``tested-on-pr-head``. The aggregator
+      # prints it, so a skipped main run says which guarantee it rests on.
+      skip_reason: ${{ steps.detect.outputs.skip_reason }}
       # #1020 — "all", or the space-separated test files this PR can affect.
       tests: ${{ steps.select.outputs.tests }}
     steps:
@@ -62,20 +93,95 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # #2431 — the merge group's head: the temporary branch's commit.
+          # (``merge_group.base_sha`` is deliberately not used — see below.)
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          # #2429 — the push's own commit ids and repository, consumed only
+          # by ci-tested-on-pr-head.sh, which validates their shape.
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          # Push to main runs the full suite unconditionally: it is the
-          # post-merge safety net, and a squash-merge's diff is not the
-          # thing we filtered on when the PR was open.
-          if [ "$EVENT" != "pull_request" ]; then
+          # A push to main is the post-merge safety net, and a squash-merge's
+          # diff is not the thing we filtered on when the PR was open — so it
+          # runs the full suite, UNLESS its tree is exactly one a green PR run
+          # already put through the full suite (#2429). The script fails
+          # safe: any doubt at all is a non-zero exit and the full suite.
+          # The aggregator still reports success, with a skip marker; a
+          # release never rests on such a run — release.yml's gate (#1226)
+          # requires a full-suite marker on the tagged commit itself, which a
+          # workflow_dispatch run (never skipped: only a push asks) provides.
+          if [ "$EVENT" = "push" ]; then
+            if tested="$(.github/scripts/ci-tested-on-pr-head.sh)"; then
+              echo "→ $tested — the 12 shards will be skipped"
+              echo "backend=false" >> "$GITHUB_OUTPUT"
+              # #2431 — the script names which guarantee it found: the merge
+              # queue's run of this exact commit, or the merged PR's head.
+              case "$tested" in
+                merge_group*) echo "skip_reason=tested-in-merge-queue" >> "$GITHUB_OUTPUT" ;;
+                *) echo "skip_reason=tested-on-pr-head" >> "$GITHUB_OUTPUT" ;;
+              esac
+              exit 0
+            fi
+            echo "event=push — running the full backend suite"
+            echo "backend=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # #2431 — a merge-group run takes the same path filter as a PR
+          # (#813), over everything the group's tree adds to main: the
+          # commits of every entry ahead of this one as well as its own,
+          # because the verdict is for that whole tree.
+          #
+          # The base is ``git merge-base origin/main HEAD`` with main freshly
+          # fetched, NOT ``merge_group.base_sha``. GitHub documents that field
+          # only loosely, and for an entry behind others in the queue it may
+          # name the previous entry's temporary commit rather than main — a
+          # diff from there would cover this entry's commit alone and could
+          # skip the shards for a tree whose backend changes came in with an
+          # entry ahead of it. The merge base with main is right either way:
+          # each queue branch is built on main, so main as of the group's
+          # creation is an ancestor of the head; if main has since advanced
+          # (an earlier group merged — that is, a fast-forward to an ancestor
+          # of this head) the base moves up with it, and anything else can only
+          # widen the diff, which is the safe direction.
+          #
+          # Fail safe: a malformed head, a head that is not the commit checked
+          # out, a failed fetch or no merge base all run everything. It never
+          # NARROWS (#1020): the ``select`` step below only narrows on
+          # pull_request, so a backend-relevant group always runs the full
+          # suite. The queue is the last gate before main, and its full run is
+          # what lets the push to main skip the shards.
+          if [ "$EVENT" = "merge_group" ]; then
+            sha_re='^[0-9a-f]{40}$'
+            if ! [[ "$MG_HEAD_SHA" =~ $sha_re ]] || [ "$MG_HEAD_SHA" != "$SHA" ]; then
+              echo "::warning::merge group head '$MG_HEAD_SHA' is malformed or not the checked-out commit — running the full backend suite"
+              echo "backend=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if ! git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main \
+               || ! mg_base="$(git merge-base refs/remotes/origin/main "$MG_HEAD_SHA")" \
+               || ! [[ "$mg_base" =~ $sha_re ]]; then
+              echo "::warning::no merge base between main and the merge group head — running the full backend suite"
+              echo "backend=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "merge group: diffing ${mg_base} (merge base with main) ... ${MG_HEAD_SHA}"
+            BASE_SHA="$mg_base"
+            HEAD_SHA="$MG_HEAD_SHA"
+          # The daily schedule and a manual dispatch exist to run everything.
+          elif [ "$EVENT" != "pull_request" ]; then
             echo "event=$EVENT — running the full backend suite"
             echo "backend=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # Three dots: changes on the head branch since the merge base, not
-          # everything main has moved on by.
+          # everything main has moved on by. (For a merge group the base is
+          # already the merge base with main.)
           #
           # ``--no-renames`` is load-bearing. With rename detection on (the
           # default) ``git mv backend/thing.py docs/thing.md`` reports ONLY
@@ -92,8 +198,18 @@ jobs:
           echo "Changed files:"
           sed 's/^/  /' "$changed"
 
+          # #2431 — CHANGELOG.md is the one file nearly every PR used to
+          # touch at the same spot, so two queued PRs conflicted and the
+          # merge queue dropped the second. Entries go in changelog.d/ now;
+          # release prep folds them in. A warning, not a failure: the
+          # release-prep PR edits CHANGELOG.md on purpose.
+          if [ "$EVENT" = "pull_request" ] && grep -qx 'CHANGELOG.md' "$changed"; then
+            echo "::warning file=CHANGELOG.md::This PR edits CHANGELOG.md directly. Add a changelog.d/<issue>-<slug>.md fragment instead (see changelog.d/README.md), or the merge queue will drop this PR whenever another one ahead of it touches the changelog."
+          fi
+
           relevant="$(.github/scripts/ci-backend-relevant.sh < "$changed")"
           echo "backend=$relevant" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=no-backend-change" >> "$GITHUB_OUTPUT"
           if [ "$relevant" = "true" ]; then
             echo "→ backend suite WILL run"
           else
@@ -101,17 +217,21 @@ jobs:
           fi
 
       # #1020 — WHICH backend tests can this change set affect? Reads the
-      # test-impact map the most recent successful push-to-main run built from
+      # test-impact map the most recent successful full main run (a push that
+      # ran the shards, the daily schedule, or a dispatch — #2429) built from
       # its shards' coverage contexts ({app file → test files that executed
       # it}) and applies the fail-open rules in
       # .github/scripts/select_impacted_tests.py. The answer is "all" whenever
       # the map is missing or any changed path is outside what the map can
       # speak for (migrations, config, data files, conftest, import-only
-      # modules such as models, anything in the must-run manifest). Push to
-      # main always runs everything — that is the safety net that makes a
-      # wrong selection recoverable rather than lost, the same contract #813
-      # relies on. Nothing in this step may fail the job: every error path
-      # lands on "all".
+      # modules such as models, anything in the must-run manifest). A
+      # narrowed PR run publishes no ``backend-full-suite`` marker, so its
+      # push to main never qualifies for the #2429 skip and runs everything —
+      # that is the safety net that makes a wrong selection recoverable
+      # rather than lost, the same contract #813 relies on. (Only a PR run
+      # that itself passed the full suite lets its push skip the shards.)
+      # Nothing in this step may fail the job: every error path lands on
+      # "all".
       - id: select
         name: Which backend tests can this change set affect?
         if: steps.detect.outputs.backend == 'true'
@@ -124,17 +244,15 @@ jobs:
           if [ "$EVENT" = "pull_request" ]; then
             map_dir="$RUNNER_TEMP/impact-map"
             mkdir -p "$map_dir"
-            # Newest successful main run that published a map. A green run can
-            # lack one (the aggregator builds it only when every shard ran), so
-            # look back a few. ``gh`` is preinstalled on ubuntu-latest.
-            for run_id in $(gh run list --workflow CI --branch main --event push \
-                              --status success --limit 5 --json databaseId \
-                              --jq '.[].databaseId' 2>/dev/null || true); do
-              if gh run download "$run_id" -n test-impact-map -D "$map_dir" 2>/dev/null; then
-                echo "test-impact map from main run $run_id"
-                break
-              fi
-            done
+            # Newest map a successful main run (push, schedule or dispatch)
+            # published, found by artifact name rather than by walking runs:
+            # since #2429 most pushes skip the shards and publish none. The
+            # script never accepts a pull_request run's artifact — a fork PR's
+            # run executes the fork's workflow and can report head_branch
+            # "main". ``gh`` and ``jq`` are preinstalled on ubuntu-latest.
+            if run_id="$(.github/scripts/latest-main-artifact.sh test-impact-map "$map_dir")"; then
+              echo "test-impact map from main run $run_id"
+            fi
             tests="$(python3 .github/scripts/select_impacted_tests.py \
                        --changed "$RUNNER_TEMP/changed-files.txt" \
                        --map "$map_dir/test-impact-map.json")" || tests=all
@@ -264,6 +382,15 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3 scripts/lint_docs_links.py
 
+      # #2431 — CHANGELOG entries arrive as changelog.d/ fragments, folded in
+      # at release prep. A malformed one (no section heading, an unknown
+      # section, a name that does not sort by issue) would otherwise surface
+      # only then, as a failed fold with the release waiting on it.
+      # stdlib-only; runs from repo root.
+      - name: Changelog fragment linter
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/changelog_assemble.py --check
+
   # The ~4,200-test suite is DB-bound (conftest TRUNCATEs every table per
   # test), so we fan it out across 12 parallel jobs via pytest-split; each
   # job still runs ``-n auto`` (4 xdist workers on a 4-vCPU runner).
@@ -376,11 +503,18 @@ jobs:
           # test files the diff can affect; "all" (and every push to main)
           # is the whole suite via pyproject's testpaths.
           if [ "$TESTS" = all ] || [ -z "$TESTS" ]; then set --; else set -- $TESTS; fi
-          # #1020 — the push-to-main run also records WHICH test executed
-          # each line; the aggregator turns that into the test-impact map
-          # PRs select from. Coverage is otherwise off (#1019).
+          # #1020 — a main run (push, schedule or dispatch — #2429) also
+          # records WHICH test executed each line; the aggregator turns that
+          # into the test-impact map PRs select from. Coverage is otherwise
+          # off (#1019).
+          # #2431 — not on a merge-group run either: its map would never be
+          # read (latest-main-artifact.sh takes main runs only), so the
+          # coverage overhead would buy nothing.
           extra=()
-          if [ "$EVENT" = push ]; then extra=(--cov=app --cov-context=test --cov-report=); fi
+          case "$EVENT" in
+            pull_request | merge_group) ;;
+            *) extra=(--cov=app --cov-context=test --cov-report=) ;;
+          esac
           rc=0
           python -m pytest "$@" -n auto --splits 12 --group ${{ matrix.shard }} \
             --store-durations --clean-durations "${extra[@]}" || rc=$?
@@ -406,7 +540,7 @@ jobs:
       # #1020 — this shard's coverage contexts, for the test-impact map.
       # pytest-cov has already combined the xdist workers' data into one file.
       - name: Upload coverage contexts
-        if: github.event_name == 'push'
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@v7
         with:
           name: coverage-shard-${{ matrix.shard }}
@@ -429,12 +563,21 @@ jobs:
     if: always()
     steps:
       - name: All shards passed
+        id: verdict
         env:
           SHARDS: ${{ needs.backend-test-shard.result }}
           BACKEND_RELEVANT: ${{ needs.changes.outputs.backend }}
+          SKIP_REASON: ${{ needs.changes.outputs.skip_reason }}
           TESTS: ${{ needs.changes.outputs.tests }}
         run: |
           set -euo pipefail
+          # #2429 — what this ATTEMPT's verdict rests on, published below as a
+          # per-attempt marker artifact. ci-tested-on-pr-head.sh reads the
+          # ``full-suite`` marker of a PR run's latest attempt as the proof the
+          # full suite passed; ci-full-suite-passed.sh (release.yml's gate)
+          # reads both, so a release never rests on a skipped-shards run.
+          marker_dir="$RUNNER_TEMP/backend-marker"
+          mkdir -p "$marker_dir"
 
           if [ "$SHARDS" = "skipped" ]; then
             # Only an explicit "false" justifies a skip. An empty value means
@@ -445,7 +588,28 @@ jobs:
               echo "::error::shards were skipped but change detection did not ask for it (backend='$BACKEND_RELEVANT')"
               exit 1
             fi
-            echo "no backend-relevant files changed — 12 shards skipped (#813)"
+            case "$SKIP_REASON" in
+              tested-on-pr-head)
+                # #2429 — the ``changes`` log names the PR, head and run.
+                echo "::notice title=Backend tests already passed on the PR head (#2429)::this commit's tree is identical to a PR head whose CI run passed the full backend suite — 12 shards skipped"
+                echo "shards skipped: tree tested on a PR head ($GITHUB_SHA, attempt $GITHUB_RUN_ATTEMPT)" > "$marker_dir/backend-suite.txt"
+                echo "marker=skipped-tested-on-pr-head" >> "$GITHUB_OUTPUT"
+                ;;
+              tested-in-merge-queue)
+                # #2431 — the merge queue's own run of this exact commit
+                # passed the full suite; the ``changes`` log names the run.
+                echo "::notice title=Backend tests already passed in the merge queue (#2431)::the merge queue's CI run of this exact commit passed the full backend suite — 12 shards skipped"
+                echo "shards skipped: commit tested in the merge queue ($GITHUB_SHA, attempt $GITHUB_RUN_ATTEMPT)" > "$marker_dir/backend-suite.txt"
+                echo "marker=skipped-tested-in-merge-queue" >> "$GITHUB_OUTPUT"
+                ;;
+              no-backend-change)
+                echo "no backend-relevant files changed — 12 shards skipped (#813)"
+                ;;
+              *)
+                echo "::error::shards were skipped for an unknown reason ('$SKIP_REASON')"
+                exit 1
+                ;;
+            esac
             exit 0
           fi
 
@@ -455,8 +619,23 @@ jobs:
           fi
           if [ "$TESTS" != all ]; then
             echo "::notice title=Backend tests narrowed (#1020)::this PR ran only the test files its diff can affect: $TESTS — the full suite runs on merge to main"
+          else
+            echo "full suite: all 12 shards passed ($GITHUB_SHA, attempt $GITHUB_RUN_ATTEMPT)" > "$marker_dir/backend-suite.txt"
+            echo "marker=full-suite" >> "$GITHUB_OUTPUT"
           fi
           echo "all 12 backend test shards passed"
+
+      # #2429 — the per-attempt marker. Named by attempt so a re-run can never
+      # inherit an earlier attempt's verdict: readers look up the name for the
+      # run's LATEST attempt. 90 days, so release.yml can still read it for a
+      # tag cut well after the merge.
+      - name: Upload backend-suite marker
+        if: steps.verdict.outputs.marker != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-${{ steps.verdict.outputs.marker }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/backend-marker/backend-suite.txt
+          retention-days: 90
 
       # #1019 — assemble the full durations picture from the shards' uploads.
       # Only when EVERY shard succeeded AND the run was not narrowed (#1020):
@@ -496,17 +675,18 @@ jobs:
           retention-days: 30
 
       # #1020 — fold the shards' coverage contexts into the test-impact map
-      # PRs select from. Push to main only: that run is always the whole
-      # suite, and a map built from a narrowed run would attribute too little
-      # and shrink the next selection further.
+      # PRs select from. Main runs only (push, schedule, dispatch — #2429;
+      # never a merge-group run, #2431):
+      # those are always the whole suite, and a map built from a narrowed run
+      # would attribute too little and shrink the next selection further.
       - uses: actions/download-artifact@v8
-        if: github.event_name == 'push' && needs.backend-test-shard.result == 'success'
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.backend-test-shard.result == 'success'
         with:
           pattern: coverage-shard-*
           path: ${{ runner.temp }}/coverage
 
       - name: Build test-impact map
-        if: github.event_name == 'push' && needs.backend-test-shard.result == 'success'
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.backend-test-shard.result == 'success'
         env:
           COVERAGE: ${{ runner.temp }}/coverage
           MAP: ${{ runner.temp }}/impact/test-impact-map.json
@@ -521,7 +701,7 @@ jobs:
       # than the last merge to main only exists if main has been idle that
       # long, and the selector falls back to the full suite without one.
       - name: Upload test-impact map
-        if: github.event_name == 'push' && needs.backend-test-shard.result == 'success'
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.backend-test-shard.result == 'success'
         uses: actions/upload-artifact@v7
         with:
           name: test-impact-map
@@ -727,7 +907,7 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v5
         with:
-          version: v4.3.0
+          version: v4.3.1
 
       - name: Install kubeconform
         run: .github/scripts/install-kubeconform.sh

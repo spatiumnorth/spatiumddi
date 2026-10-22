@@ -41,7 +41,8 @@ from typing import Final
 
 import structlog
 from fastapi import Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import literal_column, select
+from sqlalchemy import table as sa_table
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -70,6 +71,17 @@ class ModuleSpec:
     # router mounted and a sidebar row visible, pointing at a subsystem
     # the operator has turned off.
     requires: tuple[str, ...] = ()
+    # #2100 — a default-OFF module that resolves ON, absent an operator
+    # override, on an install whose named table already holds a row. This
+    # is how a module carved out of an existing always-on surface ships
+    # default-off WITHOUT hiding that surface from the installs that use
+    # it, and without seeding a ``feature_module`` row (#1069 forbids
+    # that: a row means "an operator changed this", and a seeded one makes
+    # the catalog default dead code). Only consulted while no override row
+    # exists, so an operator's choice always wins, in both directions.
+    # ``default_enabled`` stays the FRESH-install value and is what
+    # ``tests/test_feature_module_defaults.py`` pins.
+    default_on_if_rows_in: str | None = None
 
 
 # Stable dotted-name ids. A new module appends here and does NOT seed a
@@ -458,6 +470,41 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="IPAM",
         description="One-shot migration import of prefixes / IP addresses / VLANs / VRFs / tenants / sites from a NetBox instance into native IPAM rows. Run it from Administration → Import → NetBox; the connection and token are supplied per import and never stored.",
     ),
+    # IPAM — NAT mappings (#2100). Operator-curated 1:1 / PAT / hide-NAT
+    # cross-reference data: the NAT Mappings page, the /ipam/nat-mappings
+    # routes, the Dashboard count and the NAT panels + badges on subnet / IP
+    # detail.
+    #
+    # Default-OFF (#1069): most installs never record a NAT binding, and the
+    # surface was always-on only because it predates the module catalog. But
+    # it predates the catalog, so an install upgraded with mappings already
+    # in it must keep seeing them — and seeding a row to say so is exactly
+    # what #1069 forbids. ``default_on_if_rows_in`` covers that: with no
+    # operator override, the module resolves ON iff ``nat_mapping`` holds a
+    # row. The consequence, stated rather than hidden: a firewall mirror
+    # writing the first NAT row on a fresh install turns the surface on,
+    # because data now exists for it to show; and deleting the last mapping
+    # turns it back off unless the operator has enabled it explicitly.
+    #
+    # Deliberately NO ``requires=`` link from the PAN-OS / Fortinet / Meraki
+    # mirrors: they keep writing ``nat_mapping`` provenance rows while this is
+    # off, so turning it on later shows a current picture rather than a gap.
+    # Disabling is allowed with rows present — the data is hidden, not lost.
+    ModuleSpec(
+        id="ipam.nat",
+        label="NAT mappings",
+        group="IPAM",
+        description=(
+            "Operator-curated 1:1 / PAT / hide-NAT mappings between internal and "
+            "external addresses — the NAT Mappings page, the Dashboard count and "
+            "the NAT panels on subnet and IP detail. Off on a fresh install, but "
+            "on by default wherever NAT mappings already exist. Turning it off "
+            "hides the data without deleting it, and the PAN-OS, Fortinet and "
+            "Meraki mirrors keep recording NAT rules while it is off."
+        ),
+        default_enabled=False,
+        default_on_if_rows_in="nat_mapping",
+    ),
     # Integrations — read-only mirrors of external orchestrators.
     # Default-disabled: each one needs operator-supplied credentials
     # before it does anything useful, and the kickoff lives behind
@@ -739,6 +786,10 @@ def is_known(module_id: str) -> bool:
 _CACHE_TTL_S: Final[float] = 5.0
 _cache_loaded_at: float = 0.0
 _cached_enabled: set[str] = set()
+# The catalog the cached set was resolved against. A verdict computed under a
+# different ``MODULES`` (the suite swaps defaults per test; #2395) must not
+# answer for this one, TTL or not.
+_cached_for: object = None
 
 
 def invalidate_cache() -> None:
@@ -779,30 +830,90 @@ def _resolve_with_parents(
     return all(_resolve_with_parents(parent, own, seen) for parent in spec.requires)
 
 
+async def _table_has_rows(db: AsyncSession, table_name: str) -> bool:
+    """``SELECT 1 FROM <table> LIMIT 1`` — stops at the first row, not a COUNT.
+
+    ``table()`` builds a lightweight clause with a properly quoted
+    identifier, so the catalog does not have to import the model (and the
+    model graph) just to ask whether a table is empty.
+    """
+    probe = sa_table(table_name)
+    found: object = (
+        await db.execute(select(literal_column("1")).select_from(probe).limit(1))
+    ).first()
+    return found is not None
+
+
+@dataclass(frozen=True)
+class ModuleStates:
+    """Per-module state before ``requires`` resolution.
+
+    ``own`` is what each module resolves to on its own: the operator's
+    override row when one exists, else ``defaults``. ``defaults`` is the
+    EFFECTIVE default for this install — the catalog's ``default_enabled``,
+    except where ``default_on_if_rows_in`` has turned it on (#2100).
+    """
+
+    own: dict[str, bool]
+    defaults: dict[str, bool]
+
+
+async def load_module_states(db: AsyncSession, *, probe_overridden: bool = False) -> ModuleStates:
+    """Read the override rows and resolve every module's own state.
+
+    The single place a module's state is derived, so the gate
+    (``get_enabled_modules``) and the list endpoint the frontend resolves
+    from cannot disagree — if they did, the sidebar would show a row whose
+    page 404s. The data-presence probe runs only for a module that declares
+    one AND has no override row, so the gate pays nothing for it once an
+    operator has chosen. ``probe_overridden`` runs it regardless, so
+    ``defaults`` is exact for a module that HAS an override — the Settings
+    page needs that to tell "overridden" from "at its default"; ``own``
+    is the same either way.
+    """
+    rows = (await db.execute(select(FeatureModule))).scalars().all()
+    overrides: dict[str, bool] = {row.id: row.enabled for row in rows}
+
+    defaults: dict[str, bool] = {}
+    for spec in MODULES:
+        default = spec.default_enabled
+        if (
+            not default
+            and spec.default_on_if_rows_in
+            and (probe_overridden or spec.id not in overrides)
+        ):
+            default = await _table_has_rows(db, spec.default_on_if_rows_in)
+        defaults[spec.id] = default
+
+    own = {spec.id: overrides.get(spec.id, defaults[spec.id]) for spec in MODULES}
+    return ModuleStates(own=own, defaults=defaults)
+
+
 async def get_enabled_modules(db: AsyncSession) -> set[str]:
     """Return the set of currently-enabled module ids.
 
     Resolved as:
         for each module in the catalog:
             if a DB override exists, honour it
-            else honour the catalog's default_enabled
+            else honour the effective default (``load_module_states``)
         then drop any module whose ``requires`` chain is not fully
         enabled (#1068).
+
+    Cached for ``_CACHE_TTL_S``, which also bounds the data-presence probe
+    behind ``default_on_if_rows_in`` to one cheap query per worker per TTL.
+    A first row written elsewhere (a mirror in a Celery worker) is picked up
+    at the next expiry.
     """
-    global _cache_loaded_at, _cached_enabled
+    global _cache_loaded_at, _cached_enabled, _cached_for
     now = time.monotonic()
-    if now - _cache_loaded_at < _CACHE_TTL_S and _cached_enabled:
+    if now - _cache_loaded_at < _CACHE_TTL_S and _cached_enabled and _cached_for is MODULES:
         return _cached_enabled
 
-    rows = (await db.execute(select(FeatureModule))).scalars().all()
-    overrides: dict[str, bool] = {row.id: row.enabled for row in rows}
-
-    own: dict[str, bool] = {
-        spec.id: overrides.get(spec.id, spec.default_enabled) for spec in MODULES
-    }
+    own = (await load_module_states(db)).own
     enabled = {mid for mid in own if _resolve_with_parents(mid, own)}
 
     _cached_enabled = enabled
+    _cached_for = MODULES
     _cache_loaded_at = now
     return enabled
 

@@ -371,3 +371,102 @@ async def test_the_render_stores_the_snapshot_it_read_under(db_session: AsyncSes
         )
     ).scalar_one()
     assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_a_retired_op_is_stamped_like_any_applied_op(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """#2108 — the split-horizon render retires an op as ``applied``; it must
+    carry what ``_mark_applied`` stamps (``applied_at``, ``updated_at``, one
+    attempt: the render delivered it once), and the pending-ops API shows it."""
+    from app.core.security import generate_api_token, hash_password  # noqa: PLC0415
+    from app.models.auth import APIToken, User  # noqa: PLC0415
+
+    server, zone, _headers = await _agent(db_session, views=True)
+    old = datetime.now(UTC) - timedelta(hours=1)
+    op = _op(server.id, zone, "early", created_at=old)
+    op.updated_at = old
+    db_session.add(op)
+    db_session.add(_record(zone, "early"))
+    owner = User(
+        username=f"tok-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.test",
+        display_name="Token User",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(owner)
+    await db_session.flush()
+    raw, _prefix, token_hash = generate_api_token()
+    db_session.add(
+        APIToken(
+            name="t-2108",
+            token_hash=token_hash,
+            prefix=raw[:10],
+            scope="user",
+            scopes=[],
+            resource_grants=[],
+            user_id=owner.id,
+            created_by_user_id=owner.id,
+            is_active=True,
+        )
+    )
+    await db_session.commit()
+    server_id, op_id = server.id, op.id
+
+    before = datetime.now(UTC)
+    outcome = await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+    assert outcome.bundle is not None
+
+    row = (
+        await db_session.execute(select(DNSRecordOp).where(DNSRecordOp.id == op_id))
+    ).scalar_one()
+    await db_session.refresh(row)
+    assert row.state == "applied"
+    assert row.applied_at is not None and row.applied_at >= before
+    assert row.updated_at >= before
+    assert row.attempts == 1
+    assert row.last_error is None and row.next_attempt_at is None
+
+    r = await client.get(
+        f"/api/v1/dns/servers/{server_id}/pending-ops",
+        headers={"Authorization": f"Bearer {raw}"},
+    )
+    assert r.status_code == 200, r.text
+    item = next(i for i in r.json()["items"] if i["op_id"] == str(op_id))
+    assert item["state"] == "applied"
+    assert item["applied_at"] is not None
+    assert item["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_retired_backed_off_op_clears_its_failure(db_session: AsyncSession) -> None:
+    """#2108 — an op backing off after a failed dispatch, then retired by the
+    split-horizon render, reads as delivered: its error and retry time are
+    cleared and the render counts as one more attempt."""
+    server, zone, _headers = await _agent(db_session, views=True)
+    old = datetime.now(UTC) - timedelta(hours=1)
+    op = _op(server.id, zone, "early", created_at=old)
+    op.updated_at = old
+    op.attempts = 2
+    op.last_error = "the agent reported an error"
+    op.next_attempt_at = datetime.now(UTC) + timedelta(minutes=5)
+    db_session.add(op)
+    db_session.add(_record(zone, "early"))
+    await db_session.commit()
+    op_id = op.id
+
+    await render_and_store(db_session, server, rendered_by=store.RENDERED_BY_WORKER)
+    await db_session.commit()
+
+    row = (
+        await db_session.execute(select(DNSRecordOp).where(DNSRecordOp.id == op_id))
+    ).scalar_one()
+    await db_session.refresh(row)
+    assert row.state == "applied"
+    assert row.applied_at is not None
+    assert row.attempts == 3
+    assert row.last_error is None
+    assert row.next_attempt_at is None

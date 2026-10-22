@@ -256,6 +256,16 @@ export function RuleEditorModal({
             {existing ? "; its parameters cannot be edited here." : "."}
           </p>
         )}
+        {existing && types && !spec && (
+          // #2130 — the catalogue leaves out a type whose feature module is
+          // off. The rule is kept as stored (no parameter is sent on Save)
+          // and is not evaluated until the module is back on.
+          <p className="text-xs text-muted-foreground">
+            This rule&apos;s type belongs to a feature module that is turned
+            off, so it is not evaluated. Its parameters are kept as stored and
+            can be edited again once the module is on.
+          </p>
+        )}
         {spec?.params.map((p) => (
           <Field
             key={p.name}

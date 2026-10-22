@@ -1,3 +1,4 @@
+import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -33,6 +34,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Shown in the create modal so operators know what to run on their
@@ -407,9 +409,13 @@ function ClusterModal({
   const qc = useQueryClient();
   const editing = !!cluster;
 
+  // DNS off (#2135): no /dns/groups read and no picker. The stored
+  // dns_group_id is sent back untouched, so saving here cannot clear it.
+  const dnsOn = useModuleOn("core.dns");
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
+    enabled: dnsOn,
   });
 
   const [name, setName] = useState(cluster?.name ?? "");
@@ -425,7 +431,7 @@ function ClusterModal({
   const [podCidr, setPodCidr] = useState(cluster?.pod_cidr ?? "");
   const [serviceCidr, setServiceCidr] = useState(cluster?.service_cidr ?? "");
   const [syncInterval, setSyncInterval] = useState(
-    cluster?.sync_interval_seconds ?? 60,
+    String(cluster?.sync_interval_seconds ?? 60),
   );
   const [mirrorPods, setMirrorPods] = useState(cluster?.mirror_pods ?? false);
   const [showGuide, setShowGuide] = useState(!editing);
@@ -491,7 +497,7 @@ function ClusterModal({
           dns_group_id: dnsGroupId || null,
           pod_cidr: podCidr,
           service_cidr: serviceCidr,
-          sync_interval_seconds: syncInterval,
+          sync_interval_seconds: Number(syncInterval.trim()),
           mirror_pods: mirrorPods,
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
@@ -512,7 +518,7 @@ function ClusterModal({
         dns_group_id: dnsGroupId || null,
         pod_cidr: podCidr,
         service_cidr: serviceCidr,
-        sync_interval_seconds: syncInterval,
+        sync_interval_seconds: Number(syncInterval.trim()),
         mirror_pods: mirrorPods,
       };
       return kubernetesApi.createCluster(create);
@@ -533,6 +539,17 @@ function ClusterModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          // #2110 — "1h" and an empty field are refused, not read as 1 / the default.
+          const intervalError = secondsFieldError(
+            "Sync interval",
+            syncInterval,
+            SYNC_INTERVAL_BOUNDS,
+          );
+          if (intervalError) {
+            setError(intervalError);
+            return;
+          }
+          setError("");
           saveMut.mutate();
         }}
         className="space-y-3"
@@ -667,20 +684,22 @@ function ClusterModal({
           <Field label="IPAM space">
             <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
-          <Field label="DNS server group (optional)">
-            <select
-              className={inputCls}
-              value={dnsGroupId ?? ""}
-              onChange={(e) => setDnsGroupId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {dnsGroups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {dnsOn && (
+            <Field label="DNS server group (optional)">
+              <select
+                className={inputCls}
+                value={dnsGroupId ?? ""}
+                onChange={(e) => setDnsGroupId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {dnsGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
         </div>
 
         <div className="space-y-2">
@@ -735,7 +754,7 @@ function ClusterModal({
             className={inputCls}
             value={syncInterval}
             min={30}
-            onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
+            onChange={(e) => setSyncInterval(e.target.value)}
           />
         </Field>
 

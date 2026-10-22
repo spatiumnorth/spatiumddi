@@ -82,6 +82,11 @@ EXPECTED_DEFAULTS: dict[str, bool] = {
     "migration.cutover": False,
     # ── IPAM ────────────────────────────────────────────────────────
     "ipam.import.netbox": True,
+    # #2100 — off on a FRESH install, but ``default_on_if_rows_in`` resolves
+    # it on (without seeding a row) wherever ``nat_mapping`` already holds
+    # data, so an upgraded install that uses NAT keeps it. This file pins
+    # the fresh-install value; ``test_feature_module_nat_2100.py`` pins the rest.
+    "ipam.nat": False,
     # ── Integrations ────────────────────────────────────────────────
     "integrations.kubernetes": False,
     "integrations.docker": False,
@@ -296,3 +301,22 @@ def test_a_core_subsystem_has_no_parent_of_its_own() -> None:
 
     for mid in ("core.dns", "core.dhcp"):
         assert MODULES_BY_ID[mid].requires == (), f"{mid} must stay a root of the requires graph."
+
+
+def test_every_default_on_if_rows_in_names_a_real_table() -> None:
+    """``default_on_if_rows_in`` (#2100) is a probe against a table by name.
+
+    A typo would make the probe raise on every module-state load — every
+    gated request — so the table must exist in the model metadata.
+    """
+    import app.models  # noqa: F401 — registers every table on Base.metadata
+    from app.models.base import Base
+    from app.services.feature_modules import MODULES
+
+    tables = set(Base.metadata.tables)
+    for spec in MODULES:
+        if spec.default_on_if_rows_in is None:
+            continue
+        assert (
+            spec.default_on_if_rows_in in tables
+        ), f"{spec.id}: default_on_if_rows_in={spec.default_on_if_rows_in!r} is not a table."

@@ -17,7 +17,9 @@ stayed up for :data:`SETTLE_SECONDS` after it. A process that dies while the
 marker is armed, however it died (named OOM-killed and the agent exiting with
 it, the whole container killed, a node lost), leaves it behind, and the next
 start counts that as one death of that bundle. Exits the agent chooses (a
-SIGTERM, a re-bootstrap) disarm it first and are not counted.
+SIGTERM, a critical thread ending) disarm it first and are not counted. A
+re-registration after a 401 or 404 is not an exit at all (#2052): the daemon
+keeps running, and a bundle still settling goes on settling.
 
 What a count means is decided in ``sync.SyncLoop``:
 
@@ -25,6 +27,8 @@ What a count means is decided in ``sync.SyncLoop``:
   startup. The agent asks the control plane first, and only re-applies the
   cache when the control plane cannot be reached (non-negotiable #5: one
   death may be a power cut, and a cache that is never used is no cache).
+  A control plane that answers but sends no bundle within
+  :data:`BOOT_HOLD_MAX_WAIT_SECONDS` counts as unreachable (#2241).
 * :data:`QUARANTINE_AFTER_DEATHS` deaths the agent WATCHED (the daemon exited
   while the agent was alive to see it, :meth:`ApplyGuard.daemon_died`): the
   bundle is quarantined (#882) as well. Offline it falls back to the
@@ -49,6 +53,7 @@ next start, which is what #2019 needed.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -65,6 +70,45 @@ SETTLE_SECONDS = 300.0
 
 #: Deaths of the same bundle after which startup syncs before using the cache.
 SYNC_FIRST_AFTER_DEATHS = 1
+
+#: Default of :data:`BOOT_HOLD_MAX_WAIT_SECONDS` (#2241).
+DEFAULT_BOOT_HOLD_MAX_WAIT_SECONDS = 600.0
+
+
+def _boot_hold_max_wait_from_env() -> float:
+    """``AGENT_BOOT_HOLD_MAX_WAIT_S``, or the default when unset or unusable.
+
+    A value that is not a positive number is ignored rather than honoured:
+    zero would turn the hold back into the pre-#2019 behaviour (the cache
+    applied on the first poll), and a typo must not leave a server dark for
+    longer than the default."""
+    raw = os.environ.get("AGENT_BOOT_HOLD_MAX_WAIT_S", "").strip()
+    if not raw:
+        return DEFAULT_BOOT_HOLD_MAX_WAIT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if not value > 0 or value == float("inf"):
+        log.warning(
+            "boot_hold_max_wait_invalid_using_default",
+            value=raw,
+            default_s=DEFAULT_BOOT_HOLD_MAX_WAIT_SECONDS,
+        )
+        return DEFAULT_BOOT_HOLD_MAX_WAIT_SECONDS
+    return value
+
+
+#: How long a startup hold waits for the control plane to send a bundle before
+#: the held cache is served anyway (#2241). The hold asks the control plane
+#: first, and falls back to the cache at once when it cannot be reached. A
+#: control plane that IS reachable but cannot produce a bundle (renders
+#: OOM-killed or timed out at scale, a re-registration backing off, a long-poll
+#: that only ever answers 304) used to keep the server dark for as long as that
+#: lasted: hours in the #2240 scale lab, on servers holding a valid cache. Past
+#: this wait the control plane counts as unreachable for the hold. A bundle the
+#: daemon was SEEN to die on twice is still never re-applied by it.
+BOOT_HOLD_MAX_WAIT_SECONDS = _boot_hold_max_wait_from_env()
 
 #: WATCHED deaths of the same bundle (the agent saw the daemon exit) after
 #: which it is quarantined. Unwatched deaths never quarantine (module doc).
