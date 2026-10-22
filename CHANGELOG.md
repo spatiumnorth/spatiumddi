@@ -144,6 +144,148 @@ the formatter handles the rest.
   appliance's row there, taking that row's agent id. A row found by agent
   id is still never moved (#934).
 
+- **One failing alert rule no longer re-pages every alert in the pass,
+  every minute (#2261).** The alert evaluator ran every rule in one
+  transaction and delivered each new event as soon as it opened, before
+  the single commit at the end. A rule whose query failed (a SQL error,
+  or a slow DNS-threat matcher hitting the task's command timeout)
+  aborted that transaction, so the commit discarded every event the
+  pass had already sent: the pages went out, nothing appeared under
+  /alerts, and the next tick (plus Celery's three autoretries) sent
+  them again. Now each rule runs in its own savepoint, so a failing
+  rule rolls back only itself, and nothing is delivered until the
+  events are committed; a pass that fails before its commit has sent
+  nothing, and one that fails after it finds its events already open
+  and does not re-send them. Each queued delivery is claimed before it
+  is sent, so it is never sent twice, and one a worker died before
+  sending is re-sent by a later pass once it is ten minutes old, unless
+  the event has resolved or its rule is disabled. Passes are
+  serialised by an advisory lock (an overlapping pass, including
+  "Evaluate now", returns zero counts), and at most one event per
+  rule and subject can be open: the index is now unique, and the
+  migration resolves any duplicates already stored, keeping the
+  earliest. The conformity engine had the same shape and gets the same
+  fix: a check that raises a database error no longer loses every
+  policy's results and `last_evaluated_at` (so policies no longer re-run
+  and re-page every minute), and its alerts, including "evaluate now",
+  are sent only after they are stored. The audit-chain and schema-check
+  tasks commit their alert before delivering it too, and a resumed
+  upgrade run that fails again resolves its previous failure alert
+  before opening the new one.
+
+- **Overlapping DHCP lease pulls no longer duplicate a lease and stop
+  that server's pull for good (#2262).** The Windows DHCP / FortiGate
+  lease pull stamped its interval only at the end of a pass and took
+  no lock, so a pass slower than the 10 s beat tick was started again
+  while it ran, and the manual Sync Leases raced it too. Both passes
+  inserted the same new lease, and from then on every pull of that
+  server failed on that address, leaving leases and IPAM `dhcp`
+  mirrors stale until someone deleted the row by hand. The scheduled
+  pass now claims its interval when it starts, the scheduled pass and
+  the manual Sync share a per-server lock (a Sync that hits it answers
+  409), the insert is an upsert, and a pull that meets an address with
+  two rows keeps the newest and carries on, so an install wedged today
+  recovers on its next pull. Migration `e4b8c2d17a95` deletes existing
+  duplicates (keeping the most recently seen row) and adds unique
+  indexes on the lease identity: (server, address, MAC) for DHCPv4,
+  (server, address, DUID, IAID) for DHCPv6. Not on (server, address)
+  alone, because the Kea lease-event path keeps one row per client on
+  an address on purpose (#1318). If two Kea lease reports for one
+  server insert the same new lease at once, the later one now answers
+  `503` so the agent retries it and it lands as an update, rather than
+  a `409` that the agent would treat as a rejection and drop with the
+  rest of its batch.
+
+- **Agents no longer report a config apply of `ok` before they have applied anything (#2258).** The DNS, DHCP and looking-glass agents sent a default `ok` with no etag on every heartbeat until their first apply, so a fresh agent whose `/config` fetch never succeeded showed a green chip and never fired `agent_config_rejected`, and a server move's reset to unknown (#934) was undone within one heartbeat. The agents now send an empty block until something has applied, and the control plane treats `ok` without an etag as unknown (NULL), which also covers older agents still in the field.
+
+- **A disabled Tailscale tenant no longer reads "Token rejected", and
+  the Integrations card always names tenants with a credential problem
+  (#2191, #2192).** A tenant whose last sync got a 401 and was then
+  disabled kept its red chip on the Tailscale page, in
+  `GET /tailscale/tenants` and in `list_tailscale_targets`, while its
+  alert and the dashboard chips had cleared. One shared rule in
+  `credential_status` now gives such a tenant the state `disabled` on
+  all of them; the page greys its last error as "Last error
+  (disabled)". The Integrations dashboard cards used to name only
+  their first three targets, so a rejected tenant beyond them was
+  counted and never named. Targets with a credential problem or a sync
+  error are now listed first, ahead of healthy ones, even past three;
+  this covers every integration card, and the IPAM-tab panel orders
+  the same way. The list stays bounded: a card names up to eight
+  problem targets and says "+N more with problems" for the rest, and
+  the dashboard API returns at most 50 problem rows per integration.
+  Its counts ("N token expired", the new `problem_count`) are now
+  taken over every target rather than the trimmed row list, which
+  used to undercount past 20 targets.
+
+- **A trial slot on slow storage is no longer reverted because the
+  image check judged k3s's import while it was still running
+  (#2109).** Before it commits a trial slot, firstboot checks that
+  k3s imported every baked image tarball. It waited 120 s for the
+  kubelet, took a kubelet that answers to mean k3s's start-up import
+  was over, and then touched every tarball it could not yet see as
+  imported so k3s would import it again. On a node whose import
+  outlasted that wait, it touched the tarball k3s was importing at
+  that moment, which made k3s import it a second time, gave up before
+  that import ended, and left a healthy slot uncommitted, so the
+  next reboot reverted it. The kubelet is not the signal even on a
+  fast node: k3s starts it once its import queue is empty, while the
+  last tarball is still being imported (seen on a real k3s v1.36.4:
+  the kubelet started 8 s before the last import ended, and the old
+  check made k3s import that tarball twice). The check now asks
+  whether a process holds a baked tarball open, which k3s does for
+  exactly as long as it imports it. It waits while one is open, never
+  touches one that is, and judges once none is. It waits at most what
+  is left of firstboot's 10-minute start timeout, and if k3s is still
+  importing then it reports that and does not commit, rather than
+  calling an unfinished import a missing image, and names the Fleet
+  action (Approve trial) that keeps the slot once the import is over.
+  An open tarball is recognised by its inode rather than its path, so
+  a tarball k3s opened under another name (a bind mount, a symlinked
+  directory) still counts as being imported. On a node whose import
+  finished long ago it judges at once, as before.
+
+- **A DNS server holding its cached config after a crash no longer
+  stays dark while the control plane answers but cannot send a
+  bundle (#2241).** After named dies on a bundle, the #2019 hold asks
+  the control plane for a fresh one before starting it, and serves
+  the cache at once only when the control plane cannot be reached. A
+  control plane that answers but cannot render (renders OOM-killed or
+  killed at their time limit at scale, a long-poll that only ever ends
+  in 304) never counted as unreachable, so in the #2240 scale lab five
+  servers with valid caches stayed dark for about 3.5 hours. Once the
+  hold has lasted `AGENT_BOOT_HOLD_MAX_WAIT_S` seconds (default 600)
+  with nothing applied, the control plane now counts as unreachable:
+  the agent logs `bootstrap_hold_max_wait_elapsed_applying_cache`,
+  serves the cache under the offline rules and keeps syncing, and the
+  control plane's bundle is applied normally when it arrives, as a
+  reload of the daemon the fallback started. A bundle named was seen
+  dying on twice is never re-applied by this timer, not even on its
+  quarantine backoff: only a different last-known-good may serve (one
+  with no recorded etag does not count, since nothing says it is not
+  the same bundle), and with none the server stays down. A held cache
+  that fails to apply hands over to the last-known-good once, not on
+  every poll. The server row shows the wait in
+  the hold's `no_previous` reason, then `ok` once the cache serves.
+
+- **The MFA step of sign-in honours account lockout and has its own
+  attempt budget.** `POST /auth/login/mfa` now refuses a locked account
+  with the same 403 `/login` gives it, before checking the code, so a
+  correct code can no longer complete a sign-in or clear the lock.
+  Wrong codes (TOTP or recovery) still count towards the lockout
+  counter, and also against a per-account MFA budget that applies
+  whether or not lockout is enabled: 5 wrong codes in 15 minutes and
+  the MFA step answers 429 with `Retry-After` until 15 minutes after the
+  last one. The budget lives on the user row, so it holds when Redis is
+  unavailable, and attempts are read under a row lock so concurrent
+  ones are counted one at a time. Each MFA challenge also accepts at
+  most 3 wrong codes; after that, and after a successful sign-in, it is
+  spent and sign-in starts again at the password. A successful sign-in
+  or an admin unlock resets the budget. Refusals are audited as
+  `login` failures (`account_locked`, `mfa_attempts_exhausted`,
+  `mfa_challenge_spent`), and using up the budget writes an
+  `account.mfa_attempts_exhausted` row. See `docs/features/AUTH.md`.
+
 - **Deleting a Kubernetes cluster, Tailscale tenant or NetBird instance
   left its DNS names served (#2288).** The mirrored zone and records go
   with the target through a database CASCADE, which the bundle-dirty
@@ -536,6 +678,14 @@ the formatter handles the rest.
   is where receiver credentials live), with `url_changed` /
   `secret_rotated` flags on update. Delivery attempts by the worker stay
   unaudited: they are telemetry visible in the deliveries list.
+- **Deleting a site no longer turns its geo-scoped DNS pool members into
+  answers for every client (#2292).** `dns_pool_member.site_id` is SET NULL,
+  and a member with no site and no CIDRs is the unscoped default, so a member
+  meant for site-A clients began answering everyone. Site delete and bulk
+  delete now return 409 naming the pools and members that reference the site
+  (this does not cover E911 bindings, #2298). Independently, a member linked
+  to a site whose last subnet was unlinked now serves nobody instead of
+  falling back to default.
 
 - **Deleting an armed block-sync target left its blocks enforced on the
   device for good (#2291).** The PAN-OS, UniFi, Meraki and OPNsense
@@ -1568,6 +1718,25 @@ the formatter handles the rest.
   server", enabled) when no rule of that type or name exists; it is
   not seeded at startup, so an operator who deletes it keeps it
   deleted. Downgrade drops the six columns and leaves the rule.
+- `e4c9b2a17f60` — adds `user.mfa_failed_count` (Integer, NOT NULL,
+  server default 0) and nullable `user.mfa_last_failed_at`, the
+  per-account wrong-code budget for the MFA sign-in step. Downgrade
+  drops both.
+- `e4b8c2d17a95` — #2262: deletes duplicate `dhcp_lease` rows (same
+  server, address and MAC, or same server, address, DUID and IAID),
+  keeping the most recently seen, then adds the partial unique indexes
+  `uq_dhcp_lease_server_ip_mac` (`WHERE duid IS NULL`) and
+  `uq_dhcp_lease_server_ip_duid` (`WHERE duid IS NOT NULL`, NULLS NOT
+  DISTINCT). Downgrade drops the indexes; the deleted duplicates are not
+  restored.
+- `b4d81f2e6a93` — #2261: `ix_alert_event_rule_subject_open` becomes a
+  UNIQUE partial index (one open `alert_event` per rule, subject type
+  and subject). Duplicate open events are resolved first, keeping the
+  earliest-fired. Also adds the nullable
+  `alert_event.delivery_pending_since` with a partial index on its
+  non-NULL rows; existing rows stay NULL. Downgrade restores the
+  non-unique index and drops the column; the resolved duplicates stay
+  resolved.
 
 ## 1.0.0-beta.1 — 2026-10-21
 

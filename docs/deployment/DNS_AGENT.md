@@ -484,6 +484,23 @@ that bundle. A SIGTERM or a re-bootstrap disarms it first and is not counted.
   reached, or its own bundle fails to apply, does it apply the cache after
   all: one death can be a power cut, and a healthy server must not stay dark
   over it (non-negotiable #5).
+- **No bundle within the max wait (#2241):** a control plane that answers
+  but cannot produce a bundle (renders OOM-killed or killed at their time
+  limit at scale, a long-poll that only ever ends in `304`, a
+  re-registration backing off) never reads as unreachable, and used to keep
+  servers with a valid cache dark for hours. Once the hold has lasted
+  `AGENT_BOOT_HOLD_MAX_WAIT_S` seconds (default `600`, 10 minutes; a value
+  that is not a positive number is ignored) with no bundle applied, the control plane counts as unreachable: the agent logs
+  `bootstrap_hold_max_wait_elapsed_applying_cache`, serves the cache under
+  the same rules as offline, and keeps polling. The apply starts the
+  deferred named; a bundle that arrives later is applied the normal way, as
+  a reload (or not at all, if its structure is the cache's). A bundle the
+  daemon was *seen* dying on twice (below) is never re-applied by this
+  timer, not even on its quarantine backoff: only a different
+  last-known-good may serve (one with no recorded etag, as agents upgraded
+  in the field can carry, does not count: nothing says it is not the same
+  bundle), and with none named stays down until the control plane sends a
+  bundle or becomes unreachable.
 - **Two watched deaths:** the bundle is also quarantined. A death is
   *watched* when named exited while the agent stayed alive to see it (the
   agent's `dns_daemon_exited`). A marker left armed by a process that simply
@@ -503,8 +520,10 @@ that bundle. A SIGTERM or a re-bootstrap disarms it first and is not counted.
 
 While the bundle is held the server row reads `no_previous` (or `reverted`
 when the last-known-good is serving) with an error that says named died on
-the bundle, how many times, and, when the OOM record is present, that the
-memory limit killed it. A revert never goes back to a bundle the daemon was
+the bundle, how many times, when the OOM record is present that the memory
+limit killed it, and how long the hold waits before the cache serves anyway.
+Once the cache serves, the row reads `ok` with the cached bundle's etag in
+`config_apply_etag`, as it does after an offline fallback. A revert never goes back to a bundle the daemon was
 seen dying on, and at startup, before the control plane has been asked, not to
 one it died on at all. Technitium keeps its own configuration under `/etc/dns`, so for it the
 guard can only change the order (sync first); it cannot keep the daemon off
