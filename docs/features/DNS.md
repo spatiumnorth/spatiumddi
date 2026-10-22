@@ -1793,12 +1793,17 @@ unrelated edit.
 - **`dnssec_validation` enum.** `auto`, `yes`, or `no`.
 - **`notify_enabled` enum.** `yes`, `no`, `explicit`, `master-only` or
   `primary-only`.
-- **`query_log_channel` enum.** `file`, `syslog` or `stderr`.
-- **`query_log_severity`.** `critical`, `error`, `warning`, `notice`,
-  `info`, `dynamic`, `debug` or `debug <level>`.
-- **Paths.** `query_log_file` must be a file under `/var/log/named/` (the
-  directory the agent makes writable and its query-log shipper tails), and
-  `gss_tsig_keytab_path` a file under `/etc/` or `/var/lib/`. Both must be
+- **`query_log_channel` / `query_log_file`.** Fixed: the channel is
+  `file` at `/var/log/named/queries.log`, the file the agent's query-log
+  shipper tails (and the DNS Queries tab reads). Any other channel or path
+  is refused with a 422 (#2265), since it would silently empty that tab.
+- **`query_log_severity`.** `info`, `dynamic`, `debug` or `debug <level>`.
+  named logs queries at `info`, so `notice` and quieter would drop every
+  line and are refused. `query_log_print_category` / `_print_severity`
+  are honoured; `query_log_print_time` must stay on (the shipper reads the
+  timestamp).
+- **Paths.** `gss_tsig_keytab_path` must be a file under `/etc/` or
+  `/var/lib/`. It must be
   absolute, with no `.` or `..` segment, using only letters, digits, `.`,
   `_`, `-` and `/`: the path sits inside `"…"` in `named.conf`.
 

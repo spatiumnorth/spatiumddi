@@ -450,11 +450,20 @@ _OPTION_CHOICES: dict[str, frozenset[str]] = {
     "forward_policy": frozenset({"first", "only"}),
     "dnssec_validation": frozenset({"auto", "yes", "no"}),
     "notify_enabled": frozenset({"yes", "no", "explicit", "master-only", "primary-only"}),
-    "query_log_channel": frozenset({"file", "syslog", "stderr"}),
+    # Only ``file`` (#2265): the agent's QueryLogShipper tails the file
+    # channel, so syslog / stderr would silently empty the DNS Queries tab.
+    "query_log_channel": frozenset({"file"}),
 }
 
-#: ``severity`` in a logging channel. ``debug`` may carry a level.
-_SEVERITIES = frozenset({"critical", "error", "warning", "notice", "info", "dynamic", "debug"})
+#: Severities that still let a query line through the channel (#2265).
+#: named logs queries at ``info``, so a channel threshold of ``notice`` or
+#: above drops every line and the DNS Queries tab goes quiet.
+_QUERY_LOG_SEVERITIES = frozenset({"info", "dynamic", "debug"})
+
+#: The one path the shipper tails (#2265); ``query_log_file`` may not move.
+QUERY_LOG_FIXED_FILE = "/var/log/named/queries.log"
+
+#: ``debug`` may carry a level.
 _DEBUG_LEVEL_RE = re.compile(r"^debug\s+\d{1,3}$")
 
 #: Where each path option may point. The query log has to land in the
@@ -500,9 +509,9 @@ def _validate_path(value: str, *, field: str) -> str:
 def _validate_choice(value: str, *, field: str) -> str:
     candidate = (value or "").strip().lower()
     if field == "query_log_severity":
-        if candidate in _SEVERITIES or _DEBUG_LEVEL_RE.match(candidate):
+        if candidate in _QUERY_LOG_SEVERITIES or _DEBUG_LEVEL_RE.match(candidate):
             return candidate
-        allowed = ", ".join(sorted(_SEVERITIES)) + ", debug <level>"
+        allowed = ", ".join(sorted(_QUERY_LOG_SEVERITIES)) + ", debug <level>"
     else:
         if candidate in _OPTION_CHOICES[field]:
             return candidate
@@ -617,8 +626,26 @@ def validate_server_option(
         return _validate_also_notify(list(value), field=field, known_keys=known_keys)
     if field in _OPTION_CHOICES or field == "query_log_severity":
         return _validate_choice(str(value), field=field)
+    if field == "query_log_file":
+        candidate = _validate_path(str(value), field=field)
+        if candidate != QUERY_LOG_FIXED_FILE:
+            raise ViewValidationError(
+                f"The query log is always written to {QUERY_LOG_FIXED_FILE}, the file "
+                "the agent's query-log shipper tails; a different path would leave "
+                "the DNS Queries tab empty.",
+                field=field,
+                value=value,
+            )
+        return candidate
     if field in PATH_OPTION_PREFIXES:
         return _validate_path(str(value), field=field)
+    if field == "query_log_print_time" and value is False:
+        raise ViewValidationError(
+            "query_log_print_time must stay on: the query-log shipper reads each "
+            "line's timestamp.",
+            field=field,
+            value="false",
+        )
     return value
 
 

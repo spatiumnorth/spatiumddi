@@ -64,25 +64,53 @@ statistics-channels {{
 }};
 {logging_block}{tsig_include}"""
 
-# Query-log channel + category block. Path matches the QueryLogShipper
-# default (``/var/log/named/queries.log``) so the shipper can tail the
-# same file the daemon writes — the entrypoint script chowns this
-# directory to the unprivileged ``spatium`` user at boot. Severity +
-# print-* defaults match ``DNSServerOptions``' column defaults; we
-# don't plumb the per-field overrides through the agent yet because
-# the operator-facing UI surfaces the boolean toggle only.
-_QUERY_LOG_HEAD = """\
-logging {
-    channel queries_channel {
-        file "/var/log/named/queries.log" versions 5 size 50m;
-        severity info;
-        print-category yes;
-        print-severity yes;
-        print-time yes;
-    };
-    category queries { queries_channel; };
-    category query-errors { queries_channel; };
+# Query-log channel + category block. The channel is ALWAYS a file at the
+# QueryLogShipper default (``/var/log/named/queries.log``) so the shipper
+# can tail what the daemon writes — the entrypoint script chowns this
+# directory to the unprivileged ``spatium`` user at boot. ``channel`` and
+# ``file`` are not operator-settable (the control plane refuses them, #2265):
+# syslog / stderr / another path would silently starve the DNS Queries tab.
+# ``severity`` and ``print-*`` ARE honoured, within what the shipper can
+# still read (see ``_query_log_channel_settings``).
+_QUERY_LOG_FILE = "/var/log/named/queries.log"
+_QUERY_LOG_DEBUG_RE = re.compile(r"^debug(?:\s+\d{1,3})?$")
+
+
+def _query_log_channel_settings(opts: dict[str, Any]) -> tuple[str, str, str, str]:
+    """``(severity, print-category, print-severity, print-time)`` tokens.
+
+    named logs queries at ``info``, so a channel severity of ``notice`` or
+    above would drop every line; a stored value like that (set before the
+    control plane refused it) falls back to ``info`` here rather than
+    emptying the DNS Queries tab. ``print-time`` is always ``yes`` — the
+    shipper reads each line's timestamp. Absent keys (an older control
+    plane) render the historical defaults.
+    """
+    severity = str(opts.get("query_log_severity") or "info").strip().lower()
+    if severity != "dynamic" and not _QUERY_LOG_DEBUG_RE.match(severity):
+        severity = "info"
+
+    def yn(key: str) -> str:
+        return "no" if opts.get(key) is False else "yes"
+
+    return severity, yn("query_log_print_category"), yn("query_log_print_severity"), "yes"
+
+
+def _query_log_head(opts: dict[str, Any]) -> str:
+    severity, category, print_sev, print_time = _query_log_channel_settings(opts)
+    return f"""\
+logging {{
+    channel queries_channel {{
+        file "{_QUERY_LOG_FILE}" versions 5 size 50m;
+        severity {severity};
+        print-category {category};
+        print-severity {print_sev};
+        print-time {print_time};
+    }};
+    category queries {{ queries_channel; }};
+    category query-errors {{ queries_channel; }};
 """
+
 
 # RPZ policy hits (issue #699). named logs a rewrite to its OWN ``rpz``
 # category, never to ``queries`` — so without these two lines a blocked
@@ -123,7 +151,7 @@ def _render_logging_block(opts: dict[str, Any]) -> str:
     """
     if not bool(opts.get("query_log_enabled")):
         return ""
-    block = _QUERY_LOG_HEAD + _RPZ_LOG_CATEGORIES
+    block = _query_log_head(opts) + _RPZ_LOG_CATEGORIES
     if bool(opts.get("response_log_enabled")):
         block += _RESPONSE_LOG_CATEGORY
     return block + "};\n"

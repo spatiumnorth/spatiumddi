@@ -128,6 +128,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Query-log severity and print-* settings now reach named.conf
+  (#2265).** The Options UI let operators pick the log channel, file,
+  severity and print flags, and the BIND9 agent rendered a hard-coded
+  channel regardless. Severity (`info` / `debug [N]` / `dynamic`) and
+  `print-category` / `print-severity` are now rendered, in the agent and
+  the control-plane template. The channel and path stay fixed at
+  `/var/log/named/queries.log`, which the DNS Queries shipper tails, so
+  syslog / stderr / another path, a severity above `info` (it would drop
+  every query line) and `print-time` off are refused with a 422, and the
+  channel / path fields are gone from the UI. Default groups render
+  byte-identically.
+
 - **The Technitium agent ignored every NOTIFY setting (#2267).** `notify
   no` (a stealth primary) still notified the zone's NS hosts, because
   Technitium defaults to `ZoneNameServers`, and also-notify targets were
