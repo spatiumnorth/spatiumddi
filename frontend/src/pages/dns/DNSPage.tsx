@@ -49,6 +49,7 @@ import {
 import { useNavigate } from "react-router-dom";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
+import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
 import { SpoolChip } from "@/components/SpoolChip";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
@@ -5700,6 +5701,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   <ConfigApplyChip server={s} />
                   <SpoolChip server={s} />
                   <DaemonStateChip server={s} />
+                  <DuplicateAgentChip server={s} />
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {s.host}:{s.port}
@@ -7440,6 +7442,22 @@ function OptionsTab({ groupId }: { groupId: string }) {
           </p>
           <ul className="mt-1 list-disc pl-4">
             {opts?.technitium_warnings?.map((w) => (
+              <li key={w} className="break-words">
+                {w}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Stored forwarders pinned to port 53 in a group that forwards
+          encrypted (#2128): saved before the refusal, they render as TLS to
+          port 53 and never answer. */}
+      {(opts?.forwarder_warnings?.length ?? 0) > 0 && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          <p className="font-medium">These forwarders cannot answer:</p>
+          <ul className="mt-1 list-disc pl-4">
+            {opts?.forwarder_warnings?.map((w) => (
               <li key={w} className="break-words">
                 {w}
               </li>

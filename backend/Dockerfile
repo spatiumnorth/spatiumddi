@@ -165,6 +165,12 @@ RUN python -m pip uninstall -y --root-user-action=ignore pip \
 
 COPY --chown=app:app . .
 
+# The build's own version stamp (#2111): a nightly passes
+# ``0.0.0-nightly-YYYYMMDD+<sha>`` so /version can report the same string
+# its agents do, not just the image tag. Empty for a release or local build.
+ARG APP_VERSION=
+ENV APP_VERSION=${APP_VERSION}
+
 USER app
 
 EXPOSE 8000
