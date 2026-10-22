@@ -13171,6 +13171,9 @@ export function BlockDetailView({
   const [freeRangePreset, setFreeRangePreset] = useState<FreeCidrRange | null>(
     null,
   );
+  // The block a Find Free row names (it can be a child of this block), so
+  // "Create subnet here" files the subnet under it, not under this block (#2417).
+  const [findFreeBlockId, setFindFreeBlockId] = useState<string | null>(null);
 
   const crumbs: BreadcrumbItem[] = [
     { label: spaceName, variant: "space", onClick: onSelectSpace },
@@ -13446,11 +13449,12 @@ export function BlockDetailView({
       {showCreateSubnet && (
         <CreateSubnetModal
           spaceId={block.space_id}
-          defaultBlockId={block.id}
+          defaultBlockId={findFreeBlockId ?? block.id}
           defaultNetwork={freeRangePreset?.network}
           onClose={() => {
             setShowCreateSubnet(false);
             setFreeRangePreset(null);
+            setFindFreeBlockId(null);
           }}
         />
       )}
@@ -13530,7 +13534,8 @@ export function BlockDetailView({
           space={space}
           defaultBlockId={block.id}
           onClose={() => setShowFindFree(false)}
-          onPickCidr={(cidr) => {
+          onPickCidr={(cidr, parentBlockId) => {
+            setFindFreeBlockId(parentBlockId);
             setFreeRangePreset({
               network: cidr,
               first: "",

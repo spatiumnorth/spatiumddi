@@ -1918,6 +1918,8 @@ confirmation gates and pg advisory locks held through commit:
   unallocated CIDRs of the requested prefix length. Optional
   `parent_block_id` scope (Find Free… on the block detail
   pre-restricts to that block) and a `min_free_addresses` filter.
+  "Create subnet here" files the subnet under the block the row names
+  (which may be a child of the searched block).
   Service layer in `app.services.ipam.free_space`.
 
 - `POST /ipam/subnets/{id}/split/preview` + `/commit` — break a
