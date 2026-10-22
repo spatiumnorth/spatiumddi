@@ -485,7 +485,7 @@ DNSServerOptions.blackhole: list[str]           -- queries from these addresses 
 - All values accept BIND9 ACL names (see §3.7), CIDRs, or literals (`any`, `none`, `localhost`, `localnets`)
 - Can be overridden at the **view** level and further overridden at the **zone** level
 - `blackhole` is applied before any ACL processing — matching queries receive no response (useful for DoS mitigation)
-- `allow_query_cache` should be restricted to internal clients on authoritative-only servers (`none`)
+- `allow_query_cache` should be restricted to internal clients on authoritative-only servers (`none`). The group-level value renders on BIND9 only (#2264) and only when it differs from the stored default `["localhost", "localnets"]`; an untouched group leaves BIND's own default (derived from `allow-recursion`). PowerDNS and Technitium have no cache-access ACL, so a non-default value is refused (422) for a group holding one of them.
 
 ### 3.7 DNS ACLs (Named Access Control Lists)
 
