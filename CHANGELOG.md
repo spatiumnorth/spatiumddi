@@ -128,6 +128,52 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Technitium DNS Server 15.4.0 → 15.6.2 (#2238).** The
+  `dns-technitium` image is built on the upstream image, now pinned at
+  15.6.2 by tag and digest. Upstream's 15.5.0 – 15.6.2 fix
+  vulnerabilities in Technitium itself, which Trivy cannot see (it
+  scans OS packages and libraries, not the application): cache
+  poisoning by an out-of-bailiwick DNAME and by off-path CNAME
+  injection; a DNSSEC validation bypass through out-of-bailiwick DS
+  records in referrals; a 4,096:1 amplification through CNAME and
+  delegation hops; an authorization bypass in which the `ptr` option
+  on Add / Update / Delete Record wrote PTRs in reverse zones the user
+  had no rights to; an out-of-memory crash on certain responses,
+  unbounded DoH/3 buffering, a persistent DoS against a chosen domain
+  and a UDP receive loop driven by empty packets; stored XSS; a
+  zone-name validation bypass in Clone Zone and DNS Client import; a
+  session-token prefix oracle that let a user recover every active
+  session's token; two admin-API CPU DoS issues (password iteration
+  count, zone-name filter regex); log injection through the login
+  API; and a missing zone-boundary check that let a user with write
+  access to one zone change records in a sub-zone on the same server.
+  Taken under the 1.0 freeze as a security fix; the `versions.json`
+  hold stays for later non-security minors.
+  Both drivers and the importer were checked against the 15.5 / 15.6
+  API changes and exercised against a live 15.6.2. Neither driver
+  uses the `ptr` option (SpatiumDDI writes its PTRs as records in the
+  reverse zone), both authenticate with a permanent API token, and
+  every response shape they parse is unchanged. Two changes needed
+  adapting:
+  **The agentless driver's Test connection no longer trusts the
+  health check to prove the token.** From 15.5 Technitium answers
+  `dnsClient/healthCheck` without any session for a request from
+  loopback, so behind a reverse proxy on the Technitium host a
+  revoked or mistyped token read as "Authenticated". The zone listing
+  that follows now decides: a rejected token there fails the test.
+  **The agent skips a parent's record at the apex of a hosted child
+  two or more labels down.** 15.6.2 refuses it ("The domain name
+  'a.b.example.com' does not belong to the zone: example.com"), where
+  15.4.0 accepted it; one label down (`kid.example.com`) is still
+  written. The child zone on the same daemon answers that name either
+  way, so the agent now logs `technitium_record_shadowed_by_child_zone`
+  and leaves the zone's apply status `ok` instead of reporting a
+  refused record on every render (the #1712 rule, extended). A record
+  written there before the upgrade is no longer listed or served from
+  the parent side on 15.6.2. The agentless driver reports the same
+  refusal as a failed record op rather than, as on 15.4.0, filing the
+  record in the child zone.
+
 - **Turning BIND9 query logging on or off now takes effect without
   restarting named (#2249).** `rndc reconfig` never applies the
   `querylog` switch: a named that started with query logging off
