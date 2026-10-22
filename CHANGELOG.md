@@ -128,6 +128,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **DNSSEC trust anchors reach BIND9, so `dnssec-validation yes`
+  validates something (#2266).** Anchors added with
+  `POST /groups/{id}/options/trust-anchors` were stored and listed
+  but never shipped or rendered; with `yes` BIND 9.20 validates
+  nothing without one. The bundle now carries them (BIND9 groups
+  only, and only when there are any, so a group without anchors
+  keeps a byte-identical `named.conf` and etag) and the agent
+  renders a top-level `trust-anchors { ... };` statement with
+  `static-key` / `initial-key` (DNSKEY anchors; DS anchors are not
+  stored). Checked with `named-checkconf` on BIND 9.20. The values
+  are validated at the API, as they land verbatim in `named.conf`,
+  and adding an anchor to a group with a PowerDNS, Technitium or
+  agentless server is a 422 naming the driver. The options response
+  gains an advisory `dnssec_warnings` entry (shown on the DNS
+  Options tab) for `yes` with no anchor on a BIND9 group.
+
 - **The backup target form keeps the line breaks of a multi-line
   field (#2199).** Every destination field was a one-line input, and
   an input turns each line break into a space. So an SCP private key

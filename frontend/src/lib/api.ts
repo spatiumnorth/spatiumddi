@@ -5590,6 +5590,8 @@ export interface DNSServerOptions {
   technitium_warnings?: string[];
   // #2128: stored forwarders pinned to port 53 in an encrypted group.
   forwarder_warnings?: string[];
+  // #2266: dnssec_validation "yes" with no trust anchor validates nothing.
+  dnssec_warnings?: string[];
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the

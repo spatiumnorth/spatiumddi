@@ -773,7 +773,9 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     ``encode_bundle_body`` to write in."""
     # Options (per group)
     opts_res = await db.execute(
-        select(DNSServerOptions).where(DNSServerOptions.group_id == server.group_id)
+        select(DNSServerOptions)
+        .where(DNSServerOptions.group_id == server.group_id)
+        .options(selectinload(DNSServerOptions.trust_anchors))
     )
     opts = opts_res.scalar_one_or_none()
 
@@ -1212,6 +1214,26 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             list(opts.allow_recursion if opts.allow_recursion is not None else [])
             if opts
             else list(DEFAULT_ALLOW_RECURSION)
+        )
+    if server.driver == "bind9" and opts is not None and opts.trust_anchors:
+        # DNSSEC trust anchors (#2266). Stored and listed since the options
+        # API shipped, shipped to nobody: ``dnssec-validation yes`` therefore
+        # validated nothing. BIND9-only, and only when there are some, so a
+        # group without anchors keeps a byte-identical bundle and etag.
+        # Sorted: the relationship has no order, and an unstable list would
+        # shift the etag on every poll.
+        options_block["trust_anchors"] = sorted(
+            (
+                {
+                    "zone_name": ta.zone_name,
+                    "algorithm": ta.algorithm,
+                    "key_tag": ta.key_tag,
+                    "public_key": ta.public_key,
+                    "is_initial_key": bool(ta.is_initial_key),
+                }
+                for ta in opts.trust_anchors
+            ),
+            key=lambda t: (t["zone_name"], t["algorithm"], t["key_tag"], t["public_key"]),
         )
     if server.driver == "powerdns":
         # PowerDNS ALIAS expansion (#1353): the group's own plain-DNS
