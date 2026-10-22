@@ -237,7 +237,7 @@ async def network_summary(db: DB, current_user: CurrentUser) -> NetworkDashboard
                 select(Circuit)
                 .where(Circuit.deleted_at.is_(None))
                 .where(Circuit.term_end_date.is_not(None))
-                .where(Circuit.term_end_date <= today)
+                .where(Circuit.term_end_date < today)  # end date is inclusive
                 .where(Circuit.status != "decom")
             )
         )

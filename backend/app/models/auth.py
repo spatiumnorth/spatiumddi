@@ -171,6 +171,15 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_failed_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Per-account wrong-code budget for the MFA step of sign-in. Applies
+    # whether or not lockout is enabled; see
+    # ``app.services.account_lockout.MFA_FAIL_MAX``.
+    mfa_failed_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sa_text("0")
+    )
+    mfa_last_failed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # lazy="selectin" so `user.groups` is always populated when the User is
     # fetched via `db.get(User, ...)` in `get_current_user`. The permissions
