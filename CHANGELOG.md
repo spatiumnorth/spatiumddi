@@ -159,6 +159,29 @@ the formatter handles the rest.
   Apply disabled for a selective restore of a plain archive, and says
   why. A full restore of the same archive is still offered.
 
+- **A demoted member whose etcd stops before answering its own removal
+  now finishes its leave (#2394).** When a member removes itself
+  through its own etcd, a peer that has applied the removal can reject
+  that etcd's traffic before the member has applied the change itself:
+  k3s then closes etcd, and the removal call answers
+  `etcdserver: server stopped` though the member is gone.
+  `spatium-etcd-evict --leave-self` read any error as "not removed"
+  and refused the leave at once, before it asked the node it joined.
+  k3s restarted, found its removal tombstone, wiped its etcd data and
+  rejoined as a new voter, and the row read `failed`. Seen once in
+  nine three-node demote drills. An error answer for the node's own
+  member now stops k3s and goes to the same check as an accepted one:
+  the node it joined decides, and a survivor that answers and still
+  lists the member still refuses the leave. Only an error that shows
+  etcd never acted on the call refuses at once, with k3s left running:
+  curl failing before it sent the call (it could not connect, or TLS
+  failed), no gRPC status, or the strict reconfiguration check's
+  refusal. When no survivor can be reached after an error answer, the
+  leave goes on only if k3s left its tombstone (it writes one only
+  once a peer has applied the member's removal); without one, nothing
+  shows the member gone, and the leave is refused rather than wiping a
+  node whose member may still vote.
+
 - **A slot upgrade stopped in its first moments no longer stays "in-flight" (#2424).** The runner wrote the in-flight state before arming the trap that records a failure on an abrupt exit, so a stop landing in between left the upgrade reading in-flight with nothing to clear it. The trap is now armed first.
 
 - **A refused request to a superadmin-only route is now audited (#2304).**
