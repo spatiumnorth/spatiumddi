@@ -1049,6 +1049,15 @@ dns-bind9-ns1:
 > plane cannot tell, so delete the stale row(s) under DNS → Server groups and
 > save again. The Operator Copilot's role assignment moves the row the same
 > way.
+>
+> On an appliance, a brand-new agent lands in the appliance's assigned DNS
+> group, not the one its `AGENT_GROUP` names (#2190). The supervisor writes
+> the new chart values before it labels the node for a new engine, and labels
+> it only once the engine's DaemonSet carries the new group, but the
+> registration does not rely on that: an agent whose hostname is one approved
+> appliance's, running that appliance's current engine, registers into the
+> appliance's group and adopts its row there by hostname. A row the agent
+> already has (found by agent id) still never moves.
 
 ---
 

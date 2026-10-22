@@ -89,7 +89,10 @@ _MAX_ERROR = 2000
 #   the agent keys its "this RPZ file is unchanged, hard-link it" decision on.
 #   Bundles without a blocklist, and every non-BIND9 bundle, are byte-identical
 #   to 11's, so the re-render this bump forces moves no ETag for them.
-RENDERER_REVISION = 12
+# 13 (#2124): a ``sinkhole`` entry whose list names an address carries
+#   ``sinkhole_ip`` (the agent renders it as A + AAAA local data). It is part
+#   of the entry, so it is inside ``rpz_sha256`` too.
+RENDERER_REVISION = 13
 
 
 def _serves(revision: int | None) -> bool:
