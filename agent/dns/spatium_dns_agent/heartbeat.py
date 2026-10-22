@@ -43,7 +43,7 @@ class HeartbeatClient:
         # assigns itself in). Its ``as_dict()`` rides the heartbeat's
         # ``config`` field so the control plane can tell a server that is up
         # but running a REVERTED config apart from one that converged.
-        # Defaults to a healthy ApplyStatus so a heartbeat sent before the
+        # Defaults to an empty ("nothing applied yet", #2258) ApplyStatus so a heartbeat sent before the
         # first sync doesn't report a failure that hasn't happened.
         self.config_apply: ApplyStatus = ApplyStatus()
         self.failed_ops_count = 0

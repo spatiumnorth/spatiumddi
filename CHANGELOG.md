@@ -128,6 +128,8 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Agents no longer report a config apply of `ok` before they have applied anything (#2258).** The DNS, DHCP and looking-glass agents sent a default `ok` with no etag on every heartbeat until their first apply, so a fresh agent whose `/config` fetch never succeeded showed a green chip and never fired `agent_config_rejected`, and a server move's reset to unknown (#934) was undone within one heartbeat. The agents now send an empty block until something has applied, and the control plane treats `ok` without an etag as unknown (NULL), which also covers older agents still in the field.
+
 - **A disabled Tailscale tenant no longer reads "Token rejected", and
   the Integrations card always names tenants with a credential problem
   (#2191, #2192).** A tenant whose last sync got a 401 and was then
