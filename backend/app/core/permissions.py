@@ -810,9 +810,55 @@ def has_any_grant_for(user: User, action: str, resource_type: str) -> bool:
     return False
 
 
+def _instance_scoped_admit(
+    request: Request,
+    user: User,
+    action: str,
+    instance_routes: dict[str, tuple[str, str, frozenset[str]]],
+) -> bool:
+    """True when ``user`` holds ``action`` on the ONE resource the route's path
+    names, via a grant scoped to that resource (or an unscoped one).
+
+    ``instance_routes`` maps a path parameter (``subnet_id``) to
+    ``(resource_type, list_suffix, write_templates)``. The route's own path
+    template decides what is admitted, so a scoped grant reaches only the
+    named resource and its children and nothing aggregate:
+
+    * a ``read`` is admitted for any route carrying the path parameter, plus
+      the type's collection route (``list_suffix``) so the holder can list;
+      the collection handler must then narrow to the granted rows.
+    * a mutating method is admitted only for the route templates in
+      ``write_templates`` (``"METHOD /path"``); every other write keeps its
+      own inline unscoped check and stays refused.
+    """
+    route = request.scope.get("route")
+    template = getattr(route, "path", "") or ""
+    method = request.method.upper()
+    for pname, (rtype, list_suffix, write_templates) in instance_routes.items():
+        raw = request.path_params.get(pname)
+        if raw is None:
+            if action == "read" and list_suffix and template.endswith(list_suffix):
+                if has_any_grant_for(user, "read", rtype):
+                    return True
+            continue
+        try:
+            rid = str(UUID(str(raw)))
+        except ValueError:
+            continue
+        if action == "read":
+            allowed = True
+        else:
+            tail = template.split("/ipam", 1)[-1]
+            allowed = f"{method} {tail}" in write_templates
+        if allowed and user_has_permission(user, action, rtype, rid):
+            return True
+    return False
+
+
 def require_any_resource_or_scoped(
     unscoped_types: tuple[str, ...],
     scoped_types: tuple[str, ...],
+    instance_routes: dict[str, tuple[str, str, frozenset[str]]] | None = None,
 ) -> Callable[..., Awaitable[User]]:
     """Coarse router gate that also admits instance-scoped delegates.
 
@@ -843,6 +889,10 @@ def require_any_resource_or_scoped(
             for rt in scoped_types:
                 if has_any_grant_for(current_user, action, rt):
                     return current_user
+        if instance_routes and _instance_scoped_admit(
+            request, current_user, action, instance_routes
+        ):
+            return current_user
         all_types = list(unscoped_types) + list(scoped_types)
         first = all_types[0] if all_types else "*"
         await _record_denial(db, current_user, request, action, first, None)

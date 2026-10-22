@@ -123,6 +123,16 @@ DDNSDomainOverride = Annotated[str | None, BeforeValidator(_validate_opt_ddns_do
 # this coarse gate and reaches the per-IP delegation gate
 # (``_user_can_write_ip``), which enforces the real per-row boundary. Per-row
 # scoping happens inline in the handlers via `user_has_permission`.
+_IPAM_READ_TYPES = (
+    "ip_space",
+    "ip_block",
+    "subnet",
+    "ip_address",
+    "custom_field",
+    "nat_mapping",
+    "manage_ipam_templates",
+)
+
 router = APIRouter(
     dependencies=[
         Depends(
@@ -145,13 +155,30 @@ router = APIRouter(
                 # (#103). require_any_resource_permission's unscoped check would
                 # 403 such a delegate before delegation ever runs.
                 ("address_set",),
+                # A grant scoped to ONE subnet (#2438): admits the routes that
+                # name that subnet (reads, PUT, address create) and the subnet
+                # list (narrowed in the handler). Nothing aggregate.
+                instance_routes={
+                    "subnet_id": (
+                        "subnet",
+                        "/subnets",
+                        frozenset(
+                            {"PUT /subnets/{subnet_id}", "POST /subnets/{subnet_id}/addresses"}
+                        ),
+                    )
+                },
             )
         )
     ]
 )
 
 
-def _require_type_write(current_user: User, resource_type: str, action: str = "write") -> None:
+def _require_type_write(
+    current_user: User,
+    resource_type: str,
+    action: str = "write",
+    resource_id: uuid.UUID | None = None,
+) -> None:
     """Per-type inline gate for the structural IPAM handlers (space/block/subnet
     create, update, resize, split, merge, move, purge, DNS sync, delete). The
     router-level gate admits an any-of grant over the whole IPAM surface —
@@ -161,7 +188,7 @@ def _require_type_write(current_user: User, resource_type: str, action: str = "w
     delegate could mutate core structure it holds no permission on (#508).
     ``action`` is ``write`` (the default) or ``delete`` for the delete routes.
     Superadmin and wildcard grants pass via ``user_has_permission``."""
-    if not user_has_permission(current_user, action, resource_type):
+    if not user_has_permission(current_user, action, resource_type, resource_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Permission denied: need '{action}' on '{resource_type}'",
@@ -5183,7 +5210,13 @@ async def list_subnets(
     if scoped_subnets is not None:
         query = query.where(Subnet.id.in_(scoped_subnets))
     result = await db.execute(query)
-    return list(result.scalars().all())
+    rows = list(result.scalars().all())
+    # A caller admitted only by grants scoped to individual subnets (#2438)
+    # sees those subnets and no others. Anyone holding a type-level IPAM read
+    # keeps the full list, as before.
+    if not any(user_has_permission(current_user, "read", rt) for rt in _IPAM_READ_TYPES):
+        rows = [r for r in rows if user_has_permission(current_user, "read", "subnet", r.id)]
+    return rows
 
 
 @router.post("/subnets", response_model=SubnetResponse, status_code=status.HTTP_201_CREATED)
@@ -6312,7 +6345,12 @@ async def update_subnet(
         subnet,
         [body.dns_zone_id, *(body.dns_additional_zone_ids or [])],
     )
-    _require_type_write(current_user, "subnet")
+    # Per-row: a grant scoped to this subnet suffices (#2438); an unscoped one
+    # still does. Moving it under another block touches a resource the scoped
+    # grant does not name, so that needs the type-level grant.
+    _require_type_write(current_user, "subnet", resource_id=subnet_id)
+    if body.block_id is not None and body.block_id != subnet.block_id:
+        _require_type_write(current_user, "subnet")
 
     old_block_id = subnet.block_id
 

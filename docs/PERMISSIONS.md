@@ -131,6 +131,12 @@ on inactive.
    satisfy an unscoped check (one passed without `resource_id`). This prevents
    "I have write on *this one* subnet" from accidentally granting "write on
    subnets in general".
+   **IPAM subnets (#2438).** A `read` / `write` grant scoped to one subnet
+   reaches that subnet and its addresses and nothing else: the routes that
+   name it (reads, `PUT /ipam/subnets/{id}`, `POST …/addresses`) and the
+   subnet list, which is narrowed to the granted subnets. Spaces, blocks,
+   other subnets, delete / resize / move and re-parenting stay refused
+   unless a type-level grant covers them.
 5. **Privilege ceiling on role / group edits (#400 C4).** When a non-superadmin
    creates or edits a role's permission set (or assigns roles to a group), every
    permission they add must be one they *themselves* effectively hold —
