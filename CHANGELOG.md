@@ -128,6 +128,29 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Overlapping DHCP lease pulls no longer duplicate a lease and stop
+  that server's pull for good (#2262).** The Windows DHCP / FortiGate
+  lease pull stamped its interval only at the end of a pass and took
+  no lock, so a pass slower than the 10 s beat tick was started again
+  while it ran, and the manual Sync Leases raced it too. Both passes
+  inserted the same new lease, and from then on every pull of that
+  server failed on that address, leaving leases and IPAM `dhcp`
+  mirrors stale until someone deleted the row by hand. The scheduled
+  pass now claims its interval when it starts, the scheduled pass and
+  the manual Sync share a per-server lock (a Sync that hits it answers
+  409), the insert is an upsert, and a pull that meets an address with
+  two rows keeps the newest and carries on, so an install wedged today
+  recovers on its next pull. Migration `e4b8c2d17a95` deletes existing
+  duplicates (keeping the most recently seen row) and adds unique
+  indexes on the lease identity: (server, address, MAC) for DHCPv4,
+  (server, address, DUID, IAID) for DHCPv6. Not on (server, address)
+  alone, because the Kea lease-event path keeps one row per client on
+  an address on purpose (#1318). If two Kea lease reports for one
+  server insert the same new lease at once, the later one now answers
+  `503` so the agent retries it and it lands as an update, rather than
+  a `409` that the agent would treat as a rejection and drop with the
+  rest of its batch.
+
 - **Agents no longer report a config apply of `ok` before they have applied anything (#2258).** The DNS, DHCP and looking-glass agents sent a default `ok` with no etag on every heartbeat until their first apply, so a fresh agent whose `/config` fetch never succeeded showed a green chip and never fired `agent_config_rejected`, and a server move's reset to unknown (#934) was undone within one heartbeat. The agents now send an empty block until something has applied, and the control plane treats `ok` without an etag as unknown (NULL), which also covers older agents still in the field.
 
 - **A disabled Tailscale tenant no longer reads "Token rejected", and
@@ -1654,6 +1677,13 @@ the formatter handles the rest.
   server default 0) and nullable `user.mfa_last_failed_at`, the
   per-account wrong-code budget for the MFA sign-in step. Downgrade
   drops both.
+- `e4b8c2d17a95` — #2262: deletes duplicate `dhcp_lease` rows (same
+  server, address and MAC, or same server, address, DUID and IAID),
+  keeping the most recently seen, then adds the partial unique indexes
+  `uq_dhcp_lease_server_ip_mac` (`WHERE duid IS NULL`) and
+  `uq_dhcp_lease_server_ip_duid` (`WHERE duid IS NOT NULL`, NULLS NOT
+  DISTINCT). Downgrade drops the indexes; the deleted duplicates are not
+  restored.
 
 ## 1.0.0-beta.1 — 2026-10-21
 
