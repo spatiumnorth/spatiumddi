@@ -128,6 +128,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A cluster rolling upgrade no longer rolls the control plane, and
+  leaves the run with nothing driving it, when the seed boots its new
+  slot (#2176).** The run holds the shared image tags until every node
+  runs the target (#1710), but the seed's firstboot also writes its
+  slot's version into the control chart as `APPLIANCE_VERSION` (#2004),
+  and that alone changed the api, worker and beat pod templates: they
+  rolled on every node, still on the old image, the worker running the
+  drive was shut down, and the run sat `running` until the drive's
+  Lease ran out (600 s) and the orphan sweep picked it up again. The
+  version is now a value of its own in the control chart
+  (`applianceVersion`, no longer a `sharedEnv` entry), and the run pins
+  it with the tags, to the version the control plane reports, until the
+  flip moves both in one step. The pods still report the version they
+  run once the run has flipped. A roll from a version without this fix
+  still rolls the control plane once, at the seed's boot.
+
 - **A blocked name answered SERVFAIL after ~10 s when its upstream
   lookup failed (#2427).** The BIND9 `response-policy` statement
   (global and per-view, agent and control-plane template) lacked
