@@ -386,9 +386,7 @@ async def test_the_sweep_sizes_each_request_from_its_groups_stored_bundles(
     await db_session.commit()
     assert (await agent_bundles._run(str(rendered.id)))["status"] == "stored"
 
-    from app.db import task_session
-
-    async with task_session() as db:
+    async with app_db.task_session() as db:
         known = await agent_bundles.known_records(db, [rendered.id, joined.id, lonely.id])
     assert known == {rendered.id: 4, joined.id: 4}
 
