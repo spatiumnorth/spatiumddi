@@ -328,17 +328,20 @@ def _drop_undefined_key_refs(
     known_keys: frozenset[str],
     *,
     where: str,
+    known_acls: frozenset[str] | None = None,
     deny_if_emptied: bool = False,
 ) -> Any:
-    """``elements`` without any ``key <name>`` citing a key the bundle does not define (#2282).
+    """``elements`` without any citation the bundle does not define (#2282, #2283).
 
-    ``key_reference`` also reads ``also-notify``'s ``<ip> key <name>``. A
-    citation of an undefined key is an undefined symbol: ``named-checkconf``
+    Covers ``key <name>`` (``key_reference`` also reads ``also-notify``'s
+    ``<ip> key <name>``) and, when ``known_acls`` is given, a bare ACL name.
+    A citation of an undefined name is an undefined symbol: ``named-checkconf``
     rejects the file and the agent declines the whole bundle. The write paths
-    refuse to create or orphan one (rename / delete of a cited key is a 409),
-    so this covers a row stored before that guard, or an operator key whose
-    secret no longer decrypts and was therefore left out of ``tsig_keys``.
-    ``known_keys`` holds :func:`_key_name_norm` forms. Returns the original
+    refuse to create or orphan one (rename / delete of a cited key or ACL is a
+    409), so this covers a row stored before that guard, or an operator key
+    whose secret no longer decrypts and was therefore left out of ``tsig_keys``.
+    ``known_keys`` holds :func:`_key_name_norm` forms; ``known_acls`` holds ACL
+    names verbatim (BIND ACL names are case-sensitive). Returns the original
     object untouched when nothing is dropped, so a healthy bundle keeps its
     ETag.
 
@@ -348,11 +351,13 @@ def _drop_undefined_key_refs(
     as ``any`` and omits an empty zone / view ``allow-query`` so it inherits
     the server's (often ``any``). So for an access list
     (``deny_if_emptied``) that ends up empty, ``["none"]`` is returned. A
-    dropped *negated* element (``!key x``) collapses the list to ``["none"]``
-    too — conservative for a key (an undefined key matches no request), but
-    it keeps one rule for every dropped negation. ``also-notify`` is not an
-    access list and ``none`` is not legal there; ACL entries are not either,
-    since an entry-less ACL already renders ``{ none; }``.
+    dropped *negated* element (``!key x`` / ``!name``) collapses the list to
+    ``["none"]`` too — conservative for a key (an undefined key matches no
+    request), but it keeps one rule for every dropped negation. ``none`` is
+    never substituted in place (``["none", "10/8"]`` denies everyone).
+    ``also-notify`` is not an access list and ``none`` is not legal there;
+    ACL entries are not either, since an entry-less ACL already renders
+    ``{ none; }``.
     """
     if not isinstance(elements, list):
         return elements
@@ -361,11 +366,15 @@ def _drop_undefined_key_refs(
     for el in elements:
         text = str(el)
         name = key_reference(text)
+        acl = is_name_reference(text) if known_acls is not None else None
         if name is not None and _key_name_norm(name) not in known_keys:
             logger.warning("dns_bundle_entry_dropped_undefined_key", where=where, key=name)
-            widened = widened or text.strip().startswith("!")
+        elif acl is not None and known_acls is not None and acl not in known_acls:
+            logger.warning("dns_bundle_entry_dropped_undefined_acl", where=where, acl=acl)
+        else:
+            kept.append(el)
             continue
-        kept.append(el)
+        widened = widened or text.strip().startswith("!")
     if len(kept) == len(elements):
         return elements
     if deny_if_emptied and (widened or not kept):
@@ -1360,8 +1369,10 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     # one was an undefined symbol that failed the entire bundle.
     acls_block = _safe_acls_block(acls)
 
-    # #2282 — never ship a ``key <name>`` the bundle does not define.
+    # #2282 / #2283 — never ship a ``key <name>`` or ACL name the bundle does
+    # not define. Access lists that empty out become ``none``, not "inherit".
     known_key_names = frozenset(_key_name_norm(k["name"]) for k in tsig_keys)
+    known_acl_names = frozenset(a["name"] for a in acls_block)
     for a in acls_block:
         a["entries"] = [
             e
@@ -1374,6 +1385,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 ve.get(f),
                 known_key_names,
                 where=f"view:{ve['name']}.{f}",
+                known_acls=known_acl_names,
                 deny_if_emptied=True,
             )
     for f in (*ADDRESS_MATCH_LIST_OPTIONS, "also_notify"):
@@ -1382,6 +1394,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 options_block[f],
                 known_key_names,
                 where=f"options.{f}",
+                known_acls=known_acl_names,
                 deny_if_emptied=f != "also_notify",
             )
     for zp in zone_payload:
@@ -1390,6 +1403,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 zp.get(f),
                 known_key_names,
                 where=f"zone:{zp['name']}.{f}",
+                known_acls=known_acl_names,
                 deny_if_emptied=f != "also_notify",
             )
 
