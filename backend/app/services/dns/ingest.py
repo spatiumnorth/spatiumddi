@@ -26,7 +26,7 @@ DNSKEY, CDS/CDNSKEY, private-type 65534) are never ingested — BIND owns them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -72,10 +72,19 @@ class IngestResult:
     removed: int = 0
     skipped_managed: int = 0
     skipped_ignored: int = 0
+    # What was added / removed, as ``{name, fqdn, record_type, value, ttl}``
+    # dicts, so the caller can audit the batch by name (#2302). Uncapped here;
+    # the audit writer caps what it persists.
+    added_records: list[dict[str, object]] = field(default_factory=list)
+    removed_records: list[dict[str, object]] = field(default_factory=list)
 
 
 def _key(name: str, rtype: str, value: str) -> tuple[str, str, str]:
     return (name.lower(), rtype.upper(), value.strip())
+
+
+def _describe(fqdn: str, name: str, rtype: str, value: str, ttl: int | None) -> dict[str, object]:
+    return {"name": name, "fqdn": fqdn, "record_type": rtype, "value": value, "ttl": ttl}
 
 
 def _is_apex_ns(name: str, rtype: str) -> bool:
@@ -162,12 +171,20 @@ async def reconcile_external_records(
             )
         )
         result.added += 1
+        result.added_records.append(_describe(fqdn, rec.name, rtype, rec.value, rec.ttl))
 
     # Remove mirrors that vanished upstream (present in DB, absent from the
     # agent's current external set). Hard-delete — a stale mirror would
-    # otherwise re-render a record the writer already withdrew.
+    # otherwise re-render a record the writer already withdrew. Not
+    # soft-deleted: the row is a cache of what the external writer holds, so
+    # "restoring" it would resurrect a record the writer withdrew, and a
+    # churning writer would pile up soft-deleted rows. The trail is the audit
+    # row the caller writes from ``removed_records`` (#2302).
     for k, row in external_by_key.items():
         if k not in desired_keys:
+            result.removed_records.append(
+                _describe(row.fqdn, row.name, row.record_type, row.value, row.ttl)
+            )
             await db.delete(row)
             result.removed += 1
 
