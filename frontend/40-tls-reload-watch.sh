@@ -15,13 +15,16 @@
 # node's web port refused connections until its replacement pod had started.
 #
 # The nginx image's entrypoint runs this (/docker-entrypoint.d/*.sh) before it
-# starts nginx. It forks the watcher and returns at once. The watcher takes its
-# first reading before nginx loads the files, so a change between the two gets a
-# reload rather than going unnoticed. Each change is checked with ``nginx -t``
-# first. A pair nginx refuses (a key that does not match its certificate) is not
-# sent: nginx keeps serving the certificate it has, the refusal is logged once,
-# and the watcher tests again on every tick until the files change or nginx
-# accepts them. A reload that finds no nginx running yet is retried too.
+# starts nginx. It takes its first reading of the files, forks the watcher and
+# returns at once, so that reading comes before nginx loads the files and a
+# change between the two gets a reload rather than going unnoticed (a reading
+# taken in the forked watcher could come after nginx's, and would take a pair
+# nginx never loaded for the one it serves). Each change is checked with
+# ``nginx -t`` first. A pair nginx refuses (a key that does not match its
+# certificate) is not sent: nginx keeps serving the certificate it has, the
+# refusal is logged once, and the watcher tests again on every tick until the
+# files change or nginx accepts them. A reload that finds no nginx running yet
+# is retried too.
 #
 # No certificate mounted (Docker Compose, or the chart's frontend.tls.enabled
 # off): nothing to watch, so it exits.
@@ -61,7 +64,6 @@ _stamp() {
 
 _watch() {
     set +e
-    _last=$(_stamp)
     _refused=""
     while sleep "$_every"; do
         _now=$(_stamp)
@@ -82,5 +84,7 @@ _watch() {
     done
 }
 
+# Here, not in the watcher: the entrypoint starts nginx only after this returns.
+_last=$(_stamp)
 _log "watching $_dir every ${_every}s; nginx reloads when the certificate changes"
 _watch </dev/null &

@@ -227,6 +227,28 @@ def test_it_returns_at_once_so_the_entrypoint_goes_on_to_nginx(rig: _Rig) -> Non
     assert _group_alive(proc.pid), "the watcher must outlive the entrypoint's loop"
 
 
+def test_the_first_reading_is_taken_before_nginx_starts(rig: _Rig) -> None:
+    """The entrypoint starts nginx as soon as the script returns, and nginx
+    loads the pair then. A first reading taken later, in the forked watcher,
+    can see a pair the kubelet wrote after nginx loaded its own: the watcher
+    then takes the new pair for the one being served and never reloads it,
+    the #1219 strand again. So the reading is done before the script returns.
+    A slow hash makes the order visible: it has finished by the time the
+    script has."""
+    slow = rig.root / "slowbin"
+    slow.mkdir()
+    fake = slow / "sha256sum"
+    fake.write_text(
+        '#!/bin/sh\nout=$(cksum)\nsleep 0.3\necho read >> "$STATE/readings"\necho "$out"\n'
+    )
+    fake.chmod(0o755)
+    rig.env["PATH"] = f"{slow}:{rig.env['PATH']}"
+    _started(rig)
+    readings = rig.state / "readings"
+    assert readings.exists(), "the script returned before its first reading of the pair"
+    assert "read" in readings.read_text().split()
+
+
 def test_no_certificate_means_no_watcher(rig: _Rig) -> None:
     """Docker Compose (and the chart with frontend.tls.enabled off) mounts no
     certificate: nothing to watch, and nothing is left running."""
