@@ -30,8 +30,8 @@
 #     --format '{{.Manifest.Digest}}'
 # and paste the result below. Both must move together — a mismatched pair
 # fails the pull outright rather than silently preferring one.
-ARG TECHNITIUM_VERSION=15.4.0
-ARG TECHNITIUM_DIGEST=sha256:df7d90ef0f7b6fff6916d291a7022cd902290cc31c3141d4158b6c375a641b41
+ARG TECHNITIUM_VERSION=15.6.2
+ARG TECHNITIUM_DIGEST=sha256:eb48ac5c135f4ab936b536f74f853d53e15ab39ef37fdbc9598a089b90d9f245
 ARG PYTHON_VERSION=3.12
 
 # Builder matches the RUNTIME's libc family (glibc/Debian), not Alpine —

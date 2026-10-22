@@ -22,7 +22,7 @@ The downgrade restores the non-unique index and drops the column. The
 duplicates it resolved stay resolved: they were never a real second condition.
 
 Revision ID: b4d81f2e6a93
-Revises: d3a7f19c52e8
+Revises: e4b8c2d17a95
 Create Date: 2026-10-20 10:00:00.000000
 """
 
@@ -31,7 +31,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "b4d81f2e6a93"
-down_revision = "d3a7f19c52e8"
+down_revision = "e4b8c2d17a95"
 branch_labels = None
 depends_on = None
 

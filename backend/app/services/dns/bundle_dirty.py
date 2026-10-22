@@ -514,6 +514,55 @@ async def mark_bundles_dirty(
     return sorted(await db.run_sync(lambda session: _collect(session, aff)))
 
 
+async def mark_integration_dns_released(
+    db: AsyncSession, *, own_fk: str, target_id: uuid.UUID
+) -> list[uuid.UUID]:
+    """Mark the DNS groups an integration target's rows live in, before its delete (#2288).
+
+    ``DNSZone`` / ``DNSRecord`` carry CASCADE FKs to the Kubernetes cluster,
+    Tailscale tenant and NetBird instance that own them, so deleting the target
+    removes them in the database — the listener never sees an ORM delete and the
+    stored bundle would stay "current", with every agent still serving the
+    names. The reconcilers retract these rows with ORM ``db.delete`` and no
+    ``DNSRecordOp`` (bundle-dirty is the delivery path), so this does the
+    equivalent: collect the groups of the owned zones and of the zones holding
+    owned records, mark them in the caller's transaction, and wake their
+    agents. Call it BEFORE ``db.delete(target)``; ``own_fk`` is the shared
+    column name (``kubernetes_cluster_id`` / ``tailscale_tenant_id`` /
+    ``netbird_instance_id``).
+    """
+    from app.core.agent_wake import collect_wake, dns_group_channel
+
+    zone_col = getattr(DNSZone, own_fk, None)
+    rec_col = getattr(DNSRecord, own_fk, None)
+    if rec_col is None:
+        raise ValueError(f"{own_fk} is not a DNS ownership column")
+    groups: set[uuid.UUID] = set()
+    if zone_col is not None:
+        groups.update(
+            (await db.execute(select(DNSZone.group_id).where(zone_col == target_id)))
+            .scalars()
+            .all()
+        )
+    groups.update(
+        (
+            await db.execute(
+                select(DNSZone.group_id)
+                .join(DNSRecord, DNSRecord.zone_id == DNSZone.id)
+                .where(rec_col == target_id)
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not groups:
+        return []
+    for gid in groups:
+        collect_wake(dns_group_channel(gid))
+    return await mark_bundles_dirty(db, group_ids=groups)
+
+
 # ── Enqueue after commit ───────────────────────────────────────────────────
 
 

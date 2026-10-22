@@ -19,9 +19,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy import func as sa_func
-from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 
@@ -94,6 +95,43 @@ async def own_server_condition(db: AsyncSession, appliance: Appliance, model: An
             & model.agent_id.is_not(None)
         )
     return or_(*conds)
+
+
+def orchestrated_server_condition(model: Any) -> Any:
+    """SQL condition selecting ``model`` (DNSServer / DHCPServer) rows that run
+    on a node the rolling-upgrade orchestrator slot-swaps (#2179).
+
+    That is an APPROVED appliance whose supervisor reports
+    ``deployment_kind = 'appliance'`` — the same set every appliance-scoped
+    upgrade preflight reads — owning the row by the FK, or by the agent's
+    reported ``host`` against the appliance's hostname (the hostname branch of
+    :func:`own_server_condition`, for an agent-based row with no FK).
+
+    It deliberately does NOT read the server row's own ``deployment_kind`` as
+    the primary signal: #170 Wave C1 moved deployment telemetry onto the
+    supervisor's heartbeat, so neither the DNS nor the DHCP agent sends it and
+    the column is NULL on every post-#170 appliance. A filter on it alone
+    matches nothing. It stays in the OR for an agent that still reports it.
+
+    Unlike :func:`own_server_condition` this answers "is it on SOME
+    orchestrated appliance", not "which one", so two appliances sharing a
+    hostname do not disable the match — either way the row is on a node this
+    run will touch.
+    """
+    a = aliased(Appliance)
+    owned = exists().where(
+        a.state == APPLIANCE_STATE_APPROVED,
+        a.deployment_kind == "appliance",
+        or_(
+            a.id == model.appliance_id,
+            and_(
+                model.appliance_id.is_(None),
+                model.agent_id.is_not(None),
+                hostname_sql(a.hostname) == hostname_sql(model.host),
+            ),
+        ),
+    )
+    return or_(owned, model.deployment_kind == "appliance")
 
 
 def current_dns_drivers(appliance: Appliance) -> set[str]:

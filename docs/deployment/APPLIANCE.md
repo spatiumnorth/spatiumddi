@@ -2751,16 +2751,24 @@ introduced by an upgrade don't clobber operator-created ones.
    clear-ingests`), so a write an earlier import left behind
    cannot fail this boot's imports (#1630). k3s imports the new
    tarballs. `spatiumddi-firstboot.service` waits for
-   `/health/live` to return 200. It then checks that k3s
-   imported every baked tarball and that every image is in
-   containerd, and has k3s re-import whatever is missing
-   (`spatium-k3s-images verify --repair`, #1630).
+   `/health/live` to return 200. It then waits until k3s holds
+   none of the tarballs open, which is how long each import
+   lasts (#2109), checks that k3s imported every baked tarball
+   and that every image is in containerd, and has k3s
+   re-import whatever is missing, never one it is still
+   importing (`spatium-k3s-images verify --repair`, #1630).
+   It waits at most what is left of firstboot's 10-minute
+   start timeout. If k3s is still importing when that runs
+   out, the slot is not committed; once
+   `spatium-k3s-images verify` passes, **Approve trial** in
+   Fleet keeps it before the next reboot reverts it.
 7. On health-OK: `grub-set-default <new_slot>` commits the
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack
    broken, or an image still missing after the re-import,
-   which would leave a workload in `ErrImageNeverPull`; for
-   that one firstboot exits 1 before the commit): no commit
+   which would leave a workload in `ErrImageNeverPull`, or k3s
+   still importing when that time runs out; for those
+   firstboot exits 1 before the commit): no commit
    happens. Next reboot reverts to the
    previous `saved_entry` automatically. If the new slot's
    migrate step had already run, the reverted release cannot
