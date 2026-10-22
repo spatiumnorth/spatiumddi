@@ -128,6 +128,37 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The backup target form keeps the line breaks of a multi-line
+  field (#2199).** Every destination field was a one-line input, and
+  an input turns each line break into a space. So an SCP private key
+  reached paramiko as one line ("not a valid OPENSSH private key
+  file"), a two-host known_hosts became one entry, and a second HTTPS
+  header folded into the first one's value. The destination catalog
+  (`GET /backup/targets/kinds`) now marks each field whose value is
+  lines `multiline`: SCP's private key and known_hosts, HTTPS PUT's
+  extra headers and GCS's service-account JSON. The form renders
+  those as textareas, masked for the secret ones with a Show toggle,
+  and sends the value unchanged. Editing a target without retyping
+  its key still keeps the stored key. The API now refuses (422) a
+  PEM key whose BEGIN and END lines arrive on one line, naming the
+  lost line breaks rather than leaving paramiko to call it an invalid
+  key. Azure Blob's Connection string help no longer calls the
+  one-line portal string "multi-line".
+
+- **The Manual restore card no longer offers a selective restore of
+  an Exclude-secrets archive (#2201).** The card decided whether an
+  archive could be restored selectively from `format_version == 2`,
+  and every archive is version 2, including an Exclude-secrets one,
+  whose database dump is plain SQL. The API refuses a selective
+  restore of a plain dump, and that refusal stays: a selective restore
+  filters pg_restore's custom format by table, which plain SQL cannot
+  be. So the card enabled Apply for a request that always failed. The
+  manifest preview (`POST /backup/manifest-preview`) now returns the
+  `dump_format` the restore resolves, from the same helper the restore
+  uses, and `selective_restore_supported`. The card reads them, keeps
+  Apply disabled for a selective restore of a plain archive, and says
+  why. A full restore of the same archive is still offered.
+
 - **A demoted member whose etcd stops before answering its own removal
   now finishes its leave (#2394).** When a member removes itself
   through its own etcd, a peer that has applied the removal can reject
