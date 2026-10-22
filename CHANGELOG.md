@@ -128,6 +128,30 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The rolling-upgrade Plan's Kea HA version-skew check sees appliance
+  HA pairs (#2179).** `kea_ha_version_skew` picked Kea servers by
+  `dhcp_server.deployment_kind = 'appliance'`, which no DHCP agent has
+  sent since #170 moved the deployment kind onto the supervisor's
+  `appliance` row. So on every appliance cluster it answered "No Kea HA
+  pairs on appliance nodes", whatever pairs ran there, and never gave the
+  warning it exists for: an HA pair already split across Kea majors, or
+  about to be split by a node-at-a-time roll. A server now counts as on an
+  appliance when an approved appliance whose supervisor reports
+  `deployment_kind = 'appliance'` owns it, by the `appliance_id` foreign
+  key or by the agent's host matching the appliance's hostname
+  (`orchestrated_server_condition` in `services/appliance/ownership.py`).
+  The PowerDNS LMDB migration check, which had worked around the same trap
+  with its own query, uses the same rule, so the two cannot drift again; it
+  no longer counts a row claimed only by a pending or docker-hosted
+  appliance's hostname. The HA test now runs over every Kea member of a
+  group, as the config renderer does, so a pair whose partner is a docker
+  agent is reported, with that partner named as one this upgrade does not
+  touch, and a group whose third member has no peer URL is not called a
+  pair. The check still compares the Kea version each agent reads off its
+  daemon, still only warns, and still ignores a pair with no appliance
+  member. No other upgrade check filtered on a server row's
+  `deployment_kind`.
+
 - **A UniFi controller named like an existing Router now syncs (#2140).**
   Router names are unique, and the UniFi reconciler created its Router
   under the controller's name without checking. An operator who had
