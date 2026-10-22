@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { humanTime } from "../network/_shared";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import {
@@ -1090,10 +1091,10 @@ function GroupServersList({
             const seenLabel =
               s.driver === "kea"
                 ? seenAt
-                  ? `seen ${new Date(seenAt).toLocaleTimeString()}`
+                  ? `seen ${humanTime(seenAt)}`
                   : "never heard from"
                 : seenAt
-                  ? `synced ${new Date(seenAt).toLocaleTimeString()}`
+                  ? `synced ${humanTime(seenAt)}`
                   : "never synced";
             const pauseInFlight =
               (pauseMut.isPending || resumeMut.isPending) &&
@@ -1140,6 +1141,14 @@ function GroupServersList({
                           }
                         >
                           Maintenance
+                        </span>
+                      )}
+                      {s.last_sync_error && (
+                        <span
+                          className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
+                          title={`Lease pull failing since ${s.last_sync_error_at ? new Date(s.last_sync_error_at).toLocaleString() : "unknown"}: ${s.last_sync_error}`}
+                        >
+                          Sync failing
                         </span>
                       )}
                       <ConfigApplyChip server={s} />

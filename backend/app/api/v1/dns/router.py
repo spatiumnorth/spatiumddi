@@ -88,6 +88,7 @@ from app.drivers.dns.windows import test_winrm_credentials
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.dns import (
+    DEFAULT_ALLOW_QUERY_CACHE,
     DEFAULT_ALLOW_RECURSION,
     DNS_TTL_MAX,
     DNSSEC_ALGORITHMS,
@@ -4103,6 +4104,21 @@ async def update_options(
                 + ". Move the Technitium server to its own group, or leave these at "
                 "their defaults.",
             )
+    # #2264: only BIND9 renders ``allow-query-cache``. PowerDNS has no such
+    # setting either, so refuse a changed non-default value rather than store
+    # one the daemon ignores (same rule as the Technitium gate above).
+    if (
+        "allow_query_cache" in changes
+        and list(changes["allow_query_cache"] or []) != list(DEFAULT_ALLOW_QUERY_CACHE)
+        and list(changes["allow_query_cache"] or []) != list(opts.allow_query_cache or [])
+        and "powerdns" in await _group_driver_names(db, group_id)
+    ):
+        raise HTTPException(
+            422,
+            "allow_query_cache: this group has a PowerDNS server, which has no "
+            "cache-access ACL, so the value would be ignored. Move the PowerDNS "
+            "server to its own group, or leave it at its default.",
+        )
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     forwarders_before = list(opts.forwarders or [])
     transport_before = opts.forward_transport
