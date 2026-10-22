@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A zone's own export re-imported as a delete + create of every MX,
+  SRV, CNAME, NS, PTR and TXT record (#2187).** The record API stores a
+  name target without its trailing dot, relative to the zone, but the
+  zone-file writer forced a dot on it (`mail` became the absolute
+  `mail.`), and the import diff compared the value text exactly. The
+  writer now writes targets as stored (`$ORIGIN` makes the file read
+  them the same way) and quotes TXT through the shared driver helper,
+  and the diff compares names absolute and case-folded and TXT in one
+  quoted form, so exporting a zone and importing it back plans nothing
+  under `replace` or `merge`.
+
 - **A replayed grant no longer re-points an address's IPAM row to the
   client that already released it (#2391).** After an agent restart
   the lease file is re-sent, so an old client's grant (and release) of

@@ -1403,6 +1403,8 @@ XLSX**. Over REST:
 | Template | `GET …/zones/{zid}/import/template?format=csv\|xlsx` |
 | Import | `POST …/zones/{zid}/import/spreadsheet/preview` then `…/commit`, multipart: `file`, `mode` (`merge` / `replace`), and on a replace commit `confirm_zone`. Needs write on `dns_record`; a replace that deletes also needs delete. |
 
+The zone-file export writes a record target (MX, SRV, CNAME, NS, PTR, DNAME) exactly as stored: a target with no trailing dot stays relative to `$ORIGIN`. Import compares names absolute and case-insensitive, and TXT bare or quoted, so re-importing your own export plans no changes (#2187).
+
 **Columns.** One row per record. The header row is required; column names are
 case-insensitive and `record_type` is accepted for `type`.
 
