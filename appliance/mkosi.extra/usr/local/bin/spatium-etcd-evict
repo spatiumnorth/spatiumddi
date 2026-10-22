@@ -301,14 +301,30 @@ def grpc_error(headers: str) -> str:
     return f"grpc-status {status.group(1)}: {text}"[:200]
 
 
+# curl exits that show etcd never saw the removal. curl raises them only while
+# it connects (6 the name lookup, which only a SPATIUM_ETCD_URL naming a host
+# needs; 7 the TCP connect; 35 the TLS handshake; 58 loading this node's client
+# certificate or key; 60 checking etcd's certificate; 77 reading the CA file),
+# and it sends the call only once connected. It sends the call again, on a new
+# connection, only after etcd refused the stream unprocessed (REFUSED_STREAM).
+# Any other exit can come after the call was sent: a timeout (28, as
+# --max-time covers the whole call) or a connection lost mid-call (16, 52, 55,
+# 56, 92). Read from curl 8.14.1, the one Debian trixie ships.
+CURL_NEVER_SENT = frozenset({6, 7, 35, 58, 60, 77})
+
+
 def refused_before_proposing(err: str) -> bool:
-    """True when remove_member()'s error shows etcd never acted on the call: no
-    gRPC answer at all (see grpc_error), or a refusal etcd gives before it
-    proposes the change. For MemberRemove those are FailedPrecondition (9, from
-    its gRPC interceptor or its strict reconfiguration check) and that check's
-    "unhealthy cluster" (14). Any other error, a transport failure included,
-    does not show it: "server stopped" and the timeouts come after the change
-    was proposed, and it may have been applied (#2394)."""
+    """True when remove_member()'s error shows etcd never acted on the call: a
+    curl that failed before it sent the call (CURL_NEVER_SENT), no gRPC answer
+    at all (see grpc_error), or a refusal etcd gives before it proposes the
+    change. For MemberRemove those are FailedPrecondition (9, from its gRPC
+    interceptor or its strict reconfiguration check) and that check's
+    "unhealthy cluster" (14). Any other error does not show it: "server
+    stopped" comes after the change was proposed, and a timeout or a
+    connection lost mid-call can, so it may have been applied (#2394)."""
+    curl = re.match(r"curl exit (\d+):", err)
+    if curl:
+        return int(curl.group(1)) in CURL_NEVER_SENT
     if err.startswith("no grpc-status"):
         return True
     m = re.match(r"grpc-status (\d+): (.*)", err, re.S)
@@ -475,9 +491,10 @@ def leave_self() -> int:
     agreement. An error answer is not proof either way (#2394): this node's
     etcd can apply its own removal and shut down while the call waits, and
     the call then answers `etcdserver: server stopped` with the member gone.
-    So only an answer showing that etcd never acted on the call refuses at
-    once, with k3s left running (refused_before_proposing). After any other
-    answer k3s is stopped and the survivor is asked, as after an accepted one.
+    So only an error showing that etcd never acted on the call refuses at
+    once, with k3s left running (refused_before_proposing: curl never sent
+    it, or etcd refused it before proposing). After any other error k3s is
+    stopped and the survivor is asked, as after an accepted one.
 
     Only a survivor that answers and still lists the member refuses the
     leave. One that cannot be reached in the window does not refuse an

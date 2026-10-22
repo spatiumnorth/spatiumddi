@@ -57,7 +57,23 @@ else:
         print(os.environ["FAKE_ANSWER"]); sys.exit(1)
 """
 
-SEED = {"ID": 8674559146448320794, "name": "ddipg-seed-964d1931"}
+# curl itself, for the answers that are curl's own exit code. It reads the frame
+# remove_frame() pipes in (the member ID is a varint after the 5-byte gRPC header
+# and field 1's tag), hands the removal to FAKE's `remove`, and exits
+# FAKE_CURL_EXIT with curl's message on stderr.
+FAKE_CURL = r"""
+import os, subprocess, sys
+frame, mid = sys.stdin.buffer.read(), 0
+for i, b in enumerate(frame[6:]):
+    mid |= (b & 0x7F) << (7 * i)
+    if not b & 0x80:
+        break
+subprocess.run([sys.executable, os.environ["FAKE"], "remove", str(mid)], check=True)
+sys.stderr.write(os.environ["FAKE_CURL_ERROR"] + "\n")
+sys.exit(int(os.environ["FAKE_CURL_EXIT"]))
+"""
+
+SEED ={"ID": 8674559146448320794, "name": "ddipg-seed-964d1931"}
 ME = {"ID": 12000000000000000002, "name": "ddipg-member-1-7f072fd9"}
 OTHER = {"ID": 18446744073709551557, "name": "ddipg-member-2-7d1c4ad1"}
 
@@ -77,6 +93,7 @@ def _run(
     answer: str = "",
     applied: bool = True,
     tombstone: bool = False,
+    curl: tuple[int, str] | None = None,
 ) -> tuple[int, list[str], bool, str]:
     k3s = tmp_path / "k3s-server"
     (k3s / "db" / "etcd").mkdir(parents=True)
@@ -118,6 +135,19 @@ def _run(
         "FAKE_NOT_APPLIED": "" if applied else "1",
         "FAKE_TOMBSTONE": str(k3s / "db" / "etcd" / "tombstone") if tombstone else "",
     }
+    if curl is not None:
+        # The runner's own curl call, with `curl` (exit code, message) its answer.
+        fake_curl = tmp_path / "fake_curl.py"
+        fake_curl.write_text(FAKE_CURL)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "curl").write_text(f'#!/bin/sh\nexec "{sys.executable}" "{fake_curl}" "$@"\n')
+        (bin_dir / "curl").chmod(0o755)
+        del env["SPATIUM_ETCD_REMOVE_CMD"]
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        env["FAKE"] = str(fake)
+        env["FAKE_CURL_EXIT"] = str(curl[0])
+        env["FAKE_CURL_ERROR"] = f"curl: ({curl[0]}) {curl[1]}"
     r = subprocess.run(
         [sys.executable, str(SCRIPT), "--leave-self"],
         env=env,
@@ -257,3 +287,60 @@ def test_an_error_answer_with_no_survivor_goes_on_when_k3s_left_its_tombstone(
     assert removed == ["remove", str(ME["ID"])]
     assert stopped
     assert "tombstone" in log
+
+
+# ---- a curl that failed (#2394) ---------------------------------------------------
+#
+# Without SPATIUM_ETCD_REMOVE_CMD the runner sends the removal with curl, and a
+# failed curl answers with its exit code. curl raises some exits only while it
+# connects, before it sends anything, so etcd never saw the call. Every other
+# exit can come after the call was sent, when etcd may have applied it.
+
+# The runner's CURL_NEVER_SENT, each with a message of the kind curl prints.
+NEVER_SENT = {
+    6: "Could not resolve host: etcd",
+    7: "Failed to connect to 127.0.0.1 port 2379: Connection refused",
+    35: "TLS connect error: unexpected eof while reading",
+    58: "could not load PEM client certificate",
+    60: "SSL certificate problem: certificate has expired",
+    77: "error setting certificate file",
+}
+MAY_HAVE_BEEN_SENT = {
+    16: "Error in the HTTP2 framing layer",
+    28: "Operation timed out after 15002 milliseconds with 0 bytes received",
+    52: "Empty reply from server",
+    55: "Failed sending data to the peer",
+    56: "Recv failure: Connection reset by peer",
+    92: "HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR (err 2)",
+}
+
+
+@pytest.mark.parametrize("code", sorted(NEVER_SENT))
+def test_a_curl_that_never_sent_the_removal_refuses_at_once_with_k3s_running(
+    tmp_path: Path, code: int
+) -> None:
+    """etcd never saw the call, so the member still votes. Stopping k3s here
+    would take a voter away while it still counts, and two demotes at once
+    could briefly cost a three-node cluster its quorum."""
+    rc, removed, stopped, log = _run(tmp_path, curl=(code, NEVER_SENT[code]), applied=False)
+    assert rc == 1, log
+    assert removed == ["remove", str(ME["ID"])]
+    assert not stopped, log
+    assert (
+        f"could not remove this node's etcd member {ME['ID']} {ME['name']}: curl exit {code}:"
+        in log
+    )
+
+
+@pytest.mark.parametrize("code", sorted(MAY_HAVE_BEEN_SENT))
+def test_a_curl_that_failed_after_sending_the_removal_still_asks_the_survivor(
+    tmp_path: Path, code: int
+) -> None:
+    """etcd may have applied the removal, as it did here: k3s is stopped and the
+    survivor decides, as after `server stopped`."""
+    rc, removed, stopped, log = _run(tmp_path, curl=(code, MAY_HAVE_BEEN_SENT[code]))
+    assert rc == 0, log
+    assert removed == ["remove", str(ME["ID"])]
+    assert stopped
+    assert f"curl exit {code}:" in log
+    assert "no longer lists" in log

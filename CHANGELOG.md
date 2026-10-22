@@ -141,10 +141,11 @@ the formatter handles the rest.
   nine three-node demote drills. An error answer for the node's own
   member now stops k3s and goes to the same check as an accepted one:
   the node it joined decides, and a survivor that answers and still
-  lists the member still refuses the leave. Only an answer that shows
-  etcd never acted on the call (no gRPC status, or the strict
-  reconfiguration check's refusal) refuses at once, with k3s left
-  running. When no survivor can be reached after an error answer, the
+  lists the member still refuses the leave. Only an error that shows
+  etcd never acted on the call refuses at once, with k3s left running:
+  curl failing before it sent the call (it could not connect, or TLS
+  failed), no gRPC status, or the strict reconfiguration check's
+  refusal. When no survivor can be reached after an error answer, the
   leave goes on only if k3s left its tombstone (it writes one only
   once a peer has applied the member's removal); without one, nothing
   shows the member gone, and the leave is refused rather than wiping a
