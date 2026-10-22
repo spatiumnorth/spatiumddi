@@ -18,7 +18,9 @@ Which row is "the appliance's" depends on the engine (#1715, #1856):
 * a row already carrying the current engine's driver, when there is one;
 * otherwise, when the save also switches the engine, the row the new
   engine's agent will adopt. Registration finds a row by agent id with no
-  group filter, else by hostname within the group it names, and an
+  group filter, else by hostname within the appliance's assigned group
+  (#2190 — not the group the pod's env names, which can be a chart
+  revision behind), and an
   engine-only switch lets the new engine's agent adopt the old engine's row
   by hostname — so at the moment of an engine-AND-group save the row still
   carries the OLD driver. It moves as the new engine's row: its driver is

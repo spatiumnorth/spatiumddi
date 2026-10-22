@@ -37,7 +37,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import DB, CurrentUser, SuperAdmin, require_superadmin
+from app.api.deps import DB, CurrentUser, SuperAdmin, ensure_superadmin
 from app.api.pagination import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE,
@@ -122,6 +122,7 @@ from app.services.appliance.group_names import (
 )
 from app.services.approvals.gate import gate_or_execute
 from app.services.dns import dnssec_signers, technitium_api_scope
+from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
     APEX_CNAME_DETAIL,
@@ -600,6 +601,19 @@ class ServerUpdate(BaseModel):
         return v
 
 
+def _duplicate_agent_fields(s: DNSServer) -> dict[str, Any]:
+    """#2044 — the server row's duplicate-agent fields, all empty unless an
+    episode is current (one reading, shared with the alert)."""
+    if not duplicate_agent_active(s):
+        return {}
+    return {
+        "duplicate_agent": True,
+        "duplicate_agent_since": s.duplicate_agent_first_at,
+        "duplicate_agent_last_at": s.duplicate_agent_last_at,
+        "duplicate_agent_ip": s.duplicate_agent_ip,
+    }
+
+
 class ServerResponse(BaseModel):
     id: uuid.UUID
     group_id: uuid.UUID
@@ -661,6 +675,16 @@ class ServerResponse(BaseModel):
     # ``config_apply_status`` reports at #882's severity. ``null`` — never
     # reported.
     daemon_not_serving: bool | None = None
+    # #2044 — a second live agent process is polling as this server (a cloned
+    # VM or a copied state dir keeps the agent_id) and is being refused: only
+    # the most recent process is served record ops. Derived
+    # (``agent_instance.duplicate_active``), as the
+    # ``dns_agent_duplicate_instance`` alert reads it. ``duplicate_agent_ip``
+    # is where the refused process last polled from.
+    duplicate_agent: bool = False
+    duplicate_agent_since: datetime | None = None
+    duplicate_agent_last_at: datetime | None = None
+    duplicate_agent_ip: str | None = None
     # #1111 — the stored agent config bundle: what the long-poll serves and
     # when it was rendered, whether the newest render is behind the changes
     # made since (watermark < dirty_seq), how many renders this server has
@@ -725,6 +749,7 @@ class ServerResponse(BaseModel):
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
             daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
+            **_duplicate_agent_fields(s),
             bundle_etag=s.bundle_etag,
             bundle_built_at=s.bundle_built_at,
             bundle_rendered_by=s.bundle_rendered_by,
@@ -776,6 +801,40 @@ class TrustAnchorCreate(BaseModel):
     key_tag: int
     public_key: str
     is_initial_key: bool = True
+
+    # All four land verbatim inside a ``trust-anchors { ... };`` statement in
+    # named.conf (#2266), so each is held to what BIND can parse: a malformed
+    # value would not break one anchor, it would make ``named-checkconf``
+    # reject the file and stop the whole group converging (#876 / #899).
+    @field_validator("zone_name")
+    @classmethod
+    def validate_anchor_zone(cls, v: str) -> str:
+        v = v.strip()
+        if v in (".", ""):
+            return "."
+        return validate_fqdn(v, field="zone_name")
+
+    @field_validator("algorithm")
+    @classmethod
+    def validate_anchor_algorithm(cls, v: int) -> int:
+        if not 1 <= v <= 255:
+            raise ValueError("algorithm must be a DNSSEC algorithm number (1-255)")
+        return v
+
+    @field_validator("key_tag")
+    @classmethod
+    def validate_anchor_key_tag(cls, v: int) -> int:
+        if not 0 <= v <= 65535:
+            raise ValueError("key_tag must be between 0 and 65535")
+        return v
+
+    @field_validator("public_key")
+    @classmethod
+    def validate_anchor_public_key(cls, v: str) -> str:
+        compact = "".join(v.split())
+        if not compact or not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", compact):
+            raise ValueError("public_key must be the base64 DNSKEY public key")
+        return compact
 
 
 class TrustAnchorResponse(BaseModel):
@@ -997,6 +1056,9 @@ class ServerOptionsResponse(BaseModel):
     # Stored group forwarders that cannot work with the group's transport,
     # saved before the #2128 refusal. Advisory: the save is not refused.
     forwarder_warnings: list[str] = Field(default_factory=list)
+    # DNSSEC validation that cannot work as configured (#2266): ``yes`` with
+    # no trust anchor on a BIND9 group validates nothing. Advisory only.
+    dnssec_warnings: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -3692,7 +3754,14 @@ async def _options_response(
 ) -> ServerOptionsResponse:
     out = ServerOptionsResponse.model_validate(opts)
     out.forwarder_warnings = _stored_forwarder_warnings(opts)
-    if "technitium" in await _group_driver_names(db, group_id):
+    drivers = await _group_driver_names(db, group_id)
+    if opts.dnssec_validation == "yes" and not opts.trust_anchors and "bind9" in drivers:
+        out.dnssec_warnings.append(
+            "dnssec_validation is 'yes' but no trust anchor is configured: BIND validates "
+            "nothing without one. Add the root (or another) trust anchor, or use 'auto' to "
+            "validate against BIND's built-in root anchor."
+        )
+    if "technitium" in drivers:
         acls = await _group_acl_definitions(db, group_id)
         out.technitium_warnings = technitium_stored_warnings(opts, acls)
         # Zone-level overrides saved before the gate (#1765).
@@ -4106,6 +4175,16 @@ async def add_trust_anchor(
     group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
 ) -> DNSTrustAnchor:
     await _require_group(group_id, db)
+    # Only the BIND9 agent renders ``trust-anchors`` (#2266). Storing one for a
+    # group another driver serves would be accepted and ignored.
+    others = sorted(d for d in await _group_driver_names(db, group_id) if d != "bind9")
+    if others:
+        raise HTTPException(
+            422,
+            "Trust anchors are only applied by BIND9; this group has a "
+            + ", ".join(others)
+            + " server, which would ignore them. Use a group of BIND9 servers.",
+        )
     result = await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
     opts = result.scalar_one_or_none()
     if not opts:
@@ -7297,7 +7376,7 @@ async def delete_zone(
     await _require_zone(group_id, zone_id, db, current_user)
     if permanent:
         # Refused before a change request could be queued for it.
-        require_superadmin(current_user)
+        ensure_superadmin(current_user)
     op = get_operation("delete_zone")
     assert op is not None  # registered at import
     args = DeleteZoneArgs(group_id=group_id, zone_id=zone_id, permanent=permanent)
@@ -8389,7 +8468,7 @@ async def delete_record(
         await db.commit()
         return
 
-    require_superadmin(current_user)
+    ensure_superadmin(current_user)
 
     db.add(
         AuditLog(
@@ -8496,7 +8575,7 @@ async def bulk_delete_records(
     if permanent:
         # Gate BEFORE any wire op is enqueued: a 403 must leave nothing queued
         # for the agent.
-        require_superadmin(current_user)
+        ensure_superadmin(current_user)
 
     res = await db.execute(select(DNSRecord).where(DNSRecord.id.in_(body.record_ids)))
     records = list(res.scalars().all())

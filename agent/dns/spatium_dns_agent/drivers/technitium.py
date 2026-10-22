@@ -587,12 +587,25 @@ def _shadowing_zone(domain: str, zone: str, hosted: Any) -> str | None:
     parent's record cannot be served from this daemon, and writing it is
     destructive.
 
-    The child's APEX is not shadowed: at that node Technitium keeps the
-    parent's side apart (``_parentSideZone`` beside ``_apexZone``), which is
-    where a delegation's NS lives, so the parent's records at the cut are
-    written as before. ``hosted`` is the zone names this daemon serves
-    (lower-case, no trailing dot); returns the deepest one that is a strict
-    descendant of ``zone`` and strictly contains ``domain``.
+    The child's APEX is not shadowed when the child is ONE label below the
+    parent: at that node Technitium keeps the parent's side apart
+    (``_parentSideZone`` beside ``_apexZone``), which is where a delegation's
+    NS lives, so the parent's records at the cut are written as before.
+
+    From 15.6.2 the daemon refuses the parent's record outright instead of
+    misfiling it ("The domain name '<d>' does not belong to the zone: <z>",
+    ``AuthZoneManager.GetOrAddSubDomainZone``) — and that check also refuses
+    the apex of a child TWO or more labels below the parent (``a.b.p2`` in
+    ``p2`` while ``a.b.p2`` is hosted), because it tests whether the name
+    relative to the parent has a dot. Verified live against 15.6.2 (#2238);
+    15.4.0 accepted the same write. The child still answers that name on
+    this daemon, so such a record is skipped like any other shadowed one
+    rather than refused on every render.
+
+    ``hosted`` is the zone names this daemon serves (lower-case, no trailing
+    dot); returns the deepest one that is a strict descendant of ``zone`` and
+    strictly contains ``domain``, or is ``domain`` itself at two or more
+    labels below ``zone``.
     """
     zone = zone.rstrip(".").lower()
     domain = domain.rstrip(".").lower()
@@ -601,7 +614,9 @@ def _shadowing_zone(domain: str, zone: str, hosted: Any) -> str | None:
         cand = str(cand).rstrip(".").lower()
         if cand == zone or not cand.endswith("." + zone):
             continue
-        if domain.endswith("." + cand) and (best is None or len(cand) > len(best)):
+        inside = domain.endswith("." + cand)
+        deep_apex = domain == cand and "." in cand[: -len(zone) - 1]
+        if (inside or deep_apex) and (best is None or len(cand) > len(best)):
             best = cand
     return best
 
@@ -1830,6 +1845,7 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
     allowed: set[str] = set()
     modes: set[str] = set()
     custom_addresses: set[str] = set()
+    invalid_addresses: set[str] = set()
     skipped_redirects: set[str] = set()
 
     for bl in bundle.get("blocklists") or []:
@@ -1860,8 +1876,20 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
             mapped = _BLOCK_MODE_TYPES.get(mode)
             if mapped:
                 modes.add(mapped)
-            if mode in ("sinkhole", "redirect") and entry.get("target"):
-                custom_addresses.add(str(entry["target"]))
+            if mode in ("sinkhole", "redirect"):
+                # The list's ``sinkhole_ip`` is what a sinkhole answers with
+                # (#2124); it used to be ignored here, so a sinkhole list
+                # with no per-entry target fell back to NxDomain. A value
+                # that is not an IP address is left out rather than handed
+                # to Technitium, which would refuse the whole settings call.
+                for candidate in (entry.get("sinkhole_ip"), entry.get("target")):
+                    if candidate:
+                        try:
+                            custom_addresses.add(
+                                str(ipaddress.ip_address(str(candidate).strip()))
+                            )
+                        except ValueError:
+                            invalid_addresses.add(str(candidate))
 
     if skipped_redirects:
         log.warning(
@@ -1876,11 +1904,38 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
             ),
         )
 
+    if invalid_addresses:
+        log.warning(
+            "technitium_sinkhole_address_unusable",
+            sample=sorted(invalid_addresses)[:5],
+            detail=(
+                "A sinkhole address is not an IP address and was left out; "
+                "blocked names answer with the unspecified address instead."
+            ),
+        )
+
     # One server-wide blocking type has to cover every entry. If the lists
     # disagree, prefer the address-answering mode: it is the more specific
     # intent (an operator asked for a sinkhole), and NxDomain would drop
     # the sinkhole silently.
-    blocking_type = "CustomAddress" if "CustomAddress" in modes else "NxDomain"
+    #
+    # Same answer the BIND9 renderer gives (#2124): both families, the
+    # list's address replacing the unspecified address of its own family.
+    # A sinkhole with no address at all is AnyAddress — Technitium's name
+    # for exactly 0.0.0.0 / :: — rather than a CustomAddress with nothing
+    # in it, which the apply step would turn into NxDomain.
+    if "CustomAddress" in modes:
+        if custom_addresses:
+            blocking_type = "CustomAddress"
+            families = {ipaddress.ip_address(a).version for a in custom_addresses}
+            if 4 not in families:
+                custom_addresses.add("0.0.0.0")
+            if 6 not in families:
+                custom_addresses.add("::")
+        else:
+            blocking_type = "AnyAddress"
+    else:
+        blocking_type = "NxDomain"
 
     return {
         "enabled": bool(blocked),

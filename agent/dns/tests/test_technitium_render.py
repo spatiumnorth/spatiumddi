@@ -1909,7 +1909,70 @@ def test_blocking_payload_prefers_custom_address_when_modes_disagree() -> None:
         )
     )
     assert out["blocking_type"] == "CustomAddress"
-    assert out["custom_addresses"] == ["10.0.0.1"]
+    # The v4 address, plus the v6 unspecified address so AAAA answers too
+    # (#2124 — the same answer the BIND9 renderer gives).
+    assert out["custom_addresses"] == ["10.0.0.1", "::"]
+
+
+def test_blocking_payload_sinkhole_without_an_address_is_any_address() -> None:
+    """#2124 — a sinkhole list with no per-entry target was CustomAddress
+    with nothing in it, which the apply step turns into NxDomain: the
+    sinkhole silently became a different mode. AnyAddress is Technitium's
+    name for 0.0.0.0 / ::, the BIND9 renderer's default."""
+    out = _blocking_payload(
+        _bl([{"domain": "b.test", "action": "block", "block_mode": "sinkhole"}])
+    )
+    assert out["blocking_type"] == "AnyAddress"
+    assert out["custom_addresses"] == []
+
+
+def test_blocking_payload_sinkhole_reads_the_lists_address() -> None:
+    """The list's ``sinkhole_ip`` (shipped since #2124) is the answer."""
+    v4 = _blocking_payload(
+        _bl(
+            [
+                {
+                    "domain": "b.test",
+                    "action": "block",
+                    "block_mode": "sinkhole",
+                    "sinkhole_ip": "192.0.2.53",
+                }
+            ]
+        )
+    )
+    assert v4["blocking_type"] == "CustomAddress"
+    assert v4["custom_addresses"] == ["192.0.2.53", "::"]
+    v6 = _blocking_payload(
+        _bl(
+            [
+                {
+                    "domain": "b.test",
+                    "action": "block",
+                    "block_mode": "sinkhole",
+                    "sinkhole_ip": "2001:db8::53",
+                }
+            ]
+        )
+    )
+    assert v6["custom_addresses"] == ["0.0.0.0", "2001:db8::53"]
+
+
+def test_blocking_payload_drops_an_unusable_sinkhole_address() -> None:
+    """Technitium would refuse the whole settings call over a bad address."""
+    out = _blocking_payload(
+        _bl(
+            [
+                {
+                    "domain": "b.test",
+                    "action": "block",
+                    "block_mode": "sinkhole",
+                    "sinkhole_ip": "not-an-ip",
+                }
+            ]
+        )
+    )
+    assert out["blocking_type"] == "AnyAddress"
+    assert out["custom_addresses"] == []
 
 
 def test_blocking_payload_collapses_per_view_lists() -> None:
@@ -4472,3 +4535,26 @@ def test_forwarder_stale_delete_of_a_gone_record_is_not_a_failure(tmp_path: Path
     d._apply_failures = []
     d._sync_forwarder_records("t", "f.test", [("192.0.2.53", "Udp", 0)], None)
     assert d._apply_failures == []
+
+
+def test_blocking_payload_keeps_a_name_another_list_blocks_and_a_feed_excepts() -> None:
+    """#2123 / #2124: the control plane ships only the feed carve-outs no
+    other list blocks (``c.feed.test``). The operator's ``x.example.test``,
+    which an AdGuard-style feed ``@@``-excepts, is NOT in the exceptions, so
+    it stays in the blocked set and out of the allowed one."""
+    out = _blocking_payload(
+        _bl(
+            [
+                {"domain": "x.example.test", "action": "block", "block_mode": "nxdomain"},
+                {
+                    "domain": "feed.test",
+                    "action": "block",
+                    "block_mode": "nxdomain",
+                    "is_wildcard": True,
+                },
+            ],
+            ["c.feed.test"],
+        )
+    )
+    assert "x.example.test" in out["blocked"]
+    assert out["allowed"] == ["c.feed.test"]
