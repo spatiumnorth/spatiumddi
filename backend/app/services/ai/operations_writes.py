@@ -243,6 +243,8 @@ async def _apply_update_conformity_policy(
                 f"Built-in policy only accepts {sorted(_CONFORMITY_BUILTIN_MUTABLE)}; "
                 f"rejected: {offending}"
             )
+    from app.services.conformity.current import retire_pass_if_rescoped  # noqa: PLC0415
+
     applied: dict[str, Any] = {}
     for key, value in changes.items():
         if getattr(p, key) != value:
@@ -256,6 +258,9 @@ async def _apply_update_conformity_policy(
 
         # #2277 — close the alerts a now-disabled policy left open.
         await resolve_policy_alerts(db, p.id, reason=RESOLUTION_POLICY_DISABLED)
+    # #2278 — same rule as the REST PATCH: a re-scoped policy's last
+    # pass no longer describes it.
+    retire_pass_if_rescoped(p, applied)
     write_audit(
         db,
         user=user,

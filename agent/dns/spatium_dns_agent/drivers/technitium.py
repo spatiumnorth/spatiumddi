@@ -587,12 +587,25 @@ def _shadowing_zone(domain: str, zone: str, hosted: Any) -> str | None:
     parent's record cannot be served from this daemon, and writing it is
     destructive.
 
-    The child's APEX is not shadowed: at that node Technitium keeps the
-    parent's side apart (``_parentSideZone`` beside ``_apexZone``), which is
-    where a delegation's NS lives, so the parent's records at the cut are
-    written as before. ``hosted`` is the zone names this daemon serves
-    (lower-case, no trailing dot); returns the deepest one that is a strict
-    descendant of ``zone`` and strictly contains ``domain``.
+    The child's APEX is not shadowed when the child is ONE label below the
+    parent: at that node Technitium keeps the parent's side apart
+    (``_parentSideZone`` beside ``_apexZone``), which is where a delegation's
+    NS lives, so the parent's records at the cut are written as before.
+
+    From 15.6.2 the daemon refuses the parent's record outright instead of
+    misfiling it ("The domain name '<d>' does not belong to the zone: <z>",
+    ``AuthZoneManager.GetOrAddSubDomainZone``) — and that check also refuses
+    the apex of a child TWO or more labels below the parent (``a.b.p2`` in
+    ``p2`` while ``a.b.p2`` is hosted), because it tests whether the name
+    relative to the parent has a dot. Verified live against 15.6.2 (#2238);
+    15.4.0 accepted the same write. The child still answers that name on
+    this daemon, so such a record is skipped like any other shadowed one
+    rather than refused on every render.
+
+    ``hosted`` is the zone names this daemon serves (lower-case, no trailing
+    dot); returns the deepest one that is a strict descendant of ``zone`` and
+    strictly contains ``domain``, or is ``domain`` itself at two or more
+    labels below ``zone``.
     """
     zone = zone.rstrip(".").lower()
     domain = domain.rstrip(".").lower()
@@ -601,7 +614,9 @@ def _shadowing_zone(domain: str, zone: str, hosted: Any) -> str | None:
         cand = str(cand).rstrip(".").lower()
         if cand == zone or not cand.endswith("." + zone):
             continue
-        if domain.endswith("." + cand) and (best is None or len(cand) > len(best)):
+        inside = domain.endswith("." + cand)
+        deep_apex = domain == cand and "." in cand[: -len(zone) - 1]
+        if (inside or deep_apex) and (best is None or len(cand) > len(best)):
             best = cand
     return best
 

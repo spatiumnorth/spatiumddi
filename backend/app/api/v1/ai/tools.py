@@ -22,6 +22,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app.api.deps import DB, SuperAdmin
+from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
 from app.services import feature_modules as fm_svc
 from app.services.ai.tools import REGISTRY, effective_tool_names
@@ -104,6 +105,13 @@ async def update_tool_catalog(
     if settings_row is None:
         settings_row = PlatformSettings(id=1)
         db.add(settings_row)
+    # Platform-layer effective set before the write (registry defaults
+    # when the override is NULL). Modules / providers are deliberately
+    # left out: the audit row records what THIS write changed.
+    before_override = (
+        list(settings_row.ai_tools_enabled) if settings_row.ai_tools_enabled is not None else None
+    )
+    before = effective_tool_names(platform_enabled=before_override, provider_enabled=None)
     if body.enabled is None:
         settings_row.ai_tools_enabled = None
     else:
@@ -111,5 +119,33 @@ async def update_tool_catalog(
         # a renamed tool. Same forward-compat we apply when reading.
         registered = {t.name for t in REGISTRY.all() if not t.writes}
         settings_row.ai_tools_enabled = sorted(set(body.enabled) & registered)
+    after_override = (
+        list(settings_row.ai_tools_enabled) if settings_row.ai_tools_enabled is not None else None
+    )
+    after = effective_tool_names(platform_enabled=after_override, provider_enabled=None)
+    # Non-negotiable #4: the audit row rides the same transaction as the
+    # write. A diff, not the catalog; nothing changed => nothing written.
+    enabled_now = sorted(after - before)
+    disabled_now = sorted(before - after)
+    if enabled_now or disabled_now or before_override != after_override:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="ai_tools_catalog",
+                resource_display="Copilot tool catalog",
+                changed_fields=["ai_tools_enabled"],
+                old_value={"platform_override": before_override},
+                new_value={
+                    "platform_override": after_override,
+                    "enabled": enabled_now,
+                    "disabled": disabled_now,
+                },
+                result="success",
+            )
+        )
     await db.commit()
     return await list_tools(current_user, db)

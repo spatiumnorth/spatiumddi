@@ -41,6 +41,10 @@ from app.services.conformity.checks import (
     CHECK_CATALOG,
     CHECK_REGISTRY,
 )
+from app.services.conformity.current import (
+    current_status_counts,
+    retire_pass_if_rescoped,
+)
 from app.services.conformity.engine import (
     RESOLUTION_POLICY_DELETED,
     RESOLUTION_POLICY_DISABLED,
@@ -65,7 +69,6 @@ _STATUSES = frozenset({"pass", "fail", "warn", "not_applicable"})
 _BUILTIN_MUTABLE_FIELDS = frozenset(
     {"enabled", "eval_interval_hours", "severity", "fail_alert_rule_id", "description"}
 )
-
 
 # ── Schemas ─────────────────────────────────────────────────────────
 
@@ -349,6 +352,8 @@ async def update_policy(
         # #2277 — a disabled policy is never evaluated again; its open
         # alerts would otherwise stay red forever.
         await resolve_policy_alerts(db, p.id, reason=RESOLUTION_POLICY_DISABLED)
+    # #2278 — a re-scoped policy's last pass answers a different question.
+    retire_pass_if_rescoped(p, changed)
     if changed:
         db.add(
             AuditLog(
@@ -466,16 +471,19 @@ async def list_results(
 
 @router.get("/summary", response_model=SummaryResponse)
 async def summary(db: DB, current_user: CurrentUser) -> SummaryResponse:
-    """Per-framework rollup of latest results.
+    """Per-framework rollup of the CURRENT results.
 
-    For each (policy, resource) we keep only the newest row, then
-    bucket by status and group by framework. Powers the Platform
+    Current means the most recent pass of each ENABLED policy
+    (``services.conformity.current``, #2278): a target deleted or
+    reclassified out of scope since is not in that pass, and a disabled
+    policy contributes no results — only to ``policies_total``. The
+    counting runs in SQL, so this reads policies × current targets
+    rather than the whole append-only history. Powers the Platform
     Insights conformity card and the dashboard pivot table.
     """
     _require_read(current_user)
 
     policies = list((await db.execute(select(ConformityPolicy))).scalars().all())
-    by_id: dict[str, ConformityPolicy] = {str(p.id): p for p in policies}
     framework_buckets: dict[str, FrameworkRollup] = {
         p.framework: FrameworkRollup(
             framework=p.framework,
@@ -494,38 +502,29 @@ async def summary(db: DB, current_user: CurrentUser) -> SummaryResponse:
         if p.enabled:
             b.policies_enabled += 1
 
-    # Newest result per (policy, resource).
-    rows = list(
-        (await db.execute(select(ConformityResult).order_by(desc(ConformityResult.evaluated_at))))
-        .scalars()
-        .all()
-    )
-    seen: set[tuple[str, str, str]] = set()
     overall = {"pass": 0, "warn": 0, "fail": 0, "not_applicable": 0}
-    for r in rows:
-        key = (str(r.policy_id), r.resource_kind, r.resource_id)
-        if key in seen:
-            continue
-        seen.add(key)
-        policy = by_id.get(str(r.policy_id))
-        if policy is None:
-            continue
-        b = framework_buckets[policy.framework]
-        if r.status == "pass":
-            b.pass_count += 1
-            overall["pass"] += 1
-        elif r.status == "warn":
-            b.warn_count += 1
-            overall["warn"] += 1
-        elif r.status == "fail":
-            b.fail_count += 1
-            overall["fail"] += 1
-        else:
-            b.not_applicable_count += 1
-            overall["not_applicable"] += 1
+    for fw, by_status in (await current_status_counts(db)).items():
+        b = framework_buckets[fw]
+        for st, n in by_status.items():
+            if st == "pass":
+                b.pass_count += n
+                overall["pass"] += n
+            elif st == "warn":
+                b.warn_count += n
+                overall["warn"] += n
+            elif st == "fail":
+                b.fail_count += n
+                overall["fail"] += n
+            else:
+                b.not_applicable_count += n
+                overall["not_applicable"] += n
 
     last_evaluated = (
-        await db.execute(select(func.max(ConformityPolicy.last_evaluated_at)))
+        await db.execute(
+            select(func.max(ConformityPolicy.last_evaluated_at)).where(
+                ConformityPolicy.enabled.is_(True)
+            )
+        )
     ).scalar()
 
     return SummaryResponse(
