@@ -136,6 +136,7 @@ class ScpDestination(BackupDestination):
             name="private_key",
             label="Private key (PEM)",
             type="password",
+            multiline=True,
             required=False,
             secret=True,
             description=(
@@ -166,6 +167,7 @@ class ScpDestination(BackupDestination):
             name="known_hosts",
             label="known_hosts content",
             type="text",
+            multiline=True,
             required=False,
             description=(
                 "OpenSSH known_hosts file content. Required when "
@@ -191,6 +193,18 @@ class ScpDestination(BackupDestination):
                 raise DestinationConfigError("'port' must be 1..65535")
         if not config.get("password") and not config.get("private_key"):
             raise DestinationConfigError("set ONE of 'password' or 'private_key'")
+        private_key = config.get("private_key")
+        if isinstance(private_key, str) and _pem_lost_its_line_breaks(private_key):
+            # paramiko answers a one-line key with "not a valid OPENSSH
+            # private key file", which reads as a wrong key rather than a
+            # mangled one. A one-line input folds every line break into a
+            # space, so say that, here (#2199).
+            raise DestinationConfigError(
+                "'private_key' has lost its line breaks: a PEM key's BEGIN line, "
+                "base64 body and END line must each be on their own line. Paste "
+                "the key into a multi-line field, or send it with real '\\n' "
+                "characters"
+            )
         remote_path = config["remote_path"]
         if not remote_path.startswith("/"):
             raise DestinationConfigError("'remote_path' must be absolute")
@@ -542,6 +556,19 @@ def _key_identities(keytype: str, key_b64: str) -> set[bytes]:
         except Exception:  # noqa: BLE001 — the raw blob above still counts
             pass
     return out
+
+
+def _pem_lost_its_line_breaks(pem: str) -> bool:
+    """True for a PEM block whose BEGIN and END markers sit on ONE line.
+
+    A Fernet-wrapped value (``__enc__:…``, the PATCH carry-over) and a
+    non-PEM value never match, so only a key that was actually pasted
+    flattened is refused.
+    """
+    text = pem.strip()
+    if not text.startswith("-----BEGIN ") or "-----END " not in text:
+        return False
+    return "\n" not in text and "\r" not in text
 
 
 def _load_private_key(pem: str, passphrase: str | None):

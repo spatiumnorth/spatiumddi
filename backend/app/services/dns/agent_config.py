@@ -177,17 +177,69 @@ def _compute_etag(payload: dict[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(blob).hexdigest()
 
 
+#: The key under which a BIND9 bundle carries each RPZ zone's content hash
+#: (#2157). The agent re-serialises a zone's file only when this moves, and
+#: otherwise hard-links the file it already serves, so an apply that touched
+#: no blocklist writes no RPZ bytes. Kept out of every other driver's bundle:
+#: nothing there reads it, and it would move their ETags for nothing.
+#:
+#: The name is load-bearing for the streamed render: sorted, it lands after
+#: ``entries`` (and ``exceptions``) in the zone's dict, and it is inserted
+#: after ``entries`` in the unsorted wire body too, so in all three documents
+#: its placeholder comes after the entries it hashes have been streamed.
+RPZ_CONTENT_HASH_KEY = "rpz_sha256"
+
+
+def _rpz_hasher(rpz_zone_name: str, exceptions: list[str]) -> Any:
+    """A SHA-256 primed with everything about an RPZ zone but its entries.
+
+    The entries follow as ``json.dumps(entries, **_ETAG_JSON)`` — whole, or a
+    batch at a time by the streamed render, which joins to the same bytes —
+    so both renders produce the same hash for the same state. Entries and
+    exceptions are all the agent's RPZ renderer reads from the zone's dict
+    (``block_mode`` and the wildcard flag ride on each entry), and the zone
+    name is folded in so two zones can never share a hash.
+    """
+    h = hashlib.sha256()
+    h.update(
+        json.dumps({"exceptions": exceptions, "rpz_zone_name": rpz_zone_name}, **_ETAG_JSON).encode(
+            "utf-8"
+        )
+    )
+    h.update(b"\n")
+    return h
+
+
+def _rpz_hash_value(hasher: Any) -> str:
+    return "sha256:" + hasher.hexdigest()
+
+
 def _entry_dict(
-    domain: str, action: str, block_mode: str, target: str | None, is_wildcard: bool
+    domain: str,
+    action: str,
+    block_mode: str,
+    target: str | None,
+    is_wildcard: bool,
+    sinkhole_ip: str | None = None,
 ) -> dict[str, Any]:
-    """One blocklist entry as the bundle ships it."""
-    return {
+    """One blocklist entry as the bundle ships it.
+
+    ``sinkhole_ip`` rides only on a ``sinkhole`` entry whose list names an
+    address (#2124) — the agent never received it, so every sinkhole list
+    rendered as ``rpz-drop``. Leaving the key off everywhere else keeps the
+    bundle of a list that does not sinkhole byte-identical, ETag included,
+    and costs nothing on the ~600k-entry feeds the bundle is sized for.
+    """
+    out: dict[str, Any] = {
         "domain": domain,
         "action": action,
         "block_mode": block_mode,
         "target": target,
         "is_wildcard": is_wildcard,
     }
+    if block_mode == "sinkhole" and sinkhole_ip:
+        out["sinkhole_ip"] = sinkhole_ip
+    return out
 
 
 def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
@@ -559,10 +611,14 @@ BLOCKLIST_RENDER_BATCH = 5000
 @dataclass(frozen=True)
 class _StreamedEntries:
     """One RPZ zone whose entries the streamed render writes in itself: the
-    zone's dict carries ``mark`` in place of its ``entries`` list."""
+    zone's dict carries ``mark`` in place of its ``entries`` list, and (a
+    BIND9 bundle, #2157) ``hash_mark`` in place of its content hash, which
+    ``hasher`` accumulates as the entries stream past."""
 
     mark: str
     lists: list[Any]
+    hash_mark: str | None = None
+    hasher: Any = None
 
 
 @dataclass
@@ -711,7 +767,14 @@ async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody
             has_views=rendered.has_views,
         )
 
-    marks = [zone.mark for zone in assembled.streamed]
+    # Every placeholder in document order: each zone's entries, then (#2157)
+    # its content hash, which is known only once those entries have streamed.
+    seq: list[tuple[str, _StreamedEntries, bool]] = []
+    for zone in assembled.streamed:
+        seq.append((zone.mark, zone, False))
+        if zone.hash_mark is not None:
+            seq.append((zone.hash_mark, zone, True))
+    marks = [mark for mark, _zone, _is_hash in seq]
     structural_mark = _placeholder()
     body["structural_etag"] = structural_mark
     structural_hash = hashlib.sha256()
@@ -737,14 +800,22 @@ async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody
     body.clear()
     assembled.structural.clear()
 
-    for i, zone in enumerate(assembled.streamed):
+    for i, (_mark, zone, is_hash) in enumerate(seq):
         if i:
             structural_hash.update(structural_parts[i])
             etag_hash.update(etag_parts[i])
             writer.write(wire_parts[i])
-        await _stream_zone_entries(
-            db, zone.lists, (structural_hash.update, etag_hash.update), writer.write
-        )
+        if is_hash:
+            value = _rpz_hash_value(zone.hasher)
+            hashed = json.dumps(value, **_ETAG_JSON).encode("utf-8")
+            structural_hash.update(hashed)
+            etag_hash.update(hashed)
+            writer.write(json.dumps(value, **WIRE_JSON).encode("utf-8"))
+            continue
+        hashes = (structural_hash.update, etag_hash.update)
+        if zone.hasher is not None:
+            hashes = (*hashes, zone.hasher.update)
+        await _stream_zone_entries(db, zone.lists, hashes, writer.write)
 
     last = len(marks)
     structural_hash.update(structural_parts[last])
@@ -775,7 +846,9 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     ``encode_bundle_body`` to write in."""
     # Options (per group)
     opts_res = await db.execute(
-        select(DNSServerOptions).where(DNSServerOptions.group_id == server.group_id)
+        select(DNSServerOptions)
+        .where(DNSServerOptions.group_id == server.group_id)
+        .options(selectinload(DNSServerOptions.trust_anchors))
     )
     opts = opts_res.scalar_one_or_none()
 
@@ -1043,7 +1116,13 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 {
                     **base_zp,
                     "view_name": None,
-                    "records": [_rec_dict(r) for r in rec_rows],
+                    # A member scoped to a site with no subnets serves nobody
+                    # (#2292) — even when no geo view exists to carry it.
+                    "records": [
+                        _rec_dict(r)
+                        for r in rec_rows
+                        if str(r.pool_member_id) not in geo.unreachable_members
+                    ],
                 }
             )
             continue
@@ -1209,6 +1288,26 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             if opts
             else list(DEFAULT_ALLOW_RECURSION)
         )
+    if server.driver == "bind9" and opts is not None and opts.trust_anchors:
+        # DNSSEC trust anchors (#2266). Stored and listed since the options
+        # API shipped, shipped to nobody: ``dnssec-validation yes`` therefore
+        # validated nothing. BIND9-only, and only when there are some, so a
+        # group without anchors keeps a byte-identical bundle and etag.
+        # Sorted: the relationship has no order, and an unstable list would
+        # shift the etag on every poll.
+        options_block["trust_anchors"] = sorted(
+            (
+                {
+                    "zone_name": ta.zone_name,
+                    "algorithm": ta.algorithm,
+                    "key_tag": ta.key_tag,
+                    "public_key": ta.public_key,
+                    "is_initial_key": bool(ta.is_initial_key),
+                }
+                for ta in opts.trust_anchors
+            ),
+            key=lambda t: (t["zone_name"], t["algorithm"], t["key_tag"], t["public_key"]),
+        )
     if server.driver == "powerdns":
         # PowerDNS ALIAS expansion (#1353): the group's own plain-DNS
         # forwarders, or "" for ALIAS off. Never a built-in public resolver.
@@ -1299,7 +1398,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     # with exceptions already applied by `build_effective_for_{view,group}`.
     def _entries_payload(eff_entries: list[Any]) -> list[dict[str, Any]]:
         return [
-            _entry_dict(e.domain, e.action, e.block_mode, e.target, e.is_wildcard)
+            _entry_dict(e.domain, e.action, e.block_mode, e.target, e.is_wildcard, e.sinkhole_ip)
             for e in eff_entries
         ]
 
@@ -1360,6 +1459,8 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
 
     blocklists_payload: list[dict[str, Any]] = []
     streamed: list[_StreamedEntries] = []
+    # #2157 — only the BIND9 agent reads the per-zone content hash.
+    rpz_hashes = server.driver == "bind9"
 
     async def _streamed_zone(
         lists: list[Any] | None, rpz_zone_name: str, view_name: str | None
@@ -1372,16 +1473,37 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         if not lists or not await has_entries(db, lists):
             return False
         mark = _placeholder()
-        streamed.append(_StreamedEntries(mark=mark, lists=lists))
-        blocklists_payload.append(
-            {
-                "rpz_zone_name": rpz_zone_name,
-                "entries": mark,
-                "exceptions": sorted(await exception_domains(db, lists)),
-                "view_name": view_name,
-            }
+        exceptions = sorted(await exception_domains(db, lists))
+        zone_dict: dict[str, Any] = {
+            "rpz_zone_name": rpz_zone_name,
+            "entries": mark,
+            "exceptions": exceptions,
+            "view_name": view_name,
+        }
+        zone = (
+            _StreamedEntries(
+                mark=mark,
+                lists=lists,
+                hash_mark=_placeholder(),
+                hasher=_rpz_hasher(rpz_zone_name, exceptions),
+            )
+            if rpz_hashes
+            else _StreamedEntries(mark=mark, lists=lists)
         )
+        if zone.hash_mark is not None:
+            zone_dict[RPZ_CONTENT_HASH_KEY] = zone.hash_mark
+        streamed.append(zone)
+        blocklists_payload.append(zone_dict)
         return True
+
+    def _hashed(zone_dict: dict[str, Any]) -> dict[str, Any]:
+        """The materialised render's half of #2157: the same hash the streamed
+        render computes, over the same bytes."""
+        if rpz_hashes:
+            hasher = _rpz_hasher(zone_dict["rpz_zone_name"], zone_dict["exceptions"])
+            hasher.update(json.dumps(zone_dict["entries"], **_ETAG_JSON).encode("utf-8"))
+            zone_dict[RPZ_CONTENT_HASH_KEY] = _rpz_hash_value(hasher)
+        return zone_dict
 
     # #1706 — a view's own zone already folds in the group's lists, so the
     # group zone rendered beside it would hold the same entries a second time.
@@ -1402,15 +1524,17 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             if eff_v.entries:
                 views_with_own_zone += 1
                 blocklists_payload.append(
-                    {
-                        "rpz_zone_name": f"spatium-blocklist-{v.name}.rpz.",
-                        "entries": _entries_payload(eff_v.entries),
-                        "exceptions": sorted(eff_v.exceptions),
-                        # Issue #24 — when views exist, RPZ zones + the
-                        # response-policy directive must live INSIDE the
-                        # owning view block, not at global options scope.
-                        "view_name": v.name,
-                    }
+                    _hashed(
+                        {
+                            "rpz_zone_name": f"spatium-blocklist-{v.name}.rpz.",
+                            "entries": _entries_payload(eff_v.entries),
+                            "exceptions": sorted(eff_v.exceptions),
+                            # Issue #24 — when views exist, RPZ zones + the
+                            # response-policy directive must live INSIDE the
+                            # owning view block, not at global options scope.
+                            "view_name": v.name,
+                        }
+                    )
                 )
     # With views, only a view that got no zone of its own needs the group's
     # (the agent loads it into that view alone). Without views it is the one
@@ -1426,15 +1550,18 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             eff_g = await build_effective_for_group(db, server.group_id)
             if eff_g.entries:
                 blocklists_payload.append(
-                    {
-                        "rpz_zone_name": "spatium-blocklist.rpz.",
-                        "entries": _entries_payload(eff_g.entries),
-                        "exceptions": sorted(eff_g.exceptions),
-                        # Group-level blocklist. ``view_name=None`` marks it
-                        # global: the single RPZ with no views, or (#1706)
-                        # the fallback for a view with no zone of its own.
-                        "view_name": None,
-                    }
+                    _hashed(
+                        {
+                            "rpz_zone_name": "spatium-blocklist.rpz.",
+                            "entries": _entries_payload(eff_g.entries),
+                            "exceptions": sorted(eff_g.exceptions),
+                            # Group-level blocklist. ``view_name=None`` marks
+                            # it global: the single RPZ with no views, or
+                            # (#1706) the fallback for a view with no zone of
+                            # its own.
+                            "view_name": None,
+                        }
+                    )
                 )
 
     # Phase 8f-3 — fleet upgrade intent. Only set when the operator

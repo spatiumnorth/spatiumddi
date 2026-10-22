@@ -303,6 +303,23 @@ def test_render_server_config_rrl_default_noop(zone: ZoneData) -> None:
     assert "tcp-clients" not in out
 
 
+def test_render_server_config_query_log_switch(zone: ZoneData) -> None:
+    """#2249 — an explicit ``querylog yes;`` with query logging on, mirroring
+    the agent renderer, and nothing with it off so an existing group's
+    preview is unchanged."""
+    on = ServerOptions(query_log_enabled=True, response_log_enabled=True)
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id="x", name="ns1"), on, bundle=_bundle_with_opts(zone, on)
+    )
+    assert "querylog yes;" in out
+    assert "responselog yes;" in out
+    off = ServerOptions()
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id="x", name="ns1"), off, bundle=_bundle_with_opts(zone, off)
+    )
+    assert "querylog" not in out
+
+
 def test_render_server_config_split_horizon_views() -> None:
     """Issue #24: the same zone name materialises once per view (with
     each view's filtered records pre-expanded by the bundle builder),
@@ -526,6 +543,7 @@ def test_render_rpz_zone_nxdomain_and_sinkhole_and_exception() -> None:
     assert "spatium-blocklist.rpz. IN SOA" in out
     assert "ads.example.com IN CNAME ." in out
     assert "*.tracker.example.net IN A 10.0.0.250" in out
+    assert "*.tracker.example.net IN AAAA ::" in out  # #2124
     assert "redirect.example.org IN A 1.2.3.4" in out
     assert "allowed.example.com" not in out  # exception excluded
 
