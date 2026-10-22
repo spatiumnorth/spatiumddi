@@ -11012,6 +11012,10 @@ export interface IntegrationsDashboardPanel {
   stale_count: number;
   error_count: number;
   warning_count: number;
+  // #2192 — over every target, not the capped `targets` list.
+  problem_count?: number;
+  credential_dead_count?: number;
+  credential_expiring_count?: number;
   targets: IntegrationsDashboardTargetRow[];
 }
 export interface IntegrationsDashboardErrorRow {
@@ -15376,7 +15380,9 @@ export type CredentialState =
   | "expiring"
   | "expired"
   | "rejected"
-  | "unknown";
+  | "unknown"
+  // #2191 — the target is switched off; its last rejection is history.
+  | "disabled";
 
 export interface TailscaleTenant {
   id: string;
