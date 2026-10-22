@@ -59,6 +59,7 @@ from app.core.dns_names import (
     contains_control_chars,
     contains_zonefile_unsafe,
     primary_ns_error,
+    structured_rdata_error,
     validate_fqdn,
     validate_hostname,
     validate_record_owner,
@@ -1835,7 +1836,15 @@ async def _enforce_absolute_target(db: DB, zone: DNSZone, record_type: str, valu
         raise HTTPException(status_code=422, detail=err)
 
 
-def _validate_address_record_value(record_type: str, value: str) -> None:
+def _validate_address_record_value(
+    record_type: str,
+    value: str,
+    *,
+    priority: int | None = None,
+    weight: int | None = None,
+    port: int | None = None,
+    origin: str | None = None,
+) -> None:
     """Reject rdata that would break — or inject into — a rendered zone (#467, #597).
 
     Three checks, in order of the record's shape:
@@ -1879,6 +1888,11 @@ def _validate_address_record_value(record_type: str, value: str) -> None:
         return
 
     if rtype not in ("A", "AAAA"):
+        err = structured_rdata_error(
+            rtype, value, priority=priority, weight=weight, port=port, origin=origin
+        )
+        if err is not None:
+            raise HTTPException(status_code=422, detail=err)
         return
     candidate = value.strip()
     family_ok = True
@@ -8196,7 +8210,14 @@ async def create_record(
     body.priority, body.weight, body.port = _normalize_record_struct_fields(
         body.record_type, body.priority, body.weight, body.port
     )
-    _validate_address_record_value(body.record_type, body.value)
+    _validate_address_record_value(
+        body.record_type,
+        body.value,
+        priority=body.priority,
+        weight=body.weight,
+        port=body.port,
+        origin=zone.name,
+    )
     await _enforce_absolute_target(db, zone, body.record_type, body.value)
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
     _enforce_bind_check_names(body.record_type, fqdn, body.value, zone.name)
@@ -8314,7 +8335,14 @@ async def update_record(
     # only) would 422 a pre-existing row whose value predates the rule —
     # blocking edits to legacy data, contrary to the validate-on-write stance.
     if "value" in changes:
-        _validate_address_record_value(record.record_type, record.value)
+        _validate_address_record_value(
+            record.record_type,
+            record.value,
+            priority=record.priority,
+            weight=record.weight,
+            port=record.port,
+            origin=zone.name if zone is not None else None,
+        )
         # Resubmitting a row's own value (a TTL edit) does not re-judge a row
         # that predates the rule, as for check-names below.
         if zone is not None and (record.value or "").strip() != (before_value or "").strip():
@@ -8906,7 +8934,14 @@ async def bulk_create_records(
         dotless_target(r.record_type, r.value) is not None for r in accepted
     ) and await group_needs_absolute_targets(db, zone.group_id)
     for r in accepted:
-        _validate_address_record_value(r.record_type, r.value)
+        _validate_address_record_value(
+            r.record_type,
+            r.value,
+            priority=r.priority,
+            weight=r.weight,
+            port=r.port,
+            origin=zone.name,
+        )
         if needs_absolute:
             target_err = dotless_target_error(r.record_type, r.value, zone.name)
             if target_err is not None:
@@ -9727,7 +9762,14 @@ def _sheet_row_validator(
                 body.record_type, body.priority, body.weight, body.port
             )
             if value_changed:
-                _validate_address_record_value(body.record_type, body.value)
+                _validate_address_record_value(
+                    body.record_type,
+                    body.value,
+                    priority=prio,
+                    weight=weight,
+                    port=port,
+                    origin=zone.name,
+                )
                 if needs_absolute:
                     err = dotless_target_error(body.record_type, body.value, zone.name)
                     if err is not None:
