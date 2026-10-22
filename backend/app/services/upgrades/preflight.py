@@ -68,7 +68,9 @@ from app.models.appliance import (
     Appliance,
     ApplianceUpgradeImage,
 )
-from app.services.appliance.ownership import k8s_node_name
+from app.models.dhcp import DHCPServer, DHCPServerGroup
+from app.models.dns import DNSServer
+from app.services.appliance.ownership import k8s_node_name, orchestrated_server_condition
 from app.services.upgrades import mutex
 
 logger = structlog.get_logger(__name__)
@@ -1044,23 +1046,46 @@ async def check_kea_ha_version_skew() -> PreflightResult:
     guidance is to upgrade every HA member together. So the honest thing is to
     tell the operator before they press Start.
 
-    Two pieces of scoping matter, and getting either wrong turns this check into
-    a liar that blocks unrelated work:
+    The versions compared are the ones each agent reads live off its Kea
+    control socket (``dhcp_server.kea_version``) — what the daemons actually
+    speak to each other now. An appliance's slot version says nothing about the
+    Kea it runs, and a member that has never reported is UNKNOWN, never old.
 
-    * **Only appliance nodes.** The orchestrator only ever touches appliance
-      nodes; docker / k8s DHCP agents upgrade through the manual copy-paste path
-      and are never cordoned, drained or slot-swapped by this run. Counting them
-      would let two unrelated docker containers veto an appliance-cluster
-      upgrade. ``deployment_kind`` is matched strictly against ``appliance`` (an
-      ``appliance`` OR ``NULL`` fallback would lie about a row that has not
-      checked in yet — same convention as the Upgrade / Reboot affordances).
+    Two pieces of scoping matter, and getting either wrong turns this check into
+    a liar:
+
+    * **Only HA groups with a member on an appliance node.** The orchestrator
+      only ever touches appliance nodes; docker / k8s DHCP agents upgrade
+      through the manual copy-paste path and are never cordoned, drained or
+      slot-swapped by this run. A group made only of those is never counted —
+      two unrelated docker containers must not turn an appliance-cluster
+      upgrade amber.
+
+      Recognising an appliance node is the subtle part (#2179). The obvious
+      predicate, ``dhcp_server.deployment_kind = 'appliance'``, is a trap: #170
+      Wave C1 moved deployment telemetry onto the supervisor's heartbeat, so the
+      DHCP agent never sends it and the column is NULL on every post-#170
+      appliance — filtering on it made this check report "no Kea HA pairs" on
+      every appliance cluster it was written for. Membership comes from
+      ``orchestrated_server_condition`` instead, the rule
+      ``check_powerdns_lmdb_migration`` shares: an approved appliance owning the
+      row by FK or by the agent's host. The strictness the original column
+      match was after survives in that rule — the appliance has to be approved
+      and report ``deployment_kind = 'appliance'`` itself; an unclaimed row is
+      never assumed to be one.
     * **Only *real* HA pairs.** HA is not "≥ 2 Kea members" — that is half the
       condition. ``_resolve_failover`` in ``services/dhcp/config_bundle.py``
       renders the HA hook only when there are ≥ 2 Kea members AND every one of
       them carries a non-empty ``ha_peer_url``; without a URL a peer cannot be
       reached for heartbeats or lease updates, so no HA relationship exists and
-      there is nothing for an upgrade to disrupt. This check must use the same
-      predicate or it invents HA pairs that the renderer never built.
+      there is nothing for an upgrade to disrupt. The predicate is evaluated
+      over EVERY Kea member of the group, as the renderer does — not over the
+      appliance members alone, which would miss a pair whose partner is a
+      docker agent and invent one where a third, URL-less member suppresses HA.
+
+    A pair with a member off the appliance fleet is still reported, and that
+    member is named: this run upgrades only the appliance side, so converging
+    the pair needs the other one upgraded separately.
 
     **This check never returns ``fail``.** A ``fail`` sets ``can_start=False``,
     and blocking the upgrade would be exactly backwards: if a pair is *already*
@@ -1071,17 +1096,24 @@ async def check_kea_ha_version_skew() -> PreflightResult:
     """
     try:
         async with AsyncSessionLocal() as db:
-            rows = (await db.execute(text("""
-                            SELECT g.name         AS group_name,
-                                   s.name         AS server_name,
-                                   s.kea_version  AS kea_version,
-                                   s.ha_peer_url  AS ha_peer_url
-                            FROM dhcp_server_group g
-                            JOIN dhcp_server s ON s.server_group_id = g.id
-                            WHERE s.driver = 'kea'
-                              AND s.deployment_kind = 'appliance'
-                            ORDER BY g.name, s.name
-                            """))).mappings().all()
+            rows = (
+                (
+                    await db.execute(
+                        select(
+                            DHCPServerGroup.name.label("group_name"),
+                            DHCPServer.name.label("server_name"),
+                            DHCPServer.kea_version.label("kea_version"),
+                            DHCPServer.ha_peer_url.label("ha_peer_url"),
+                            orchestrated_server_condition(DHCPServer).label("on_appliance"),
+                        )
+                        .join(DHCPServer, DHCPServer.server_group_id == DHCPServerGroup.id)
+                        .where(DHCPServer.driver == "kea")
+                        .order_by(DHCPServerGroup.name, DHCPServer.name)
+                    )
+                )
+                .mappings()
+                .all()
+            )
     except Exception as e:  # pragma: no cover - DB unavailable is its own signal
         logger.warning("preflight_kea_ha_skew_query_failed", error=str(e))
         return PreflightResult(
@@ -1097,10 +1129,13 @@ async def check_kea_ha_version_skew() -> PreflightResult:
 
     # Mirror _resolve_failover exactly: ≥ 2 Kea members AND every member has a
     # peer URL. Anything else renders no HA hook, so there is no HA to disrupt.
+    # Then keep only the pairs this run touches: at least one appliance member.
     ha_groups = {
         name: members
         for name, members in by_group.items()
-        if len(members) >= 2 and all(m["ha_peer_url"] for m in members)
+        if len(members) >= 2
+        and all(m["ha_peer_url"] for m in members)
+        and any(m["on_appliance"] for m in members)
     }
     if not ha_groups:
         return PreflightResult(
@@ -1116,9 +1151,12 @@ async def check_kea_ha_version_skew() -> PreflightResult:
     pre_3: list[str] = []
     unknown: list[str] = []
     groups: list[dict[str, Any]] = []
+    off_appliance: list[str] = []
+    off_by_group: dict[str, list[str]] = {}
     for name, members in ha_groups.items():
         majors = {_kea_major(m["kea_version"]) for m in members}
         known = {m for m in majors if m is not None}
+        affected = True
         if len(known) > 1:
             mixed.append(name)
         elif None in majors:
@@ -1128,11 +1166,22 @@ async def check_kea_ha_version_skew() -> PreflightResult:
             unknown.append(name)
         elif known and next(iter(known)) < _KEA_HA_MIN_COMPATIBLE_MAJOR:
             pre_3.append(name)
+        else:
+            affected = False
+        if affected:
+            outsiders = [m["server_name"] for m in members if not m["on_appliance"]]
+            off_by_group[name] = outsiders
+            off_appliance.extend(outsiders)
         groups.append(
             {
                 "group": name,
                 "members": [
-                    {"server": m["server_name"], "kea_version": m["kea_version"]} for m in members
+                    {
+                        "server": m["server_name"],
+                        "kea_version": m["kea_version"],
+                        "on_appliance": bool(m["on_appliance"]),
+                    }
+                    for m in members
                 ],
             }
         )
@@ -1142,8 +1191,25 @@ async def check_kea_ha_version_skew() -> PreflightResult:
         "mixed_major": mixed,
         "pre_3_0": pre_3,
         "unknown_version": unknown,
+        "off_appliance_members": off_appliance,
         "groups": groups,
     }
+
+    # A member this run does not upgrade cannot be converged by it — say so,
+    # or "completing this upgrade fixes it" is false for that pair. Only the
+    # outsiders of the groups the returned message names: a note naming a
+    # member of a group the message never mentions reads as belonging to it.
+    def off_note(named: list[str]) -> str:
+        names = [s for g in named for s in off_by_group.get(g, [])]
+        if not names:
+            return ""
+        many = len(names) > 1
+        return (
+            f" {'Members' if many else 'Member'} {', '.join(names)} "
+            f"{'are' if many else 'is'} not on an appliance node, so this upgrade "
+            f"does not touch {'them' if many else 'it'} — upgrade "
+            f"{'them' if many else 'it'} separately to the same Kea major."
+        )
 
     if mixed:
         return PreflightResult(
@@ -1154,6 +1220,7 @@ async def check_kea_ha_version_skew() -> PreflightResult:
                 "already span different Kea major versions, so HA lease sync is "
                 "broken right now. Completing this upgrade is what converges every "
                 "member onto one version — expect HA to stay degraded until it finishes."
+                + off_note(mixed)
             ),
             detail=detail,
         )
@@ -1167,6 +1234,7 @@ async def check_kea_ha_version_skew() -> PreflightResult:
                 "HA hook cannot exchange lease updates with a pre-2.7 peer — so the "
                 "pair will fall out of sync until every member has crossed. DHCP keeps "
                 "serving throughout; only HA replication between the peers is affected."
+                + off_note(pre_3)
             ),
             detail=detail,
         )
@@ -1177,7 +1245,7 @@ async def check_kea_ha_version_skew() -> PreflightResult:
             message=(
                 f"Kea version unknown for {'groups' if len(unknown) > 1 else 'group'} "
                 f"{', '.join(unknown)} (agent has not reported it yet). If those members "
-                "are on Kea < 3.0, HA will be degraded mid-upgrade."
+                "are on Kea < 3.0, HA will be degraded mid-upgrade." + off_note(unknown)
             ),
             detail=detail,
         )
@@ -1237,21 +1305,24 @@ async def check_powerdns_lmdb_migration() -> PreflightResult:
       are never touched by this run.
 
       Identifying them is the subtle part. The obvious predicate —
-      ``deployment_kind = 'appliance'``, which is what ``check_kea_ha_version_skew``
-      uses — is a **trap on ``dns_server``**: #170 Wave C1 moved slot /
+      ``deployment_kind = 'appliance'`` — is a **trap on ``dns_server``** (and on
+      ``dhcp_server``, where it made ``check_kea_ha_version_skew`` inert until
+      #2179): #170 Wave C1 moved slot /
       deployment telemetry off the service containers onto the supervisor's
       heartbeat, so the DNS agent no longer sends ``deployment_kind`` at all
       and the column is NULL on every post-#170 appliance. Filtering on it
       would match nothing and report a cheerful "no PowerDNS nodes" on exactly
       the fleet this check exists for.
 
-      So match the way ``_cascade_delete_appliance_children`` already does
-      (#305): the FK when it is set, else the agent-reported ``host``, which
-      ``register`` fills with the appliance's hostname. ``deployment_kind``
-      stays in the OR for any agent that does still report it. The host match
-      can in principle over-match an off-fleet server an operator labelled
-      with an appliance's hostname — acceptable for a warn-only check, and the
-      same trade #305 accepted for a *destructive* one.
+      So membership comes from ``orchestrated_server_condition``, the rule the
+      Kea HA check shares so the two cannot drift apart again (#2179): an
+      approved ``deployment_kind = 'appliance'`` appliance owning the row by
+      FK, else by the agent-reported ``host``, which ``register`` fills with
+      the appliance's hostname. ``deployment_kind`` on the server row stays in
+      the OR for any agent that does still report it. The host match can in
+      principle over-match an off-fleet agent an operator labelled with an
+      appliance's hostname — acceptable for a warn-only check, and the same
+      trade #305 accepted for a *destructive* one.
 
     **This check never returns ``fail``.** A ``fail`` sets ``can_start=False``,
     and blocking would be wrong twice over: the migration is a supported,
@@ -1260,22 +1331,23 @@ async def check_powerdns_lmdb_migration() -> PreflightResult:
     """
     try:
         async with AsyncSessionLocal() as db:
-            rows = (await db.execute(text("""
-                            SELECT s.name           AS server_name,
-                                   s.daemon_version AS daemon_version
-                            FROM dns_server s
-                            WHERE s.driver = 'powerdns'
-                              AND (
-                                    s.appliance_id IS NOT NULL
-                                 OR s.deployment_kind = 'appliance'
-                                 OR EXISTS (
-                                        SELECT 1 FROM appliance a
-                                        WHERE lower(rtrim(trim(a.hostname), '.'))
-                                            = lower(rtrim(trim(s.host), '.'))
-                                    )
-                              )
-                            ORDER BY s.name
-                            """))).mappings().all()
+            rows = (
+                (
+                    await db.execute(
+                        select(
+                            DNSServer.name.label("server_name"),
+                            DNSServer.daemon_version.label("daemon_version"),
+                        )
+                        .where(
+                            DNSServer.driver == "powerdns",
+                            orchestrated_server_condition(DNSServer),
+                        )
+                        .order_by(DNSServer.name)
+                    )
+                )
+                .mappings()
+                .all()
+            )
     except Exception as e:  # pragma: no cover - DB unavailable is its own signal
         logger.warning("preflight_powerdns_lmdb_query_failed", error=str(e))
         return PreflightResult(

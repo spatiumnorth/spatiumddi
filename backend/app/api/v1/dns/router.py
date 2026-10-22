@@ -122,6 +122,7 @@ from app.services.appliance.group_names import (
 )
 from app.services.approvals.gate import gate_or_execute
 from app.services.dns import dnssec_signers, technitium_api_scope
+from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
     APEX_CNAME_DETAIL,
@@ -599,6 +600,19 @@ class ServerUpdate(BaseModel):
         return v
 
 
+def _duplicate_agent_fields(s: DNSServer) -> dict[str, Any]:
+    """#2044 — the server row's duplicate-agent fields, all empty unless an
+    episode is current (one reading, shared with the alert)."""
+    if not duplicate_agent_active(s):
+        return {}
+    return {
+        "duplicate_agent": True,
+        "duplicate_agent_since": s.duplicate_agent_first_at,
+        "duplicate_agent_last_at": s.duplicate_agent_last_at,
+        "duplicate_agent_ip": s.duplicate_agent_ip,
+    }
+
+
 class ServerResponse(BaseModel):
     id: uuid.UUID
     group_id: uuid.UUID
@@ -660,6 +674,16 @@ class ServerResponse(BaseModel):
     # ``config_apply_status`` reports at #882's severity. ``null`` — never
     # reported.
     daemon_not_serving: bool | None = None
+    # #2044 — a second live agent process is polling as this server (a cloned
+    # VM or a copied state dir keeps the agent_id) and is being refused: only
+    # the most recent process is served record ops. Derived
+    # (``agent_instance.duplicate_active``), as the
+    # ``dns_agent_duplicate_instance`` alert reads it. ``duplicate_agent_ip``
+    # is where the refused process last polled from.
+    duplicate_agent: bool = False
+    duplicate_agent_since: datetime | None = None
+    duplicate_agent_last_at: datetime | None = None
+    duplicate_agent_ip: str | None = None
     # #1111 — the stored agent config bundle: what the long-poll serves and
     # when it was rendered, whether the newest render is behind the changes
     # made since (watermark < dirty_seq), how many renders this server has
@@ -724,6 +748,7 @@ class ServerResponse(BaseModel):
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
             daemon_not_serving=is_not_serving(s.daemon_status, s.daemon_reason),
+            **_duplicate_agent_fields(s),
             bundle_etag=s.bundle_etag,
             bundle_built_at=s.bundle_built_at,
             bundle_rendered_by=s.bundle_rendered_by,

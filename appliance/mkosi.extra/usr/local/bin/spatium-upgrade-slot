@@ -333,6 +333,13 @@ _FETCH_BACKOFF_SECONDS = (5, 10, 20, 40)  # before attempts 2, 3, 4, 5
 # this long is a stall, and a stall is retried like a drop (the wrapper's
 # 45 min cap is the backstop, not the detector).
 _FETCH_READ_TIMEOUT_SECONDS = 120
+# #1804 — the image lands on /var, the filesystem etcd's WAL is on, while
+# the node is still serving (#1743). Left to the kernel, 300-400 MB of it
+# sat dirty until the slot write began, and flushing it then held etcd's
+# fdatasync for up to 8.4 s. Flushed every _FETCH_SYNC_BYTES as it lands,
+# etcd waits behind one small flush at most.
+_FETCH_CHUNK_BYTES = 1024 * 1024
+_FETCH_SYNC_BYTES = 16 * 1024 * 1024
 # Server-side trouble worth another attempt. A 4xx is an answer (a bad
 # token, a deleted image) and is never retried.
 _RETRYABLE_HTTP_STATUS = frozenset({408, 429, 500, 502, 503, 504})
@@ -421,12 +428,18 @@ def _fetch_http_once(
             raise _LocalWriteError(f"cannot write {dst}: {exc}") from exc
         try:
             last_pct = -5
+            unsynced = 0
             while True:
-                chunk = r.read(1024 * 1024)
+                chunk = r.read(_FETCH_CHUNK_BYTES)
                 if not chunk:
                     break
                 try:
                     f.write(chunk)
+                    unsynced += len(chunk)
+                    if unsynced >= _FETCH_SYNC_BYTES:
+                        f.flush()
+                        os.fdatasync(f.fileno())
+                        unsynced = 0
                 except OSError as exc:
                     raise _LocalWriteError(f"cannot write {dst}: {exc}") from exc
                 done += len(chunk)
@@ -561,6 +574,44 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+# #1804 — the slot write is paced as well as direct. O_DIRECT keeps the
+# image out of this node's page cache, but dd still wrote as fast as the
+# disk would take it. Where a cluster's members share a disk (VMs on one
+# host or one datastore) that was up to 166 MB/s, every member's etcd slowed
+# at once, and the cluster's leases were lost on the staged node and on each
+# node that took them over. At _WRITE_RATE_BYTES_PER_SECOND the 8 GiB write
+# takes about 4.5 minutes, with the node serving throughout, and the rest of
+# the disk stays free for everything else on it.
+_WRITE_CHUNK_BYTES = 4 * 1024 * 1024  # dd's bs
+_WRITE_RATE_BYTES_PER_SECOND = 32 * 1024 * 1024
+
+
+def _paced_copy(src, dst, *, clock=None, sleep=None) -> int:
+    """Copy ``src`` to ``dst`` in ``_WRITE_CHUNK_BYTES`` reads, never getting
+    ahead of ``_WRITE_RATE_BYTES_PER_SECOND`` since the copy began (#1804).
+    A destination slower than that is not slowed further. A copy that falls
+    behind (xz slow, or dd held up by a busy disk) makes up at most a second
+    of it at the disk's full speed, never the whole stall. Returns the bytes
+    copied; a ``BrokenPipeError`` from ``dst`` (dd has exited) propagates."""
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    rate = _WRITE_RATE_BYTES_PER_SECOND
+    start = clock()
+    copied = 0
+    while True:
+        buf = src.read(_WRITE_CHUNK_BYTES)
+        if not buf:
+            return copied
+        dst.write(buf)
+        copied += len(buf)
+        # Time spent behind the rate is not banked beyond a second: what is
+        # made up after a stall runs at the disk's full speed.
+        start = max(start, clock() - copied / rate - 1.0)
+        ahead = copied / rate - (clock() - start)
+        if ahead > 0:
+            sleep(ahead)
+
+
 def cmd_apply(args) -> int:
     if os.geteuid() != 0:
         print("ERROR: must run as root (writes to a block device)", file=sys.stderr)
@@ -633,13 +684,39 @@ def cmd_apply(args) -> int:
     # Decompress + dd directly into the inactive partition. xz can
     # stream-decompress so we don't need disk space for an intermediate
     # uncompressed file.
+    #
+    # #1804 — the write bypasses the page cache. The node is still serving
+    # while it stages (#1743), and a buffered dd queued hundreds of MB of
+    # the 8 GiB image ahead of every other write on the disk: etcd's WAL
+    # fdatasync waited behind it for seconds, and on the node holding the
+    # cluster's leases the controller-manager missed its renewal and k3s
+    # exited mid-write. With O_DIRECT dd writes one 4 MiB block at a time,
+    # so etcd waits behind one block at most. iflag=fullblock is what keeps
+    # it direct: the input is xz's pipe, whose reads come back short, and dd
+    # turns O_DIRECT off at the first write shorter than bs. The runner feeds
+    # dd itself, through _paced_copy, so the write also keeps to
+    # _WRITE_RATE_BYTES_PER_SECOND.
     _write_progress("writing", None, f"writing image to {inactive['partlabel']}")
-    print(f"  writing → {target_dev}")
+    print(f"  writing → {target_dev} (paced to "
+          f"{_WRITE_RATE_BYTES_PER_SECOND // (1024 * 1024)} MiB/s)")
     xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
                           stdout=subprocess.PIPE)
-    subprocess.run(["dd", f"of={target_dev}", "bs=4M", "conv=fsync",
-                     "status=progress"],
-                    stdin=xz.stdout, check=True)
+    dd = subprocess.Popen(["dd", f"of={target_dev}", "bs=4M", "iflag=fullblock",
+                           "oflag=direct", "conv=fsync", "status=progress"],
+                          stdin=subprocess.PIPE)
+    try:
+        _paced_copy(xz.stdout, dd.stdin)
+    except BrokenPipeError:
+        pass  # dd stopped reading; its exit status below says why
+    finally:
+        try:
+            dd.stdin.close()
+        except BrokenPipeError:
+            pass  # dd has exited, so the close's flush has no reader; dd.wait() says why
+    if dd.wait() != 0:
+        xz.kill()
+        xz.wait()
+        raise subprocess.CalledProcessError(dd.returncode, "dd")
     xz.wait()
     if xz.returncode != 0:
         print("ERROR: xz exited non-zero", file=sys.stderr)
