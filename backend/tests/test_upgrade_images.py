@@ -384,3 +384,143 @@ async def test_imported_row_filename_falls_back_on_an_unrecognisable_url() -> No
     )
 
     assert _github_asset_filename("https://example.test/download?id=7") == _GITHUB_IMAGE_FILENAME
+
+
+# ── fleet-architecture gating (#2399) ────────────────────────────────
+
+
+async def _node(db: AsyncSession, arch: str | None) -> None:
+    from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
+
+    db.add(
+        Appliance(
+            id=uuid.uuid4(),
+            hostname=f"n-{uuid.uuid4().hex[:8]}",
+            state=APPLIANCE_STATE_APPROVED,
+            public_key_der=b"k",
+            public_key_fingerprint=uuid.uuid4().hex * 2,
+            cert_serial="0001",
+            deployment_kind="appliance",
+            architecture=arch,
+            supervisor_version="2026.09.01-1",
+        )
+    )
+    await db.flush()
+
+
+def _rel(arch: str) -> releases_service.UpgradeImageRelease:
+    return releases_service.UpgradeImageRelease(
+        tag="2026.05.14-1",
+        name="2026.05.14-1",
+        published_at=datetime(2026, 5, 14, tzinfo=UTC),
+        body="",
+        html_url="https://example/r",
+        is_prerelease=False,
+        is_installed=False,
+        image_asset_url=f"https://x/{arch}.raw.xz",
+        checksum_asset_url=f"https://x/{arch}.sha256",
+        size_bytes=10,
+        architecture=arch,
+    )
+
+
+async def _patch_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake() -> tuple[bool, list]:
+        return (True, [_rel("amd64"), _rel("arm64")])
+
+    monkeypatch.setattr(releases_service, "list_available_upgrade_images", fake)
+
+
+async def test_picker_only_offers_the_fleets_architecture(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _node(db_session, "amd64")
+    await _patch_list(monkeypatch)
+    token = await _token(db_session)
+    body = (await client.get(f"{_BASE}/available", headers=_hdr(token))).json()
+    assert [r["architecture"] for r in body["available"]] == ["amd64"]
+    assert body["fleet"]["architectures"] == ["amd64"]
+    assert body["fleet"]["restricted"] is True
+
+
+async def test_picker_mixed_fleet_offers_both_with_counts(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _node(db_session, "amd64")
+    await _node(db_session, "arm64")
+    await _node(db_session, "arm64")
+    await _patch_list(monkeypatch)
+    token = await _token(db_session)
+    body = (await client.get(f"{_BASE}/available", headers=_hdr(token))).json()
+    assert {r["architecture"] for r in body["available"]} == {"amd64", "arm64"}
+    assert body["fleet"]["counts"] == {"amd64": 1, "arm64": 2}
+
+
+async def test_picker_unfiltered_when_a_node_architecture_is_unknown(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _node(db_session, "amd64")
+    await _node(db_session, None)
+    await _patch_list(monkeypatch)
+    token = await _token(db_session)
+    body = (await client.get(f"{_BASE}/available", headers=_hdr(token))).json()
+    assert len(body["available"]) == 2
+    assert body["fleet"]["unknown_count"] == 1
+    assert body["fleet"]["restricted"] is False
+
+
+async def test_import_refuses_architecture_no_node_runs(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _node(db_session, "amd64")
+    resolved: list[str] = []
+
+    async def fake(tag: str, architecture: str | None = None):
+        resolved.append(tag)
+        return releases_service.UpgradeImageChoice(spec=None, available=())
+
+    monkeypatch.setattr(releases_service, "resolve_upgrade_image_choice", fake)
+    token = await _token(db_session)
+    resp = await client.post(
+        f"{_BASE}/import-from-github",
+        headers=_hdr(token),
+        json={"release_tag": "2026.05.14-1", "architecture": "arm64"},
+    )
+    assert resp.status_code == 422
+    assert "amd64" in resp.json()["detail"]
+    assert resolved == []
+
+
+async def test_import_refuses_resolved_architecture_when_unspecified(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No architecture in the request: the release's only image is arm64."""
+    await _node(db_session, "amd64")
+
+    async def fake(tag: str, architecture: str | None = None):
+        spec = _rel("arm64")
+        return releases_service.UpgradeImageChoice(spec=spec, available=("arm64",))
+
+    monkeypatch.setattr(releases_service, "resolve_upgrade_image_choice", fake)
+    token = await _token(db_session)
+    resp = await client.post(
+        f"{_BASE}/import-from-github",
+        headers=_hdr(token),
+        json={"release_tag": "2026.05.14-1"},
+    )
+    assert resp.status_code == 422
+
+
+async def test_upload_refuses_declared_architecture_no_node_runs(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    await _node(db_session, "amd64")
+    token = await _token(db_session)
+    resp = await client.post(
+        _BASE,
+        headers=_hdr(token),
+        files={"file": ("x.raw.xz", b"abc")},
+        data={"sha256": "0" * 64, "appliance_version": "1.0.0", "architecture": "arm64"},
+    )
+    assert resp.status_code == 422
+    assert "amd64" in resp.json()["detail"]

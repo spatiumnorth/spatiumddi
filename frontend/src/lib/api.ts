@@ -13445,9 +13445,18 @@ export interface AvailableUpgradeImage {
   architecture: string;
 }
 
+export interface FleetArchitectures {
+  architectures: string[];
+  unknown_count: number;
+  counts: Record<string, number>;
+  restricted: boolean;
+}
+
 export interface AvailableUpgradeImages {
   github_reachable: boolean;
   available: AvailableUpgradeImage[];
+  fleet: FleetArchitectures;
+  control_plane_architecture: string | null;
 }
 
 export const applianceUpgradeImagesApi = {

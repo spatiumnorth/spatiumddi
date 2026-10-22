@@ -53,6 +53,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import platform
 import shutil
 import uuid
 from collections.abc import AsyncIterator
@@ -74,7 +75,8 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
@@ -82,10 +84,10 @@ from app.config import settings
 from app.core.content_disposition import content_disposition
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import OctetStreamResponse
-from app.models.appliance import ApplianceUpgradeImage
+from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance, ApplianceUpgradeImage
 from app.models.audit import AuditLog
 from app.services.appliance import releases as releases_service
-from app.services.appliance.architecture import ApplianceArchitecture
+from app.services.appliance.architecture import ApplianceArchitecture, normalize
 
 logger = structlog.get_logger(__name__)
 
@@ -543,12 +545,31 @@ class AvailableUpgradeImageRow(BaseModel):
     architecture: str
 
 
+class FleetArchitectures(BaseModel):
+    """What the fleet runs, as far as it has told us (#2399)."""
+
+    # Distinct non-null ``architecture`` of approved appliances.
+    architectures: list[str]
+    # Approved appliances that have not reported one (older supervisor,
+    # or not yet heartbeated). They could be any architecture, so while
+    # any exist nothing is refused or filtered.
+    unknown_count: int
+    # Approved appliances per architecture, for "which nodes is this for".
+    counts: dict[str, int]
+    # True when images for other architectures are hidden / refused.
+    restricted: bool
+
+
 class AvailableUpgradeImagesResponse(BaseModel):
     # ``github_reachable`` lets the picker auto-detect: false ⇒ default
     # the UI to the air-gap upload tab; true + non-empty ⇒ default to
     # the pick-from-GitHub tab.
     github_reachable: bool
     available: list[AvailableUpgradeImageRow]
+    fleet: FleetArchitectures
+    # The control plane's own architecture (None if unrecognised); the UI
+    # preselects this row when it is the fleet's only architecture.
+    control_plane_architecture: str | None = None
 
 
 class ImportFromGithubRequest(BaseModel):
@@ -588,6 +609,53 @@ def _row_to_schema(row: ApplianceUpgradeImage) -> UpgradeImageRow:
 
 
 # ── Endpoints ──────────────────────────────────────────────────────
+
+
+async def _fleet_architectures(db: AsyncSession) -> FleetArchitectures:
+    """Architectures of the approved appliances (#2399).
+
+    ``restricted`` is only true when every approved appliance has
+    reported an architecture: a NULL one (older supervisor) could be
+    either, so it must not block an import (#1026 treats NULL as
+    unknown). An empty fleet is likewise unrestricted.
+    """
+    rows = (
+        await db.execute(
+            select(Appliance.architecture, func.count())
+            .where(Appliance.state == APPLIANCE_STATE_APPROVED)
+            .group_by(Appliance.architecture)
+        )
+    ).all()
+    counts: dict[str, int] = {}
+    unknown = 0
+    for arch, n in rows:
+        canon = normalize(arch)
+        if canon is None:
+            unknown += n
+        else:
+            counts[canon] = counts.get(canon, 0) + n
+    return FleetArchitectures(
+        architectures=sorted(counts),
+        unknown_count=unknown,
+        counts=counts,
+        restricted=bool(counts) and unknown == 0,
+    )
+
+
+def _refuse_unused_architecture(fleet: FleetArchitectures, architecture: str | None) -> None:
+    """422 when ``architecture`` is one no approved appliance runs."""
+    if architecture is None or not fleet.restricted:
+        return
+    if architecture in fleet.architectures:
+        return
+    raise HTTPException(
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        (
+            f"No approved appliance runs {architecture}; this fleet runs "
+            f"{', '.join(fleet.architectures)}. Refusing to store an image "
+            "no node could boot."
+        ),
+    )
 
 
 @router.post(
@@ -649,6 +717,9 @@ async def upload_upgrade_image(
     ),
 ) -> UpgradeImageRow:
     _require_superadmin(current_user)
+
+    # #2399 — refuse an architecture no node runs before reading a byte.
+    _refuse_unused_architecture(await _fleet_architectures(db), architecture)
 
     expected_sha = sha256.lower().strip()
     if not all(c in "0123456789abcdef" for c in expected_sha):
@@ -785,6 +856,7 @@ async def list_upgrade_images(current_user: CurrentUser, db: DB) -> UpgradeImage
 )
 async def list_available_upgrade_images(
     current_user: CurrentUser,
+    db: DB,
 ) -> AvailableUpgradeImagesResponse:
     """Connected-install picker source.
 
@@ -796,8 +868,14 @@ async def list_available_upgrade_images(
     """
     _require_superadmin(current_user)
     reachable, releases = await releases_service.list_available_upgrade_images()
+    fleet = await _fleet_architectures(db)
+    if fleet.restricted:
+        # #2399 — only offer images some node can boot.
+        releases = [r for r in releases if r.architecture in fleet.architectures]
     return AvailableUpgradeImagesResponse(
         github_reachable=reachable,
+        fleet=fleet,
+        control_plane_architecture=normalize(platform.machine()),
         available=[
             AvailableUpgradeImageRow(
                 tag=r.tag,
@@ -839,6 +917,12 @@ async def import_upgrade_image_from_github(
     _require_superadmin(current_user)
     tag = body.release_tag.strip()
 
+    fleet = await _fleet_architectures(db)
+    # Checked on what the caller asked for before any network call, and
+    # again on what resolved (an unspecified architecture resolves to the
+    # release's only one) before the download.
+    _refuse_unused_architecture(fleet, body.architecture)
+
     choice = await releases_service.resolve_upgrade_image_choice(tag, body.architecture)
     spec = choice.spec
     if spec is None:
@@ -871,6 +955,8 @@ async def import_upgrade_image_from_github(
                 "GitHub is unreachable."
             ),
         )
+
+    _refuse_unused_architecture(fleet, spec.architecture)
 
     # 1. Fetch + parse the .sha256 sidecar (``<hash>  <filename>`` or a
     #    bare hash). Small text file — a 30 s timeout is plenty.

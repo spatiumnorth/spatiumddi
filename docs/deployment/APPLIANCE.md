@@ -3093,7 +3093,10 @@ whereas pointing the bootloader at it cannot be undone remotely.
    its sha256 sidecar out-of-band (air-gap), or — on a connected
    install — **import from GitHub** straight from the release-asset
    picker, where the control plane downloads + sha256-verifies the
-   image for you (no out-of-band round trip). On the Rolling Upgrade tab
+   image for you (no out-of-band round trip). Only architectures an
+   approved appliance runs are offered, and the API refuses (422) an
+   import or upload for any other (#2399); while any appliance has not
+   reported its architecture yet, nothing is filtered or refused. On the Rolling Upgrade tab
    the operator picks it from the dropdown — the control plane composes
    an authenticated download URL with an HMAC token, and every per-node
    host runner pulls bytes back through the control plane. No node ever

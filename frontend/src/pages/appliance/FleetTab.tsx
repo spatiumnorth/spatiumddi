@@ -1271,14 +1271,6 @@ export function FleetTab({
                   Refresh
                 </button>
               </div>
-              <p className="mb-4 text-xs text-muted-foreground">
-                Stage an appliance OS upgrade image. Connected installs can
-                import directly from a GitHub release; air-gapped installs
-                upload the <code>.raw.xz</code> out-of-band. Either way the
-                supervisor downloads through the control plane via an
-                authenticated internal URL once an OS upgrade points at the
-                stored row.
-              </p>
               <UpgradeImageManager />
             </div>
           )}
@@ -6282,11 +6274,23 @@ function UpgradeImageManager() {
   const effectiveMode: UpgradeSourceMode =
     mode ?? (githubReachable && available.length > 0 ? "github" : "upload");
 
-  // Default-select the newest available tag once the list lands.
+  const fleet = availableQuery.data?.fleet;
+  const cpArch = availableQuery.data?.control_plane_architecture ?? null;
+
+  // Default-select the newest available tag once the list lands (#2399:
+  // the newest row for the control plane's own architecture when that is
+  // the fleet's only one).
   useEffect(() => {
-    if (!selectedTag && available.length > 0)
-      setSelectedTag(availableKey(available[0]));
-  }, [available, selectedTag]);
+    if (!selectedTag && available.length > 0) {
+      const preferred =
+        fleet?.restricted &&
+        fleet.architectures.length === 1 &&
+        fleet.architectures[0] === cpArch
+          ? available.find((r) => r.architecture === cpArch)
+          : undefined;
+      setSelectedTag(availableKey(preferred ?? available[0]));
+    }
+  }, [available, selectedTag, fleet, cpArch]);
 
   const upload = useMutation({
     mutationFn: () =>
@@ -6386,6 +6390,19 @@ function UpgradeImageManager() {
             </p>
           ) : (
             <div className="space-y-3">
+              {fleet && (
+                <p className="text-[11px] text-muted-foreground">
+                  {fleet.restricted
+                    ? `Showing images for this fleet's architecture${
+                        fleet.architectures.length > 1 ? "s" : ""
+                      }: ${fleet.architectures.join(", ")}.`
+                    : fleet.unknown_count > 0
+                      ? `${fleet.unknown_count} appliance${
+                          fleet.unknown_count === 1 ? " has" : "s have"
+                        } not reported an architecture yet, so every architecture is shown.`
+                      : "No approved appliances yet, so every architecture is shown."}
+                </p>
+              )}
               <div>
                 <label className="text-muted-foreground">Release</label>
                 <select
@@ -6397,6 +6414,11 @@ function UpgradeImageManager() {
                     <option key={availableKey(r)} value={availableKey(r)}>
                       {r.tag}
                       {` · ${r.architecture}`}
+                      {fleet?.counts[r.architecture]
+                        ? ` (${fleet.counts[r.architecture]} node${
+                            fleet.counts[r.architecture] === 1 ? "" : "s"
+                          })`
+                        : ""}
                       {r.is_prerelease ? " (pre-release)" : ""}
                       {r.is_installed ? " · installed" : ""}
                       {r.size_bytes
@@ -6473,9 +6495,10 @@ function UpgradeImageManager() {
                 <option value="arm64">arm64 (AArch64)</option>
               </select>
               <p className="mt-1 text-[11px] text-muted-foreground">
-                From the asset name you downloaded. Lets the control plane
-                refuse this image for a node of the other architecture before
-                scheduling; the appliance re-checks the real image either way.
+                From the asset name you downloaded. The control plane refuses an
+                architecture no appliance in the fleet runs, and an upgrade for
+                a node of the other architecture; the appliance re-checks the
+                real image either way.
               </p>
             </div>
             <div className="sm:col-span-2">

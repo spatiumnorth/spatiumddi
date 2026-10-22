@@ -128,6 +128,19 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Upgrade images: only the fleet's architecture is offered, and a
+  mismatched import or upload is refused (#2399).** The release picker
+  listed every architecture and the import downloaded whichever row
+  was picked, so a 1.5 GiB image no node could boot was stored before
+  the #1026 scheduling gate ever ran. `GET /upgrade-images/available`
+  now returns only images matching an approved appliance's reported
+  architecture (with per-architecture node counts), and both the
+  GitHub import and the air-gap upload answer 422 naming the fleet's
+  architectures, before downloading or reading anything. An appliance
+  that has not reported an architecture lifts the restriction, and the
+  UI says so. The picker preselects the control plane's own
+  architecture when it is the fleet's only one, and the duplicated
+  description paragraph on the card is gone.
 - **The BIND9 agent no longer rewrites every RPZ zone file on every
   structural apply (#2157).** Removing a forward zone or editing a group
   option re-serialised every blocklist from scratch: ~11 MB per catalog
