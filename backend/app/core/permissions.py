@@ -810,6 +810,20 @@ def has_any_grant_for(user: User, action: str, resource_type: str) -> bool:
     return False
 
 
+def request_route_key(request: Request) -> str:
+    """``"METHOD /path-template"`` of the matched route, relative to the IPAM
+    router's ``/ipam`` prefix (``"PUT /addresses/{address_id}"``).
+
+    This is the key the route allow-lists of
+    :func:`require_any_resource_or_scoped` are written in. It is built from
+    the route TEMPLATE, never the concrete URL, so a path value cannot steer
+    which entry matches.
+    """
+    route = request.scope.get("route")
+    template = getattr(route, "path", "") or ""
+    return f"{request.method.upper()} {template.split('/ipam', 1)[-1]}"
+
+
 def _instance_scoped_admit(
     request: Request,
     user: User,
@@ -831,9 +845,7 @@ def _instance_scoped_admit(
       caller holds any read grant on the type; its handler must narrow the
       rows to the granted ones.
     """
-    route = request.scope.get("route")
-    template = getattr(route, "path", "") or ""
-    key = f"{request.method.upper()} {template.split('/ipam', 1)[-1]}"
+    key = request_route_key(request)
     for pname, (rtype, list_route, read_routes, write_routes) in instance_routes.items():
         raw = request.path_params.get(pname)
         if raw is None:
@@ -862,7 +874,7 @@ def _has_any_read_grant(user: User, resource_type: str) -> bool:
 
 def require_any_resource_or_scoped(
     unscoped_types: tuple[str, ...],
-    scoped_types: tuple[str, ...],
+    scoped_routes: dict[str, frozenset[str]],
     instance_routes: dict[str, tuple[str, str, frozenset[str], frozenset[str]]] | None = None,
 ) -> Callable[..., Awaitable[User]]:
     """Coarse router gate that also admits instance-scoped delegates.
@@ -870,15 +882,19 @@ def require_any_resource_or_scoped(
     Passes if the user has the method-derived action (unscoped) on ANY
     ``unscoped_types`` — the normal :func:`require_any_resource_permission`
     behaviour — OR, for **mutating** methods only (write / delete, never read),
-    holds ANY grant (scoped or unscoped) on ANY ``scoped_types`` via
-    :func:`has_any_grant_for`.
+    holds ANY grant (scoped or unscoped) on a ``scoped_routes`` type via
+    :func:`has_any_grant_for` AND the request's route is on that type's
+    allow-list.
 
-    The scoped admit exists for delegation types (``address_set``, #103) whose
-    real boundary is enforced by a downstream per-row gate, so a delegate with
-    only ``{write, address_set, <id>}`` clears the coarse gate and reaches that
-    gate. It is restricted to write/delete so a scoped *read* grant can never
-    widen read access to the aggregate router's data; read still requires a
-    normal (typically type-level) read grant.
+    ``scoped_routes`` maps a delegation type (``address_set``, #103) to the
+    ``"METHOD /path"`` templates (see :func:`request_route_key`) whose handler
+    enforces that type's real boundary with its own per-row gate. The grant's
+    ``resource_id`` is not consulted here, so the allow-list is the whole
+    boundary of this admit: a delegate with only ``{write, address_set, <id>}``
+    reaches exactly those routes, and a route added later stays closed to it
+    until someone lists it. The admit is restricted to write/delete so a scoped
+    *read* grant can never widen read access to the aggregate router's data;
+    read still requires a normal (typically type-level) read grant.
 
     ``instance_routes`` (#2438) additionally admits a grant scoped to ONE
     resource on an allow-list of routes that name that resource in their path
@@ -895,15 +911,16 @@ def require_any_resource_or_scoped(
         for rt in unscoped_types:
             if user_has_permission(current_user, action, rt):
                 return current_user
-        if action != "read":
-            for rt in scoped_types:
-                if has_any_grant_for(current_user, action, rt):
+        if action != "read" and scoped_routes:
+            key = request_route_key(request)
+            for rt, routes in scoped_routes.items():
+                if key in routes and has_any_grant_for(current_user, action, rt):
                     return current_user
         if instance_routes and _instance_scoped_admit(
             request, current_user, action, instance_routes
         ):
             return current_user
-        all_types = list(unscoped_types) + list(scoped_types)
+        all_types = list(unscoped_types) + list(scoped_routes)
         first = all_types[0] if all_types else "*"
         await _record_denial(db, current_user, request, action, first, None)
         raise HTTPException(
@@ -945,6 +962,7 @@ __all__ = [
     "require_any_permission",
     "require_any_resource_permission",
     "require_permission",
+    "request_route_key",
     "require_resource_permission",
     "token_scope_allows",
     "token_scoped_resource_ids",
