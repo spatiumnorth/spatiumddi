@@ -345,7 +345,8 @@ AGENT_STALE_AFTER_SECONDS = 90  # 3× heartbeat interval per DNS_AGENT.md §4
 
 
 async def _dns_agent_stale_sweep_async() -> dict[str, int]:
-    """Mark agents stale when no heartbeat seen for AGENT_STALE_AFTER_SECONDS.
+    """Mark agents stale when no heartbeat seen for AGENT_STALE_AFTER_SECONDS,
+    and re-elect a primary in any group left without one (#2276).
 
     Idempotent — only flips status for servers whose status is currently
     'active' but whose last_seen_at is beyond the threshold.
@@ -367,7 +368,7 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
             if not await is_module_enabled(db, "core.dns"):
                 # Typed dict[str, int] — a "status" string would not type
                 # check, and zero marked is the honest count anyway.
-                return {"marked_unreachable": 0}
+                return {"marked_unreachable": 0, "primaries_healed": 0}
             cutoff = datetime.now(UTC) - timedelta(seconds=AGENT_STALE_AFTER_SECONDS)
             # Issue #182: paused servers are deliberately offline —
             # don't trip the heartbeat-stale state transition for them.
@@ -385,10 +386,16 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
                 .returning(DNSServer.id)
             )
             changed = len(res.all())
+            # #2276 — self-heal a group left with servers and no primary (its
+            # primary deleted on a build that did not re-elect). Idempotent;
+            # rides this 60 s sweep rather than a beat entry of its own.
+            from app.services.dns.record_ops import heal_primaryless_groups
+
+            healed = await heal_primaryless_groups(db)
             await db.commit()
             if changed:
                 logger.info("dns_agent_stale_sweep", marked_unreachable=changed)
-            return {"marked_unreachable": changed}
+            return {"marked_unreachable": changed, "primaries_healed": healed}
     finally:
         await engine.dispose()
 

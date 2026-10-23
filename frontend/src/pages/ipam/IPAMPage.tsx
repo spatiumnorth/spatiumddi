@@ -76,6 +76,7 @@ import {
   type CustomField,
   type IPAMTemplate,
   type DNSZone,
+  type EffectiveDdns,
   type FreeCidrRange,
   type Router as NetworkRouter,
   type VLAN,
@@ -107,6 +108,7 @@ import {
   nameInZoneError,
   parseTtlInput,
   summarizeZoneNames,
+  zoneKindForName,
 } from "@/lib/dnsNames";
 import {
   GATEWAY_FORWARD_SKIPPED_LABEL,
@@ -1255,9 +1257,10 @@ function DnsSettingsSection({
   const allAvailableZones: DNSZone[] = zoneQueries.flatMap(
     (q: { data?: DNSZone[] }) => q.data ?? [],
   );
-  // Exclude reverse-lookup zones (in-addr.arpa, ip6.arpa) from primary/additional pickers
+  // Exclude reverse-lookup zones (under in-addr.arpa / ip6.arpa, by label —
+  // not a name that merely contains "arpa", #2472) from primary/additional pickers
   const availableZones = allAvailableZones.filter(
-    (z) => !z.name.toLowerCase().includes("arpa"),
+    (z) => zoneKindForName(z.name) !== "reverse",
   );
 
   // Displayed values when inheriting
@@ -1993,6 +1996,9 @@ export function DdnsSettingsSection({
   domainOverride,
   ttlText,
   subnetNetwork,
+  inherit,
+  effective,
+  onInheritChange,
   onEnabledChange,
   onPolicyChange,
   onDomainOverrideChange,
@@ -2003,6 +2009,11 @@ export function DdnsSettingsSection({
   domainOverride: string | null;
   ttlText: string;
   subnetNetwork?: string;
+  /** #2475 — a subnet inherits its DDNS unless it opts out. Without
+   *  `onInheritChange` the section is the old subnet-only form. */
+  inherit?: boolean;
+  effective?: EffectiveDdns | null;
+  onInheritChange?: (v: boolean) => void;
   onEnabledChange: (v: boolean) => void;
   onPolicyChange: (v: DdnsPolicy) => void;
   onDomainOverrideChange: (v: string | null) => void;
@@ -2029,7 +2040,30 @@ export function DdnsSettingsSection({
     return `dhcp-${octets[2]}-${octets[3]}`;
   })();
 
-  const disabled = !enabled;
+  // While inheriting, the controls show what the subnet resolves to (the
+  // parent's settings), read-only — never the subnet's own stored values,
+  // which are not the ones in force (#2475).
+  const inheriting = inherit === true && !!onInheritChange;
+  const shown = inheriting && effective ? effective : null;
+  const shownEnabled = inheriting ? (effective?.enabled ?? false) : enabled;
+  const shownPolicy = (shown?.hostname_policy as DdnsPolicy) ?? policy;
+  const shownOverride = inheriting
+    ? (shown?.domain_override ?? null)
+    : domainOverride;
+  const shownTtl = inheriting
+    ? shown?.ttl == null
+      ? ""
+      : String(shown.ttl)
+    : ttlText;
+  const sourceText = !effective
+    ? "the parent block or space"
+    : effective.source === "block"
+      ? `block ${effective.source_name ?? ""}`.trim()
+      : effective.source === "space"
+        ? `space ${effective.source_name ?? ""}`.trim()
+        : "the parent block or space";
+
+  const disabled = inheriting || !shownEnabled;
 
   return (
     <div className="space-y-2">
@@ -2038,30 +2072,51 @@ export function DdnsSettingsSection({
           <Network className="h-3.5 w-3.5 text-muted-foreground" />
           <span className="text-xs font-medium">Dynamic DNS (from DHCP)</span>
         </div>
-        <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => onEnabledChange(e.target.checked)}
-            className="h-3.5 w-3.5"
-          />
-          Enabled
-        </label>
+        <div className="flex items-center gap-3">
+          {onInheritChange && (
+            <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={inherit === true}
+                onChange={(e) => onInheritChange(e.target.checked)}
+                className="h-3.5 w-3.5"
+              />
+              Inherit from parent
+            </label>
+          )}
+          <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={shownEnabled}
+              disabled={inheriting}
+              onChange={(e) => onEnabledChange(e.target.checked)}
+              className="h-3.5 w-3.5"
+            />
+            Enabled
+          </label>
+        </div>
       </div>
-      {!enabled && (
+      {inheriting && (
+        <p className="text-xs text-muted-foreground italic">
+          {effective
+            ? `Inheriting from ${sourceText}: DDNS is ${effective.enabled ? "enabled" : "disabled"}.`
+            : "Inheriting from the parent block or space."}
+        </p>
+      )}
+      {!shownEnabled && !inheriting && (
         <p className="text-xs text-muted-foreground italic">
           When enabled, DHCP leases in this subnet will publish A/AAAA + PTR
           records into the subnet's forward / reverse zones.
         </p>
       )}
-      {enabled && (
+      {shownEnabled && (
         <div className="space-y-2 pl-5 border-l-2 border-muted">
           <label className="block text-xs">
             <span className="block text-muted-foreground mb-0.5">
               Hostname policy
             </span>
             <select
-              value={policy}
+              value={shownPolicy}
               onChange={(e) => onPolicyChange(e.target.value as DdnsPolicy)}
               disabled={disabled}
               className="w-full rounded-md border bg-background px-2 py-1 text-sm disabled:opacity-60"
@@ -2078,19 +2133,21 @@ export function DdnsSettingsSection({
               <option value="disabled">disabled — no DDNS records</option>
             </select>
           </label>
-          {preview && policy !== "client_provided" && policy !== "disabled" && (
-            <p className="text-[11px] text-muted-foreground">
-              Generated names look like{" "}
-              <code className="rounded bg-muted px-1">{preview}</code>.
-            </p>
-          )}
+          {preview &&
+            shownPolicy !== "client_provided" &&
+            shownPolicy !== "disabled" && (
+              <p className="text-[11px] text-muted-foreground">
+                Generated names look like{" "}
+                <code className="rounded bg-muted px-1">{preview}</code>.
+              </p>
+            )}
           <label className="block text-xs">
             <span className="block text-muted-foreground mb-0.5">
               Domain override (optional)
             </span>
             <input
               type="text"
-              value={domainOverride ?? ""}
+              value={shownOverride ?? ""}
               onChange={(e) =>
                 onDomainOverrideChange(e.target.value.trim() || null)
               }
@@ -2110,7 +2167,7 @@ export function DdnsSettingsSection({
             <input
               type="text"
               inputMode="numeric"
-              value={ttlText}
+              value={shownTtl}
               onChange={(e) => onTtlTextChange(e.target.value)}
               placeholder="300"
               disabled={disabled}
@@ -2568,7 +2625,14 @@ export function CreateSubnetModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     null,
   );
-  // DDNS state — subnet-only, no inheritance for MVP
+  // DDNS state — a new subnet inherits unless the operator opts out (#2475)
+  const [ddnsInherit, setDdnsInherit] = useState(true);
+  const { data: effectiveDdns } = useQuery({
+    queryKey: ["effective-ddns-block", blockId],
+    queryFn: () => ipamApi.getEffectiveBlockDdns(blockId),
+    enabled: !!blockId,
+    staleTime: 30_000,
+  });
   const [ddnsEnabled, setDdnsEnabled] = useState(false);
   const [ddnsPolicy, setDdnsPolicy] = useState<DdnsPolicy>(
     "client_or_generated",
@@ -2635,6 +2699,8 @@ export function CreateSubnetModal({
       setCustomFields((prev) => ({ ...prev, ...v.customFields }));
     }
     if (v.ddns) {
+      // A template's DDNS is this subnet's own, as its DNS group is (#1304).
+      setDdnsInherit(false);
       setDdnsEnabled(v.ddns.enabled);
       setDdnsPolicy(v.ddns.policy);
       setDdnsDomainOverride(v.ddns.domainOverride);
@@ -2754,10 +2820,18 @@ export function CreateSubnetModal({
             }),
         dhcp_inherit_settings: dhcpInherit,
         ...(dhcpInherit ? {} : { dhcp_server_group_id: dhcpServerGroupId }),
-        ddns_enabled: ddnsEnabled,
-        ddns_hostname_policy: ddnsPolicy,
-        ddns_domain_override: ddnsDomainOverride,
-        ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+        // While inheriting, only the flag is sent: the form's own DDNS
+        // values are not in force, and sending ``ddns_enabled`` would read as
+        // an opt-out (#2475).
+        ddns_inherit_settings: ddnsInherit,
+        ...(ddnsInherit
+          ? {}
+          : {
+              ddns_enabled: ddnsEnabled,
+              ddns_hostname_policy: ddnsPolicy,
+              ddns_domain_override: ddnsDomainOverride,
+              ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+            }),
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
@@ -3068,6 +3142,9 @@ export function CreateSubnetModal({
 
       {tab === "ddns" && (
         <DdnsSettingsSection
+          inherit={ddnsInherit}
+          effective={effectiveDdns ?? null}
+          onInheritChange={setDdnsInherit}
           enabled={ddnsEnabled}
           policy={ddnsPolicy}
           domainOverride={ddnsDomainOverride}
@@ -3392,6 +3469,9 @@ export function AddAddressModal({
   const [reservedUntil, setReservedUntil] = useState<string>("");
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
+  // #2469 — the pre-fill below may re-pick while zones are still arriving;
+  // it stops the moment the operator chooses (None included).
+  const [dnsZoneTouched, setDnsZoneTouched] = useState(false);
   // Issue #25 — split-horizon publishing. Extra zone UUIDs to
   // publish beyond the singular primary. Only surfaced when the
   // subnet has ``dns_split_horizon`` on (effective).
@@ -3516,7 +3596,7 @@ export function AddAddressModal({
   });
   const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
-    .filter((z: DNSZone) => !z.name.toLowerCase().includes("arpa"));
+    .filter((z: DNSZone) => zoneKindForName(z.name) !== "reverse");
 
   // When the block/subnet has an explicit primary zone and/or additional
   // zones, restrict the picker to just those. Falling back to every zone in
@@ -3531,17 +3611,27 @@ export function AddAddressModal({
       ? allGroupZones.filter((z: DNSZone) => explicitZoneIds.includes(z.id))
       : allGroupZones;
 
-  // Pre-select the primary zone (dns_zone_id) or first zone when there's only one
+  // Pre-select the primary zone (dns_zone_id), or the first zone when the
+  // subnet pins no primary. The zones of a subnet can come from several DNS
+  // groups, each its own request, so the primary may arrive after another
+  // group's zones (#2469): wait for it (falling back to the first zone only
+  // once every group has answered) and re-pick when it lands, until the
+  // operator has chosen.
+  const primaryZoneId = effectiveDns?.dns_zone_id;
+  const zonesSettled = zoneQueries.every(
+    (q: { isLoading: boolean }) => !q.isLoading,
+  );
   useEffect(() => {
-    if (!dnsZoneId && availableZones.length > 0) {
-      const primary = effectiveDns?.dns_zone_id;
-      setDnsZoneId(
-        primary && availableZones.some((z: DNSZone) => z.id === primary)
-          ? primary
-          : availableZones[0].id,
-      );
-    }
-  }, [availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (dnsZoneTouched || availableZones.length === 0) return;
+    const target =
+      primaryZoneId &&
+      availableZones.some((z: DNSZone) => z.id === primaryZoneId)
+        ? primaryZoneId
+        : !primaryZoneId || zonesSettled
+          ? availableZones[0].id
+          : null;
+    if (target && target !== dnsZoneId) setDnsZoneId(target);
+  }, [availableZones.length, primaryZoneId, zonesSettled, dnsZoneTouched]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const mutation = useMutation({
     mutationFn: async (force: boolean) => {
@@ -3831,7 +3921,10 @@ export function AddAddressModal({
                 <select
                   className={inputCls}
                   value={dnsZoneId}
-                  onChange={(e) => setDnsZoneId(e.target.value)}
+                  onChange={(e) => {
+                    setDnsZoneId(e.target.value);
+                    setDnsZoneTouched(true);
+                  }}
                 >
                   <ZoneOptions
                     zones={availableZones}
@@ -4206,7 +4299,10 @@ function SyncMenu({
   onSyncAll,
   hasDhcp,
   hasDns,
+  dnsGate,
 }: {
+  // #2571 — props spread onto the DNS item when the caller may not sync it.
+  dnsGate?: { disabled?: boolean; title?: string };
   onSyncDns: () => void;
   onSyncDhcp: () => void;
   onSyncAll: () => void;
@@ -4220,7 +4316,15 @@ function SyncMenu({
       title="Sync IPAM with DNS and/or DHCP servers"
       items={[
         ...(hasDns
-          ? [{ key: "dns", label: "DNS", icon: Globe2, onSelect: onSyncDns }]
+          ? [
+              {
+                key: "dns",
+                label: "DNS",
+                icon: Globe2,
+                onSelect: onSyncDns,
+                ...dnsGate,
+              },
+            ]
           : []),
         ...(hasDhcp
           ? [
@@ -4423,6 +4527,9 @@ const NEEDS_ADDRESS_WRITE =
 const NEEDS_NMAP_WRITE = "Requires write permission on nmap scans";
 const NEEDS_ADDRESS_DELETE =
   "Requires delete permission in IPAM, and write on this subnet or on an address set in it";
+const NEEDS_DNS_SYNC =
+  "Requires read permission in IPAM and write permission on subnets";
+const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
 const NEEDS_ORPHAN_PURGE =
   "Requires delete permission in IPAM and write permission on subnets";
 
@@ -4934,6 +5041,12 @@ export function SubnetDetail({
   const canEditSubnet = perms.can("write", "subnet", subnet.id);
   const canAllocate = subnetWritable || writableSets.length > 0;
   const canScan = perms.can("write", "manage_nmap_scans");
+  // #2571 — DNS sync: the drift preview is a read on the IPAM router and the
+  // commit is write on subnets, both at the type level (a grant scoped to one
+  // subnet reaches neither, #2497).
+  const canDnsSync =
+    IPAM_GATE_TYPES.some((t) => perms.can("read", t)) && canWriteSubnets;
+  const dnsSyncGate = permissionGate(canDnsSync, NEEDS_DNS_SYNC);
   // Bulk delete and Clean Orphans are deletes: the router gate wants
   // ``delete``, the handler write on the row's subnet or address set.
   const canDeleteIpam = canDeleteInIpam(
@@ -5611,6 +5724,7 @@ export function SubnetDetail({
             <SyncMenu
               hasDhcp={dhcpOn && dhcpScopes.length > 0}
               hasDns={dnsOn}
+              dnsGate={dnsSyncGate}
               onSyncDns={() => setShowDnsSync(true)}
               onSyncDhcp={() => setShowDhcpSync(true)}
               onSyncAll={() => setShowSyncAll(true)}
@@ -5848,7 +5962,8 @@ export function SubnetDetail({
               </div>
               <button
                 onClick={() => setShowDnsSync(true)}
-                className="flex items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-900 hover:bg-amber-500/30 dark:text-amber-200"
+                {...dnsSyncGate}
+                className="flex items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-900 hover:bg-amber-500/30 disabled:cursor-not-allowed disabled:opacity-50 dark:text-amber-200"
               >
                 <Globe2 className="h-3 w-3" />
                 Open Sync DNS
@@ -7977,6 +8092,8 @@ export function EditSubnetModal({
   onDeleted?: () => void;
 }) {
   const qc = useQueryClient();
+  // #2571 — DELETE /subnets/{id} asks delete on subnets at the type level.
+  const canDeleteSubnet = usePermissions().can("delete", "subnet");
   const [name, setName] = useState(subnet.name ?? "");
   const [description, setDescription] = useState(subnet.description ?? "");
   const [gateway, setGateway] = useState(subnet.gateway ?? "");
@@ -8018,7 +8135,15 @@ export function EditSubnetModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     subnet.dhcp_server_group_id ?? null,
   );
-  // DDNS state — initialised from subnet
+  // DDNS state — initialised from subnet (#2475: inheritance is shown and kept)
+  const [ddnsInherit, setDdnsInherit] = useState(
+    subnet.ddns_inherit_settings ?? true,
+  );
+  const { data: effectiveDdns } = useQuery({
+    queryKey: ["effective-ddns-subnet", subnet.id],
+    queryFn: () => ipamApi.getEffectiveSubnetDdns(subnet.id),
+    staleTime: 30_000,
+  });
   const [ddnsEnabled, setDdnsEnabled] = useState(subnet.ddns_enabled ?? false);
   const [ddnsPolicy, setDdnsPolicy] = useState<DdnsPolicy>(
     subnet.ddns_hostname_policy ?? "client_or_generated",
@@ -8193,10 +8318,18 @@ export function EditSubnetModal({
         dns_split_horizon: dnsSplitHorizon,
         dhcp_inherit_settings: dhcpInherit,
         dhcp_server_group_id: dhcpInherit ? null : dhcpServerGroupId,
-        ddns_enabled: ddnsEnabled,
-        ddns_hostname_policy: ddnsPolicy,
-        ddns_domain_override: ddnsDomainOverride,
-        ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+        // While inheriting, only the flag is sent: the form's own DDNS
+        // values are not in force, and sending ``ddns_enabled`` would read as
+        // an opt-out (#2475).
+        ddns_inherit_settings: ddnsInherit,
+        ...(ddnsInherit
+          ? {}
+          : {
+              ddns_enabled: ddnsEnabled,
+              ddns_hostname_policy: ddnsPolicy,
+              ddns_domain_override: ddnsDomainOverride,
+              ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+            }),
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
@@ -8564,6 +8697,9 @@ export function EditSubnetModal({
 
       {tab === "ddns" && (
         <DdnsSettingsSection
+          inherit={ddnsInherit}
+          effective={effectiveDdns ?? null}
+          onInheritChange={setDdnsInherit}
           enabled={ddnsEnabled}
           policy={ddnsPolicy}
           domainOverride={ddnsDomainOverride}
@@ -8661,7 +8797,8 @@ export function EditSubnetModal({
           </p>
           <button
             onClick={() => setDeleteStep(1)}
-            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+            {...permissionGate(canDeleteSubnet, NEEDS_SUBNET_DELETE)}
+            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Delete this subnet…
           </button>
@@ -9200,7 +9337,7 @@ export function EditAddressModal({
   });
   const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
-    .filter((z: DNSZone) => !z.name.toLowerCase().includes("arpa"));
+    .filter((z: DNSZone) => zoneKindForName(z.name) !== "reverse");
 
   // When the block/subnet has an explicit primary zone and/or additional
   // zones, restrict the picker to just those. Falling back to every zone in
@@ -9215,6 +9352,43 @@ export function EditAddressModal({
       ? allGroupZones.filter((z: DNSZone) => explicitZoneIds.includes(z.id))
       : allGroupZones;
 
+  // #2468 — the zone the record is in need not be one the subnet lists any
+  // more (update_subnet re-syncs no address). Look it up among every group's
+  // zones, so the dialog names where the record really is instead of "None"
+  // or another zone. Only fetched when the stored zone is missing from the
+  // picker, and only once the subnet's own zones have answered.
+  const storedZoneId = address.forward_zone_id;
+  const subnetZonesSettled = zoneQueries.every(
+    (q: { isLoading: boolean }) => !q.isLoading,
+  );
+  const storedZoneMissing =
+    !!storedZoneId &&
+    dnsOn &&
+    subnetZonesSettled &&
+    !availableZones.some((z: DNSZone) => z.id === storedZoneId);
+  const { data: lookupGroups = [] } = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: dnsApi.listGroups,
+    enabled: storedZoneMissing,
+    staleTime: 60_000,
+  });
+  const lookupQueries = useQueries({
+    queries: lookupGroups.map((g: { id: string }) => ({
+      queryKey: ["dns-zones", g.id],
+      queryFn: () => dnsApi.listZones(g.id),
+      staleTime: 60_000,
+      enabled: storedZoneMissing,
+    })),
+  });
+  const storedExtraZone: DNSZone | undefined = storedZoneMissing
+    ? lookupQueries
+        .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
+        .find((z: DNSZone) => z.id === storedZoneId)
+    : undefined;
+  const pickerZones: DNSZone[] = storedExtraZone
+    ? [...availableZones, storedExtraZone]
+    : availableZones;
+
   // Pre-select the IP's *current* forward zone — NOT the subnet's primary.
   // Defaulting to the primary meant a no-op (or hostname-only) Save re-homed
   // the A/AAAA record into the primary zone, silently moving it off an
@@ -9222,15 +9396,15 @@ export function EditAddressModal({
   // stays on the "None" option so an unrelated edit doesn't fabricate a
   // record; the operator can still pick a zone explicitly to add one.
   useEffect(() => {
-    if (!dnsZoneId && availableZones.length > 0) {
+    if (!dnsZoneId && pickerZones.length > 0) {
       const current = address.forward_zone_id;
-      if (current && availableZones.some((z: DNSZone) => z.id === current)) {
+      if (current && pickerZones.some((z: DNSZone) => z.id === current)) {
         setDnsZoneId(current);
       }
     }
-  }, [availableZones.length, address.forward_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pickerZones.length, address.forward_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const selectedZone = availableZones.find((z: DNSZone) => z.id === dnsZoneId);
+  const selectedZone = pickerZones.find((z: DNSZone) => z.id === dnsZoneId);
   const fqdnPreview =
     hostname && selectedZone
       ? `${hostname}.${selectedZone.name.replace(/\.$/, "")}`
@@ -9399,12 +9573,12 @@ export function EditAddressModal({
             availableZones.length > 0 && <GatewayHostnameNote />}
         </Field>
         {/* DNS zone — only shown when zones are available */}
-        {availableZones.length > 0 && (
+        {pickerZones.length > 0 && (
           <Field label="DNS Zone">
-            {availableZones.length === 1 ? (
+            {pickerZones.length === 1 ? (
               <p className="text-xs text-muted-foreground py-1">
                 <Globe2 className="inline h-3 w-3 mr-1" />
-                {availableZones[0].name.replace(/\.$/, "")}
+                {pickerZones[0].name.replace(/\.$/, "")}
                 {fqdnPreview && (
                   <span className="ml-2 font-mono text-emerald-600 dark:text-emerald-400">
                     → {fqdnPreview}
@@ -9427,6 +9601,11 @@ export function EditAddressModal({
                     additionalIds={effectiveDns?.dns_additional_zone_ids ?? []}
                     noneOption="None (remove DNS record)"
                   />
+                  {storedExtraZone && (
+                    <option value={storedExtraZone.id}>
+                      {`${storedExtraZone.name.replace(/\.$/, "")} (current — not among this subnet's zones)`}
+                    </option>
+                  )}
                 </select>
                 {fqdnPreview && (
                   <p className="text-xs font-mono text-emerald-600 dark:text-emerald-400">
@@ -10494,7 +10673,7 @@ function BulkEditAddressesModal({
   });
   const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
-    .filter((z: DNSZone) => !z.name.toLowerCase().includes("arpa"));
+    .filter((z: DNSZone) => zoneKindForName(z.name) !== "reverse");
   const explicitZoneIds = [
     ...(effectiveDns?.dns_zone_id ? [effectiveDns.dns_zone_id] : []),
     ...(effectiveDns?.dns_additional_zone_ids ?? []),
@@ -12709,6 +12888,9 @@ export function EditBlockModal({
           onZoneIdChange={setDnsZoneId}
           onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
           parentBlockId={block.parent_block_id}
+          // A top-level block inherits from its space (#2477), as its DHCP
+          // tab and New IP Block already do.
+          fallbackSpaceId={!block.parent_block_id ? block.space_id : undefined}
         />
       )}
 

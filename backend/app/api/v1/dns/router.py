@@ -186,6 +186,7 @@ from app.services.dns.server_move import (
     CATALOG_UNSUPPORTED_DRIVERS,
     ServerMoveError,
     catalog_unsupported_message,
+    elect_primary,
     ensure_group_catalog_compatible,
     ensure_group_single_driver,
     lock_server_row,
@@ -2318,10 +2319,12 @@ async def create_server(
         # ``# TODO: encrypt`` marker.
         data["api_key_encrypted"] = encrypt_str(body.api_key)
 
-    # Auto-mark this server as primary if the group has no primary yet.
-    # Prevents the footgun where a freshly-created group has zero primaries
-    # and `enqueue_record_op` silently drops every write targeting its zones.
-    # Admins can still flip the flag later via PUT; this only fires on create.
+    # Auto-mark this server as primary if the group has no primary yet, so a
+    # freshly-created group has one from the start. (A group without one no
+    # longer drops writes — ``resolve_primary_server`` falls back to the
+    # election's pick and the beat sweep stamps it, #2276 — but the paths that
+    # read the flag directly, catalog producer and DNSSEC reporter among them,
+    # still want it set.) Admins can move it later via PUT.
     has_primary = await db.execute(
         select(DNSServer).where(DNSServer.group_id == group_id, DNSServer.is_primary.is_(True))
     )
@@ -2580,11 +2583,11 @@ async def update_server(
             )
             server.is_primary = True
         else:
-            # Clearing the LAST primary re-creates the footgun create-time
-            # auto-election exists to prevent: ``enqueue_record_op`` drops
-            # every write to the group's zones with only a log line — no
-            # error reaches whoever made the change. Promote a replacement
-            # instead; that demotes this one as a side effect.
+            # Clearing the LAST primary would not stick: since #2276 the
+            # write path stands in the election's pick and the 60 s beat
+            # sweep re-stamps the flag — very likely on this same server, the
+            # oldest. Refuse, and point at the operation that does what the
+            # operator means: promote a replacement, which demotes this one.
             others = await db.execute(
                 select(DNSServer.id)
                 .where(
@@ -2598,10 +2601,10 @@ async def update_server(
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "This is the only primary in its group; clearing it would "
-                        "silently drop every DNS record write to the group's zones. "
-                        "Mark another server in the group as primary instead — that "
-                        "demotes this one."
+                        "This is the only primary in its group, and a group without "
+                        "one has a primary re-elected automatically within a minute, "
+                        "so clearing it would not stick. Mark another server in the "
+                        "group as primary instead — that demotes this one."
                     ),
                 )
             server.is_primary = False
@@ -2632,6 +2635,12 @@ async def delete_server(
     group_id: uuid.UUID, server_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> None:
     server = await _require_server(group_id, server_id, db)
+    # #2276 — deleting the primary elects a successor in the same transaction,
+    # the way the #934 move does. A group left without one used to drop every
+    # later record write before the agent fan-out, behind a 200.
+    successor = None
+    if server.is_primary:
+        successor = await elect_primary(db, server.group_id, exclude_id=server.id)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -2641,6 +2650,11 @@ async def delete_server(
             resource_type="dns_server",
             resource_id=str(server.id),
             resource_display=server.name,
+            new_value=(
+                {"primary_elected": str(successor.id), "primary_elected_name": successor.name}
+                if successor is not None
+                else None
+            ),
             result="success",
         )
     )
@@ -7211,14 +7225,12 @@ async def rollover_zone_dnssec_key(
         {"name": "@", "type": "DNSSEC_OP", "key_tag": body.key_tag},
     )
     if op is None:
-        # #1946 — no row was written (no primary, or no enabled agent-based
-        # server): answering ``queued`` would claim a rollover nobody runs.
+        # #1946 — no row was written (no servers in the group, or no enabled
+        # agent-based server; a missing primary flag no longer stops it,
+        # #2276): answering ``queued`` would claim a rollover nobody runs.
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Nothing to run the rollover: the group has no primary server "
-                "or no enabled agent-based server"
-            ),
+            detail=("Nothing to run the rollover: the group has no enabled " "agent-based server"),
         )
     db.add(
         AuditLog(
@@ -8852,7 +8864,10 @@ async def bulk_delete_records(
             skipped.append(
                 {
                     "record_id": str(rec.id),
-                    "reason": "no primary configured for zone — wire delete skipped",
+                    "reason": (
+                        "no enabled server in the zone's group to send it to — "
+                        "wire delete skipped"
+                    ),
                 }
             )
             continue
