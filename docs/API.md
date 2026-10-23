@@ -386,6 +386,8 @@ Two narrowing mechanisms apply, both enforced in `deps.py`
   list means no scope restriction. A non-empty list is checked against
   the request method + path; a request matching none of the token's
   scopes returns `401 "Token scope insufficient for this request"`.
+  Path prefixes match on a whole segment: `dns:write` covers
+  `/api/v1/dns/...` but not `/api/v1/dnsbl/...` or `/api/v1/dns-threat/...`.
   `read` permits only safe methods (`GET` / `HEAD` / `OPTIONS`) — plus
   a JSON-RPC `POST` to the read-only MCP endpoint.
 - **Per-resource grants** (`resource_grants: [...]`) — bind a token to a
