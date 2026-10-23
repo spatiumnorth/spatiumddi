@@ -1920,6 +1920,8 @@ confirmation gates and pg advisory locks held through commit:
   unallocated CIDRs of the requested prefix length. Optional
   `parent_block_id` scope (Find Free… on the block detail
   pre-restricts to that block) and a `min_free_addresses` filter.
+  Each candidate carries `free_addresses` (its usable host count, as
+  the subnet would hold) and the filter compares against it.
   Service layer in `app.services.ipam.free_space`.
 
 - `POST /ipam/subnets/{id}/split/preview` + `/commit` — break a
