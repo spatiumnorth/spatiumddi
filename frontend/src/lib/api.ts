@@ -9780,6 +9780,8 @@ export interface DHCPClientClass {
   // each option to whichever family it is valid in.
   address_family: "ipv4" | "ipv6" | "dual";
   options: Record<string, unknown>;
+  // #2296 — a row stored before its name became reserved; rename it.
+  reserved_name?: boolean;
   created_at: string;
   modified_at: string;
 }

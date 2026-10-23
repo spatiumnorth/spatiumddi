@@ -1383,11 +1383,15 @@ def render(
     # MAC blocklist — render as Kea's reserved ``DROP`` class. Any packet
     # whose hardware address matches the OR-ed expression is silently
     # dropped before allocation. ``DROP`` is a Kea built-in name, not
-    # something the operator can reuse — so if a user-defined class is
-    # already named ``DROP`` we skip blocklist rendering to avoid
-    # clobbering it (defensive; the API already reserves the name).
+    # something the operator can reuse. The API refuses the name since #2296,
+    # but a class stored before that may still carry it: it keeps rendering
+    # (an existing bundle must not break) and the blocklist is skipped so it
+    # is not clobbered, which is loud here because it leaves the blocklist
+    # unenforced.
     drop_expr = _build_drop_expression(bundle.get("mac_blocks") or [])
-    if drop_expr and not any(c.get("name") == "DROP" for c in rendered_classes):
+    if drop_expr and any(c.get("name") == "DROP" for c in rendered_classes):
+        _log.warning("mac_blocklist_shadowed_by_drop_class")
+    elif drop_expr:
         rendered_classes.append({"name": "DROP", "test": drop_expr})
 
     if rendered_classes:
