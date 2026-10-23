@@ -91,6 +91,7 @@ from app.services.dns.row_locks import ids_in, lock_ops
 from app.services.dns.rrset import RRSET_OPS
 from app.services.dns.soa_timers import served_soa_timers
 from app.services.dns.tsig import (
+    dedupe_tsig_keys,
     legacy_group_key,
     resolve_group_transfer_key,
     transfer_needs_tsig,
@@ -1207,6 +1208,10 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             # otherwise fail. Operator visibility is via the audit log.
             continue
         tsig_keys.append({"name": k.name, "secret": secret, "algorithm": k.algorithm})
+    # A stored operator key that duplicates another name (the legacy group
+    # key, or ``foo`` vs ``foo.``) would render two ``key {}`` statements and
+    # stop the whole group converging (#2295). One survives, deterministically.
+    tsig_keys = dedupe_tsig_keys(tsig_keys)
 
     # The DNS group's ``is_recursive=False`` is the high-level authoritative-only
     # intent (§4.9 DNS safety); it MUST force ``recursion no;`` regardless of the

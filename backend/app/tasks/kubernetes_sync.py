@@ -3,7 +3,7 @@
 Fires every 30 s from Celery Beat — the cluster-level minimum interval.
 Iterates every enabled ``KubernetesCluster`` and runs the per-cluster
 reconciler when its individual ``sync_interval_seconds`` has elapsed.
-Gated overall by ``PlatformSettings.integration_kubernetes_enabled`` so
+Gated overall by the ``integrations.kubernetes`` feature module (#2196) so
 flipping the global toggle off pauses all clusters without touching
 their rows.
 
@@ -25,13 +25,11 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.db import task_connect_args
 from app.models.kubernetes import KubernetesCluster
-from app.models.settings import PlatformSettings
+from app.services.feature_modules import is_module_enabled
 from app.services.integration_sync_failure import record_sync_crash
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
-
-_PLATFORM_SINGLETON_ID = 1
 
 
 async def _run_sweep() -> dict[str, Any]:
@@ -48,8 +46,7 @@ async def _run_sweep() -> dict[str, Any]:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
-            ps = await db.get(PlatformSettings, _PLATFORM_SINGLETON_ID)
-            if ps is None or not ps.integration_kubernetes_enabled:
+            if not await is_module_enabled(db, "integrations.kubernetes"):
                 return {"status": "disabled"}
 
             rows = (

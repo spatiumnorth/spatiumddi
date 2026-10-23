@@ -1064,9 +1064,22 @@ ip_allocation_strategy: str (default "sequential")  -- sequential | random
 **Session / security**
 
 ```
-session_timeout_minutes: int (default 60)
-auto_logout_minutes: int (default 0)  -- idle session timeout; 0 = disabled
+session_timeout_minutes: int (default 60)  -- idle session timeout; 0 = disabled
+auto_logout_minutes: int (default 0)       -- console warning before it; 0 = disabled
 ```
+
+`session_timeout_minutes` is enforced by the API: a browser session
+(`user_session`) whose last activity is older than the timeout is refused
+on its next request and on `/auth/refresh`, and is left out of the
+Sessions list. Activity is `user_session.last_seen_at`. A refresh carries
+it forward rather than counting as activity, and the console sends
+`X-Spatium-Idle-Seconds` (time since the operator last used the page) on
+every request, so background polling does not keep a session alive. The
+check allows up to a minute (a quarter of the timeout, if shorter) past
+the configured value, never less. API tokens are not sessions and are not
+affected. The console shows the warning `auto_logout_minutes` before
+expiry, capped at half the timeout, and returns to the login page when
+the timeout passes.
 
 **Password policy** (issue #70 — flat columns, not a JSONB blob; validator + history in `app.services.password_policy`)
 
@@ -1139,7 +1152,7 @@ maintenance_message: str (default "")
 maintenance_started_at: timestamp | null  -- server-stamped on enable, never operator-set directly
 ```
 
-Other notable areas on the model (each a small cluster of columns): integration toggles (`integration_kubernetes_enabled`, `integration_docker_enabled`, …), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled` — changes via the Tool Catalog are audited as an enabled/disabled diff, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
+Other notable areas on the model (each a small cluster of columns): a derived copy of each integration's on/off state (`integration_kubernetes_enabled`, `integration_docker_enabled`, …; the `integrations.*` feature module is the switch, #2196), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled` — changes via the Tool Catalog are audited as an enabled/disabled diff, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
 
 ---
 

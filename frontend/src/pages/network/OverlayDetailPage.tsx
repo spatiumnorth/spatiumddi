@@ -33,6 +33,7 @@ import {
   type SimulatedSiteResolution,
   type SimulateResponse,
 } from "@/lib/api";
+import { formatApiError } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
@@ -474,14 +475,31 @@ function SitesTab({ overlayId }: { overlayId: string }) {
       <ConfirmModal
         open={confirmDetachId !== null}
         title="Detach site"
-        message="Detach this site from the overlay?"
+        loading={detach.isPending}
+        message={
+          <>
+            Detach this site from the overlay?
+            {detach.isError && (
+              <span role="alert" className="mt-2 block text-destructive">
+                Could not detach the site:{" "}
+                {formatApiError(detach.error, "the request failed")}
+              </span>
+            )}
+          </>
+        }
         confirmLabel="Detach"
         tone="destructive"
         onConfirm={() => {
-          if (confirmDetachId) detach.mutate(confirmDetachId);
+          // Stays open on a refusal, so it never reads as having worked.
+          if (confirmDetachId)
+            detach.mutate(confirmDetachId, {
+              onSuccess: () => setConfirmDetachId(null),
+            });
+        }}
+        onClose={() => {
+          detach.reset();
           setConfirmDetachId(null);
         }}
-        onClose={() => setConfirmDetachId(null)}
       />
     </div>
   );

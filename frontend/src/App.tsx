@@ -101,7 +101,7 @@ import { NotFoundPage } from "@/pages/NotFoundPage";
 import { useAuth } from "@/hooks/useAuth";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated, bootstrapping } = useAuth();
+  const { isAuthenticated, bootstrapping, mustChangePassword } = useAuth();
   // On a full page reload the in-memory access token is gone; the app runs
   // one silent /auth/refresh against the HttpOnly cookie (#484). Render a
   // loader until it resolves so a real session isn't bounced to /login.
@@ -112,7 +112,12 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
       </div>
     );
   }
-  return isAuthenticated ? <>{children}</> : <Navigate to="/login" replace />;
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  // A user who must change their password gets Change Password on a reload
+  // or a typed URL as on the login form, not a console whose every read the
+  // server refuses (#2440). /change-password is not itself protected.
+  if (mustChangePassword) return <Navigate to="/change-password" replace />;
+  return <>{children}</>;
 }
 
 // Network device ids are UUIDs (`network_device.id`).
