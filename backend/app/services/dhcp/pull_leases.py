@@ -62,7 +62,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dns_names import sanitize_hostname
@@ -139,9 +140,82 @@ class PullLeasesResult:
     # the caller publishes an agent wake for them AFTER its commit so the
     # records converge instantly instead of on the agent's safety tick.
     dns_wake_group_ids: set[str] = field(default_factory=set)
+    # #2262 — another pull of this server (the scheduled task or a manual
+    # Sync) holds its lock, so this one did nothing. Not an error: the other
+    # pull is doing the work.
+    busy: bool = False
+    # #2262 — surplus ``dhcp_lease`` rows for one address deleted by this pull
+    # (left behind by overlapping pulls before they were serialised).
+    duplicates_removed: int = 0
+
+
+# #2262 — namespace for the per-server lease-pull advisory lock. The second key
+# is hashtext(server_id); this int keeps the keyspace apart from the other
+# two-int advisory locks in the app.
+_PULL_LOCK_NS = 0x2262_D4C9
+
+
+async def _try_lock_server(db: AsyncSession, server: DHCPServer) -> bool:
+    """Take the per-server pull lock for the rest of the caller's transaction.
+
+    Transaction-scoped, so it is released by the caller's COMMIT (or
+    ROLLBACK): exactly when this pull's writes become visible to the next
+    one. The scheduled task and ``POST /dhcp/servers/{id}/sync-leases`` both
+    come through here, so they serialise against each other as well as
+    against themselves.
+    """
+    return bool(
+        await db.scalar(
+            text("SELECT pg_try_advisory_xact_lock(:ns, hashtext(:sid))"),
+            {"ns": _PULL_LOCK_NS, "sid": str(server.id)},
+        )
+    )
+
+
+_SYNC_ERROR_MAX = 2000
+_SYNC_ERROR_SHOWN = 3
+
+
+def _summarise_errors(errors: list[str]) -> str:
+    """Concise, bounded one-liner naming the failing parts (first few errors)."""
+    shown = "; ".join(errors[:_SYNC_ERROR_SHOWN])
+    if len(errors) > _SYNC_ERROR_SHOWN:
+        shown += f" (+{len(errors) - _SYNC_ERROR_SHOWN} more)"
+    return shown[:_SYNC_ERROR_MAX]
 
 
 async def pull_leases_from_server(
+    db: AsyncSession,
+    server: DHCPServer,
+    *,
+    apply: bool = True,
+) -> PullLeasesResult:
+    """Pull leases, then record the outcome on the server row (#2306).
+
+    Single place for both callers (scheduled task + manual Sync leases). A
+    pull that returns any ``result.errors`` is FAILING — including a partial
+    one (scopes read but the lease read failed, or one scope's enumeration
+    failed); the summary names the failing parts. Only a clean pull clears
+    ``last_sync_error``. Agent-based drivers are not applicable and untouched.
+
+    A ``busy`` result (#2262) records nothing: this call did no pull, so it
+    has no outcome to report, and the pass that holds the server records its
+    own. Writing the row here would also wait on that pass's row lock, so a
+    manual Sync that should answer 409 at once would hang until it finished.
+    """
+    result = await _pull_leases_core(db, server, apply=apply)
+    if apply and not result.busy and is_agentless(server.driver):
+        if result.errors:
+            server.last_sync_error = _summarise_errors(result.errors)
+            server.last_sync_error_at = datetime.now(UTC)
+        else:
+            server.last_sync_error = None
+            server.last_sync_error_at = None
+        await db.flush()
+    return result
+
+
+async def _pull_leases_core(
     db: AsyncSession,
     server: DHCPServer,
     *,
@@ -168,6 +242,14 @@ async def pull_leases_from_server(
         driver = get_driver(server.driver)
     except ValueError as exc:
         result.errors.append(str(exc))
+        return result
+
+    # #2262 — one pull per server at a time. Two overlapping pulls both saw a
+    # new lease as absent and both inserted it; every later pull then failed
+    # on that address. A dry run writes nothing and needs no lock.
+    if apply and not await _try_lock_server(db, server):
+        result.busy = True
+        logger.info("dhcp_pull_leases_server_busy", server=str(server.id))
         return result
 
     subnets = await _load_subnet_cache(db)
@@ -265,28 +347,61 @@ async def pull_leases_from_server(
         containing = _find_containing_subnet(ip, subnets, preferred_subnet_ids=preferred_subnet_ids)
         scope_id = scope_cache.get(containing.id) if containing else None
 
-        existing = (
-            await db.execute(
-                select(DHCPLease).where(
-                    DHCPLease.server_id == server.id,
-                    DHCPLease.ip_address == ip,
+        # #2262 — every row for the address, newest first. This path keeps one
+        # row per address, but overlapping pulls from before it was serialised
+        # left installs with two; ``scalar_one_or_none`` raised on those and
+        # aborted the server's pull on every tick. Keep the newest, drop the
+        # rest (the kept row still holds the address, so no mirror or DDNS
+        # teardown).
+        rows = list(
+            (
+                await db.execute(
+                    select(DHCPLease)
+                    .where(
+                        DHCPLease.server_id == server.id,
+                        DHCPLease.ip_address == ip,
+                    )
+                    .order_by(DHCPLease.last_seen_at.desc(), DHCPLease.id.desc())
                 )
             )
-        ).scalar_one_or_none()
+            .scalars()
+            .all()
+        )
+        existing = rows[0] if rows else None
+        if apply and len(rows) > 1:
+            for extra in rows[1:]:
+                await db.delete(extra)
+            # Flushed now: the unit of work orders UPDATEs before DELETEs, so
+            # the MAC refresh below could otherwise collide with a surplus row
+            # carrying the new MAC on the identity index.
+            await db.flush()
+            result.duplicates_removed += len(rows) - 1
+            logger.info(
+                "dhcp_pull_leases_duplicates_removed",
+                server=str(server.id),
+                ip=ip,
+                removed=len(rows) - 1,
+            )
 
         if existing is None:
             if apply:
-                db.add(
-                    DHCPLease(
-                        server_id=server.id,
-                        scope_id=scope_id,
-                        ip_address=ip,
-                        mac_address=mac,
-                        hostname=lease.get("hostname"),
-                        client_id=lease.get("client_id"),
-                        state="active",
-                        expires_at=lease.get("expires_at"),
-                        last_seen_at=now,
+                # #2262 — an upsert on the lease identity, so a pull racing a
+                # writer the lock does not cover still lands one row.
+                fields = {
+                    "scope_id": scope_id,
+                    "hostname": lease.get("hostname"),
+                    "client_id": lease.get("client_id"),
+                    "state": "active",
+                    "expires_at": lease.get("expires_at"),
+                    "last_seen_at": now,
+                }
+                await db.execute(
+                    pg_insert(DHCPLease)
+                    .values(server_id=server.id, ip_address=ip, mac_address=mac, **fields)
+                    .on_conflict_do_update(
+                        index_elements=["server_id", "ip_address", "mac_address"],
+                        index_where=DHCPLease.duid.is_(None),
+                        set_=fields,
                     )
                 )
             result.imported += 1

@@ -156,12 +156,20 @@ REAL_TOKENS = [
 ]
 
 
-@pytest.mark.parametrize(("label", "model", "field", "token"), REAL_TOKENS)
+# ids= keeps the token out of the test node id: node ids are written to
+# backend/.test_durations, and a token-shaped id there trips secret scanning.
+@pytest.mark.parametrize(
+    ("label", "model", "field", "token"), REAL_TOKENS, ids=[r[0] for r in REAL_TOKENS]
+)
 def test_real_tokens_pass_unchanged(label: str, model: type, field: str, token: str) -> None:
     assert getattr(model(**{field: token}), field) == token, label
 
 
-@pytest.mark.parametrize(("label", "model", "field", "token"), REAL_TOKENS)
+# ids= keeps the token out of the test node id: node ids are written to
+# backend/.test_durations, and a token-shaped id there trips secret scanning.
+@pytest.mark.parametrize(
+    ("label", "model", "field", "token"), REAL_TOKENS, ids=[r[0] for r in REAL_TOKENS]
+)
 def test_surrounding_whitespace_is_stripped_not_refused(
     label: str, model: type, field: str, token: str
 ) -> None:
