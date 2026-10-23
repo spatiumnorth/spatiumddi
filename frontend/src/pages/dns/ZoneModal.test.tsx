@@ -21,6 +21,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import userEvent from "@testing-library/user-event";
 import type { DNSZone } from "@/lib/api";
 import { zoneKindForName } from "@/lib/dnsNames";
 
@@ -346,5 +347,45 @@ describe("zoneKindForName", () => {
     ["", "forward"],
   ])("%s → %s", (name, kind) => {
     expect(zoneKindForName(name)).toBe(kind);
+  });
+});
+
+describe("Sub-zone's pre-filled name takes the label at the start (#2464)", () => {
+  it("typing a label where the focus lands makes <label>.<parent>", async () => {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ZoneModal
+          groupId="grp-1"
+          views={[]}
+          initialName=".parent.example.com"
+          onClose={() => {}}
+        />
+      </QueryClientProvider>,
+    );
+    const input = control("Zone Name (FQDN)") as HTMLInputElement;
+    expect(document.activeElement).toBe(input);
+    await userEvent.keyboard("xp");
+    expect(input.value).toBe("xp.parent.example.com");
+  });
+
+  it("a pre-fill that is not a leading-dot suffix is left alone", () => {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ZoneModal
+          groupId="grp-1"
+          views={[]}
+          initialName="corp.example.com"
+          onClose={() => {}}
+        />
+      </QueryClientProvider>,
+    );
+    const input = control("Zone Name (FQDN)") as HTMLInputElement;
+    expect(input.selectionStart).toBe(input.value.length);
   });
 });

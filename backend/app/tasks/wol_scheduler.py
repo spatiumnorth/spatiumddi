@@ -79,6 +79,7 @@ from app.services.wol_scheduler.verify import (
     auto_stagger_ms,
     verify_run_targets,
 )
+from app.tasks.module_gate import module_gated
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -1107,6 +1108,7 @@ async def _sweep() -> dict[str, int]:
 
 
 @celery_app.task(name="app.tasks.wol_scheduler.sweep_wol_schedules")
+@module_gated("tools.wake_scheduler")
 def sweep_wol_schedules() -> dict[str, int]:
     result = asyncio.run(_sweep())
     if (

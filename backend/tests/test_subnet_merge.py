@@ -269,3 +269,61 @@ async def test_endpoint_smoke(client: AsyncClient, db_session: AsyncSession) -> 
     body = resp.json()
     assert body["merged_subnet"]["network"] == "10.0.0.0/24"
     assert sorted(body["deleted_subnet_ids"]) == sorted([str(a.id), str(b.id)])
+
+
+_FLAGS = dict(
+    pci_scope=True,
+    hipaa_scope=True,
+    internet_facing=True,
+    subnet_role="management",
+    do_not_probe=True,
+    discovery_enabled=True,
+)
+
+
+@pytest.mark.asyncio
+async def test_merge_of_agreeing_sources_keeps_settings(db_session: AsyncSession) -> None:
+    """#2414: a merge of two sources that agree keeps their settings."""
+    a, b = await _make_pair(db_session)
+    for s in (a, b):
+        for k, v in _FLAGS.items():
+            setattr(s, k, v)
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    assert preview.conflicts == []
+    result = await commit_subnet_merge(db_session, a, [b.id], confirm_cidr="10.0.0.0/24")
+    for k, v in _FLAGS.items():
+        assert getattr(result.merged_subnet, k) == v, k
+
+
+@pytest.mark.asyncio
+async def test_merge_unions_compliance_flags_and_previews_it(db_session: AsyncSession) -> None:
+    """#2414: PCI on one source only -> merged is PCI, preview says so."""
+    a, b = await _make_pair(db_session)
+    b.pci_scope = True
+    b.do_not_probe = True
+    b.do_not_probe_reason = "fragile"
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    assert preview.conflicts == []
+    assert any("pci_scope" in w for w in preview.warnings)
+    assert any("do_not_probe" in w for w in preview.warnings)
+    result = await commit_subnet_merge(db_session, a, [b.id], confirm_cidr="10.0.0.0/24")
+    assert result.merged_subnet.pci_scope is True
+    assert result.merged_subnet.do_not_probe is True
+    assert result.merged_subnet.do_not_probe_reason == "fragile"
+    assert result.merged_subnet.hipaa_scope is False
+
+
+@pytest.mark.asyncio
+async def test_merge_site_disagreement_is_a_conflict(db_session: AsyncSession) -> None:
+    """#2414: sources in different kinds/sites are refused, not silently picked."""
+    a, b = await _make_pair(db_session)
+    a.subnet_role = "management"
+    b.discovery_interval_minutes = 99
+    b.kind = "multicast"
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    assert any(c.type == "metadata_mismatch:kind" for c in preview.conflicts)
+    assert any("subnet_role" in w for w in preview.warnings)
+    assert any("discovery_interval_minutes" in w for w in preview.warnings)

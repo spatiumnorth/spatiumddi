@@ -475,6 +475,7 @@ async def commit_move(
         )
 
     # ── Apply the rewrite ──────────────────────────────────────────────────
+    old_parent_id = moved_block.parent_block_id
     # 1. Moved block itself.
     moved_block.space_id = uuid.UUID(plan.target_space_id)
     moved_block.parent_block_id = (
@@ -510,6 +511,15 @@ async def commit_move(
         )
 
     await db.flush()
+
+    # The subtree left its old parent chain and joined the new one: both
+    # rollups (and the moved block's own) are stale until recomputed (#2412).
+    # Lazy import: the router imports this module.
+    from app.api.v1.ipam.router import _update_block_utilization  # noqa: PLC0415
+
+    if old_parent_id is not None:
+        await _update_block_utilization(db, old_parent_id)
+    await _update_block_utilization(db, moved_block.id)
 
     return MoveResult(
         block_id=plan.block_id,
