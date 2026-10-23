@@ -4152,11 +4152,23 @@ async def delete_appliance(
     if dependents.dns or dependents.dhcp:
         from app.models.dhcp import DHCPServer  # noqa: PLC0415
         from app.models.dns import DNSServer  # noqa: PLC0415
+        from app.services.dns.server_move import elect_primary  # noqa: PLC0415
 
+        lost_primary: set[uuid.UUID] = set()
         for d in dependents.dns:
             dns_server = await db.get(DNSServer, d.id)
             if dns_server is not None:
+                if dns_server.is_primary:
+                    lost_primary.add(dns_server.group_id)
                 await db.delete(dns_server)
+        if lost_primary:
+            # #2276 — a group whose primary went with the appliance elects a
+            # successor among its remaining servers, or every later record
+            # write to its zones resolves against no primary. Flushed first so
+            # the election cannot pick a server being deleted here.
+            await db.flush()
+            for group_id in lost_primary:
+                await elect_primary(db, group_id, exclude_id=None)
         for d in dependents.dhcp:
             dhcp_server = await db.get(DHCPServer, d.id)
             if dhcp_server is not None:
