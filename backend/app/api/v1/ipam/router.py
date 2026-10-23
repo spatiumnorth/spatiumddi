@@ -6694,8 +6694,13 @@ async def update_subnet(
     # If vlan_ref_id is being set, derive/validate the integer vlan_id tag.
     if "vlan_ref_id" in body.model_fields_set:
         if body.vlan_ref_id is None:
-            # Clearing the FK — leave vlan_id alone unless caller also sent it
-            pass
+            # Clearing the FK (#2474). The integer tag was derived from the
+            # referenced VLAN, so it goes with it — unless the caller also
+            # sent a vlan_id of its own, or the subnet had no reference (a
+            # hand-typed legacy tag must survive an untouched save).
+            if subnet.vlan_ref_id is not None and "vlan_id" not in body.model_fields_set:
+                body.vlan_id = None
+                body.model_fields_set.add("vlan_id")
         else:
             vlan_obj = await db.get(VLAN, body.vlan_ref_id)
             if vlan_obj is None:
@@ -6759,6 +6764,11 @@ async def update_subnet(
         "ddns_domain_override",
         "ddns_ttl",
         "show_free_ranges",  # #2137 — null restores the default
+        # #2474 — the Edit dialog's "clear" for these three sends null.
+        "vxlan_id",
+        "subnet_role",
+        "vlan_ref_id",
+        "vlan_id",
     }
     changes = body.model_dump(exclude_none=True, exclude=exclude_fields)
     changes_for_audit = body.model_dump(mode="json", exclude_none=True, exclude=exclude_fields)
@@ -6809,6 +6819,10 @@ async def update_subnet(
         "ddns_domain_override",
         "ddns_ttl",
         "show_free_ranges",
+        "vxlan_id",
+        "subnet_role",
+        "vlan_ref_id",
+        "vlan_id",
     ):
         if _field in body.model_fields_set:
             _val = getattr(body, _field)
