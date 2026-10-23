@@ -591,6 +591,11 @@ describe("Add IP dialog", () => {
 
 describe("Subnet detail", () => {
   function subnetDetail() {
+    // #2571 — Sync > DNS is gated on permissions; this control is about the
+    // module being on, so sign in as a superadmin.
+    answer("authApi", "myPermissions", () =>
+      Promise.resolve({ is_superadmin: true, grants: [] }),
+    );
     answer("ipamApi", "listAddresses", () =>
       Promise.resolve([address({ id: "ip-1" })]),
     );
