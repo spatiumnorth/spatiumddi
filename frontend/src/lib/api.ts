@@ -8411,6 +8411,10 @@ export interface DHCPServer {
   roles: string[];
   status: string;
   last_sync_at: string | null;
+  /** Why the last scheduled lease pull failed (agentless drivers); null
+   * once a pull succeeds. */
+  last_sync_error?: string | null;
+  last_sync_error_at?: string | null;
   last_health_check_at: string | null;
   agent_registered: boolean;
   agent_approved: boolean;
