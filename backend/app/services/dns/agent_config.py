@@ -97,6 +97,7 @@ from app.services.dns.tsig import (
     legacy_group_key,
     resolve_group_transfer_key,
     transfer_needs_tsig,
+    tsig_secret_shape_problem,
     view_transfer_key,
 )
 from app.services.dns_blocklist import (
@@ -1493,6 +1494,13 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             # Decryption failure (e.g. key rotated since this row was written).
             # Skip rather than write a broken key block — agent reload would
             # otherwise fail. Operator visibility is via the audit log.
+            continue
+        if (problem := tsig_secret_shape_problem(secret)) is not None:
+            # A row stored before the API checked secrets. It is written
+            # verbatim into the agent's key file, so a value that is not one
+            # base64 string is left out rather than shipped; any reference
+            # to the key is then dropped below like any other undefined key.
+            logger.warning("dns_tsig_key_secret_unrenderable", key=k.name, problem=problem)
             continue
         tsig_keys.append({"name": k.name, "secret": secret, "algorithm": k.algorithm})
     # A stored operator key that duplicates another name (the legacy group
