@@ -172,7 +172,50 @@ async def _try_lock_server(db: AsyncSession, server: DHCPServer) -> bool:
     )
 
 
+_SYNC_ERROR_MAX = 2000
+_SYNC_ERROR_SHOWN = 3
+
+
+def _summarise_errors(errors: list[str]) -> str:
+    """Concise, bounded one-liner naming the failing parts (first few errors)."""
+    shown = "; ".join(errors[:_SYNC_ERROR_SHOWN])
+    if len(errors) > _SYNC_ERROR_SHOWN:
+        shown += f" (+{len(errors) - _SYNC_ERROR_SHOWN} more)"
+    return shown[:_SYNC_ERROR_MAX]
+
+
 async def pull_leases_from_server(
+    db: AsyncSession,
+    server: DHCPServer,
+    *,
+    apply: bool = True,
+) -> PullLeasesResult:
+    """Pull leases, then record the outcome on the server row (#2306).
+
+    Single place for both callers (scheduled task + manual Sync leases). A
+    pull that returns any ``result.errors`` is FAILING — including a partial
+    one (scopes read but the lease read failed, or one scope's enumeration
+    failed); the summary names the failing parts. Only a clean pull clears
+    ``last_sync_error``. Agent-based drivers are not applicable and untouched.
+
+    A ``busy`` result (#2262) records nothing: this call did no pull, so it
+    has no outcome to report, and the pass that holds the server records its
+    own. Writing the row here would also wait on that pass's row lock, so a
+    manual Sync that should answer 409 at once would hang until it finished.
+    """
+    result = await _pull_leases_core(db, server, apply=apply)
+    if apply and not result.busy and is_agentless(server.driver):
+        if result.errors:
+            server.last_sync_error = _summarise_errors(result.errors)
+            server.last_sync_error_at = datetime.now(UTC)
+        else:
+            server.last_sync_error = None
+            server.last_sync_error_at = None
+        await db.flush()
+    return result
+
+
+async def _pull_leases_core(
     db: AsyncSession,
     server: DHCPServer,
     *,
