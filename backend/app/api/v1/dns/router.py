@@ -7,7 +7,7 @@ import ipaddress
 import re
 import uuid
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal, Self
 
@@ -8175,6 +8175,44 @@ async def _refuse_cname_conflict(
         )
 
 
+async def _enforce_views_in_zone_group(
+    db: DB, zone: DNSZone, view_ids: Iterable[uuid.UUID | None]
+) -> None:
+    """422 a record ``view_id`` that is not a view of the zone's own group (#2501).
+
+    A record carrying another group's view id puts an id into the set the
+    renderer matches the group's views against, so every operator view of the
+    group then skips the zone: it stops being served, silently. A record in a
+    different view from the zone's own pinned one is never rendered either.
+    The zone-file import's check (``_diff_zone_file``) is the same rule.
+    """
+    wanted = {v for v in view_ids if v is not None}
+    if not wanted:
+        return
+    found = set(
+        (
+            await db.execute(
+                select(DNSView.id).where(DNSView.group_id == zone.group_id, DNSView.id.in_(wanted))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if wanted - found:
+        raise HTTPException(
+            status_code=422,
+            detail="view_id does not name a view in this zone's server group",
+        )
+    if zone.view_id is not None and wanted != {zone.view_id}:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "view_id differs from the view this zone is pinned to, so the "
+                "record would never be rendered"
+            ),
+        )
+
+
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/records",
     response_model=RecordResponse,
@@ -8191,6 +8229,7 @@ async def create_record(
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_zone(zone, "add records to")
     await _check_driver_gated_record_type(body.record_type, group_id, db)
+    await _enforce_views_in_zone_group(db, zone, [body.view_id])
     # #424 — per-type structured-field rules (SRV needs priority+weight+port,
     # MX takes only priority and defaults it to 10, others take none).
     body.priority, body.weight, body.port = _normalize_record_struct_fields(
@@ -8298,6 +8337,8 @@ async def update_record(
         clearable={"view_id", "ttl"},
         non_nullable={"name", "value", "tags"},
     )
+    if "view_id" in changes and zone is not None:
+        await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
     before_name, before_value = record.name, record.value
     before_view = record.view_id
     before_op = record_op_payload(record)
@@ -8846,6 +8887,8 @@ async def bulk_create_records(
     if any(r.record_type == "CNAME" and is_apex(r.name) for r in body.records):
         raise HTTPException(status_code=422, detail=APEX_CNAME_DETAIL)
 
+    await _enforce_views_in_zone_group(db, zone, {r.view_id for r in body.records})
+
     names = sorted({r.name.lower() for r in body.records})
     existing_keys: set[tuple[Any, ...]] = set()
     # #1381 — what each submitted name already holds (view, type), for the
@@ -9079,11 +9122,7 @@ async def _diff_zone_file(
         (await db.execute(select(DNSView).where(DNSView.group_id == zone.group_id))).scalars().all()
     )
     view_names = {v.id: v.name for v in views}
-    if body.view_id is not None and body.view_id not in view_names:
-        raise HTTPException(
-            status_code=422,
-            detail="view_id does not name a view in this zone's server group",
-        )
+    await _enforce_views_in_zone_group(db, zone, [body.view_id])
     replace = body.conflict_strategy == "replace"
     diff = diff_records(
         parsed,
