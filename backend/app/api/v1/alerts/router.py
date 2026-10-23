@@ -511,6 +511,13 @@ async def resolve_event(event_id: uuid.UUID, db: DB, current_user: SuperAdmin) -
         raise HTTPException(status_code=404, detail="Event not found")
     if event.resolved_at is None:
         event.resolved_at = datetime.now(UTC)
+        # Reassign, not mutate: JSONB isn't change-tracked in place. The
+        # evaluator keeps a manually resolved event resolved while its
+        # subject still matches (#2498).
+        event.last_observed_value = {
+            **(event.last_observed_value or {}),
+            "resolved_by": alert_service.MANUAL_RESOLVED_BY,
+        }
         db.add(
             AuditLog(
                 action="resolve",

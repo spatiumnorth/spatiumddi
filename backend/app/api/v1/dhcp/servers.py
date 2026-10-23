@@ -193,6 +193,8 @@ class ServerResponse(BaseModel):
     server_group_id: uuid.UUID | None
     status: str
     last_sync_at: datetime | None
+    last_sync_error: str | None = None
+    last_sync_error_at: datetime | None = None
     last_health_check_at: datetime | None
     agent_registered: bool
     agent_approved: bool
@@ -285,6 +287,8 @@ class ServerResponse(BaseModel):
             server_group_id=s.server_group_id,
             status=s.status,
             last_sync_at=s.last_sync_at,
+            last_sync_error=s.last_sync_error,
+            last_sync_error_at=s.last_sync_error_at,
             last_health_check_at=s.last_health_check_at,
             agent_registered=s.agent_registered,
             # Agentless drivers have no agent to approve, so "approval" is
