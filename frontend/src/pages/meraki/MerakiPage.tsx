@@ -354,9 +354,13 @@ export function MerakiPage() {
       {del && (
         <DeleteOrgModal
           org={del}
-          onClose={() => setDel(null)}
+          onClose={() => {
+            delMut.reset();
+            setDel(null);
+          }}
           onConfirm={() => delMut.mutate(del.id)}
           isPending={delMut.isPending}
+          error={delMut.isError ? errMsg(delMut.error, "Delete failed") : null}
         />
       )}
     </div>
@@ -917,11 +921,13 @@ function DeleteOrgModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   org: MerakiOrg;
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
+  error?: string | null;
 }) {
   const [checked, setChecked] = useState(false);
   return (
@@ -930,7 +936,9 @@ function DeleteOrgModal({
         <p className="text-sm text-muted-foreground">
           Remove the Meraki organization{" "}
           <span className="font-semibold">{org.name}</span>? This only affects
-          SpatiumDDI — nothing on the Meraki side changes. Only rows that were
+          SpatiumDDI — nothing on the Meraki side changes. If active block sync
+          is armed, disarm it first (that lifts the pushed blocks from the
+          device); delete is refused while it is armed. Only rows that were
           purely mirrored are removed. Anything you added yourself (addresses,
           DHCP scopes, reservations, edited rows, custom fields) is kept and
           detached from this integration.
@@ -944,6 +952,11 @@ function DeleteOrgModal({
           />
           <span>I understand.</span>
         </label>
+        {error && (
+          <p className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

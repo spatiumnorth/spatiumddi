@@ -21,7 +21,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.crypto import decrypt_dict, encrypt_dict
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
@@ -381,11 +381,21 @@ async def delete_endpoint(endpoint_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     status_code=status.HTTP_202_ACCEPTED,
     response_model=StatusResponse,
 )
-async def sync_endpoint(endpoint_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_endpoint(endpoint_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     forbid_in_demo_mode("Cloud sync is disabled")
     e = await db.get(CloudEndpoint, endpoint_id)
     if e is None:
         raise HTTPException(status_code=404, detail="Cloud endpoint not found")
+
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="cloud_endpoint",
+        resource_id=e.id,
+        resource_display=str(getattr(e, "name", None) or e.id),
+        action="sync",
+    )
+    await db.commit()
 
     from app.tasks.cloud_sync import sync_endpoint_now  # noqa: PLC0415
 

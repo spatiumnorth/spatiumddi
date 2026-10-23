@@ -19,7 +19,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
@@ -388,10 +388,23 @@ async def update_firewall(
 
 
 @router.delete("/firewalls/{firewall_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_firewall(firewall_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_firewall(
+    firewall_id: uuid.UUID, db: DB, user: SuperAdmin, force: bool = False
+) -> None:
     f = await db.get(PANOSFirewall, firewall_id)
     if f is None:
         raise HTTPException(status_code=404, detail="Palo Alto firewall not found")
+    from app.services.block_sync.delete_guard import (  # noqa: PLC0415
+        assert_block_sync_deletable,
+    )
+
+    await assert_block_sync_deletable(
+        db,
+        target_kind="paloalto",
+        target_id=f.id,
+        armed=f.block_sync_enabled,
+        force=force,
+    )
     # #601 — sweep any active block-sync push rows for this target (polymorphic
     # target_id, so nothing cascades). Does NOT lift the tags off the firewall
     # — disarm the target first if it should stop enforcing them.
@@ -420,10 +433,20 @@ async def delete_firewall(firewall_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     status_code=status.HTTP_202_ACCEPTED,
     response_model=StatusResponse,
 )
-async def sync_firewall(firewall_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_firewall(firewall_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     f = await db.get(PANOSFirewall, firewall_id)
     if f is None:
         raise HTTPException(status_code=404, detail="Palo Alto firewall not found")
+
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="panos_firewall",
+        resource_id=f.id,
+        resource_display=str(getattr(f, "name", None) or f.id),
+        action="sync",
+    )
+    await db.commit()
 
     from app.tasks.panos_sync import sync_firewall_now  # noqa: PLC0415
 

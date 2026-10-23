@@ -16,7 +16,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.celery_app import celery_app
 from app.db import task_session
-from app.services.conformity import evaluate_due_policies
+from app.services.conformity import evaluate_due_policies, resolve_orphaned_policy_alerts
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -32,6 +33,7 @@ logger = structlog.get_logger(__name__)
     retry_jitter=True,
     max_retries=3,
 )
+@module_gated("compliance.conformity")
 def evaluate_conformity(self: object) -> dict[str, int]:  # type: ignore[type-arg]
     return asyncio.run(_run())
 
@@ -39,6 +41,15 @@ def evaluate_conformity(self: object) -> dict[str, int]:  # type: ignore[type-ar
 async def _run() -> dict[str, int]:
     async with task_session() as session:
         try:
+            # #2277 — close events a disabled / deleted / re-wired policy
+            # left open. Isolated: a sweep failure must not stop the
+            # evaluation pass behind it.
+            try:
+                if await resolve_orphaned_policy_alerts(session):
+                    await session.commit()
+            except SQLAlchemyError:
+                await session.rollback()
+                logger.exception("conformity_orphan_sweep_failed")
             result = await evaluate_due_policies(session)
             if result["policies_evaluated"]:
                 logger.info("conformity_evaluated", **result)

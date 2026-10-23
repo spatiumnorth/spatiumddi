@@ -233,6 +233,27 @@ async def list_statics(
     return list(res.scalars().all())
 
 
+async def _recount_subnet(db: DB, subnet_id: uuid.UUID) -> None:
+    """Refresh the cached allocated counts a static's IPAM mirror changed.
+
+    The mirror row counts toward the subnet's ``allocated_ips`` and its
+    block's rollup; without this they stay stale until the hourly recount
+    (#2533). Flush first so the counts see the mirror write, and again
+    before the block sums the subnet's new count.
+    """
+    from app.api.v1.ipam.router import (  # noqa: PLC0415
+        _update_block_utilization,
+        _update_utilization,
+    )
+
+    await db.flush()
+    await _update_utilization(db, subnet_id)
+    await db.flush()
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is not None:
+        await _update_block_utilization(db, subnet.block_id)
+
+
 @router.post(
     "/scopes/{scope_id}/statics",
     response_model=StaticResponse,
@@ -263,6 +284,7 @@ async def create_static(
     await push_static_change(db, st, action="create")
     collect_wake(dhcp_group_channel(scope.group_id))
     await upsert_ipam_for_static(db, scope, st)
+    await _recount_subnet(db, scope.subnet_id)
     write_audit(
         db,
         user=user,
@@ -318,6 +340,7 @@ async def update_static(
     await push_static_change(db, st, action="update", prev_mac=prev_mac, prev_ip=prev_ip)
     collect_wake(dhcp_group_channel(scope.group_id))
     await upsert_ipam_for_static(db, scope, st, action="update")
+    await _recount_subnet(db, scope.subnet_id)
     write_audit(
         db,
         user=user,
@@ -355,5 +378,7 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: CurrentUser) -> None
     # #1274 — a row handed to a live lease gets its DDNS back, but only once
     # the reservation is gone: DDNS lets a reservation's hostname win.
     await db.flush()
+    if scope is not None:
+        await _recount_subnet(db, scope.subnet_id)
     await publish_handover_ddns(db, handovers)
     await db.commit()

@@ -17,7 +17,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
@@ -26,6 +26,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.tailscale import TailscaleTenant
+from app.services.dns.bundle_dirty import mark_integration_dns_released
 from app.services.integration_credentials import credential_status
 from app.services.integration_ownership import release_integration_rows
 from app.services.tailscale.client import AUTH_REJECTED_PREFIX, is_auth_rejected
@@ -134,7 +135,7 @@ class TenantResponse(BaseModel):
     api_key_expires_at: datetime | None
     # "api" (read from Tailscale) | "operator" (typed in) | null.
     api_key_expiry_source: str | None
-    # ok | expiring | expired | rejected | unknown — see
+    # ok | expiring | expired | rejected | unknown | disabled — see
     # app/services/integration_credentials.py.
     credential_state: str
     credential_days_left: int | None
@@ -179,6 +180,7 @@ def _to_response(t: TailscaleTenant) -> TenantResponse:
         expires_at=t.api_key_expires_at,
         rejected=is_auth_rejected(t.last_sync_error),
         now=datetime.now(UTC),
+        enabled=t.enabled,
     )
     return TenantResponse(
         id=t.id,
@@ -429,6 +431,8 @@ async def delete_tenant(tenant_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     await release_integration_rows(
         db, own_fk="tailscale_tenant_id", target_id=t.id, user=user, target_name=t.name
     )
+    # #2288 — the DNS rows cascade in the database; mark their groups' bundles dirty.
+    await mark_integration_dns_released(db, own_fk="tailscale_tenant_id", target_id=t.id)
     await db.delete(t)
     await db.commit()
 
@@ -437,10 +441,20 @@ async def delete_tenant(tenant_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     "/tenants/{tenant_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_tenant(tenant_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_tenant(tenant_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     t = await db.get(TailscaleTenant, tenant_id)
     if t is None:
         raise HTTPException(status_code=404, detail="Tailscale tenant not found")
+
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="tailscale_tenant",
+        resource_id=t.id,
+        resource_display=str(getattr(t, "name", None) or t.id),
+        action="sync",
+    )
+    await db.commit()
 
     from app.tasks.tailscale_sync import sync_tenant_now  # noqa: PLC0415
 

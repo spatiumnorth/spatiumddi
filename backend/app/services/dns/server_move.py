@@ -50,7 +50,9 @@ from app.models.dns import (
     DNSRecordOp,
     DNSServer,
     DNSServerGroup,
+    DNSServerOptions,
     DNSServerZoneState,
+    DNSTrustAnchor,
 )
 from app.services.appliance.cluster_dns_group import cluster_dns_group_refusal
 from app.services.appliance.ownership import owning_appliance_for_dns_server
@@ -180,6 +182,23 @@ async def ensure_group_single_driver(
     # already holds; joining would install it and fail every signed transfer.
     if refusal := await group_key_refusal(db, group_id, {driver}):
         raise ServerMoveError(f"Group {group_name!r}: {refusal}", status_code=422)
+    # #2266 — only BIND9 renders DNSSEC trust anchors; a group holding some
+    # would have them silently ignored (and validation weakened) by a server
+    # of any other driver. Mirrors the 422 on adding an anchor.
+    if driver != "bind9":
+        n_anchors = (
+            await db.execute(
+                select(func.count(DNSTrustAnchor.id))
+                .join(DNSServerOptions, DNSTrustAnchor.server_options_id == DNSServerOptions.id)
+                .where(DNSServerOptions.group_id == group_id)
+            )
+        ).scalar_one()
+        if n_anchors:
+            raise ServerMoveError(
+                f"Group {group_name!r} has DNSSEC trust anchors, which only BIND9 applies; "
+                f"a {driver!r} server would ignore them. Remove the anchors first.",
+                status_code=422,
+            )
     # #1784 — the experimental agentless Technitium driver supports ONE
     # server per group. Enforced on every path that puts a server in a group
     # (create, driver change, move) because they all come through here.

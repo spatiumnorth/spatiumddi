@@ -28,7 +28,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_credential_problem, header_secret
@@ -38,6 +38,7 @@ from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
 from app.models.kubernetes import KubernetesCluster
+from app.services.dns.bundle_dirty import mark_integration_dns_released
 from app.services.integration_ownership import release_integration_rows
 
 router = APIRouter(
@@ -646,6 +647,8 @@ async def delete_cluster(cluster_id: uuid.UUID, db: DB, user: SuperAdmin) -> Non
     await release_integration_rows(
         db, own_fk="kubernetes_cluster_id", target_id=c.id, user=user, target_name=c.name
     )
+    # #2288 — the DNS rows cascade in the database; mark their groups' bundles dirty.
+    await mark_integration_dns_released(db, own_fk="kubernetes_cluster_id", target_id=c.id)
     await db.delete(c)
     await db.commit()
 
@@ -654,7 +657,7 @@ async def delete_cluster(cluster_id: uuid.UUID, db: DB, user: SuperAdmin) -> Non
     "/clusters/{cluster_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_cluster(cluster_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_cluster(cluster_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     """Queue an on-demand reconcile for this cluster.
 
     Fire-and-forget — the reconciler runs on the worker and updates
@@ -666,6 +669,16 @@ async def sync_cluster(cluster_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusRe
         raise HTTPException(status_code=404, detail="Cluster not found")
 
     # Deferred import — keeps the router module cheap to import.
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="kubernetes_cluster",
+        resource_id=c.id,
+        resource_display=str(getattr(c, "name", None) or c.id),
+        action="sync",
+    )
+    await db.commit()
+
     from app.tasks.kubernetes_sync import sync_cluster_now  # noqa: PLC0415
 
     try:

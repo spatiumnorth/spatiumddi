@@ -25,7 +25,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
@@ -50,6 +50,7 @@ from app.models.settings import (
     PlatformSettings,
 )
 from app.services import audit_forward as audit_forward_svc
+from app.services import feature_modules as fm_svc
 from app.services.appliance.access import console_only_detail, covers, effective_doors
 from app.services.appliance.apt import (
     mask_proxy_url,
@@ -164,6 +165,10 @@ class SettingsResponse(BaseModel):
     oui_lookup_enabled: bool
     oui_update_interval_hours: int
     oui_last_updated_at: datetime | None
+    # #2196 / #2197 — all eleven integration switches. Each is the state of
+    # the integration's feature module (``integrations.*``), filled in by
+    # ``_settings_response``; the ``PlatformSettings`` column of the same
+    # name is only a derived copy and is never what this reports.
     integration_kubernetes_enabled: bool
     integration_docker_enabled: bool
     integration_proxmox_enabled: bool
@@ -171,6 +176,10 @@ class SettingsResponse(BaseModel):
     integration_unifi_enabled: bool
     integration_cloud_enabled: bool
     integration_opnsense_enabled: bool
+    integration_netbird_enabled: bool
+    integration_panos_enabled: bool
+    integration_fortinet_enabled: bool
+    integration_meraki_enabled: bool
     domain_whois_interval_hours: int
     # Device profiling — fingerbank API key. Boolean reflects whether
     # an encrypted key is stored; the plaintext is never returned.
@@ -897,6 +906,10 @@ class SettingsUpdate(BaseModel):
     dhcp_default_lease_time: int | None = None
     oui_lookup_enabled: bool | None = None
     oui_update_interval_hours: int | None = None
+    # #2196 / #2197 — writing one of these switches the integration's
+    # feature module, exactly as Settings → Features does (superadmin-only,
+    # audited as a ``feature_module`` change). Sending the current value is a
+    # no-op, so a form that echoes the whole object back changes nothing.
     integration_kubernetes_enabled: bool | None = None
     integration_docker_enabled: bool | None = None
     integration_proxmox_enabled: bool | None = None
@@ -904,6 +917,10 @@ class SettingsUpdate(BaseModel):
     integration_unifi_enabled: bool | None = None
     integration_cloud_enabled: bool | None = None
     integration_opnsense_enabled: bool | None = None
+    integration_netbird_enabled: bool | None = None
+    integration_panos_enabled: bool | None = None
+    integration_fortinet_enabled: bool | None = None
+    integration_meraki_enabled: bool | None = None
     domain_whois_interval_hours: int | None = None
     # Device profiling — fingerbank API key. Plaintext on the wire
     # (TLS-protected); empty string clears the stored value. Omit the
@@ -1453,6 +1470,13 @@ class SettingsUpdate(BaseModel):
             raise ValueError("Must be >= 0 (0 = no timeout)")
         return v
 
+    @field_validator("auto_logout_minutes")
+    @classmethod
+    def validate_auto_logout(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("Must be >= 0 (0 = no warning)")
+        return v
+
     @field_validator(
         "dns_auto_sync_interval_minutes",
         "dns_pull_from_server_interval_minutes",
@@ -1809,9 +1833,18 @@ def _column_defaults() -> dict[str, Any]:
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
+async def _settings_response(db: DB, settings: PlatformSettings) -> SettingsResponse:
+    """Serialise the settings row, with the integration switches read from
+    their feature modules (#2196) — the module is authoritative, and a
+    column that a module turned on before this row existed never received
+    would otherwise be reported here as off."""
+    resp = SettingsResponse.model_validate(settings)
+    return resp.model_copy(update=await fm_svc.integration_flags(db))
+
+
 @router.get("", response_model=SettingsResponse)
-async def get_settings(current_user: CurrentUser, db: DB) -> PlatformSettings:
-    return await _get_or_create(db)
+async def get_settings(current_user: CurrentUser, db: DB) -> SettingsResponse:
+    return await _settings_response(db, await _get_or_create(db))
 
 
 @router.get("/defaults")
@@ -1822,7 +1855,7 @@ async def get_settings_defaults(current_user: CurrentUser) -> dict[str, Any]:
 @router.put("", response_model=SettingsResponse)
 async def update_settings(
     body: SettingsUpdate, request: Request, current_user: CurrentUser, db: DB
-) -> PlatformSettings:
+) -> SettingsResponse:
     forbid_in_demo_mode("Platform settings updates are disabled")
     # Superadmin passes via user_has_permission shortcut; users with an
     # explicit `write`/`admin` grant on `settings` also pass.
@@ -1899,6 +1932,29 @@ async def update_settings(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Appliance registration can only be changed by a superadmin",
         )
+
+    # #2196 / #2197 — an integration switch is its feature module. Popped out
+    # of ``changes`` so the generic setattr loop never writes the derived
+    # column on its own; a real change goes through the module below. Only a
+    # value that DIFFERS from the module counts, so echoing the current state
+    # back is a no-op. Superadmin-only, like the Settings → Features toggle it
+    # is equivalent to: a delegated ``write:settings`` editor must not be able
+    # to arm an integration that pulls from (and, for some, writes to) other
+    # infrastructure. Demo mode is already refused for the whole PUT above.
+    _integration_requested = {
+        f: changes.pop(f) for f in list(changes) if f in fm_svc.INTEGRATION_FIELD_TO_MODULE
+    }
+    _integration_flips: dict[str, bool] = {}
+    if _integration_requested:
+        _integration_current = await fm_svc.integration_flags(db)
+        _integration_flips = {
+            f: v for f, v in _integration_requested.items() if _integration_current[f] != v
+        }
+        if _integration_flips and not is_effective_superadmin(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Integrations can only be switched on or off by a superadmin",
+            )
 
     # Maintenance mode (issue #57). Capture the prior enabled state before
     # the setattr loop mutates it so we can detect an actual flip (and
@@ -2264,6 +2320,26 @@ async def update_settings(
             continue
         setattr(settings, field, value)
 
+    for field, value in _integration_flips.items():
+        module_id = fm_svc.INTEGRATION_FIELD_TO_MODULE[field]
+        await fm_svc.set_module_enabled(db, module_id, value, user_id=current_user.id)
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="feature_module",
+                resource_id=module_id,
+                resource_display=fm_svc.MODULES_BY_ID[module_id].label,
+                result="success",
+                new_value={"enabled": value},
+            )
+        )
+    if _integration_flips:
+        await fm_svc.sync_integration_settings_mirror(db)
+        changes.update(_integration_flips)
+
     if snmp_users_audit is not None:
         changes["snmp_v3_users"] = snmp_users_audit
     if syslog_targets_audit is not None:
@@ -2526,6 +2602,12 @@ async def update_settings(
 
         _maintenance_mode.invalidate_cache()
 
+    # Same for the idle-session timeout the auth layer enforces.
+    if "session_timeout_minutes" in changes:
+        from app.core import session_idle as _session_idle
+
+        _session_idle.invalidate_cache()
+
     # The settings router has no request-scoped wake collector, so
     # publish directly after the commit. Only fire when a host-config
     # field actually changed so unrelated settings writes don't wake
@@ -2533,8 +2615,11 @@ async def update_settings(
     if _host_config_touched:
         await publish_wake(HOSTCONFIG_ALL)
 
+    if _integration_flips:
+        fm_svc.invalidate_cache()
+
     logger.info("platform_settings_updated", user=current_user.username, changes=changes)
-    return settings
+    return await _settings_response(db, settings)
 
 
 # ── Dedicated resolver endpoints (issue #158) ───────────────────────────────────
@@ -3356,9 +3441,7 @@ def _audit_forward_target(
 
 
 @router.get("/audit-forward-targets", response_model=list[AuditTargetResponse])
-async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTargetResponse]:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def list_audit_targets(current_user: SuperAdmin, db: DB) -> list[AuditTargetResponse]:
     res = await db.execute(select(AuditForwardTarget).order_by(AuditForwardTarget.name))
     return [_target_to_response(t) for t in res.scalars().all()]
 
@@ -3369,11 +3452,9 @@ async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTar
     status_code=status.HTTP_201_CREATED,
 )
 async def create_audit_target(
-    body: AuditTargetBody, current_user: CurrentUser, db: DB
+    body: AuditTargetBody, current_user: SuperAdmin, db: DB
 ) -> AuditTargetResponse:
     forbid_in_demo_mode("Audit-forward target creation is disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     _require_webhook_url(body, None)
     row = AuditForwardTarget()
     _apply_body(row, body)
@@ -3406,12 +3487,10 @@ async def update_audit_target(
     # surface as a bind-time 500 (live: target_id='0'); typed, it is a 422.
     target_id: uuid.UUID,
     body: AuditTargetBody,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> AuditTargetResponse:
     forbid_in_demo_mode("Audit-forward target updates are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -3440,9 +3519,7 @@ async def update_audit_target(
 
 
 @router.delete("/audit-forward-targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_audit_target(target_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def delete_audit_target(target_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         return
@@ -3453,7 +3530,7 @@ async def delete_audit_target(target_id: uuid.UUID, current_user: CurrentUser, d
 
 @router.post("/audit-forward-targets/{target_id}/test")
 async def test_audit_target(
-    target_id: uuid.UUID, current_user: CurrentUser, db: DB
+    target_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> dict[str, Any]:
     """Send a synthetic event to one target and report success / error.
 
@@ -3461,8 +3538,6 @@ async def test_audit_target(
     filter it out in the collector if they want. Doesn't land in
     ``audit_log`` — this is explicit probe traffic, not an audit.
     """
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -3792,9 +3867,7 @@ def _audit_influx(
 
 
 @router.get("/influxdb-targets", response_model=list[InfluxDBTargetResponse])
-async def list_influxdb_targets(current_user: CurrentUser, db: DB) -> list[InfluxDBTargetResponse]:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def list_influxdb_targets(current_user: SuperAdmin, db: DB) -> list[InfluxDBTargetResponse]:
     res = await db.execute(select(InfluxDBTarget).order_by(InfluxDBTarget.name))
     return [_influx_to_response(t) for t in res.scalars().all()]
 
@@ -3805,11 +3878,9 @@ async def list_influxdb_targets(current_user: CurrentUser, db: DB) -> list[Influ
     status_code=status.HTTP_201_CREATED,
 )
 async def create_influxdb_target(
-    body: InfluxDBTargetBody, current_user: CurrentUser, db: DB
+    body: InfluxDBTargetBody, current_user: SuperAdmin, db: DB
 ) -> InfluxDBTargetResponse:
     forbid_in_demo_mode("InfluxDB target creation is disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = InfluxDBTarget()
     secret_changes = _apply_influx_body(row, body)
     _assert_influx_writable(row)
@@ -3829,12 +3900,10 @@ async def create_influxdb_target(
 async def update_influxdb_target(
     target_id: uuid.UUID,
     body: InfluxDBTargetBody,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> InfluxDBTargetResponse:
     forbid_in_demo_mode("InfluxDB target updates are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -3851,9 +3920,7 @@ async def update_influxdb_target(
 
 
 @router.delete("/influxdb-targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_influxdb_target(target_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+async def delete_influxdb_target(target_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         return
@@ -3870,7 +3937,7 @@ class InfluxDBTestResponse(BaseModel):
 
 @router.post("/influxdb-targets/{target_id}/test", response_model=InfluxDBTestResponse)
 async def test_influxdb_target(
-    target_id: uuid.UUID, current_user: CurrentUser, db: DB
+    target_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> InfluxDBTestResponse:
     """Write one synthetic point and report the server's verdict.
 
@@ -3881,8 +3948,6 @@ async def test_influxdb_target(
     contaminates a real series, and the watermarks are untouched — this
     is a probe, not a push.
     """
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(InfluxDBTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Target not found")
@@ -4033,7 +4098,7 @@ class BrandingLogoInfo(BaseModel):
 
 @router.put("/branding/logo", response_model=BrandingLogoInfo)
 async def upload_branding_logo(
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
     file: UploadFile = File(..., description="PNG image, 512 KB maximum."),
 ) -> BrandingLogoInfo:
@@ -4044,11 +4109,6 @@ async def upload_branding_logo(
     into stored XSS against every visitor, including unauthenticated ones.
     """
     forbid_in_demo_mode("Branding changes are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Branding can only be changed by a superadmin",
-        )
 
     # Read with one byte of headroom so an oversized upload is detected
     # rather than silently truncated to the limit.
@@ -4122,14 +4182,9 @@ async def upload_branding_logo(
 
 
 @router.delete("/branding/logo", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_branding_logo(current_user: CurrentUser, db: DB) -> Response:
+async def delete_branding_logo(current_user: SuperAdmin, db: DB) -> Response:
     """Drop the custom logo; the UI falls back to the bundled asset."""
     forbid_in_demo_mode("Branding changes are disabled")
-    if not is_effective_superadmin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Branding can only be changed by a superadmin",
-        )
 
     row = (
         await db.execute(

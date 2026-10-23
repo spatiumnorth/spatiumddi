@@ -17,7 +17,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
@@ -362,10 +362,20 @@ async def delete_firewall(firewall_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     status_code=status.HTTP_202_ACCEPTED,
     response_model=StatusResponse,
 )
-async def sync_firewall(firewall_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_firewall(firewall_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     f = await db.get(FortinetFirewall, firewall_id)
     if f is None:
         raise HTTPException(status_code=404, detail="Fortinet firewall not found")
+
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="fortinet_firewall",
+        resource_id=f.id,
+        resource_display=str(getattr(f, "name", None) or f.id),
+        action="sync",
+    )
+    await db.commit()
 
     from app.tasks.fortinet_sync import sync_firewall_now  # noqa: PLC0415
 

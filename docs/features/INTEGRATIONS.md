@@ -627,6 +627,7 @@ It is off by default and layered behind several independent gates so it can neve
 4. **RBAC `manage_block_sync`** on every endpoint (Network Editor builtin role; superadmin bypasses). Palo Alto DAG enforcement additionally requires **`manage_firewall_enforcement`** to arm.
 5. **Preview + confirm + full audit** on every push — `POST /block-sync/blocks/preview` (and `?preview` on reconcile) returns the exact per-target add/remove diff without writing.
 6. **Two-person approval** — creating/arming a block routes through the approval workflow (#62) as `admin:manage_block_sync` when a policy matches.
+7. **Deleting a target is refused while it is armed (#2291).** A delete would drop the record of what was pushed while the device keeps enforcing it (PAN-OS tags are registered with no timeout; UniFi MACs stay quarantined; Meraki clients stay `Blocked`). **Disarm first** — that lifts every pushed block — then delete. If the lift has not finished or failed (device unreachable) the target still has push rows and delete is refused with a 409 until they are lifted; `?force=true` deletes anyway and leaves cleanup on the device to you. `force` never overrides an armed target.
 
 ### Desired-state model
 

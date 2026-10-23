@@ -17,7 +17,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.v1._common import StatusResponse
+from app.api.v1._common import StatusResponse, add_trigger_audit
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
@@ -398,10 +398,23 @@ async def update_router(
 
 
 @router.delete("/routers/{router_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_router(router_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_router(
+    router_id: uuid.UUID, db: DB, user: SuperAdmin, force: bool = False
+) -> None:
     r = await db.get(OPNsenseRouter, router_id)
     if r is None:
         raise HTTPException(status_code=404, detail="OPNsense firewall not found")
+    from app.services.block_sync.delete_guard import (  # noqa: PLC0415
+        assert_block_sync_deletable,
+    )
+
+    await assert_block_sync_deletable(
+        db,
+        target_kind="opnsense",
+        target_id=r.id,
+        armed=r.block_sync_enabled,
+        force=force,
+    )
     # #601 — sweep any active block-sync push rows for this target. They have no
     # FK to opnsense_router (target_id is polymorphic), so nothing cascades.
     # NOTE: this does NOT lift the blocks off the firewall — disarm the target
@@ -430,10 +443,20 @@ async def delete_router(router_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     "/routers/{router_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_router(router_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
+async def sync_router(router_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     r = await db.get(OPNsenseRouter, router_id)
     if r is None:
         raise HTTPException(status_code=404, detail="OPNsense firewall not found")
+
+    add_trigger_audit(
+        db,
+        user,
+        resource_type="opnsense_router",
+        resource_id=r.id,
+        resource_display=str(getattr(r, "name", None) or r.id),
+        action="sync",
+    )
+    await db.commit()
 
     from app.tasks.opnsense_sync import sync_router_now  # noqa: PLC0415
 

@@ -264,9 +264,15 @@ export function TailscalePage() {
                             : "never"}
                           {t.last_sync_error && (
                             <div
-                              className="text-[11px] text-destructive max-w-xs truncate"
+                              className={
+                                t.enabled
+                                  ? "text-[11px] text-destructive max-w-xs truncate"
+                                  : "text-[11px] text-muted-foreground max-w-xs truncate"
+                              }
                               title={t.last_sync_error}
+                              data-testid="tenant-last-error"
                             >
+                              {t.enabled ? "" : "Last error (disabled): "}
                               {t.last_sync_error}
                             </div>
                           )}
@@ -612,7 +618,10 @@ function TenantModal({
           <p className="text-[11px] text-muted-foreground">
             Token expires{" "}
             <span className="font-medium text-foreground">
-              {new Date(tenant!.api_key_expires_at!).toLocaleDateString()}
+              {fmtExpiry(
+                tenant!.api_key_expires_at!,
+                tenant!.api_key_expiry_source === "operator",
+              )}
             </span>{" "}
             (read from Tailscale). Enter a new API key above to replace it.
           </p>
@@ -833,6 +842,16 @@ function dateInDays(days: number): string {
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+// An operator-entered expiry is stored as UTC midnight of the chosen day, so
+// it must render in UTC or it reads a day early west of UTC (#2260). An
+// expiry Tailscale reported is a real instant and renders in local time.
+function fmtExpiry(iso: string, operatorDate: boolean): string {
+  return new Date(iso).toLocaleDateString(
+    undefined,
+    operatorDate ? { timeZone: "UTC" } : undefined,
+  );
 }
 
 // Start of the chosen day, UTC: erring early means warning early.
