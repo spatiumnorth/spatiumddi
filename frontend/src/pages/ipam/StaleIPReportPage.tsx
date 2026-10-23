@@ -4,16 +4,17 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { History, RefreshCw, Trash2 } from "lucide-react";
 
 import {
+  formatApiError,
   ipamApi,
   type StaleIPDeprecateRequest,
   type StaleIPDeprecateResponse,
   type StaleIPEntry,
-  formatApiError,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { SeenDot } from "@/pages/ipam/SeenDot";
 import { humanTime } from "@/pages/network/_shared";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 
 const PAGE_SIZE = 200;
@@ -21,6 +22,11 @@ const PAGE_SIZE = 200;
 // processes at most this many rows, then reports ``capped`` so the
 // operator knows to run it again for the remainder.
 const BULK_CAP = 5000;
+
+// The route's own coarse gate (#2521): write on any of the IPAM resource
+// types. A hand-picked or all-matching deprecate rewrites address rows.
+const DEPRECATE_TYPES = ["ip_space", "ip_block", "subnet", "ip_address"];
+const DEPRECATE_DENIED = "Requires write permission on IPAM addresses";
 
 const inputCls =
   "rounded-md border bg-background px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring";
@@ -34,6 +40,11 @@ const inputCls =
  */
 export function StaleIPReportPage() {
   const qc = useQueryClient();
+  const perms = usePermissions();
+  const deprecateGate = permissionGate(
+    DEPRECATE_TYPES.some((t) => perms.can("write", t)),
+    DEPRECATE_DENIED,
+  );
   const [staleDays, setStaleDays] = useState(90);
   const [includeNeverSeen, setIncludeNeverSeen] = useState(false);
   const [spaceId, setSpaceId] = useState<string>("");
@@ -154,6 +165,7 @@ export function StaleIPReportPage() {
             variant="destructive"
             disabled={total === 0 || deprecate.isPending}
             onClick={() => setPending({ kind: "all", count: total })}
+            {...deprecateGate}
           >
             <Trash2 className="h-4 w-4" />
             Deprecate all {total}
@@ -248,6 +260,7 @@ export function StaleIPReportPage() {
             variant="destructive"
             disabled={deprecate.isPending}
             onClick={() => setPending({ kind: "selected", ids: [...selected] })}
+            {...deprecateGate}
           >
             <Trash2 className="h-4 w-4" />
             Deprecate selected
