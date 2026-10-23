@@ -243,11 +243,24 @@ async def _apply_update_conformity_policy(
                 f"Built-in policy only accepts {sorted(_CONFORMITY_BUILTIN_MUTABLE)}; "
                 f"rejected: {offending}"
             )
+    from app.services.conformity.current import retire_pass_if_rescoped  # noqa: PLC0415
+
     applied: dict[str, Any] = {}
     for key, value in changes.items():
         if getattr(p, key) != value:
             setattr(p, key, value)
             applied[key] = value
+    if "enabled" in applied and not p.enabled:
+        from app.services.conformity.engine import (  # noqa: PLC0415
+            RESOLUTION_POLICY_DISABLED,
+            resolve_policy_alerts,
+        )
+
+        # #2277 — close the alerts a now-disabled policy left open.
+        await resolve_policy_alerts(db, p.id, reason=RESOLUTION_POLICY_DISABLED)
+    # #2278 — same rule as the REST PATCH: a re-scoped policy's last
+    # pass no longer describes it.
+    retire_pass_if_rescoped(p, applied)
     write_audit(
         db,
         user=user,
@@ -289,12 +302,15 @@ async def _apply_evaluate_conformity_policy(
     db: AsyncSession, user: User, args: EvaluateConformityPolicyArgs
 ) -> dict[str, Any]:
     from app.models.conformity import ConformityPolicy  # noqa: PLC0415
+    from app.services import alerts as alert_service  # noqa: PLC0415
     from app.services.conformity import evaluate_policy  # noqa: PLC0415
 
     p = await db.get(ConformityPolicy, args.policy_id)
     if p is None:
         raise ValueError(f"Conformity policy {args.policy_id} not found")
-    summary = await evaluate_policy(db, p)
+    # #2261 — queue any alert this opens; it pages only after the commit below.
+    with alert_service.defer_deliveries() as pending:
+        summary = await evaluate_policy(db, p)
     write_audit(
         db,
         user=user,
@@ -305,6 +321,7 @@ async def _apply_evaluate_conformity_policy(
         new_value={"via": "ai_proposal", **{k: int(v) for k, v in summary.items()}},
     )
     await db.commit()
+    await alert_service.deliver_deferred(db, pending)
     return {"id": str(p.id), "name": p.name, **{k: int(v) for k, v in summary.items()}}
 
 
@@ -1842,6 +1859,11 @@ async def _apply_commit_dhcp_import(
         conflict_actions={},
         current_user=user,
     )
+    # #2040 — same wake the REST commit route stashes; the dispatch site's
+    # collector publishes it now that commit_import has committed.
+    from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
+
+    collect_wake(dhcp_group_channel(args.target_group_id))
     return {
         "scopes_created": result.total_scopes_created,
         "scopes_skipped": result.total_scopes_skipped,

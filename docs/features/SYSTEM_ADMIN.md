@@ -61,7 +61,14 @@ control plane is doing without standing up a separate Prometheus
   one-line setup hint when `/var/run/docker.sock` isn't mounted
   into the api container.
 - **Conformity** — promoted from the Compliance surface; shows
-  the latest conformity-evaluation rollup.
+  the latest conformity-evaluation rollup. "Latest" is each
+  **enabled** policy's most recent evaluation pass: a target deleted
+  or moved out of a policy's scope drops out at that policy's next
+  pass, a disabled policy counts towards `policies_total` but reports
+  no results, and editing what a policy checks (`target_kind`,
+  `target_filter`, `check_kind`, `check_args`) clears its last pass
+  until it runs again. The conformity PDF reports the same set and
+  prints each policy's as-of time (#2278).
 - **Copilot Usage** — Operator Copilot token / cost observability.
 
 Backend at `app/api/v1/admin/postgres.py` (5 endpoints) +
@@ -382,6 +389,13 @@ The archive is the unit operators move around — single-file, easy to ship over
 - Webhook forward targets (#1502, `audit_forward_target.url` / `auth_header`, and the legacy `platform_settings.audit_forward_webhook_url` / `audit_forward_webhook_auth_header`). A Slack, Discord or Teams incoming-webhook URL lets anyone who has it post into that channel. Re-issue the URL in the chat platform (and any collector token) once the upgrade has finished, paste the new one into the target, and the leftover copy is dead. That is also the only way to retire a URL that is already in an older archive.
 
 An "exclude secrets" diagnostic archive blanks those leftover columns along with the encrypted ones. Clearing or replacing a webhook URL or header also blanks its leftover plaintext column in the same change, so a value an admin has removed does not stay in the database or in later full backups. Restoring an "exclude secrets" archive leaves the encrypted webhook columns as an empty bytea rather than NULL; the application treats an empty bytea as unset everywhere (`url_set`, the audit snapshot, and the check that a webhook target has a URL), so a restored target with no re-entered URL is reported as unconfigured instead of silently failing to deliver — re-enter the URL and header after such a restore.
+
+An "exclude secrets" archive removes every secret, not only the credentials an operator types in: the appliance CA private key, the k3s join tokens and the cluster kubeconfig, persistent pairing-code reveals, the ACME account key, and the stored digests of credentials (local password hashes, API-token, session, pairing-code and agent-token digests). Its `secrets.enc` carries no `SECRET_KEY` or `CREDENTIAL_ENCRYPTION_KEY`, only the archive metadata the passphrase check needs. Restoring one succeeds and leaves an install that regenerates what it can:
+
+- **Local sign-in.** Every local password is cleared, so sign in through an external provider or reset a password with the recipe in [Troubleshooting](../TROUBLESHOOTING.md#resetting-the-admin-password). API tokens and sessions no longer match anything; issue new tokens.
+- **Appliances.** The appliance CA is regenerated on the next approval, so appliances approved against the old one must be re-keyed. The supervisor re-reports the kubeconfig and the join token on its next heartbeat. Pairing codes cannot be claimed or revealed; create new ones.
+- **Agents** are refused on their next request and re-bootstrap from their pre-shared key.
+- **ACME.** The next certificate order mints a new account key and registers it with the CA.
 
 So treat an archive as the install itself. Keep it at a destination that restricts who can read it and, if the medium could leave your control, encrypts it at rest (S3 / Azure / GCS server-side encryption, an encrypted share). A removable disk on the appliance cannot be encrypted — see [Removable (USB) disks](#removable-usb-disks-on-the-appliance).
 
@@ -1050,9 +1064,22 @@ ip_allocation_strategy: str (default "sequential")  -- sequential | random
 **Session / security**
 
 ```
-session_timeout_minutes: int (default 60)
-auto_logout_minutes: int (default 0)  -- idle session timeout; 0 = disabled
+session_timeout_minutes: int (default 60)  -- idle session timeout; 0 = disabled
+auto_logout_minutes: int (default 0)       -- console warning before it; 0 = disabled
 ```
+
+`session_timeout_minutes` is enforced by the API: a browser session
+(`user_session`) whose last activity is older than the timeout is refused
+on its next request and on `/auth/refresh`, and is left out of the
+Sessions list. Activity is `user_session.last_seen_at`. A refresh carries
+it forward rather than counting as activity, and the console sends
+`X-Spatium-Idle-Seconds` (time since the operator last used the page) on
+every request, so background polling does not keep a session alive. The
+check allows up to a minute (a quarter of the timeout, if shorter) past
+the configured value, never less. API tokens are not sessions and are not
+affected. The console shows the warning `auto_logout_minutes` before
+expiry, capped at half the timeout, and returns to the login page when
+the timeout passes.
 
 **Password policy** (issue #70 — flat columns, not a JSONB blob; validator + history in `app.services.password_policy`)
 
@@ -1125,7 +1152,7 @@ maintenance_message: str (default "")
 maintenance_started_at: timestamp | null  -- server-stamped on enable, never operator-set directly
 ```
 
-Other notable areas on the model (each a small cluster of columns): integration toggles (`integration_kubernetes_enabled`, `integration_docker_enabled`, …), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled`, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
+Other notable areas on the model (each a small cluster of columns): integration toggles (`integration_kubernetes_enabled`, `integration_docker_enabled`, …), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled` — changes via the Tool Catalog are audited as an enabled/disabled diff, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
 
 ---
 
@@ -1378,6 +1405,15 @@ PEM private keys, JWTs, PSKs, API tokens, TSIG keys. Matched both by field
 name and by value shape, and removed in **every** mode including the
 unscrubbed one. There is no version of "let me read my own logs" that is
 improved by including the key that decrypts the database.
+
+The process environment (`system/env.txt`) is the exception to matching by
+name: a variable's **value** appears only when its name is on an allowlist
+of known non-secret settings (log level, timeouts, feature flags, versions,
+Kubernetes service links). Every other variable is listed with its value
+replaced, so the dump still shows what is set. Connection URLs such as
+`DATABASE_URL` and `REDIS_URL` are on the replaced side. The appliance
+diagnostic bundle applies the same rule to its env dumps and runs every
+file it contains, logs included, through the same secret-shape sweep.
 
 **Pseudonymise — identifiers.** IPs, hostnames, domains, MACs, usernames
 become stable synthetic values, so the archive stays *readable*:

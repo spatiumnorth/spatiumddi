@@ -54,6 +54,7 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dns_server_channel, publish_wake
 from app.core.redis_client import make_async_redis, make_sync_redis
+from app.core.task_attempts import count_delivery
 from app.db import task_session
 from app.drivers.dns import AGENTLESS_DRIVERS
 from app.models.dns import DNSServer
@@ -77,6 +78,11 @@ SLOT_RETRY_SECONDS = 2
 # enqueue (a change bumps it immediately); the sweep does not spin on it.
 SWEEP_FAILED_BACKOFF = timedelta(minutes=5)
 SWEEP_MAX_PER_TICK = 500
+# How many times one render message may be delivered (#2271). A render whose
+# worker is killed (OOM) is requeued by ``reject_on_worker_lost``; past this
+# the render is recorded as failed instead, and ``SWEEP_FAILED_BACKOFF``
+# paces the next attempt rather than the workers taking turns to die on it.
+MAX_RENDER_DELIVERIES = 3
 _CONNECT_TIMEOUT = 2.0
 
 # Release a key only while it still holds this holder's token. A lease can
@@ -339,6 +345,41 @@ async def _run(server_id_text: str, lock_token: str | None = None) -> dict[str, 
     return result
 
 
+async def _run_bounded(
+    server_id_text: str, lock_token: str | None, task_id: str | None
+) -> dict[str, Any]:
+    """``_run`` behind the delivery bound (#2271).
+
+    A redelivery of this message means the worker holding it died without
+    acking — for a render, most likely the OOM killer. Past
+    ``MAX_RENDER_DELIVERIES`` stop rendering and record the failure, which
+    is what the graceful path would have done had the process survived.
+    """
+    deliveries = await count_delivery(TASK_RENDER, task_id)
+    if deliveries is not None and deliveries > MAX_RENDER_DELIVERIES:
+        try:
+            server_id = uuid.UUID(server_id_text)
+            async with task_session() as db:
+                await record_failure(
+                    db,
+                    server_id,
+                    f"render abandoned: message delivered {deliveries} times — the worker "
+                    "was lost mid-render each time (out of memory?)",
+                )
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("dns_agent_bundle_record_failure_failed", server_id=server_id_text)
+        logger.error(
+            "dns_agent_bundle_render_abandoned",
+            server_id=server_id_text,
+            task_id=task_id,
+            deliveries=deliveries,
+            limit=MAX_RENDER_DELIVERIES,
+        )
+        return {"status": "abandoned", "deliveries": deliveries}
+    return await _run(server_id_text, lock_token=lock_token)
+
+
 @celery_app.task(
     name=TASK_RENDER,
     bind=True,
@@ -354,7 +395,13 @@ def render_dns_bundle(  # type: ignore[type-arg]
     ``lock_token``: set only on the retry of a render that was deferred for
     the fleet slot — the server's lock still holds it.
     """
-    result = asyncio.run(_run(server_id, lock_token=lock_token))
+    result = asyncio.run(
+        _run_bounded(
+            server_id,
+            lock_token,
+            getattr(getattr(self, "request", None), "id", None),
+        )
+    )
     token = result.pop("lock_token", None)
     if result.get("status") == "deferred":
         render_dns_bundle.apply_async(
