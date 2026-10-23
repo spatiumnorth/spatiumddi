@@ -40,7 +40,7 @@ from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.core.security import generate_api_token
 from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
-from app.models.auth import APIToken
+from app.models.auth import APIToken, User
 from app.models.dns import DNSZone
 from app.models.ipam import Subnet
 from app.services.api_token_scopes import validate_resource_grant_shape, validate_scopes
@@ -104,6 +104,10 @@ class ApiTokenResponse(BaseModel):
     scopes: list[str] = Field(default_factory=list)
     resource_grants: list[dict] = Field(default_factory=list)
     user_id: uuid.UUID | None
+    # Whose token this is (#2443). Filled by the list endpoint, which a
+    # superadmin sees across users; None elsewhere or for an ownerless token.
+    owner_username: str | None = None
+    owner_display_name: str | None = None
     expires_at: datetime | None
     last_used_at: datetime | None
     is_active: bool
@@ -224,12 +228,23 @@ class EnrolmentContext(BaseModel):
 
 
 @router.get("", response_model=list[ApiTokenResponse])
-async def list_tokens(db: DB, current_user: CurrentUser) -> list[APIToken]:
-    """List tokens owned by the caller. Superadmin sees everyone's."""
-    stmt = select(APIToken).order_by(APIToken.created_at.desc())
+async def list_tokens(db: DB, current_user: CurrentUser) -> list[ApiTokenResponse]:
+    """List tokens owned by the caller. Superadmin sees everyone's, each
+    row naming its owner."""
+    stmt = (
+        select(APIToken, User.username, User.display_name)
+        .outerjoin(User, User.id == APIToken.user_id)
+        .order_by(APIToken.created_at.desc())
+    )
     if not is_effective_superadmin(current_user):
         stmt = stmt.where(APIToken.user_id == current_user.id)
-    return list((await db.execute(stmt)).scalars().all())
+    out: list[ApiTokenResponse] = []
+    for token, username, display_name in (await db.execute(stmt)).all():
+        row = ApiTokenResponse.model_validate(token)
+        row.owner_username = username
+        row.owner_display_name = display_name or None
+        out.append(row)
+    return out
 
 
 @router.post("", response_model=ApiTokenCreateResponse, status_code=201)
@@ -255,6 +270,11 @@ async def create_token(
     # entropy to be useful to an attacker.
     display_prefix = raw[:10]
     expires_at = _resolve_expiry(body)
+    if expires_at is not None and expires_at <= datetime.now(UTC):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="expires_at must be in the future",
+        )
     # Resource grants (#374): existence + "can't exceed yourself" checks.
     await _validate_resource_grants(db, current_user, body.resource_grants)
     token = APIToken(
