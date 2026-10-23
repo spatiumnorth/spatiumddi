@@ -178,7 +178,7 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     fixture; doing it globally fixes the whole class.
     """
     from app.api import health
-    from app.core import maintenance_mode
+    from app.core import maintenance_mode, session_idle
     from app.services import feature_modules
     from app.services.appliance import cluster_health
     from app.services.dns import tld_registry
@@ -196,8 +196,11 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     cluster_health.invalidate_probe_cache()
     # GHSA-c58p-8cq9-g3gm — /health/platform caches its Celery worker ping.
     health.invalidate_worker_ping_cache()
+    # The idle-session timeout is cached the same way.
+    session_idle.invalidate_cache()
     yield
     maintenance_mode.invalidate_cache()
+    session_idle.invalidate_cache()
     feature_modules.invalidate_cache()
     tld_registry.invalidate_effective_cache()
     cluster_health.invalidate_probe_cache()

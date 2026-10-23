@@ -60,7 +60,7 @@ import structlog
 from sqlalchemy import select, text
 
 from app.config import settings
-from app.core.versions import includes_release, parse_release
+from app.core.versions import canonical_version, includes_release, parse_release
 from app.db import AsyncSessionLocal
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
@@ -681,7 +681,7 @@ def check_version_path(
       and patch jumps never warn (#1182). The switch from CalVer to
       SemVer is never a skip.
     """
-    current = current_version or settings.version or "dev"
+    current = current_version or canonical_version(settings.version, settings.app_version) or "dev"
     base_detail: dict[str, Any] = {"current": current, "target": target_version}
     target = parse_release(target_version)
     if target is None:
@@ -1009,7 +1009,7 @@ async def run_all(
         overall = "ok"
     return PreflightReport(
         target_version=target_version,
-        current_version=settings.version or "dev",
+        current_version=canonical_version(settings.version, settings.app_version) or "dev",
         overall=overall,
         can_start=overall != "fail",
         results=results,

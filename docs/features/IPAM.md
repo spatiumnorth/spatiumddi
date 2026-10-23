@@ -80,8 +80,8 @@ Subnet
   -- Status / Metadata
   status: enum(active, deprecated, reserved, quarantine)
   utilization_percent: float (computed)
-  total_ips: int (computed)
-  allocated_ips: int (computed)
+  total_ips: int (computed — usable addresses; IPv4 network + broadcast excluded)
+  allocated_ips: int (computed — non-available rows, excluding the IPv4 network / broadcast placeholders, so allocated ≤ total)
   
   -- Custom Fields (see section 6)
   custom_fields: JSONB
@@ -1924,15 +1924,24 @@ confirmation gates and pg advisory locks held through commit:
   subnet into 2^k aligned children at a longer prefix. Preview
   reports the prospective children + any IP-address conflicts
   (rows that wouldn't fit cleanly into one child or the other);
-  commit refuses if the typed CIDR doesn't match. Service in
-  `app.services.ipam.subnet_split`.
+  commit refuses if the typed CIDR doesn't match. Children inherit
+  the parent's compliance and discovery settings (PCI / HIPAA scope,
+  internet-facing, role, do-not-probe, kind, customer, site, discovery
+  and split-horizon); integration ownership and import provenance are
+  not carried, and the preview warns when the parent has any. Service
+  in `app.services.ipam.subnet_split`.
 
 - `POST /ipam/subnets/{id}/merge/preview` + `/commit` — collapse
   contiguous siblings back into one supernet via
   `ipaddress.collapse_addresses`. Preview reports the prospective
   merged CIDR + any conflicts. Single-source gateways are
   preserved; differing source gateways are nulled (operator must
-  re-set). Service in `app.services.ipam.subnet_merge`.
+  re-set). PCI scope, HIPAA scope, internet-facing and do-not-probe
+  are the safe union (true when any source has it, and the preview
+  says so); sources that disagree on kind, customer or site are a
+  conflict; any other disagreeing setting (role, discovery, ...) is a
+  preview warning and the target's value is kept. Service in
+  `app.services.ipam.subnet_merge`.
 
 UI surfaces all three on the subnet-detail header, *and* via the
 bulk-action toolbar on the block- and space-level subnet tables:
