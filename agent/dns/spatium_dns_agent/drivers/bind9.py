@@ -232,6 +232,25 @@ def _render_allow_update(zone: dict[str, Any], group_key_name: str | None) -> st
     return f'allow-update {{ {" ".join(items)} }}; '
 
 
+def _dedupe_key_names(keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the first key per BIND-normalised name (case-folded, no trailing dot).
+
+    Two ``key`` statements for one name are a redefinition: ``named-checkconf``
+    rejects the file and the whole bundle is declined (#2295). The control plane
+    refuses the clash and dedupes the bundle; this covers an older control plane.
+    """
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for k in keys:
+        norm = str(k.get("name", "")).strip().lower().rstrip(".")
+        if norm in seen:
+            log.warning("tsig_key_duplicate_skipped", key=k.get("name"))
+            continue
+        seen.add(norm)
+        out.append(k)
+    return out
+
+
 def _transfer_key_grants(tsig_keys: list[dict[str, Any]]) -> list[str]:
     """``key "name";`` items for every TSIG key in the bundle (issue #734).
 
@@ -2022,7 +2041,7 @@ class Bind9Driver(DriverBase):
             if str(opts.get("forward_policy", "first")).lower() == "only":
                 fwd_block += "    forward only;\n"
 
-        tsig_keys = bundle.get("tsig_keys") or []
+        tsig_keys = _dedupe_key_names(bundle.get("tsig_keys") or [])
         tsig_key_name = tsig_keys[0]["name"] if tsig_keys else None
         # Derived from ``state_dir``, not hardcoded (#920). AGENT_STATE_DIR is
         # an honoured override and every other path the config points at —
