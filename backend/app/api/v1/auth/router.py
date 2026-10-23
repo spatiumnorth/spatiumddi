@@ -19,6 +19,7 @@ from sqlalchemy import select, update
 
 from app.api.deps import DB, CurrentUser
 from app.api.stepup import refuse_if_stepup_blocked
+from app.api.token_binding import honours_token_binding
 from app.config import settings
 from app.core.auth.ldap import LDAPServiceError, authenticate_ldap
 from app.core.auth.oidc import OIDCConfig, OIDCServiceError
@@ -73,6 +74,7 @@ from app.core.security import (
     hash_refresh_token,
     verify_password,
 )
+from app.core.session_idle import get_session_timeout_minutes, is_idle_expired, last_activity
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
 from app.models.auth_provider import PASSWORD_PROVIDER_TYPES, AuthProvider
@@ -878,7 +880,12 @@ async def refresh_token_endpoint(request: Request, response: Response, db: DB) -
         .where(UserSession.expires_at > datetime.now(UTC))
     )
     session = result.scalar_one_or_none()
-    if session is None:
+    # A session idle past the configured Session Timeout cannot be renewed:
+    # the refresh cookie outlives the access token, so this is the gate that
+    # actually ends an abandoned session.
+    if session is None or is_idle_expired(
+        session, await get_session_timeout_minutes(db), datetime.now(UTC)
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token"
         )
@@ -909,7 +916,11 @@ async def refresh_token_endpoint(request: Request, response: Response, db: DB) -
         # looking recent. It is also what the session viewer means by
         # "created" — when that person signed in.
         created_at=session.created_at,
-        last_seen_at=now,
+        # Carried across as well, for the same kind of reason: the console
+        # refreshes on its own whenever the access token expires, so a
+        # refresh says nothing about whether anyone is at the keyboard.
+        # Restamping here would reset the idle timeout every 15 minutes.
+        last_seen_at=last_activity(session),
         expires_at=now + timedelta(days=settings.refresh_token_expire_days),
     )
     db.add(new_session)
@@ -1073,6 +1084,7 @@ async def logout(current_user: CurrentUser, response: Response, db: DB) -> None:
 
 
 @router.get("/me", response_model=UserResponse)
+@honours_token_binding
 async def get_me(current_user: CurrentUser) -> UserResponse:
     # #351 — ``is_superadmin`` here reports the *effective* status (the legacy
     # column OR a group → Superadmin-role ``{*, *}`` wildcard), NOT the raw
@@ -1096,6 +1108,7 @@ async def get_me(current_user: CurrentUser) -> UserResponse:
 
 
 @router.get("/me/permissions", response_model=MyPermissionsResponse)
+@honours_token_binding
 async def get_my_permissions(current_user: CurrentUser) -> MyPermissionsResponse:
     """Return the calling credential's effective permission grants (issue #449).
 

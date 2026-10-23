@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { humanTime } from "../network/_shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
@@ -19,6 +20,7 @@ import {
   type DNSServerGroup,
   type DNSZone,
   type SiteRead,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import {
@@ -354,9 +356,7 @@ function MemberRow({ member }: { member: DNSPoolMember }) {
         </div>
       </td>
       <td className="py-1.5 text-muted-foreground">
-        {member.last_check_at
-          ? new Date(member.last_check_at).toLocaleTimeString()
-          : "—"}
+        {member.last_check_at ? humanTime(member.last_check_at) : "—"}
       </td>
       <td
         className="max-w-md truncate py-1.5 text-muted-foreground"
@@ -553,8 +553,7 @@ export function PoolModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const e = err as { response?: { data?: { detail?: string } } };
-      setError(e?.response?.data?.detail ?? "Failed to save pool");
+      setError(formatApiError(err, "Failed to save pool"));
     },
   });
 

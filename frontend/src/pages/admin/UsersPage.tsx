@@ -28,6 +28,16 @@ import { Modal } from "@/components/ui/modal";
 import { StepUpSection } from "@/components/StepUpSection";
 import { stepUpBody } from "@/lib/stepup";
 
+/**
+ * A refused user dialog says what is wrong in words (#2435). A 422's detail
+ * is an array of field errors, which used to be printed as raw JSON; and
+ * pydantic prefixes a validator's message with "Value error, ", which names
+ * nothing the reader can act on.
+ */
+function userDialogError(err: unknown, fallback: string): string {
+  return formatApiError(err, fallback).replace(/(^|: |; )Value error, /g, "$1");
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const inputCls =
@@ -89,10 +99,7 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
       onClose();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to create user";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(userDialogError(err, "Failed to create user"));
     },
   });
 
@@ -243,10 +250,7 @@ function EditUserModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to update";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(userDialogError(err, "Failed to update"));
     },
   });
 
@@ -345,10 +349,7 @@ function ProviderLink({ user }: { user: AppUser }) {
       qc.invalidateQueries({ queryKey: ["users"] });
     },
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to link";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(userDialogError(err, "Failed to link"));
     },
   });
   // ``user`` is the modal's snapshot, so after a link read the provider
@@ -430,10 +431,7 @@ function ResetPasswordModal({
       ),
     onSuccess: onClose,
     onError: (err: unknown) => {
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to reset password";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      setError(userDialogError(err, "Failed to reset password"));
     },
   });
 

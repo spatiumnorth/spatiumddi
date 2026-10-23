@@ -38,6 +38,7 @@ from app.db import task_connect_args
 from app.models.wol_schedule import WolCalendar
 from app.services.feature_modules import get_enabled_modules
 from app.services.wol_scheduler.calendar_sync import sync_calendar
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -111,6 +112,7 @@ async def _sync_one(calendar_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.wol_calendar.sweep_wol_calendars", bind=True)
+@module_gated("tools.wake_scheduler")
 def sweep_wol_calendars(self: object) -> dict[str, Any]:  # noqa: ARG001
     result = asyncio.run(_sweep())
     if result.get("synced") or result.get("errors"):

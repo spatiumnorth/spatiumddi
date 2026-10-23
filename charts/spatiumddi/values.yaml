@@ -112,6 +112,22 @@ api:
   service:
     type: ClusterIP
     port: 8000
+    # #1805 — "" (the default) renders no field: kube-proxy spreads every
+    # caller's connections over every api pod, as before #1805.
+    # PreferSameNode sends a node's connections to the api pod on that node
+    # while it is ready, and to all api pods only while it is not; a node
+    # with no api pod of its own keeps the spread. The appliance sets it in
+    # its own values (firstboot's spatium-control HelmChart and the seed
+    # supervisor's HelmChartConfig): it runs one api pod per control-plane
+    # node, and a node lost hard keeps its api pod listed until the node
+    # reads NotReady (about 40 s), so without it a share of every other
+    # node's requests (the supervisor's heartbeat, the DNS and DHCP agents,
+    # the frontend's /api proxy) hung there until the caller's own timeout.
+    # On other clusters it pins every caller on a node that runs an api pod
+    # to that one pod, which can leave the other api pods idle and the HPA
+    # reacting late. Rendered on Kubernetes 1.34+, where the PreferSameNode
+    # feature is on by default; older API servers refuse the value.
+    trafficDistribution: ""
   autoscaling:
     enabled: true
     minReplicas: 2
@@ -923,6 +939,15 @@ dnsAgents:
   agentKey:
     existingSecret: ""           # external secret with key DNS_AGENT_KEY
     value: ""
+  # #2223 — how long a server may take to start listening on :53 before it
+  # is restarted; the liveness probe (:53, 3 x 30 s) only starts after it.
+  # A cold start renders and checks every zone before the daemon starts:
+  # measured with BIND 9.20, named-checkzone costs ~70 ms a zone, so 20,000
+  # zones take ~23 minutes on a release without #2180's batched checks.
+  # 10 s x 360 = 60 minutes. Per server: servers[].startupProbe.
+  startupProbe:
+    periodSeconds: 10
+    failureThreshold: 360
   servers: []
     # - name: ns1
     #   flavor: bind9            # bind9 (default) | powerdns | technitium
@@ -949,7 +974,11 @@ dnsAgents:
     #   # 512Mi is for a group with NO blocklists. One catalog feed (AdGuard DNS
     #   # filter, ~186k entries) needs roughly 1 GB while an apply is in flight
     #   # (estimate): size the limit from docs/features/DNS.md section 8.0
-    #   # before subscribing.
+    #   # before subscribing. Zone data needs it too (#2223, measured): about
+    #   # 1.5 kB per record for named and the agent while it takes a bundle,
+    #   # so 512Mi is a few hundred thousand records at most, and a million
+    #   # records in 20,000 zones peaked at ~1.35 GB. With no `resources` set
+    #   # the server gets the 2Gi default limit.
     #   resources:
     #     requests: { cpu: 100m, memory: 128Mi }
     #     limits:   { cpu: 500m, memory: 512Mi }

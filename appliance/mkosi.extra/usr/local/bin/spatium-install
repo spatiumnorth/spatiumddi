@@ -4077,6 +4077,54 @@ _save_install_logs() {
     return 0
 }
 
+# #2256 — copy the live root onto the target.
+#
+# Two halves, both needed:
+#
+# 1. The excludes. /var/lib/rancher/k3s/data/ is k3s's own self-extraction
+#    area: the binary unpacks its bundled tools into <hash>-tmp/ on ANY
+#    invocation (even `k3s kubectl`) and renames it to <hash> when done.
+#    It is runtime state the installed system regenerates on its first
+#    k3s start, and nothing is baked there (the image bakes only
+#    agent/images/, which stays copied) — so copying it can only ever
+#    carry a half-extracted tree k3s then trusts, or race the extraction.
+# 2. Exit 24. rsync says "some files vanished before they could be
+#    transferred" for anything deleted between the file-list scan and the
+#    read; on a live root that is by definition transient churn, so it is
+#    logged and accepted — for THIS copy only. Every other non-zero exit
+#    (23 partial transfer, 11 disk full, ...) still fails, and the caller's
+#    pipefail + set -e aborts the install. Not a blanket ignore.
+#
+# SRC / DEST default to the real thing; they are parameters so the tests
+# can run this against a stub rsync.
+_copy_live_root() {
+    local _rc=0
+    rsync -aAXH --info=progress2 \
+        --exclude="/dev/*" \
+        --exclude="/proc/*" \
+        --exclude="/sys/*" \
+        --exclude="/tmp/*" \
+        --exclude="/run/*" \
+        --exclude="/mnt/*" \
+        --exclude="/media/*" \
+        --exclude="/lib/live" \
+        --exclude="/var/log/*" \
+        --exclude="/var/cache/apt/archives/*" \
+        --exclude="/var/lib/rancher/k3s/data/*" \
+        --exclude="/var/lib/spatiumddi/firstboot.done" \
+        --exclude="/var/lib/spatiumddi/swapfile" \
+        --exclude="/etc/spatiumddi/.env" \
+        --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
+        --exclude="/etc/ssh/ssh_host_*" \
+        --exclude="/etc/issue.d/zz-spatium-live.issue" \
+        "${LIVE_ROOT_SRC:-/}" "${MOUNT}/" 2>> "$INSTALL_LOG" || _rc=$?
+    if [ "$_rc" -eq 24 ]; then
+        log "rsync exit 24 (some files vanished during the live-root copy) - treated as success"
+        return 0
+    fi
+    return "$_rc"
+}
+
 do_install() {
     # #1026 — refuse an unbootable architecture/firmware pairing before
     # the disk is touched. Both the wizard and the headless preseed path
@@ -4504,24 +4552,7 @@ EOF
         # whiptail --gauge — so the blocks go straight out and rsync's own
         # stderr goes to the log. Only emit on a CHANGE, or the protocol
         # is flooded with thousands of identical blocks.
-        rsync -aAXH --info=progress2 \
-            --exclude="/dev/*" \
-            --exclude="/proc/*" \
-            --exclude="/sys/*" \
-            --exclude="/tmp/*" \
-            --exclude="/run/*" \
-            --exclude="/mnt/*" \
-            --exclude="/media/*" \
-            --exclude="/lib/live" \
-            --exclude="/var/log/*" \
-            --exclude="/var/cache/apt/archives/*" \
-            --exclude="/var/lib/spatiumddi/firstboot.done" \
-            --exclude="/var/lib/spatiumddi/swapfile" \
-            --exclude="/etc/spatiumddi/.env" \
-            --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
-            --exclude="/etc/ssh/ssh_host_*" \
-            --exclude="/etc/issue.d/zz-spatium-live.issue" \
-            / "$MOUNT/" 2>> "$INSTALL_LOG" \
+        _copy_live_root \
             | { _last=-1
                 while IFS= read -r -d $'\r' _line || [ -n "$_line" ]; do
                     case "$_line" in
