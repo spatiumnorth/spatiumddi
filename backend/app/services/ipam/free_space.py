@@ -68,10 +68,9 @@ class FreeSpaceCandidate:
     parent_block_id: uuid.UUID
     parent_block_cidr: str
     free_addresses: int | None = None
-    """Populated only when the caller passed ``min_free_addresses`` AND
-    the candidate already exists as a Subnet row. Otherwise None — a
-    free CIDR that hasn't been turned into a subnet yet has no
-    "allocated_ips" to subtract from."""
+    """Usable addresses in the candidate. A candidate is wholly free, so
+    this is its full host count (network/broadcast excluded for IPv4
+    shorter than /31). Always populated; ``min_free_addresses`` filters on it."""
 
 
 @dataclass
@@ -81,6 +80,13 @@ class FreeSpaceResult:
     """Free-form metadata — currently carries ``warning`` for the empty-
     space case and ``blocks_scanned`` / ``candidates_emitted`` counters
     so operators can tell why they got fewer rows than they asked for."""
+
+
+def _usable_addresses(net: IPNetwork) -> int:
+    n = net.num_addresses
+    if isinstance(net, ipaddress.IPv4Network) and net.prefixlen < 31:
+        n -= 2
+    return min(n, 2**63 - 1)
 
 
 def _validate_prefix(prefix_length: int, address_family: int) -> str | None:
@@ -288,7 +294,7 @@ async def find_free_space(
         if prefix_length < block_net.prefixlen:
             continue
 
-        occupants, subnet_by_cidr = await _direct_child_cidrs(db, block)
+        occupants, _ = await _direct_child_cidrs(db, block)
         remaining = cap - len(candidates)
         for cand in _candidates_for_block(block_net, occupants, prefix_length, remaining):
             cand_str = str(cand)
@@ -299,18 +305,12 @@ async def find_free_space(
                 continue
             seen_cidrs.add(cand_str)
 
-            free_addresses: int | None = None
-            if min_free_addresses is not None:
-                # Only count subnets that *exist*. A candidate that's
-                # entirely free hasn't been allocated yet, so there's no
-                # "free addresses" in the sense the caller means.
-                existing = subnet_by_cidr.get(cand_str)
-                if existing is None:
-                    continue
-                fa = max(0, int(existing.total_ips) - int(existing.allocated_ips))
-                if fa < min_free_addresses:
-                    continue
-                free_addresses = fa
+            # A free CIDR is wholly unallocated, so every usable address in
+            # it is free (same host count a Subnet row would carry as
+            # total_ips: network/broadcast excluded for IPv4 < /31).
+            free_addresses = _usable_addresses(cand)
+            if min_free_addresses is not None and free_addresses < min_free_addresses:
+                continue
 
             candidates.append(
                 FreeSpaceCandidate(

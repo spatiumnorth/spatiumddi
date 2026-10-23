@@ -187,8 +187,8 @@ class BackupTargetCreate(BaseModel):
     passphrase: str = Field(..., min_length=8, max_length=512)
     passphrase_hint: str = Field("", max_length=200)
     schedule_cron: str | None = Field(default=None, max_length=120)
-    retention_keep_last_n: int | None = Field(default=None, ge=0, le=10_000)
-    retention_keep_days: int | None = Field(default=None, ge=0, le=10_000)
+    retention_keep_last_n: int | None = Field(default=None, ge=1, le=10_000)
+    retention_keep_days: int | None = Field(default=None, ge=1, le=10_000)
     write_only: bool = False
 
     @field_validator("kind")
@@ -215,8 +215,8 @@ class BackupTargetUpdate(BaseModel):
     passphrase: str | None = Field(default=None, min_length=8, max_length=512)
     passphrase_hint: str | None = None
     schedule_cron: str | None = None
-    retention_keep_last_n: int | None = Field(default=None, ge=0, le=10_000)
-    retention_keep_days: int | None = Field(default=None, ge=0, le=10_000)
+    retention_keep_last_n: int | None = Field(default=None, ge=1, le=10_000)
+    retention_keep_days: int | None = Field(default=None, ge=1, le=10_000)
     write_only: bool | None = None
     drill_enabled: bool | None = None
     drill_cron: str | None = None
@@ -616,6 +616,8 @@ class RunNowResponse(BaseModel):
     error: str | None
     # The node whose pod wrote the archive (#1838); null off the appliance.
     node_name: str | None = None
+    # Set when the archive was written but the retention sweep failed.
+    retention_failure_category: str | None = None
 
 
 @router.post("/{target_id}/run-now", response_model=RunNowResponse)
@@ -1077,6 +1079,7 @@ async def restore_from_archive(
                     "cascade_widened_tables": outcome.cascade_widened_tables,
                     "allow_newer_schema": body.allow_newer_schema,
                     "warnings": outcome.warnings,
+                    "reconciled_backup_targets": outcome.reconciled_backup_targets,
                 },
             )
         )

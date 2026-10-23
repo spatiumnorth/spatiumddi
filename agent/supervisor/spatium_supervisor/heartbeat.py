@@ -346,13 +346,19 @@ _stranded_pending: set[str] = set()
 _mirror_claims_owed: dict[str, dict] = {}
 
 # #2404: what the Redis reclaim (_reclaim_stranded_redis) keeps between seed
-# ticks. The hostnames a failed sweep still owes, handed back as evicted names
-# next tick (as ``_stranded_pending`` is for Postgres), so an outage drops no
-# eviction; and the failures logged since the last clean sweep, so one that
-# repeats tick after tick is logged once. A restart forgets both, and the sweep
-# needs neither to converge: it finds a stranded claim from the Node list.
+# ticks. The hostnames a failed sweep still owes, handed back next tick (as
+# ``_stranded_pending`` is for Postgres) and freed there while the Node list
+# still lacks them, so an outage drops no eviction and a node that rejoined
+# under the name keeps its replica; and the kinds of failure logged since the
+# last clean sweep (the request and its status, never the answer's body), so
+# one that repeats tick after tick is logged once. A restart forgets both, and
+# the sweep needs neither to converge: it finds a stranded claim from the Node
+# list.
 _redis_stranded_pending: set[str] = set()
 _redis_failures_logged: set[str] = set()
+# Review of #2433: the most kinds kept between clean sweeps. One more starts
+# them over, so the set cannot grow with an outage, however long.
+_REDIS_FAILURE_KINDS_KEPT = 8
 
 
 class _ReplaceHold:
@@ -512,14 +518,19 @@ def _carry_stranded(previous: set[str], evicted_now: list[str], outcome) -> set[
 def _reclaim_stranded_redis(evicted_now: list[str], log: structlog.stdlib.BoundLogger) -> None:
     """#590 / #2404: one seed tick of the Redis reclaim.
 
-    The names evicted this tick, and any a failed sweep left owed, go in as
-    authoritative; on any other tick the sweep looks for a claim pinned to a
-    node that is no longer a Node (``k8s_api.reclaim_stranded_redis_storage``).
-    A claim is logged as reclaimed once, on the tick its DELETE lands; a
-    failure is logged once per kind, until a sweep comes back clean."""
+    The names evicted this tick go in as authoritative, and any a failed
+    sweep left owed go in apart, to be freed only while the Node list still
+    lacks them (review of #2433); on any other tick the sweep looks for a
+    claim pinned to a node that is no longer a Node
+    (``k8s_api.reclaim_stranded_redis_storage``). A claim is logged as
+    reclaimed once, on the tick its DELETE lands; a failure is logged once
+    per kind (the request and its status, never the answer's body), until a
+    sweep comes back clean."""
     from . import k8s_api  # noqa: PLC0415
 
-    out = k8s_api.reclaim_stranded_redis_storage(set(evicted_now) | _redis_stranded_pending)
+    out = k8s_api.reclaim_stranded_redis_storage(
+        evicted_now, owed_nodes=set(_redis_stranded_pending)
+    )
     # Mutated in place, like _stranded_pending. As _carry_stranded does for
     # Postgres: a failed sweep keeps everything owed plus this tick's
     # evictions; a clean one owes nothing (a Redis claim is never deferred).
@@ -539,11 +550,18 @@ def _reclaim_stranded_redis(evicted_now: list[str], log: structlog.stdlib.BoundL
             # only when the PV is gone)
             affinity_source=dict(out.sources),
         )
-    if out.error is not None and out.error not in _redis_failures_logged:
-        _redis_failures_logged.add(out.error)
+    # Review of #2433: keyed on the kind, not the error text, which quotes the
+    # answer's body; an error that quotes none is its own kind.
+    kind = out.error_kind or out.error
+    if kind is not None and kind not in _redis_failures_logged:
+        if len(_redis_failures_logged) >= _REDIS_FAILURE_KINDS_KEPT:
+            _redis_failures_logged.clear()
+        _redis_failures_logged.add(kind)
         log.warning(
             "supervisor.heartbeat.redis_storage_reclaim_failed",
             error=out.error,
+            # what this line stands for until a sweep comes back clean
+            kind=kind,
             owed=sorted(_redis_stranded_pending),
         )
 
@@ -1528,12 +1546,13 @@ def heartbeat_once(
         # and claim on a live node once the claim is gone, and the replica
         # resyncs from the master (cache/broker data; Postgres is the store
         # of record). #2404: every seed tick, not only the eviction one. The
-        # names evicted THIS tick (and any a failed sweep left owed) go at
-        # once, and on any other tick a claim pinned to a node that is no
-        # longer a Node is found and freed while a Redis pod is Pending. So a
-        # failed answer, a Node removed another way, and an eviction a
-        # restarted supervisor never saw all converge; one read of the
-        # Pending pods per tick while Redis is whole.
+        # names evicted THIS tick go at once (and any a failed sweep left
+        # owed, while the Node list still lacks them), and on any other tick
+        # a claim pinned to a node that is no longer a Node is found and
+        # freed while a Redis pod is Pending. So a failed answer, a Node
+        # removed another way, and an eviction a restarted supervisor never
+        # saw all converge; one read of the Pending pods per tick while
+        # Redis is whole.
         _reclaim_stranded_redis(evicted_now, log)
 
         # #1058 — the deleted Node strands the CloudNativePG instance claim

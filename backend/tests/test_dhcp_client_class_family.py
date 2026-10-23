@@ -113,21 +113,21 @@ def test_a_kea_class_defined_in_both_blocks_imports_as_one_dual_class() -> None:
         "Dhcp4": {
             "subnet4": [],
             "client-classes": [
-                {"name": "known", "test": "member('KNOWN')", "option-data": []},
+                {"name": "known-hosts", "test": "member('KNOWN')", "option-data": []},
                 {"name": "split", "test": "member('A')"},
             ],
         },
         "Dhcp6": {
             "subnet6": [],
             "client-classes": [
-                {"name": "known", "test": "member('KNOWN')"},
+                {"name": "known-hosts", "test": "member('KNOWN')"},
                 {"name": "split", "test": "member('B')"},
             ],
         },
     }
     preview = parse_kea_config(json.dumps(cfg).encode())
     by = [(c.name, c.address_family, c.supported) for c in preview.client_classes]
-    assert by == [("known", "dual", True), ("split", "ipv4", True), ("split", "ipv6", False)]
+    assert by == [("known-hosts", "dual", True), ("split", "ipv4", True), ("split", "ipv6", False)]
 
 
 def test_the_bundle_carries_each_familys_options() -> None:
