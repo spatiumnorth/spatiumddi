@@ -336,6 +336,8 @@ DHCPPool
 > reservation state, and is served by the endpoints below (#913, corrected
 > in #917).
 
+**Range validation (#2500).** `start_ip` / `end_ip` must be valid IPs of the subnet's address family, `start_ip <= end_ip`, and both must lie inside the scope's subnet, for every range type (`dynamic`, `reserved`, `excluded`); otherwise the API answers 422 naming the subnet. Kea rejects a pool outside its subnet's prefix and the whole group stops converging. On update the merged range (stored row under the patch) is checked, but only when `start_ip` / `end_ip` is edited, so pools stored by the importers or the Windows topology pull (which write rows directly, not through this endpoint) stay editable for other fields.
+
 ### Pool occupancy over REST (issue #913)
 
 ```
