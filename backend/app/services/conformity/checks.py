@@ -788,15 +788,18 @@ async def check_no_lanwide_control_plane_ports(
     supervisor's peer-scoped drop-in is authoritative. Each node reports
     ``base_lanwide_k3s`` (True = still on the legacy LAN-wide base).
 
-    Verdict policy honours non-negotiable #5 — **never connectivity-FAIL**:
+    Verdict policy (#2259) — an unverified node is not a compliant node:
 
     * FAIL only on a CONFIRMED LAN-wide node (``base_lanwide_k3s is True``).
-    * Otherwise PASS. Nodes that are stale (no recent heartbeat, beyond
+    * WARN when any node is stale (no heartbeat inside
       ``args["stale_minutes"]`` — default 30) or unverified
-      (``base_lanwide_k3s is None``) report **PASS-stale** with a
-      diagnostic, rather than failing the compliance claim because the
-      control plane temporarily lost contact.
-    * No reporting appliance node → vacuously PASS.
+      (``base_lanwide_k3s is None``): "we don't know yet", the same
+      outcome ``no_open_ports`` uses. Never FAIL for lost contact, but
+      never PASS either — a PASS counts in ``pass_count`` and the PDF
+      pass percentage, and nothing was verified.
+    * NOT_APPLICABLE when no appliance node reports a base-conf marker
+      (Compose / plain k8s have none; there is nothing to assess).
+    * PASS only when every reporting node is hardened and fresh.
     """
     if target_kind != "platform":
         return CheckOutcome.not_applicable(
@@ -824,8 +827,8 @@ async def check_no_lanwide_control_plane_ports(
             {"lanwide_hosts": sorted(r.hostname for r in lanwide)},
         )
     if not rows:
-        return CheckOutcome.passed(
-            "no appliance node has reported a base-conf marker (vacuously compliant)",
+        return CheckOutcome.not_applicable(
+            "no appliance node has reported a base-conf marker — nothing to assess",
             {"reported": 0},
         )
     cutoff = now - timedelta(minutes=stale_minutes)
@@ -837,9 +840,9 @@ async def check_no_lanwide_control_plane_ports(
     stale = [r for r in rows if r.base_lanwide_k3s is False and _stale(r)]
     fresh = [r for r in rows if r.base_lanwide_k3s is False and not _stale(r)]
     if unknown or stale:
-        return CheckOutcome.passed(
+        return CheckOutcome.warn(
             f"{len(fresh)} node(s) confirmed hardened; {len(stale)} stale + "
-            f"{len(unknown)} unverified reported PASS-stale (no LAN-wide port confirmed)",
+            f"{len(unknown)} unverified — LAN-wide control-plane ports not confirmed absent",
             {
                 "hardened_fresh": sorted(r.hostname for r in fresh),
                 "stale": sorted(r.hostname for r in stale),
@@ -1966,7 +1969,7 @@ CHECK_CATALOG: list[dict[str, Any]] = [
                 "type": "int",
                 "required": False,
                 "default": 30,
-                "label": "Treat a node's report as stale after N minutes (PASS-stale, never FAIL)",
+                "label": "Treat a node's report as stale after N minutes (warn, never FAIL)",
             }
         ],
     },

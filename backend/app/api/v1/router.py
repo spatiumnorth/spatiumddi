@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 
-from app.api.token_path_scope import enforce_path_token_scope
+from app.api.token_path_scope import include_token_scoped
 from app.api.v1.acme import router as acme_router
 from app.api.v1.address_sets import router as address_sets_router
 from app.api.v1.admin.agent_keys import router as agent_keys_router
@@ -282,13 +282,16 @@ api_v1_router.include_router(
     tags=["dicom"],
     dependencies=[Depends(require_module("network.dicom"))],
 )
+# wake_publishing (#2040): an ERL or binding edit changes the DHCP options
+# 99 / 123 the agents render, so its handlers ``collect_wake`` the DHCP groups.
 api_v1_router.include_router(
     e911_router,
     prefix="/e911",
     tags=["e911"],
-    dependencies=[Depends(require_module("network.e911"))],
+    dependencies=[Depends(require_module("network.e911")), Depends(wake_publishing)],
 )
-api_v1_router.include_router(
+include_token_scoped(
+    api_v1_router,
     dns_router,
     prefix="/dns",
     tags=["dns"],
@@ -300,11 +303,7 @@ api_v1_router.include_router(
     # off (the gate answers 404, which re-bootstraps agents).
     # GHSA-46mq-mpwf-xxwv: a zone-scoped token is held to its zones on
     # every route keyed on {zone_id}, before any handler runs.
-    dependencies=[
-        Depends(require_module("core.dns")),
-        Depends(wake_publishing),
-        Depends(enforce_path_token_scope),
-    ],
+    dependencies=[Depends(require_module("core.dns")), Depends(wake_publishing)],
 )
 api_v1_router.include_router(dns_agents_router, prefix="/dns", tags=["dns-agents"])
 api_v1_router.include_router(
@@ -320,16 +319,13 @@ api_v1_router.include_router(
     tags=["dns-import"],
     dependencies=[Depends(require_module("dns.import")), Depends(wake_publishing)],
 )
-api_v1_router.include_router(
+include_token_scoped(
+    api_v1_router,
     dns_pool_router,
     prefix="/dns",
     tags=["dns-pools"],
     # #358 — GSLB pool reconcile calls enqueue_record_op; publish on commit.
-    dependencies=[
-        Depends(require_module("core.dns")),
-        Depends(wake_publishing),
-        Depends(enforce_path_token_scope),
-    ],
+    dependencies=[Depends(require_module("core.dns")), Depends(wake_publishing)],
 )
 api_v1_router.include_router(
     dns_tools_router,
@@ -368,14 +364,15 @@ api_v1_router.include_router(
 # path param and 422). Registering the static-prefix router first wins.
 api_v1_router.include_router(time_bound_grants_router, prefix="/groups", tags=["time-bound-grants"])
 api_v1_router.include_router(groups_router, prefix="/groups", tags=["groups"])
-api_v1_router.include_router(
+include_token_scoped(
+    api_v1_router,
     ipam_router,
     prefix="/ipam",
     tags=["ipam"],
     # #358 — IPAM→DNS auto-sync calls enqueue_record_op; publish on commit.
     # GHSA-46mq-mpwf-xxwv: a subnet-scoped token is held to its subnets on
     # every route keyed on {subnet_id} / {address_id}.
-    dependencies=[Depends(wake_publishing), Depends(enforce_path_token_scope)],
+    dependencies=[Depends(wake_publishing)],
 )
 api_v1_router.include_router(
     kubernetes_router,
@@ -440,9 +437,12 @@ api_v1_router.include_router(
     tags=["network"],
     dependencies=[Depends(require_module("network.device"))],
 )
+# wake_publishing (#2040): ``POST /new-devices/block`` creates dhcp_mac_block
+# rows and ``collect_wake``s their groups, which without a collector here was a
+# silent no-op — the block reached agents only on the safety tick.
 api_v1_router.include_router(
     new_devices_router,
-    dependencies=[Depends(require_module("security.new_device_watch"))],
+    dependencies=[Depends(require_module("security.new_device_watch")), Depends(wake_publishing)],
 )
 api_v1_router.include_router(
     block_sync_router,

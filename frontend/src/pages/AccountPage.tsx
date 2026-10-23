@@ -49,6 +49,7 @@ function PasswordPanel() {
         </p>
         <Link
           to="/change-password"
+          state={{ voluntary: true }}
           className="inline-flex rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
         >
           Change password…
