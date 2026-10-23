@@ -72,6 +72,7 @@ from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
 from app.services.dns.sync_check import (
+    address_own_forward_zone_id,
     forward_zone_ids_in_order,
     ipam_authors_zone,
     resolve_reverse_zone,
@@ -2032,6 +2033,10 @@ async def _sync_dns_record(
         return False
 
     zone = await db.get(DNSZone, effective_zone_id) if effective_zone_id else None
+    if zone is not None and zone.deleted_at is not None:
+        # ``db.get`` answers from the identity map without the soft-delete
+        # filter, so a zone trashed earlier in this session comes back (#2104).
+        zone = None
     if effective_zone_id and not zone:
         # Stale FK — primary zone deleted out from under us. Treat as
         # no-primary so the cleanup path still runs against extras.
@@ -7628,6 +7633,10 @@ async def _apply_dns_sync(
                     # #2072 — strict, so a name too long for its zone is
                     # reported in ``errors`` instead of counted as synced. The
                     # refusal comes before anything is written for this IP.
+                    # #2104 — the address's own zone (#493), which the drift
+                    # check judged it against. Passing none resolved the
+                    # subnet's zone and moved a host the operator had put in
+                    # another zone back into the subnet's.
                     # #2118 — an address whose own A / AAAA alias already
                     # serves its name is skipped there, not refused, so its
                     # missing PTR is still written.
@@ -7637,7 +7646,13 @@ async def _apply_dns_sync(
                     collector = _dns_op_collector.get()
                     ops_before = len(collector) if collector is not None else 0
                     await _sync_dns_record(
-                        db, ip, sn, action="create", strict=True, skip_own_alias=True
+                        db,
+                        ip,
+                        sn,
+                        zone_id=await address_own_forward_zone_id(db, ip),
+                        action="create",
+                        strict=True,
+                        skip_own_alias=True,
                     )
                     if collector is not None and len(collector) == ops_before:
                         continue
