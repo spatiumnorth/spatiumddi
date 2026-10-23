@@ -467,7 +467,9 @@ broke it.
 
 **A bundle the daemon dies on is not re-applied blindly either (#2019).**
 The quarantine only hears of failures the agent survives. A bundle too big
-for the container's memory limit (a large RPZ blocklist set) applies cleanly
+for the container's memory limit (a large RPZ blocklist set; on the appliance
+that limit is sized from node RAM, see `APPLIANCE.md` "Memory sizing for
+named") applies cleanly
 and then named is OOM-killed while it loads the zones; nothing is caught, and
 the agent used to re-apply that same cached bundle at every start, before
 its sync thread existed, so the server crash-looped even after the operator

@@ -693,7 +693,33 @@ def role_release_fingerprint(env_file: Path) -> str:
         f"image_tag={tag}\nchart_sha256={_chart_digest()}\n"
         f"control_plane_url={role_control_plane_url(env_vars)}\n"
         f"skip_tls_verify={cp_tls.skip_verify()}\n"
+        f"dns_bind9_memory={_dns_bind9_memory_key()}\n"
     )
+
+
+def _dns_bind9_memory_key() -> str:
+    """The dns-bind9 memory sizing as the role apply would render it (#2223),
+    for the skip key: a node joining or leaving the cluster can move the
+    smallest DNS node, with nothing in the role env changing. ``unknown`` when
+    the node list cannot be read (the compose path, or a kubeapi that is
+    down), which is stable, so it does not re-apply on every heartbeat."""
+    mib, _err = k8s_api.dns_sizing_memory_mib()
+    sized = k8s_api.dns_bind9_memory(mib)
+    return sized.get("limit", "unknown")
+
+
+def size_dns_bind9(values: dict[str, object], mem_mib: int | None) -> dict[str, object]:
+    """PURE — #2223: ``values`` with ``dnsBind9.memory`` sized from
+    ``mem_mib`` (see :func:`k8s_api.dns_bind9_memory`). Applied after the
+    #1439 keep, so a block kept on for another node is sized too. A block that
+    is off, or a size that is unknown, is left as it is."""
+    block = values.get("dnsBind9")
+    sized = k8s_api.dns_bind9_memory(mem_mib)
+    if not isinstance(block, dict) or block.get("enabled") is not True or not sized:
+        return values
+    out = dict(values)
+    out["dnsBind9"] = {**block, "memory": sized}
+    return out
 
 
 def role_label_diff(profiles: list[str]) -> dict[str, str | None]:
@@ -893,6 +919,21 @@ def apply_role_assignment(
             blocks=kept,
             reason="another node serves them",
         )
+
+    # #2223 — named's memory limit, sized from the smallest DNS node's RAM.
+    # Only when the DaemonSet renders: a DHCP-only node has nothing to size,
+    # and failing its apply over a node list it does not need would be wrong.
+    # An unknown read fails the apply (retried next heartbeat) rather than
+    # writing the chart without the sizing, which would put every DNS node
+    # back on the chart default and restart named cluster-wide.
+    if _agent_block_on(values, "dnsBind9"):
+        dns_mib, dns_err = k8s_api.dns_sizing_memory_mib()
+        if dns_mib is None:
+            return LifecycleResult(
+                state="failed",
+                reason=f"not writing the role chart: node memory unreadable ({dns_err})",
+            )
+        values = size_dns_bind9(values, dns_mib)
 
     try:
         chart_bytes = _read_chart_tarball()

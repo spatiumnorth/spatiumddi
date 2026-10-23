@@ -24,6 +24,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
+from app.core.agent_wake import collect_wake
 from app.core.dns_names import (
     MAX_NAME_LEN,
     bind_check_names_error,
@@ -69,6 +70,7 @@ from app.services.ai.operations_risky import (
     DeleteSubnetArgs,
 )
 from app.services.approvals.gate import gate_or_execute
+from app.services.dhcp.agent_wake_targets import dhcp_group_channels_for_subnets
 from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_ipam_row
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
@@ -6605,6 +6607,12 @@ async def update_subnet(
     if old_block_id != subnet.block_id:
         await _update_block_utilization(db, old_block_id)
         await _update_block_utilization(db, subnet.block_id)
+
+    # #2040 — the DHCP bundle reads this row (DNS servers + domain name for
+    # RA and the DHCPv6 domain search, VLAN + site for the E911 options), so
+    # wake every group serving a scope here. Stashed now, published by the
+    # router's ``wake_publishing`` after the commit below.
+    collect_wake(*await dhcp_group_channels_for_subnets(db, [subnet.id]))
 
     await db.commit()
     await db.refresh(subnet)

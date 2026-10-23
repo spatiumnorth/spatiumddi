@@ -3,6 +3,7 @@ import axios, {
   type AxiosInstance,
   type AxiosResponse,
 } from "axios";
+import { idleHeader } from "@/lib/activity";
 import { getAccessToken, setAccessToken } from "@/lib/authToken";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
@@ -28,6 +29,9 @@ function createClient(): AxiosInstance {
     const token = getAccessToken();
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
+      // How long the operator has been away, so a background poll does not
+      // count as activity for the Session Timeout (lib/activity.ts).
+      Object.assign(config.headers, idleHeader());
     }
     return config;
   });
@@ -4937,7 +4941,7 @@ export async function* streamChatTurn(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     body: JSON.stringify(body),
@@ -14073,7 +14077,7 @@ async function* _streamApplianceLogSse(
   const token = getAccessToken();
   const res = await fetch(url, {
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     signal,
@@ -14149,7 +14153,7 @@ export async function* streamClusterHealth(
   const token = getAccessToken();
   const res = await fetch("/api/v1/appliance/cluster/health/stream", {
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     signal,
@@ -16589,7 +16593,7 @@ export async function* streamNmapScan(
   const url = nmapApi.streamUrl(scanId);
   const res = await fetch(url, {
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     signal,

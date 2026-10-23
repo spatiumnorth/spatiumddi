@@ -1026,7 +1026,9 @@ The spool file needs free disk in the state directory for one bundle.
 
 Before #1725 the pod had no memory limit, so that peak was the node's: the
 kubelet evicted the worker, Postgres and the api, then the kernel killed
-named. The pod now carries a memory request (256Mi) and a limit (2Gi), so an
+named. The pod now carries a memory request and a limit (on the appliance
+sized from node RAM since #2223: a quarter of the smallest DNS node, 2Gi to
+8Gi, request an eighth of it; 2Gi / 256Mi on the other paths), so an
 overload kills named inside its own cgroup and leaves the control plane
 alone. That is a DNS outage on that node, not a platform outage, but it is
 still an outage: **size the limit for the lists you subscribe to.**
@@ -1069,10 +1071,11 @@ Entry counts are on each list after its first sync.
 
 Where to change it:
 
-- Appliance: `dnsBind9.resources` on the role chart, as a HelmChartConfig
+- Appliance: sized for you from node RAM (#2223); to pin it, set
+  `dnsBind9.resources.limits.memory` on the role chart, as a HelmChartConfig
   (see `docs/deployment/APPLIANCE.md`, "Memory sizing for named"). The limit
-  is one value for the whole cluster; the role chart renders the same on
-  every node.
+  is one value for the whole cluster, from its smallest DNS node; the role
+  chart renders the same on every node.
 - Umbrella chart: `dnsAgents.servers[].resources`.
 - Docker Compose: `DNS_BIND9_MEM_LIMIT` in `.env` (default `2g`).
 - Raw manifests: edit `k8s/dns/bind9-statefulset.yaml`.
@@ -1126,6 +1129,55 @@ lived) the bundle is quarantined and only retried on a backoff; on the
 appliance today the OOM kill takes the agent with named (#2018), so there the
 agent stops at syncing first and the kubelet backs off the crash loop. See `docs/deployment/DNS_AGENT.md` (last-known-good revert) for what
 serves meanwhile.
+
+**Many zones and many records (#2223).** The same container holds a large
+zone set the same way: named keeps every record in memory and the agent
+parses the whole bundle on each poll. Measured on a synthetic bundle of
+20,005 zones and 1,000,000 A / PTR records (a 126 MB bundle; the agent on
+Python 3.14, named 9.20.29):
+
+| | Measured |
+|---|---|
+| named, resident with every zone loaded | 868 MB (the scale lab saw 952 MB anon on its nodes) |
+| named, start to "all zones loaded" | about 5 s |
+| `named-checkzone`, per zone | about 70 ms, so ~23 min for every zone of a cold start, run one zone at a time |
+| agent, peak while it takes a bundle | 461 - 480 MB (was 682 - 713 MB, and 884 MB during a startup hold) |
+| agent, between polls | 95 - 116 MB (was 431 - 473 MB) |
+
+ddi-pg's scale lab hit this with 1M records in 20,000 zones on a 2Gi limit:
+5 of 7 `dns-bind9` containers were OOM-killed with the agent at 1.1 GB anon,
+and none came back. Four things in the agent made it that large, and are
+fixed: it parsed the cached bundle's whole text beside the objects it built
+(about 125 MB at this size); the zone list it keeps for the DNSSEC re-read
+and its per-zone serial map held on to the memory of every bundle it had
+parsed, because CPython returns memory to the system only in whole arenas
+(~370 MB that stayed resident between polls); a startup hold (#2019) kept
+the cached bundle parsed while the first fetch parsed the next one; and the
+ingest thread re-parsed the whole cache, records included, every 180 s
+after a change, which at a steady stream of record edits is every sweep, so
+it could overlap the sync loop's own parse (about 530 MB of its own).
+
+Rule of thumb for zone data, from those numbers: about 1 kB of named memory
+per record, plus about 0.5 kB per record for the agent while it takes a
+bundle, plus the resolver cache below if the group recurses. A million
+records is therefore about 1.35 GB before the cache, which fits a 2Gi
+limit only while the resolver cache stays well under its `512m` share; a
+group that serves that many records and also recurses for clients wants
+3Gi. On the appliance the limit is sized from node RAM (#2223: a quarter of
+the smallest DNS node, 2Gi to 8Gi), so a node of 12 GB or more gets 3Gi
+without any override, and 2M records want about 4Gi, a 16 GB node. These are measurements of one bundle shape (short names, A and PTR
+records), so treat them as a starting point rather than a guarantee.
+
+**A cold start takes a while, and the probes allow for it.** A restarted
+container renders and `named-checkzone`s every zone before named starts. At
+20,000 zones that is tens of minutes (see the table), and the liveness probe
+used to start checking :53 30 s after the container did, so it killed the
+container before named listened, on every attempt. The DNS containers now
+carry a startup probe on the same :53 check with a 60-minute budget (10 s x
+360); liveness and readiness start once it has passed. A daemon that never
+listens is still restarted, after the budget. Raise it for a larger group:
+`dns.startupProbe.failureThreshold` on the appliance role chart,
+`dnsAgents.startupProbe` (or `servers[].startupProbe`) on the umbrella chart.
 
 **Resolver cache.** BIND's `max-cache-size` sizes one cache, every view with
 recursion has its own, and the default is 90 % of physical memory for each:

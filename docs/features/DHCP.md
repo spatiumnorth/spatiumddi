@@ -814,8 +814,10 @@ DHCPMACBlock
 
 | Driver | Enforcement | Update mechanism |
 |---|---|---|
-| Kea | Packets matching the reserved `DROP` client class are silently dropped before allocation. The agent renders active blocks as `hexstring(pkt4.mac, ':') == '…'` OR-clauses inside `DROP.test`. | ConfigBundle — blocklist changes shift the bundle ETag; agent long-poll picks them up and re-renders. |
+| Kea | Packets matching the reserved `DROP` client class are silently dropped before allocation. The agent renders active blocks as `hexstring(pkt4.mac, ':') == '…'` OR-clauses inside `DROP.test`. On DHCPv6 scopes the same class is rendered best-effort (#2268), see below. | ConfigBundle — blocklist changes shift the bundle ETag; agent long-poll picks them up and re-renders. |
 | Windows DHCP | Server-level deny filter list (`Add-DhcpServerv4Filter -List Deny`). Deny filter is server-global — every scope on the server enforces it. | 60 s Celery beat task diffs desired-set against `Get-DhcpServerv4Filter -List Deny` and ships one batched PS script per WinRM round trip. |
+
+**What a MAC block can and cannot catch on DHCPv6.** A DHCPv6 packet has no hardware address field (Kea has no `pkt6.mac`), so the Dhcp6 `DROP` class derives the MAC from what the client sends: the link-layer address inside an Ethernet DUID-LL (type 3) or DUID-LLT (type 1) client-id, and the client link-layer address option (79, RFC 6939) that a first-hop relay may add (checked on both the innermost relay, which is the first hop, and the outermost, so a chain of relays is covered). It does **not** catch a client using DUID-EN or DUID-UUID, a DUID it randomised (many OSes generate a stable but non-MAC-derived DUID), a client that changes DUID, or a relayed packet whose relay adds no option 79. Treat the v6 block as a partial control: for a hard guarantee also block the device at the switch or router. Windows DHCP's deny filter is IPv4-only and does not apply to DHCPv6 scopes.
 
 Group-global is deliberate. Kea supports per-subnet via class/pool pinning; Windows doesn't support per-scope deny at all. A single "this device is bad, nowhere gets to serve it" rule is the usage pattern — per-scope precision is deferred until a concrete need surfaces.
 

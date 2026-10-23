@@ -128,6 +128,168 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A backup run in flight during a restore now records its end (#2353).**
+  A restore ends every other database session, the running backup's
+  included, so the run could not stamp its own result: the target stayed
+  "in progress" and Run now answered 409 until the 2 hour presumed-dead
+  reap. The runner now writes the terminal state and its audit row on a
+  fresh session when its own was closed under it. The write only lands
+  while the row still carries that run's claim, so it never overwrites a
+  newer run.
+
+- **The DHCP MAC blocklist is now enforced on DHCPv6 scopes, best
+  effort (#2268).** The reserved `DROP` client class was rendered into
+  Dhcp4 only, so a blocked (rogue / lost_stolen / quarantine) device
+  still got DHCPv6 leases. Kea has no `pkt6.mac` and a DHCPv6 packet
+  carries no hardware address, so the Dhcp6 `DROP` class matches the
+  MAC inside an Ethernet DUID-LL / DUID-LLT and the relay's RFC 6939
+  link-layer option (79). A client with a DUID-EN / DUID-UUID or a
+  randomised DUID, or behind a relay that adds no option 79, is not
+  caught. DHCP.md section 4a now says so; the rendered expression was
+  checked with `kea-dhcp6 -t` (Kea 3.0.3).
+
+- **BGP-mode MetalLB runs newer FRRouting and kube-rbac-proxy images
+  (#2239).** BGP mode is off by default, so only installs that turn
+  it on are affected. kube-rbac-proxy moves from v0.12.0 to v0.23.0.
+  The old build had 7 CRITICAL and 96 HIGH findings, including
+  CVE-2022-1996 (an auth bypass in go-restful), and it is the one
+  BGP-mode container with an authenticated listener. v0.23.0 has 4
+  HIGH and no CRITICAL. FRRouting moves from 10.4.1 to 10.4.5, on the
+  same 10.4 line, clearing the OpenSSL CRITICAL CVE-2026-31789 (2
+  CRITICAL and 21 HIGH findings before, 20 HIGH after). Both are
+  image-only changes: the MetalLB 0.15.3 chart stays, because
+  metallb/metallb#3063 is still open. The chart's kube-rbac-proxy
+  arguments still work on v0.23: it ignores `--logtostderr` and logs
+  a warning. Metrics still answer 401 without a token, 403 for an
+  account without `/metrics` access, and 200 for one with it.
+  **frr-k8s stays at v0.0.21**, with its 6 CRITICAL findings, and
+  that is deliberate. From v0.0.23 the frr-k8s binary serves its
+  metrics over HTTPS and watches a new FRRK8sConfiguration CRD, and
+  the frr-k8s templates inside the 0.15.3 chart support neither.
+  Verified on k3s 1.36: with v0.0.27 the controller cannot start its
+  manager, and the FRR container fails its plain-HTTP startup probe
+  with a 400. v0.0.22, the newest version those templates can run,
+  scans the same as v0.0.21. Fixing frr-k8s needs a chart change,
+  not an image bump. That change would also remove the
+  kube-rbac-proxy sidecars.
+
+- **A DNS server holding a million records no longer OOM-kills
+  itself, and a restarted one comes back (#2223).** ddi-pg's scale
+  lab ran 1,000,000 records in 20,000 zones on 7 nodes: 5
+  `dns-bind9` containers were OOM-killed at their 2Gi limit with
+  the agent at 1.1 GB, and none recovered, because the `:53`
+  liveness probe started 30 s after the container did and killed it
+  before named listened. Two fixes. The DNS containers in both
+  charts (bind9, PowerDNS, Technitium) gain a startup probe on the
+  same `:53` check with a 60-minute budget, which liveness and
+  readiness wait for: a cold start at that size checks every zone
+  file first (~70 ms each, measured), so it takes tens of minutes.
+  A daemon that never listens is still restarted, after the budget;
+  `dns.startupProbe` / `dnsAgents.startupProbe` raise it. And the
+  agent's memory: measured on a synthetic bundle of that shape (126
+  MB), its peak while taking a bundle fell from ~700 MB to ~480 MB,
+  from 884 MB to 461 MB during a startup hold, and what it keeps
+  between polls from ~450 MB to ~110 MB. The bundle is parsed
+  a zone at a time instead of from its whole text; the zone list
+  kept for the DNSSEC re-read, the per-zone serial map and the
+  startup report are kept as compact JSON, because as parsed objects
+  they held most of the freed bundle resident (CPython returns
+  memory an arena at a time); a startup hold (#2019) keeps the held
+  bundle as a hard link on disk rather than parsed; and the ingest
+  thread reads the zone list without the records, where it re-parsed
+  the whole cache every 180 s after a change, beside the sync
+  loop's own parse. And on the appliance the `dns-bind9` memory
+  limit is no longer a fixed 2Gi, which the lab hit at about 2M
+  records: the supervisor sizes it from node RAM, a quarter of the
+  smallest node labelled for dns-bind9, rounded to whole GiB, floor
+  2Gi, cap 8Gi, with the request an eighth of it as before (so 4 GB
+  → 2Gi / 256Mi, 16 GB → 4Gi / 512Mi, 64 GB → 8Gi / 1Gi). One
+  value for the cluster, because the role chart must render the same
+  on every node (#1137). A memory value in `dnsBind9.resources` in
+  the `spatiumddi-appliance` HelmChartConfig still wins. Sizing in
+  `docs/features/DNS.md` §8.0 and `docs/deployment/APPLIANCE.md`.
+
+- **Appliance k3s v1.36.4+k3s1 → v1.36.5+k3s1 (#2224).** A patch on
+  the same Kubernetes minor (1.36.5, Go 1.26.8), so a slot revert to
+  the previous release still works: etcd stays on the 3.6.14 data
+  format (k3s's fork goes from `v3.6.14-k3s1` to `v3.6.14-k3s3`,
+  confirmed in the tag's `go.mod`; the release's backport titles
+  mention etcd 3.7.1 / kine 0.17.1, and neither is in it), with kine
+  0.16.5, CoreDNS 1.14.7 and helm-controller v0.17.9. klipper-helm
+  stays at v0.13.3. Upstream it brings a grpc CVE fix, an etcd
+  compressed-snapshot restore fix, an end to the spurious "node
+  password secret already exists" on restart, anonymous requests to
+  the supervisor router refused, and a stricter CA-hash check on join
+  (k3s-io/k3s#14706). That check does not change our join: the
+  published token is the full `K10<hash>` token over k3s's own
+  single-certificate CA, which takes the unchanged path. A joiner
+  whose hash does not match the seed's CA now fails on an x509 error
+  instead of "token CA hash does not match", and the Fleet join
+  reason still reads it as a rejected token. helm-controller v0.17.8
+  / v0.17.9 create a chart's values Secret and content ConfigMap
+  before its Job, no longer resume a Job they are about to delete and
+  recreate (a values change landing while a new Job is still
+  suspended), and prefer control-plane nodes for chart Jobs;
+  `failurePolicy: retry` is untouched. The kind node image in the
+  agent e2e stays at v1.36.4: kind publishes no v1.36.5 image.
+
+- **A DHCP config change reaches a parked agent on the wake, not
+  on the long-poll timeout (#2040).** The agent's `/config` long-poll
+  keeps one database session for its whole wait, and a re-query
+  hands back the rows already loaded in it without refreshing them.
+  So when a wake arrived the bundle was rebuilt from the group and
+  its member servers as they were when the poll
+  parked, and a group-level change (HA mode, heartbeat, peer URLs,
+  thread pool, lease cache) reached the agent only when the poll
+  timed out, up to 30 s later. Each pass now expires
+  the session first and reads committed state. A sweep for handlers
+  that change the bundle without waking found five more: a subnet
+  edit (its DNS servers, domain name, VLAN and site feed RA, the
+  DHCPv6 domain search and the E911 options), E911 ERL and binding
+  edits, a feature-module toggle, `POST /new-devices/block` (it
+  stashed a wake with nothing mounted to publish it), and copilot or
+  approved operations applied through `/ai`, `/change-requests` and
+  `/requests` (none of those mounts a collector, so the op's own wake
+  was dropped). All now wake the affected DHCP groups. A new guard
+  test fails a handler that collects a wake with no collector, and a
+  mutating `/dhcp` or `/e911` route that neither wakes nor says why
+  it need not. The Looking Glass long-poll had the same defect: it
+  never re-read the collector row, so disabling a collector reached
+  it only at the timeout (and a collector edit published no wake at
+  all); it now expires its session each pass too. The DNS long-poll
+  serves stored bundle rows, so it was exposed in one narrow case: a
+  newer renderer revision re-rendering a bundle in place during a
+  rolling upgrade; that read now refreshes the row it returns.
+
+- **Streaming responses kept sending after the caller's access ended.**
+  The cluster-health, pod-log, nmap-progress and AI-chat streams checked
+  the caller once, when the connection opened, and then sent until the
+  client disconnected — so signing a session out, disabling the account,
+  revoking or expiring the API token, or removing the permission did not
+  stop a stream already open. Each stream now re-runs the request's
+  authentication and permission checks every 15 seconds and ends when
+  they fail, or when the access token it was opened with expires. The
+  log panes reconnect on their own, without re-tailing. The nmap stream's
+  open-time check now goes through the same path as every other route,
+  so it also applies the password-change gate and honours time-bound
+  grants.
+
+- **Settings → Sessions: the Session Timeout and Auto-Logout Warning
+  are now applied.** Both were stored and read by nothing, so an idle
+  console session stayed usable for the refresh cookie's full lifetime.
+  A browser session idle longer than the Session Timeout is now refused
+  on its next request and on `/auth/refresh`, and is no longer listed
+  as live on the Sessions page; `0` disables it. A refresh no longer
+  counts as activity, and the console reports how long the operator has
+  been away on every request, so a page left open and polling still
+  runs out. The console shows the Auto-Logout Warning that many
+  minutes before expiry (at most half the timeout; `0` = no warning)
+  and returns to the login page when the timeout passes. API tokens are
+  not affected. The default timeout is the 60 minutes the setting has
+  always shown: a console tab idle for longer than that will need to
+  sign in again after upgrading; set it to `0` for wall displays. A
+  negative Auto-Logout Warning is now rejected.
+
 - **The DNS zone import previews, the import commits and sync-with-server
   now also need read on DNS records.** These are POSTs, so they asked
   only for `write`, while their answers list the zone's existing records
