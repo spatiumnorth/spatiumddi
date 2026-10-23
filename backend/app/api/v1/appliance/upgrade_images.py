@@ -76,15 +76,16 @@ from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, SuperAdmin
 from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
 from app.config import settings
 from app.core.content_disposition import content_disposition
-from app.core.permissions import is_effective_superadmin, require_permission
+from app.core.permissions import require_permission
 from app.core.responses import OctetStreamResponse
 from app.models.appliance import ApplianceUpgradeImage
 from app.models.audit import AuditLog
 from app.services.appliance import releases as releases_service
+from app.services.appliance import upgrade_image_space
 from app.services.appliance.architecture import ApplianceArchitecture
 
 logger = structlog.get_logger(__name__)
@@ -143,14 +144,6 @@ def _stored_upload_name(raw: str | None, image_id: uuid.UUID) -> str:
     if name in ("", ".", ".."):
         return f"{image_id}.raw.xz"
     return name[:255]
-
-
-def _require_superadmin(user: CurrentUser) -> None:
-    if not is_effective_superadmin(user):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Upgrade-image management is restricted to superadmins.",
-        )
 
 
 def _image_path(image_id: uuid.UUID) -> Path:
@@ -380,6 +373,18 @@ async def _bytes_present_in_active_store(image_id: uuid.UUID) -> bool:
     return True
 
 
+async def _require_store_headroom(image_bytes: int | None) -> None:
+    """422 when storing ``image_bytes`` would push the store's volume under
+    the kubelet's eviction margin (#2400). ``None`` (size unknown) still
+    checks the margin itself, so a volume already in DiskPressure refuses."""
+    usage = await upgrade_image_space.get_store_usage(SLOT_IMAGE_DIR)
+    if usage is None:
+        return
+    message = upgrade_image_space.shortfall_message(usage, image_bytes or 0)
+    if message is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, message)
+
+
 async def _delete_from_mirror(image_id: uuid.UUID) -> None:
     """Issue DELETE against the mirror; tolerate 404 (already gone)."""
     headers = {"X-Mirror-Auth": mirror_auth_token("delete", image_id)}
@@ -597,7 +602,7 @@ def _row_to_schema(row: ApplianceUpgradeImage) -> UpgradeImageRow:
     summary="Upload an upgrade image for an air-gapped appliance upgrade",
 )
 async def upload_upgrade_image(
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
     file: UploadFile = File(
         ...,
@@ -648,7 +653,6 @@ async def upload_upgrade_image(
         description="Optional operator note shown in the Fleet UI list.",
     ),
 ) -> UpgradeImageRow:
-    _require_superadmin(current_user)
 
     expected_sha = sha256.lower().strip()
     if not all(c in "0123456789abcdef" for c in expected_sha):
@@ -684,6 +688,7 @@ async def upload_upgrade_image(
             # rows may already carry a ``desired_slot_image_url`` built
             # from it, and a fresh id would leave those pointing at
             # nothing while the operator watches a "successful" upload.
+            await _require_store_headroom(file.size)
             repaired = await _store_verified_image(existing.id, _file_iter(), expected_sha)
             db.add(
                 AuditLog(
@@ -716,6 +721,7 @@ async def upload_upgrade_image(
 
     image_id = uuid.uuid4()
 
+    await _require_store_headroom(file.size)
     bytes_written = await _store_verified_image(image_id, _file_iter(), expected_sha)
 
     row = ApplianceUpgradeImage(
@@ -763,8 +769,7 @@ async def upload_upgrade_image(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="List uploaded / imported upgrade images",
 )
-async def list_upgrade_images(current_user: CurrentUser, db: DB) -> UpgradeImageList:
-    _require_superadmin(current_user)
+async def list_upgrade_images(current_user: SuperAdmin, db: DB) -> UpgradeImageList:
     rows = (
         (
             await db.execute(
@@ -784,7 +789,7 @@ async def list_upgrade_images(current_user: CurrentUser, db: DB) -> UpgradeImage
     summary="List GitHub releases carrying an importable appliance upgrade image",
 )
 async def list_available_upgrade_images(
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> AvailableUpgradeImagesResponse:
     """Connected-install picker source.
 
@@ -794,7 +799,6 @@ async def list_available_upgrade_images(
     any fetch error (rate-limited / offline / air-gapped) so the UI
     can fall back to the upload tab cleanly.
     """
-    _require_superadmin(current_user)
     reachable, releases = await releases_service.list_available_upgrade_images()
     return AvailableUpgradeImagesResponse(
         github_reachable=reachable,
@@ -825,7 +829,7 @@ async def list_available_upgrade_images(
 )
 async def import_upgrade_image_from_github(
     body: ImportFromGithubRequest,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     db: DB,
 ) -> UpgradeImageRow:
     """Download + sha256-verify + store a release's appliance upgrade image.
@@ -836,7 +840,6 @@ async def import_upgrade_image_from_github(
     verified-storage path the upload flow uses. Off-prem call — the
     api reaches out to github.com (or the release asset CDN).
     """
-    _require_superadmin(current_user)
     tag = body.release_tag.strip()
 
     choice = await releases_service.resolve_upgrade_image_choice(tag, body.architecture)
@@ -917,6 +920,13 @@ async def import_upgrade_image_from_github(
                         status.HTTP_502_BAD_GATEWAY,
                         f"GitHub returned {resp.status_code} for the {tag} upgrade image.",
                     )
+                # Refuse before a byte is written: the size comes from the
+                # response, falling back to the release asset's (#2400).
+                try:
+                    declared = int(resp.headers.get("content-length", ""))
+                except ValueError:
+                    declared = spec.size_bytes or 0
+                await _require_store_headroom(declared)
 
                 async def _gh_iter() -> AsyncIterator[bytes]:
                     async for chunk in resp.aiter_bytes(_CHUNK_BYTES):
@@ -987,9 +997,8 @@ async def import_upgrade_image_from_github(
     summary="Fetch upgrade image metadata",
 )
 async def get_upgrade_image(
-    image_id: uuid.UUID, current_user: CurrentUser, db: DB
+    image_id: uuid.UUID, current_user: SuperAdmin, db: DB
 ) -> UpgradeImageRow:
-    _require_superadmin(current_user)
     row = await db.get(ApplianceUpgradeImage, image_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Upgrade image not found.")
@@ -1164,8 +1173,7 @@ async def download_upgrade_image(
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Delete an uploaded / imported upgrade image",
 )
-async def delete_upgrade_image(image_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
-    _require_superadmin(current_user)
+async def delete_upgrade_image(image_id: uuid.UUID, current_user: SuperAdmin, db: DB) -> None:
     row = await db.get(ApplianceUpgradeImage, image_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Upgrade image not found.")

@@ -28,6 +28,8 @@ from app.models.opnsense import OPNsenseRouter
 from app.models.panos import PANOSFirewall
 from app.models.unifi import UnifiController
 from app.services.feature_modules import is_module_enabled
+from app.services.integration_sync_failure import record_sync_crash
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -71,7 +73,17 @@ async def _run_sweep() -> dict[str, Any]:
                 except Exception as exc:  # noqa: BLE001 — one target can't poison the sweep
                     await db.rollback()
                     errors += 1
-                    messages.append(f"{rid}: {exc}")
+                    crash = await record_sync_crash(
+                        db,
+                        OPNsenseRouter,
+                        rid,
+                        resource_type="opnsense_router",
+                        action="block_sync_push",
+                        exc=exc,
+                        error_field="last_block_sync_error",
+                        stamp_field="last_block_sync_at",
+                    )
+                    messages.append(f"{rid}: {crash}")
                     logger.warning("block_sync_opnsense_crash", target=str(rid), error=str(exc))
                     continue
                 ran += 1
@@ -90,7 +102,17 @@ async def _run_sweep() -> dict[str, Any]:
                 except Exception as exc:  # noqa: BLE001
                     await db.rollback()
                     errors += 1
-                    messages.append(f"{cid}: {exc}")
+                    crash = await record_sync_crash(
+                        db,
+                        UnifiController,
+                        cid,
+                        resource_type="unifi_controller",
+                        action="block_sync_push",
+                        exc=exc,
+                        error_field="last_block_sync_error",
+                        stamp_field="last_block_sync_at",
+                    )
+                    messages.append(f"{cid}: {crash}")
                     logger.warning("block_sync_unifi_crash", target=str(cid), error=str(exc))
                     continue
                 ran += 1
@@ -109,7 +131,17 @@ async def _run_sweep() -> dict[str, Any]:
                 except Exception as exc:  # noqa: BLE001
                     await db.rollback()
                     errors += 1
-                    messages.append(f"{fid}: {exc}")
+                    crash = await record_sync_crash(
+                        db,
+                        PANOSFirewall,
+                        fid,
+                        resource_type="panos_firewall",
+                        action="block_sync_push",
+                        exc=exc,
+                        error_field="last_block_sync_error",
+                        stamp_field="last_block_sync_at",
+                    )
+                    messages.append(f"{fid}: {crash}")
                     logger.warning("block_sync_panos_crash", target=str(fid), error=str(exc))
                     continue
                 ran += 1
@@ -128,7 +160,17 @@ async def _run_sweep() -> dict[str, Any]:
                 except Exception as exc:  # noqa: BLE001
                     await db.rollback()
                     errors += 1
-                    messages.append(f"{oid}: {exc}")
+                    crash = await record_sync_crash(
+                        db,
+                        MerakiOrg,
+                        oid,
+                        resource_type="meraki_org",
+                        action="block_sync_push",
+                        exc=exc,
+                        error_field="last_block_sync_error",
+                        stamp_field="last_block_sync_at",
+                    )
+                    messages.append(f"{oid}: {crash}")
                     logger.warning("block_sync_meraki_crash", target=str(oid), error=str(exc))
                     continue
                 ran += 1
@@ -165,28 +207,34 @@ async def _run_one(target_kind: str, target_id: str) -> dict[str, Any]:
             if not await is_module_enabled(db, _MODULE_ID):
                 return {"status": "disabled"}
             tid = _uuid.UUID(target_id)
-            if target_kind == "opnsense":
-                router = await db.get(OPNsenseRouter, tid)
-                if router is None:
-                    return {"status": "not_found"}
-                summary = await reconcile_opnsense(db, router)
-            elif target_kind == "unifi":
-                controller = await db.get(UnifiController, tid)
-                if controller is None:
-                    return {"status": "not_found"}
-                summary = await reconcile_unifi(db, controller)
-            elif target_kind == "paloalto":
-                fw = await db.get(PANOSFirewall, tid)
-                if fw is None:
-                    return {"status": "not_found"}
-                summary = await reconcile_panos(db, fw)
-            elif target_kind == "meraki":
-                org = await db.get(MerakiOrg, tid)
-                if org is None:
-                    return {"status": "not_found"}
-                summary = await reconcile_meraki(db, org)
-            else:
+            targets: dict[str, tuple[type[Any], str, Any]] = {
+                "opnsense": (OPNsenseRouter, "opnsense_router", reconcile_opnsense),
+                "unifi": (UnifiController, "unifi_controller", reconcile_unifi),
+                "paloalto": (PANOSFirewall, "panos_firewall", reconcile_panos),
+                "meraki": (MerakiOrg, "meraki_org", reconcile_meraki),
+            }
+            if target_kind not in targets:
                 return {"status": "bad_target_kind"}
+            model, resource_type, reconcile = targets[target_kind]
+            target = await db.get(model, tid)
+            if target is None:
+                return {"status": "not_found"}
+            try:
+                summary = await reconcile(db, target)
+            except Exception as exc:  # noqa: BLE001 — record it, don't lose it (#2141)
+                await db.rollback()
+                crash = await record_sync_crash(
+                    db,
+                    model,
+                    tid,
+                    resource_type=resource_type,
+                    action="block_sync_push",
+                    exc=exc,
+                    error_field="last_block_sync_error",
+                    stamp_field="last_block_sync_at",
+                )
+                logger.warning("block_sync_now_crash", target=str(tid), error=crash)
+                return {"status": "error", "error": crash}
             await db.commit()
             return {
                 "status": "ok" if summary.ok else "error",
@@ -237,6 +285,7 @@ async def _run_lift(target_kind: str, target_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.block_sync.sweep_block_sync", bind=True)
+@module_gated("security.block_sync")
 def sweep_block_sync(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_sweep())
 

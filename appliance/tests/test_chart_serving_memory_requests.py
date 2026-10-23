@@ -53,7 +53,15 @@ def test_the_serving_roles_were_found() -> None:
 
 @pytest.mark.parametrize("role", sorted(_serving_roles()))
 def test_serving_memory_request_clears_the_idle_working_set(role: str) -> None:
-    req = _serving_roles()[role]["resources"]["requests"]["memory"]
+    cfg = _serving_roles()[role]
+    # #2223: a role whose memory the supervisor sizes per node keeps its
+    # floor under ``memory.request``; the template layers it under any
+    # explicit ``resources.requests.memory``, so the effective request is
+    # the explicit one when present, else that floor.
+    req = (cfg.get("resources", {}).get("requests", {}) or {}).get("memory") or (
+        cfg.get("memory", {}) or {}
+    ).get("request")
+    assert req, f"{role} has no memory request in resources or memory (#1828)"
     assert _mi(req) >= MIN_MI, (
         f"{role} requests {req}: a spatium-service pod over its memory request is "
         "evicted ahead of the control plane (#1828)"

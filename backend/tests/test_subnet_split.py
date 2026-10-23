@@ -317,3 +317,33 @@ async def test_endpoint_rejects_bad_confirm(client: AsyncClient, db_session: Asy
         json={"new_prefix_length": 25, "confirm_cidr": "wrong"},
     )
     assert resp.status_code == 422
+
+
+_FLAGS = dict(
+    pci_scope=True,
+    hipaa_scope=True,
+    internet_facing=True,
+    subnet_role="management",
+    do_not_probe=True,
+    do_not_probe_reason="fragile PLCs",
+    discovery_enabled=True,
+    discovery_interval_minutes=45,
+    dns_split_horizon=True,
+)
+
+
+@pytest.mark.asyncio
+async def test_split_children_keep_compliance_and_probe_settings(
+    db_session: AsyncSession,
+) -> None:
+    """#2414: children inherit PCI/HIPAA/internet-facing/role/do-not-probe."""
+    subnet = await _make_subnet(db_session, "10.0.0.0/24")
+    for k, v in _FLAGS.items():
+        setattr(subnet, k, v)
+    await db_session.flush()
+
+    result = await commit_subnet_split(db_session, subnet, 25, confirm_cidr="10.0.0.0/24")
+    assert len(result.children) == 2
+    for child in result.children:
+        for k, v in _FLAGS.items():
+            assert getattr(child, k) == v, k

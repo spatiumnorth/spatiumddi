@@ -390,6 +390,37 @@ def test_user_drop_class_not_clobbered() -> None:
     assert "aa:bb:cc:dd:ee:ff" not in drops[0]["test"]
 
 
+def test_mac_blocks_render_drop_class_on_dhcp6(wire_bundle_v6: dict) -> None:
+    """#2268 — a blocked MAC must also be enforced on Dhcp6. Kea has no
+    ``pkt6.mac``, so the class matches the MAC embedded in an Ethernet
+    DUID-LL / DUID-LLT and in the relay's link-layer option (79)."""
+    wire_bundle_v6["mac_blocks"] = [
+        {"mac_address": "AA-BB-CC-DD-EE-FF", "reason": "rogue", "description": ""},
+        {"mac_address": "garbage", "reason": "other", "description": ""},
+    ]
+    out = render(wire_bundle_v6)
+    drop = [c for c in out["Dhcp6"]["client-classes"] if c["name"] == "DROP"]
+    assert len(drop) == 1
+    t = drop[0]["test"]
+    assert "pkt4" not in t
+    assert "substring(option[1].hex, 4, 6) == 0xaabbccddeeff" in t  # DUID-LL
+    assert "substring(option[1].hex, 8, 6) == 0xaabbccddeeff" in t  # DUID-LLT
+    # relay6[-1] is the innermost relay (the first hop, which adds option
+    # 79); relay6[0] the outermost. One relay: the same; a chain: -1 matters.
+    assert "relay6[-1].option[79]" in t
+    assert "relay6[0].option[79]" in t
+    assert "garbage" not in t
+    # v4 keeps its own expression.
+    assert any(c["name"] == "DROP" for c in out["Dhcp4"]["client-classes"])
+
+
+def test_no_dhcp6_drop_class_without_blocks(wire_bundle_v6: dict) -> None:
+    out = render(wire_bundle_v6)
+    assert not any(
+        c["name"] == "DROP" for c in out["Dhcp6"].get("client-classes", [])
+    )
+
+
 # ── DHCPv6 — Dhcp6 / subnet6 render branch (issue #330) ────────────────
 
 

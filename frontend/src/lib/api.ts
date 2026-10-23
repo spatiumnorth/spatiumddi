@@ -3,7 +3,12 @@ import axios, {
   type AxiosInstance,
   type AxiosResponse,
 } from "axios";
-import { getAccessToken, setAccessToken } from "@/lib/authToken";
+import { idleHeader } from "@/lib/activity";
+import {
+  getAccessToken,
+  setAccessToken,
+  setMustChangePassword,
+} from "@/lib/authToken";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
 
@@ -28,6 +33,9 @@ function createClient(): AxiosInstance {
     const token = getAccessToken();
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
+      // How long the operator has been away, so a background poll does not
+      // count as activity for the Session Timeout (lib/activity.ts).
+      Object.assign(config.headers, idleHeader());
     }
     return config;
   });
@@ -124,8 +132,9 @@ function createClient(): AxiosInstance {
             {},
             { withCredentials: true },
           );
-          const { access_token } = res.data;
+          const { access_token, force_password_change } = res.data;
           setAccessToken(access_token);
+          setMustChangePassword(!!force_password_change);
           refreshQueue.forEach(({ resolve }) => resolve(access_token));
           refreshQueue = [];
           if (originalRequest?.headers)
@@ -1751,6 +1760,8 @@ export const ipamApi = {
       create_for_ip_ids?: string[];
       update_record_ids?: string[];
       delete_stale_record_ids?: string[];
+      // #2471 — missing rows left unticked; the API writes none of them.
+      skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
     },
   ) =>
     api
@@ -1770,6 +1781,8 @@ export const ipamApi = {
       create_for_ip_ids?: string[];
       update_record_ids?: string[];
       delete_stale_record_ids?: string[];
+      // #2471 — missing rows left unticked; the API writes none of them.
+      skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
     },
   ) =>
     api
@@ -1789,6 +1802,8 @@ export const ipamApi = {
       create_for_ip_ids?: string[];
       update_record_ids?: string[];
       delete_stale_record_ids?: string[];
+      // #2471 — missing rows left unticked; the API writes none of them.
+      skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
     },
   ) =>
     api
@@ -1967,6 +1982,8 @@ export const ipamApi = {
         updated_count: number;
         not_found: string[];
         skipped: string[];
+        /** With ``dns_zone_id: ""``: the addresses whose records were removed. */
+        dns_cleared: string[];
       }>(`/ipam/addresses/bulk-edit`, data)
       .then((r) => r.data),
   backfillReverseZonesSpace: (spaceId: string) =>
@@ -2646,6 +2663,9 @@ export interface AuditIntegrity {
   ok: boolean;
   rows_checked: number;
   breaks: AuditChainBreak[];
+  first_seq?: number | null;
+  last_seq?: number | null;
+  partial?: boolean;
 }
 
 // ── AI tool catalog (issue #101 follow-up) ──────────────────────────
@@ -2817,10 +2837,12 @@ export const auditApi = {
   /** Walk the chain and report any tampering (issue #73). The
    *  ``max_rows`` cap is for huge tables — leave unset for a full
    *  sweep. */
-  integrity: (maxRows?: number) =>
+  integrity: (maxRows?: number, newest?: boolean) =>
     api
       .get<AuditIntegrity>("/audit/integrity", {
-        params: maxRows ? { max_rows: maxRows } : undefined,
+        params: maxRows
+          ? { max_rows: maxRows, ...(newest ? { newest: true } : {}) }
+          : undefined,
       })
       .then((r) => r.data),
   /** Compliance / change report PDF (#48) — auditor-facing rollup of every
@@ -2878,6 +2900,9 @@ export const auditApi = {
 export interface BackupManifest {
   format?: string;
   format_version?: number;
+  /** "custom" (pg_dump custom format) or "plain" (SQL text). An
+   *  Exclude-secrets archive is plain, at format_version 2 (#2201). */
+  dump_format?: "custom" | "plain";
   app_version?: string;
   schema_version?: string | null;
   hostname?: string;
@@ -2913,6 +2938,13 @@ export interface BackupManifestPreviewResponse {
   manifest: BackupManifest;
   archive_bytes: number;
   format_recognised: boolean;
+  /** The dump format the restore will act on, resolved server-side by
+   *  the restore's own helper; null when the archive does not say. Absent
+   *  from a server older than #2201. */
+  dump_format?: "custom" | "plain" | null;
+  /** True only for a custom-format dump — the one shape the API accepts
+   *  a selective restore of. */
+  selective_restore_supported?: boolean;
 }
 
 export const backupApi = {
@@ -3024,6 +3056,10 @@ export interface BackupTargetConfigField {
   required: boolean;
   description: string | null;
   secret: boolean;
+  /** The value is lines (a PEM key, known_hosts, one header per line):
+   *  render a textarea, never an `<input>`, which folds each line break
+   *  into a space (#2199). Absent from a server older than that. */
+  multiline?: boolean;
 }
 
 export interface BackupTargetKind {
@@ -4916,7 +4952,7 @@ export async function* streamChatTurn(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     body: JSON.stringify(body),
@@ -5480,6 +5516,14 @@ export interface DNSServer {
   daemon_status_since: string | null;
   /** #1067 — derived; render from this, see `DaemonStateFields`. */
   daemon_not_serving: boolean | null;
+  /** #2044 — a second live agent process is polling as this server (a
+   * cloned VM or a copied state dir keeps the agent_id) and is being
+   * refused; only the most recent process is served. `false` with the other
+   * three `null` when no episode is current. */
+  duplicate_agent: boolean;
+  duplicate_agent_since: string | null;
+  duplicate_agent_last_at: string | null;
+  duplicate_agent_ip: string | null;
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;
@@ -5565,6 +5609,8 @@ export interface DNSServerOptions {
   technitium_warnings?: string[];
   // #2128: stored forwarders pinned to port 53 in an encrypted group.
   forwarder_warnings?: string[];
+  // #2266: dnssec_validation "yes" with no trust anchor validates nothing.
+  dnssec_warnings?: string[];
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the
@@ -6858,10 +6904,20 @@ export interface DNSBlockList {
   last_sync_status: string | null;
   last_sync_error: string | null;
   entry_count: number;
+  /** Rules the last adblock refresh could not enforce, by category (#2123).
+   *  null = not recorded (no adblock refresh yet, or another feed format). */
+  feed_parse_skipped: DNSBlockListFeedSkipped | null;
   created_at: string;
   modified_at: string;
   applied_group_ids: string[];
   applied_view_ids: string[];
+}
+
+export interface DNSBlockListFeedSkipped {
+  regex: number;
+  modifier: number;
+  badfilter: number;
+  malformed: number;
 }
 
 export interface DNSBlockListEntry {
@@ -6886,6 +6942,8 @@ export interface DNSBlockListException {
   list_id: string;
   domain: string;
   reason: string;
+  /** manual | feed — a feed row is the feed's own `@@` rule (#2123). */
+  source: string;
   created_at: string;
 }
 
@@ -8372,6 +8430,10 @@ export interface DHCPServer {
   roles: string[];
   status: string;
   last_sync_at: string | null;
+  /** Why the last scheduled lease pull failed (agentless drivers); null
+   * once a pull succeeds. */
+  last_sync_error?: string | null;
+  last_sync_error_at?: string | null;
   last_health_check_at: string | null;
   agent_registered: boolean;
   agent_approved: boolean;
@@ -10529,6 +10591,9 @@ export interface ApiToken {
   scopes: ApiTokenScope[];
   resource_grants?: ApiTokenResourceGrant[];
   user_id: string | null;
+  /** Set by the list endpoint (#2443). */
+  owner_username?: string | null;
+  owner_display_name?: string | null;
   expires_at: string | null;
   last_used_at: string | null;
   is_active: boolean;
@@ -11001,6 +11066,10 @@ export interface IntegrationsDashboardPanel {
   stale_count: number;
   error_count: number;
   warning_count: number;
+  // #2192 — over every target, not the capped `targets` list.
+  problem_count?: number;
+  credential_dead_count?: number;
+  credential_expiring_count?: number;
   targets: IntegrationsDashboardTargetRow[];
 }
 export interface IntegrationsDashboardErrorRow {
@@ -14026,7 +14095,7 @@ async function* _streamApplianceLogSse(
   const token = getAccessToken();
   const res = await fetch(url, {
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     signal,
@@ -14102,7 +14171,7 @@ export async function* streamClusterHealth(
   const token = getAccessToken();
   const res = await fetch("/api/v1/appliance/cluster/health/stream", {
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     signal,
@@ -15365,7 +15434,9 @@ export type CredentialState =
   | "expiring"
   | "expired"
   | "rejected"
-  | "unknown";
+  | "unknown"
+  // #2191 — the target is switched off; its last rejection is history.
+  | "disabled";
 
 export interface TailscaleTenant {
   id: string;
@@ -16540,7 +16611,7 @@ export async function* streamNmapScan(
   const url = nmapApi.streamUrl(scanId);
   const res = await fetch(url, {
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     signal,

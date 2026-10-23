@@ -3,9 +3,10 @@
 The worker's ServiceAccount cannot patch (or read) ``spatium-appliance-tls``
 (#983 / #1445), so ``_store_certificate`` commits the row and wakes the api;
 the api's ``sync_active_cert_to_secret`` (wake + periodic tick) does the
-patch and the frontend roll, and publishes what the Secret holds so the
-``secret_expiring`` alert — evaluated in the worker — can judge the cert
-actually served.
+patch, and publishes what the Secret holds so the ``secret_expiring`` alert —
+evaluated in the worker — can judge the cert actually served. The frontend
+picks the new files up itself and reloads nginx in place: the api no longer
+rolls its Deployment (#1173).
 """
 
 from __future__ import annotations
@@ -55,11 +56,6 @@ def redis_store(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "app.core.redis_client.make_async_redis", lambda *_a, **_k: _FakeRedis(store)
     )
     return store
-
-
-@pytest.fixture(autouse=True)
-def _reset_roll_flag() -> None:
-    bootstrap._frontend_roll_pending = False
 
 
 async def _order(db: AsyncSession) -> ACMEOrder:
@@ -122,18 +118,18 @@ async def test_worker_issue_wakes_api_and_api_deploys(
     wake.assert_awaited_once_with(APPLIANCE_CERT_DEPLOY)
     assert row.is_active
 
-    # Api side: Secret holds the old cert -> patch it and roll the frontend.
+    # Api side: Secret holds the old cert -> patch it, and only it (#1173).
     deploy = MagicMock(return_value=True)
-    roll = MagicMock(return_value=True)
+    roll = MagicMock(return_value=(True, None))
     with (
         patch.object(bootstrap, "read_deployed_cert", lambda: ("old", "old")),
         patch.object(bootstrap, "deploy_active_cert", deploy, create=True),
-        patch.object(bootstrap, "reload_frontend_nginx", roll, create=True),
+        patch.object(deployment.k8s, "patch_deployment_annotation", roll),
     ):
         out = await bootstrap.sync_active_cert_to_secret()
     assert out["status"] == "deployed"
     assert deploy.call_args.args == (row.cert_pem, key_pem)
-    roll.assert_called_once()
+    roll.assert_not_called()
     # The worker-readable snapshot now names the cert just deployed.
     valid_to, fp = await bootstrap.read_served_cert_snapshot()
     info = parse_pem_certificate(cert_pem)
@@ -148,46 +144,19 @@ async def test_periodic_reconcile_catches_missed_wake_and_is_idempotent(
     cert_pem, key_pem = await _active_le_cert(db_session)
 
     deploy = MagicMock(return_value=True)
-    roll = MagicMock(return_value=True)
+    roll = MagicMock(return_value=(True, None))
     served = {"v": ("stale", "stale")}
     with (
         patch.object(bootstrap, "read_deployed_cert", lambda: served["v"]),
         patch.object(bootstrap, "deploy_active_cert", deploy, create=True),
-        patch.object(bootstrap, "reload_frontend_nginx", roll, create=True),
+        patch.object(deployment.k8s, "patch_deployment_annotation", roll),
     ):
         assert (await bootstrap.sync_active_cert_to_secret())["status"] == "deployed"
         served["v"] = (cert_pem, key_pem)
-        # Converged: a second tick writes nothing and rolls nothing.
+        # Converged: a second tick writes nothing.
         assert (await bootstrap.sync_active_cert_to_secret())["status"] == "in-sync"
     assert deploy.call_count == 1
-    assert roll.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_a_failed_roll_is_retried_once_the_secret_is_in_sync(
-    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch, redis_store: dict[str, Any]
-) -> None:
-    """A Secret PATCH that lands with a roll that does not must not read as
-    converged on the next tick, or nginx keeps the old cert indefinitely."""
-    monkeypatch.setattr(bootstrap.settings, "appliance_mode", True)
-    await _active_le_cert(db_session)
-
-    served = {"v": ("stale", "stale")}
-
-    def _deploy(c: str, k: str, *, name: str = "") -> bool:
-        served["v"] = (c, k)
-        return True
-
-    roll = MagicMock(side_effect=[False, True])
-    with (
-        patch.object(bootstrap, "read_deployed_cert", lambda: served["v"]),
-        patch.object(bootstrap, "deploy_active_cert", _deploy, create=True),
-        patch.object(bootstrap, "reload_frontend_nginx", roll, create=True),
-    ):
-        assert (await bootstrap.sync_active_cert_to_secret())["status"] == "roll-failed"
-        assert (await bootstrap.sync_active_cert_to_secret())["status"] == "rolled"
-        assert (await bootstrap.sync_active_cert_to_secret())["status"] == "in-sync"
-    assert roll.call_count == 2
+    roll.assert_not_called()
 
 
 @pytest.mark.asyncio

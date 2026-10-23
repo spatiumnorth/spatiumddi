@@ -2,7 +2,7 @@
 
 Mirrors ``docker_sync`` — 30 s beat tick, per-endpoint interval
 gating, platform-wide kill switch via
-``PlatformSettings.integration_proxmox_enabled``. Plus a
+the ``integrations.proxmox`` feature module (#2196). Plus a
 ``sync_node_now`` task for the UI's "Sync Now" button.
 """
 
@@ -20,11 +20,11 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.db import task_connect_args
 from app.models.proxmox import ProxmoxNode
-from app.models.settings import PlatformSettings
+from app.services.feature_modules import is_module_enabled
+from app.services.integration_sync_failure import record_sync_crash
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
-
-_PLATFORM_SINGLETON_ID = 1
 
 
 async def _run_sweep() -> dict[str, Any]:
@@ -36,8 +36,7 @@ async def _run_sweep() -> dict[str, Any]:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
-            ps = await db.get(PlatformSettings, _PLATFORM_SINGLETON_ID)
-            if ps is None or not ps.integration_proxmox_enabled:
+            if not await is_module_enabled(db, "integrations.proxmox"):
                 return {"status": "disabled"}
 
             rows = (
@@ -79,7 +78,15 @@ async def _run_sweep() -> dict[str, Any]:
                     # next node's first query raises PendingRollbackError,
                     # turning one bad node into a sweep-wide failure (#333).
                     await db.rollback()
-                    errors.append(f"{node_name}: {exc}")
+                    crash = await record_sync_crash(
+                        db,
+                        ProxmoxNode,
+                        node_id,
+                        resource_type="proxmox_node",
+                        action="proxmox.reconcile",
+                        exc=exc,
+                    )
+                    errors.append(f"{node_name}: {crash}")
                     logger.warning(
                         "proxmox_reconcile_crash",
                         node=str(node_id),
@@ -120,7 +127,21 @@ async def _run_one(node_id: str) -> dict[str, Any]:
             node = await db.get(ProxmoxNode, _uuid.UUID(node_id))
             if node is None:
                 return {"status": "not_found"}
-            summary = await reconcile_node(db, node)
+            row_id = node.id
+            try:
+                summary = await reconcile_node(db, node)
+            except Exception as exc:  # noqa: BLE001 — record it, don't lose it (#2141)
+                await db.rollback()
+                crash = await record_sync_crash(
+                    db,
+                    ProxmoxNode,
+                    row_id,
+                    resource_type="proxmox_node",
+                    action="proxmox.reconcile",
+                    exc=exc,
+                )
+                logger.warning("proxmox_sync_now_crash", target=str(row_id), error=crash)
+                return {"status": "error", "error": crash}
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,
@@ -148,6 +169,7 @@ async def _run_one(node_id: str) -> dict[str, Any]:
     name="app.tasks.proxmox_sync.sweep_proxmox_nodes",
     bind=True,
 )
+@module_gated("integrations.proxmox")
 def sweep_proxmox_nodes(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_sweep())
 
