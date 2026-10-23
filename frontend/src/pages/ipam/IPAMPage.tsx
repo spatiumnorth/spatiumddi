@@ -6871,27 +6871,31 @@ export function SubnetDetail({
                               >
                                 <div className="flex items-center justify-end gap-1">
                                   {addr.status === "orphan" ? (
-                                    <>
-                                      <button
-                                        onClick={() =>
-                                          restoreAddr.mutate(addr.id)
-                                        }
-                                        disabled={restoreAddr.isPending}
-                                        className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
-                                        title="Restore (mark as allocated)"
-                                      >
-                                        <RefreshCw className="h-3.5 w-3.5" />
-                                      </button>
-                                      <button
-                                        onClick={() =>
-                                          setConfirmPurgeAddr(addr)
-                                        }
-                                        className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                        title="Permanently delete"
-                                      >
-                                        <Trash2 className="h-3.5 w-3.5" />
-                                      </button>
-                                    </>
+                                    // #2520 — restore / purge / edit / delete are writes:
+                                    // a row the operator may not write offers none.
+                                    permitsWrite ? (
+                                      <>
+                                        <button
+                                          onClick={() =>
+                                            restoreAddr.mutate(addr.id)
+                                          }
+                                          disabled={restoreAddr.isPending}
+                                          className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
+                                          title="Restore (mark as allocated)"
+                                        >
+                                          <RefreshCw className="h-3.5 w-3.5" />
+                                        </button>
+                                        <button
+                                          onClick={() =>
+                                            setConfirmPurgeAddr(addr)
+                                          }
+                                          className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                          title="Permanently delete"
+                                        >
+                                          <Trash2 className="h-3.5 w-3.5" />
+                                        </button>
+                                      </>
+                                    ) : null
                                   ) : addr.auto_from_lease ? (
                                     // Mirror of a dynamic DHCP lease — the DHCP
                                     // server owns the state; editing or deleting
@@ -6903,7 +6907,8 @@ export function SubnetDetail({
                                     >
                                       <Lock className="h-3.5 w-3.5" />
                                     </span>
-                                  ) : !isReadOnly(addr.status) ? (
+                                  ) : !isReadOnly(addr.status) &&
+                                    permitsWrite ? (
                                     <>
                                       <button
                                         onClick={() => setEditingAddress(addr)}
