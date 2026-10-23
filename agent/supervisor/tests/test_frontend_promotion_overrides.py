@@ -61,7 +61,9 @@ def test_the_first_promotion_changes_the_frontends_replicas_and_nothing_else(
     one = _frontend(monkeypatch, 1, kube)
     three = _frontend(monkeypatch, 3, kube)   # the same HelmChartConfig, promoted
 
-    assert (one.pop("replicas"), three.pop("replicas")) == (1, 3)
+    one_replicas = one.pop("replicas")
+    three_replicas = three.pop("replicas")
+    assert (one_replicas, three_replicas) == (1, 3)
     assert one == three
     # What the chart gate renders the frontend with is what the supervisor
     # writes: hard anti-affinity on every size (the chart adds the host network
@@ -74,5 +76,7 @@ def test_a_demote_back_to_one_node_changes_only_the_replicas_too(monkeypatch) ->
     three = _frontend(monkeypatch, 3, kube)
     one = _frontend(monkeypatch, 1, kube)
 
-    assert (three.pop("replicas"), one.pop("replicas")) == (3, 1)
+    three_replicas = three.pop("replicas")
+    one_replicas = one.pop("replicas")
+    assert (three_replicas, one_replicas) == (3, 1)
     assert one == three
