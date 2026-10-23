@@ -98,6 +98,8 @@ import {
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   customFieldChecked,
+  missingRequiredCustomFields,
+  requiredFieldsMessage,
   withCustomFieldDefaults,
 } from "@/lib/customFieldValues";
 import {
@@ -851,13 +853,23 @@ function CustomFieldsSection({
                     value={String(val)}
                     onChange={(e) => onChange(def.name, e.target.value)}
                   >
-                    {!def.is_required && (
-                      <option value="">
-                        {localUnset && hasInherited
-                          ? `— inherited: ${String(inheritedVal)} —`
+                    {/* Always offer the empty choice: without it the browser
+                        shows the first option for a value that matches none,
+                        and an option nobody chose is what the Save looks like
+                        it sends (#2478). A Required field with nothing to
+                        inherit cannot be left on it, so it is not pickable. */}
+                    <option
+                      value=""
+                      disabled={
+                        def.is_required && !(localUnset && hasInherited)
+                      }
+                    >
+                      {localUnset && hasInherited
+                        ? `— inherited: ${String(inheritedVal)} —`
+                        : def.is_required
+                          ? "— Select —"
                           : "— None —"}
-                      </option>
-                    )}
+                    </option>
                     {def.options.map((opt) => (
                       <option key={opt} value={opt}>
                         {opt}
@@ -2671,6 +2683,15 @@ export function CreateSubnetModal({
   // What the Custom Fields section shows, defaults included, is what the
   // request sends (#1303).
   const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
+  // Values the new subnet inherits from its block chain count towards a
+  // Required field (#2478).
+  const { data: parentFields } = useQuery({
+    queryKey: ["block-effective-fields", blockId],
+    queryFn: () => ipamApi.effectiveBlockFields(blockId),
+    enabled: !!blockId,
+    staleTime: 30_000,
+  });
+  const cfInherited = parentFields?.custom_fields ?? {};
 
   // Available subnets query (only active when in size mode and block + prefix are set)
   const { data: availableNets = [], isFetching: searchingNets } = useQuery({
@@ -3015,6 +3036,7 @@ export function CreateSubnetModal({
             onChange={(k, v) =>
               setCustomFields((prev) => ({ ...prev, [k]: v }))
             }
+            inherited={cfInherited}
           />
         </div>
       )}
@@ -3116,6 +3138,15 @@ export function CreateSubnetModal({
             setError(null);
             if (typeof ddnsTtl === "string") {
               setError(`DDNS TTL override ${ddnsTtl}. Leave blank to inherit.`);
+              return;
+            }
+            const missing = missingRequiredCustomFields(
+              cfDefs,
+              shownCustomFields,
+              cfInherited,
+            );
+            if (missing.length > 0) {
+              setError(requiredFieldsMessage(missing));
               return;
             }
             mutation.mutate();
@@ -4175,7 +4206,10 @@ function SyncMenu({
   onSyncAll,
   hasDhcp,
   hasDns,
+  dnsGate,
 }: {
+  // #2571 — props spread onto the DNS item when the caller may not sync it.
+  dnsGate?: { disabled?: boolean; title?: string };
   onSyncDns: () => void;
   onSyncDhcp: () => void;
   onSyncAll: () => void;
@@ -4189,7 +4223,15 @@ function SyncMenu({
       title="Sync IPAM with DNS and/or DHCP servers"
       items={[
         ...(hasDns
-          ? [{ key: "dns", label: "DNS", icon: Globe2, onSelect: onSyncDns }]
+          ? [
+              {
+                key: "dns",
+                label: "DNS",
+                icon: Globe2,
+                onSelect: onSyncDns,
+                ...dnsGate,
+              },
+            ]
           : []),
         ...(hasDhcp
           ? [
@@ -4392,6 +4434,9 @@ const NEEDS_ADDRESS_WRITE =
 const NEEDS_NMAP_WRITE = "Requires write permission on nmap scans";
 const NEEDS_ADDRESS_DELETE =
   "Requires delete permission in IPAM, and write on this subnet or on an address set in it";
+const NEEDS_DNS_SYNC =
+  "Requires read permission in IPAM and write permission on subnets";
+const NEEDS_SUBNET_DELETE = "Requires delete permission on subnets";
 const NEEDS_ORPHAN_PURGE =
   "Requires delete permission in IPAM and write permission on subnets";
 
@@ -4889,15 +4934,26 @@ export function SubnetDetail({
   // #1155 — the header's write actions, each on the check the server makes
   // for it, so a read-only operator is not handed a form that ends in
   // "Permission denied":
-  //   * Edit — write on subnets at the type level (PUT /subnets/{id}); the
-  //     reshaping tools (resize / split / merge / clean orphans) change the
-  //     subnet itself and ask for the same;
+  //   * Edit — write on THIS subnet (PUT /subnets/{id} takes a grant scoped
+  //     to it, #2438); the reshaping tools (resize / split / merge / clean
+  //     orphans) change the subnet itself and ask for write on subnets at
+  //     the type level, which is what their routes still want;
   //   * Allocate IP, Bulk allocate, Import addresses — write on this subnet
   //     or on an address set in it (#103), as the allocation routes do;
   //   * Scan with nmap — the nmap scan permission.
   const canWriteSubnets = perms.can("write", "subnet");
+  // Edit asks what ``PUT /subnets/{id}`` asks, and that route takes a grant
+  // scoped to this one subnet (#2438, #2569). The reshaping tools below keep
+  // the type-level ask: the server still refuses them to a scoped holder.
+  const canEditSubnet = perms.can("write", "subnet", subnet.id);
   const canAllocate = subnetWritable || writableSets.length > 0;
   const canScan = perms.can("write", "manage_nmap_scans");
+  // #2571 — DNS sync: the drift preview is a read on the IPAM router and the
+  // commit is write on subnets, both at the type level (a grant scoped to one
+  // subnet reaches neither, #2497).
+  const canDnsSync =
+    IPAM_GATE_TYPES.some((t) => perms.can("read", t)) && canWriteSubnets;
+  const dnsSyncGate = permissionGate(canDnsSync, NEEDS_DNS_SYNC);
   // Bulk delete and Clean Orphans are deletes: the router gate wants
   // ``delete``, the handler write on the row's subnet or address set.
   const canDeleteIpam = canDeleteInIpam(
@@ -5575,6 +5631,7 @@ export function SubnetDetail({
             <SyncMenu
               hasDhcp={dhcpOn && dhcpScopes.length > 0}
               hasDns={dnsOn}
+              dnsGate={dnsSyncGate}
               onSyncDns={() => setShowDnsSync(true)}
               onSyncDhcp={() => setShowDhcpSync(true)}
               onSyncAll={() => setShowSyncAll(true)}
@@ -5632,7 +5689,7 @@ export function SubnetDetail({
             <HeaderButton
               icon={Pencil}
               onClick={() => setShowEditSubnet(true)}
-              {...permissionGate(canWriteSubnets, NEEDS_SUBNET_WRITE)}
+              {...permissionGate(canEditSubnet, NEEDS_SUBNET_WRITE)}
             >
               Edit
             </HeaderButton>
@@ -5812,7 +5869,8 @@ export function SubnetDetail({
               </div>
               <button
                 onClick={() => setShowDnsSync(true)}
-                className="flex items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-900 hover:bg-amber-500/30 dark:text-amber-200"
+                {...dnsSyncGate}
+                className="flex items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-900 hover:bg-amber-500/30 disabled:cursor-not-allowed disabled:opacity-50 dark:text-amber-200"
               >
                 <Globe2 className="h-3 w-3" />
                 Open Sync DNS
@@ -7941,6 +7999,8 @@ export function EditSubnetModal({
   onDeleted?: () => void;
 }) {
   const qc = useQueryClient();
+  // #2571 — DELETE /subnets/{id} asks delete on subnets at the type level.
+  const canDeleteSubnet = usePermissions().can("delete", "subnet");
   const [name, setName] = useState(subnet.name ?? "");
   const [description, setDescription] = useState(subnet.description ?? "");
   const [gateway, setGateway] = useState(subnet.gateway ?? "");
@@ -8625,7 +8685,8 @@ export function EditSubnetModal({
           </p>
           <button
             onClick={() => setDeleteStep(1)}
-            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+            {...permissionGate(canDeleteSubnet, NEEDS_SUBNET_DELETE)}
+            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Delete this subnet…
           </button>
@@ -8645,6 +8706,16 @@ export function EditSubnetModal({
             setError(null);
             if (typeof ddnsTtl === "string") {
               setError(`DDNS TTL override ${ddnsTtl}. Leave blank to inherit.`);
+              return;
+            }
+            const missing = missingRequiredCustomFields(
+              cfDefs,
+              customFields,
+              cfInheritedValues,
+              subnet.custom_fields,
+            );
+            if (missing.length > 0) {
+              setError(requiredFieldsMessage(missing));
               return;
             }
             mutation.mutate();
@@ -12102,6 +12173,15 @@ export function CreateBlockModal({
   // What the Custom Fields section shows, defaults included, is what the
   // request sends (#1303).
   const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
+  // Values inherited from the parent block chain count towards a Required
+  // field (#2478).
+  const { data: parentFields } = useQuery({
+    queryKey: ["block-effective-fields", parentBlockId],
+    queryFn: () => ipamApi.effectiveBlockFields(parentBlockId),
+    enabled: !!parentBlockId,
+    staleTime: 30_000,
+  });
+  const cfInherited = parentFields?.custom_fields ?? {};
 
   const { data: blockTemplates } = useQuery({
     queryKey: ["ipam-templates", "block"],
@@ -12268,6 +12348,7 @@ export function CreateBlockModal({
             onChange={(k, v) =>
               setCustomFields((prev) => ({ ...prev, [k]: v }))
             }
+            inherited={cfInherited}
           />
         </div>
       )}
@@ -12340,6 +12421,15 @@ export function CreateBlockModal({
         <button
           onClick={() => {
             setError(null);
+            const missing = missingRequiredCustomFields(
+              cfDefs,
+              shownCustomFields,
+              cfInherited,
+            );
+            if (missing.length > 0) {
+              setError(requiredFieldsMessage(missing));
+              return;
+            }
             mutation.mutate();
           }}
           disabled={!network || mutation.isPending}
@@ -12686,6 +12776,9 @@ export function EditBlockModal({
           onZoneIdChange={setDnsZoneId}
           onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
           parentBlockId={block.parent_block_id}
+          // A top-level block inherits from its space (#2477), as its DHCP
+          // tab and New IP Block already do.
+          fallbackSpaceId={!block.parent_block_id ? block.space_id : undefined}
         />
       )}
 
@@ -12766,6 +12859,16 @@ export function EditBlockModal({
         <button
           onClick={() => {
             setError(null);
+            const missing = missingRequiredCustomFields(
+              cfDefs,
+              customFields,
+              cfInheritedValues,
+              block.custom_fields,
+            );
+            if (missing.length > 0) {
+              setError(requiredFieldsMessage(missing));
+              return;
+            }
             mutation.mutate();
           }}
           disabled={mutation.isPending}
@@ -13232,6 +13335,9 @@ export function BlockDetailView({
   const [freeRangePreset, setFreeRangePreset] = useState<FreeCidrRange | null>(
     null,
   );
+  // The block a Find Free row names (it can be a child of this block), so
+  // "Create subnet here" files the subnet under it, not under this block (#2417).
+  const [findFreeBlockId, setFindFreeBlockId] = useState<string | null>(null);
 
   const crumbs: BreadcrumbItem[] = [
     { label: spaceName, variant: "space", onClick: onSelectSpace },
@@ -13507,11 +13613,12 @@ export function BlockDetailView({
       {showCreateSubnet && (
         <CreateSubnetModal
           spaceId={block.space_id}
-          defaultBlockId={block.id}
+          defaultBlockId={findFreeBlockId ?? block.id}
           defaultNetwork={freeRangePreset?.network}
           onClose={() => {
             setShowCreateSubnet(false);
             setFreeRangePreset(null);
+            setFindFreeBlockId(null);
           }}
         />
       )}
@@ -13590,8 +13697,10 @@ export function BlockDetailView({
         <FindFreeModal
           space={space}
           defaultBlockId={block.id}
+          defaultBlockLabel={block.network}
           onClose={() => setShowFindFree(false)}
-          onPickCidr={(cidr) => {
+          onPickCidr={(cidr, parentBlockId) => {
+            setFindFreeBlockId(parentBlockId);
             setFreeRangePreset({
               network: cidr,
               first: "",
@@ -16456,7 +16565,7 @@ export function IPAMPage() {
   });
 
   // Fetch ALL blocks so deep-link can look up any block by ID
-  const { data: allBlocks } = useQuery({
+  const { data: allBlocks, error: blocksError } = useQuery({
     queryKey: ["blocks"],
     queryFn: () => ipamApi.listBlocks(),
   });
@@ -16518,6 +16627,28 @@ export function IPAMPage() {
       setPendingHighlightAddress(null);
     }
   }, [selectedSubnet, pendingHighlightAddress]);
+
+  // #2569 — a holder whose grant names one subnet reads that subnet but not
+  // the spaces or blocks above it (both lists answer 403), so the restore
+  // below, which waits for all three lists, never fires and ``?subnet=X`` shows
+  // an empty page. When a parent list is refused, open the URL's subnet from
+  // ``GET /ipam/subnets/X`` itself; the tree may stay empty.
+  const urlSubnetId = searchParams.get("subnet");
+  const parentsRefused = spacesError != null || blocksError != null;
+  const { data: urlSubnet } = useQuery({
+    queryKey: ["subnet", urlSubnetId],
+    queryFn: () => ipamApi.getSubnet(urlSubnetId!),
+    enabled: !!urlSubnetId && parentsRefused,
+    retry: false,
+  });
+  useEffect(() => {
+    if (urlRestored.current || !urlSubnet || !parentsRefused) return;
+    if (urlSubnet.id !== urlSubnetId) return;
+    urlRestored.current = true;
+    setSelectedSubnet(urlSubnet);
+    setSelectedBlock(null);
+    setSelectedSpace(null);
+  }, [urlSubnet, urlSubnetId, parentsRefused]);
 
   // URL-state restore: reopen last-visited space/block/subnet on back-navigation
   // Depends on searchParams so that when `useStickyLocation` navigates from
