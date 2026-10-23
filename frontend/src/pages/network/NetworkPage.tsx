@@ -621,8 +621,10 @@ export function NetworkPage() {
                             <input
                               type="checkbox"
                               checked={d.is_active}
+                              aria-label={`Active ${d.name}`}
                               disabled={toggleActiveMut.isPending}
                               onChange={() => toggleActiveMut.mutate(d)}
+                              {...writeGate}
                             />
                           </label>
                         </td>
