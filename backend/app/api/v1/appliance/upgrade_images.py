@@ -85,6 +85,7 @@ from app.core.responses import OctetStreamResponse
 from app.models.appliance import ApplianceUpgradeImage
 from app.models.audit import AuditLog
 from app.services.appliance import releases as releases_service
+from app.services.appliance import upgrade_image_space
 from app.services.appliance.architecture import ApplianceArchitecture
 
 logger = structlog.get_logger(__name__)
@@ -370,6 +371,18 @@ async def _bytes_present_in_active_store(image_id: uuid.UUID) -> bool:
             f"Upgrade-image mirror returned {resp.status_code} on a presence check.",
         )
     return True
+
+
+async def _require_store_headroom(image_bytes: int | None) -> None:
+    """422 when storing ``image_bytes`` would push the store's volume under
+    the kubelet's eviction margin (#2400). ``None`` (size unknown) still
+    checks the margin itself, so a volume already in DiskPressure refuses."""
+    usage = await upgrade_image_space.get_store_usage(SLOT_IMAGE_DIR)
+    if usage is None:
+        return
+    message = upgrade_image_space.shortfall_message(usage, image_bytes or 0)
+    if message is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, message)
 
 
 async def _delete_from_mirror(image_id: uuid.UUID) -> None:
@@ -675,6 +688,7 @@ async def upload_upgrade_image(
             # rows may already carry a ``desired_slot_image_url`` built
             # from it, and a fresh id would leave those pointing at
             # nothing while the operator watches a "successful" upload.
+            await _require_store_headroom(file.size)
             repaired = await _store_verified_image(existing.id, _file_iter(), expected_sha)
             db.add(
                 AuditLog(
@@ -707,6 +721,7 @@ async def upload_upgrade_image(
 
     image_id = uuid.uuid4()
 
+    await _require_store_headroom(file.size)
     bytes_written = await _store_verified_image(image_id, _file_iter(), expected_sha)
 
     row = ApplianceUpgradeImage(
@@ -905,6 +920,13 @@ async def import_upgrade_image_from_github(
                         status.HTTP_502_BAD_GATEWAY,
                         f"GitHub returned {resp.status_code} for the {tag} upgrade image.",
                     )
+                # Refuse before a byte is written: the size comes from the
+                # response, falling back to the release asset's (#2400).
+                try:
+                    declared = int(resp.headers.get("content-length", ""))
+                except ValueError:
+                    declared = spec.size_bytes or 0
+                await _require_store_headroom(declared)
 
                 async def _gh_iter() -> AsyncIterator[bytes]:
                     async for chunk in resp.aiter_bytes(_CHUNK_BYTES):

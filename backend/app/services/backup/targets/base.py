@@ -230,6 +230,24 @@ def scrub_url(text: str, *urls: str) -> str:
     return text
 
 
+def describe_exc(exc: BaseException) -> str:
+    """A non-empty, operator-readable reason for ``exc``.
+
+    Many library exceptions carry no text at all — ``httpx.ReadTimeout``,
+    ``asyncio.TimeoutError``, a bare ``TimeoutError`` — so ``f"...: {exc}"``
+    stored ``"WebDAV PUT failed: "`` and told the operator nothing (#2402).
+    Falls back to the exception's type, and says plainly when it was a
+    timeout. Callers still run :func:`scrub_url` over the result.
+    """
+    text = str(exc).strip()
+    if text:
+        return text
+    name = type(exc).__name__
+    if isinstance(exc, TimeoutError) or "timeout" in name.lower():
+        return f"{name} (the destination timed out)"
+    return name
+
+
 def config_field_specs(driver: BackupDestination) -> tuple[ConfigFieldSpec, ...]:
     """The driver's INPUT fields — ``config_fields`` minus notices.
 
