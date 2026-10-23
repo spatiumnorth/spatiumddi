@@ -43,8 +43,10 @@ from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
 from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
 from app.services.ipam.integration_space_audit import (
+    EVIDENCE_DHCP_RESERVATION_OTHER_SPACE,
     EVIDENCE_OPERATOR_CREATE,
     EVIDENCE_OUTSIDE_TARGET_SPACE,
+    EVIDENCE_PREDATES_SPACE_SUBNETS,
     TARGET_MODELS,
     find_cross_space_adoptions,
 )
@@ -260,38 +262,162 @@ async def test_operator_row_in_another_space_is_never_adopted(
 
 
 @pytest.mark.parametrize("kind", list(_CASES))
-async def test_owned_row_in_another_space_is_neither_moved_nor_deleted(
+async def test_pure_mirror_row_left_in_another_space_is_deleted_not_moved(
     db_session: AsyncSession, kind: str
 ) -> None:
-    """A row carrying the target's FK but sitting in another space — what a
-    pre-#2577 build left behind, or a target whose space was changed. The
-    reconciler must not move it into its space, dedupe it away, or
-    absence-delete it; repairing it is the operator's call."""
+    """A row the target created and nobody touched, sitting in another space —
+    what changing the target's ``ipam_space_id`` leaves behind. It is released
+    by deleting it (the integration re-creates its row in its own space); it is
+    never moved across spaces."""
+    fk, run = _CASES[kind]
+    target, corp_subnet, mirror_subnet = await _setup(db_session, kind)
+    stray = IPAddress(
+        subnet_id=corp_subnet.id,
+        address=_ADDR,
+        status="allocated",
+        hostname="mirror-host",
+        **{fk: target.id},
+    )
+    db_session.add(stray)
+    await db_session.commit()
+    stray_id = stray.id
+
+    summary = await run(db_session, target, [_ADDR])
+    await db_session.commit()
+    assert any(
+        "released what this target owned outside" in w for w in summary.warnings
+    ), summary.warnings
+    assert await db_session.get(IPAddress, stray_id, populate_existing=True) is None
+    ours = (
+        (await db_session.execute(select(IPAddress).where(getattr(IPAddress, fk) == target.id)))
+        .scalars()
+        .all()
+    )
+    assert [(r.subnet_id, str(r.address)) for r in ours] == [(mirror_subnet.id, _ADDR)]
+
+
+@pytest.mark.parametrize("kind", list(_CASES))
+async def test_adopted_row_in_another_space_is_unclaimed_in_place(
+    db_session: AsyncSession, kind: str
+) -> None:
+    """An operator row carrying the target's FK in its HOME space — adopted by
+    a pre-#2577 build that never moved it, or adopted before a space change.
+    It is un-claimed in place: FK cleared, same subnet, ``user_modified_at``
+    kept. Never moved, never deleted — whether still desired or not."""
     fk, run = _CASES[kind]
     target, corp_subnet, _ = await _setup(db_session, kind)
+    stamp = datetime.now(UTC) - timedelta(days=3)
     stray = IPAddress(
         subnet_id=corp_subnet.id,
         address=_ADDR,
         status="allocated",
         hostname="corp-host",
+        user_modified_at=stamp,
         **{fk: target.id},
     )
     db_session.add(stray)
     await db_session.commit()
-    before = _snapshot(stray)
 
-    # Still desired: a move would have re-parented it into ``mirror``.
     summary = await run(db_session, target, [_ADDR])
     await db_session.commit()
-    assert any("outside its IP space" in w for w in summary.warnings), summary.warnings
+    assert any("1 un-claimed" in w for w in summary.warnings), summary.warnings
     row = await db_session.get(IPAddress, stray.id, populate_existing=True)
-    assert row is not None and _snapshot(row) == before, f"{kind} moved or rewrote it"
+    assert row is not None, f"{kind} deleted an adopted operator row"
+    assert row.subnet_id == corp_subnet.id
+    assert row.user_modified_at == stamp
+    assert row.hostname == "corp-host"
+    assert all(getattr(row, f) is None for f in INTEGRATION_OWNERSHIP_FKS)
 
-    # No longer desired: absence-delete would have deleted it.
+
+async def _evidence_created_by(db: AsyncSession, row: IPAddress, target: Any) -> None:
+    user = User(
+        username=_n("u"),
+        email=f"{_n('u')}@example.com",
+        display_name="u",
+        hashed_password=hash_password("password123"),
+        auth_source="local",
+    )
+    user.groups = []
+    db.add(user)
+    await db.flush()
+    row.created_by_user_id = user.id
+
+
+async def _evidence_audit(db: AsyncSession, row: IPAddress, target: Any) -> None:
+    await _audit_create(db, row)
+
+
+async def _evidence_older(db: AsyncSession, row: IPAddress, target: Any) -> None:
+    await db.refresh(target, ["created_at"])
+    row.created_at = target.created_at - timedelta(days=30)
+
+
+async def _evidence_other_owner(db: AsyncSession, row: IPAddress, target: Any) -> None:
+    other = _targets(uuid.uuid4())["unifi"]
+    other.ipam_space_id = target.ipam_space_id
+    db.add(other)
+    await db.flush()
+    row.unifi_controller_id = other.id
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [_evidence_created_by, _evidence_audit, _evidence_older, _evidence_other_owner],
+    ids=["created_by_user", "operator_audit", "older_than_target", "second_owner"],
+)
+async def test_unclear_rows_outside_the_space_are_unclaimed_never_deleted(
+    db_session: AsyncSession, evidence: Callable[..., Awaitable[None]]
+) -> None:
+    """``user_modified_at`` is not the only sign of a person's hand. A row with
+    any other one — or a second owner — is un-claimed, not deleted: when the
+    evidence is unclear the release fails towards keeping the row."""
+    fk, run = _CASES["docker"]
+    target, corp_subnet, _ = await _setup(db_session, "docker")
+    stray = IPAddress(
+        subnet_id=corp_subnet.id, address=_ADDR, status="allocated", **{fk: target.id}
+    )
+    db_session.add(stray)
+    await db_session.flush()
+    await evidence(db_session, stray, target)
+    await db_session.commit()
+
     await run(db_session, target, [])
     await db_session.commit()
     row = await db_session.get(IPAddress, stray.id, populate_existing=True)
-    assert row is not None and _snapshot(row) == before, f"{kind} deleted or released it"
+    assert row is not None
+    assert row.subnet_id == corp_subnet.id
+    assert row.docker_host_id is None
+
+
+@pytest.mark.parametrize("kind", list(_CASES))
+async def test_pre_fix_damage_inside_the_target_space_is_not_released(
+    db_session: AsyncSession, kind: str
+) -> None:
+    """An operator row a pre-#2577 build already MOVED into the target's space
+    is not "outside" — the release must not delete or un-claim it; the audit
+    report and the operator decide."""
+    fk, run = _CASES[kind]
+    target, _, mirror_subnet = await _setup(db_session, kind)
+    stolen = IPAddress(
+        subnet_id=mirror_subnet.id,
+        address=_ADDR,
+        status="allocated",
+        hostname="corp-host",
+        user_modified_at=datetime.now(UTC),
+        **{fk: target.id},
+    )
+    db_session.add(stolen)
+    await db_session.flush()
+    await _audit_create(db_session, stolen)
+    await db_session.commit()
+
+    summary = await run(db_session, target, [_ADDR])
+    await db_session.commit()
+    assert not any("released" in w for w in summary.warnings), summary.warnings
+    row = await db_session.get(IPAddress, stolen.id, populate_existing=True)
+    assert row is not None
+    assert row.subnet_id == mirror_subnet.id
+    assert getattr(row, fk) == target.id
 
 
 async def test_same_space_adoption_still_works(db_session: AsyncSession) -> None:
@@ -309,6 +435,164 @@ async def test_same_space_adoption_still_works(db_session: AsyncSession) -> None
     assert row is not None
     assert getattr(row, fk) == target.id
     assert row.user_modified_at is not None
+
+
+# ── Space re-targeting: owned subnets (#2577) ─────────────────────────────
+
+
+def _subnet_desired(kind: str, network: str) -> Any:
+    mod = importlib.import_module(f"app.services.{kind}.reconcile")
+    values: dict[str, Any] = {
+        "network": network,
+        "name": f"{kind}-net",
+        "description": "mirror",
+        "gateway": None,
+        "site_name": "default",
+        "network_id": "n1",
+        "vlan_tag": None,
+        "vlan_name": "",
+    }
+    names = {f.name for f in dataclasses.fields(mod._DesiredSubnet)}
+    return mod._DesiredSubnet(**{k: v for k, v in values.items() if k in names})
+
+
+async def _run_subnet_phase(db: AsyncSession, kind: str, target: Any, networks: list[str]) -> Any:
+    mod = importlib.import_module(f"app.services.{kind}.reconcile")
+    summary = mod.ReconcileSummary(ok=True)
+    desired = [_subnet_desired(kind, n) for n in networks]
+    if kind == "unifi":
+        await mod._apply_blocks_and_subnets(db, target, desired, {}, summary)
+    else:
+        await mod._apply_blocks_and_subnets(db, target, desired, summary)
+    return summary
+
+
+_SUBNET_KINDS = ["docker", "unifi", "kubernetes"]
+
+
+@pytest.mark.parametrize("kind", _SUBNET_KINDS)
+async def test_space_change_releases_the_old_space_and_rebuilds_in_the_new(
+    db_session: AsyncSession, kind: str
+) -> None:
+    """Re-target an integration from space ``old`` to ``new``. Its pure mirror
+    subnet and rows in ``old`` are deleted, an operator row it adopted there is
+    un-claimed in place (and keeps its subnet alive, un-claimed), and the next
+    pass builds the mirror in ``new``. Nothing moves between spaces."""
+    fk, run = _CASES[kind]
+    old = await _space(db_session, "old")
+    new = await _space(db_session, "new")
+    target = _targets(old.id)[kind]
+    db_session.add(target)
+    await db_session.flush()
+
+    await _run_subnet_phase(db_session, kind, target, [_CIDR, "10.251.0.0/24"])
+    await run(db_session, target, [_ADDR, "10.251.0.7"])
+    await db_session.commit()
+    old_subnets = {
+        str(s.network): s
+        for s in (
+            await db_session.execute(select(Subnet).where(Subnet.space_id == old.id))
+        ).scalars()
+    }
+    assert getattr(old_subnets[_CIDR], fk) == target.id
+    # The operator adopts-in-place an address in the second subnet.
+    adopted = IPAddress(
+        subnet_id=old_subnets["10.251.0.0/24"].id,
+        address="10.251.0.20",
+        status="allocated",
+        hostname="kept",
+        user_modified_at=datetime.now(UTC),
+        **{fk: target.id},
+    )
+    db_session.add(adopted)
+    await db_session.commit()
+    kept_subnet_id = old_subnets["10.251.0.0/24"].id
+    gone_subnet_id = old_subnets[_CIDR].id
+    old_id, new_id, adopted_id, target_id = old.id, new.id, adopted.id, target.id
+
+    target.ipam_space_id = new.id
+    await db_session.commit()
+    summary = await _run_subnet_phase(db_session, kind, target, [_CIDR, "10.251.0.0/24"])
+    await run(db_session, target, [_ADDR, "10.251.0.7"])
+    await db_session.commit()
+    assert any("released what this target owned outside" in w for w in summary.warnings)
+
+    db_session.expire_all()
+    assert await db_session.get(Subnet, gone_subnet_id) is None
+    kept = await db_session.get(Subnet, kept_subnet_id)
+    assert kept is not None and kept.space_id == old_id
+    assert getattr(kept, fk) is None
+    row = await db_session.get(IPAddress, adopted_id)
+    assert row is not None and row.subnet_id == kept_subnet_id and getattr(row, fk) is None
+    assert row.user_modified_at is not None
+    leftovers = (
+        await db_session.execute(
+            select(IPAddress)
+            .join(Subnet, IPAddress.subnet_id == Subnet.id)
+            .where(Subnet.space_id == old_id, getattr(IPAddress, fk) == target_id)
+        )
+    ).all()
+    assert leftovers == []
+
+    ours = (
+        await db_session.execute(
+            select(Subnet.network, Subnet.space_id).where(getattr(Subnet, fk) == target_id)
+        )
+    ).all()
+    assert {(str(n), sp) for n, sp in ours} == {(_CIDR, new_id), ("10.251.0.0/24", new_id)}
+    addrs = (
+        await db_session.execute(
+            select(IPAddress.address, Subnet.space_id)
+            .join(Subnet, IPAddress.subnet_id == Subnet.id)
+            .where(getattr(IPAddress, fk) == target_id)
+        )
+    ).all()
+    assert {(str(a), sp) for a, sp in addrs} == {(_ADDR, new_id), ("10.251.0.7", new_id)}
+
+
+@pytest.mark.parametrize("kind", _SUBNET_KINDS)
+async def test_owned_subnet_in_another_space_is_never_updated_or_reparented(
+    db_session: AsyncSession, kind: str
+) -> None:
+    """Before the fix the subnet phase loaded the target's subnets from every
+    space, renamed them and re-parented them under a block of the NEW space.
+    A subnet an operator has a row in is un-claimed and left exactly as it
+    was."""
+    fk, _ = _CASES[kind]
+    old = await _space(db_session, "old")
+    new = await _space(db_session, "new")
+    target = _targets(new.id)[kind]
+    db_session.add(target)
+    await db_session.flush()
+    subnet = await _subnet(db_session, old, **{fk: target.id})
+    subnet.name = "operator-name"
+    db_session.add(IPAddress(subnet_id=subnet.id, address=_ADDR, status="allocated"))
+    await db_session.commit()
+    block_id, subnet_id, old_id = subnet.block_id, subnet.id, old.id
+
+    await _run_subnet_phase(db_session, kind, target, [_CIDR])
+    await db_session.commit()
+    db_session.expire_all()
+    row = await db_session.get(Subnet, subnet_id)
+    assert row is not None
+    assert (row.space_id, row.block_id, row.name) == (old_id, block_id, "operator-name")
+    assert getattr(row, fk) is None
+
+
+async def test_release_helper_ignores_an_empty_space_list(db_session: AsyncSession) -> None:
+    """ "No space" is never read as "everything is outside"."""
+    from app.services.integration_ownership import release_outside_space
+
+    fk, _ = _CASES["docker"]
+    target, corp_subnet, _ = await _setup(db_session, "docker")
+    stray = IPAddress(
+        subnet_id=corp_subnet.id, address=_ADDR, status="allocated", **{fk: target.id}
+    )
+    db_session.add(stray)
+    await db_session.commit()
+    out = await release_outside_space(db_session, fk, target.id, [None])
+    assert out.total == 0
+    assert (await db_session.get(IPAddress, stray.id, populate_existing=True)) is not None
 
 
 # ── Structural guard ──────────────────────────────────────────────────────
@@ -374,6 +658,68 @@ def test_no_reconciler_loads_addresses_across_spaces() -> None:
     assert not offenders, "unscoped IPAddress lookups (#2577):\n" + "\n".join(offenders)
 
 
+def _unscoped_owned_selects(tree: ast.AST, source: str) -> list[tuple[int, str]]:
+    """Every ``select(Subnet…)`` / ``select(IPBlock…)`` filtered by an
+    integration ownership FK without a ``space_id`` bound. Ownership alone
+    reaches the target's rows in every space — its old space after a space
+    change — which the subnet phase then renamed, re-parented under a block
+    of the new space, or deleted with what it held."""
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    found = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "select"):
+            continue
+        model = next(
+            (a.id for a in node.args if isinstance(a, ast.Name) and a.id in ("Subnet", "IPBlock")),
+            None,
+        )
+        if model is None:
+            continue
+        top: ast.AST = node
+        while True:
+            parent = parents.get(top)
+            if isinstance(parent, ast.Attribute) and parent.value is top:
+                top = parent
+            elif isinstance(parent, ast.Call) and parent.func is top:
+                top = parent
+            else:
+                break
+        text = ast.get_source_segment(source, top) or ""
+        by_owner = any(f"{model}.{fk}" in text for fk in INTEGRATION_OWNERSHIP_FKS) or (
+            f"getattr({model}" in text
+        )
+        if by_owner and f"{model}.space_id" not in text:
+            found.append((node.lineno, text.splitlines()[0]))
+    return found
+
+
+def test_no_reconciler_loads_owned_subnets_or_blocks_across_spaces() -> None:
+    """Load a target's subnets through ``owned_subnets_in_space``, or bound
+    the query by ``space_id``."""
+    offenders = []
+    for path in _reconciler_files():
+        source = path.read_text()
+        for line, text in _unscoped_owned_selects(ast.parse(source), source):
+            offenders.append(f"{path.relative_to(_APP)}:{line}: {text.strip()}")
+    assert not offenders, "unscoped owned Subnet/IPBlock lookups (#2577):\n" + "\n".join(offenders)
+
+
+def test_the_subnet_guard_catches_the_pre_fix_shape() -> None:
+    bad = (
+        "async def f(db, t, s, c):\n"
+        "    a = await db.execute(select(Subnet).where(Subnet.docker_host_id == t))\n"
+        "    b = await db.execute(select(IPBlock).where(IPBlock.tailscale_tenant_id == t,\n"
+        "        IPBlock.network == c))\n"
+        "    ok = await db.execute(select(Subnet).where(Subnet.unifi_controller_id == t,\n"
+        "        Subnet.space_id == s))\n"
+        "    ok2 = await db.execute(select(Subnet).where(Subnet.space_id == s))\n"
+    )
+    assert [line for line, _ in _unscoped_owned_selects(ast.parse(bad), bad)] == [2, 3]
+
+
 def test_every_reconciler_that_moves_rows_guards_the_move() -> None:
     offenders = []
     for path in _reconciler_files():
@@ -431,6 +777,9 @@ async def test_detector_reports_a_stolen_row_and_its_home(db_session: AsyncSessi
     controller = UnifiController(name=_n("unifi"), ipam_space_id=mirror.id)
     db_session.add(controller)
     await db_session.flush()
+    now = datetime.now(UTC)
+    # The corp subnet long predates the row; the mirror subnet came later.
+    corp_subnet.created_at = now - timedelta(days=60)
 
     # The damage: an operator-created row now in ``mirror`` carrying the FK.
     stolen = IPAddress(
@@ -439,7 +788,8 @@ async def test_detector_reports_a_stolen_row_and_its_home(db_session: AsyncSessi
         status="allocated",
         hostname="corp-host",
         unifi_controller_id=controller.id,
-        user_modified_at=datetime.now(UTC),
+        user_modified_at=now,
+        created_at=now - timedelta(days=30),
     )
     # The integration's own row at an overlapping address: not damage.
     own = IPAddress(
@@ -457,10 +807,163 @@ async def test_detector_reports_a_stolen_row_and_its_home(db_session: AsyncSessi
     assert [r.ip_address_id for r in rows] == [stolen.id]
     hit = rows[0]
     assert hit.integration == "unifi"
-    assert hit.likely_cross_space
+    assert hit.likely_cross_space and not hit.needs_review
     assert EVIDENCE_OPERATOR_CREATE in hit.evidence
+    assert EVIDENCE_PREDATES_SPACE_SUBNETS in hit.evidence
     assert hit.created_by == "alice"
     assert [(h.subnet_id, h.address_free) for h in hit.home_candidates] == [(corp_subnet.id, True)]
+
+
+async def test_same_space_adoption_in_an_overlapping_range_is_not_flagged_as_damage(
+    db_session: AsyncSession,
+) -> None:
+    """An operator row created in the integration's own space, then adopted
+    there. The same range existing in another space is no evidence the row
+    came from it: listed for review, never ``likely_cross_space``."""
+    corp = await _space(db_session, "corp")
+    mirror = await _space(db_session, "mirror")
+    corp_subnet = await _subnet(db_session, corp)
+    mirror_subnet = await _subnet(db_session, mirror)
+    now = datetime.now(UTC)
+    # Both subnets predate the row: it could have been created in either.
+    corp_subnet.created_at = now - timedelta(days=90)
+    mirror_subnet.created_at = now - timedelta(days=60)
+    host = _targets(mirror.id)["docker"]
+    db_session.add(host)
+    await db_session.flush()
+    adopted = IPAddress(
+        subnet_id=mirror_subnet.id,
+        address=_ADDR,
+        status="allocated",
+        docker_host_id=host.id,
+        user_modified_at=now,
+        created_at=now - timedelta(days=30),
+    )
+    db_session.add(adopted)
+    await db_session.flush()
+    await _audit_create(db_session, adopted)
+    await db_session.commit()
+
+    rows = await find_cross_space_adoptions(db_session)
+    assert [r.ip_address_id for r in rows] == [adopted.id]
+    assert not rows[0].likely_cross_space
+    assert rows[0].needs_review and rows[0].review_reason
+    assert EVIDENCE_PREDATES_SPACE_SUBNETS not in rows[0].evidence
+
+
+async def test_detector_uses_a_dhcp_reservation_in_another_space_as_evidence(
+    db_session: AsyncSession,
+) -> None:
+    from app.models.dhcp import DHCPScope, DHCPServerGroup, DHCPStaticAssignment
+
+    corp = await _space(db_session, "corp")
+    mirror = await _space(db_session, "mirror")
+    corp_subnet = await _subnet(db_session, corp)
+    mirror_subnet = await _subnet(db_session, mirror)
+    host = _targets(mirror.id)["docker"]
+    db_session.add(host)
+    await db_session.flush()
+    stolen = IPAddress(
+        subnet_id=mirror_subnet.id,
+        address=_ADDR,
+        status="allocated",
+        docker_host_id=host.id,
+        user_modified_at=datetime.now(UTC),
+    )
+    db_session.add(stolen)
+    group = DHCPServerGroup(name=_n("g"), description="")
+    db_session.add(group)
+    await db_session.flush()
+    scope = DHCPScope(group_id=group.id, subnet_id=corp_subnet.id, name="corp")
+    db_session.add(scope)
+    await db_session.flush()
+    db_session.add(
+        DHCPStaticAssignment(
+            scope_id=scope.id,
+            ip_address=_ADDR,
+            mac_address="aa:bb:cc:00:25:77",
+            ip_address_id=stolen.id,
+        )
+    )
+    await db_session.flush()
+    await _audit_create(db_session, stolen)
+    await db_session.commit()
+
+    rows = await find_cross_space_adoptions(db_session)
+    assert [r.ip_address_id for r in rows] == [stolen.id]
+    assert rows[0].likely_cross_space
+    assert EVIDENCE_DHCP_RESERVATION_OTHER_SPACE in rows[0].evidence
+
+
+async def test_detector_reports_a_cloud_row_outside_when_there_is_no_public_space(
+    db_session: AsyncSession,
+) -> None:
+    """``public_space_id`` NULL made the target-space test NULL rather than
+    false, so a Cloud row in a foreign space was never reported."""
+    corp = await _space(db_session, "corp")
+    mirror = await _space(db_session, "mirror")
+    corp_subnet = await _subnet(db_session, corp)
+    endpoint = _targets(mirror.id)["cloud"]
+    assert endpoint.public_space_id is None
+    db_session.add(endpoint)
+    await db_session.flush()
+    stray = IPAddress(
+        subnet_id=corp_subnet.id, address=_ADDR, status="allocated", cloud_endpoint_id=endpoint.id
+    )
+    db_session.add(stray)
+    await db_session.commit()
+
+    rows = await find_cross_space_adoptions(db_session)
+    assert [r.ip_address_id for r in rows] == [stray.id]
+    assert EVIDENCE_OUTSIDE_TARGET_SPACE in rows[0].evidence
+
+
+async def test_detector_truncation_is_honest(db_session: AsyncSession) -> None:
+    """The cap applies to real findings. Before, each model's query was capped
+    at ``limit * 4`` BEFORE the Python filter, so rows that matched the SQL
+    but not the rules could crowd out real findings — and the cut was never
+    reported."""
+    from app.services.ipam.integration_space_audit import audit_cross_space_adoptions
+
+    corp = await _space(db_session, "corp")
+    mirror = await _space(db_session, "mirror")
+    corp_subnet = await _subnet(db_session, corp, "10.252.0.0/24")
+    mirror_subnet = await _subnet(db_session, mirror, "10.10.0.0/24")
+    host = _targets(mirror.id)["docker"]
+    db_session.add(host)
+    await db_session.flush()
+    # Five operator-audited adoptions in the host's own space with no overlap
+    # anywhere — not findings — sorting before the one real finding.
+    noise = [
+        IPAddress(
+            subnet_id=mirror_subnet.id,
+            address=f"10.10.0.{i}",
+            status="allocated",
+            docker_host_id=host.id,
+            user_modified_at=datetime.now(UTC),
+        )
+        for i in range(1, 6)
+    ]
+    real = [
+        IPAddress(
+            subnet_id=corp_subnet.id,
+            address=f"10.252.0.{i}",
+            status="allocated",
+            docker_host_id=host.id,
+        )
+        for i in (1, 2)
+    ]
+    db_session.add_all(noise + real)
+    await db_session.flush()
+    for row in noise:
+        await _audit_create(db_session, row)
+    await db_session.commit()
+
+    one = await audit_cross_space_adoptions(db_session, limit=1)
+    assert [str(r.address) for r in one.rows] == ["10.252.0.1"]
+    assert one.truncated
+    both = await audit_cross_space_adoptions(db_session, limit=2)
+    assert len(both.rows) == 2 and not both.truncated
 
 
 async def test_detector_reports_rows_outside_the_target_space(db_session: AsyncSession) -> None:

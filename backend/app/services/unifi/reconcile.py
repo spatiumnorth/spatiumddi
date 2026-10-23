@@ -49,6 +49,7 @@ from app.services.integration_ownership import (
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
+    owned_subnets_in_space,
     owning_integration,
     subnet_has_surviving_addresses,
 )
@@ -580,8 +581,18 @@ async def _apply_blocks_and_subnets(
         existing_networks[supernet] = parent
         summary.blocks_created += 1
 
-    res = await db.execute(select(Subnet).where(Subnet.unifi_controller_id == controller.id))
-    current_subnets = {str(s.network): s for s in res.scalars().all()}
+    # #2577 — only subnets in the controller's own space; anything it owns
+    # in another (its old space, after a space change) is released first.
+    current_subnets = {
+        str(s.network): s
+        for s in await owned_subnets_in_space(
+            db,
+            "unifi_controller_id",
+            controller.id,
+            controller.ipam_space_id,
+            warnings=summary.warnings,
+        )
+    }
 
     desired_map = {d.network: d for d in desired_subnets}
     used_wrapper_cidrs: set[str] = set()
@@ -721,9 +732,14 @@ async def _apply_addresses(
     # Keep the most-recently-modified row, soft-delete the rest. Done
     # before adoption so the adopted set is already deduped.
     # #2577 — only rows inside the controller's space; a unifi-owned row in
-    # another space is never deduped (deleted) from here.
+    # another space is released (never moved or deduped across spaces) by
+    # ``owned_addresses_in_space`` before this sees anything.
     pre_owned = await owned_addresses_in_space(
-        db, "unifi_controller_id", controller.id, controller.ipam_space_id
+        db,
+        "unifi_controller_id",
+        controller.id,
+        controller.ipam_space_id,
+        warnings=summary.warnings,
     )
     pre_groups: dict[str, list[IPAddress]] = {}
     for row in pre_owned:

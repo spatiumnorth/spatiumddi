@@ -16,7 +16,7 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from app.api.deps import DB, SuperAdmin
-from app.services.ipam.integration_space_audit import find_cross_space_adoptions
+from app.services.ipam.integration_space_audit import audit_cross_space_adoptions
 
 router = APIRouter(tags=["ipam"])
 
@@ -47,6 +47,8 @@ class SuspectRowOut(BaseModel):
     created_by: str | None = None
     evidence: list[str]
     likely_cross_space: bool
+    needs_review: bool = False
+    review_reason: str | None = None
     home_candidates: list[HomeCandidateOut]
 
 
@@ -63,13 +65,15 @@ async def integration_space_audit(
     include_same_space: bool = Query(
         False,
         description="Also list operator-origin rows adopted inside the integration's own "
-        "space (normal adoption, not #2577 damage).",
+        "space whose address exists in no other space (normal adoption, not #2577 damage).",
     ),
     limit: int = Query(500, ge=1, le=5000),
 ) -> IntegrationSpaceAuditOut:
-    rows = await find_cross_space_adoptions(db, include_same_space=include_same_space, limit=limit)
+    result = await audit_cross_space_adoptions(
+        db, include_same_space=include_same_space, limit=limit
+    )
     return IntegrationSpaceAuditOut(
-        count=len(rows),
-        truncated=len(rows) >= limit,
-        rows=[SuspectRowOut.model_validate(r, from_attributes=True) for r in rows],
+        count=len(result.rows),
+        truncated=result.truncated,
+        rows=[SuspectRowOut.model_validate(r, from_attributes=True) for r in result.rows],
     )

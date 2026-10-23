@@ -68,6 +68,7 @@ from app.services.integration_ownership import (
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
+    owned_subnets_in_space,
     owning_integration,
     subnet_has_surviving_addresses,
 )
@@ -586,11 +587,6 @@ async def _apply_addresses(
     *,
     allow_delete: bool = True,
 ) -> None:
-    subnet_rows = (
-        (await db.execute(select(Subnet).where(Subnet.cloud_endpoint_id == endpoint.id)))
-        .scalars()
-        .all()
-    )
     # Also consider operator subnets in the same space(s) for IP
     # containment — an instance IP may land in an operator-curated subnet
     # the reconciler reused (subnets_matched). We restrict to the bound
@@ -598,6 +594,11 @@ async def _apply_addresses(
     space_ids = [endpoint.ipam_space_id]
     if endpoint.public_space_id is not None and endpoint.public_space_id != endpoint.ipam_space_id:
         space_ids.append(endpoint.public_space_id)
+    # #2577 — the endpoint's own subnets in its bound space(s) only; anything
+    # it owns elsewhere (a previous space) is released first.
+    subnet_rows = await owned_subnets_in_space(
+        db, "cloud_endpoint_id", endpoint.id, space_ids, warnings=summary.warnings
+    )
     all_space_subnets = (
         (await db.execute(select(Subnet).where(Subnet.space_id.in_(space_ids)))).scalars().all()
     )
@@ -644,7 +645,7 @@ async def _apply_addresses(
         await db.flush()
 
     # #2577 — the rows we may update, move and absence-delete: ours AND in
-    # our space. A row carrying our FK in another space is left alone.
+    # our space. One carrying our FK in another space is released first (#2577).
     current = {
         str(a.address): a
         for a in await owned_addresses_in_space(

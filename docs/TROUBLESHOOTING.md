@@ -398,6 +398,17 @@ and deletes rows inside its target's own space. Nothing already moved is put
 back automatically, because the row's original subnet was never recorded,
 and a wrong guess would move it a second time.
 
+One kind of damage does repair itself. An operator row the old build
+claimed but never managed to move still sits in its home space carrying the
+integration's column. On the first sync after the upgrade the integration
+**releases** everything it owns outside its own space: it clears its column
+on such a row and leaves the row where it is, `user_modified_at` included.
+It only ever deletes a row it can show is a pure mirror row of its own
+(created after the integration, never edited or audited by a person, no
+DHCP reservation, no other owner); when in doubt it un-claims. The same
+release is what happens when you change an integration's IP space on
+purpose. The sync warnings say what was released.
+
 **Before anything else** — Upgrade first, so the integration stops moving
 rows while you repair them. If the integration is still pointed at an
 overlapping space, leave it running: it no longer touches the other space.
@@ -422,23 +433,40 @@ subnet and space it sits in now, and:
   `created_before_target` means the row is older than the integration
   target, which an integration-created row can't be.
   `outside_target_space` means it carries the integration's column but sits
-  outside the integration's space; the reconciler now leaves such a row
-  frozen where it is.
-- `likely_cross_space` — the row has operator-origin evidence AND some
-  subnet in another space contains its address. These are the rows to
-  repair.
+  outside the integration's space; the integration's next sync releases it
+  (see above), so these only show up until then.
+  `dhcp_reservation_in_other_space` means a DHCP reservation linked to the
+  row belongs to a scope in another space: it was made there.
+  `predates_its_space_subnets` means the row is older than every subnet of
+  its current space that contains it, while a subnet in another space that
+  contains it is older than the row. A row can't be created before its
+  subnet, so it was moved in. (A subnet split in its own space can produce
+  this too, so it is evidence, not proof.)
+- `likely_cross_space` — the row has operator-origin evidence AND one of
+  the last two pieces of evidence that it lived in another space. These are
+  the rows to repair.
+- `needs_review` — the row has operator-origin evidence and some subnet in
+  another space contains its address, but nothing shows it ever lived
+  there. That is exactly what an ordinary adoption in the integration's
+  **own** space looks like whenever the range also exists in another space,
+  so do not move these on the report's word: confirm with whoever owns the
+  address first. A row the old build stole after the integration was set
+  up, and without a DHCP reservation, also lands here — which is why they
+  are listed at all.
 - `home_candidates` — the subnets in other spaces that contain the address,
   and `address_free`, whether nothing holds that address there now. The
   one with `address_free: true` in the space the address went missing from
   is almost always where the row came from.
 
 `?include_same_space=true` also lists operator rows an integration adopted
-inside its **own** space. That is normal, documented adoption, not this
-bug.
+inside its own space whose address exists in no other space. That is
+normal, documented adoption, not this bug. `truncated: true` means more
+rows matched than `limit` returned; raise `limit` (up to 5000).
 
 ### Put a row back
 
-For each `likely_cross_space` row, confirm the home subnet with whoever
+For each `likely_cross_space` row — and each `needs_review` row its owner
+confirms came from another space — confirm the home subnet with whoever
 owns the address, then move it back and release the integration's claim.
 Use the column for the integration the report names (`unifi_controller_id`,
 `docker_host_id`, `kubernetes_cluster_id`, `proxmox_node_id`,

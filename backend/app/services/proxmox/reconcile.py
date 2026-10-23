@@ -750,7 +750,7 @@ async def _apply_addresses(
         await db.flush()
 
     # #2577 — the rows we may update, move and absence-delete: ours AND in
-    # our space. A row carrying our FK in another space is left alone.
+    # our space. One carrying our FK in another space is released first (#2577).
     current = {
         str(a.address): a
         for a in await owned_addresses_in_space(

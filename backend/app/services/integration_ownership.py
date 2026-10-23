@@ -20,12 +20,15 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Collection, Iterable
+from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, String, and_, cast, exists, func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
-from app.models.ipam import IPAddress, Subnet
+from app.models.audit import AuditLog
+from app.models.ipam import IPAddress, IPBlock, Subnet
 
 # Ownership FK → the integration's name, as block-sync targets and the
 # block-move blockers report it.
@@ -161,10 +164,12 @@ async def address_taken(
 # their own space and could then delete it — so enabling an integration on an
 # overlapping range silently stole operator rows (and, by the
 # ``ondelete=SET NULL`` on ``DNSRecord.ip_address_id``, orphaned their DNS
-# records). OPNsense alone had been fixed, by hand, in its own file. These two
-# helpers are the only way a reconciler loads ``IPAddress`` rows, so an eighth
-# reconciler gets the scoping for free; ``tests/test_integration_space_scoping.py``
-# fails any reconciler query that bypasses them.
+# records). OPNsense alone had been fixed, by hand, in its own file. These
+# helpers are the only way a reconciler loads ``IPAddress`` rows (and the
+# ``Subnet`` rows it owns), so an eighth reconciler gets the scoping — and the
+# release of whatever it owns outside its space — for free;
+# ``tests/test_integration_space_scoping.py`` fails any reconciler query that
+# bypasses them.
 
 
 def _space_id_list(space_ids: Any | Iterable[Any]) -> list[Any]:
@@ -197,6 +202,215 @@ async def addresses_in_space(
     return list((await db.execute(stmt)).scalars().all())
 
 
+def ownership_target_model(own_fk: str) -> Any:
+    """The integration target model ``own_fk`` points at (``DockerHost`` for
+    ``docker_host_id``, …), read off the column's foreign key so a new
+    integration is covered without a second list."""
+    if own_fk not in INTEGRATION_OWNERSHIP:
+        raise ValueError(f"not an integration ownership FK: {own_fk!r}")
+    import app.models  # noqa: F401, PLC0415  — registers every mapper
+    from app.models.base import Base  # noqa: PLC0415
+
+    (ref,) = IPAddress.__table__.c[own_fk].foreign_keys
+    table = ref.column.table.name
+    for mapper in Base.registry.mappers:
+        if getattr(mapper.class_, "__tablename__", None) == table:
+            return mapper.class_
+    raise LookupError(f"no model for table {table!r}")  # pragma: no cover
+
+
+@dataclass
+class SpaceRelease:
+    """What ``release_outside_space`` did with a target's rows that sat
+    outside its IP space (#2577)."""
+
+    addresses_deleted: int = 0
+    addresses_unclaimed: int = 0
+    subnets_deleted: int = 0
+    subnets_unclaimed: int = 0
+    blocks_deleted: int = 0
+    blocks_unclaimed: int = 0
+
+    @property
+    def total(self) -> int:
+        return (
+            self.addresses_deleted
+            + self.addresses_unclaimed
+            + self.subnets_deleted
+            + self.subnets_unclaimed
+            + self.blocks_deleted
+            + self.blocks_unclaimed
+        )
+
+    def describe(self) -> str:
+        parts = []
+        for noun, deleted, unclaimed in (
+            ("address row(s)", self.addresses_deleted, self.addresses_unclaimed),
+            ("subnet(s)", self.subnets_deleted, self.subnets_unclaimed),
+            ("block(s)", self.blocks_deleted, self.blocks_unclaimed),
+        ):
+            if deleted or unclaimed:
+                parts.append(
+                    f"{deleted + unclaimed} {noun} ({deleted} deleted as pure mirror rows, "
+                    f"{unclaimed} un-claimed and left in place)"
+                )
+        return (
+            "released what this target owned outside its IP space: "
+            + "; ".join(parts)
+            + ". Nothing was moved between spaces (#2577)"
+        )
+
+
+def _operator_touched(resource_type: str, id_col: Any) -> Any:
+    """An audit row written by a user (not the system) about this row: an
+    IPAM create, an edit, a profile scan — any of them means a person has
+    had a hand in it, so it is not a pure mirror row."""
+    return exists().where(
+        AuditLog.resource_type == resource_type,
+        AuditLog.resource_id == cast(id_col, String),
+        AuditLog.user_id.is_not(None),
+    )
+
+
+def _no_other_owner(model: Any, own_fk: str) -> list[Any]:
+    return [
+        getattr(model, fk).is_(None)
+        for fk in INTEGRATION_OWNERSHIP
+        if fk != own_fk and hasattr(model, fk)
+    ]
+
+
+async def release_outside_space(
+    db: AsyncSession,
+    own_fk: str,
+    target_id: Any,
+    space_ids: Any | Iterable[Any],
+    *,
+    warnings: list[str] | None = None,
+) -> SpaceRelease:
+    """Release every ``IPAddress`` / ``Subnet`` / ``IPBlock`` the target owns
+    outside ``space_ids`` (#2577).
+
+    Such rows are what a change of the target's ``ipam_space_id`` leaves
+    behind in the old space, or an operator row a pre-#2577 build claimed
+    and never managed to move. (A row a pre-#2577 build DID move sits in the
+    target's space, so it is not outside and is not touched here; the audit
+    report finds those.) Each is released, never moved across spaces:
+
+    * a **pure mirror row** — created by the integration and never touched
+      by a person — is deleted; the integration re-creates its rows in its
+      current space;
+    * anything else is **un-claimed in place**: the ownership FK is cleared,
+      the row stays in its space, ``user_modified_at`` stays as it is.
+
+    "Pure mirror" needs positive evidence on every count and fails towards
+    un-claiming: no audit row written by a user (create, edit, anything), no
+    other integration's FK, and created after the target itself (an
+    integration cannot have created a row older than itself). An address
+    also needs no ``user_modified_at``, no ``created_by_user_id``, no import
+    provenance and no DHCP reservation; a subnet or block must hold nothing —
+    no addresses, DHCP scopes, subnets or child blocks — to be deleted.
+
+    An empty space list releases nothing: a target always has a space, and
+    treating "unknown" as "everything is outside" would release it all.
+    """
+    if own_fk not in INTEGRATION_OWNERSHIP:
+        raise ValueError(f"not an integration ownership FK: {own_fk!r}")
+    from app.models.dhcp import DHCPScope  # noqa: PLC0415
+
+    out = SpaceRelease()
+    ids = _space_id_list(space_ids)
+    if not ids:
+        return out
+    target_model = ownership_target_model(own_fk)
+    target_created = (
+        select(target_model.created_at).where(target_model.id == target_id).scalar_subquery()
+    )
+
+    # Addresses first, so a subnet left empty by them can go too.
+    addr_fk = getattr(IPAddress, own_fk)
+    addr_pure = and_(
+        IPAddress.user_modified_at.is_(None),
+        IPAddress.created_by_user_id.is_(None),
+        IPAddress.import_source.is_(None),
+        IPAddress.static_assignment_id.is_(None),
+        IPAddress.created_at >= target_created,
+        not_(_operator_touched("ip_address", IPAddress.id)),
+        *_no_other_owner(IPAddress, own_fk),
+    )
+    rows = (
+        await db.execute(
+            select(IPAddress, addr_pure.label("pure"))
+            .join(Subnet, IPAddress.subnet_id == Subnet.id)
+            .where(addr_fk == target_id, Subnet.space_id.not_in(ids))
+        )
+    ).all()
+    for row, pure in rows:
+        if pure:
+            await db.delete(row)
+            out.addresses_deleted += 1
+        else:
+            setattr(row, own_fk, None)
+            out.addresses_unclaimed += 1
+    if rows:
+        await db.flush()
+
+    if hasattr(Subnet, own_fk):
+        subnet_pure = and_(
+            Subnet.created_at >= target_created,
+            not_(_operator_touched("subnet", Subnet.id)),
+            not_(exists().where(IPAddress.subnet_id == Subnet.id)),
+            not_(exists().where(DHCPScope.subnet_id == Subnet.id)),
+            *_no_other_owner(Subnet, own_fk),
+        )
+        subnets = (
+            await db.execute(
+                select(Subnet, subnet_pure.label("pure")).where(
+                    getattr(Subnet, own_fk) == target_id, Subnet.space_id.not_in(ids)
+                )
+            )
+        ).all()
+        for subnet, pure in subnets:
+            if pure:
+                await db.delete(subnet)
+                out.subnets_deleted += 1
+            else:
+                setattr(subnet, own_fk, None)
+                out.subnets_unclaimed += 1
+        if subnets:
+            await db.flush()
+
+    if hasattr(IPBlock, own_fk):
+        child = aliased(IPBlock)
+        block_pure = and_(
+            IPBlock.created_at >= target_created,
+            not_(_operator_touched("ip_block", IPBlock.id)),
+            not_(exists().where(Subnet.block_id == IPBlock.id)),
+            not_(exists().where(child.parent_block_id == IPBlock.id)),
+            *_no_other_owner(IPBlock, own_fk),
+        )
+        blocks = (
+            await db.execute(
+                select(IPBlock, block_pure.label("pure")).where(
+                    getattr(IPBlock, own_fk) == target_id, IPBlock.space_id.not_in(ids)
+                )
+            )
+        ).all()
+        for block, pure in blocks:
+            if pure:
+                await db.delete(block)
+                out.blocks_deleted += 1
+            else:
+                setattr(block, own_fk, None)
+                out.blocks_unclaimed += 1
+        if blocks:
+            await db.flush()
+
+    if out.total and warnings is not None:
+        warnings.append(out.describe())
+    return out
+
+
 async def owned_addresses_in_space(
     db: AsyncSession,
     own_fk: str,
@@ -208,33 +422,43 @@ async def owned_addresses_in_space(
     """The rows the target owns (``own_fk == target_id``) inside ``space_ids``.
 
     This is a reconciler's "current" set: the rows it may update, move,
-    dedupe and absence-delete. A row carrying the target's FK in another
-    space — left behind when the target's space was changed, or stolen by a
-    pre-#2577 build — is excluded and therefore left exactly where it is;
-    ``find_cross_space_adoptions`` reports such rows for an operator to
-    repair by hand.
+    dedupe and absence-delete. Whatever the target owns OUTSIDE its space —
+    left behind when the target's space was changed, or an operator row a
+    pre-#2577 build claimed in its home space — is released first by
+    ``release_outside_space`` (pure mirror rows deleted, everything else
+    un-claimed in place, nothing moved across spaces), so every reconciler
+    gets the same treatment.
 
-    Pass the sync summary's ``warnings`` to have such rows counted into it,
-    so a frozen row is visible on the integration's own sync status rather
-    than only in that report."""
+    Pass the sync summary's ``warnings`` to have what was released reported
+    on the integration's own sync status."""
     if own_fk not in INTEGRATION_OWNERSHIP:
         raise ValueError(f"not an integration ownership FK: {own_fk!r}")
+    await release_outside_space(db, own_fk, target_id, space_ids, warnings=warnings)
     owned = getattr(IPAddress, own_fk) == target_id
     stmt = scope_addresses_to_space(select(IPAddress), space_ids).where(owned)
-    rows = list((await db.execute(stmt)).scalars().all())
-    if warnings is not None:
-        outside = await db.scalar(
-            select(func.count())
-            .select_from(IPAddress)
-            .join(Subnet, IPAddress.subnet_id == Subnet.id)
-            .where(owned, Subnet.space_id.not_in(_space_id_list(space_ids)))
-        )
-        if outside:
-            warnings.append(
-                f"{outside} address row(s) owned by this target sit outside its IP space "
-                "and were left untouched; see GET /api/v1/ipam/integration-space-audit (#2577)"
-            )
-    return rows
+    return list((await db.execute(stmt)).scalars().all())
+
+
+async def owned_subnets_in_space(
+    db: AsyncSession,
+    own_fk: str,
+    target_id: Any,
+    space_ids: Any | Iterable[Any],
+    *,
+    warnings: list[str] | None = None,
+) -> list[Subnet]:
+    """The subnets the target owns inside ``space_ids`` — a reconciler's
+    current subnet set. Owned subnets (and addresses and blocks) outside the
+    space are released first, exactly as ``owned_addresses_in_space`` does,
+    so a subnet left in a target's old space is never updated, re-parented
+    under a block of the new space, or cascade-deleted with what it holds."""
+    if own_fk not in INTEGRATION_OWNERSHIP:
+        raise ValueError(f"not an integration ownership FK: {own_fk!r}")
+    await release_outside_space(db, own_fk, target_id, space_ids, warnings=warnings)
+    stmt = select(Subnet).where(
+        getattr(Subnet, own_fk) == target_id, Subnet.space_id.in_(_space_id_list(space_ids))
+    )
+    return list((await db.execute(stmt)).scalars().all())
 
 
 def move_stays_in_space(current_subnet_id: Any, space_subnet_ids: Collection[Any]) -> bool:
@@ -257,6 +481,10 @@ __all__ = [
     "dns_record_owned_elsewhere",
     "move_stays_in_space",
     "owned_addresses_in_space",
+    "owned_subnets_in_space",
+    "ownership_target_model",
+    "release_outside_space",
+    "SpaceRelease",
     "owned_by_other_integration",
     "owning_integration",
     "scope_addresses_to_space",

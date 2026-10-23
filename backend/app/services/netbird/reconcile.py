@@ -46,6 +46,7 @@ from app.services.integration_ownership import (
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
+    owned_subnets_in_space,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.netbird.client import (
@@ -223,6 +224,7 @@ async def _ensure_block_and_subnet(
         await db.execute(
             select(IPBlock).where(
                 IPBlock.netbird_instance_id == instance.id,
+                IPBlock.space_id == instance.ipam_space_id,
                 IPBlock.network == cidr_norm,
             )
         )
@@ -239,14 +241,22 @@ async def _ensure_block_and_subnet(
         await db.flush()
         summary.blocks_created += 1
 
-    existing_subnet = (
-        await db.execute(
-            select(Subnet).where(
-                Subnet.netbird_instance_id == instance.id,
-                Subnet.network == cidr_norm,
+    # #2577 — the overlay subnet in the instance's own space only; one it owns
+    # in another space (its old space, after a space change) is released.
+    existing_subnet = next(
+        (
+            s
+            for s in await owned_subnets_in_space(
+                db,
+                "netbird_instance_id",
+                instance.id,
+                instance.ipam_space_id,
+                warnings=summary.warnings,
             )
-        )
-    ).scalar_one_or_none()
+            if str(s.network) == cidr_norm
+        ),
+        None,
+    )
     if existing_subnet is None:
         existing_subnet = Subnet(
             space_id=instance.ipam_space_id,
@@ -311,7 +321,7 @@ async def _apply_addresses(
         await db.flush()
 
     # #2577 — the rows we may update, move and absence-delete: ours AND in
-    # our space. A row carrying our FK in another space is left alone.
+    # our space. One carrying our FK in another space is released first (#2577).
     current = {
         str(a.address): a
         for a in await owned_addresses_in_space(

@@ -52,6 +52,7 @@ from app.services.integration_ownership import (
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
+    owned_subnets_in_space,
     subnet_has_surviving_addresses,
 )
 from app.services.ipam.utilization import counts_toward_utilization
@@ -335,8 +336,14 @@ async def _apply_blocks_and_subnets(
         existing_networks[supernet] = parent
         summary.blocks_created += 1
 
-    res = await db.execute(select(Subnet).where(Subnet.docker_host_id == host.id))
-    current_subnets = {str(s.network): s for s in res.scalars().all()}
+    # #2577 — only subnets in the host's own space; anything it owns in
+    # another (its old space, after a space change) is released first.
+    current_subnets = {
+        str(s.network): s
+        for s in await owned_subnets_in_space(
+            db, "docker_host_id", host.id, host.ipam_space_id, warnings=summary.warnings
+        )
+    }
 
     desired_map = {d.network: d for d in desired_subnets}
     used_wrapper_cidrs: set[str] = set()
@@ -475,7 +482,7 @@ async def _apply_addresses(
         await db.flush()
 
     # #2577 — the rows we may update, move and absence-delete: ours AND in
-    # our space. A row carrying our FK in another space is left alone.
+    # our space. One carrying our FK in another space is released first (#2577).
     current = {
         str(a.address): a
         for a in await owned_addresses_in_space(

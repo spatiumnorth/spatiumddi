@@ -565,7 +565,7 @@ async def apply_addresses(
         (await db.execute(select(Subnet).where(Subnet.space_id == space_id))).scalars().all()
     )
     # #2577 — only rows inside the target's space are ours to update or
-    # absence-delete; one carrying our FK elsewhere is left alone.
+    # absence-delete; one carrying our FK elsewhere is released first.
     current_rows = await owned_addresses_in_space(
         db, owner.fk_attr, target_id, space_id, warnings=summary.warnings
     )
