@@ -36,7 +36,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.ipam import IPAddress, IPBlock, NATMapping, Subnet
 from app.models.panos import FIREWALL_OBJECT_KINDS, FirewallObject
 from app.services._mirror_hostname import normalize_desired_hostname
-from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
+from app.services.integration_ownership import (
+    INTEGRATION_OWNERSHIP_FKS,
+    owned_addresses_in_space,
+)
 from app.services.ipam.utilization import counts_toward_utilization
 
 _BIGINT_MAX = 2**63 - 1
@@ -561,10 +564,10 @@ async def apply_addresses(
     subnets = list(
         (await db.execute(select(Subnet).where(Subnet.space_id == space_id))).scalars().all()
     )
-    current_rows = (
-        (await db.execute(select(IPAddress).where(getattr(IPAddress, owner.fk_attr) == target_id)))
-        .scalars()
-        .all()
+    # #2577 — only rows inside the target's space are ours to update or
+    # absence-delete; one carrying our FK elsewhere is left alone.
+    current_rows = await owned_addresses_in_space(
+        db, owner.fk_attr, target_id, space_id, warnings=summary.warnings
     )
     current = {str(a.address): a for a in current_rows}
     desired: dict[str, MirrorAddress] = {}

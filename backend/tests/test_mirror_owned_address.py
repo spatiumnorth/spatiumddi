@@ -166,8 +166,9 @@ async def test_kubernetes_row_not_moved_onto_other_integrations_row(
     db_session: AsyncSession,
 ) -> None:
     """Our node row sits in a subnet of another space; the cluster's own
-    space has a UniFi row at that address. Moving it would collide, so
-    the row stays put and the rest of the sync commits."""
+    space has a UniFi row at that address. Since #2577 a row in another
+    space is never moved, so it stays put, the sync reports it, and the
+    rest of the sync commits."""
     _space, lan, cluster, unifi_row = await _k8s_setup(db_session)
     other_space = await _make_space(db_session)
     other_block = IPBlock(space_id=other_space.id, network="10.0.0.0/24", name="old")
@@ -196,7 +197,7 @@ async def test_kubernetes_row_not_moved_onto_other_integrations_row(
         summary = await reconcile_cluster(db_session, cluster)
 
     assert summary.ok, summary.error
-    assert any("10.0.0.5" in w and "not moving" in w for w in summary.warnings)
+    assert any("outside its IP space" in w for w in summary.warnings)
     await db_session.refresh(own_row)
     assert own_row.subnet_id == old_sub.id
     await _assert_left_alone(db_session, unifi_row)

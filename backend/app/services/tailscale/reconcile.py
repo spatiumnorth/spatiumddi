@@ -36,7 +36,13 @@ from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.tailscale import TailscaleTenant
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.dns.cname_conflict import find_record_insert_conflict
-from app.services.integration_ownership import address_taken, owned_by_other_integration
+from app.services.integration_ownership import (
+    address_taken,
+    addresses_in_space,
+    move_stays_in_space,
+    owned_addresses_in_space,
+    owned_by_other_integration,
+)
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.tailscale.client import (
     TailscaleClient,
@@ -317,6 +323,7 @@ async def _apply_addresses(
         .all()
     )
     subnets = list(subnet_rows)
+    space_subnet_ids = {s.id for s in subnets}
 
     desired_map: dict[str, _DesiredAddress] = {}
     for d in desired:
@@ -327,11 +334,9 @@ async def _apply_addresses(
     # Claim pre-existing operator rows at desired addresses.
     desired_addrs = list(desired_map.keys())
     if desired_addrs:
-        existing = (
-            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
-            .scalars()
-            .all()
-        )
+        # #2577 — adoption candidates come from this target's own space
+        # only. The same address in another space is a different host.
+        existing = await addresses_in_space(db, tenant.ipam_space_id, desired_addrs)
         for row in existing:
             if row.tailscale_tenant_id == tenant.id:
                 continue  # already ours
@@ -350,8 +355,14 @@ async def _apply_addresses(
                 row.user_modified_at = datetime.now(UTC)
         await db.flush()
 
-    res = await db.execute(select(IPAddress).where(IPAddress.tailscale_tenant_id == tenant.id))
-    current = {str(a.address): a for a in res.scalars().all()}
+    # #2577 — the rows we may update, move and absence-delete: ours AND in
+    # our space. A row carrying our FK in another space is left alone.
+    current = {
+        str(a.address): a
+        for a in await owned_addresses_in_space(
+            db, "tailscale_tenant_id", tenant.id, tenant.ipam_space_id, warnings=summary.warnings
+        )
+    }
 
     dirty_subnets: set[Any] = {s.id for s in subnets if s.tailscale_tenant_id == tenant.id}
 
@@ -377,6 +388,13 @@ async def _apply_addresses(
             row = current[addr]
             changed = False
             if row.subnet_id != subnet.id:
+                # #2577 — never re-parent a row across IP spaces.
+                if not move_stays_in_space(row.subnet_id, space_subnet_ids):
+                    summary.warnings.append(
+                        f"address {addr}: current subnet is outside this target's "
+                        f"IP space; not moving"
+                    )
+                    continue
                 # Another integration's row (or another Tailscale tenant's) may
                 # already sit at the target (subnet, address); moving onto
                 # it would hit ``uq_ip_address_subnet_address`` and roll

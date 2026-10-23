@@ -19,12 +19,13 @@ on any hand-written chain of these columns elsewhere in ``app/``.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Collection, Iterable
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.ipam import IPAddress
+from app.models.ipam import IPAddress, Subnet
 
 # Ownership FK → the integration's name, as block-sync targets and the
 # block-move blockers report it.
@@ -147,14 +148,117 @@ async def address_taken(
     return (await db.execute(stmt.limit(1))).scalar_one_or_none() is not None
 
 
+# ── Space scoping (#2577) ─────────────────────────────────────────────────
+#
+# IP spaces are independent: the same address, MAC and hostname may exist in
+# two of them and mean two different hosts. Every integration mirror targets
+# exactly one space (``<target>.ipam_space_id``; a Cloud endpoint may add a
+# ``public_space_id``), and must never look at, adopt, move, dedupe or delete
+# an ``IPAddress`` row outside it.
+#
+# Before #2577 seven of the eight reconcilers looked rows up by bare address
+# across EVERY space, adopted any operator row they found, re-parented it into
+# their own space and could then delete it — so enabling an integration on an
+# overlapping range silently stole operator rows (and, by the
+# ``ondelete=SET NULL`` on ``DNSRecord.ip_address_id``, orphaned their DNS
+# records). OPNsense alone had been fixed, by hand, in its own file. These two
+# helpers are the only way a reconciler loads ``IPAddress`` rows, so an eighth
+# reconciler gets the scoping for free; ``tests/test_integration_space_scoping.py``
+# fails any reconciler query that bypasses them.
+
+
+def _space_id_list(space_ids: Any | Iterable[Any]) -> list[Any]:
+    if isinstance(space_ids, Collection) and not isinstance(space_ids, (str, bytes)):
+        return [s for s in space_ids if s is not None]
+    return [space_ids] if space_ids is not None else []
+
+
+def scope_addresses_to_space(stmt: Select[Any], space_ids: Any | Iterable[Any]) -> Select[Any]:
+    """Restrict an ``IPAddress`` select to rows whose subnet sits in one of
+    ``space_ids``. A statement narrowed this way can never return a row from
+    another space, whatever else it filters on. An empty / ``None`` space
+    list matches nothing — a target with no space owns no rows."""
+    ids = _space_id_list(space_ids)
+    return stmt.join(Subnet, IPAddress.subnet_id == Subnet.id).where(Subnet.space_id.in_(ids))
+
+
+async def addresses_in_space(
+    db: AsyncSession, space_ids: Any | Iterable[Any], addresses: Iterable[str]
+) -> list[IPAddress]:
+    """Every row at one of ``addresses`` inside ``space_ids`` — the adoption
+    candidates for a reconciler. Rows at the same address in any OTHER space
+    are not returned, so they cannot be claimed, moved or deleted."""
+    addrs = list(addresses)
+    if not addrs:
+        return []
+    stmt = scope_addresses_to_space(select(IPAddress), space_ids).where(
+        IPAddress.address.in_(addrs)
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+async def owned_addresses_in_space(
+    db: AsyncSession,
+    own_fk: str,
+    target_id: Any,
+    space_ids: Any | Iterable[Any],
+    *,
+    warnings: list[str] | None = None,
+) -> list[IPAddress]:
+    """The rows the target owns (``own_fk == target_id``) inside ``space_ids``.
+
+    This is a reconciler's "current" set: the rows it may update, move,
+    dedupe and absence-delete. A row carrying the target's FK in another
+    space — left behind when the target's space was changed, or stolen by a
+    pre-#2577 build — is excluded and therefore left exactly where it is;
+    ``find_cross_space_adoptions`` reports such rows for an operator to
+    repair by hand.
+
+    Pass the sync summary's ``warnings`` to have such rows counted into it,
+    so a frozen row is visible on the integration's own sync status rather
+    than only in that report."""
+    if own_fk not in INTEGRATION_OWNERSHIP:
+        raise ValueError(f"not an integration ownership FK: {own_fk!r}")
+    owned = getattr(IPAddress, own_fk) == target_id
+    stmt = scope_addresses_to_space(select(IPAddress), space_ids).where(owned)
+    rows = list((await db.execute(stmt)).scalars().all())
+    if warnings is not None:
+        outside = await db.scalar(
+            select(func.count())
+            .select_from(IPAddress)
+            .join(Subnet, IPAddress.subnet_id == Subnet.id)
+            .where(owned, Subnet.space_id.not_in(_space_id_list(space_ids)))
+        )
+        if outside:
+            warnings.append(
+                f"{outside} address row(s) owned by this target sit outside its IP space "
+                "and were left untouched; see GET /api/v1/ipam/integration-space-audit (#2577)"
+            )
+    return rows
+
+
+def move_stays_in_space(current_subnet_id: Any, space_subnet_ids: Collection[Any]) -> bool:
+    """Whether a reconciler may re-parent a row it owns, given the ids of
+    every subnet in its target space. A row whose CURRENT subnet is outside
+    that set lives in another space and is never moved: re-parenting it is
+    exactly how #2577 made operator rows vanish from their own space.
+    ``owned_addresses_in_space`` already keeps such rows out of a
+    reconciler's current set; this is the guard at the write itself."""
+    return current_subnet_id in space_subnet_ids
+
+
 __all__ = [
     "ACME_RECORD_TAG",
     "DNS_RECORD_OWNER_FKS",
     "INTEGRATION_OWNERSHIP",
     "INTEGRATION_OWNERSHIP_FKS",
     "address_taken",
+    "addresses_in_space",
     "dns_record_owned_elsewhere",
+    "move_stays_in_space",
+    "owned_addresses_in_space",
     "owned_by_other_integration",
     "owning_integration",
+    "scope_addresses_to_space",
     "subnet_has_surviving_addresses",
 ]

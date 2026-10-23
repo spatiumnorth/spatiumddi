@@ -41,7 +41,13 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.opnsense import OPNsenseRouter
 from app.services._mirror_hostname import normalize_desired_hostname
-from app.services.integration_ownership import owned_by_other_integration, owning_integration
+from app.services.integration_ownership import (
+    addresses_in_space,
+    move_stays_in_space,
+    owned_addresses_in_space,
+    owned_by_other_integration,
+    owning_integration,
+)
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.opnsense.client import (
     OPNsenseClient,
@@ -489,6 +495,7 @@ async def _apply_addresses(
         .all()
     )
     subnets = list(subnet_rows)
+    space_subnet_ids = {s.id for s in subnets}
 
     # Dedupe by address. A reservation + a lease on the same IP collapse
     # to one desired row; the first-seen wins (reservations are added
@@ -518,18 +525,9 @@ async def _apply_addresses(
         # legitimate row in its own space (and Phase 1 could stamp the FK
         # onto a foreign-space row). Join through Subnet → space_id keeps
         # both the claim and the unclaimable guard inside our space.
-        existing = (
-            (
-                await db.execute(
-                    select(IPAddress)
-                    .join(Subnet, IPAddress.subnet_id == Subnet.id)
-                    .where(Subnet.space_id == router.ipam_space_id)
-                    .where(IPAddress.address.in_(desired_addrs))
-                )
-            )
-            .scalars()
-            .all()
-        )
+        # The shared helper is the one every reconciler uses since #2577,
+        # which found this fix had been applied here and nowhere else.
+        existing = await addresses_in_space(db, router.ipam_space_id, desired_addrs)
         for row in existing:
             if row.opnsense_router_id == router.id:
                 continue  # already ours
@@ -550,8 +548,14 @@ async def _apply_addresses(
                 row.user_modified_at = datetime.now(UTC)
         await db.flush()
 
-    res = await db.execute(select(IPAddress).where(IPAddress.opnsense_router_id == router.id))
-    current = {str(a.address): a for a in res.scalars().all()}
+    # #2577 — the rows we may update, move and absence-delete: ours AND in
+    # our space. A row carrying our FK in another space is left alone.
+    current = {
+        str(a.address): a
+        for a in await owned_addresses_in_space(
+            db, "opnsense_router_id", router.id, router.ipam_space_id, warnings=summary.warnings
+        )
+    }
 
     dirty_subnets: set[Any] = {s.id for s in subnets if s.opnsense_router_id == router.id}
 
@@ -596,6 +600,13 @@ async def _apply_addresses(
             changed = False
             # subnet_id is factual — always update.
             if row.subnet_id != subnet.id:
+                # #2577 — never re-parent a row across IP spaces.
+                if not move_stays_in_space(row.subnet_id, space_subnet_ids):
+                    summary.warnings.append(
+                        f"address {addr}: current subnet is outside this target's "
+                        f"IP space; not moving"
+                    )
+                    continue
                 dirty_subnets.add(row.subnet_id)
                 row.subnet_id = subnet.id
                 changed = True

@@ -45,6 +45,9 @@ from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import (
+    addresses_in_space,
+    move_stays_in_space,
+    owned_addresses_in_space,
     owned_by_other_integration,
     owning_integration,
     subnet_has_surviving_addresses,
@@ -699,6 +702,7 @@ async def _apply_addresses(
         .all()
     )
     subnets = list(subnet_rows)
+    space_subnet_ids = {s.id for s in subnets}
 
     desired_map: dict[str, _DesiredAddress] = {}
     for d in desired:
@@ -716,10 +720,10 @@ async def _apply_addresses(
     #     hits the (subnet_id, address) unique violation.
     # Keep the most-recently-modified row, soft-delete the rest. Done
     # before adoption so the adopted set is already deduped.
-    pre_owned = (
-        (await db.execute(select(IPAddress).where(IPAddress.unifi_controller_id == controller.id)))
-        .scalars()
-        .all()
+    # #2577 — only rows inside the controller's space; a unifi-owned row in
+    # another space is never deduped (deleted) from here.
+    pre_owned = await owned_addresses_in_space(
+        db, "unifi_controller_id", controller.id, controller.ipam_space_id
     )
     pre_groups: dict[str, list[IPAddress]] = {}
     for row in pre_owned:
@@ -737,11 +741,9 @@ async def _apply_addresses(
 
     desired_addrs = list(desired_map.keys())
     if desired_addrs:
-        existing = (
-            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
-            .scalars()
-            .all()
-        )
+        # #2577 — adoption candidates come from the controller's own space
+        # only. The same address in another space is a different host.
+        existing = await addresses_in_space(db, controller.ipam_space_id, desired_addrs)
         # Group by address so we can detect "multiple operator-owned
         # rows at this address" before adopting any of them. Adopting
         # both would re-create the duplicate we just cleaned up.
@@ -781,8 +783,16 @@ async def _apply_addresses(
                 winner.user_modified_at = datetime.now(UTC)
         await db.flush()
 
-    res = await db.execute(select(IPAddress).where(IPAddress.unifi_controller_id == controller.id))
-    current = {str(a.address): a for a in res.scalars().all()}
+    current = {
+        str(a.address): a
+        for a in await owned_addresses_in_space(
+            db,
+            "unifi_controller_id",
+            controller.id,
+            controller.ipam_space_id,
+            warnings=summary.warnings,
+        )
+    }
 
     dirty_subnets: set[Any] = {s.id for s in subnets if s.unifi_controller_id == controller.id}
 
@@ -805,6 +815,13 @@ async def _apply_addresses(
             row = current[addr]
             changed = False
             if row.subnet_id != subnet.id:
+                # #2577 — never re-parent a row across IP spaces.
+                if not move_stays_in_space(row.subnet_id, space_subnet_ids):
+                    summary.warnings.append(
+                        f"address {addr}: current subnet is outside this target's "
+                        f"IP space; not moving"
+                    )
+                    continue
                 # Before moving the row, check whether the target
                 # (subnet_id, address) tuple is already occupied by a
                 # different row — typically one written by SNMP

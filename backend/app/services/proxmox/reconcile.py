@@ -44,6 +44,9 @@ from app.models.proxmox import ProxmoxNode
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import (
     address_taken,
+    addresses_in_space,
+    move_stays_in_space,
+    owned_addresses_in_space,
     owned_by_other_integration,
     owning_integration,
     subnet_has_surviving_addresses,
@@ -700,6 +703,7 @@ async def _apply_addresses(
         .all()
     )
     subnets = list(subnet_rows)
+    space_subnet_ids = {s.id for s in subnets}
 
     # Dedupe by address — a guest with multiple IPs on the same NIC
     # will show up once per IP, but two NICs bridged to the same VLAN
@@ -723,11 +727,9 @@ async def _apply_addresses(
     # with a counter bump so the operator can see the conflict.
     desired_addrs = list(desired_map.keys())
     if desired_addrs:
-        existing = (
-            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
-            .scalars()
-            .all()
-        )
+        # #2577 — adoption candidates come from this target's own space
+        # only. The same address in another space is a different host.
+        existing = await addresses_in_space(db, node.ipam_space_id, desired_addrs)
         for row in existing:
             if row.proxmox_node_id == node.id:
                 continue  # already ours
@@ -747,8 +749,14 @@ async def _apply_addresses(
                 row.user_modified_at = datetime.now(UTC)
         await db.flush()
 
-    res = await db.execute(select(IPAddress).where(IPAddress.proxmox_node_id == node.id))
-    current = {str(a.address): a for a in res.scalars().all()}
+    # #2577 — the rows we may update, move and absence-delete: ours AND in
+    # our space. A row carrying our FK in another space is left alone.
+    current = {
+        str(a.address): a
+        for a in await owned_addresses_in_space(
+            db, "proxmox_node_id", node.id, node.ipam_space_id, warnings=summary.warnings
+        )
+    }
 
     dirty_subnets: set[Any] = {s.id for s in subnets if s.proxmox_node_id == node.id}
 
@@ -777,6 +785,13 @@ async def _apply_addresses(
             # subnet_id is factual (where the address lives); always
             # update regardless of the user-modified lock.
             if row.subnet_id != subnet.id:
+                # #2577 — never re-parent a row across IP spaces.
+                if not move_stays_in_space(row.subnet_id, space_subnet_ids):
+                    summary.warnings.append(
+                        f"address {addr}: current subnet is outside this target's "
+                        f"IP space; not moving"
+                    )
+                    continue
                 # A row another integration (or Proxmox endpoint) owns
                 # may already sit at the target (subnet, address); the
                 # move would hit ``uq_ip_address_subnet_address`` and
