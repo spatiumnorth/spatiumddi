@@ -68,7 +68,10 @@ from app.services.dhcp.agent_token import (
     verify_agent_token,
 )
 from app.services.dhcp.config_bundle import build_config_bundle
-from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
+from app.services.dhcp.ipam_mirror import (
+    insert_ipam_mirror_row,
+    lease_hostname_suppressed_subnets,
+)
 from app.services.dhcp.lease_cleanup import address_still_held
 from app.services.dhcp.normalize import canonical_duid, norm_duid, norm_ip, norm_mac
 from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS as ACTIVITY_LOG_RETENTION_HOURS
@@ -1240,6 +1243,11 @@ async def agent_lease_events(
     # subnet itself is resolved correctly.
     subnets = await _load_subnet_cache(db)
     scope_cache = await _load_scope_cache(db, server.server_group_id)
+    # #2269 — scopes not set to ``on_lease`` keep the lease's hostname out of
+    # IPAM; the mirror row itself is still written.
+    no_hostname_subnets = await lease_hostname_suppressed_subnets(
+        db, group_id=server.server_group_id
+    )
     subnet_for_ip = {
         ip: _find_containing_subnet(ip, subnets, preferred_subnet_ids=set(scope_cache))
         for ip in ips
@@ -1400,7 +1408,8 @@ async def agent_lease_events(
 
     def _apply_lease_fields(row: IPAddress, ev: Any, lease: Any) -> None:
         """Stamp lease state onto a mirror row we own (auto/available)."""
-        row.hostname = (ev.hostname or row.hostname or "")[:253]
+        if row.subnet_id not in no_hostname_subnets:
+            row.hostname = (ev.hostname or row.hostname or "")[:253]
         # A DHCPv6 lease usually has no MAC (#1141) — keep what the row has
         # rather than blanking it.
         row.mac_address = ev.mac_address or row.mac_address
@@ -1434,7 +1443,9 @@ async def agent_lease_events(
                 candidate = IPAddress(
                     subnet_id=subnet.id,
                     address=ev.ip_address,
-                    hostname=(ev.hostname or "")[:253],
+                    hostname=(
+                        "" if subnet.id in no_hostname_subnets else (ev.hostname or "")[:253]
+                    ),
                     mac_address=ev.mac_address,
                     status="dhcp",
                     auto_from_lease=True,

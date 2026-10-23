@@ -121,10 +121,10 @@ def _normalize_sync_mode(v: str | None) -> str:
     value, which the old ``<select>`` couldn't render, so edits snapped back
     (#475). The UI now speaks the canonical vocabulary directly; these legacy
     values are still mapped in for backward-compatible API clients. Empty /
-    missing defaults to ``on_static_only`` (the model default).
+    missing defaults to ``on_lease`` (the model default).
     """
     if not v:  # None or ""
-        return "on_static_only"
+        return "on_lease"
     legacy = {"none": "disabled", "ipam": "on_static_only", "learned": "on_lease"}
     return legacy.get(v, v)
 
@@ -301,7 +301,7 @@ class ScopeCreate(BaseModel):
     options: Any = None
     ddns_enabled: bool = False
     ddns_hostname_policy: str | None = "client"
-    hostname_to_ipam_sync: str = "on_static_only"
+    hostname_to_ipam_sync: str = "on_lease"
     hostname_sync_mode: str | None = None
     # When False, this scope's dynamic-pool lease mirrors are excluded from the
     # IPAM↔DNS drift check (ephemeral leases don't read as "out of sync").

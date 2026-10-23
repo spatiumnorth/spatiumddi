@@ -128,6 +128,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A scope's "Hostname → IPAM Sync" setting now does something
+  (#2269).** It was stored and never read: every lease's hostname
+  was written to IPAM whatever the scope said, so "Don't sync to
+  IPAM" still filled IPAM. Now only `on_lease` writes a lease's
+  hostname onto its IPAM mirror row; `disabled` and `on_static_only`
+  keep it out. This covers the Kea lease-event path, the Windows
+  poll path and a reservation handing its address back to a live
+  lease. The mirror row itself (status, MAC, last-seen) is still
+  created in every mode, and turning the setting off deletes
+  nothing: existing mirrors stay and their hostnames are not
+  blanked or overwritten. The old default `on_static_only` would
+  have stripped lease hostnames from every existing scope, so the
+  default is now `on_lease` and stored `on_static_only` values are
+  rewritten to it (migration `e7b3d19a4c26`); `disabled` is
+  honoured as set.
+
 - **A nightly no longer calls itself `nightly-YYYYMMDD` in the update
   check, the upgrade pre-flight and the DNS bundle stamp (#2354).**
   #2111 gave `GET /version` one spelling of a nightly
