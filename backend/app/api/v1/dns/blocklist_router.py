@@ -16,6 +16,7 @@ produced by `app.services.dns_blocklist`.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import uuid
@@ -34,6 +35,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.permissions import require_resource_permission
+from app.core.safe_fetch import FetchRefusedError, check_feed_url_shape, guard_url
 from app.core.update_nulls import resolve_update_changes
 from app.models.audit import AuditLog
 from app.models.dns import (
@@ -113,6 +115,29 @@ def _check_sinkhole_ip(v: str | None) -> str | None:
         raise ValueError(f"sinkhole_ip must be an IPv4 or IPv6 address, not {v!r}") from None
 
 
+def _check_feed_url(v: str | None) -> str | None:
+    """A feed URL is ``http(s)://host…``; blank is "no feed" (stored as is).
+
+    Shape only. The address the host resolves to is checked when the list
+    is saved (:func:`_guard_feed_target`) and again on every fetch.
+    """
+    if v is None or not v.strip():
+        return v
+    return check_feed_url_shape(v)
+
+
+async def _guard_feed_target(url: str | None) -> None:
+    """Refuse a feed URL whose host resolves to loopback / link-local /
+    metadata — the same check every fetch repeats. Generic 422: the
+    resolved address is logged, not echoed back."""
+    if not url or not url.strip():
+        return
+    try:
+        await asyncio.to_thread(guard_url, url, label="dns_blocklist_feed")
+    except FetchRefusedError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
 def _check_interval(v: int | None) -> int | None:
     if v is not None and not 0 <= v <= MAX_UPDATE_INTERVAL_HOURS:
         raise ValueError(
@@ -144,6 +169,11 @@ class BlockListCreate(BaseModel):
         if v not in VALID_SOURCE_TYPES:
             raise ValueError(f"source_type must be one of {sorted(VALID_SOURCE_TYPES)}")
         return v
+
+    @field_validator("feed_url")
+    @classmethod
+    def _v_feed_url(cls, v: str | None) -> str | None:
+        return _check_feed_url(v)
 
     @field_validator("update_interval_hours")
     @classmethod
@@ -189,6 +219,11 @@ class BlockListUpdate(BaseModel):
         if v is not None and v not in VALID_SOURCE_TYPES:
             raise ValueError(f"source_type must be one of {sorted(VALID_SOURCE_TYPES)}")
         return v
+
+    @field_validator("feed_url")
+    @classmethod
+    def _v_feed_url(cls, v: str | None) -> str | None:
+        return _check_feed_url(v)
 
     @field_validator("update_interval_hours")
     @classmethod
@@ -1059,6 +1094,7 @@ async def create_blocklist(
     existing = await db.execute(select(DNSBlockList).where(DNSBlockList.name == body.name))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A blocklist with that name already exists")
+    await _guard_feed_target(body.feed_url)
 
     bl = DNSBlockList(**body.model_dump())
     db.add(bl)
@@ -1107,6 +1143,8 @@ async def update_blocklist(
             "enabled",
         },
     )
+    if "feed_url" in changes:
+        await _guard_feed_target(changes["feed_url"])
     wildcard_flipped = (
         "feed_entries_are_wildcard" in changes
         and changes["feed_entries_are_wildcard"] != bl.feed_entries_are_wildcard

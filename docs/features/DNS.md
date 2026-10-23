@@ -1379,6 +1379,32 @@ due together are queued a minute apart, at most 55 per sweep so each has run
 before the next sweep looks again; any beyond that go in the next hour,
 longest-overdue first.
 
+#### Which feed URLs can be fetched?
+
+A feed URL is fetched by the control plane, so it goes through the same
+outbound address check as the other operator-configured fetches (integration
+test-connection, WoL calendar feeds):
+
+- **`http` or `https` only.** Any other scheme is a 422 when the list is
+  saved.
+- **Loopback, link-local and the unspecified address are refused**:
+  `127.0.0.0/8`, `::1`, `169.254.0.0/16` (which covers the cloud metadata
+  address), `fe80::/10`, `0.0.0.0/8`, `::`, and IPv4-mapped forms of them.
+  The address is checked when the list is saved (422), again before each
+  fetch, and again when the connection is opened, so a name that answers
+  differently the second time is still refused. Each redirect hop is
+  checked the same way, up to 5 hops.
+- **Private addresses (RFC 1918, IPv6 unique-local) are allowed**, so an
+  internal feed mirror keeps working. There is no setting for this; it is
+  the same line the other guarded fetches draw.
+
+A refused fetch shows `Fetch refused: feed URL target is not permitted` on
+the list and is not retried. Other failures show only the HTTP status or the
+kind of failure (`could not connect`, `timed out`); the detail is in the
+worker log, with the feed URL reduced to its scheme and host. The fetch goes
+direct: `HTTP_PROXY` / `HTTPS_PROXY` in the worker's environment are not
+used.
+
 #### Do feed entries block subdomains?
 
 Yes by default, and it is a **per-list** setting — *Block subdomains of
