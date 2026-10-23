@@ -447,6 +447,17 @@ export interface ProbePolicy {
   inherited: boolean;
 }
 
+/** What a subnet's DDNS resolves to and where from (#2475). */
+export interface EffectiveDdns {
+  enabled: boolean;
+  hostname_policy: DdnsHostnamePolicy;
+  domain_override: string | null;
+  ttl: number | null;
+  source: "subnet" | "block" | "space" | "none";
+  source_id: string | null;
+  source_name: string | null;
+}
+
 export interface EffectiveDns {
   dns_group_ids: string[];
   dns_zone_id: string | null;
@@ -1557,6 +1568,14 @@ export const ipamApi = {
   getEffectiveSubnetDns: (subnetId: string) =>
     api
       .get<EffectiveDns>(`/ipam/subnets/${subnetId}/effective-dns`)
+      .then((r) => r.data),
+  getEffectiveBlockDdns: (blockId: string) =>
+    api
+      .get<EffectiveDdns>(`/ipam/blocks/${blockId}/effective-ddns`)
+      .then((r) => r.data),
+  getEffectiveSubnetDdns: (subnetId: string) =>
+    api
+      .get<EffectiveDdns>(`/ipam/subnets/${subnetId}/effective-ddns`)
       .then((r) => r.data),
   getEffectiveSpaceDns: (spaceId: string) =>
     api
@@ -10170,11 +10189,34 @@ export interface AgentLogSource {
   server_kind: "dns" | "dhcp";
   driver: string;
   host: string;
+  /** Server group (#2120). `null` for a DHCP server in no group. */
+  group_id?: string | null;
+  group_name?: string | null;
+}
+
+/**
+ * Scope of an agent-log read (#2120): `server_id` → that server,
+ * `group_id` → every server in the group, neither → every server the
+ * caller may read. The server always narrows to what the caller may read.
+ */
+export interface AgentLogScope {
+  server_id?: string | null;
+  group_id?: string | null;
+}
+
+/** Echoed scope + the servers a read actually covered (#2120). */
+export interface AgentLogScopeEcho {
+  server_id: string | null;
+  group_id: string | null;
+  server_ids: string[];
 }
 
 export interface DNSQueryLogRow {
   id: number;
   ts: string;
+  /** Which server logged it (#2120). */
+  server_id: string;
+  server_name: string;
   client_ip: string | null;
   client_port: number | null;
   qname: string | null;
@@ -10193,8 +10235,7 @@ export interface DNSQueryLogRow {
   raw: string;
 }
 
-export interface DNSQueryLogRequest {
-  server_id: string;
+export interface DNSQueryLogRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
   q?: string | null;
@@ -10207,8 +10248,7 @@ export interface DNSQueryLogRequest {
   max_events?: number;
 }
 
-export interface DNSQueryLogResponse {
-  server_id: string;
+export interface DNSQueryLogResponse extends AgentLogScopeEcho {
   events: DNSQueryLogRow[];
   truncated: boolean;
 }
@@ -10216,6 +10256,9 @@ export interface DNSQueryLogResponse {
 export interface DHCPActivityLogRow {
   id: number;
   ts: string;
+  /** Which server logged it (#2120). */
+  server_id: string;
+  server_name: string;
   severity: string | null;
   code: string | null;
   mac_address: string | null;
@@ -10224,8 +10267,7 @@ export interface DHCPActivityLogRow {
   raw: string;
 }
 
-export interface DHCPActivityLogRequest {
-  server_id: string;
+export interface DHCPActivityLogRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
   q?: string | null;
@@ -10236,8 +10278,7 @@ export interface DHCPActivityLogRequest {
   max_events?: number;
 }
 
-export interface DHCPActivityLogResponse {
-  server_id: string;
+export interface DHCPActivityLogResponse extends AgentLogScopeEcho {
   events: DHCPActivityLogRow[];
   truncated: boolean;
 }
@@ -10249,15 +10290,13 @@ export interface DNSQueryAnalyticsRow {
   count: number;
 }
 
-export interface DNSQueryAnalyticsRequest {
-  server_id: string;
+export interface DNSQueryAnalyticsRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
   limit?: number;
 }
 
-export interface DNSQueryAnalyticsResponse {
-  server_id: string;
+export interface DNSQueryAnalyticsResponse extends AgentLogScopeEcho {
   since: string | null;
   until: string | null;
   total_queries: number;
@@ -10557,12 +10596,12 @@ export const API_TOKEN_SCOPES: {
   {
     value: "ipam:write",
     label: "IPAM write",
-    hint: "Mutate /ipam/*, /vlans*, /vrfs*, /network-devices*.",
+    hint: "Mutate /ipam/*, /vlans/*, /vrfs/*, /network-devices/*.",
   },
   {
     value: "dns:write",
     label: "DNS write",
-    hint: "Mutate /dns/* + /dns-pools*. Excludes the agent surface.",
+    hint: "Mutate /dns/*. Excludes the agent surface, /dnsbl/* and /dns-threat/*.",
   },
   {
     value: "dhcp:write",

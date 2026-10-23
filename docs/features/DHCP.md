@@ -1131,6 +1131,14 @@ How the kill is seen depends on the deployment:
 
 ---
 
+> **Logs → DHCP Activity across a group (#2120).** The Kea activity log
+> reads one server, one DHCP server group, or every server:
+> `POST /logs/dhcp-activity` takes an optional `server_id` and an optional
+> `group_id`, each row carries the `server_name` that logged it, and the
+> selection is narrowed to the servers the caller may read — so an HA pair's
+> two halves read as one time-ordered stream. See
+> [`OBSERVABILITY.md` §4½](../OBSERVABILITY.md).
+
 ## 5. DHCP Lease Tracking
 
 Leases are **read-only** in SpatiumDDI — they are pulled from the DHCP server, not managed directly.

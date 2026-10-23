@@ -351,7 +351,13 @@ api_v1_router.include_router(
     tags=["docker"],
     dependencies=[Depends(require_module("integrations.docker"))],
 )
-api_v1_router.include_router(domains_router, tags=["domains"])
+# Gated (#2325): Domain rows trigger off-prem RDAP lookups, so the module is
+# the one switch that stops them. Ships default-ON — see its ModuleSpec.
+api_v1_router.include_router(
+    domains_router,
+    tags=["domains"],
+    dependencies=[Depends(require_module("network.domains"))],
+)
 # Mount the time-bound-grant routes BEFORE the groups router: the groups
 # router carries a ``GET /{group_id}`` that would otherwise shadow
 # ``/groups/time-bound-grants`` (the literal path would be parsed as a UUID

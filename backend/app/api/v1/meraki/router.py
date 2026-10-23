@@ -28,6 +28,7 @@ from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace, Subnet
 from app.models.meraki import MerakiOrg
 from app.models.panos import FirewallObject
+from app.services.integration_ownership import release_integration_rows
 from app.services.meraki.client import MerakiClient, MerakiClientError
 
 router = APIRouter(
@@ -365,6 +366,11 @@ async def delete_org(org_pk: uuid.UUID, db: DB, user: SuperAdmin, force: bool = 
         )
     )
     _audit(db, user=user, action="delete", org_id=o.id, org_name=o.name)
+    # #2287 — hand back operator-made rows in mirrored subnets / blocks before
+    # the FK cascade can destroy them.
+    await release_integration_rows(
+        db, own_fk="meraki_org_id", target_id=o.id, user=user, target_name=o.name
+    )
     await db.delete(o)
     await db.commit()
 

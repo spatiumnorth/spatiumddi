@@ -54,7 +54,7 @@ Per-cluster config (`KubernetesCluster` rows):
 - **Ingresses** with `status.loadBalancer.ingress[0].ip` → A record per `rules[].host` in the longest-suffix-matching zone in the bound DNS group. `ingress[0].hostname` (cloud LBs) → CNAME. `auto_generated=True` + fixed 300 s TTL.
 - **Pods** (opt-in) → `IPAddress` per pod with `status="kubernetes-pod"`.
 
-**Delete semantics**: removed cluster objects immediately drop their mirror rows (not orphaned). Deleting the cluster itself cascades every mirror via the FK.
+**Delete semantics**: removed cluster objects immediately drop their mirror rows (not orphaned). Deleting the cluster itself removes purely mirrored rows; anything an operator added inside a mirrored block or subnet (addresses, DHCP scopes, reservations, edited rows) is kept and detached from the cluster (#2287).
 
 ### Setup
 
