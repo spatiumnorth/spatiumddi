@@ -6661,7 +6661,7 @@ export function AclsTab({ groupId }: { groupId: string }) {
 
 // ── TSIG Keys Tab ─────────────────────────────────────────────────────────────
 
-function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
+export function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const { isSuperadmin } = useDnsGrants();
   const { data: keys = [], isFetching } = useQuery({
@@ -6681,12 +6681,17 @@ function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
     action: "created" | "rotated";
   } | null>(null);
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMut = useMutation({
     mutationFn: (id: string) => dnsApi.deleteTSIGKey(group.id, id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dns-tsig-keys", group.id] });
       setConfirmDelete(null);
     },
+    // The server refuses a key something still cites (409, #2282) and says
+    // what cites it; the dialog stays open, so show that reason in it.
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete the TSIG key")),
   });
   const rotateMut = useMutation({
     mutationFn: (id: string) => dnsApi.rotateTSIGKey(group.id, id),
@@ -6795,7 +6800,10 @@ function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
                       <Pencil className="h-3 w-3" />
                     </button>
                     <button
-                      onClick={() => setConfirmDelete(k)}
+                      onClick={() => {
+                        setDeleteError(null);
+                        setConfirmDelete(k);
+                      }}
                       className="h-6 w-6 inline-flex items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
                       title="Delete key"
                       {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
@@ -6830,9 +6838,13 @@ function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
       {confirmDelete && (
         <ConfirmDestroyModal
           title="Delete TSIG Key"
-          description={`Permanently delete "${confirmDelete.name}"? Any zones referencing this key in their allow-update / allow-transfer fields will start failing auth on the next BIND reload.`}
+          description={`Permanently delete "${confirmDelete.name}"? A key that an ACL, a view, a server option or a zone (allow-query, allow-transfer, also-notify) still cites cannot be deleted: the server refuses, names what cites it, and the key stays until those references are removed. Dynamic-update grants for the key are removed with it.`}
+          error={deleteError}
           checkLabel={`I understand "${confirmDelete.name}" will be deleted from every BIND9 server in this group on the next config push.`}
-          onConfirm={() => deleteMut.mutate(confirmDelete.id)}
+          onConfirm={() => {
+            setDeleteError(null);
+            deleteMut.mutate(confirmDelete.id);
+          }}
           onClose={() => setConfirmDelete(null)}
           isPending={deleteMut.isPending}
         />
