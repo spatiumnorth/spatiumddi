@@ -11,6 +11,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
+from app.api.token_binding import route_honours_token_binding
 from app.core.security import decode_access_token, hash_api_token, live_access_session
 from app.core.session_idle import (
     activity_write_interval,
@@ -174,6 +175,18 @@ async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> Us
     # Stash this token's resource grants (issue #374) so the permission layer
     # can intersect them with the owner's RBAC. Empty/None = unrestricted.
     user._api_token_resource_grants = list(token.resource_grants or [])
+    # A coarse permission gate admits a bound token on a resource TYPE match
+    # alone, so only a route that narrows to the bound instances may serve
+    # one. Every other route refuses it, rather than answering for the whole
+    # estate (``app.api.token_binding``).
+    if user._api_token_resource_grants and not route_honours_token_binding(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This API token is restricted to specific subnets or DNS zones, "
+                "and this endpoint cannot be limited to them"
+            ),
+        )
     return user
 
 
@@ -302,8 +315,16 @@ async def _load_time_bound_grants(db: AsyncSession, user: User) -> None:
         user._active_time_bound_grants = []
 
 
-def require_superadmin(current_user: Annotated[User, Depends(get_current_user)]) -> User:
+async def require_superadmin(
+    request: Request,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> User:
     """FastAPI dependency: 403 unless the user is an *effective* superadmin.
+
+    A refusal writes a ``denied`` audit row through the same recorder the
+    ``require_permission`` family uses (#2304), so probing a superadmin-only
+    route is as visible as probing an IPAM one. The 403 body is unchanged.
 
     Delegates to :func:`app.core.permissions.is_effective_superadmin`, which
     admits both:
@@ -319,20 +340,36 @@ def require_superadmin(current_user: Annotated[User, Depends(get_current_user)])
     legacy flag and the RBAC model. The helper unifies them; this dependency
     is just the gate-style wrapper for routes that pre-Depend.
 
-    Endpoints that already have a hand-rolled ``_require_superadmin`` helper
-    should call ``is_effective_superadmin(user)`` directly from inside the
-    handler — same check, same behaviour.
+    Handlers must take ``SuperAdmin`` rather than hand-roll an
+    ``is_effective_superadmin`` check + 403, or the refusal is not audited.
     """
     # Lazy import: `app.core.permissions` imports ``CurrentUser`` / ``get_db``
     # from this module at top-level, so an eager import here triggers a
     # circular-import crash at uvicorn startup. Local import side-steps it
     # because by the time this function is called the module graph is fully
     # initialised.
-    from app.core.permissions import is_effective_superadmin
+    from app.core.permissions import _record_denial, is_effective_superadmin
 
     if is_effective_superadmin(current_user):
         return current_user
+    await _record_denial(db, current_user, request, "access", "superadmin", None)
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superadmin required")
+
+
+def ensure_superadmin(user: User) -> None:
+    """Imperative superadmin check for code that cannot take ``SuperAdmin``.
+
+    For a check that only applies on one branch of a handler (``?permanent=true``)
+    or inside an operation the approval engine applies outside any route. It
+    raises the same 403 as :func:`require_superadmin` but writes no audit row,
+    because it has no request to attribute one to. Never call
+    ``require_superadmin`` directly: it is an async dependency, so a bare call
+    returns an un-awaited coroutine and checks nothing.
+    """
+    from app.core.permissions import is_effective_superadmin
+
+    if not is_effective_superadmin(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superadmin required")
 
 
 # Type aliases for injection
