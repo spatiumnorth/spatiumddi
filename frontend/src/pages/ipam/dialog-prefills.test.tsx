@@ -760,6 +760,64 @@ describe("Allocate IP offers only the statuses its requests accept (#1422)", () 
   });
 });
 
+// ── #2469 — the DNS Zone pre-fill does not latch on the first group to answer ─
+describe("Allocate IP pre-fills the primary zone whichever DNS group answers first (#2469)", () => {
+  const zp = { id: "zp", group_id: "gP", name: "p.test.", kind: "forward" };
+  const zs = { id: "zs", group_id: "gS", name: "s.test.", kind: "forward" };
+
+  function allocateTwoGroups() {
+    let releasePrimary: (v: unknown) => void = () => {};
+    const held = new Promise((r) => (releasePrimary = r));
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({
+        dns_group_ids: ["gS", "gP"],
+        dns_zone_id: "zp",
+        dns_additional_zone_ids: ["zs"],
+      }),
+    );
+    answer("dnsApi", "listZones", (g: unknown) =>
+      g === "gP" ? held : Promise.resolve([zs]),
+    );
+    const nextAddress = allocateIp();
+    return { nextAddress, releasePrimary: () => releasePrimary([zp]) };
+  }
+
+  it("settles on the primary once its group answers, and sends it", async () => {
+    const { nextAddress, releasePrimary } = allocateTwoGroups();
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    await screen.findByText("DNS Zone", { selector: "label" });
+    releasePrimary();
+    await waitFor(() =>
+      expect(control("DNS Zone").querySelector("select")?.value).toBe("zp"),
+    );
+    await press("Allocate");
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+    expect(nextAddress.mock.calls[0][1]).toMatchObject({ dns_zone_id: "zp" });
+  });
+
+  it("an operator's own pick is not overridden when the primary lands", async () => {
+    const { nextAddress, releasePrimary } = allocateTwoGroups();
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    await screen.findByText("DNS Zone", { selector: "label" });
+    // Only the additional zone is on offer so far: a static line, not a
+    // picker. Land the primary, then choose the additional zone.
+    releasePrimary();
+    const picker = await waitFor(() => {
+      const s = control("DNS Zone").querySelector("select");
+      expect(s).toBeTruthy();
+      return s as HTMLSelectElement;
+    });
+    fireEvent.change(picker, { target: { value: "zs" } });
+    await press("Allocate");
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+    expect(nextAddress.mock.calls[0][1]).toMatchObject({ dns_zone_id: "zs" });
+  });
+});
+
 // ── #2468 — Edit address names the zone its record is in ─────────────────────
 describe("Edit address names the zone its record is in (#2468)", () => {
   function zone(id: string, name: string, group = "g1"): DNSZone {
