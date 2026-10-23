@@ -19,7 +19,7 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DB, CurrentUser, require_superadmin
+from app.api.deps import DB, CurrentUser, ensure_superadmin
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
 from app.core.agent_wake import collect_wake, dhcp_group_channel
@@ -975,7 +975,7 @@ async def delete_scope(
     """
     if permanent:
         # Refused before a change request could be queued for it.
-        require_superadmin(user)
+        ensure_superadmin(user)
     op = get_operation("delete_scope")
     assert op is not None  # registered at import
     args = DeleteScopeArgs(scope_id=scope_id, permanent=permanent)

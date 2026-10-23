@@ -274,6 +274,7 @@ class HttpsPutDestination(BackupDestination):
             name="extra_headers",
             label="Extra headers",
             type="text",
+            multiline=True,
             required=False,
             description="Optional, one 'Name: value' per line.",
         ),
