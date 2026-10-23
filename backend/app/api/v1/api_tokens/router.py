@@ -270,6 +270,11 @@ async def create_token(
     # entropy to be useful to an attacker.
     display_prefix = raw[:10]
     expires_at = _resolve_expiry(body)
+    if expires_at is not None and expires_at <= datetime.now(UTC):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="expires_at must be in the future",
+        )
     # Resource grants (#374): existence + "can't exceed yourself" checks.
     await _validate_resource_grants(db, current_user, body.resource_grants)
     token = APIToken(

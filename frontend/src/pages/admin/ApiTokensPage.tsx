@@ -805,12 +805,16 @@ export function ApiTokensPage() {
                       <span
                         className={cn(
                           "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium",
-                          t.is_active
+                          t.is_active && !isExpired(t.expires_at)
                             ? "bg-emerald-500/15 text-emerald-600"
                             : "bg-muted text-muted-foreground",
                         )}
                       >
-                        {t.is_active ? "Active" : "Revoked"}
+                        {!t.is_active
+                          ? "Revoked"
+                          : isExpired(t.expires_at)
+                            ? "Expired"
+                            : "Active"}
                       </span>
                     </td>
                     <td className="px-3 py-2">
@@ -943,18 +947,26 @@ function ownerLabel(t: ApiToken): string {
     : t.owner_username;
 }
 
+function isExpired(iso: string | null | undefined): boolean {
+  return !!iso && new Date(iso).getTime() <= Date.now();
+}
+
 function ExpiryCell({ iso }: { iso: string }) {
   const expires = new Date(iso);
   const now = Date.now();
   const daysOut = Math.round((expires.getTime() - now) / (24 * 60 * 60 * 1000));
+  const expired = expires.getTime() <= now;
   let cls = "";
-  if (daysOut < 0) cls = "text-destructive";
+  if (expired) cls = "text-destructive";
+  else if (daysOut < 0) cls = "text-destructive";
   else if (daysOut < 7) cls = "text-amber-600 dark:text-amber-400";
   else cls = "text-muted-foreground";
   return (
     <span className={cls} title={expires.toLocaleString()}>
-      {daysOut < 0
-        ? `Expired ${-daysOut}d ago`
+      {expired
+        ? daysOut < 0
+          ? `Expired ${-daysOut}d ago`
+          : "Expired"
         : daysOut === 0
           ? "Expires today"
           : `In ${daysOut}d`}
