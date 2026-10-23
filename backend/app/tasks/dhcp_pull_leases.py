@@ -49,6 +49,7 @@ from app.models.dhcp import DHCPServer
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
 from app.tasks._interval_gate import FAST_BEAT_JITTER_TOLERANCE, interval_skip
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -155,6 +156,10 @@ async def _run_pull() -> dict[str, Any]:
                         driver=server.driver,
                         error=str(exc),
                     )
+                    # #2306 — persist on the row so the server list can show
+                    # it; a later successful pull clears it.
+                    server.last_sync_error = (str(exc) or type(exc).__name__)[:2000]
+                    server.last_sync_error_at = now
                     continue
 
                 if result.busy:
@@ -286,6 +291,7 @@ async def _run_pull() -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases", bind=True)
+@module_gated("core.dhcp")
 def auto_pull_dhcp_leases(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     """Celery beat entrypoint — fires every 10s; the task itself checks the
     platform-settings gate and the per-run interval (in seconds)."""

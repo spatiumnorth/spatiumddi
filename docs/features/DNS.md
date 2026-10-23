@@ -485,7 +485,7 @@ DNSServerOptions.blackhole: list[str]           -- queries from these addresses 
 - All values accept BIND9 ACL names (see §3.7), CIDRs, or literals (`any`, `none`, `localhost`, `localnets`)
 - Can be overridden at the **view** level and further overridden at the **zone** level
 - `blackhole` is applied before any ACL processing — matching queries receive no response (useful for DoS mitigation)
-- `allow_query_cache` should be restricted to internal clients on authoritative-only servers (`none`)
+- `allow_query_cache` should be restricted to internal clients on authoritative-only servers (`none`). The group-level value renders on BIND9 only (#2264) and only when it differs from the stored default `["localhost", "localnets"]`; an untouched group leaves BIND's own default (derived from `allow-recursion`). PowerDNS and Technitium have no cache-access ACL, so a non-default value is refused (422) for a group holding one of them.
 
 ### 3.7 DNS ACLs (Named Access Control Lists)
 
@@ -1456,7 +1456,9 @@ zone-file replace does.
 **Validation.** Every row goes through the record API's own checks: the type
 list, the RFC 2181 owner rule, the TTL bounds (#2073), the structured-field
 rules (#424), the per-type value checks (one IP per A / AAAA row, a valid
-target name for CNAME / NS / PTR / DNAME), absolute targets on PowerDNS
+target name for CNAME / NS / PTR / DNAME, and rdata dnspython can read for
+the structured types such as CAA / TLSA / SSHFP / NAPTR / LOC / MX / SRV,
+#2502), absolute targets on PowerDNS
 (#2060), BIND's check-names and the full-name lengths (#1378, #2072), and the
 driver-gated types. A row that fails is reported in the preview's `errors` with
 its spreadsheet row number (the header is row 1), never as a 500. **The commit
