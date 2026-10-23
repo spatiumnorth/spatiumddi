@@ -13,6 +13,7 @@ import {
   alertsApi,
   dnsApi,
   domainsApi,
+  formatApiError,
   tlsCertsApi,
   type AlertSeverity,
   type Domain,
@@ -22,6 +23,7 @@ import { RdapPanel } from "@/components/network/rdap-panel";
 import { CertsCompactTable } from "@/pages/network/CertificatesPage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -490,6 +492,13 @@ export function DomainDetailPage() {
     enabled: !!id,
   });
 
+  // #2519 — the router asks write on 'manage_domains', as the list does.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_domains"),
+    "Requires write permission on domains",
+  );
+
   const refreshMut = useMutation({
     mutationFn: () => domainsApi.refreshWhois(id),
     onSuccess: () => {
@@ -550,6 +559,7 @@ export function DomainDetailPage() {
             onClick={() => refreshMut.mutate()}
             disabled={refreshMut.isPending}
             className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
+            {...writeGate}
           >
             <RefreshCw
               className={cn(
@@ -559,6 +569,11 @@ export function DomainDetailPage() {
             />
             {refreshMut.isPending ? "Refreshing…" : "Refresh WHOIS"}
           </button>
+          {refreshMut.isError && (
+            <p role="alert" className="basis-full text-sm text-destructive">
+              {formatApiError(refreshMut.error, "WHOIS refresh failed")}
+            </p>
+          )}
         </div>
 
         {/* Info card */}

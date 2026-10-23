@@ -2,7 +2,7 @@
 
 Mirrors ``proxmox_sync`` — 30 s beat tick, per-controller interval
 gating, platform-wide kill switch via
-``PlatformSettings.integration_unifi_enabled``. Plus a
+the ``integrations.unifi`` feature module (#2196). Plus a
 ``sync_controller_now`` task for the UI's "Sync Now" button.
 
 Cloud-mode controllers have a 60 s floor regardless of the
@@ -25,14 +25,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.celery_app import celery_app
 from app.config import settings
 from app.db import task_connect_args
-from app.models.settings import PlatformSettings
 from app.models.unifi import UnifiController
+from app.services.feature_modules import is_module_enabled
 from app.services.integration_sync_failure import record_sync_crash
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
-_PLATFORM_SINGLETON_ID = 1
 _CLOUD_INTERVAL_FLOOR_S = 60
 
 
@@ -51,8 +50,7 @@ async def _run_sweep() -> dict[str, Any]:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
-            ps = await db.get(PlatformSettings, _PLATFORM_SINGLETON_ID)
-            if ps is None or not ps.integration_unifi_enabled:
+            if not await is_module_enabled(db, "integrations.unifi"):
                 return {"status": "disabled"}
 
             rows = (

@@ -1451,7 +1451,6 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                   <th className="px-3 py-2 text-left font-medium">Name</th>
                   <th className="px-3 py-2 text-left font-medium">Enabled</th>
                   <th className="px-3 py-2 text-left font-medium">Lease (s)</th>
-                  <th className="px-3 py-2 text-left font-medium">DDNS</th>
                   {showServing && (
                     <th
                       className="px-3 py-2 text-left font-medium"
@@ -1487,9 +1486,6 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                         <td className="px-3 py-2 tabular-nums">
                           {sc.lease_time}
                         </td>
-                        <td className="px-3 py-2">
-                          {sc.ddns_enabled ? "on" : "off"}
-                        </td>
                         {showServing && (
                           <td className="px-3 py-2">
                             {servingById.get(sc.id) ? (
@@ -1513,7 +1509,6 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                                   : null,
                                 `enabled: ${sc.enabled ? "yes" : "no"}`,
                                 `lease time: ${sc.lease_time}s`,
-                                `DDNS: ${sc.ddns_enabled ? "on" : "off"}`,
                                 `scope_id: ${sc.id}`,
                                 sc.subnet_id
                                   ? `subnet_id: ${sc.subnet_id}`
