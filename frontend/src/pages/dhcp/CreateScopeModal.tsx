@@ -20,18 +20,6 @@ import { optionKeyCode } from "./dhcpOptionKeys";
 import { GROUP_FAILOVER_QUERY_KEY, useGroupFailover } from "./windowsFailover";
 import { v6ScopeLacksHa, v6ScopeNoHaNote } from "@/lib/dhcpHa";
 
-// #1308 — the scope API's own vocabulary (``VALID_HOSTNAME_POLICIES`` in
-// backend/app/api/v1/dhcp/scopes.py). The dialog used to offer client / ipam /
-// generate: create refused the last two with a 422, update stored them
-// unchecked, and a stored server_name / derived / none showed as
-// "Client-supplied".
-const DDNS_HOSTNAME_POLICIES: { value: string; label: string }[] = [
-  { value: "client", label: "Client-supplied" },
-  { value: "server_name", label: "Server name" },
-  { value: "derived", label: "Derived" },
-  { value: "none", label: "None" },
-];
-
 // Suggest a dynamic pool range for a v4 subnet: skip the first 10 hosts
 // (reserve for infra / static) and the last host (broadcast). Returns null
 // for IPv6 or subnets too small to be useful.
@@ -103,10 +91,6 @@ export function CreateScopeModal({
   const [leaseCacheMaxAge, setLeaseCacheMaxAge] = useState(
     scope?.lease_cache_max_age != null ? String(scope.lease_cache_max_age) : "",
   );
-  const [ddnsEnabled, setDdnsEnabled] = useState(scope?.ddns_enabled ?? false);
-  const [ddnsPolicy, setDdnsPolicy] = useState(
-    scope?.ddns_hostname_policy ?? "client",
-  );
   // When off, this scope's dynamic-pool lease mirrors are excluded from the
   // IPAM↔DNS drift check (ephemeral pulled leases don't read as "out of sync").
   const [dnsTrackDynamicLeases, setDnsTrackDynamicLeases] = useState(
@@ -119,7 +103,7 @@ export function CreateScopeModal({
   // response echoes these, so the <select> below must speak them too or edits
   // snap back to the first option (#475). Default matches the backend model.
   const [hostnameSync, setHostnameSync] = useState(
-    scope?.hostname_sync_mode ?? "on_static_only",
+    scope?.hostname_sync_mode ?? "on_lease",
   );
   const [options, setOptions] = useState<DHCPOption[]>(scope?.options ?? []);
   // DHCPv6 mode (issue #52) — only surfaced/sent for IPv6 scopes.
@@ -213,7 +197,11 @@ export function CreateScopeModal({
     queryFn: () => ipamApi.getSubnet(fixedSubnetId!),
     enabled: !!fixedSubnetId,
   });
-  const pinnedGroup = dhcpGroups.find((g) => g.id === defaultGroupId);
+  // #2479 — an existing scope's group is not editable (the API refuses a move),
+  // so Edit shows the stored group as a read-only pill like a pinned create.
+  const pinnedGroup = dhcpGroups.find(
+    (g) => g.id === (editing ? scope?.group_id : defaultGroupId),
+  );
   // Settings + specific subnet feed the auto-prefill for new scopes.
   const { data: settings } = useQuery({
     queryKey: ["settings"],
@@ -439,8 +427,6 @@ export function CreateScopeModal({
         max_lease_time: parsedMaxLease,
         lease_cache_threshold: parsedCacheThreshold,
         lease_cache_max_age: parsedCacheMaxAge,
-        ddns_enabled: ddnsEnabled,
-        ddns_hostname_policy: ddnsEnabled ? ddnsPolicy : null,
         hostname_sync_mode: hostnameSync,
         dns_track_dynamic_leases: dnsTrackDynamicLeases,
         options,
@@ -614,7 +600,7 @@ export function CreateScopeModal({
               else show a picker. Defaults to the DHCP group inherited
               from the subnet / block / space. Scopes belong to groups,
               and every server in the group serves this scope. */}
-          {defaultGroupId && pinnedGroup ? (
+          {(editing || defaultGroupId) && pinnedGroup ? (
             <Field label="DHCP Server Group">
               <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-1.5 text-sm">
                 <span className="font-medium">{pinnedGroup.name}</span>
@@ -970,57 +956,17 @@ export function CreateScopeModal({
           <span>Enabled (serve leases from this scope)</span>
         </label>
 
-        <div className="rounded-md border p-3 space-y-2">
-          <label className="flex items-center gap-2 text-sm font-medium">
-            <input
-              type="checkbox"
-              checked={ddnsEnabled}
-              onChange={(e) => setDdnsEnabled(e.target.checked)}
-            />
-            <span>DDNS — push lease updates to DNS</span>
-          </label>
-          {ddnsEnabled && (
-            <div className="space-y-2 pl-6">
-              <Field label="Hostname Policy">
-                <select
-                  className={inputCls}
-                  value={ddnsPolicy}
-                  onChange={(e) => setDdnsPolicy(e.target.value)}
-                >
-                  {DDNS_HOSTNAME_POLICIES.map((p) => (
-                    <option key={p.value} value={p.value}>
-                      {p.label}
-                    </option>
-                  ))}
-                  {/* A value stored before edits were checked (#1308) shows
-                      as itself, and is sent back unchanged until another
-                      policy is picked. */}
-                  {!DDNS_HOSTNAME_POLICIES.some(
-                    (p) => p.value === ddnsPolicy,
-                  ) && (
-                    <option value={ddnsPolicy}>
-                      {ddnsPolicy} (not a supported policy)
-                    </option>
-                  )}
-                </select>
-              </Field>
-              {/* #784 — a "Domain Override" input used to sit here. Nothing
-                  stored it: no column, no field on the create/update models,
-                  and the response hardcoded null, so a typed value was
-                  silently discarded. The setting is real one level up, on the
-                  subnet, which is where the DDNS resolution chain reads it. */}
-              <p className="text-xs text-muted-foreground">
-                The DDNS domain comes from the subnet (inherited from its block
-                or IP space unless overridden). Set it in IPAM → the subnet's
-                DDNS settings.
-              </p>
-            </div>
-          )}
-        </div>
+        {/* #2270 — a scope's DDNS toggle and hostname policy used to sit here.
+            Neither reached Kea or DNS: DDNS is gated only by the subnet's own
+            settings, so the controls were stored, shipped and ignored. */}
+        <p className="text-xs text-muted-foreground">
+          DDNS (pushing lease updates to DNS) is configured on the subnet, not
+          the scope: set it in IPAM → the subnet's DDNS settings.
+        </p>
 
         <Field
           label="Hostname → IPAM Sync"
-          hint="How learned hostnames from DHCP clients feed back into IPAM address records."
+          hint="Whether a lease's client hostname is written onto its IPAM address record. The record itself is always created."
         >
           <select
             className={inputCls}

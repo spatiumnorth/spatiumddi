@@ -35,6 +35,7 @@ from pydantic import (
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin, ensure_superadmin
@@ -75,7 +76,7 @@ from app.core.permissions import (
     user_has_permission,
 )
 from app.core.responses import CsvResponse, DnsZoneResponse, ZipResponse
-from app.core.update_nulls import resolve_update_changes
+from app.core.update_nulls import changed_keys, resolve_update_changes
 from app.drivers._winrm import validate_transport
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import (
@@ -185,6 +186,7 @@ from app.services.dns.server_move import (
     CATALOG_UNSUPPORTED_DRIVERS,
     ServerMoveError,
     catalog_unsupported_message,
+    elect_primary,
     ensure_group_catalog_compatible,
     ensure_group_single_driver,
     lock_server_row,
@@ -211,7 +213,12 @@ from app.services.dns.tld_registry import (
     resolve_effective,
     store_snapshot,
 )
-from app.services.dns.tsig import group_key_names, rotate_group_tsig_key
+from app.services.dns.tsig import (
+    RESERVED_TSIG_PREFIX,
+    group_key_names,
+    normalize_tsig_name,
+    rotate_group_tsig_key,
+)
 from app.services.dns.tsig_algorithms import key_refusal as tsig_key_refusal
 from app.services.dns.zone_forward_transport import zone_forward_transport_refusal
 from app.services.dns.zone_move import (
@@ -2068,6 +2075,7 @@ async def update_group(
         group_drivers = (await _drivers_by_group(db, [group.id])).get(group.id, [])
         if set(group_drivers) & CATALOG_UNSUPPORTED_DRIVERS:
             raise HTTPException(status_code=422, detail=catalog_unsupported_message(group_drivers))
+    before = {k: getattr(group, k, None) for k in changes}
     for k, v in changes.items():
         setattr(group, k, v)
 
@@ -2080,7 +2088,7 @@ async def update_group(
             resource_type="dns_server_group",
             resource_id=str(group.id),
             resource_display=group.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -2311,10 +2319,12 @@ async def create_server(
         # ``# TODO: encrypt`` marker.
         data["api_key_encrypted"] = encrypt_str(body.api_key)
 
-    # Auto-mark this server as primary if the group has no primary yet.
-    # Prevents the footgun where a freshly-created group has zero primaries
-    # and `enqueue_record_op` silently drops every write targeting its zones.
-    # Admins can still flip the flag later via PUT; this only fires on create.
+    # Auto-mark this server as primary if the group has no primary yet, so a
+    # freshly-created group has one from the start. (A group without one no
+    # longer drops writes — ``resolve_primary_server`` falls back to the
+    # election's pick and the beat sweep stamps it, #2276 — but the paths that
+    # read the flag directly, catalog producer and DNSSEC reporter among them,
+    # still want it set.) Admins can move it later via PUT.
     has_primary = await db.execute(
         select(DNSServer).where(DNSServer.group_id == group_id, DNSServer.is_primary.is_(True))
     )
@@ -2465,6 +2475,7 @@ async def update_server(
                 changes["status"] = "syncing"
         else:
             changes["status"] = "disabled"
+    before = {k: getattr(server, k, None) for k in changes}
     for k, v in changes.items():
         setattr(server, k, v)
 
@@ -2572,11 +2583,11 @@ async def update_server(
             )
             server.is_primary = True
         else:
-            # Clearing the LAST primary re-creates the footgun create-time
-            # auto-election exists to prevent: ``enqueue_record_op`` drops
-            # every write to the group's zones with only a log line — no
-            # error reaches whoever made the change. Promote a replacement
-            # instead; that demotes this one as a side effect.
+            # Clearing the LAST primary would not stick: since #2276 the
+            # write path stands in the election's pick and the 60 s beat
+            # sweep re-stamps the flag — very likely on this same server, the
+            # oldest. Refuse, and point at the operation that does what the
+            # operator means: promote a replacement, which demotes this one.
             others = await db.execute(
                 select(DNSServer.id)
                 .where(
@@ -2590,10 +2601,10 @@ async def update_server(
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "This is the only primary in its group; clearing it would "
-                        "silently drop every DNS record write to the group's zones. "
-                        "Mark another server in the group as primary instead — that "
-                        "demotes this one."
+                        "This is the only primary in its group, and a group without "
+                        "one has a primary re-elected automatically within a minute, "
+                        "so clearing it would not stick. Mark another server in the "
+                        "group as primary instead — that demotes this one."
                     ),
                 )
             server.is_primary = False
@@ -2608,7 +2619,7 @@ async def update_server(
             resource_type="dns_server",
             resource_id=str(server.id),
             resource_display=server.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             new_value=move_result.as_audit_value() if move_result else None,
             result="success",
         )
@@ -2624,6 +2635,12 @@ async def delete_server(
     group_id: uuid.UUID, server_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> None:
     server = await _require_server(group_id, server_id, db)
+    # #2276 — deleting the primary elects a successor in the same transaction,
+    # the way the #934 move does. A group left without one used to drop every
+    # later record write before the agent fan-out, behind a 200.
+    successor = None
+    if server.is_primary:
+        successor = await elect_primary(db, server.group_id, exclude_id=server.id)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -2633,6 +2650,11 @@ async def delete_server(
             resource_type="dns_server",
             resource_id=str(server.id),
             resource_display=server.name,
+            new_value=(
+                {"primary_elected": str(successor.id), "primary_elected_name": successor.name}
+                if successor is not None
+                else None
+            ),
             result="success",
         )
     )
@@ -4145,6 +4167,7 @@ async def update_options(
     resolver_before = alias_resolver(opts.forwarders, opts.forward_transport)
     forwarders_before = list(opts.forwarders or [])
     transport_before = opts.forward_transport
+    before = {k: getattr(opts, k, None) for k in changes}
     for k, v in changes.items():
         setattr(opts, k, v)
 
@@ -4187,7 +4210,7 @@ async def update_options(
             resource_type="dns_server_options",
             resource_id=str(opts.id),
             resource_display=f"options for group {group_id}",
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -4670,6 +4693,44 @@ _TSIG_ALGO_LENGTHS = {
 _TSIG_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.\-]*[a-z0-9])?\.?$")
 
 
+async def _tsig_name_refusal(
+    db: AsyncSession, group_id: uuid.UUID, name: str, *, exclude_id: uuid.UUID | None = None
+) -> HTTPException | None:
+    """Refuse a TSIG key name that would render a second ``key {}`` for one name (#2295).
+
+    Names are compared the way BIND does (case-folded, trailing dot dropped),
+    and against the group's own generated key too. ``spatium-`` is reserved for
+    that generated key.
+    """
+    norm = normalize_tsig_name(name)
+    if norm.startswith(RESERVED_TSIG_PREFIX):
+        return HTTPException(
+            status_code=422,
+            detail=f"TSIG key name '{name}' uses the reserved '{RESERVED_TSIG_PREFIX}' prefix "
+            "(it is the group's generated key); choose another name",
+        )
+    group = await db.get(DNSServerGroup, group_id)
+    if group is not None and normalize_tsig_name(group.tsig_key_name) == norm:
+        return HTTPException(
+            status_code=422,
+            detail=f"TSIG key name '{name}' clashes with this group's generated key "
+            f"'{group.tsig_key_name}'",
+        )
+    rows = (
+        await db.execute(
+            select(DNSTSIGKey.id, DNSTSIGKey.name).where(DNSTSIGKey.group_id == group_id)
+        )
+    ).all()
+    for rid, rname in rows:
+        if rid != exclude_id and normalize_tsig_name(rname) == norm:
+            return HTTPException(
+                status_code=409,
+                detail=f"A TSIG key named '{rname}' already exists in this group "
+                "(names are compared case-insensitively, ignoring a trailing dot)",
+            )
+    return None
+
+
 def _generate_tsig_secret(algorithm: str) -> str:
     import base64
     import secrets
@@ -4871,14 +4932,8 @@ async def create_tsig_key(
     # installed and left to fail every signed transfer with BADKEY.
     if refusal := tsig_key_refusal(body.algorithm, await _group_driver_names(db, group_id)):
         raise HTTPException(status_code=422, detail=refusal)
-    existing = await db.execute(
-        select(DNSTSIGKey).where(DNSTSIGKey.group_id == group_id, DNSTSIGKey.name == body.name)
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(
-            status_code=409,
-            detail="A TSIG key with that name already exists in this group",
-        )
+    if refusal_exc := await _tsig_name_refusal(db, group_id, body.name):
+        raise refusal_exc
 
     plaintext = body.secret.strip() if body.secret else _generate_tsig_secret(body.algorithm)
     key = DNSTSIGKey(
@@ -4945,16 +5000,12 @@ async def update_tsig_key(
         ):
             raise HTTPException(status_code=422, detail=refusal)
     if changes.get("name") and changes["name"] != key.name:
-        clash = await db.execute(
-            select(DNSTSIGKey).where(
-                DNSTSIGKey.group_id == group_id,
-                DNSTSIGKey.name == changes["name"],
-                DNSTSIGKey.id != key_id,
-            )
-        )
-        if clash.scalar_one_or_none():
-            raise HTTPException(status_code=409, detail="Name already in use")
+        if refusal_exc := await _tsig_name_refusal(
+            db, group_id, changes["name"], exclude_id=key_id
+        ):
+            raise refusal_exc
         await _assert_tsig_key_is_unreferenced(group_id, key, db, action="rename")
+    before = {k: getattr(key, k, None) for k in changes}
     for k, v in changes.items():
         setattr(key, k, v)
     db.add(
@@ -4966,7 +5017,7 @@ async def update_tsig_key(
             resource_type="dns_tsig_key",
             resource_id=str(key.id),
             resource_display=key.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -5183,6 +5234,7 @@ async def update_view(
         },
     )
     changes.update(await _validated_view_fields(group_id, body, db))
+    before = {k: getattr(view, k, None) for k in changes}
     for k, v in changes.items():
         setattr(view, k, v)
     db.add(
@@ -5194,7 +5246,7 @@ async def update_view(
             resource_type="dns_view",
             resource_id=str(view.id),
             resource_display=view.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -6203,6 +6255,7 @@ async def update_zone(
         k in changes and (changes[k] or "") != (getattr(zone, k) or "")
         for k in ("primary_ns", "admin_email")
     ) or any(k in changes and changes[k] != getattr(zone, k) for k in _ZONE_FILE_TIMER_FIELDS)
+    before = {k: getattr(zone, k, None) for k in changes}
     for k, v in changes.items():
         setattr(zone, k, v)
     if soa_changed:
@@ -6220,7 +6273,7 @@ async def update_zone(
             resource_type="dns_zone",
             resource_id=str(zone.id),
             resource_display=zone.name,
-            changed_fields=list(changes.keys()),
+            changed_fields=changed_keys(before, changes),
             result="success",
         )
     )
@@ -7172,14 +7225,12 @@ async def rollover_zone_dnssec_key(
         {"name": "@", "type": "DNSSEC_OP", "key_tag": body.key_tag},
     )
     if op is None:
-        # #1946 — no row was written (no primary, or no enabled agent-based
-        # server): answering ``queued`` would claim a rollover nobody runs.
+        # #1946 — no row was written (no servers in the group, or no enabled
+        # agent-based server; a missing primary flag no longer stops it,
+        # #2276): answering ``queued`` would claim a rollover nobody runs.
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Nothing to run the rollover: the group has no primary server "
-                "or no enabled agent-based server"
-            ),
+            detail=("Nothing to run the rollover: the group has no enabled " "agent-based server"),
         )
     db.add(
         AuditLog(
@@ -8406,6 +8457,13 @@ async def update_record(
         clearable={"view_id", "ttl"},
         non_nullable={"name", "value", "tags"},
     )
+    # An untouched Save sends every field the dialog shows; only a field whose
+    # value differs is a change (#2463). Nothing changed → nothing to bump,
+    # queue or audit.
+    changes = {k: v for k, v in changes.items() if getattr(record, k) != v}
+    if not changes:
+        record.provider_warning = None  # type: ignore[attr-defined]
+        return record
     if "view_id" in changes and zone is not None:
         await _enforce_views_in_zone_group(db, zone, [changes["view_id"]])
     before_name, before_value = record.name, record.value
@@ -8806,7 +8864,10 @@ async def bulk_delete_records(
             skipped.append(
                 {
                     "record_id": str(rec.id),
-                    "reason": "no primary configured for zone — wire delete skipped",
+                    "reason": (
+                        "no enabled server in the zone's group to send it to — "
+                        "wire delete skipped"
+                    ),
                 }
             )
             continue

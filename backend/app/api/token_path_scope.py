@@ -27,6 +27,12 @@ about more than one subnet narrow their own rows with
 ``_token_subnet_scope_uuids`` (or refuse, where the answer is a fact about the
 whole block and cannot be narrowed).
 
+Ids carried in a form field or a JSON body are NOT seen here: the body is
+the handler's to parse. A route that takes its subnet, block or space from
+the body (the IPAM imports) checks the token itself, and a route whose answer
+covers a whole block or space it was handed (an export) refuses a token bound
+to subnets rather than relying on this admit.
+
 Sessions and tokens without resource grants are untouched (one attribute
 read, no query). A token with a wildcard ``subnet`` grant is not checked on
 blocks and spaces. An id that does not parse, or an address that does not

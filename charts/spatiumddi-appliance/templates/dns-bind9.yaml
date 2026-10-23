@@ -86,7 +86,27 @@ spec:
           # A CPU request keeps the serving pod out of BestEffort QoS (the
           # lowest CFS weight on the node) so a busy control plane cannot
           # starve it — see dhcp-kea.yaml for the measurement. Requests only.
-          {{- with .Values.dnsBind9.resources }}
+          # #2223 — memory comes from ``dnsBind9.memory`` (the supervisor
+          # sizes it from the smallest DNS node's RAM: a quarter, 2Gi to
+          # 8Gi) unless ``dnsBind9.resources`` sets the limit or the request
+          # itself, so an operator's explicit override always wins.
+          {{- $res := deepCopy (.Values.dnsBind9.resources | default dict) }}
+          {{- $mem := .Values.dnsBind9.memory | default dict }}
+          {{- if $mem.limit }}
+          {{- $limits := get $res "limits" | default dict }}
+          {{- if not (get $limits "memory") }}
+          {{- $_ := set $limits "memory" $mem.limit }}
+          {{- end }}
+          {{- $_ := set $res "limits" $limits }}
+          {{- end }}
+          {{- if $mem.request }}
+          {{- $requests := get $res "requests" | default dict }}
+          {{- if not (get $requests "memory") }}
+          {{- $_ := set $requests "memory" $mem.request }}
+          {{- end }}
+          {{- $_ := set $res "requests" $requests }}
+          {{- end }}
+          {{- with $res }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -181,6 +201,7 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
             timeoutSeconds: 3
+          {{- include "spatiumddi-appliance.dnsStartupProbe" . | nindent 10 }}
           livenessProbe:
             tcpSocket:
               port: 53

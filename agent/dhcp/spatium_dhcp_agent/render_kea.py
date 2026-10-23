@@ -711,6 +711,33 @@ def _normalize_mac_for_kea(raw: str) -> str | None:
     return ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
 
 
+def _add_mac_blocklist_class(
+    rendered_classes: list[dict[str, Any]], drop_expr: str, *, family: str
+) -> None:
+    """Add the MAC blocklist to ``rendered_classes`` as Kea's ``DROP`` class.
+
+    Kea drops any packet in a class named ``DROP``, and only that name does
+    it, so the blocklist cannot be rendered under another name. An operator
+    class already called ``DROP`` (stored before the API refused the name,
+    #2296) is not skipped and not renamed: renaming it would stop it
+    dropping the packets it drops today, and skipping the blocklist would
+    leave every blocked MAC served. Instead the one ``DROP`` class matches
+    either: the operator's test OR the blocklist. A ``DROP`` with no test
+    (assigned only by reservations) takes the blocklist as its test, which
+    keeps those assignments working. Two classes of one name would make Kea
+    reject the whole config, so this is the only shape that keeps both.
+    """
+    if not drop_expr:
+        return
+    existing = next((c for c in rendered_classes if c.get("name") == "DROP"), None)
+    if existing is None:
+        rendered_classes.append({"name": "DROP", "test": drop_expr})
+        return
+    own = existing.get("test")
+    existing["test"] = f"({own}) or ({drop_expr})" if own else drop_expr
+    _log.warning("mac_blocklist_merged_into_operator_drop_class", family=family)
+
+
 def _build_drop_expression(mac_blocks: list[dict[str, Any]]) -> str:
     """Build a Kea client-class ``test`` expression for the DROP list.
 
@@ -731,6 +758,35 @@ def _build_drop_expression(mac_blocks: list[dict[str, Any]]) -> str:
     if not norms:
         return ""
     return " or ".join(f"hexstring(pkt4.mac, ':') == '{m}'" for m in norms)
+
+
+def _build_drop_expression_v6(mac_blocks: list[dict[str, Any]]) -> str:
+    """Best-effort Kea Dhcp6 ``test`` expression for the MAC blocklist (#2268).
+
+    Kea has no ``pkt6.mac``: a DHCPv6 packet carries no hardware address at
+    all. A MAC can only be recovered from (a) the client DUID when it is
+    DUID-LLT (type 1) or DUID-LL (type 3) over Ethernet (hwtype 1), or
+    (b) the RFC 6939 client link-layer address option (79) a first-hop relay
+    appends. Both are matched here, per MAC. A client using DUID-EN /
+    DUID-UUID, a randomised DUID, or an unrelayed packet from a relay that
+    doesn't add option 79, carries no MAC and cannot be matched.
+    """
+    clauses: list[str] = []
+    for entry in mac_blocks:
+        mac = entry.get("mac_address") if isinstance(entry, dict) else None
+        if not mac:
+            continue
+        n = _normalize_mac_for_kea(str(mac))
+        if n is None:
+            continue
+        h = "0x" + n.replace(":", "")
+        clauses.append(
+            f"(substring(option[1].hex, 0, 4) == 0x00030001 and substring(option[1].hex, 4, 6) == {h})"
+            f" or (substring(option[1].hex, 0, 4) == 0x00010001 and substring(option[1].hex, 8, 6) == {h})"
+            f" or (substring(relay6[-1].option[79].hex, 0, 2) == 0x0001 and substring(relay6[-1].option[79].hex, 2, 6) == {h})"
+            f" or (substring(relay6[0].option[79].hex, 0, 2) == 0x0001 and substring(relay6[0].option[79].hex, 2, 6) == {h})"
+        )
+    return " or ".join(clauses)
 
 
 def _reservation(res: dict[str, Any]) -> dict[str, Any]:
@@ -1383,12 +1439,12 @@ def render(
     # MAC blocklist — render as Kea's reserved ``DROP`` class. Any packet
     # whose hardware address matches the OR-ed expression is silently
     # dropped before allocation. ``DROP`` is a Kea built-in name, not
-    # something the operator can reuse — so if a user-defined class is
-    # already named ``DROP`` we skip blocklist rendering to avoid
-    # clobbering it (defensive; the API already reserves the name).
+    # something the operator can reuse. The API refuses the name since #2296,
+    # but a class stored before that may still carry it: see
+    # ``_add_mac_blocklist_class``, which keeps that class dropping what it
+    # dropped and enforces the blocklist too.
     drop_expr = _build_drop_expression(bundle.get("mac_blocks") or [])
-    if drop_expr and not any(c.get("name") == "DROP" for c in rendered_classes):
-        rendered_classes.append({"name": "DROP", "test": drop_expr})
+    _add_mac_blocklist_class(rendered_classes, drop_expr, family="ipv4")
 
     if rendered_classes:
         dhcp4["client-classes"] = rendered_classes
@@ -1509,8 +1565,8 @@ def render(
         if opts6:
             dhcp6["option-data"] = opts6
         # Client classes render through the v6 name map. The MAC blocklist
-        # DROP class is v4-only (Kea v6 has no ``pkt4.mac``) so it is not
-        # carried into Dhcp6 — matching the backend driver.
+        # DROP class is rendered best-effort from the DUID / relay option 79
+        # (#2268) — Kea v6 has no ``pkt6.mac``.
         rendered_classes_v6: list[dict[str, Any]] = [
             {
                 "name": c["name"],
@@ -1528,6 +1584,8 @@ def render(
             for c in classes
             if _class_in_family(c, "ipv6")
         ]
+        drop_expr_v6 = _build_drop_expression_v6(bundle.get("mac_blocks") or [])
+        _add_mac_blocklist_class(rendered_classes_v6, drop_expr_v6, family="ipv6")
         if rendered_classes_v6:
             dhcp6["client-classes"] = rendered_classes_v6
     out["Dhcp6"] = dhcp6

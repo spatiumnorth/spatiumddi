@@ -1832,8 +1832,8 @@ function ServerModal({
                 <span className="block text-xs text-muted-foreground">
                   The server DDNS and record writes are applied at. Exactly one
                   per group &mdash; ticking this demotes whichever server holds
-                  it now. A group with no primary silently drops every record
-                  write to its zones, so it can only be moved, not cleared.
+                  it now. A group left without one has a primary re-elected
+                  automatically, so the flag can only be moved, not cleared.
                 </span>
               </span>
             </label>
@@ -4071,7 +4071,8 @@ function ZoneDetailView({
   // reintroduce a local one). The explicit ``showAddRecord`` check still
   // covers the case that actually matters whatever it is built on.
   useEffect(() => {
-    if (isForward || zone.tailscale_tenant_id) return;
+    // #2529 — the keyboard path must honour the same grant as the button.
+    if (isForward || zone.tailscale_tenant_id || !canWriteRecords) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (isTypingTarget(e.target)) return;
@@ -4082,7 +4083,7 @@ function ZoneDetailView({
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [isForward, zone.tailscale_tenant_id, showAddRecord]);
+  }, [isForward, zone.tailscale_tenant_id, showAddRecord, canWriteRecords]);
 
   // Records / Pools sub-tab toggle. Pools live under the same zone but
   // need their own management surface — health-check config, member
@@ -6447,7 +6448,7 @@ function SubnetPickerModal({
 
 // ── ACLs Tab ──────────────────────────────────────────────────────────────────
 
-function AclsTab({ groupId }: { groupId: string }) {
+export function AclsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   const { can } = useDnsGrants();
   const [showCreate, setShowCreate] = useState(false);
@@ -6460,6 +6461,9 @@ function AclsTab({ groupId }: { groupId: string }) {
   const [newDesc, setNewDesc] = useState("");
   const [newEntries, setNewEntries] = useState("");
   const [error, setError] = useState("");
+  // #2444 — the server refuses a delete of an ACL that another ACL or a zone
+  // cites (409); the reason is shown in the dialog, which stays open.
+  const [deleteError, setDeleteError] = useState("");
 
   const { data: acls = [] } = useQuery({
     queryKey: ["dns-acls", groupId],
@@ -6479,7 +6483,12 @@ function AclsTab({ groupId }: { groupId: string }) {
   });
   const delMut = useMutation({
     mutationFn: (id: string) => dnsApi.deleteAcl(groupId, id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-acls", groupId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-acls", groupId] });
+      setConfirmDelete(null);
+    },
+    onError: (e: ApiError) =>
+      setDeleteError(formatApiError(e, "Failed to delete the ACL")),
   });
 
   function createAcl(e: React.FormEvent) {
@@ -6586,7 +6595,10 @@ function AclsTab({ groupId }: { groupId: string }) {
               </div>
               <button
                 className="h-7 w-7 flex items-center justify-center rounded opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive disabled:opacity-0"
-                onClick={() => setConfirmDelete(acl)}
+                onClick={() => {
+                  setDeleteError("");
+                  setConfirmDelete(acl);
+                }}
                 title="Delete ACL"
                 {...permissionGate(
                   can("delete", "dns_group"),
@@ -6619,17 +6631,27 @@ function AclsTab({ groupId }: { groupId: string }) {
           confirmLabel="Delete ACL"
           tone="destructive"
           onClose={() => setConfirmDelete(null)}
+          loading={delMut.isPending}
           onConfirm={() => {
+            setDeleteError("");
             delMut.mutate(confirmDelete.id);
-            setConfirmDelete(null);
           }}
           message={
-            <p className="text-sm">
-              Any view or zone referencing{" "}
-              <span className="font-mono">{confirmDelete.name}</span> by name
-              will stop resolving it — check the Views tab before removing an
-              ACL that is in use.
-            </p>
+            <div className="space-y-2">
+              <p className="text-sm">
+                An ACL that another ACL, a view or a zone still cites by name
+                cannot be deleted — the server refuses it, and the reason is
+                shown here. Remove the references first.
+              </p>
+              {deleteError && (
+                <p
+                  role="alert"
+                  className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-sm text-destructive"
+                >
+                  {deleteError}
+                </p>
+              )}
+            </div>
           }
         />
       )}
