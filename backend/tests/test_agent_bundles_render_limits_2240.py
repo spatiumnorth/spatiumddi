@@ -146,6 +146,26 @@ def test_a_deferred_retry_keeps_the_limits_of_its_message(
     )
 
 
+def test_a_handed_on_retry_keeps_the_limits_of_its_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2252: a holder whose server changed again while another render waits
+    hands its slot on and comes back through the queue. It comes back under
+    its own message's limits, as a deferred render does."""
+    result, published, seen = _run_task_with(
+        monkeypatch, {"status": "handed_on", "lock_token": "tok", "renders": 1}, [3180, 3120]
+    )
+    assert seen == [3120], "the render ran under its message's soft limit"
+    assert result["status"] == "handed_on"
+    (retry,) = published
+    assert retry["kwargs"] == {"lock_token": "tok"}, "the server's lock goes with it"
+    assert retry["countdown"] == agent_bundles.HANDED_ON_RETRY_SECONDS
+    assert (retry["soft_time_limit"], retry["time_limit"]) == (3120, 3180), (
+        "a handed-on render came back at the 900 s floor, so a big group's "
+        "next render had to resize before it could start"
+    )
+
+
 def test_a_render_too_big_for_its_message_republishes_itself_sized_for_the_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
