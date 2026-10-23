@@ -217,9 +217,10 @@ rules:
     verbs: ["get", "list", "watch"]
     # #590 / #750 — ensure_coredns_ha: the seed's heartbeat matches the
     # k3s-bundled CoreDNS to the cluster's node count. Two or more nodes get
-    # 2 replicas + fast-evict tolerations + required anti-affinity (k3s resets
-    # it to a single 300s-toleration replica on every restart; a single
-    # replica deterministically sits on the seed, so a hard seed kill silences
+    # one replica per node (#1718; it was 2) + required anti-affinity, with
+    # k3s's own tolerations (#1753; k3s resets it to a single 300s-toleration
+    # replica on every restart; a single replica deterministically sits on
+    # the seed, so a hard seed kill silences
     # all Service/pod-FQDN resolution — api readiness's Postgres + Redis
     # lookups included — for 5 minutes). A single-node box is held at the
     # stock shape instead, because the HA pod template cannot schedule there
@@ -229,6 +230,15 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     resourceNames: ["coredns"]
+    verbs: ["get", "patch"]
+    # #1718 — ensure_kube_dns_node_local: on two or more nodes the seed's
+    # heartbeat sets the kube-dns Service's trafficDistribution to
+    # PreferSameNode, so every node resolves through its own CoreDNS replica
+    # and a lost node's replica stalls no one else's lookups. resourceNames-
+    # pinned to kube-dns.
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["kube-dns"]
     verbs: ["get", "patch"]
     # #1058 — the dead-node evict reclaims the CloudNativePG instance claim
     # the deleted node stranded (k8s_api.reclaim_stranded_postgres_storage,

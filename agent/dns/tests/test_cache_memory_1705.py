@@ -82,7 +82,7 @@ def test_ingest_sweep_does_not_reparse_an_unchanged_cache(
     loads: list[int] = []
     real = ingest_mod.load_config
     monkeypatch.setattr(
-        ingest_mod, "load_config", lambda sd: (loads.append(1), real(sd))[1]
+        ingest_mod, "load_config", lambda sd, **kw: (loads.append(1), real(sd, **kw))[1]
     )
     w = IngestWorker(agent_cfg, ["tok"])
     read: list[str] = []

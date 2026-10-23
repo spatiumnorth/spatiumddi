@@ -42,6 +42,7 @@ from app.services.bgp.hijack_monitor import (
     refresh_tracked_prefixes_for_asn,
     resolve_stale_detections,
 )
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -202,6 +203,7 @@ async def _run_poll() -> dict[str, Any]:
     retry_backoff_max=600,
     max_retries=3,
 )
+@module_gated("network.asn")
 def poll_bgp_hijacks(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     """Beat-fired hourly. Per-row ``next_check_at`` gates the actual
     pace; ``PlatformSettings.bgp_monitoring_interval_hours`` controls the
