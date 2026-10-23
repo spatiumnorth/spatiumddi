@@ -27,6 +27,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ListReadError } from "@/components/ui/list-read-error";
 
 type TabId = DHCPImportSource;
 
@@ -268,6 +269,7 @@ function ImportTab({ source }: { source: DHCPImportSource }) {
             blocks={blocksQ.data ?? []}
             servers={serversQ.data ?? []}
             serversLoading={serversQ.isLoading}
+            serversError={serversQ.error}
             onPreview={() => {
               setState((s) => ({ ...s, phase: "previewing", error: null }));
               previewMut.mutate();
@@ -316,6 +318,7 @@ function ConfigureForm({
   blocks,
   servers,
   serversLoading,
+  serversError,
   onPreview,
   previewing,
 }: {
@@ -327,6 +330,7 @@ function ConfigureForm({
   blocks: { id: string; name: string; network: string }[];
   servers: WindowsDHCPServerOption[];
   serversLoading: boolean;
+  serversError: unknown;
   onPreview: () => void;
   previewing: boolean;
 }) {
@@ -408,9 +412,11 @@ function ConfigureForm({
                 <option value="">
                   {serversLoading
                     ? "Loading…"
-                    : eligibleServers.length === 0
-                      ? "— no eligible servers —"
-                      : "— select —"}
+                    : serversError
+                      ? "— servers unavailable —"
+                      : eligibleServers.length === 0
+                        ? "— no eligible servers —"
+                        : "— select —"}
                 </option>
                 {servers.map((srv) => (
                   <option
@@ -423,6 +429,14 @@ function ConfigureForm({
                   </option>
                 ))}
               </select>
+              {serversError ? (
+                <p className="mt-1 text-xs">
+                  <ListReadError
+                    error={serversError}
+                    what="the servers to import from"
+                  />
+                </p>
+              ) : null}
             </div>
           )}
 
