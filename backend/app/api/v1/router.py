@@ -282,11 +282,13 @@ api_v1_router.include_router(
     tags=["dicom"],
     dependencies=[Depends(require_module("network.dicom"))],
 )
+# wake_publishing (#2040): an ERL or binding edit changes the DHCP options
+# 99 / 123 the agents render, so its handlers ``collect_wake`` the DHCP groups.
 api_v1_router.include_router(
     e911_router,
     prefix="/e911",
     tags=["e911"],
-    dependencies=[Depends(require_module("network.e911"))],
+    dependencies=[Depends(require_module("network.e911")), Depends(wake_publishing)],
 )
 include_token_scoped(
     api_v1_router,
@@ -429,9 +431,12 @@ api_v1_router.include_router(
     tags=["network"],
     dependencies=[Depends(require_module("network.device"))],
 )
+# wake_publishing (#2040): ``POST /new-devices/block`` creates dhcp_mac_block
+# rows and ``collect_wake``s their groups, which without a collector here was a
+# silent no-op — the block reached agents only on the safety tick.
 api_v1_router.include_router(
     new_devices_router,
-    dependencies=[Depends(require_module("security.new_device_watch"))],
+    dependencies=[Depends(require_module("security.new_device_watch")), Depends(wake_publishing)],
 )
 api_v1_router.include_router(
     block_sync_router,

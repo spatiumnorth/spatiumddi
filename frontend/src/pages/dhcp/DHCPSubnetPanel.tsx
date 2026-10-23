@@ -19,6 +19,7 @@ import {
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreatePoolModal } from "./CreatePoolModal";
 import { DeleteConfirmModal, V6NoHaTag } from "./_shared";
+import { scopeDeleteCopy } from "@/lib/dhcp-scope-delete";
 import { v6ScopeLacksHa } from "@/lib/dhcpHa";
 import { ScopeServingStrip } from "./WindowsFailoverPanel";
 
@@ -108,6 +109,11 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
     queryKey: ["dhcp-pools", scope.id],
     queryFn: () => dhcpApi.listPools(scope.id),
   });
+  // #2446 — the delete takes the scope's reservations too; count them.
+  const { data: statics = [] } = useQuery({
+    queryKey: ["dhcp-statics", scope.id],
+    queryFn: () => dhcpApi.listStatics(scope.id),
+  });
   // #1238 — HA is DHCPv4 only; flag a v6 scope on a multi-Kea group.
   const { data: groups = [] } = useQuery({
     queryKey: ["dhcp-groups"],
@@ -160,7 +166,6 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
             <p className="text-xs text-muted-foreground">
               Lease {scope.lease_time}s · {pools.length} pool
               {pools.length !== 1 ? "s" : ""}
-              {scope.ddns_enabled && " · DDNS"}
             </p>
           </div>
         </div>
@@ -254,8 +259,11 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
       {deleteScope && (
         <DeleteConfirmModal
           title="Delete DHCP Scope"
-          description={`Delete scope "${scope.name}" and all its pools?`}
-          references={[`${pools.length} pool${pools.length !== 1 ? "s" : ""}`]}
+          {...scopeDeleteCopy(
+            scope.name || scope.id.slice(0, 8),
+            pools.length,
+            statics.length,
+          )}
           onConfirm={() => delMut.mutate()}
           onClose={() => {
             setDeleteScope(false);
