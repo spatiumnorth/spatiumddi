@@ -75,6 +75,11 @@ from app.services.dhcp.static_ipam import audit_static_removed, sync_static_for_
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
+from app.services.dns.ddns import (
+    EffectiveDDNS,
+    resolve_effective_ddns,
+    resolve_effective_ddns_for_block,
+)
 from app.services.dns.sync_check import (
     address_own_forward_zone_id,
     forward_zone_ids_in_order,
@@ -3711,6 +3716,41 @@ class EffectiveDnsResponse(BaseModel):
     inherited_from_block_id: str | None
 
 
+class EffectiveDdnsResponse(BaseModel):
+    """What a subnet's DDNS resolves to, and where it comes from (#2475).
+
+    ``source`` is ``subnet`` (its own settings), ``block`` / ``space`` (the
+    ancestor it inherits from, named by ``source_id`` / ``source_name``) or
+    ``none``.
+    """
+
+    enabled: bool
+    hostname_policy: str
+    domain_override: str | None
+    ttl: int | None
+    source: str
+    source_id: str | None = None
+    source_name: str | None = None
+
+
+async def _effective_ddns_response(db: AsyncSession, eff: EffectiveDDNS) -> EffectiveDdnsResponse:
+    kind, _, ident = eff.source.partition(":")
+    name: str | None = None
+    if ident:
+        row = await db.get(IPBlock if kind == "block" else IPSpace, uuid.UUID(ident))
+        if row is not None:
+            name = (row.name or str(getattr(row, "network", ""))) if kind == "block" else row.name
+    return EffectiveDdnsResponse(
+        enabled=eff.enabled,
+        hostname_policy=eff.hostname_policy,
+        domain_override=eff.domain_override,
+        ttl=eff.ttl,
+        source=kind,
+        source_id=ident or None,
+        source_name=name,
+    )
+
+
 class EffectiveDhcpResponse(BaseModel):
     """Effective DHCP server-group resolution for a space/block/subnet.
 
@@ -5363,6 +5403,17 @@ async def get_effective_block_dns(
     )
 
 
+@router.get("/blocks/{block_id}/effective-ddns", response_model=EffectiveDdnsResponse)
+async def get_effective_block_ddns(
+    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> EffectiveDdnsResponse:
+    """DDNS a subnet created in this block would inherit (#2475)."""
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+    return await _effective_ddns_response(db, await resolve_effective_ddns_for_block(db, block))
+
+
 @router.get(
     "/blocks/{block_id}/effective-dhcp",
     response_model=EffectiveDhcpResponse,
@@ -6569,6 +6620,17 @@ async def get_effective_subnet_dns(
     return EffectiveDnsResponse(
         dns_group_ids=[], dns_zone_id=None, dns_additional_zone_ids=[], inherited_from_block_id=None
     )
+
+
+@router.get("/subnets/{subnet_id}/effective-ddns", response_model=EffectiveDdnsResponse)
+async def get_effective_subnet_ddns(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> EffectiveDdnsResponse:
+    """Resolve effective DDNS for a subnet: its own, or its block chain / space (#2475)."""
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    return await _effective_ddns_response(db, await resolve_effective_ddns(db, subnet))
 
 
 @router.get(

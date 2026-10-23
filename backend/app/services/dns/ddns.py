@@ -134,6 +134,45 @@ async def resolve_effective_ddns(db: AsyncSession, subnet: Subnet) -> EffectiveD
     )
 
 
+async def resolve_effective_ddns_for_block(db: AsyncSession, block: IPBlock) -> EffectiveDDNS:
+    """Effective DDNS a subnet created directly under ``block`` would inherit.
+
+    The same walk ``resolve_effective_ddns`` does after its own subnet check:
+    the first non-inheriting block up the chain, else the space. Backs the
+    New Subnet dialog's DDNS tab (#2475), where the subnet does not exist yet.
+    """
+    current: IPBlock | None = block
+    while current is not None:
+        if not current.ddns_inherit_settings:
+            return EffectiveDDNS(
+                enabled=current.ddns_enabled,
+                hostname_policy=current.ddns_hostname_policy,
+                domain_override=current.ddns_domain_override,
+                ttl=current.ddns_ttl,
+                source=f"block:{current.id}",
+            )
+        if current.parent_block_id:
+            current = await db.get(IPBlock, current.parent_block_id)
+            continue
+        space = await db.get(IPSpace, current.space_id)
+        if space is None:
+            break
+        return EffectiveDDNS(
+            enabled=space.ddns_enabled,
+            hostname_policy=space.ddns_hostname_policy,
+            domain_override=space.ddns_domain_override,
+            ttl=space.ddns_ttl,
+            source=f"space:{space.id}",
+        )
+    return EffectiveDDNS(
+        enabled=False,
+        hostname_policy="client_or_generated",
+        domain_override=None,
+        ttl=None,
+        source="none",
+    )
+
+
 _POLICIES: frozenset[str] = frozenset(
     {"client_provided", "client_or_generated", "always_generate", "disabled"}
 )
