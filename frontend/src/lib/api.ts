@@ -3,7 +3,12 @@ import axios, {
   type AxiosInstance,
   type AxiosResponse,
 } from "axios";
-import { getAccessToken, setAccessToken } from "@/lib/authToken";
+import { idleHeader } from "@/lib/activity";
+import {
+  getAccessToken,
+  setAccessToken,
+  setMustChangePassword,
+} from "@/lib/authToken";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
 
@@ -28,6 +33,9 @@ function createClient(): AxiosInstance {
     const token = getAccessToken();
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
+      // How long the operator has been away, so a background poll does not
+      // count as activity for the Session Timeout (lib/activity.ts).
+      Object.assign(config.headers, idleHeader());
     }
     return config;
   });
@@ -124,8 +132,9 @@ function createClient(): AxiosInstance {
             {},
             { withCredentials: true },
           );
-          const { access_token } = res.data;
+          const { access_token, force_password_change } = res.data;
           setAccessToken(access_token);
+          setMustChangePassword(!!force_password_change);
           refreshQueue.forEach(({ resolve }) => resolve(access_token));
           refreshQueue = [];
           if (originalRequest?.headers)
@@ -436,6 +445,17 @@ export interface ProbePolicy {
   source: string | null;
   scope: string | null;
   inherited: boolean;
+}
+
+/** What a subnet's DDNS resolves to and where from (#2475). */
+export interface EffectiveDdns {
+  enabled: boolean;
+  hostname_policy: DdnsHostnamePolicy;
+  domain_override: string | null;
+  ttl: number | null;
+  source: "subnet" | "block" | "space" | "none";
+  source_id: string | null;
+  source_name: string | null;
 }
 
 export interface EffectiveDns {
@@ -1546,6 +1566,14 @@ export const ipamApi = {
     api
       .get<EffectiveDns>(`/ipam/subnets/${subnetId}/effective-dns`)
       .then((r) => r.data),
+  getEffectiveBlockDdns: (blockId: string) =>
+    api
+      .get<EffectiveDdns>(`/ipam/blocks/${blockId}/effective-ddns`)
+      .then((r) => r.data),
+  getEffectiveSubnetDdns: (subnetId: string) =>
+    api
+      .get<EffectiveDdns>(`/ipam/subnets/${subnetId}/effective-ddns`)
+      .then((r) => r.data),
   getEffectiveSpaceDns: (spaceId: string) =>
     api
       .get<EffectiveDns>(`/ipam/spaces/${spaceId}/effective-dns`)
@@ -1751,6 +1779,8 @@ export const ipamApi = {
       create_for_ip_ids?: string[];
       update_record_ids?: string[];
       delete_stale_record_ids?: string[];
+      // #2471 — missing rows left unticked; the API writes none of them.
+      skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
     },
   ) =>
     api
@@ -1770,6 +1800,8 @@ export const ipamApi = {
       create_for_ip_ids?: string[];
       update_record_ids?: string[];
       delete_stale_record_ids?: string[];
+      // #2471 — missing rows left unticked; the API writes none of them.
+      skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
     },
   ) =>
     api
@@ -1789,6 +1821,8 @@ export const ipamApi = {
       create_for_ip_ids?: string[];
       update_record_ids?: string[];
       delete_stale_record_ids?: string[];
+      // #2471 — missing rows left unticked; the API writes none of them.
+      skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
     },
   ) =>
     api
@@ -1967,6 +2001,8 @@ export const ipamApi = {
         updated_count: number;
         not_found: string[];
         skipped: string[];
+        /** With ``dns_zone_id: ""``: the addresses whose records were removed. */
+        dns_cleared: string[];
       }>(`/ipam/addresses/bulk-edit`, data)
       .then((r) => r.data),
   backfillReverseZonesSpace: (spaceId: string) =>
@@ -2646,6 +2682,9 @@ export interface AuditIntegrity {
   ok: boolean;
   rows_checked: number;
   breaks: AuditChainBreak[];
+  first_seq?: number | null;
+  last_seq?: number | null;
+  partial?: boolean;
 }
 
 // ── AI tool catalog (issue #101 follow-up) ──────────────────────────
@@ -2817,10 +2856,12 @@ export const auditApi = {
   /** Walk the chain and report any tampering (issue #73). The
    *  ``max_rows`` cap is for huge tables — leave unset for a full
    *  sweep. */
-  integrity: (maxRows?: number) =>
+  integrity: (maxRows?: number, newest?: boolean) =>
     api
       .get<AuditIntegrity>("/audit/integrity", {
-        params: maxRows ? { max_rows: maxRows } : undefined,
+        params: maxRows
+          ? { max_rows: maxRows, ...(newest ? { newest: true } : {}) }
+          : undefined,
       })
       .then((r) => r.data),
   /** Compliance / change report PDF (#48) — auditor-facing rollup of every
@@ -2878,6 +2919,9 @@ export const auditApi = {
 export interface BackupManifest {
   format?: string;
   format_version?: number;
+  /** "custom" (pg_dump custom format) or "plain" (SQL text). An
+   *  Exclude-secrets archive is plain, at format_version 2 (#2201). */
+  dump_format?: "custom" | "plain";
   app_version?: string;
   schema_version?: string | null;
   hostname?: string;
@@ -2913,6 +2957,13 @@ export interface BackupManifestPreviewResponse {
   manifest: BackupManifest;
   archive_bytes: number;
   format_recognised: boolean;
+  /** The dump format the restore will act on, resolved server-side by
+   *  the restore's own helper; null when the archive does not say. Absent
+   *  from a server older than #2201. */
+  dump_format?: "custom" | "plain" | null;
+  /** True only for a custom-format dump — the one shape the API accepts
+   *  a selective restore of. */
+  selective_restore_supported?: boolean;
 }
 
 export const backupApi = {
@@ -3024,6 +3075,10 @@ export interface BackupTargetConfigField {
   required: boolean;
   description: string | null;
   secret: boolean;
+  /** The value is lines (a PEM key, known_hosts, one header per line):
+   *  render a textarea, never an `<input>`, which folds each line break
+   *  into a space (#2199). Absent from a server older than that. */
+  multiline?: boolean;
 }
 
 export interface BackupTargetKind {
@@ -4916,7 +4971,7 @@ export async function* streamChatTurn(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     body: JSON.stringify(body),
@@ -5476,6 +5531,14 @@ export interface DNSServer {
   daemon_status_since: string | null;
   /** #1067 — derived; render from this, see `DaemonStateFields`. */
   daemon_not_serving: boolean | null;
+  /** #2044 — a second live agent process is polling as this server (a
+   * cloned VM or a copied state dir keeps the agent_id) and is being
+   * refused; only the most recent process is served. `false` with the other
+   * three `null` when no episode is current. */
+  duplicate_agent: boolean;
+  duplicate_agent_since: string | null;
+  duplicate_agent_last_at: string | null;
+  duplicate_agent_ip: string | null;
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;
@@ -5561,6 +5624,8 @@ export interface DNSServerOptions {
   technitium_warnings?: string[];
   // #2128: stored forwarders pinned to port 53 in an encrypted group.
   forwarder_warnings?: string[];
+  // #2266: dnssec_validation "yes" with no trust anchor validates nothing.
+  dnssec_warnings?: string[];
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the
@@ -6854,10 +6919,20 @@ export interface DNSBlockList {
   last_sync_status: string | null;
   last_sync_error: string | null;
   entry_count: number;
+  /** Rules the last adblock refresh could not enforce, by category (#2123).
+   *  null = not recorded (no adblock refresh yet, or another feed format). */
+  feed_parse_skipped: DNSBlockListFeedSkipped | null;
   created_at: string;
   modified_at: string;
   applied_group_ids: string[];
   applied_view_ids: string[];
+}
+
+export interface DNSBlockListFeedSkipped {
+  regex: number;
+  modifier: number;
+  badfilter: number;
+  malformed: number;
 }
 
 export interface DNSBlockListEntry {
@@ -6882,6 +6957,8 @@ export interface DNSBlockListException {
   list_id: string;
   domain: string;
   reason: string;
+  /** manual | feed — a feed row is the feed's own `@@` rule (#2123). */
+  source: string;
   created_at: string;
 }
 
@@ -8368,6 +8445,10 @@ export interface DHCPServer {
   roles: string[];
   status: string;
   last_sync_at: string | null;
+  /** Why the last scheduled lease pull failed (agentless drivers); null
+   * once a pull succeeds. */
+  last_sync_error?: string | null;
+  last_sync_error_at?: string | null;
   last_health_check_at: string | null;
   agent_registered: boolean;
   agent_approved: boolean;
@@ -9733,6 +9814,8 @@ export interface DHCPClientClass {
   // each option to whichever family it is valid in.
   address_family: "ipv4" | "ipv6" | "dual";
   options: Record<string, unknown>;
+  // #2296 — a row stored before its name became reserved; rename it.
+  reserved_name?: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -10103,11 +10186,34 @@ export interface AgentLogSource {
   server_kind: "dns" | "dhcp";
   driver: string;
   host: string;
+  /** Server group (#2120). `null` for a DHCP server in no group. */
+  group_id?: string | null;
+  group_name?: string | null;
+}
+
+/**
+ * Scope of an agent-log read (#2120): `server_id` → that server,
+ * `group_id` → every server in the group, neither → every server the
+ * caller may read. The server always narrows to what the caller may read.
+ */
+export interface AgentLogScope {
+  server_id?: string | null;
+  group_id?: string | null;
+}
+
+/** Echoed scope + the servers a read actually covered (#2120). */
+export interface AgentLogScopeEcho {
+  server_id: string | null;
+  group_id: string | null;
+  server_ids: string[];
 }
 
 export interface DNSQueryLogRow {
   id: number;
   ts: string;
+  /** Which server logged it (#2120). */
+  server_id: string;
+  server_name: string;
   client_ip: string | null;
   client_port: number | null;
   qname: string | null;
@@ -10126,8 +10232,7 @@ export interface DNSQueryLogRow {
   raw: string;
 }
 
-export interface DNSQueryLogRequest {
-  server_id: string;
+export interface DNSQueryLogRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
   q?: string | null;
@@ -10140,8 +10245,7 @@ export interface DNSQueryLogRequest {
   max_events?: number;
 }
 
-export interface DNSQueryLogResponse {
-  server_id: string;
+export interface DNSQueryLogResponse extends AgentLogScopeEcho {
   events: DNSQueryLogRow[];
   truncated: boolean;
 }
@@ -10149,6 +10253,9 @@ export interface DNSQueryLogResponse {
 export interface DHCPActivityLogRow {
   id: number;
   ts: string;
+  /** Which server logged it (#2120). */
+  server_id: string;
+  server_name: string;
   severity: string | null;
   code: string | null;
   mac_address: string | null;
@@ -10157,8 +10264,7 @@ export interface DHCPActivityLogRow {
   raw: string;
 }
 
-export interface DHCPActivityLogRequest {
-  server_id: string;
+export interface DHCPActivityLogRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
   q?: string | null;
@@ -10169,8 +10275,7 @@ export interface DHCPActivityLogRequest {
   max_events?: number;
 }
 
-export interface DHCPActivityLogResponse {
-  server_id: string;
+export interface DHCPActivityLogResponse extends AgentLogScopeEcho {
   events: DHCPActivityLogRow[];
   truncated: boolean;
 }
@@ -10182,15 +10287,13 @@ export interface DNSQueryAnalyticsRow {
   count: number;
 }
 
-export interface DNSQueryAnalyticsRequest {
-  server_id: string;
+export interface DNSQueryAnalyticsRequest extends AgentLogScope {
   since?: string | null;
   until?: string | null;
   limit?: number;
 }
 
-export interface DNSQueryAnalyticsResponse {
-  server_id: string;
+export interface DNSQueryAnalyticsResponse extends AgentLogScopeEcho {
   since: string | null;
   until: string | null;
   total_queries: number;
@@ -10490,12 +10593,12 @@ export const API_TOKEN_SCOPES: {
   {
     value: "ipam:write",
     label: "IPAM write",
-    hint: "Mutate /ipam/*, /vlans*, /vrfs*, /network-devices*.",
+    hint: "Mutate /ipam/*, /vlans/*, /vrfs/*, /network-devices/*.",
   },
   {
     value: "dns:write",
     label: "DNS write",
-    hint: "Mutate /dns/* + /dns-pools*. Excludes the agent surface.",
+    hint: "Mutate /dns/*. Excludes the agent surface, /dnsbl/* and /dns-threat/*.",
   },
   {
     value: "dhcp:write",
@@ -10525,6 +10628,9 @@ export interface ApiToken {
   scopes: ApiTokenScope[];
   resource_grants?: ApiTokenResourceGrant[];
   user_id: string | null;
+  /** Set by the list endpoint (#2443). */
+  owner_username?: string | null;
+  owner_display_name?: string | null;
   expires_at: string | null;
   last_used_at: string | null;
   is_active: boolean;
@@ -10997,6 +11103,10 @@ export interface IntegrationsDashboardPanel {
   stale_count: number;
   error_count: number;
   warning_count: number;
+  // #2192 — over every target, not the capped `targets` list.
+  problem_count?: number;
+  credential_dead_count?: number;
+  credential_expiring_count?: number;
   targets: IntegrationsDashboardTargetRow[];
 }
 export interface IntegrationsDashboardErrorRow {
@@ -13421,7 +13531,29 @@ export interface UpgradeImage {
   uploaded_by_user_id: string | null;
   uploaded_at: string;
   notes: string | null;
+  // #2410 — derived server-side from columns that already exist. The
+  // release is null when GitHub has not been reached recently (the list
+  // is served from the release cache, never a live call).
+  release?: {
+    published_at: string;
+    is_prerelease: boolean;
+    html_url: string;
+  } | null;
+  channel?: UpgradeImageChannel;
+  fleet_architecture?: UpgradeImageFleetVerdict;
+  fleet_nodes?: number | null;
+  // Version is on a slot of these nodes. NOT in use: the bytes are written.
+  installed_on?: string[];
+  // These nodes are scheduled to fetch it, and a delete is refused (409).
+  scheduled_for?: string[];
+  rolling_run_id?: string | null;
 }
+
+export type UpgradeImageChannel = "stable" | "prerelease" | "nightly";
+// #2399's verdict: some node runs this architecture / the whole fleet has
+// reported and none does / not knowable (unlabelled image, a node that has
+// not reported, or no nodes yet).
+export type UpgradeImageFleetVerdict = "matches" | "no_node" | "unknown";
 
 // A GitHub release carrying an importable appliance upgrade image.
 export interface AvailableUpgradeImage {
@@ -13438,11 +13570,24 @@ export interface AvailableUpgradeImage {
   // #1026 — a release publishing both architectures appears as two
   // rows, one per architecture.
   architecture: string;
+  // #2410
+  staged_image_id?: string | null;
+  channel?: UpgradeImageChannel;
+  fleet_architecture?: UpgradeImageFleetVerdict;
+  fleet_nodes?: number | null;
+}
+
+export interface FleetArchitectures {
+  architectures: string[];
+  unknown_count: number;
+  counts: Record<string, number>;
+  restricted: boolean;
 }
 
 export interface AvailableUpgradeImages {
   github_reachable: boolean;
   available: AvailableUpgradeImage[];
+  fleet: FleetArchitectures;
 }
 
 export const applianceUpgradeImagesApi = {
@@ -13452,9 +13597,11 @@ export const applianceUpgradeImagesApi = {
       .then((r) => r.data.images),
   // Connected-install picker source — releases with an importable
   // upgrade-image asset + its .sha256 sidecar.
-  listAvailable: () =>
+  listAvailable: (allArchitectures = false) =>
     api
-      .get<AvailableUpgradeImages>("/appliance/upgrade-images/available")
+      .get<AvailableUpgradeImages>("/appliance/upgrade-images/available", {
+        params: allArchitectures ? { all_architectures: true } : undefined,
+      })
       .then((r) => r.data),
   // Control plane downloads + verifies + stores the release asset.
   importFromGithub: (release_tag: string, architecture?: string) =>
@@ -13493,8 +13640,14 @@ export const applianceUpgradeImagesApi = {
       })
       .then((r) => r.data);
   },
-  remove: (id: string) =>
-    api.delete<void>(`/appliance/upgrade-images/${id}`).then((r) => r.data),
+  // ``force`` deletes an image an appliance is scheduled to fetch or an
+  // active run names (otherwise a 409); audited server-side (#2410).
+  remove: (id: string, force = false) =>
+    api
+      .delete<void>(`/appliance/upgrade-images/${id}`, {
+        params: force ? { force: true } : undefined,
+      })
+      .then((r) => r.data),
 };
 
 // ── Appliance: container management (Phase 4d) ─────────────────────
@@ -14022,7 +14175,7 @@ async function* _streamApplianceLogSse(
   const token = getAccessToken();
   const res = await fetch(url, {
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     signal,
@@ -14098,7 +14251,7 @@ export async function* streamClusterHealth(
   const token = getAccessToken();
   const res = await fetch("/api/v1/appliance/cluster/health/stream", {
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     signal,
@@ -15361,7 +15514,9 @@ export type CredentialState =
   | "expiring"
   | "expired"
   | "rejected"
-  | "unknown";
+  | "unknown"
+  // #2191 — the target is switched off; its last rejection is history.
+  | "disabled";
 
 export interface TailscaleTenant {
   id: string;
@@ -16536,7 +16691,7 @@ export async function* streamNmapScan(
   const url = nmapApi.streamUrl(scanId);
   const res = await fetch(url, {
     headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}`, ...idleHeader() } : {}),
       Accept: "text/event-stream",
     },
     signal,

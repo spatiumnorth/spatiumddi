@@ -36,6 +36,7 @@ from app.models.audit import AuditLog
 from app.services.dhcp.lease_cleanup import sweep_orphaned_lease_mirrors
 from app.services.dhcp.static_ipam import sweep_orphaned_static_mirrors
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -98,6 +99,7 @@ async def _sweep() -> int:
     retry_backoff_max=600,
     retry_kwargs={"max_retries": 3},
 )
+@module_gated("core.dhcp")
 def sweep_orphaned_mirrors(self: Any) -> dict[str, int]:  # noqa: ARG001
     freed = asyncio.run(_sweep())
     if freed:

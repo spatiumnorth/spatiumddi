@@ -250,7 +250,7 @@ class TsigKey:
 class BlocklistEntry:
     domain: str
     action: str  # block | redirect | nxdomain
-    block_mode: str  # nxdomain | sinkhole | refused
+    block_mode: str  # nxdomain | sinkhole (``refused`` retired in #2124)
     sinkhole_ip: str | None
     target: str | None
     is_wildcard: bool

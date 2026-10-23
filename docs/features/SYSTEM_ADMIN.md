@@ -61,7 +61,14 @@ control plane is doing without standing up a separate Prometheus
   one-line setup hint when `/var/run/docker.sock` isn't mounted
   into the api container.
 - **Conformity** — promoted from the Compliance surface; shows
-  the latest conformity-evaluation rollup.
+  the latest conformity-evaluation rollup. "Latest" is each
+  **enabled** policy's most recent evaluation pass: a target deleted
+  or moved out of a policy's scope drops out at that policy's next
+  pass, a disabled policy counts towards `policies_total` but reports
+  no results, and editing what a policy checks (`target_kind`,
+  `target_filter`, `check_kind`, `check_args`) clears its last pass
+  until it runs again. The conformity PDF reports the same set and
+  prints each policy's as-of time (#2278).
 - **Copilot Usage** — Operator Copilot token / cost observability.
 
 Backend at `app/api/v1/admin/postgres.py` (5 endpoints) +
@@ -383,6 +390,13 @@ The archive is the unit operators move around — single-file, easy to ship over
 
 An "exclude secrets" diagnostic archive blanks those leftover columns along with the encrypted ones. Clearing or replacing a webhook URL or header also blanks its leftover plaintext column in the same change, so a value an admin has removed does not stay in the database or in later full backups. Restoring an "exclude secrets" archive leaves the encrypted webhook columns as an empty bytea rather than NULL; the application treats an empty bytea as unset everywhere (`url_set`, the audit snapshot, and the check that a webhook target has a URL), so a restored target with no re-entered URL is reported as unconfigured instead of silently failing to deliver — re-enter the URL and header after such a restore.
 
+An "exclude secrets" archive removes every secret, not only the credentials an operator types in: the appliance CA private key, the k3s join tokens and the cluster kubeconfig, persistent pairing-code reveals, the ACME account key, and the stored digests of credentials (local password hashes, API-token, session, pairing-code and agent-token digests). Its `secrets.enc` carries no `SECRET_KEY` or `CREDENTIAL_ENCRYPTION_KEY`, only the archive metadata the passphrase check needs. Restoring one succeeds and leaves an install that regenerates what it can:
+
+- **Local sign-in.** Every local password is cleared, so sign in through an external provider or reset a password with the recipe in [Troubleshooting](../TROUBLESHOOTING.md#resetting-the-admin-password). API tokens and sessions no longer match anything; issue new tokens.
+- **Appliances.** The appliance CA is regenerated on the next approval, so appliances approved against the old one must be re-keyed. The supervisor re-reports the kubeconfig and the join token on its next heartbeat. Pairing codes cannot be claimed or revealed; create new ones.
+- **Agents** are refused on their next request and re-bootstrap from their pre-shared key.
+- **ACME.** The next certificate order mints a new account key and registers it with the CA.
+
 So treat an archive as the install itself. Keep it at a destination that restricts who can read it and, if the medium could leave your control, encrypts it at rest (S3 / Azure / GCS server-side encryption, an encrypted share). A removable disk on the appliance cannot be encrypted — see [Removable (USB) disks](#removable-usb-disks-on-the-appliance).
 
 #### Passphrase rules
@@ -681,7 +695,7 @@ Each target carries:
 | `retention_keep_days` | Drop archives whose mtime is older than N days. |
 | `last_run_status` / `last_run_at` / `last_run_filename` / `last_run_bytes` / `last_run_duration_ms` / `last_run_error` | Surfaced inline on the target row. `last_run_status=in_progress` acts as a per-target mutex so a slow run can't double up on the next tick. |
 
-Set exactly one of `retention_keep_last_n` / `retention_keep_days`, or neither for no auto-prune. A single Celery beat task (every 60 s) walks all enabled targets, checks each one against its `next_run_at`, and dispatches a one-off backup task per target that's due.
+Both must be at least 1 (0 is rejected), and retention never deletes the newest archive or the one a run has just written, whatever the setting; a stored 0 from an older release behaves as 1. A retention failure after a successful write leaves the run `success` and shows the problem on the target's last-run error line. Set exactly one of `retention_keep_last_n` / `retention_keep_days`, or neither for no auto-prune. A single Celery beat task (every 60 s) walks all enabled targets, checks each one against its `next_run_at`, and dispatches a one-off backup task per target that's due.
 
 Two alert rules, both seeded **enabled**, watch every enabled target that has a schedule (#1262). `backup_failed` (warning) fires when the last finished run failed and resolves on the next success. `backup_stale` (critical) fires when there has been no successful run for N scheduled runs plus one hour (N = the rule's `threshold_percent`, default 2). It counts from the last success, but never from before the schedule was set, so a new schedule gets its first run first. It also catches the case where nothing runs at all: worker or beat down, or a run left `in_progress` by a process that died, which the sweep then skips for good. Clicking **Run now** clears that. Manual-only targets are not watched. The `get_backup_health` copilot tool shows the same per-target state (ok / failed / stale / stuck / running).
 
@@ -976,12 +990,26 @@ env_banner_fg: str (default "#ffffff")      -- 6-digit hex, validated
 env_banner_position: str (default "top")    -- top | bottom | both
 ```
 
-Branding writes (`app_title`, either banner) are **superadmin-only**, a
-stronger gate than the `write:settings` the rest of the PUT takes: these
-fields render to anonymous visitors on the login page, so a delegated
-settings editor must not be able to put arbitrary text in front of
-everyone. Every branding change writes an audit row
+Branding writes (`app_title`, either banner) are **superadmin-only**:
+these fields render to anonymous visitors on the login page, so a
+delegated settings editor must not be able to put arbitrary text in front
+of everyone. Every branding change writes an audit row
 (`resource_type="platform_settings"`, `resource_id="branding"`).
+
+The same holds for **most of `PUT /settings`**. A delegate holding
+`write` on `settings` may change only the fields in
+`SETTINGS_DELEGATE_WRITABLE` (`backend/app/api/v1/settings/router.py`):
+IPAM / DNS / DHCP working preferences such as utilization thresholds,
+DNS defaults, the DNS auto-sync and pull schedules, and DHCP lease and
+domain defaults. Every other field is superadmin-only, including
+`app_base_url` (it builds the URLs handed to identity providers),
+session and password policy, appliance host configuration (SSH, APT,
+syslog, SNMP, NTP, LLDP, resolver, timezone), and anything that makes an
+outbound connection. A new field is superadmin-only until it is added to
+that set. A delegate's request naming any superadmin-only field is
+refused whole with `403` and an audited denial, so nothing is written.
+`PUT /settings/resolver` is superadmin-only for the same reason. The
+Settings page offers every field to superadmins only.
 
 ### 6.1 Public branding endpoint
 
@@ -1050,9 +1078,22 @@ ip_allocation_strategy: str (default "sequential")  -- sequential | random
 **Session / security**
 
 ```
-session_timeout_minutes: int (default 60)
-auto_logout_minutes: int (default 0)  -- idle session timeout; 0 = disabled
+session_timeout_minutes: int (default 60)  -- idle session timeout; 0 = disabled
+auto_logout_minutes: int (default 0)       -- console warning before it; 0 = disabled
 ```
+
+`session_timeout_minutes` is enforced by the API: a browser session
+(`user_session`) whose last activity is older than the timeout is refused
+on its next request and on `/auth/refresh`, and is left out of the
+Sessions list. Activity is `user_session.last_seen_at`. A refresh carries
+it forward rather than counting as activity, and the console sends
+`X-Spatium-Idle-Seconds` (time since the operator last used the page) on
+every request, so background polling does not keep a session alive. The
+check allows up to a minute (a quarter of the timeout, if shorter) past
+the configured value, never less. API tokens are not sessions and are not
+affected. The console shows the warning `auto_logout_minutes` before
+expiry, capped at half the timeout, and returns to the login page when
+the timeout passes.
 
 **Password policy** (issue #70 — flat columns, not a JSONB blob; validator + history in `app.services.password_policy`)
 
@@ -1125,7 +1166,7 @@ maintenance_message: str (default "")
 maintenance_started_at: timestamp | null  -- server-stamped on enable, never operator-set directly
 ```
 
-Other notable areas on the model (each a small cluster of columns): integration toggles (`integration_kubernetes_enabled`, `integration_docker_enabled`, …), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled`, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
+Other notable areas on the model (each a small cluster of columns): a derived copy of each integration's on/off state (`integration_kubernetes_enabled`, `integration_docker_enabled`, …; the `integrations.*` feature module is the switch, #2196), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled` — changes via the Tool Catalog are audited as an enabled/disabled diff, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
 
 ---
 
@@ -1378,6 +1419,15 @@ PEM private keys, JWTs, PSKs, API tokens, TSIG keys. Matched both by field
 name and by value shape, and removed in **every** mode including the
 unscrubbed one. There is no version of "let me read my own logs" that is
 improved by including the key that decrypts the database.
+
+The process environment (`system/env.txt`) is the exception to matching by
+name: a variable's **value** appears only when its name is on an allowlist
+of known non-secret settings (log level, timeouts, feature flags, versions,
+Kubernetes service links). Every other variable is listed with its value
+replaced, so the dump still shows what is set. Connection URLs such as
+`DATABASE_URL` and `REDIS_URL` are on the replaced side. The appliance
+diagnostic bundle applies the same rule to its env dumps and runs every
+file it contains, logs included, through the same secret-shape sweep.
 
 **Pseudonymise — identifiers.** IPs, hostnames, domains, MACs, usernames
 become stable synthetic values, so the archive stays *readable*:

@@ -49,6 +49,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `dns_zone`        | DNS zones (forward and reverse)                       |
 | `dns_record`      | DNS records within a zone                             |
 | `dns_group`       | DNS server groups, servers, views, ACLs, trust anchors |
+| `server`          | Server logs on the **Logs** page (Windows event log, DHCP audit, DNS queries, DHCP activity) and DNS threat analytics. For the agent-log reads (DNS Queries, DHCP Activity) the grant may be scoped: a `resource_id` of a server id reads that server, a DNS or DHCP server-group id reads every server in that group, and group / "all" reads are narrowed to those servers (#2120). Unlike most types, the `resource_id` may name a server group as well as a server: `server` is a surface, not a table, and a group grant is how one delegate reads a load-balanced group. The Windows event-log and DHCP-audit reads, DNS threat analytics and the Copilot log tools still need it unscoped (the tools do narrow a resource-bound API token the same way) |
 | `dns_blocklist`   | Response Policy Zones / blocking lists                |
 | `dhcp_server`     | Kea + Windows DHCP server objects and server groups   |
 | `dhcp_scope`      | DHCP scopes / shared networks                         |
@@ -131,6 +132,24 @@ on inactive.
    satisfy an unscoped check (one passed without `resource_id`). This prevents
    "I have write on *this one* subnet" from accidentally granting "write on
    subnets in general".
+   **IPAM subnets (#2438).** A `read` / `write` grant scoped to one subnet
+   reaches that subnet and its addresses and nothing else. The routes it
+   opens are an allow-list, so a route added later stays closed to it until
+   it is listed: the subnet's own reads (detail, addresses, aliases, domains,
+   effective DNS / DHCP / fields, network context, next-IP preview, probe
+   policy, reconciliation, utilization history), `PUT /ipam/subnets/{id}`,
+   `POST /ipam/subnets/{id}/addresses`, and the subnet list, which is
+   narrowed to the granted subnets. Through the scoped grant the holder may
+   not point the subnet at another resource (block, customer, site, VLAN,
+   DHCP server group, DNS server groups, DDNS domain), nor name a DNS zone,
+   on the subnet or on an address, that the subnet does not already publish
+   into unless they hold `write` on that `dns_zone`. A collision warning
+   on an address create says that a hostname or MAC is in use but not
+   where, when the row is in a subnet the holder cannot read. Spaces,
+   blocks, other subnets, the DNS drift report, NAT mappings, delete /
+   resize / split / merge / next-IP / bulk / DNS-sync, and editing or
+   deleting an existing address stay refused unless a type-level grant
+   covers them.
 5. **Privilege ceiling on role / group edits (#400 C4).** When a non-superadmin
    creates or edits a role's permission set (or assigns roles to a group), every
    permission they add must be one they *themselves* effectively hold —
@@ -215,7 +234,7 @@ Editor roles grant the writes they always claimed to:
 | Surface | Gate |
 |---|---|
 | DNS zones (create, from template, edit, delete) | `write` / `delete` on `dns_zone` |
-| DNS records, bulk create, zone-file import | `write` / `delete` on `dns_record` (a `replace` import that would remove records also takes `delete`) |
+| DNS records, bulk create, zone-file import | `write` / `delete` on `dns_record` (a `replace` import that would remove records also takes `delete`; the import preview and commit, which answer with the zone's existing records, also take `read` on `dns_group`, `dns_zone` or `dns_record`, as the export does) |
 | DNS views and named ACLs | `write` / `delete` on `dns_group` |
 | Blocklist entries and exceptions | `write` / `delete` on `dns_blocklist` |
 | DHCP scopes, phone profiles, PXE profiles | `write` / `delete` on `dhcp_scope` |
@@ -284,6 +303,14 @@ never shows more than the resources' own routes would. The tag autocomplete
 (`GET /tags/keys`, `/tags/values`) follows the same rule per table: it offers
 tags only from the tables whose rows the caller can read, and an empty list
 when there are none.
+
+## Refusals are audited
+
+Every 403 the permission gates produce leaves a `denied` audit row, including a
+refusal from a route that takes `SuperAdmin` (recorded as `access` on
+`superadmin`, #2304). A handler that is superadmin-only must take the `SuperAdmin`
+dependency rather than check `is_effective_superadmin` and raise by hand, or its
+refusal is invisible to the audit log and the security dashboard.
 
 ## The console mirrors the server, it does not enforce
 

@@ -124,6 +124,9 @@ class RestoreOutcome:
     # destination agent and produces *new* DS records the operator
     # must re-publish to the parent registrar.
     warnings: list[str] = field(default_factory=list)
+    # Backup targets whose ``in_progress`` claim came back inside the
+    # archive and was settled (#2097). Empty when none.
+    reconciled_backup_targets: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
@@ -984,6 +987,24 @@ _RESTORE_LOCK_HOLDERS_SQL = (
 )
 
 
+async def restore_lock_held(db) -> bool:
+    """True while a restore holds the install-wide restore lock (#2097).
+
+    A read of ``pg_locks``, not a ``pg_try_advisory_lock``: taking the lock,
+    even for an instant, would refuse a restore that started in that instant
+    as "already in progress". Nothing here blocks or changes state.
+
+    The lock is held from before the replay until after the restore has
+    settled the run claims its archive carried, so a caller that sees it
+    free has either run before the replay or after the settle — never in the
+    window between the replay's commit and the settle, where a restored
+    claim reads as two hours old with nothing behind it.
+    """
+    from sqlalchemy import text  # noqa: PLC0415
+
+    return bool(await db.scalar(text(f"SELECT EXISTS ({_RESTORE_LOCK_HOLDERS_SQL})")))
+
+
 async def apply_backup_restore(db, *, db_url: str, **kwargs: Any) -> RestoreOutcome:
     """Restore under the install-wide advisory lock (#1571).
 
@@ -1317,31 +1338,36 @@ async def _apply_backup_restore_inner(
     # been renamed across migrations).
     from app.config import settings as _settings  # noqa: PLC0415
 
-    try:
-        rewrap_outcome = await rewrap_secrets(
-            db_url=db_url,
-            source_secret_key=secrets_payload.get("platform_secret_key", "") or "",
-            source_credential_key=secrets_payload.get("platform_credential_encryption_key", "")
-            or "",
-            dest_secret_key=_settings.secret_key,
-            dest_credential_key=_settings.credential_encryption_key or "",
-        )
-    except Exception as exc:  # noqa: BLE001
-        # Rewrap failure shouldn't blow away the whole restore —
-        # the data is in. Log loudly + surface in the response so
-        # the operator knows to apply the recovered SECRET_KEY
-        # manually.
-        #
-        # ``rewrap_secrets`` now absorbs walk failures itself and returns
-        # a partial outcome with ``aborted=True``, precisely so the
-        # counters survive; this branch is the backstop for something
-        # raised before it could (a bad key pair, say). A fresh
-        # ``RewrapOutcome()`` is honest HERE — nothing was walked — but it
-        # was NOT honest when it also swallowed a mid-walk abort (#781).
-        logger.error("backup_restore_rewrap_failed", error=str(exc))
+    if "platform_secret_key" not in secrets_payload:
+        # An exclude-secrets archive carries no key, and every value it
+        # would have decrypted was scrubbed from the dump: nothing to rewrap.
         rewrap_outcome = RewrapOutcome()
-        rewrap_outcome.aborted = True
-        rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
+    else:
+        try:
+            rewrap_outcome = await rewrap_secrets(
+                db_url=db_url,
+                source_secret_key=secrets_payload.get("platform_secret_key", "") or "",
+                source_credential_key=secrets_payload.get("platform_credential_encryption_key", "")
+                or "",
+                dest_secret_key=_settings.secret_key,
+                dest_credential_key=_settings.credential_encryption_key or "",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Rewrap failure shouldn't blow away the whole restore —
+            # the data is in. Log loudly + surface in the response so
+            # the operator knows to apply the recovered SECRET_KEY
+            # manually.
+            #
+            # ``rewrap_secrets`` now absorbs walk failures itself and returns
+            # a partial outcome with ``aborted=True``, precisely so the
+            # counters survive; this branch is the backstop for something
+            # raised before it could (a bad key pair, say). A fresh
+            # ``RewrapOutcome()`` is honest HERE — nothing was walked — but it
+            # was NOT honest when it also swallowed a mid-walk abort (#781).
+            logger.error("backup_restore_rewrap_failed", error=str(exc))
+            rewrap_outcome = RewrapOutcome()
+            rewrap_outcome.aborted = True
+            rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
 
     # Phase 4d (issue #127): scan the restored DB for PowerDNS
     # DNSSEC-enabled zones and surface a registrar-republish
@@ -1351,6 +1377,45 @@ async def _apply_backup_restore_inner(
     except Exception as exc:  # noqa: BLE001
         logger.warning("backup_restore_warning_scan_failed", error=str(exc))
         post_warnings = []
+
+    # #2097 — the archive holds its own run's ``in_progress`` claim. Settle
+    # it now, or the target refuses Run now and sits off its schedule until
+    # the 2 h reap marks a run that succeeded as failed. Needs the
+    # backup-target table to have been restored.
+    reconciled: list[dict[str, Any]] = []
+    if restored_tables is None or "backup_target" in restored_tables:
+        try:
+            from sqlalchemy.ext.asyncio import (  # noqa: PLC0415
+                async_sessionmaker,
+                create_async_engine,
+            )
+            from sqlalchemy.pool import NullPool  # noqa: PLC0415
+
+            from app.db import _json_serializer, task_connect_args  # noqa: PLC0415
+            from app.services.backup.runner import (  # noqa: PLC0415
+                reconcile_restored_run_claims,
+            )
+
+            # The database the restore just wrote (``db_url``), as every
+            # other phase uses — not the app's pooled engine, which Phase 4
+            # disposed and which need not point at the same database.
+            reconcile_engine = create_async_engine(
+                db_url,
+                poolclass=NullPool,
+                json_serializer=_json_serializer,
+                connect_args=task_connect_args(),
+            )
+            try:
+                async with async_sessionmaker(reconcile_engine, expire_on_commit=False)() as rdb:
+                    reconciled = await reconcile_restored_run_claims(rdb, manifest=manifest)
+            finally:
+                await reconcile_engine.dispose()
+        except Exception as exc:  # noqa: BLE001 — the data is in; the 2 h reap still backstops
+            logger.warning("backup_restore_reconcile_failed", error=str(exc))
+            post_warnings.append(
+                "Could not settle backup targets left 'in progress' by the restored "
+                f"archive ({exc}); they free themselves after 2 hours."
+            )
 
     # The override is the first thing an operator should read back.
     if schema_override_warning:
@@ -1418,4 +1483,5 @@ async def _apply_backup_restore_inner(
         migration=migration_outcome,
         rewrap=rewrap_outcome,
         warnings=post_warnings,
+        reconciled_backup_targets=reconciled,
     )

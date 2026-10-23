@@ -4,12 +4,20 @@ Five well-known scopes that compose by union:
 
 * ``read`` — restricts the token to safe-method requests only
   (``GET`` / ``HEAD`` / ``OPTIONS``). Any mutation 401s.
-* ``ipam:write`` — allows mutations under ``/api/v1/ipam/*``,
-  ``/api/v1/vlans*``, ``/api/v1/vrfs*``, ``/api/v1/network-devices*``.
+* ``ipam:write`` — allows mutations under ``/api/v1/ipam``,
+  ``/api/v1/vlans``, ``/api/v1/vrfs``, ``/api/v1/network-devices``.
   Read traffic anywhere is also allowed by ``read`` if combined.
-* ``dns:write`` — allows mutations under ``/api/v1/dns/*``,
-  ``/api/v1/dns-pools*``.
-* ``dhcp:write`` — allows mutations under ``/api/v1/dhcp/*``.
+* ``dns:write`` — allows mutations under ``/api/v1/dns`` (zones, records,
+  server groups, views, RPZ blocklists and DNS pools all mount there).
+  It does NOT cover the sibling mounts ``/api/v1/dnsbl`` (IP reputation
+  lists) or ``/api/v1/dns-threat`` (threat analytics): those are separate
+  products that merely share the ``dns`` spelling.
+* ``dhcp:write`` — allows mutations under ``/api/v1/dhcp``.
+
+Every prefix is matched on a whole path segment: ``/api/v1/dns`` covers
+``/api/v1/dns`` and ``/api/v1/dns/...`` but not ``/api/v1/dnsbl/...``. A
+scope grants only the surface it names, including for routers mounted later
+whose prefix happens to start with the same letters.
 * ``agent`` — allows the agent push surface
   (``/api/v1/dns/agents/*``, ``/api/v1/dhcp/agents/*``) only.
   Used by the BIND9 / Kea sidecar agents that bootstrap with
@@ -45,8 +53,8 @@ TOKEN_SCOPE_VOCABULARY: frozenset[str] = frozenset(
 
 _SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 
-# Path-prefix vocabulary per scope. Prefixes are matched as
-# ``path.startswith(prefix)`` against the request path *with* the
+# Path-prefix vocabulary per scope. Prefixes are matched on a whole path
+# segment (see ``_path_under``) against the request path *with* the
 # ``/api/v1`` mount, so the leading ``/api/v1`` is included.
 _IPAM_PREFIXES: tuple[str, ...] = (
     "/api/v1/ipam",
@@ -54,10 +62,9 @@ _IPAM_PREFIXES: tuple[str, ...] = (
     "/api/v1/vrfs",
     "/api/v1/network-devices",
 )
-_DNS_PREFIXES: tuple[str, ...] = (
-    "/api/v1/dns",
-    "/api/v1/dns-pools",
-)
+# DNS pools are served under ``/api/v1/dns/pools``; nothing is mounted at
+# ``/api/v1/dns-pools``, so it is not listed.
+_DNS_PREFIXES: tuple[str, ...] = ("/api/v1/dns",)
 _DHCP_PREFIXES: tuple[str, ...] = ("/api/v1/dhcp",)
 _AGENT_PREFIXES: tuple[str, ...] = (
     "/api/v1/dns/agents",
@@ -71,7 +78,11 @@ _MCP_PREFIXES: tuple[str, ...] = ("/api/v1/ai/mcp",)
 
 
 def _path_under(path: str, prefixes: tuple[str, ...]) -> bool:
-    return any(path.startswith(p) for p in prefixes)
+    """True when ``path`` is one of ``prefixes`` or lies beneath one of
+    them by whole path segment. ``/api/v1/dns`` matches ``/api/v1/dns`` and
+    ``/api/v1/dns/zones`` but not ``/api/v1/dnsbl`` or ``/api/v1/dns-threat``.
+    """
+    return any(path == p or path.startswith(p + "/") for p in prefixes)
 
 
 def scope_matches_request(scopes: list[str], method: str, path: str) -> bool:

@@ -1,4 +1,6 @@
+import { poolDeleteSummary } from "@/lib/pool-delete-copy";
 import { useState } from "react";
+import { humanTime } from "../network/_shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
@@ -19,6 +21,7 @@ import {
   type DNSServerGroup,
   type DNSZone,
   type SiteRead,
+  formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import {
@@ -354,9 +357,7 @@ function MemberRow({ member }: { member: DNSPoolMember }) {
         </div>
       </td>
       <td className="py-1.5 text-muted-foreground">
-        {member.last_check_at
-          ? new Date(member.last_check_at).toLocaleTimeString()
-          : "—"}
+        {member.last_check_at ? humanTime(member.last_check_at) : "—"}
       </td>
       <td
         className="max-w-md truncate py-1.5 text-muted-foreground"
@@ -553,8 +554,7 @@ export function PoolModal({
       onClose();
     },
     onError: (err: unknown) => {
-      const e = err as { response?: { data?: { detail?: string } } };
-      setError(e?.response?.data?.detail ?? "Failed to save pool");
+      setError(formatApiError(err, "Failed to save pool"));
     },
   });
 
@@ -956,7 +956,7 @@ export function PoolModal({
   );
 }
 
-function ConfirmDelete({
+export function ConfirmDelete({
   pool,
   zone,
   onConfirm,
@@ -976,13 +976,18 @@ function ConfirmDelete({
   return (
     <Modal title={`Delete pool: ${pool.name}`} onClose={onClose}>
       <p className="text-sm text-muted-foreground">
-        Delete pool <span className="font-medium">{pool.name}</span> and remove
-        the {pool.members.length} record{pool.members.length === 1 ? "" : "s"}{" "}
-        currently published as{" "}
-        <span className="font-mono">
-          {fqdn} {pool.record_type}
-        </span>
-        ?
+        {poolDeleteSummary({
+          name: pool.name,
+          fqdn,
+          recordType: pool.record_type,
+          poolEnabled: pool.enabled,
+          memberCount: pool.members.length,
+          publishedCount: pool.enabled
+            ? pool.members.filter(
+                (m) => m.enabled && m.last_check_state === "healthy",
+              ).length
+            : 0,
+        })}
       </p>
       <div className="mt-4 flex justify-end gap-2">
         <button

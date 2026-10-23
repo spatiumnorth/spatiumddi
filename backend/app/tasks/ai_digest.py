@@ -45,6 +45,7 @@ from app.models.audit import AuditLog
 from app.models.dhcp import DHCPLease
 from app.models.settings import PlatformSettings
 from app.services import audit_forward
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -376,6 +377,7 @@ async def _run() -> dict[str, Any]:
     retry_backoff=True,
     max_retries=2,
 )
+@module_gated("ai.copilot")
 def send_daily_digest(self: Any) -> dict[str, Any]:  # noqa: ARG001
     """Beat-fired entrypoint. The async helper does all the real work."""
     return asyncio.run(_run())
