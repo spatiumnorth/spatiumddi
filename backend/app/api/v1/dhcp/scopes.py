@@ -369,6 +369,10 @@ class ScopeCreate(BaseModel):
 class ScopeUpdate(BaseModel):
     model_config = {"extra": "ignore"}
 
+    # #2479 — a scope does not move between groups here. Accepted so a body
+    # that names a DIFFERENT group is refused (422) instead of ignored (the
+    # old ``extra: ignore`` answered 200 and kept the stored group).
+    group_id: uuid.UUID | None = None
     name: str | None = None
     description: str | None = None
     # See ScopeCreate: ``enabled`` is the public name, ``is_active`` the
@@ -858,6 +862,12 @@ async def update_scope(
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
+    if body.group_id is not None and body.group_id != scope.group_id:
+        raise HTTPException(
+            status_code=422,
+            detail="A scope cannot be moved to another DHCP server group; "
+            "delete it and create it in the target group",
+        )
     # ``exclude_unset`` (not ``exclude_none``) so an explicit null can clear a
     # nullable column (e.g. resetting min_lease_time / max_lease_time to empty),
     # while a field the client didn't send stays untouched (#475). But keep a
@@ -877,6 +887,7 @@ async def update_scope(
     # ``is_active`` with the stale ``enabled`` a GET supplied (#774).
     if "enabled" in changes:
         changes["is_active"] = changes.pop("enabled")
+    changes.pop("group_id", None)  # #2479 — equal to the stored group (checked above)
     # #2499 — judge the MERGED lease triple (stored row under the patch), so a
     # PUT that only sets max_lease_time cannot break an existing scope.
     if {"lease_time", "min_lease_time", "max_lease_time"} & changes.keys():
