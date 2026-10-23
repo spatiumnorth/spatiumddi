@@ -7,9 +7,8 @@ Runs on appliance api startup, and settles on ONE active
    a previous bootstrap) — re-deploy it to the TLS Secret, but ONLY if
    the Secret doesn't already hold exactly it. Handles the case where the
    Secret was wiped (fresh upgrade, factory reset) but the DB row
-   survived; nginx then reloads via the deployer. In the steady state
-   this is a no-op, because re-pushing an identical cert would still roll
-   the frontend via the rollout annotation.
+   survived; each frontend pod reloads nginx once the kubelet updates
+   its mounted copy (#1173). In the steady state this is a no-op.
 
 2. **No active row, but the TLS Secret already holds a usable cert** —
    adopt it (#767). On a fresh appliance, firstboot mints a self-signed
@@ -53,7 +52,6 @@ from app.services.appliance.deployment import (
     deploy_active_cert,
     deploy_and_reload,
     read_deployed_cert,
-    reload_frontend_nginx,
 )
 from app.services.appliance.tls import (
     TLSValidationError,
@@ -75,8 +73,8 @@ async def ensure_self_signed_cert() -> None:
     """Idempotent: ensure an active cert exists + is materialised on disk.
 
     Path A — active row already exists:
-        Re-deploy the cert to the TLS Secret and roll the frontend so it
-        re-reads — but ONLY when the Secret doesn't already hold this
+        Re-deploy the cert to the TLS Secret (the frontend reloads it in
+        place) — but ONLY when the Secret doesn't already hold this
         exact cert. Covers wipe-of-Secret edge cases; a no-op otherwise.
 
     Path B — no active row, but the TLS Secret holds a usable cert
@@ -165,16 +163,12 @@ async def ensure_self_signed_cert() -> None:
                 )
             # Only deploy when the Secret doesn't ALREADY hold exactly this
             # cert (#767). Path A exists to recover a wiped Secret, not to
-            # re-push a cert that is already deployed — and re-pushing is
-            # not free: ``reload_frontend_nginx`` writes the
-            # ``tls-secret-checksum`` pod-template annotation, and on a
-            # fresh appliance that annotation does not exist yet (adoption
-            # deploys nothing), so setting it the first time is itself a
-            # template change and rolls the frontend. Observed live on the
-            # #767 test appliance: the first api restart after adoption
-            # rolled the frontend to a new ReplicaSet for no reason. An
-            # unchanged Secret means the mounted copy is already correct,
-            # so there is nothing for a reload to pick up.
+            # re-push a cert that is already deployed. (Until #1173 a
+            # re-push also rolled the frontend: live on the #767 test
+            # appliance, the first api restart after adoption moved it to
+            # a new ReplicaSet for no reason.) An unchanged Secret means the
+            # mounted copy is already correct, so there is nothing for a
+            # reload to pick up.
             if read_deployed_cert() == (active_row.cert_pem, key_pem):
                 logger.info(
                     "appliance_active_cert_already_deployed",
@@ -200,8 +194,8 @@ async def ensure_self_signed_cert() -> None:
         # bootstraps, so the frontend nginx has been serving it since
         # its very first request — including on the "still initialising"
         # page the operator is looking at right now. Generating a rival
-        # cert here would swap it out, roll the frontend Deployment
-        # mid-boot, and force a SECOND browser trust prompt.
+        # cert here would swap it out mid-boot and force a SECOND browser
+        # trust prompt.
         if await _adopt_deployed_cert(db, desired_sans):
             return
 
@@ -214,7 +208,7 @@ async def _adopt_deployed_cert(db: AsyncSession, desired_sans: list[str]) -> boo
     Returns True when adoption succeeded — in which case the caller must
     NOT generate or deploy anything: the Secret already holds this cert,
     so there is deliberately no ``deploy_and_reload`` call (no Secret
-    PATCH, no rollout annotation bump, no frontend restart).
+    PATCH, so nothing for the frontend to reload).
 
     Returns False — leaving the caller to generate a fresh cert — when
     there is nothing to adopt: not on k8s, Secret absent, cert or key
@@ -375,14 +369,6 @@ _CERT_RECONCILE_LOCK_KEY = 0x5350433727  # "SPC7c"-ish
 SERVED_CERT_SNAPSHOT_KEY = "spatium:appliance:served-cert"
 _SERVED_CERT_SNAPSHOT_TTL = 300
 
-# Set by the replica whose Secret PATCH landed but whose frontend roll did
-# not. The next tick then sees the Secret in sync with the DB and would
-# otherwise never roll, leaving nginx on the previous certificate until
-# the pod happened to restart — while the pins list (#1219) and the alert
-# snapshot both already name the new one. Per process on purpose: only
-# the replica that wrote the Secret knows its roll failed.
-_frontend_roll_pending = False
-
 
 async def _write_served_cert_snapshot(cert_pem: str) -> None:
     """Publish the served cert's fingerprint + expiry. Best-effort."""
@@ -464,15 +450,17 @@ async def sync_active_cert_to_secret() -> dict[str, object]:
     start. A cert set by hand in the Secret is therefore replaced within a
     tick — upload it through the Web UI Certificate tab instead.
 
+    The Secret PATCH is the whole deploy: the frontend pods reload nginx
+    themselves when their mounted copy changes (#1173), so there is no
+    roll to start or to retry.
+
     Idempotent: when the Secret already holds exactly the active cert + key
-    nothing is written and the frontend is not rolled. It shares the
+    nothing is written. It shares the
     advisory lock of ``reconcile_cluster_cert_sans`` (held for the whole
     read-compare-patch), so N api replicas make one patch, and the SAN
     reconcile cannot commit a regenerated cert between this reading the
     active row and patching it.
     """
-    global _frontend_roll_pending
-
     if not settings.appliance_mode:
         return {"status": "disabled"}
 
@@ -512,21 +500,11 @@ async def sync_active_cert_to_secret() -> dict[str, object]:
         if deployed is not None:
             await _write_served_cert_snapshot(deployed[0])
         if deployed == (cert_pem, key_pem):
-            if not _frontend_roll_pending:
-                return {"status": "in-sync"}
-            # The Secret is right but the frontend never rolled onto it.
-            if await asyncio.to_thread(reload_frontend_nginx):
-                _frontend_roll_pending = False
-                return {"status": "rolled"}
-            return {"status": "roll-failed"}
+            return {"status": "in-sync"}
 
         if not await asyncio.to_thread(deploy_active_cert, cert_pem, key_pem, name=name):
             return {"status": "deploy-failed"}
         await _write_served_cert_snapshot(cert_pem)
-        if not await asyncio.to_thread(reload_frontend_nginx):
-            _frontend_roll_pending = True
-            return {"status": "roll-failed"}
-        _frontend_roll_pending = False
         logger.info("appliance_active_cert_synced", cert_id=str(active_row.id), name=name)
         return {"status": "deployed"}
 
@@ -539,10 +517,11 @@ async def reconcile_cluster_cert_sans() -> dict[str, object]:
     Only ever touches a **self-signed** active cert — an operator-uploaded
     or CSR-signed cert is left alone (the operator owns those SANs). SAN
     coverage only GROWS: a demoted node's SAN stays in the cert (harmless),
-    so a demote never rolls the frontend. Idempotent + coverage-gated, so
-    it's a cheap no-op once converged; on growth it regenerates the cert,
-    updates the ``spatium-appliance-tls`` Secret, and rolls the frontend
-    pods (via ``_generate_activate_deploy`` → ``deploy_and_reload``).
+    so a demote never changes the cert. Idempotent + coverage-gated, so
+    it's a cheap no-op once converged; on growth it regenerates the cert
+    and updates the ``spatium-appliance-tls`` Secret (via
+    ``_generate_activate_deploy`` → ``deploy_and_reload``), and every
+    frontend pod reloads nginx in place (#1173).
 
     Runs from a periodic api-side loop (main.lifespan); a per-transaction
     advisory lock keeps the api replicas from regenerating concurrently.
