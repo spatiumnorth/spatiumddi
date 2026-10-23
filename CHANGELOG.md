@@ -128,6 +128,22 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Settings → Sessions: the Session Timeout and Auto-Logout Warning
+  are now applied.** Both were stored and read by nothing, so an idle
+  console session stayed usable for the refresh cookie's full lifetime.
+  A browser session idle longer than the Session Timeout is now refused
+  on its next request and on `/auth/refresh`, and is no longer listed
+  as live on the Sessions page; `0` disables it. A refresh no longer
+  counts as activity, and the console reports how long the operator has
+  been away on every request, so a page left open and polling still
+  runs out. The console shows the Auto-Logout Warning that many
+  minutes before expiry (at most half the timeout; `0` = no warning)
+  and returns to the login page when the timeout passes. API tokens are
+  not affected. The default timeout is the 60 minutes the setting has
+  always shown: a console tab idle for longer than that will need to
+  sign in again after upgrading; set it to `0` for wall displays. A
+  negative Auto-Logout Warning is now rejected.
+
 - **The DNS zone import previews, the import commits and sync-with-server
   now also need read on DNS records.** These are POSTs, so they asked
   only for `write`, while their answers list the zone's existing records

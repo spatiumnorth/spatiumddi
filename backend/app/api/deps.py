@@ -13,6 +13,11 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.token_binding import route_honours_token_binding
 from app.core.security import decode_access_token, hash_api_token, live_access_session
+from app.core.session_idle import (
+    activity_write_interval,
+    get_session_timeout_minutes,
+    request_activity_at,
+)
 from app.db import AsyncSessionLocal, get_db
 from app.models.auth import APIToken, User
 from app.services.api_token_scopes import scope_matches_request
@@ -238,19 +243,25 @@ async def get_current_user(
         # (#1241). MFA enrolment reads it to ask an external-auth user, who
         # has no local password to re-enter, for a recent sign-in instead.
         request.state.signed_in_at = session.created_at
-        # Bump ``last_seen_at`` no more than once per minute per
-        # session — gives the admin viewer a recent timestamp without
-        # a write on every authenticated request. Not for a disabled
-        # account (#1383): its request is refused below, and the Sessions
-        # view must not show it as activity. Read as one column, so the
-        # commit still lands before the User is loaded.
+        # Bump ``last_seen_at`` no more than once per write interval per
+        # session (a minute, shorter under a short Session Timeout) — gives
+        # the admin viewer a recent timestamp without a write on every
+        # authenticated request. It is also what the idle timeout reads, so
+        # it records when the OPERATOR was last active: the console reports
+        # its idle time on background polls, and an open page that nobody
+        # touches must not keep the session alive (``app.core.session_idle``).
+        # Not for a disabled account (#1383): its request is refused below,
+        # and the Sessions view must not show it as activity. Read as one
+        # column, so the commit still lands before the User is loaded.
         now = datetime.now(UTC)
-        if session.last_seen_at is None or (now - session.last_seen_at) > timedelta(seconds=60):
+        activity_at = request_activity_at(request.headers, now)
+        interval = activity_write_interval(await get_session_timeout_minutes(db))
+        if session.last_seen_at is None or (activity_at - session.last_seen_at) > interval:
             active = (
                 await db.execute(select(User.is_active).where(User.id == user_id))
             ).scalar_one_or_none()
             if active:
-                session.last_seen_at = now
+                session.last_seen_at = activity_at
                 try:
                     await db.commit()
                 except Exception:  # noqa: BLE001 — last_seen is best-effort
