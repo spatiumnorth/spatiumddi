@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import {
+  formatApiError,
   groupsApi,
   rolesApi,
   usersApi,
@@ -11,6 +12,7 @@ import {
   type InternalGroupCreate,
   type InternalGroupUpdate,
 } from "@/lib/api";
+import { apiErrorStatus } from "@/lib/refusal";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ListReadError } from "@/components/ui/list-read-error";
@@ -298,6 +300,14 @@ function DeleteModal({
       qc.invalidateQueries({ queryKey: ["groups"] });
       onClose();
     },
+    // 404: already gone (another tab or admin), which is what was asked for,
+    // so refresh the list and close. Any other refusal is shown (#2436).
+    onError: (err: unknown) => {
+      if (apiErrorStatus(err) === 404) {
+        qc.invalidateQueries({ queryKey: ["groups"] });
+        onClose();
+      }
+    },
   });
   return (
     <Modal title="Delete Group" onClose={onClose}>
@@ -307,6 +317,11 @@ function DeleteModal({
           ? Users will lose any permissions carried by this group's roles. This
           cannot be undone.
         </p>
+        {mutation.isError && apiErrorStatus(mutation.error) !== 404 && (
+          <p className="text-xs text-destructive">
+            {formatApiError(mutation.error)}
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
