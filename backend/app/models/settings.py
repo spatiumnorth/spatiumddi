@@ -371,10 +371,8 @@ class PlatformSettings(Base):
     )
     # The legacy single webhook's URL and optional Authorization header,
     # Fernet-encrypted at rest (#1502) like the same fields on
-    # ``audit_forward_target``. The plaintext ``audit_forward_webhook_url`` /
-    # ``audit_forward_webhook_auth_header`` columns are kept, unmapped and
-    # unread, for one release so a rolling upgrade's old pods keep working
-    # (#296); the next release drops them.
+    # ``audit_forward_target``. The plaintext columns they replaced were
+    # dropped by migration ``c2b203844c95``.
     audit_forward_webhook_url_encrypted: Mapped[bytes | None] = mapped_column(
         LargeBinary, nullable=True
     )
