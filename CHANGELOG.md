@@ -128,6 +128,17 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A backup destination that times out now says so instead of
+  storing an empty reason (#2402).** A WebDAV target whose server
+  accepted the connection and never answered failed the run with
+  `WebDAV PUT failed: ` and nothing after the colon, because httpx's
+  timeout exceptions carry no text. That string is what the target's
+  `last_run_error` and the Run now answer show. The error now names
+  the exception type and, for a timeout, says the destination timed
+  out. The same fallback covers the other destination drivers that
+  built their message from the exception text (WebDAV, HTTPS PUT, S3,
+  GCS, Azure Blob, FTP, SCP, SMB).
+
 - **A DHCP scope's DDNS toggle and hostname policy did nothing, yet
   reloaded Kea whenever they changed (#2270).** DDNS is gated only by
   the subnet's own settings; the scope's `ddns_enabled` and
