@@ -15,6 +15,7 @@ import {
   applicationsApi,
   circuitsApi,
   customersApi,
+  formatApiError,
   ipamApi,
   networkApi,
   overlaysApi,
@@ -37,6 +38,7 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -96,6 +98,22 @@ const TRANSPORT_CLASSES = [
   "express_route_azure",
   "interconnect_gcp",
 ];
+
+// #2518 — the router asks write (delete) on 'overlay_network' for every
+// site and policy route, as the overlay list does.
+function useOverlayGates() {
+  const perms = usePermissions();
+  return {
+    writeGate: permissionGate(
+      perms.can("write", "overlay_network"),
+      "Requires write permission on overlay networks",
+    ),
+    deleteGate: permissionGate(
+      perms.can("delete", "overlay_network"),
+      "Requires delete permission on overlay networks",
+    ),
+  };
+}
 
 // ── Tabs container ─────────────────────────────────────────────────
 
@@ -422,6 +440,7 @@ function transportColor(transportClass: string): string {
 
 function SitesTab({ overlayId }: { overlayId: string }) {
   const qc = useQueryClient();
+  const { writeGate } = useOverlayGates();
   const sitesQ = useQuery({
     queryKey: ["overlay-sites", overlayId],
     queryFn: () => overlaysApi.listSites(overlayId),
@@ -446,11 +465,17 @@ function SitesTab({ overlayId }: { overlayId: string }) {
           variant="primary"
           icon={Plus}
           onClick={() => setShowAdd(true)}
+          {...writeGate}
         >
           Attach site
         </HeaderButton>
       </div>
 
+      {detach.isError && (
+        <p role="alert" className="text-sm text-destructive">
+          {formatApiError(detach.error, "Detach failed")}
+        </p>
+      )}
       <SiteTable
         rows={sitesQ.data ?? []}
         onEdit={(r) => setEditing(r)}
@@ -496,6 +521,7 @@ function SiteTable({
   onEdit: (r: OverlaySiteRead) => void;
   onDelete: (r: OverlaySiteRead) => void;
 }) {
+  const { writeGate, deleteGate } = useOverlayGates();
   const sitesQ = useQuery({
     queryKey: ["sites", "all"],
     queryFn: () => sitesApi.list({ limit: 500 }),
@@ -560,7 +586,8 @@ function SiteTable({
                   type="button"
                   title="Edit"
                   onClick={() => onEdit(r)}
-                  className="rounded p-1 hover:bg-muted"
+                  className="rounded p-1 hover:bg-muted disabled:opacity-30"
+                  {...writeGate}
                 >
                   <Pencil className="h-3.5 w-3.5" />
                 </button>
@@ -568,7 +595,8 @@ function SiteTable({
                   type="button"
                   title="Detach"
                   onClick={() => onDelete(r)}
-                  className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                  className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10 disabled:opacity-30"
+                  {...deleteGate}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
@@ -906,6 +934,7 @@ function SiteEditorModal({
 
 function PoliciesTab({ overlayId }: { overlayId: string }) {
   const qc = useQueryClient();
+  const { writeGate, deleteGate } = useOverlayGates();
   const policiesQ = useQuery({
     queryKey: ["overlay-policies", overlayId],
     queryFn: () => overlaysApi.listPolicies(overlayId),
@@ -957,11 +986,20 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
           variant="primary"
           icon={Plus}
           onClick={() => setShowAdd(true)}
+          {...writeGate}
         >
           New policy
         </HeaderButton>
       </div>
 
+      {(remove.isError || updatePriority.isError) && (
+        <p role="alert" className="text-sm text-destructive">
+          {formatApiError(
+            remove.error ?? updatePriority.error,
+            "Change failed",
+          )}
+        </p>
+      )}
       <div className="overflow-x-auto rounded-lg border">
         <table className="w-full text-sm">
           <thead className="bg-muted/40 text-xs uppercase tracking-wider text-muted-foreground">
@@ -1023,6 +1061,7 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
                     disabled={idx === 0 || updatePriority.isPending}
                     onClick={() => move(idx, -1)}
                     className="rounded p-1 hover:bg-muted disabled:opacity-30"
+                    {...writeGate}
                   >
                     <ArrowUp className="h-3.5 w-3.5" />
                   </button>
@@ -1035,6 +1074,7 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
                     }
                     onClick={() => move(idx, 1)}
                     className="rounded p-1 hover:bg-muted disabled:opacity-30"
+                    {...writeGate}
                   >
                     <ArrowDown className="h-3.5 w-3.5" />
                   </button>
@@ -1042,7 +1082,8 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
                     type="button"
                     title="Edit"
                     onClick={() => setEditing(p)}
-                    className="rounded p-1 hover:bg-muted"
+                    className="rounded p-1 hover:bg-muted disabled:opacity-30"
+                    {...writeGate}
                   >
                     <Pencil className="h-3.5 w-3.5" />
                   </button>
@@ -1055,7 +1096,8 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
                         onConfirm: () => remove.mutate(p.id),
                       });
                     }}
-                    className="rounded p-1 text-destructive hover:bg-destructive/10"
+                    className="rounded p-1 text-destructive hover:bg-destructive/10 disabled:opacity-30"
+                    {...deleteGate}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
