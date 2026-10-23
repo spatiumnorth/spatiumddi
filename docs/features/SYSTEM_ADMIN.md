@@ -1152,7 +1152,7 @@ maintenance_message: str (default "")
 maintenance_started_at: timestamp | null  -- server-stamped on enable, never operator-set directly
 ```
 
-Other notable areas on the model (each a small cluster of columns): integration toggles (`integration_kubernetes_enabled`, `integration_docker_enabled`, …), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled` — changes via the Tool Catalog are audited as an enabled/disabled diff, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
+Other notable areas on the model (each a small cluster of columns): a derived copy of each integration's on/off state (`integration_kubernetes_enabled`, `integration_docker_enabled`, …; the `integrations.*` feature module is the switch, #2196), Operator Copilot caps (`ai_per_user_daily_token_cap`, `ai_per_user_daily_cost_cap_usd`, `ai_tools_enabled` — changes via the Tool Catalog are audited as an enabled/disabled diff, …), audit-event forwarding (`audit_forward_syslog_*`, `audit_forward_webhook_*`), and the per-appliance host-config plane (`snmp_*`, `ntp_*`, `apt_*`, `syslog_*`, `ssh_*`, `resolver_*`, `lldp_*`, `timezone`, `console_mode`).
 
 ---
 

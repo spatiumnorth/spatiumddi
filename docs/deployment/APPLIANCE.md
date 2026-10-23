@@ -168,7 +168,7 @@ The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB
 The `/appliance` section in the SpatiumDDI UI talks to k3s directly via the api pod's mounted ServiceAccount:
 
 - **Cluster tab** (#402 — folds the former Containers/Pods tab + the etcd-snapshots section into one tab via a left sub-nav, named *Cluster* rather than *Kubernetes* for operator clarity). Three sub-sections: **Overview** — a live SSE-fed (2 s) health dashboard (KPI ribbon, CPU / memory hero chart, per-node radial gauges with the host's real partition list, workload-health panel, top-pods leaderboard) built from kubeapi node / pod listings + per-node kubelet `stats/summary` (there is no Prometheus on the appliance); **Pods** — lists every pod in the spatium namespace via kubeapi `GET /api/v1/namespaces/spatium/pods`, restart = `DELETE` the pod (owning Deployment / DaemonSet recreates it), logs = SSE wrapping kubeapi's `?follow=true` pod-log endpoint; **etcd** — the recoverable `ETCDSnapshotFile` inventory.
-- **TLS cert manager**. Patches the `spatium-appliance-tls` Secret in place via `kubectl patch secret`. Bumps a checksum annotation on the frontend Deployment to trigger a rollout (k8s doesn't auto-roll on Secret changes — the annotation acts as the trigger).
+- **TLS cert manager**. Patches the `spatium-appliance-tls` Secret in place via `kubectl patch secret`, and that is all. The frontend mounts the Secret as a directory, so the kubelet updates the certificate files in its running pods (at each pod's next sync, within about 90 s), and the frontend image's `40-tls-reload-watch.sh` reloads nginx in place when they change. A reload keeps the web ports open; until #1173 a certificate change rolled the frontend Deployment, which on a multi-node control plane closed each node's :80/:443 in turn.
 - **Logs & Diagnostics → Self-test**. Five-check battery: external DNS resolution, kubeapi reachability via the ServiceAccount, every spatium pod's health (Running + healthy / Succeeded Jobs OK), informational DHCP + DNS role presence (OK when not assigned).
 - **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets. Environment values appear only for known non-secret settings (every other variable is listed with its value replaced), and every file is swept for credential-shaped values such as keys, tokens and passwords embedded in URLs. That sweep is best effort, so review the bundle before sharing it.
 - **OS Versions**. Atomic A/B slot upgrades — same machinery as pre-#183 (Phase 8); the slot raw.xz carries a complete rootfs with k3s + baked images + chart tarballs. A slot upgrade is also an effective container upgrade because images are baked. For an upgrade scheduled from an imported/uploaded image (#199), the download is **verified by the stored sha256** (the integrity guarantee), which lets the host runner relax TLS cert-verify *only* for the appliance's own self-served URL behind the self-signed web cert — external public-CA URLs stay fully verified (#386). The Fleet drilldown shows a **live per-phase progress stepper** (download % → verify → write → bootloader → reboot-pending) with an expandable `slot-upgrade.log` tail and an honest failure card, and a stuck apply re-fires once per distinct desired-state rather than looping (#386). Uploaded/imported image bytes are persisted on a host-path mount so they survive an api restart (#386).
@@ -645,8 +645,9 @@ state on its heartbeat:
 - **Cert SAN reconcile (Phase 7c).** A periodic loop in the api lifespan
   (`reconcile_cluster_cert_sans`, advisory-locked across the api
   replicas, appliance-mode only) grows the self-signed cert as members
-  join, updates the Secret + rolls the frontend pods. Coverage only ever
-  grows, so a demote never churns the cert.
+  join and updates the Secret; each frontend pod then reloads nginx in
+  place, so a join no longer closes any node's web port (#1173).
+  Coverage only ever grows, so a demote never churns the cert.
 - **Per-role node-label gating** keeps control-plane workloads on
   control-plane nodes (`spatium.io/role-control-plane=true`), so
   promoting a DNS-only appliance never schedules Postgres onto it
@@ -3143,6 +3144,22 @@ it, which is what the write just did. Later is not safe: the inactive
 slot is a spare, so a wrong-arch rootfs sitting in it costs nothing (the
 node keeps running on the active slot and the next apply overwrites it),
 whereas pointing the bootloader at it cannot be undone remotely.
+
+### Free space is checked before an upgrade image is stored (#2400)
+
+The kubelet evicts pods at `nodefs.available<5%` and then keeps evicting
+until a further 10% (`evictionMinimumReclaim`) is free, so a node that
+dips under 5% stays in DiskPressure, evicting the api, worker and
+supervisor, until **15% of `/var` is free**. An image that fits on disk
+can therefore still take the control plane down. Upload and
+import-from-GitHub now refuse with a 422 that names the numbers when
+storing the image would leave less than 15% of the volume free (the
+mirror's volume when the slot-image mirror is on), before any byte is
+written. The node-side staging download in `spatium-upgrade-slot` applies
+the same rule and exits 7, which the slot-upgrade wrapper reports as "not
+enough free space on /var". Free space by deleting unused upgrade images
+in Fleet, then retry. On a 15 GB `/var` that is about 2.25 GB of headroom
+on top of the image.
 
 **Two source modes for the upgrade image:**
 

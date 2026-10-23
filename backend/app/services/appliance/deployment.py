@@ -7,11 +7,15 @@ kubeapi instead:
 
 * PATCH the ``spatium-appliance-tls`` Secret in the spatium
   namespace with the new tls.crt / tls.key.
-* Bump a ``checksum/secret`` annotation on the frontend Deployment's
-  pod template so the Deployment controller rolls a new pod —
-  the new pod re-reads the Secret on schedule. Plain-secret-update
-  alone doesn't trigger a rollout; the annotation is the standard
-  k8s pattern for "this Deployment depends on this Secret".
+* That is all (#1173). The frontend mounts the Secret as a directory,
+  so the kubelet updates the files inside its running pods, and the
+  image's ``40-tls-reload-watch.sh`` reloads nginx in place when they
+  change: the web ports never stop accepting. This module used to bump
+  a pod-template annotation so the Deployment rolled instead. The
+  frontend is hostNetwork with host ports 80/443, so on a multi-node
+  control plane that roll is terminate-first, and every node's web port
+  refused connections until its replacement pod had started (about
+  23 s on the seed when a member joined).
 
 Called by:
 
@@ -20,8 +24,7 @@ Called by:
   Secret manifest via k3s's auto-deploy directory before the
   chart applies; kept here as a safety net).
 * ``activate_certificate`` / ``import_signed_cert`` endpoints —
-  pushes the freshly-activated cert into the Secret + bumps the
-  Deployment annotation.
+  pushes the freshly-activated cert into the Secret.
 * ``sync_active_cert_to_secret`` — the api's continuous reconcile
   (#1895): a Let's Encrypt cert the Celery worker issues or renews is
   deployed from here, on the worker's wake or the 60 s tick, because the
@@ -40,8 +43,6 @@ a failed PATCH gets logged + retried by the api's
 
 from __future__ import annotations
 
-import hashlib
-
 import structlog
 
 from app.config import settings
@@ -57,16 +58,6 @@ logger = structlog.get_logger(__name__)
 _TLS_SECRET_NAME = "spatium-appliance-tls"
 _TLS_CRT_KEY = "tls.crt"
 _TLS_KEY_KEY = "tls.key"
-# The Deployment name + annotation key for the rollout trigger.
-# Tracks the umbrella chart's release-fullname convention
-# (``<release>-frontend``); since the appliance release is named
-# ``spatium-control`` (see appliance/mkosi.extra/usr/local/bin/
-# spatiumddi-firstboot), the resolved name is
-# ``spatium-control-spatiumddi-frontend``. Kept configurable via
-# ``settings.appliance_frontend_deployment`` so a future rename
-# doesn't require a code change.
-_DEFAULT_FRONTEND_DEPLOYMENT = "spatium-control-spatiumddi-frontend"
-_ROLLOUT_ANNOTATION = "spatiumddi.io/tls-secret-checksum"
 
 
 def read_deployed_cert() -> tuple[str, str] | None:
@@ -90,10 +81,9 @@ def read_deployed_cert() -> tuple[str, str] | None:
     # Emptiness is judged on the stripped value, but the ORIGINAL bytes
     # are what we return. Persisting a stripped copy would make the row
     # differ from the Secret by a trailing newline, so the next api start
-    # would take Path A, re-deploy it, genuinely change the Secret data,
-    # shift the rollout checksum, and roll the frontend (Recreate — ~5 s
-    # with no Web UI). That is the mid-boot roll this whole path exists
-    # to avoid, merely deferred by one restart.
+    # would take Path A, re-deploy it and genuinely change the Secret
+    # data: a certificate change nobody asked for (before #1173 it also
+    # rolled the frontend, the mid-boot roll this path exists to avoid).
     if not cert_pem.strip() or not key_pem.strip():
         return None
     return cert_pem, key_pem
@@ -103,8 +93,8 @@ def deploy_active_cert(cert_pem: str, key_pem: str, *, name: str = "") -> bool:
     """PATCH the appliance TLS Secret with the active cert + key.
 
     Idempotent: re-applying the same cert+key produces the same
-    base64'd Secret data + the same checksum annotation, which
-    kubeapi treats as a no-op (no rollout triggered).
+    base64'd Secret data, which kubeapi treats as a no-op (the mounted
+    files do not change, so no frontend reloads).
 
     Returns True if the PATCH succeeded; False otherwise (and a
     structured log line at warning level explains why).
@@ -131,103 +121,18 @@ def deploy_active_cert(cert_pem: str, key_pem: str, *, name: str = "") -> bool:
     return True
 
 
-def rollout_checksum(crt_b64: str, key_b64: str, resource_version: str) -> str:
-    """The pod-template annotation value that makes the frontend roll.
-
-    The Secret's content AND its ``resourceVersion``. Content alone was the
-    #1219 strand: a k3s start on the seed puts the first-boot certificate back
-    into the Secret (#1215), the frontend pod that starts then serves it, and
-    the api's write-back of the active certificate restores exactly the
-    content the annotation already names, so the Deployment saw no change,
-    never rolled, and nginx served the first-boot certificate until the pod
-    happened to restart. A supervisor pinned to the real certificate refuses
-    that one, so every remote appliance lost the control plane after each
-    reboot. Every real write to the Secret moves its ``resourceVersion``; a
-    PATCH that changes nothing does not, so re-applying an unchanged
-    certificate still rolls nothing.
-    """
-    src = (crt_b64 + key_b64 + ":" + resource_version).encode("utf-8")
-    return hashlib.sha256(src).hexdigest()
-
-
-def reload_frontend_nginx() -> bool:
-    """Trigger a frontend Deployment rollout so pods re-read the Secret.
-
-    Bumps the ``spatiumddi.io/tls-secret-checksum`` annotation on the
-    Deployment's pod template to ``rollout_checksum`` of the freshly-PATCHed
-    Secret (its data and its ``resourceVersion``). The Deployment controller treats the annotation
-    change as a template change + rolls the pod. Single-replica
-    appliance frontend uses the Recreate strategy (chart template
-    handles this when hostNetwork=true) so the old pod terminates
-    BEFORE the new one binds :443 — ~5 s of downtime.
-
-    Returns True on successful PATCH. False otherwise.
-    """
-    if not settings.appliance_mode:
-        return False
-    # Read the active Secret back so we hash exactly what's on the
-    # wire — covers the case where another caller updated the
-    # Secret between deploy_active_cert's PATCH and this call.
-    import json  # noqa: PLC0415
-
-    cfg = k8s.get_config()
-    if cfg is None:
-        logger.warning("appliance_nginx_reload_no_kubeapi")
-        return False
-    deployment_name = getattr(
-        settings, "appliance_frontend_deployment", _DEFAULT_FRONTEND_DEPLOYMENT
-    )
-    # Pull the Secret to hash. patch_secret didn't return the
-    # post-patch body, so re-GET via the same _request helper.
-    from urllib.parse import quote  # noqa: PLC0415
-
-    path = f"/api/v1/namespaces/{quote(cfg.namespace)}" f"/secrets/{quote(_TLS_SECRET_NAME)}"
-    try:
-        status, body = k8s._request("GET", path)
-    except k8s.KubeapiUnavailableError as exc:
-        logger.warning("appliance_nginx_reload_secret_read_failed", error=str(exc))
-        return False
-    if status != 200:
-        logger.warning(
-            "appliance_nginx_reload_secret_read_status",
-            status=status,
-            body=body[:200] if isinstance(body, bytes) else None,
-        )
-        return False
-    try:
-        secret = json.loads(body)
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("appliance_nginx_reload_secret_bad_json", error=str(exc))
-        return False
-    data = secret.get("data") or {}
-    checksum = rollout_checksum(
-        data.get(_TLS_CRT_KEY) or "",
-        data.get(_TLS_KEY_KEY) or "",
-        (secret.get("metadata") or {}).get("resourceVersion") or "",
-    )
-    ok, err = k8s.patch_deployment_annotation(deployment_name, _ROLLOUT_ANNOTATION, checksum)
-    if not ok:
-        logger.warning(
-            "appliance_nginx_reload_deployment_patch_failed",
-            deployment=deployment_name,
-            error=err,
-        )
-        return False
-    logger.info(
-        "appliance_nginx_reloaded",
-        deployment=deployment_name,
-        checksum=checksum[:12],
-    )
-    return True
-
-
 def deploy_and_reload(cert_pem: str, key_pem: str, *, name: str = "") -> bool:
-    """Convenience — PATCH the Secret, then trigger Deployment rollout.
+    """PATCH the Secret; every frontend pod then reloads nginx by itself.
 
-    Returns True only when both steps succeeded. Failed deploys skip
-    the reload (no point bumping the rollout annotation when the
-    Secret didn't update).
+    The frontend mounts the Secret as a directory, so the kubelet updates
+    the files in its running pods (at each pod's next periodic sync:
+    within about 90 s with the kubelet's default 1 min sync and its
+    jitter), and the image's ``40-tls-reload-watch.sh`` runs ``nginx -s
+    reload`` on that change, within its 5 s tick. The listening sockets stay open throughout.
+    Nothing here touches the frontend Deployment any more (#1173): its
+    roll was terminate-first on hostNetwork, so each node's web port
+    refused connections until its replacement pod had started.
+
+    Returns True when the Secret PATCH succeeded.
     """
-    if not deploy_active_cert(cert_pem, key_pem, name=name):
-        return False
-    return reload_frontend_nginx()
+    return deploy_active_cert(cert_pem, key_pem, name=name)

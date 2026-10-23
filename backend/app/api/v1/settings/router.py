@@ -50,6 +50,7 @@ from app.models.settings import (
     PlatformSettings,
 )
 from app.services import audit_forward as audit_forward_svc
+from app.services import feature_modules as fm_svc
 from app.services.appliance.access import console_only_detail, covers, effective_doors
 from app.services.appliance.apt import (
     mask_proxy_url,
@@ -164,6 +165,10 @@ class SettingsResponse(BaseModel):
     oui_lookup_enabled: bool
     oui_update_interval_hours: int
     oui_last_updated_at: datetime | None
+    # #2196 / #2197 — all eleven integration switches. Each is the state of
+    # the integration's feature module (``integrations.*``), filled in by
+    # ``_settings_response``; the ``PlatformSettings`` column of the same
+    # name is only a derived copy and is never what this reports.
     integration_kubernetes_enabled: bool
     integration_docker_enabled: bool
     integration_proxmox_enabled: bool
@@ -171,6 +176,10 @@ class SettingsResponse(BaseModel):
     integration_unifi_enabled: bool
     integration_cloud_enabled: bool
     integration_opnsense_enabled: bool
+    integration_netbird_enabled: bool
+    integration_panos_enabled: bool
+    integration_fortinet_enabled: bool
+    integration_meraki_enabled: bool
     domain_whois_interval_hours: int
     # Device profiling — fingerbank API key. Boolean reflects whether
     # an encrypted key is stored; the plaintext is never returned.
@@ -897,6 +906,10 @@ class SettingsUpdate(BaseModel):
     dhcp_default_lease_time: int | None = None
     oui_lookup_enabled: bool | None = None
     oui_update_interval_hours: int | None = None
+    # #2196 / #2197 — writing one of these switches the integration's
+    # feature module, exactly as Settings → Features does (superadmin-only,
+    # audited as a ``feature_module`` change). Sending the current value is a
+    # no-op, so a form that echoes the whole object back changes nothing.
     integration_kubernetes_enabled: bool | None = None
     integration_docker_enabled: bool | None = None
     integration_proxmox_enabled: bool | None = None
@@ -904,6 +917,10 @@ class SettingsUpdate(BaseModel):
     integration_unifi_enabled: bool | None = None
     integration_cloud_enabled: bool | None = None
     integration_opnsense_enabled: bool | None = None
+    integration_netbird_enabled: bool | None = None
+    integration_panos_enabled: bool | None = None
+    integration_fortinet_enabled: bool | None = None
+    integration_meraki_enabled: bool | None = None
     domain_whois_interval_hours: int | None = None
     # Device profiling — fingerbank API key. Plaintext on the wire
     # (TLS-protected); empty string clears the stored value. Omit the
@@ -1816,9 +1833,18 @@ def _column_defaults() -> dict[str, Any]:
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
+async def _settings_response(db: DB, settings: PlatformSettings) -> SettingsResponse:
+    """Serialise the settings row, with the integration switches read from
+    their feature modules (#2196) — the module is authoritative, and a
+    column that a module turned on before this row existed never received
+    would otherwise be reported here as off."""
+    resp = SettingsResponse.model_validate(settings)
+    return resp.model_copy(update=await fm_svc.integration_flags(db))
+
+
 @router.get("", response_model=SettingsResponse)
-async def get_settings(current_user: CurrentUser, db: DB) -> PlatformSettings:
-    return await _get_or_create(db)
+async def get_settings(current_user: CurrentUser, db: DB) -> SettingsResponse:
+    return await _settings_response(db, await _get_or_create(db))
 
 
 @router.get("/defaults")
@@ -1829,7 +1855,7 @@ async def get_settings_defaults(current_user: CurrentUser) -> dict[str, Any]:
 @router.put("", response_model=SettingsResponse)
 async def update_settings(
     body: SettingsUpdate, request: Request, current_user: CurrentUser, db: DB
-) -> PlatformSettings:
+) -> SettingsResponse:
     forbid_in_demo_mode("Platform settings updates are disabled")
     # Superadmin passes via user_has_permission shortcut; users with an
     # explicit `write`/`admin` grant on `settings` also pass.
@@ -1906,6 +1932,29 @@ async def update_settings(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Appliance registration can only be changed by a superadmin",
         )
+
+    # #2196 / #2197 — an integration switch is its feature module. Popped out
+    # of ``changes`` so the generic setattr loop never writes the derived
+    # column on its own; a real change goes through the module below. Only a
+    # value that DIFFERS from the module counts, so echoing the current state
+    # back is a no-op. Superadmin-only, like the Settings → Features toggle it
+    # is equivalent to: a delegated ``write:settings`` editor must not be able
+    # to arm an integration that pulls from (and, for some, writes to) other
+    # infrastructure. Demo mode is already refused for the whole PUT above.
+    _integration_requested = {
+        f: changes.pop(f) for f in list(changes) if f in fm_svc.INTEGRATION_FIELD_TO_MODULE
+    }
+    _integration_flips: dict[str, bool] = {}
+    if _integration_requested:
+        _integration_current = await fm_svc.integration_flags(db)
+        _integration_flips = {
+            f: v for f, v in _integration_requested.items() if _integration_current[f] != v
+        }
+        if _integration_flips and not is_effective_superadmin(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Integrations can only be switched on or off by a superadmin",
+            )
 
     # Maintenance mode (issue #57). Capture the prior enabled state before
     # the setattr loop mutates it so we can detect an actual flip (and
@@ -2271,6 +2320,26 @@ async def update_settings(
             continue
         setattr(settings, field, value)
 
+    for field, value in _integration_flips.items():
+        module_id = fm_svc.INTEGRATION_FIELD_TO_MODULE[field]
+        await fm_svc.set_module_enabled(db, module_id, value, user_id=current_user.id)
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="feature_module",
+                resource_id=module_id,
+                resource_display=fm_svc.MODULES_BY_ID[module_id].label,
+                result="success",
+                new_value={"enabled": value},
+            )
+        )
+    if _integration_flips:
+        await fm_svc.sync_integration_settings_mirror(db)
+        changes.update(_integration_flips)
+
     if snmp_users_audit is not None:
         changes["snmp_v3_users"] = snmp_users_audit
     if syslog_targets_audit is not None:
@@ -2546,8 +2615,11 @@ async def update_settings(
     if _host_config_touched:
         await publish_wake(HOSTCONFIG_ALL)
 
+    if _integration_flips:
+        fm_svc.invalidate_cache()
+
     logger.info("platform_settings_updated", user=current_user.username, changes=changes)
-    return settings
+    return await _settings_response(db, settings)
 
 
 # ── Dedicated resolver endpoints (issue #158) ───────────────────────────────────
