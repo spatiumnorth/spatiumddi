@@ -445,6 +445,17 @@ feature simply isn't installed
 { "detail": "Feature 'network.circuit' is disabled." }
 ```
 
+Disabling a module also stops its **scheduled work**, not just its routes
+([#2279](https://github.com/spatiumnorth/spatiumddi/issues/2279)): every
+module-owned Celery task carries `@module_gated("<module id>")`
+(`backend/app/tasks/module_gate.py`) and does nothing while the module,
+or a parent in its `requires=` chain, is off — no SNMP polls, TLS probes,
+conformity runs, RDAP / RPKI / RIPEstat fetches, or nmap auto-profile of
+new DHCP clients. Core, retention and prune tasks run regardless; each is
+listed with its reason in `UNGATED_BEAT_TASKS`, and
+`tests/test_module_gated_tasks_2279.py` fails any beat task that is in
+neither place.
+
 A module's shipped default lives in `default_enabled` on its catalog
 entry and nowhere else — a `feature_module` row means an operator
 changed it. A module ships **enabled** only if it is core IPAM / DNS /

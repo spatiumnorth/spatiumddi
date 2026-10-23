@@ -42,6 +42,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.v1._common import add_trigger_audit
 from app.core.permissions import require_permission
 from app.services.appliance.slot_image_target import (
     SlotImageResolutionError,
@@ -428,6 +429,19 @@ async def post_start(run_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Up
     # Inline import — keeps the celery dep off the api boot path for
     # docker-compose deploys that don't run a worker.
     from app.tasks.upgrade_orchestrator import drive_upgrade_run  # noqa: PLC0415
+
+    # #2303 — record WHO started the run before enqueueing: the orchestrator's
+    # own ``upgrade.started`` row is written on the worker and says "system".
+    add_trigger_audit(
+        db,
+        current_user,
+        resource_type="system_upgrade_run",
+        resource_id=run.id,
+        resource_display=run.target_version,
+        action="upgrade.start_requested",
+        new_value={"state": run.state},
+    )
+    await db.commit()
 
     drive_upgrade_run.delay(str(run.id))
     logger.info(
