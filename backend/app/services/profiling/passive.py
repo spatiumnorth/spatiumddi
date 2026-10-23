@@ -117,9 +117,10 @@ async def stamp_matching_ips(
     one DHCP server (``server_id``), so only rows in the IP spaces that
     server's group serves (any space holding a subnet one of the
     group's scopes is bound to) are stamped. Without a server — a task
-    enqueued before this change — the rows are stamped only when they
-    all sit in one space; a MAC spread across spaces is skipped rather
-    than written into every one of them.
+    enqueued before this change — or with a server that belongs to no
+    server group, the rows are stamped only when they all sit in one
+    space; a MAC spread across spaces is skipped rather than written
+    into every one of them. The path taken is logged.
     """
     if fingerprint.fingerbank_device_name is None:
         return 0
@@ -128,10 +129,12 @@ async def stamp_matching_ips(
         IPAddress.mac_address == fingerprint.mac_address,
         IPAddress.user_modified_at.is_(None),
     )
+    group_id: uuid.UUID | None = None
     if server_id is not None:
         group_id = (
-            select(DHCPServer.server_group_id).where(DHCPServer.id == server_id).scalar_subquery()
-        )
+            await db.execute(select(DHCPServer.server_group_id).where(DHCPServer.id == server_id))
+        ).scalar_one_or_none()
+    if group_id is not None:
         served_spaces = (
             select(Subnet.space_id)
             .join(DHCPScope, DHCPScope.subnet_id == Subnet.id)
@@ -140,7 +143,12 @@ async def stamp_matching_ips(
         stmt = stmt.where(
             IPAddress.subnet_id.in_(select(Subnet.id).where(Subnet.space_id.in_(served_spaces)))
         )
+        scope_path = "served_spaces"
     else:
+        # No reporting server, or one in no server group (so it serves no
+        # scope we could read a space off): stamp only when every matching
+        # row is in one space, never into several at once.
+        scope_path = "no_server" if server_id is None else "server_without_group"
         spaces = set(
             (
                 await db.execute(
@@ -159,8 +167,15 @@ async def stamp_matching_ips(
                 "fingerprint_stamp_skipped_ambiguous_space",
                 mac=fingerprint.mac_address,
                 spaces=len(spaces),
+                path=scope_path,
             )
             return 0
+    logger.debug(
+        "fingerprint_stamp_space_scope",
+        mac=fingerprint.mac_address,
+        path=scope_path,
+        server_id=str(server_id) if server_id else None,
+    )
 
     result = await db.execute(
         stmt.values(

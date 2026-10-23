@@ -447,14 +447,8 @@ async def record_mac_observation(
 
     # Classify against the known fleet of the sighting's own IP space
     # (#2577) — a MAC allocated in another space says nothing about this one.
-    space_id = (
-        await db.execute(
-            select(Subnet.space_id)
-            .join(IPAddress, IPAddress.subnet_id == Subnet.id)
-            .where(IPAddress.id == ip_id)
-        )
-    ).scalar_one_or_none()
-    classification = await classify_mac(db, mac_address, space_id=space_id)
+    # The row's space is resolved inside the fleet query, not looked up first.
+    classification = await classify_mac(db, mac_address, same_space_as_ip=ip_id)
     is_randomized = is_locally_administered(mac_address)
     row = (
         await db.execute(

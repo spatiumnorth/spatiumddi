@@ -131,6 +131,7 @@ function MultiHostResult({
       {confirmStamp && (
         <StampDiscoveredModal
           scanId={scan.id}
+          scanSpaceName={scan.ip_space_id ? (scan.ip_space_name ?? "") : null}
           aliveCount={alive.length}
           onClose={() => setConfirmStamp(false)}
         />
@@ -139,19 +140,31 @@ function MultiHostResult({
   );
 }
 
+/** The "Automatic" option says what the server will do without a space. */
+function automaticSpaceLabel(scanSpaceName: string | null): string {
+  return scanSpaceName !== null
+    ? `Automatic — the scan's own space (${scanSpaceName})`
+    : "Automatic — skip addresses found in more than one space";
+}
+
 function StampDiscoveredModal({
   scanId,
+  scanSpaceName,
   aliveCount,
   onClose,
 }: {
   scanId: string;
+  /** Name of the space of the IPAM row the scan was launched from, or null
+   *  when the scan is not pinned to a row. */
+  scanSpaceName: string | null;
   aliveCount: number;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
   // Overlapping IP spaces are independent (#2577): the operator picks
-  // which space the sweep belongs to. "" = let the server decide, which
-  // skips any host whose address exists in more than one space.
+  // which space the sweep belongs to. "" = let the server decide: the
+  // scan's own space when it was launched from an IPAM row, otherwise
+  // skip any host whose address exists in more than one space.
   const [spaceId, setSpaceId] = useState("");
   const { data: spaces } = useQuery({
     queryKey: ["spaces"],
@@ -200,9 +213,7 @@ function StampDiscoveredModal({
               onChange={(e) => setSpaceId(e.target.value)}
               className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 text-sm"
             >
-              <option value="">
-                Automatic — skip addresses found in more than one space
-              </option>
+              <option value="">{automaticSpaceLabel(scanSpaceName)}</option>
               {spaces?.map((sp) => (
                 <option key={sp.id} value={sp.id}>
                   {sp.name}
@@ -223,6 +234,11 @@ function StampDiscoveredModal({
         )}
         {result && (
           <div className="mt-2 space-y-1 rounded-md border bg-muted/30 p-3 text-sm">
+            <div data-testid="stamp-space-used">
+              {result.space_used
+                ? `Stamped into IP space ${result.space_used.name}`
+                : "No single IP space — hosts in more than one space were skipped"}
+            </div>
             <div>
               Created:{" "}
               <strong className="text-emerald-700 dark:text-emerald-400">

@@ -426,3 +426,116 @@ async def test_find_switchport_reports_ambiguity_across_spaces(
     )
     assert scoped.get("mac_address") == MAC
     assert scoped.get("ip_source") == "ipam"
+
+
+# ── Review follow-ups ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_nmap_stamp_reports_the_space_it_used(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """``space_used`` says which space was stamped and why, so the result
+    line and the "Automatic" label agree with what the server did."""
+    _, headers = await _admin(db_session)
+    space_a, subnet_a, space_b, subnet_b = await _two_spaces(db_session)
+    row_b = await _ip(db_session, subnet_b, ADDR, status="available")
+    pinned = await _scan(db_session, ip_address_id=row_b.id)
+    unpinned = await _scan(db_session)
+    ids = (pinned.id, unpinned.id, space_a.id, space_a.name, space_b.id, space_b.name)
+    pinned_id, unpinned_id, a_id, a_name, b_id, b_name = ids
+    await db_session.commit()
+
+    url = "/api/v1/nmap/scans/{}/stamp-discovered"
+    r = await client.post(url.format(pinned_id), headers=headers)
+    assert r.json()["space_used"] == {"id": str(b_id), "name": b_name, "source": "scan_ip_row"}
+
+    r = await client.post(url.format(unpinned_id), headers=headers)
+    assert r.json()["space_used"] is None
+
+    r = await client.post(url.format(unpinned_id), headers=headers, params={"space_id": str(a_id)})
+    assert r.json()["space_used"] == {"id": str(a_id), "name": a_name, "source": "requested"}
+
+    # The scan read carries the pinned row's space for the modal's label.
+    got = await client.get(f"/api/v1/nmap/scans/{pinned_id}", headers=headers)
+    assert got.json()["ip_space_id"] == str(b_id)
+    assert got.json()["ip_space_name"] == b_name
+    got = await client.get(f"/api/v1/nmap/scans/{unpinned_id}", headers=headers)
+    assert got.json()["ip_space_id"] is None
+
+
+async def _server_without_group(db: AsyncSession) -> DHCPServer:
+    server = DHCPServer(name=f"s2577-{uuid.uuid4().hex[:6]}", host="127.0.0.2", driver="kea")
+    db.add(server)
+    await db.flush()
+    return server
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_stamp_from_a_groupless_server_uses_the_single_space_rule(
+    db_session: AsyncSession,
+) -> None:
+    """A reporting server in no server group serves no scope to read a space
+    off. It used to stamp nothing; now it falls back to the single-space rule:
+    stamp when every matching row is in one space."""
+    from app.services.profiling.passive import stamp_matching_ips
+
+    _, subnet_a, _, _ = await _two_spaces(db_session)
+    ip_a = await _ip(db_session, subnet_a, ADDR, status="dhcp", mac=MAC)
+    server = await _server_without_group(db_session)
+    fp = await _fingerprint(db_session)
+    await db_session.commit()
+
+    assert await stamp_matching_ips(db_session, fingerprint=fp, server_id=server.id) == 1
+    await db_session.commit()
+    await db_session.refresh(ip_a)
+    assert ip_a.device_type == "Pixel 7"
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_stamp_from_a_groupless_server_skips_a_spread_mac(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.profiling.passive import stamp_matching_ips
+
+    _, subnet_a, _, subnet_b = await _two_spaces(db_session)
+    ip_a = await _ip(db_session, subnet_a, ADDR, status="dhcp", mac=MAC)
+    ip_b = await _ip(db_session, subnet_b, ADDR, status="dhcp", mac=MAC)
+    server = await _server_without_group(db_session)
+    fp = await _fingerprint(db_session)
+    await db_session.commit()
+
+    assert await stamp_matching_ips(db_session, fingerprint=fp, server_id=server.id) == 0
+    await db_session.commit()
+    await db_session.refresh(ip_a)
+    await db_session.refresh(ip_b)
+    assert ip_a.device_type is None and ip_b.device_type is None
+
+
+@pytest.mark.asyncio
+async def test_mac_observation_resolves_the_space_without_an_extra_query(
+    db_session: AsyncSession,
+) -> None:
+    """``record_mac_observation`` classifies against the sighting's own space
+    inside the fleet query: allowlist, fleet, upsert — three statements."""
+    from sqlalchemy import event
+
+    from app.services.ipam.discovery import record_mac_observation
+
+    _, subnet_a, _, _ = await _two_spaces(db_session)
+    seen = await _ip(db_session, subnet_a, "10.77.1.8", status="discovered")
+    await db_session.flush()
+
+    statements: list[str] = []
+    conn = (await db_session.connection()).sync_connection
+    assert conn is not None
+
+    def _count(*args: object) -> None:
+        statements.append(str(args[2]))
+
+    event.listen(conn, "before_cursor_execute", _count)
+    try:
+        await record_mac_observation(db_session, seen.id, MAC, source="sweep")
+    finally:
+        event.remove(conn, "before_cursor_execute", _count)
+    assert len(statements) == 3, statements

@@ -5,12 +5,14 @@
   address or MAC in two of them is not the same thing.
   - **nmap → Stamp into IPAM** wrote each host into whichever space's subnet
     the database returned first. It now uses the space you pick in the dialog,
-    or the space of the IPAM row the scan was launched from. Without either,
-    a host whose address is in more than one space is skipped and listed as
-    ambiguous.
+    or the space of the IPAM row the scan was launched from — the dialog's
+    "Automatic" option names that space, and the result says which space was
+    stamped. Without either, a host whose address is in more than one space
+    is skipped and listed as ambiguous.
   - **DHCP fingerprint profiling** stamped the device type onto every row
     with that MAC, in every space. It now stamps only the spaces the
-    reporting DHCP server's scopes serve.
+    reporting DHCP server's scopes serve; a server in no server group falls
+    back to stamping only when every row with that MAC is in one space.
   - **The MAC collision warning** on create, edit and next-IP fired for a MAC
     used in another space. It now checks the same space only.
   - **New-device detection** treated a MAC allocated in one space as known

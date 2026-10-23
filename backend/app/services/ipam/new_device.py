@@ -34,6 +34,7 @@ from datetime import UTC, datetime, timedelta
 import structlog
 from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models.auth import User
 from app.models.ipam import IPAddress, IpMacHistory, MACAllowlist, Subnet
@@ -106,7 +107,11 @@ def oui_prefix_of(mac: str | None) -> str | None:
 
 
 async def classify_mac(
-    db: AsyncSession, mac_address: str | None, *, space_id: uuid.UUID | None = None
+    db: AsyncSession,
+    mac_address: str | None,
+    *,
+    space_id: uuid.UUID | None = None,
+    same_space_as_ip: uuid.UUID | None = None,
 ) -> str:
     """Classify a MAC as ``known`` or ``new`` at observation time.
 
@@ -122,6 +127,9 @@ async def classify_mac(
       are independent networks, so a MAC allocated in one must not mask a
       first sighting in another. The allowlist stays platform-wide by
       design — it is the operator's "trust this MAC everywhere".
+      ``same_space_as_ip`` scopes it to the space of that ``IPAddress`` row
+      inside the same query — no extra round trip for a caller holding only
+      the sighting's row id (unscoped, as before, if the row is not found).
 
     Everything else is ``new``.
     """
@@ -145,6 +153,18 @@ async def classify_mac(
     if space_id is not None:
         fleet_q = fleet_q.join(Subnet, Subnet.id == IPAddress.subnet_id).where(
             Subnet.space_id == space_id
+        )
+    elif same_space_as_ip is not None:
+        sighting = aliased(IPAddress)
+        sighting_subnet = aliased(Subnet)
+        row_space = (
+            select(sighting_subnet.space_id)
+            .join(sighting, sighting.subnet_id == sighting_subnet.id)
+            .where(sighting.id == same_space_as_ip)
+            .scalar_subquery()
+        )
+        fleet_q = fleet_q.join(Subnet, Subnet.id == IPAddress.subnet_id).where(
+            or_(row_space.is_(None), Subnet.space_id == row_space)
         )
     fleet_hit = (await db.execute(fleet_q.limit(1))).first()
     if fleet_hit is not None:

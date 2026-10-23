@@ -79,6 +79,23 @@ router = APIRouter(tags=["nmap"])
 # ── Helpers ─────────────────────────────────────────────────────────
 
 
+async def _scan_ip_row_space(db: AsyncSession, scan: NmapScan) -> tuple[uuid.UUID, str] | None:
+    """The (id, name) of the IP space of the IPAM row a scan was launched
+    from, or None for a scan not pinned to a row (#2577). It is the space
+    ``stamp-discovered`` writes into when the caller names none."""
+    if scan.ip_address_id is None:
+        return None
+    row = (
+        await db.execute(
+            select(IPSpace.id, IPSpace.name)
+            .join(Subnet, Subnet.space_id == IPSpace.id)
+            .join(IPAddress, IPAddress.subnet_id == Subnet.id)
+            .where(IPAddress.id == scan.ip_address_id)
+        )
+    ).first()
+    return (row[0], row[1]) if row is not None else None
+
+
 def _to_read(row: NmapScan, *, include_raw: bool = False) -> NmapScanRead:
     summary = None
     if row.summary_json:
@@ -259,7 +276,11 @@ async def get_scan(
     row = await db.get(NmapScan, scan_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Scan not found")
-    return _to_read(row, include_raw=True)
+    out = _to_read(row, include_raw=True)
+    pinned = await _scan_ip_row_space(db, row)
+    if pinned is not None:
+        out.ip_space_id, out.ip_space_name = pinned
+    return out
 
 
 @router.delete(
@@ -421,18 +442,19 @@ async def stamp_discovered(
             ),
         )
 
-    context_space_id: uuid.UUID | None = space_id
-    if context_space_id is not None:
-        if await db.get(IPSpace, context_space_id) is None:
+    space_used: dict[str, Any] | None = None
+    if space_id is not None:
+        chosen = await db.get(IPSpace, space_id)
+        if chosen is None:
             raise HTTPException(status_code=422, detail="space_id not found")
-    elif scan.ip_address_id is not None:
-        context_space_id = (
-            await db.execute(
-                select(Subnet.space_id)
-                .join(IPAddress, IPAddress.subnet_id == Subnet.id)
-                .where(IPAddress.id == scan.ip_address_id)
-            )
-        ).scalar_one_or_none()
+        space_used = {"id": str(chosen.id), "name": chosen.name, "source": "requested"}
+    else:
+        pinned = await _scan_ip_row_space(db, scan)
+        if pinned is not None:
+            space_used = {"id": str(pinned[0]), "name": pinned[1], "source": "scan_ip_row"}
+    context_space_id: uuid.UUID | None = (
+        uuid.UUID(space_used["id"]) if space_used is not None else None
+    )
 
     now = datetime.now(UTC)
     created = 0
@@ -534,6 +556,7 @@ async def stamp_discovered(
             "skipped_addresses": skipped_address[:50],
             "skipped_ambiguous": skipped_ambiguous[:50],
             "space_id": str(context_space_id) if context_space_id else None,
+            "space_source": space_used["source"] if space_used else None,
         },
     )
     await db.commit()
@@ -544,6 +567,11 @@ async def stamp_discovered(
         "skipped_no_subnet": skipped_no_subnet,
         "skipped_addresses": skipped_address,
         "skipped_ambiguous": skipped_ambiguous,
+        # Which space the hosts were stamped into, and why: ``requested``
+        # (``space_id``), ``scan_ip_row`` (the space of the IPAM row the scan
+        # was launched from), or ``None`` — no single space, so a host found
+        # in subnets of more than one space was skipped (#2577).
+        "space_used": space_used,
     }
 
 
