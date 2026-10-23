@@ -36,6 +36,7 @@ from app.models.tls_cert import TLSCertProbe, TLSCertTarget
 from app.services.ipam.probe_policy import check_probe_target
 from app.services.tls_cert.discovery import reconcile_discovered_targets
 from app.services.tls_cert.probe import probe_one
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -182,6 +183,7 @@ async def _probe_due_async() -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.tls_certs.probe_due_certs", bind=True)
+@module_gated("security.tls_certs")
 def probe_due_certs(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     import asyncio  # noqa: PLC0415
 
@@ -200,6 +202,7 @@ async def _reconcile_async() -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.tls_certs.reconcile_discovered", bind=True)
+@module_gated("security.tls_certs")
 def reconcile_discovered(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     import asyncio  # noqa: PLC0415
 
@@ -272,6 +275,7 @@ async def _probe_one_by_id_async(target_id: str) -> dict[str, Any]:
 
 
 @celery_app.task(name="app.tasks.tls_certs.probe_one_target_by_id", bind=True)
+@module_gated("security.tls_certs")
 def probe_one_target_by_id(self: object, target_id: str) -> dict[str, Any]:  # type: ignore[type-arg]
     import asyncio  # noqa: PLC0415
 

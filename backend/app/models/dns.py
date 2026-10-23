@@ -27,6 +27,10 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
 
 #: Stored default of ``DNSServerOptions.allow_recursion`` (#1817).
+#: Stored default for ``DNSServerOptions.allow_query_cache``. Not rendered
+#: into named.conf (#2264): only a value that differs from it is shipped.
+DEFAULT_ALLOW_QUERY_CACHE: tuple[str, ...] = ("localhost", "localnets")
+
 DEFAULT_ALLOW_RECURSION: tuple[str, ...] = (
     "localhost",
     "localnets",
@@ -734,7 +738,7 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Query / Transfer ACLs
     allow_query: Mapped[list] = mapped_column(JSONB, nullable=False, default=lambda: ["any"])
     allow_query_cache: Mapped[list] = mapped_column(
-        JSONB, nullable=False, default=lambda: ["localhost", "localnets"]
+        JSONB, nullable=False, default=lambda: list(DEFAULT_ALLOW_QUERY_CACHE)
     )
     allow_transfer: Mapped[list] = mapped_column(JSONB, nullable=False, default=lambda: ["none"])
     blackhole: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)

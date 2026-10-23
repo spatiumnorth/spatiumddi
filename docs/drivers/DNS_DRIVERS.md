@@ -640,6 +640,8 @@ class PowerDNSDriverConfig:
 
 There is no `host` / `ssh_user` / `ssh_key` / RNDC counterpart — PowerDNS configuration is entirely REST-driven, and the REST endpoint is bound to loopback. This is significantly less surface area than the BIND9 driver maintains.
 
+**Listen addresses (#2307).** The agent renders `local-address=0.0.0.0, ::` so the authoritative server answers on IPv4 and IPv6, matching BIND9's `listen-on` / `listen-on-v6 { any; }`. Setting the option replaces pdns's own default, so the IPv6 entry has to be named. On a host with no IPv6 stack at all (kernel `ipv6.disable=1`, no `AF_INET6` sockets) pdns aborts on a `::` entry, so the agent probes for an `AF_INET6` socket and renders `0.0.0.0` alone there. `net.ipv6.conf.*.disable_ipv6=1` is not that case: pdns still binds `::`.
+
 ### 4.8 LMDB cache + recovery
 
 LMDB is a single mmap'd file at `/var/lib/powerdns/pdns.lmdb`. The shipped Helm chart and standalone Compose file mount it on a persistent PVC / volume:

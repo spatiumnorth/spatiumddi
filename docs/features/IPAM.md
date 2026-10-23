@@ -80,8 +80,8 @@ Subnet
   -- Status / Metadata
   status: enum(active, deprecated, reserved, quarantine)
   utilization_percent: float (computed)
-  total_ips: int (computed)
-  allocated_ips: int (computed)
+  total_ips: int (computed — usable addresses; IPv4 network + broadcast excluded)
+  allocated_ips: int (computed — non-available rows, excluding the IPv4 network / broadcast placeholders, so allocated ≤ total)
   
   -- Custom Fields (see section 6)
   custom_fields: JSONB
