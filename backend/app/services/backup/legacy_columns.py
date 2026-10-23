@@ -22,6 +22,8 @@ from sqlalchemy import Connection, inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from app.db import task_connect_args
+
 logger = structlog.get_logger(__name__)
 
 # (table, dropped plaintext column, encrypted column, plaintext column's SQL
@@ -75,7 +77,7 @@ async def fold_dropped_plaintext_columns(db_url: str) -> int:
     """
     from app.core.crypto import encrypt_str  # noqa: PLC0415
 
-    engine = create_async_engine(db_url, poolclass=NullPool)
+    engine = create_async_engine(db_url, poolclass=NullPool, connect_args=task_connect_args())
     folded = 0
     try:
         async with engine.begin() as conn:
