@@ -23,7 +23,9 @@ import {
   type NetworkNeighbourQuery,
   type NetworkTestConnectionResult,
 } from "@/lib/api";
+import { formatApiError } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
+import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { Modal } from "@/components/ui/modal";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 
@@ -66,6 +68,18 @@ export function DeviceDetailView() {
     queryFn: () => networkApi.getDevice(id),
     enabled: !!id,
   });
+
+  // #2518 — the router asks write (delete) on 'manage_network_devices', as
+  // the device list does since #1851.
+  const perms = usePermissions();
+  const writeGate = permissionGate(
+    perms.can("write", "manage_network_devices"),
+    "Requires write permission on network devices",
+  );
+  const deleteGate = permissionGate(
+    perms.can("delete", "manage_network_devices"),
+    "Requires delete permission on network devices",
+  );
 
   const testMut = useMutation({
     mutationFn: () => networkApi.testConnection(id),
@@ -213,6 +227,7 @@ export function DeviceDetailView() {
               icon={TestTube2}
               onClick={() => testMut.mutate()}
               disabled={testMut.isPending}
+              {...writeGate}
             >
               Test Connection
             </HeaderButton>
@@ -220,16 +235,22 @@ export function DeviceDetailView() {
               icon={PlayCircle}
               onClick={() => pollMut.mutate()}
               disabled={pollMut.isPending}
+              {...writeGate}
             >
               Poll Now
             </HeaderButton>
-            <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
+            <HeaderButton
+              icon={Pencil}
+              onClick={() => setShowEdit(true)}
+              {...writeGate}
+            >
               Edit
             </HeaderButton>
             <HeaderButton
               variant="destructive"
               icon={Trash2}
               onClick={() => setShowDelete(true)}
+              {...deleteGate}
             >
               Delete
             </HeaderButton>
@@ -239,6 +260,12 @@ export function DeviceDetailView() {
           <div className="mt-3">
             <TestResultBanner result={testResult} />
           </div>
+        )}
+        {pollMut.isError && (
+          <p role="alert" className="mt-3 text-xs text-destructive">
+            Poll Now was refused:{" "}
+            {formatApiError(pollMut.error, "the request failed")}
+          </p>
         )}
         {pollMut.isSuccess && pollMut.data && (
           <div className="mt-3 inline-flex items-center gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-1.5 text-xs text-emerald-700 dark:text-emerald-300">

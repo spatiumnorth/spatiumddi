@@ -195,6 +195,10 @@ async def update_collector(
         changed_fields=list(changes.keys()),
         new_value=changes,
     )
+    # #2040 — ``enabled`` and ``name`` are in the collector's bundle (a
+    # disabled collector renders an empty peer set); publish after the commit
+    # via the router's ``wake_publishing``.
+    collect_wake(looking_glass_collector_channel(c.id))
     await db.commit()
     await db.refresh(c)
     return _collector_to_read(c)
@@ -219,6 +223,9 @@ async def delete_collector(collector_id: uuid.UUID, db: DB, user: CurrentUser) -
     # FK CASCADE sweeps bgp_lg_peer rows (and, transitively, their
     # bgp_lg_route rows) — no manual cleanup needed.
     await db.delete(c)
+    # #2040 — wake the collector's parked poll so it learns now (404 → the
+    # agent re-bootstraps) rather than at the long-poll timeout.
+    collect_wake(looking_glass_collector_channel(collector_id))
     await db.commit()
     return None
 

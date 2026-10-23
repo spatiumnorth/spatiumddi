@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { humanTime } from "../network/_shared";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import {
@@ -1091,10 +1092,10 @@ function GroupServersList({
             const seenLabel =
               s.driver === "kea"
                 ? seenAt
-                  ? `seen ${new Date(seenAt).toLocaleTimeString()}`
+                  ? `seen ${humanTime(seenAt)}`
                   : "never heard from"
                 : seenAt
-                  ? `synced ${new Date(seenAt).toLocaleTimeString()}`
+                  ? `synced ${humanTime(seenAt)}`
                   : "never synced";
             const pauseInFlight =
               (pauseMut.isPending || resumeMut.isPending) &&
@@ -1141,6 +1142,14 @@ function GroupServersList({
                           }
                         >
                           Maintenance
+                        </span>
+                      )}
+                      {s.last_sync_error && (
+                        <span
+                          className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
+                          title={`Lease pull failing since ${s.last_sync_error_at ? new Date(s.last_sync_error_at).toLocaleString() : "unknown"}: ${s.last_sync_error}`}
+                        >
+                          Sync failing
                         </span>
                       )}
                       <ConfigApplyChip server={s} />
@@ -1443,7 +1452,6 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                   <th className="px-3 py-2 text-left font-medium">Name</th>
                   <th className="px-3 py-2 text-left font-medium">Enabled</th>
                   <th className="px-3 py-2 text-left font-medium">Lease (s)</th>
-                  <th className="px-3 py-2 text-left font-medium">DDNS</th>
                   {showServing && (
                     <th
                       className="px-3 py-2 text-left font-medium"
@@ -1479,9 +1487,6 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                         <td className="px-3 py-2 tabular-nums">
                           {sc.lease_time}
                         </td>
-                        <td className="px-3 py-2">
-                          {sc.ddns_enabled ? "on" : "off"}
-                        </td>
                         {showServing && (
                           <td className="px-3 py-2">
                             {servingById.get(sc.id) ? (
@@ -1505,7 +1510,6 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                                   : null,
                                 `enabled: ${sc.enabled ? "yes" : "no"}`,
                                 `lease time: ${sc.lease_time}s`,
-                                `DDNS: ${sc.ddns_enabled ? "on" : "off"}`,
                                 `scope_id: ${sc.id}`,
                                 sc.subnet_id
                                   ? `subnet_id: ${sc.subnet_id}`
