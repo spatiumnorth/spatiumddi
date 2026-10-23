@@ -292,9 +292,9 @@ class ScopeCreate(BaseModel):
     # different values is refused rather than silently resolved (#774).
     is_active: bool = True
     enabled: bool | None = None
-    lease_time: int = 86400
-    min_lease_time: int | None = None
-    max_lease_time: int | None = None
+    lease_time: int = Field(default=86400, gt=0)
+    min_lease_time: int | None = Field(default=None, gt=0)
+    max_lease_time: int | None = Field(default=None, gt=0)
     # #637 — per-scope Kea lease-cache override; null = inherit the group.
     lease_cache_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     lease_cache_max_age: int | None = Field(default=None, ge=1)
@@ -376,9 +376,9 @@ class ScopeUpdate(BaseModel):
     # different values is refused instead of silently resolved (#774).
     is_active: bool | None = None
     enabled: bool | None = None
-    lease_time: int | None = None
-    min_lease_time: int | None = None
-    max_lease_time: int | None = None
+    lease_time: int | None = Field(default=None, gt=0)
+    min_lease_time: int | None = Field(default=None, gt=0)
+    max_lease_time: int | None = Field(default=None, gt=0)
     lease_cache_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     lease_cache_max_age: int | None = Field(default=None, ge=1)
     options: Any = None
@@ -721,6 +721,7 @@ async def create_scope(
                 "members."
             ),
         )
+    _validate_lease_times(body.lease_time, body.min_lease_time, body.max_lease_time)
     _create_options = normalize_options(body.options, raw_codes=await group_raw_codes(db, group_id))
     await validate_dhcp_options(
         db, _create_options, group_id=group_id, address_family=address_family
@@ -820,6 +821,29 @@ async def get_scope_failover(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> Sco
     return ScopeServingResponse.model_validate(await scope_serving_report(db, scope))
 
 
+def _validate_lease_times(lease: int, min_lease: int | None, max_lease: int | None) -> None:
+    """422 unless ``min <= lease <= max`` (a null min / max is unset).
+
+    Kea refuses the WHOLE config for an out-of-order set, which stops every
+    scope in the group converging, so it has to be refused at save (#2499).
+    """
+    if min_lease is not None and min_lease > lease:
+        raise HTTPException(
+            status_code=422,
+            detail=f"min_lease_time ({min_lease}) must not exceed lease_time ({lease})",
+        )
+    if max_lease is not None and lease > max_lease:
+        raise HTTPException(
+            status_code=422,
+            detail=f"lease_time ({lease}) must not exceed max_lease_time ({max_lease})",
+        )
+    if min_lease is not None and max_lease is not None and min_lease > max_lease:
+        raise HTTPException(
+            status_code=422,
+            detail=f"min_lease_time ({min_lease}) must not exceed max_lease_time ({max_lease})",
+        )
+
+
 @router.put("/scopes/{scope_id}", response_model=ScopeResponse)
 async def update_scope(
     scope_id: uuid.UUID,
@@ -853,6 +877,14 @@ async def update_scope(
     # ``is_active`` with the stale ``enabled`` a GET supplied (#774).
     if "enabled" in changes:
         changes["is_active"] = changes.pop("enabled")
+    # #2499 — judge the MERGED lease triple (stored row under the patch), so a
+    # PUT that only sets max_lease_time cannot break an existing scope.
+    if {"lease_time", "min_lease_time", "max_lease_time"} & changes.keys():
+        _validate_lease_times(
+            changes.get("lease_time", scope.lease_time),
+            changes.get("min_lease_time", scope.min_lease_time),
+            changes.get("max_lease_time", scope.max_lease_time),
+        )
     # Same alias resolution, same guarantee: the write model refuses a body
     # where the two names disagree, so preferring one can no longer shadow a
     # deliberate edit to the other (#774).
