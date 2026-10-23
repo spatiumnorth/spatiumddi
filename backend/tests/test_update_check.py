@@ -61,3 +61,17 @@ def test_a_nightly_is_offered_only_releases_it_does_not_have() -> None:
 def test_a_latest_that_is_not_a_release_offers_nothing(latest: str) -> None:
     assert _is_newer(latest, "2026.09.04-1") is False
     assert _is_newer(latest, "dev") is False
+
+
+def test_a_nightly_is_not_offered_a_release_it_already_includes(monkeypatch) -> None:
+    """#2354: a nightly's ``VERSION`` is the bare image tag, which names no
+    build date, so the check offered it a release cut before it was built.
+    The running build is spelled the way ``GET /version`` spells it."""
+    from app.config import settings
+    from app.tasks.update_check import running_version
+
+    monkeypatch.setattr(settings, "version", "nightly-20261020")
+    monkeypatch.setattr(settings, "app_version", "0.0.0-nightly-20261020+885ae97")
+    assert running_version() == "0.0.0-nightly-20261020+885ae97"
+    assert _is_newer("2026.10.02-1", running_version()) is False
+    assert _is_newer("2026.10.21-1", running_version()) is True

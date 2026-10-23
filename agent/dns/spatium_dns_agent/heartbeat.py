@@ -15,6 +15,7 @@ from .cache import save_token
 from .config import AgentConfig
 from .config_apply import ApplyStatus
 from .drivers.base import DriverBase
+from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
 from .spool import SpoolManager
 
 log = structlog.get_logger(__name__)
@@ -42,7 +43,7 @@ class HeartbeatClient:
         # assigns itself in). Its ``as_dict()`` rides the heartbeat's
         # ``config`` field so the control plane can tell a server that is up
         # but running a REVERTED config apart from one that converged.
-        # Defaults to a healthy ApplyStatus so a heartbeat sent before the
+        # Defaults to an empty ("nothing applied yet", #2258) ApplyStatus so a heartbeat sent before the
         # first sync doesn't report a failure that hasn't happened.
         self.config_apply: ApplyStatus = ApplyStatus()
         self.failed_ops_count = 0
@@ -109,6 +110,14 @@ class HeartbeatClient:
             headers=features.headers(),
         )
 
+    def _auth_headers(self) -> dict[str, str]:
+        # #2044 — the process id, so the control plane can keep a displaced
+        # process's daemon / config reports off the server row.
+        return {
+            "Authorization": f"Bearer {self.token_ref[0]}",
+            AGENT_INSTANCE_HEADER: AGENT_INSTANCE,
+        }
+
     def send_once(self) -> None:
         # #1232 — a snapshot, and only what it holds is removed on success.
         # The sync thread appends acks while this request is in flight, and
@@ -154,7 +163,7 @@ class HeartbeatClient:
                 resp = c.post(
                     "/api/v1/dns/agents/heartbeat",
                     json=body,
-                    headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                    headers=self._auth_headers(),
                 )
                 if resp.status_code == 422 and "spool" in body and "spool" in resp.text:
                     log.warning("heartbeat_spool_field_unsupported")
@@ -163,7 +172,7 @@ class HeartbeatClient:
                     resp = c.post(
                         "/api/v1/dns/agents/heartbeat",
                         json=body,
-                        headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                        headers=self._auth_headers(),
                     )
             if resp.status_code == 200:
                 data = resp.json()

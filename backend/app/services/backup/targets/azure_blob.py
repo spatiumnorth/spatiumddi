@@ -95,7 +95,10 @@ class AzureBlobDestination(BackupDestination):
             type="password",
             required=False,
             secret=True,
-            description="The multi-line DefaultEndpointsProtocol=... blob from the Azure portal.",
+            description=(
+                "The one-line DefaultEndpointsProtocol=...;AccountName=...;"
+                "AccountKey=... string from the Azure portal (Access keys)."
+            ),
         ),
     )
 

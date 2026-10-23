@@ -103,7 +103,7 @@ export function CreateScopeModal({
   // response echoes these, so the <select> below must speak them too or edits
   // snap back to the first option (#475). Default matches the backend model.
   const [hostnameSync, setHostnameSync] = useState(
-    scope?.hostname_sync_mode ?? "on_static_only",
+    scope?.hostname_sync_mode ?? "on_lease",
   );
   const [options, setOptions] = useState<DHCPOption[]>(scope?.options ?? []);
   // DHCPv6 mode (issue #52) — only surfaced/sent for IPv6 scopes.
@@ -962,7 +962,7 @@ export function CreateScopeModal({
 
         <Field
           label="Hostname → IPAM Sync"
-          hint="How learned hostnames from DHCP clients feed back into IPAM address records."
+          hint="Whether a lease's client hostname is written onto its IPAM address record. The record itself is always created."
         >
           <select
             className={inputCls}
