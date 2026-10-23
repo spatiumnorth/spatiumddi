@@ -25,7 +25,7 @@ import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dns_names import contains_control_chars, primary_ns_error
+from app.core.dns_names import contains_control_chars, primary_ns_error, structured_rdata_error
 from app.drivers.dns import is_agentless
 from app.models.audit import AuditLog
 from app.models.auth import User
@@ -193,6 +193,20 @@ async def _build_records_for_zone(
                 f"{r.name or '@'} {r.record_type}: dropped — control character "
                 "in the record name or value"
             )
+            continue
+        # #2502 — rdata the agent would write verbatim and BIND would refuse
+        # is dropped here, not stored: one such row quarantines the server's
+        # whole config bundle.
+        rdata_err = structured_rdata_error(
+            r.record_type,
+            r.value,
+            priority=r.priority,
+            weight=r.weight,
+            port=r.port,
+            origin=zone_fqdn,
+        )
+        if rdata_err is not None:
+            skipped.append(f"{r.name or '@'} {r.record_type}: dropped — {rdata_err}")
             continue
         # FQDN is "<label>.<zone_fqdn>" with the apex label "@"
         # collapsing to just the zone fqdn.

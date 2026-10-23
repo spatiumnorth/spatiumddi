@@ -203,7 +203,10 @@ the canonical wording lives in `CLAUDE.md`.
     zero-footprint UI convenience, or a hand-invoked read-only diagnostic;
     otherwise disabled. Declare the value in the guard test
     `tests/test_feature_module_defaults.py`, and never seed a
-    `feature_module` row in a migration.
+    `feature_module` row in a migration. A beat task the module owns
+    gets `@module_gated("<module id>")` under `@celery_app.task`; a beat
+    task that must run regardless goes in `UNGATED_BEAT_TASKS`
+    (`app/tasks/module_gate.py`) with its reason (#2279).
 15. **New integrations show up on the Dashboard** — wire a new
     read-only integration mirror into both the IPAM `IntegrationsPanel`
     and the dedicated Integrations dashboard tab.
