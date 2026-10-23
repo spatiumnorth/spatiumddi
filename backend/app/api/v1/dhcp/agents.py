@@ -861,7 +861,6 @@ async def agent_config_longpoll(
                                     }
                                     for st in s.statics
                                 ],
-                                "ddns_enabled": s.ddns_enabled,
                             }
                             for s in bundle.scopes
                         ],

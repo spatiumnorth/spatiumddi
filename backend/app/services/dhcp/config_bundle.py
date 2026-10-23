@@ -362,8 +362,6 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 ),
                 pools=pools,
                 statics=statics,
-                ddns_enabled=sc.ddns_enabled,
-                ddns_hostname_policy=sc.ddns_hostname_policy,
                 is_active=sc.is_active,
                 address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
                 v6_address_mode=getattr(sc, "v6_address_mode", "stateful") or "stateful",

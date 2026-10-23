@@ -92,8 +92,8 @@ DHCPScope
     "bootfile-name": "pxelinux.0",
     "code:176": "MCIPADD=10.0.0.20"   -- raw vendor option by code (see below)
   }
-  ddns_enabled: bool
-  ddns_hostname_policy: enum(client, server_name, derived, none)  -- default client (#1308)
+  ddns_enabled: bool                 -- INERT (#2270): DDNS is subnet-level; only false is accepted
+  ddns_hostname_policy: str          -- INERT (#2270): only the default "client" is accepted
   dns_track_dynamic_leases: bool (default true)  -- see "Dynamic-lease DNS drift" below
   address_family: enum(ipv4, ipv6)   -- inferred from the bound subnet's CIDR
   v6_address_mode: enum(stateful, stateless, slaac)  -- v6 only (issue #52)

@@ -128,6 +128,18 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DHCP scope's DDNS toggle and hostname policy did nothing, yet
+  reloaded Kea whenever they changed (#2270).** DDNS is gated only by
+  the subnet's own settings; the scope's `ddns_enabled` and
+  `ddns_hostname_policy` reached neither Kea nor DNS, but were hashed
+  into the DHCP config ETag, so flipping one restarted Kea's HA state
+  for a byte-identical config. They no longer enter the bundle or the
+  agent wire, so such an edit converges nothing. The scope API now
+  refuses a change to either with a 422 naming the field and pointing
+  at the subnet's DDNS settings (values already stored are tolerated on
+  save), and the scope dialog and DHCP lists no longer show a DDNS
+  control or column.
+
 - **A scope's "Hostname → IPAM Sync" setting now does something
   (#2269).** It was stored and never read: every lease's hostname
   was written to IPAM whatever the scope said, so "Don't sync to
