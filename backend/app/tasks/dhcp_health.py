@@ -36,6 +36,7 @@ from app.db import task_connect_args
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import DHCPServer
 from app.services.feature_modules import is_module_enabled
+from app.tasks.module_gate import module_gated
 
 # If agent hasn't heartbeat'd in this long, mark unreachable.
 AGENT_STALE_AFTER = timedelta(seconds=120)
@@ -150,6 +151,7 @@ async def _enqueue_all() -> None:
 
 
 @celery_app.task(name="app.tasks.dhcp_health.check_all_dhcp_servers_health", bind=True)
+@module_gated("core.dhcp")
 def check_all_dhcp_servers_health(self: object) -> None:  # type: ignore[type-arg]
     """Fan-out task — enqueues one health check per registered DHCP server.
 

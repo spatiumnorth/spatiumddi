@@ -8845,14 +8845,29 @@ async def update_address(
             ],
             already=[ip.forward_zone_id, *(ip.extra_zone_ids or [])],
         )
-    hostname_or_zone_touched = "hostname" in touched or "dns_zone_id" in touched
-    mac_touched = "mac_address" in touched
+    # "Touched" means CHANGED, not merely present: the Edit dialog sends its
+    # hostname, MAC and zone on every Save, so presence alone re-ran every
+    # collision check and an untouched Save of a row that already shared a MAC
+    # or hostname (stored with a confirmation) was refused again (#2467).
+    hostname_changed = "hostname" in touched and (body.hostname or None) != (ip.hostname or None)
+    zone_changed = (
+        "dns_zone_id" in touched
+        and (uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None) != ip.forward_zone_id
+    )
+    hostname_or_zone_touched = hostname_changed or zone_changed
+    new_mac_norm = _normalize_mac(body.mac_address)
+    old_mac_norm = _normalize_mac(str(ip.mac_address) if ip.mac_address else None)
+    mac_touched = "mac_address" in touched and (
+        new_mac_norm != old_mac_norm or (new_mac_norm is None and bool(body.mac_address))
+    )
     # Effective role for the collision check — pending value if the
     # client touched it, otherwise the existing row's role. The role
     # exemption only matters when MAC was touched (otherwise no MAC
     # collision check runs anyway).
     effective_role = body.role if "role" in touched else ip.role
-    extra_zones_touched = "extra_zone_ids" in touched
+    extra_zones_touched = "extra_zone_ids" in touched and sorted(
+        body.extra_zone_ids or []
+    ) != sorted(ip.extra_zone_ids or [])
     if not body.force and (hostname_or_zone_touched or mac_touched or extra_zones_touched):
         subnet_for_check = await db.get(Subnet, ip.subnet_id)
         new_hostname = body.hostname if body.hostname is not None else ip.hostname
@@ -9224,6 +9239,9 @@ class ProfileScanResponse(BaseModel):
     "/addresses/{address_id}/profile",
     response_model=ProfileScanResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    # An nmap scan under the un-gated IPAM router (#2279): 404 with the
+    # nmap module off, exactly as /nmap/scans does.
+    dependencies=[Depends(require_module("tools.nmap"))],
 )
 async def profile_address(
     address_id: uuid.UUID,
