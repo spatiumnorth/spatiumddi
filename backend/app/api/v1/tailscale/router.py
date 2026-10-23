@@ -134,7 +134,7 @@ class TenantResponse(BaseModel):
     api_key_expires_at: datetime | None
     # "api" (read from Tailscale) | "operator" (typed in) | null.
     api_key_expiry_source: str | None
-    # ok | expiring | expired | rejected | unknown — see
+    # ok | expiring | expired | rejected | unknown | disabled — see
     # app/services/integration_credentials.py.
     credential_state: str
     credential_days_left: int | None
@@ -179,6 +179,7 @@ def _to_response(t: TailscaleTenant) -> TenantResponse:
         expires_at=t.api_key_expires_at,
         rejected=is_auth_rejected(t.last_sync_error),
         now=datetime.now(UTC),
+        enabled=t.enabled,
     )
     return TenantResponse(
         id=t.id,

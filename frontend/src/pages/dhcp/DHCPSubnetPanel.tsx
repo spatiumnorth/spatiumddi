@@ -160,7 +160,6 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
             <p className="text-xs text-muted-foreground">
               Lease {scope.lease_time}s · {pools.length} pool
               {pools.length !== 1 ? "s" : ""}
-              {scope.ddns_enabled && " · DDNS"}
             </p>
           </div>
         </div>

@@ -34,7 +34,7 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 - **k3s static binary** (~70 MB) at `/usr/local/bin/k3s`; `kubectl` / `crictl` / `ctr` symlink to it.
 - **k3s airgap images** (CoreDNS / local-path / pause / metrics-server) as zst-compressed tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst`. k3s auto-imports them into containerd at boot.
 - **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.10.2-alpine for the Control plane role.
-- **Control-plane environment** is written once, under the chart's `sharedEnv` value, which the umbrella chart appends to the api, worker AND beat containers (#1826). That is where `APPLIANCE_MODE`, `APPLIANCE_VERSION` (re-read from the booted slot's `/etc/spatiumddi/appliance-release` on every boot, so it follows an upgrade or rollback; on a multi-node cluster it is the seed's, since only the seed renders this manifest), `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and `INITIAL_NTP_SERVERS` live. When the slot-image mirror is on, its URL and secret go to the api and the worker (the worker's upgrade preflight checks the mirror's free space), not to beat. The worker runs alert evaluation (`node_pressure`, `cluster_dns_degraded`) and the rolling-upgrade orchestrator, so a variable only the api carries makes every `appliance_mode` gate read as off there. Agent pre-shared keys stay under `api.env`: only the api reads them. `charts-render-check.sh` fails a render where api, worker and beat disagree on the shared set, or where beat carries the mirror secret.
+- **Control-plane environment** is written once, under the chart's `sharedEnv` value, which the umbrella chart appends to the api, worker AND beat containers (#1826). That is where `APPLIANCE_MODE`, `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and `INITIAL_NTP_SERVERS` live. `APPLIANCE_VERSION` joins them from a value of its own, `applianceVersion`: it is re-read from the booted slot's `/etc/spatiumddi/appliance-release` on every boot, so it follows an upgrade or rollback, and on a multi-node cluster it is the seed's, since only the seed renders this manifest. It is not a `sharedEnv` entry because a cluster Rolling Upgrade holds it with `image.tag` until every node runs the target (#2176): a HelmChartConfig can pin a single value but replaces a list whole, so as an entry the seed's boot onto its new slot rolled the api, worker and beat mid-run. When the slot-image mirror is on, its URL and secret go to the api and the worker (the worker's upgrade preflight checks the mirror's free space), not to beat. The worker runs alert evaluation (`node_pressure`, `cluster_dns_degraded`) and the rolling-upgrade orchestrator, so a variable only the api carries makes every `appliance_mode` gate read as off there. Agent pre-shared keys stay under `api.env`: only the api reads them. `charts-render-check.sh` fails a render where api, worker and beat disagree on the shared set, or where beat carries the mirror secret.
 - **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Appliance installs (and the supervisor on the Control plane); the umbrella chart drives the Control plane. Built at release time + signed.
 - **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
 
@@ -161,7 +161,7 @@ answered ~5 % of the queries the load generator sent — the control plane
 had failed over, the data plane had nothing to serve with. Assign the DNS
 and DHCP roles on every node you expect to keep serving during a failover.
 
-The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). RAM has a hard floor as well, and the installer does not enforce it: the kubelet sets aside 2 GiB on every node (`kube-reserved` 1 GiB, `system-reserved` 512 MiB and the 512 MiB `memory.available` eviction threshold — #1124) and schedules pods only into what is left. A single-node control plane requests about 1.6 GiB, so it needs **at least 4 GiB of RAM** to start at all, and a DNS / DHCP appliance **at least 3 GiB**; below that the pods stay `Pending` on `Insufficient memory`. The serving roles add their own requests on top of that: BIND and Technitium 256Mi, Kea, PowerDNS and the looking-glass collector 128Mi each. They are sized above the pods' idle working sets because the kubelet evicts a pod running over its memory request before any pod within its request, whatever the PriorityClasses say (#1828). A single node with the control plane plus the DNS and DHCP roles therefore requests about 2 GiB, which uses up all the allocatable memory a 4 GiB node has. That includes an existing install: a slot upgrade to a release carrying #1124 on a smaller box comes back with nothing schedulable. 8 GiB remains the comfortable recommendation for a control plane. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
+The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). RAM has a hard floor as well, and the installer does not enforce it: the kubelet sets aside 2 GiB on every node (`kube-reserved` 1 GiB, `system-reserved` 512 MiB and the 512 MiB `memory.available` eviction threshold — #1124) and schedules pods only into what is left. A single-node control plane requests about 1.6 GiB, so it needs **at least 4 GiB of RAM** to start at all, and a DNS / DHCP appliance **at least 3 GiB**; below that the pods stay `Pending` on `Insufficient memory`. The serving roles add their own requests on top of that: BIND and Technitium 256Mi (BIND's is an eighth of its RAM-sized memory limit, so 256Mi up to a ~10 GB node and more above, #2223), Kea, PowerDNS and the looking-glass collector 128Mi each. They are sized above the pods' idle working sets because the kubelet evicts a pod running over its memory request before any pod within its request, whatever the PriorityClasses say (#1828). A single node with the control plane plus the DNS and DHCP roles therefore requests about 2 GiB, which uses up all the allocatable memory a 4 GiB node has. That includes an existing install: a slot upgrade to a release carrying #1124 on a smaller box comes back with nothing schedulable. 8 GiB remains the comfortable recommendation for a control plane. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
 
 ### Appliance management surfaces (k3s-aware)
 
@@ -170,7 +170,7 @@ The `/appliance` section in the SpatiumDDI UI talks to k3s directly via the api 
 - **Cluster tab** (#402 — folds the former Containers/Pods tab + the etcd-snapshots section into one tab via a left sub-nav, named *Cluster* rather than *Kubernetes* for operator clarity). Three sub-sections: **Overview** — a live SSE-fed (2 s) health dashboard (KPI ribbon, CPU / memory hero chart, per-node radial gauges with the host's real partition list, workload-health panel, top-pods leaderboard) built from kubeapi node / pod listings + per-node kubelet `stats/summary` (there is no Prometheus on the appliance); **Pods** — lists every pod in the spatium namespace via kubeapi `GET /api/v1/namespaces/spatium/pods`, restart = `DELETE` the pod (owning Deployment / DaemonSet recreates it), logs = SSE wrapping kubeapi's `?follow=true` pod-log endpoint; **etcd** — the recoverable `ETCDSnapshotFile` inventory.
 - **TLS cert manager**. Patches the `spatium-appliance-tls` Secret in place via `kubectl patch secret`. Bumps a checksum annotation on the frontend Deployment to trigger a rollout (k8s doesn't auto-roll on Secret changes — the annotation acts as the trigger).
 - **Logs & Diagnostics → Self-test**. Five-check battery: external DNS resolution, kubeapi reachability via the ServiceAccount, every spatium pod's health (Running + healthy / Succeeded Jobs OK), informational DHCP + DNS role presence (OK when not assigned).
-- **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets.
+- **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets. Environment values appear only for known non-secret settings (every other variable is listed with its value replaced), and every file is swept for credential-shaped values such as keys, tokens and passwords embedded in URLs. That sweep is best effort, so review the bundle before sharing it.
 - **OS Versions**. Atomic A/B slot upgrades — same machinery as pre-#183 (Phase 8); the slot raw.xz carries a complete rootfs with k3s + baked images + chart tarballs. A slot upgrade is also an effective container upgrade because images are baked. For an upgrade scheduled from an imported/uploaded image (#199), the download is **verified by the stored sha256** (the integrity guarantee), which lets the host runner relax TLS cert-verify *only* for the appliance's own self-served URL behind the self-signed web cert — external public-CA URLs stay fully verified (#386). The Fleet drilldown shows a **live per-phase progress stepper** (download % → verify → write → bootloader → reboot-pending) with an expandable `slot-upgrade.log` tail and an honest failure card, and a stuck apply re-fires once per distinct desired-state rather than looping (#386). Uploaded/imported image bytes are persisted on a host-path mount so they survive an api restart (#386).
 
 The api pod's ServiceAccount keeps minimal RBAC: namespace-scoped pods + pods/log read, the specific `spatium-appliance-tls` Secret patch, and the frontend Deployment annotation patch. The only cluster-scoped grant is **read-only** `nodes` + `nodes/proxy [get]` (added in #402) so the Cluster Overview dashboard can read per-node kubelet stats. Nothing destructive.
@@ -372,11 +372,47 @@ that is a function of the **registered node count**:
 | Nodes | Target |
 |---|---|
 | 1 | Stock: 1 replica, no fast-evict toleration, no anti-affinity — both buy nothing with one node, and a 20 s toleration would evict the only DNS pod with nowhere to put it |
-| ≥2 | `min(nodes, 2)` replicas, fast-evict tolerations, and **required** (not preferred) pod anti-affinity |
+| ≥2 | One replica per node, k3s's own tolerations, and **required** (not preferred) pod anti-affinity; the kube-dns Service gets `trafficDistribution: PreferSameNode` |
 
 Required anti-affinity is deliberate and #633 has the evidence: *preferred*
 parked both replicas on the seed, and Kubernetes never rebalances running
 pods, so the "HA" DNS died with the seed anyway.
+
+One replica per node, with node-local routing, is #1718. Until a lost node
+reads NotReady (about 40 s), its CoreDNS pod stays a ready kube-dns endpoint.
+With replicas load-balanced across nodes, about half of every other node's
+lookups went to that pod and stalled for the resolver's whole timeout. Redis
+Sentinel resolves its peers inside its event loop, so the stalls put the
+surviving sentinels into TILT, and the Redis failover took 77 s instead of
+seconds. Each node now resolves through its own replica, falling back to the
+others only while its own is not ready. A lost node takes only its own pods'
+DNS with it.
+
+The template keeps k3s's own tolerations (#1753). Earlier builds added a 20 s
+fast-evict pair. The tolerations list is the one template field both the
+supervisor and k3s's bundled manifest set, and k3s force re-applies that
+manifest at every server start. So each node's return rolled CoreDNS out
+twice: once for k3s's re-apply, once for the supervisor's patch back. Each
+rollout replaced every CoreDNS pod. With one replica per node, a fast
+eviction has nowhere to put the evicted pod anyway. k3s's re-apply now
+changes nothing.
+
+The api Service gets the same node-local routing as kube-dns (#1805), from the
+appliance's own values rather than the chart's: firstboot renders
+`api.service.trafficDistribution: PreferSameNode` into the `spatium-control`
+HelmChart, and the seed supervisor writes the same key into the
+`spatium-control` HelmChartConfig on every heartbeat, which is what a grown
+or upgraded cluster renders. Every control-plane node runs one api pod, so
+each node's in-cluster callers (its supervisor's heartbeat, the DNS and DHCP
+agents, the frontend's `/api` proxy) use that node's api pod while it is
+ready. A lost node's api pod stays listed until the node reads NotReady, and
+before this a share of every other node's heartbeats waited out their 40 s
+timeout on it, which left a healthy node's heartbeat stale past the demote
+guard's 90 s. The umbrella chart's default is `""`, so an install on your own
+Kubernetes keeps kube-proxy's spread over every api pod. One consequence on
+the appliance: traffic through the control-plane VIP enters through the
+frontend on the node announcing the VIP, and that node's api pod serves it
+alone while it is ready.
 
 **What the Cluster DNS card means** (Cluster → Overview, #985). Until now the
 appliance acted on cluster DNS and showed nothing about it, so a CoreDNS that
@@ -495,7 +531,8 @@ state on its heartbeat:
   `k8s_api.apply_control_plane_overrides()` upserts the `spatium-control`
   override (api/frontend/worker `replicas` + CNPG `instances` + Redis
   `sentinel.replicas` = committed member count, plus
-  `frontend.controlPlaneVIP`). helm-controller *merges* a
+  `frontend.controlPlaneVIP`, plus the api Service's
+  `trafficDistribution: PreferSameNode`). helm-controller *merges* a
   HelmChartConfig on top of its same-named HelmChart on every reconcile.
   Crucially the HelmChartConfig is **not** in the auto-deploy manifests
   dir, so a k3s restart's re-apply of the firstboot HelmChart defaults
@@ -565,7 +602,7 @@ state on its heartbeat:
 
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
-  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
   | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 
@@ -1158,22 +1195,35 @@ Nothing is emitted in `hard` mode (the appliance's shape — required
 anti-affinity already pins one replica per node, #590), in `none` mode, at
 `replicas: 1`, or when the operator supplied their own list.
 
-### Memory sizing for named (#1725)
+### Memory sizing for named (#1725, #2223)
 
-`dns-bind9` carries a memory request of 256Mi and a limit of 2Gi
-(`dnsBind9.resources` in `charts/spatiumddi-appliance/values.yaml`). Without
-a limit, one ~580k-entry catalog blocklist in a group with a view took the
-pod to 2.8-3.6 GB on a 6 GiB node; the kubelet then evicted the worker,
-Postgres and the api, and the kernel killed named. With the limit the kernel
-kills named inside the pod's own cgroup instead, and the control plane stays
-up.
+`dns-bind9` carries a memory limit and request sized from node RAM: a
+quarter of the RAM of the **smallest** node labelled for dns-bind9, rounded
+to whole GiB, at least 2Gi and at most 8Gi, with the request an eighth of
+the limit. So a 4 GB node gets 2Gi / 256Mi (the floor), a 16 GB node
+4Gi / 512Mi, and a 64 GB node 8Gi / 1Gi (the cap). The supervisor writes it
+into the role chart as `dnsBind9.memory`; the chart's own default there,
+2Gi / 256Mi, is what a render with no supervisor gets. Without a limit, one
+~580k-entry catalog blocklist in a group with a view took the pod to
+2.8-3.6 GB on a 6 GiB node; the kubelet then evicted the worker, Postgres
+and the api, and the kernel killed named. With the limit the kernel kills
+named inside the pod's own cgroup instead, and the control plane stays up.
+Before #2223 the limit was a fixed 2Gi, which ddi-pg's scale lab hit at
+about 2M records.
 
-Unlike the api, worker and Postgres limits, this one is **not** sized from
-the node's RAM. The role chart is one HelmChart for the whole cluster and
-every node's supervisor writes it, so it must render the same everywhere
-(#1137), and a DaemonSet has one limit for all its pods. A node whose
-blocklists need more raises it for the cluster in the `spatiumddi-appliance`
-HelmChartConfig. Edit it in place rather than applying a fresh manifest:
+It is one value for the cluster, not each node's own. The role chart is one
+HelmChart for the whole cluster and every member's supervisor writes it, so
+it must render the same everywhere (#1137), and a DaemonSet has one limit
+for all its pods, so the smallest node it runs on decides. The size is the
+kubelet's `status.capacity.memory`, which a virtio balloon does not move. A
+node that joins with less RAM lowers it for every DNS node, which is a
+rolling restart of named. If the node list cannot be read the supervisor
+writes nothing that heartbeat rather than fall back to the 2Gi default.
+
+To pin a value instead, set `dnsBind9.resources.limits.memory` (and, if you
+like, `requests.memory`) in the `spatiumddi-appliance` HelmChartConfig: a
+memory value in `dnsBind9.resources` always wins over the sizing. Edit it in
+place rather than applying a fresh manifest:
 
 ```sh
 kubectl -n kube-system edit helmchartconfig spatiumddi-appliance
@@ -1222,7 +1272,7 @@ fires (see `DNS.md` 8.0). The agent also derives named's `max-cache-size`
 from the limit (a quarter of it, split across the recursive views), so the
 resolver caches cannot take the RPZ's share.
 
-The request (256Mi) is what the scheduler reserves; the limit is a ceiling,
+The request (an eighth of the limit) is what the scheduler reserves; the limit is a ceiling,
 so the pod is Burstable and a 3 GiB DNS-only node still schedules. Under node
 memory pressure the kubelet evicts pods using more than their request in
 PriorityClass order, and `dns-bind9` runs in `spatium-service`, the highest
@@ -1318,8 +1368,9 @@ grandfathered.
 
 **Compliance + Copilot.** The `no_lanwide_control_plane_ports` conformity check
 (platform-kind, PCI-DSS 1.2.1 / HIPAA segmentation) fails only on a *confirmed*
-LAN-wide node and reports **PASS-stale** for nodes it can't currently reach
-(never connectivity-FAIL, per #5). Five Operator-Copilot MCP tools
+LAN-wide node and reports **warn** for stale or unverified nodes (unknown is
+not compliant, but lost contact is never a FAIL), and **not applicable** when no
+appliance reports at all (#2259). Five Operator-Copilot MCP tools
 (`find_firewall_policies` / `count_firewall_policies` / `find_firewall_aliases`
 / `find_firewall_effective` reads + the default-off `propose_toggle_firewall_policy`)
 surface the model to the chat, tagged `module="appliance.firewall"`.

@@ -467,7 +467,9 @@ broke it.
 
 **A bundle the daemon dies on is not re-applied blindly either (#2019).**
 The quarantine only hears of failures the agent survives. A bundle too big
-for the container's memory limit (a large RPZ blocklist set) applies cleanly
+for the container's memory limit (a large RPZ blocklist set; on the appliance
+that limit is sized from node RAM, see `APPLIANCE.md` "Memory sizing for
+named") applies cleanly
 and then named is OOM-killed while it loads the zones; nothing is caught, and
 the agent used to re-apply that same cached bundle at every start, before
 its sync thread existed, so the server crash-looped even after the operator
@@ -1049,6 +1051,15 @@ dns-bind9-ns1:
 > plane cannot tell, so delete the stale row(s) under DNS → Server groups and
 > save again. The Operator Copilot's role assignment moves the row the same
 > way.
+>
+> On an appliance, a brand-new agent lands in the appliance's assigned DNS
+> group, not the one its `AGENT_GROUP` names (#2190). The supervisor writes
+> the new chart values before it labels the node for a new engine, and labels
+> it only once the engine's DaemonSet carries the new group, but the
+> registration does not rely on that: an agent whose hostname is one approved
+> appliance's, running that appliance's current engine, registers into the
+> appliance's group and adopts its row there by hostname. A row the agent
+> already has (found by agent id) still never moves.
 
 ---
 

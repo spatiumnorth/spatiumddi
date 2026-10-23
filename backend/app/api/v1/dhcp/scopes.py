@@ -19,7 +19,7 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import DB, CurrentUser, require_superadmin
+from app.api.deps import DB, CurrentUser, ensure_superadmin
 from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp._failover_schemas import ScopeServingResponse
 from app.core.agent_wake import collect_wake, dhcp_group_channel
@@ -47,7 +47,6 @@ from app.services.tags import apply_tag_filter
 
 router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_scope"))])
 
-VALID_HOSTNAME_POLICIES = {"client", "server_name", "derived", "none"}
 VALID_SYNC_MODES = {"disabled", "on_lease", "on_static_only", "ipam", "learned"}
 # Fields on ScopeUpdate an explicit ``null`` may CLEAR (#475). Every other
 # nullable column keeps its ``exclude_none`` behaviour — a stray null is dropped
@@ -121,22 +120,34 @@ def _normalize_sync_mode(v: str | None) -> str:
     value, which the old ``<select>`` couldn't render, so edits snapped back
     (#475). The UI now speaks the canonical vocabulary directly; these legacy
     values are still mapped in for backward-compatible API clients. Empty /
-    missing defaults to ``on_static_only`` (the model default).
+    missing defaults to ``on_lease`` (the model default).
     """
     if not v:  # None or ""
-        return "on_static_only"
+        return "on_lease"
     legacy = {"none": "disabled", "ipam": "on_static_only", "learned": "on_lease"}
     return legacy.get(v, v)
 
 
+_SCOPE_DDNS_MOVED = (
+    "DDNS is configured per subnet, not per scope: set it under IPAM -> the "
+    "subnet's DDNS settings (inherited from its block or IP space). A scope's "
+    "DDNS fields have no effect on Kea or on DNS (#2270)."
+)
+
+
 def _check_hostname_policy(v: str | None) -> str:
-    """The one vocabulary for a scope's DDNS hostname policy, on create and on
-    update (#1308). Blank means the model default, ``client``."""
-    if v in (None, ""):
+    """A scope's DDNS hostname policy is inert (#2270), so the only value
+    accepted is the model default, ``client`` (blank means the same). Any other
+    value is refused naming the field, rather than stored and ignored."""
+    if v in (None, "", "client"):
         return "client"
-    if v not in VALID_HOSTNAME_POLICIES:
-        raise ValueError(f"ddns_hostname_policy must be one of {sorted(VALID_HOSTNAME_POLICIES)}")
-    return v
+    raise ValueError(f"ddns_hostname_policy has no effect on a scope. {_SCOPE_DDNS_MOVED}")
+
+
+def _check_scope_ddns_enabled(v: bool | None) -> bool:
+    if v:
+        raise ValueError(f"ddns_enabled has no effect on a scope. {_SCOPE_DDNS_MOVED}")
+    return False
 
 
 # Fields the scope write models accept under two names, as
@@ -292,16 +303,16 @@ class ScopeCreate(BaseModel):
     # different values is refused rather than silently resolved (#774).
     is_active: bool = True
     enabled: bool | None = None
-    lease_time: int = 86400
-    min_lease_time: int | None = None
-    max_lease_time: int | None = None
+    lease_time: int = Field(default=86400, gt=0)
+    min_lease_time: int | None = Field(default=None, gt=0)
+    max_lease_time: int | None = Field(default=None, gt=0)
     # #637 — per-scope Kea lease-cache override; null = inherit the group.
     lease_cache_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     lease_cache_max_age: int | None = Field(default=None, ge=1)
     options: Any = None
     ddns_enabled: bool = False
     ddns_hostname_policy: str | None = "client"
-    hostname_to_ipam_sync: str = "on_static_only"
+    hostname_to_ipam_sync: str = "on_lease"
     hostname_sync_mode: str | None = None
     # When False, this scope's dynamic-pool lease mirrors are excluded from the
     # IPAM↔DNS drift check (ephemeral leases don't read as "out of sync").
@@ -350,6 +361,11 @@ class ScopeCreate(BaseModel):
     def _h(cls, v: str | None) -> str | None:
         return _check_hostname_policy(v)
 
+    @field_validator("ddns_enabled")
+    @classmethod
+    def _ddns(cls, v: bool) -> bool:
+        return _check_scope_ddns_enabled(v)
+
     @field_validator("ra_interface")
     @classmethod
     def _ra_iface(cls, v: str) -> str:
@@ -376,9 +392,9 @@ class ScopeUpdate(BaseModel):
     # different values is refused instead of silently resolved (#774).
     is_active: bool | None = None
     enabled: bool | None = None
-    lease_time: int | None = None
-    min_lease_time: int | None = None
-    max_lease_time: int | None = None
+    lease_time: int | None = Field(default=None, gt=0)
+    min_lease_time: int | None = Field(default=None, gt=0)
+    max_lease_time: int | None = Field(default=None, gt=0)
     lease_cache_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     lease_cache_max_age: int | None = Field(default=None, ge=1)
     options: Any = None
@@ -721,6 +737,7 @@ async def create_scope(
                 "members."
             ),
         )
+    _validate_lease_times(body.lease_time, body.min_lease_time, body.max_lease_time)
     _create_options = normalize_options(body.options, raw_codes=await group_raw_codes(db, group_id))
     await validate_dhcp_options(
         db, _create_options, group_id=group_id, address_family=address_family
@@ -820,6 +837,29 @@ async def get_scope_failover(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> Sco
     return ScopeServingResponse.model_validate(await scope_serving_report(db, scope))
 
 
+def _validate_lease_times(lease: int, min_lease: int | None, max_lease: int | None) -> None:
+    """422 unless ``min <= lease <= max`` (a null min / max is unset).
+
+    Kea refuses the WHOLE config for an out-of-order set, which stops every
+    scope in the group converging, so it has to be refused at save (#2499).
+    """
+    if min_lease is not None and min_lease > lease:
+        raise HTTPException(
+            status_code=422,
+            detail=f"min_lease_time ({min_lease}) must not exceed lease_time ({lease})",
+        )
+    if max_lease is not None and lease > max_lease:
+        raise HTTPException(
+            status_code=422,
+            detail=f"lease_time ({lease}) must not exceed max_lease_time ({max_lease})",
+        )
+    if min_lease is not None and max_lease is not None and min_lease > max_lease:
+        raise HTTPException(
+            status_code=422,
+            detail=f"min_lease_time ({min_lease}) must not exceed max_lease_time ({max_lease})",
+        )
+
+
 @router.put("/scopes/{scope_id}", response_model=ScopeResponse)
 async def update_scope(
     scope_id: uuid.UUID,
@@ -853,6 +893,14 @@ async def update_scope(
     # ``is_active`` with the stale ``enabled`` a GET supplied (#774).
     if "enabled" in changes:
         changes["is_active"] = changes.pop("enabled")
+    # #2499 — judge the MERGED lease triple (stored row under the patch), so a
+    # PUT that only sets max_lease_time cannot break an existing scope.
+    if {"lease_time", "min_lease_time", "max_lease_time"} & changes.keys():
+        _validate_lease_times(
+            changes.get("lease_time", scope.lease_time),
+            changes.get("min_lease_time", scope.min_lease_time),
+            changes.get("max_lease_time", scope.max_lease_time),
+        )
     # Same alias resolution, same guarantee: the write model refuses a body
     # where the two names disagree, so preferring one can no longer shadow a
     # deliberate edit to the other (#774).
@@ -868,21 +916,22 @@ async def update_scope(
             status_code=422,
             detail=f"invalid hostname sync mode: {changes['hostname_to_ipam_sync']}",
         )
-    # #1308 — the same vocabulary as create: the scope dialog offered
-    # ``ipam`` / ``generate``, which create refused with a 422 and this path
-    # stored. Only a CHANGED policy is checked, the way options are (#597,
-    # #1228): the dialog sends the stored policy back with every save, so one
-    # written before this check must not block an unrelated edit.
-    if (
-        "ddns_hostname_policy" in changes
-        and changes["ddns_hostname_policy"] != scope.ddns_hostname_policy
-    ):
-        try:
+    # #2270 — a scope's DDNS fields are inert (DDNS is subnet-level), so a
+    # CHANGE to either is refused with a 422 naming it. Only a change: the
+    # dialog of an older client sends the stored values back on every save, and
+    # a scope created before this check may hold ``ddns_enabled=true``.
+    try:
+        if "ddns_enabled" in changes and changes["ddns_enabled"] != scope.ddns_enabled:
+            _check_scope_ddns_enabled(changes["ddns_enabled"])
+        if (
+            "ddns_hostname_policy" in changes
+            and changes["ddns_hostname_policy"] != scope.ddns_hostname_policy
+        ):
             changes["ddns_hostname_policy"] = _check_hostname_policy(
                 changes["ddns_hostname_policy"]
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if "options" in changes:
         normalized = normalize_options(
             changes["options"], raw_codes=await group_raw_codes(db, scope.group_id)
@@ -975,7 +1024,7 @@ async def delete_scope(
     """
     if permanent:
         # Refused before a change request could be queued for it.
-        require_superadmin(user)
+        ensure_superadmin(user)
     op = get_operation("delete_scope")
     assert op is not None  # registered at import
     args = DeleteScopeArgs(scope_id=scope_id, permanent=permanent)

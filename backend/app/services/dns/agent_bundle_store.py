@@ -36,6 +36,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.versions import canonical_version
 from app.models.dns import DNSAgentBundle, DNSServer
 
 logger = structlog.get_logger(__name__)
@@ -89,7 +90,12 @@ _MAX_ERROR = 2000
 #   the agent keys its "this RPZ file is unchanged, hard-link it" decision on.
 #   Bundles without a blocklist, and every non-BIND9 bundle, are byte-identical
 #   to 11's, so the re-render this bump forces moves no ETag for them.
-RENDERER_REVISION = 12
+# 13 (#2124): a ``sinkhole`` entry whose list names an address carries
+#   ``sinkhole_ip`` (the agent renders it as A + AAAA local data). It is part
+#   of the entry, so it is inside ``rpz_sha256`` too.
+# 14 (#2264): a BIND9 server's bundle carries a non-default ``allow_query_cache``
+#   (the agent now renders ``allow-query-cache``); unchanged for default groups.
+RENDERER_REVISION = 14
 
 
 def _serves(revision: int | None) -> bool:
@@ -195,13 +201,21 @@ async def newest(db: AsyncSession, server: DNSServer) -> DNSAgentBundle | None:
     """
     if server.bundle_watermark is None or not _serves(server.bundle_renderer_revision):
         return None
+    # populate_existing (#2040): the long-poll calls this once per pass on one
+    # session while still holding the previous pass's row, and a newer
+    # renderer revision re-renders a watermark IN PLACE (same id, ``store``).
+    # Without it the identity map hands back the old ETag and snapshot, so the
+    # poll compares against an ETag that no longer exists and the render
+    # reaches the agent only at the long-poll timeout.
     return (
         await db.execute(
-            select(DNSAgentBundle).where(
+            select(DNSAgentBundle)
+            .where(
                 DNSAgentBundle.server_id == server.id,
                 DNSAgentBundle.dirty_watermark == server.bundle_watermark,
                 DNSAgentBundle.renderer_revision >= RENDERER_REVISION,
             )
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
 
@@ -252,7 +266,8 @@ async def store(
     back. The render counter is incremented in SQL so it is exact under
     that race.
     """
-    app_version = settings.version
+    # The same spelling GET /version reports (#2354).
+    app_version = canonical_version(settings.version, settings.app_version)
     payload: dict[str, Any] = {
         "snapshot_at": snapshot_at,
         "visible_xacts": visible_xacts,
