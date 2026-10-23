@@ -24,6 +24,7 @@ from app.db import task_connect_args
 from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
 from app.services.integration_sync_failure import record_sync_crash
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -221,6 +222,7 @@ async def _run_token_expiry_refresh() -> dict[str, Any]:
     name="app.tasks.tailscale_sync.refresh_tailscale_token_expiry",
     bind=True,
 )
+@module_gated("integrations.tailscale")
 def refresh_tailscale_token_expiry(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_token_expiry_refresh())
 
@@ -229,6 +231,7 @@ def refresh_tailscale_token_expiry(self: Any) -> dict[str, Any]:  # noqa: ARG001
     name="app.tasks.tailscale_sync.sweep_tailscale_tenants",
     bind=True,
 )
+@module_gated("integrations.tailscale")
 def sweep_tailscale_tenants(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_sweep())
 

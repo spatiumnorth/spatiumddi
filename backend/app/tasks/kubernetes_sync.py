@@ -27,6 +27,7 @@ from app.db import task_connect_args
 from app.models.kubernetes import KubernetesCluster
 from app.models.settings import PlatformSettings
 from app.services.integration_sync_failure import record_sync_crash
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
@@ -177,6 +178,7 @@ async def _run_one(cluster_id: str) -> dict[str, Any]:
     name="app.tasks.kubernetes_sync.sweep_kubernetes_clusters",
     bind=True,
 )
+@module_gated("integrations.kubernetes")
 def sweep_kubernetes_clusters(self: Any) -> dict[str, Any]:  # noqa: ARG001
     """Beat-fired sweep — runs the reconciler against every enabled
     cluster whose interval has elapsed."""
