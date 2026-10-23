@@ -128,6 +128,23 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **An "Exclude secrets" backup now leaves out every secret.** The
+  diagnostic mode blanked the credentials an operator types in but
+  kept the appliance CA private key, the k3s join tokens, the cluster
+  kubeconfig, persistent pairing-code reveals and the ACME account
+  key, plus local password hashes and API-token / session /
+  pairing-code / agent-token digests, and its `secrets.enc` still
+  carried the install's `SECRET_KEY` and credential key. All of them
+  are now removed: the CA row is left out, the cluster credentials and
+  password hashes are NULL, the digests are replaced with values
+  nothing hashes to, and `secrets.enc` holds metadata only. Restoring
+  such an archive still succeeds: the CA is regenerated on the next
+  approval (approved appliances re-key), the supervisor re-reports the
+  kubeconfig and join token, agents re-bootstrap from their pre-shared
+  key, and the next ACME order mints a new account key. Local
+  passwords must be reset and API tokens re-issued after such a
+  restore. A normal backup is unchanged.
+
 - **The diagnostic and support bundles now keep secret environment
   values out.** The appliance diagnostic bundle's env dump matched
   secret names against a short list that missed `LG_AGENT_KEY` and
