@@ -20,7 +20,7 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
-import type { CustomField, IPAddress, IPAMTemplate } from "@/lib/api";
+import type { CustomField, DNSZone, IPAddress, IPAMTemplate } from "@/lib/api";
 
 type Answer = (...args: unknown[]) => unknown;
 /** Per API object, the calls a test answers. Anything else stays pending. */
@@ -757,6 +757,81 @@ describe("Allocate IP offers only the statuses its requests accept (#1422)", () 
       ]),
     );
     expect(control<HTMLSelectElement>("Type / Status").value).toBe("allocated");
+  });
+});
+
+// ── #2468 — Edit address names the zone its record is in ─────────────────────
+describe("Edit address names the zone its record is in (#2468)", () => {
+  function zone(id: string, name: string, group = "g1"): DNSZone {
+    return { id, group_id: group, name, kind: "forward" } as DNSZone;
+  }
+  const A = zone("za", "a.test.");
+  const B = zone("zb", "b.test.", "g2");
+  const C = zone("zc", "c.test.");
+
+  async function zonePicker(): Promise<HTMLSelectElement> {
+    await findControl("DNS Zone");
+    return waitFor(() => {
+      const picker = control("DNS Zone").querySelector("select");
+      expect(picker).toBeTruthy();
+      return picker as HTMLSelectElement;
+    });
+  }
+
+  function editStored(subnetZones: DNSZone[]) {
+    answer("customFieldsApi", "list", () => Promise.resolve([]));
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({
+        dns_group_ids: ["g1"],
+        dns_zone_id: "za",
+        dns_additional_zone_ids: subnetZones
+          .filter((z) => z.id !== "za")
+          .map((z) => z.id),
+      }),
+    );
+    answer("dnsApi", "listGroups", () =>
+      Promise.resolve([{ id: "g1" }, { id: "g2" }]),
+    );
+    answer("dnsApi", "listZones", (g: unknown) =>
+      Promise.resolve(g === "g1" ? subnetZones : [B]),
+    );
+    const updateAddress = sink(address());
+    answer("ipamApi", "updateAddress", updateAddress);
+    open(
+      <EditAddressModal
+        address={address({ forward_zone_id: "zb" })}
+        onClose={() => {}}
+      />,
+    );
+    return updateAddress;
+  }
+
+  it("with two zones left on the subnet it selects the stored zone, not None", async () => {
+    editStored([A, C]);
+    const select = await zonePicker();
+    await waitFor(() => expect(select.value).toBe("zb"));
+    expect(
+      [...select.options].some(
+        (o) => o.value === "zb" && /b\.test/.test(o.text),
+      ),
+    ).toBe(true);
+  });
+
+  it("with one zone left it names the stored zone beside the picker", async () => {
+    editStored([A]);
+    const select = await zonePicker();
+    await waitFor(() => expect(select.value).toBe("zb"));
+  });
+
+  it("an untouched Save still leaves the zone alone", async () => {
+    const updateAddress = editStored([A, C]);
+    const select = await zonePicker();
+    await waitFor(() => expect(select.value).toBe("zb"));
+    await press("Save");
+    await waitFor(() => expect(updateAddress).toHaveBeenCalledTimes(1));
+    expect(
+      (updateAddress.mock.calls[0][1] as { dns_zone_id?: string }).dns_zone_id,
+    ).toBeUndefined();
   });
 });
 
