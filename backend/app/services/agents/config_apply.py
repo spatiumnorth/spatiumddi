@@ -117,6 +117,14 @@ def apply_reported_status(
         )
         return
 
+    # ``ok`` with no etag is not a verdict: it is an agent's pre-first-apply
+    # placeholder (#2258) -- nothing has been applied, so nothing converged.
+    # Storing it would paint a green chip on a server whose /config fetch may
+    # never succeed, and undo the NULL a server move resets to (#934). Older
+    # agents in the field still send it. NULL stays UNKNOWN (#882).
+    if status == STATUS_OK and not _clip(reported.get("etag"), _MAX_ETAG):
+        return
+
     previous = server.config_apply_status
     server.config_apply_status = status
     # Cleared as a group on ``ok``: the error and the failed etag describe a

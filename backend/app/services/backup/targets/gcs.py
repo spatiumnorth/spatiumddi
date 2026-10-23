@@ -114,6 +114,7 @@ class GcsDestination(BackupDestination):
             name="service_account_json",
             label="Service-account key JSON",
             type="password",
+            multiline=True,
             required=True,
             secret=True,
             description=(
