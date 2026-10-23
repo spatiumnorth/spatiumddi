@@ -4,7 +4,11 @@ import axios, {
   type AxiosResponse,
 } from "axios";
 import { idleHeader } from "@/lib/activity";
-import { getAccessToken, setAccessToken } from "@/lib/authToken";
+import {
+  getAccessToken,
+  setAccessToken,
+  setMustChangePassword,
+} from "@/lib/authToken";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
 
@@ -128,8 +132,9 @@ function createClient(): AxiosInstance {
             {},
             { withCredentials: true },
           );
-          const { access_token } = res.data;
+          const { access_token, force_password_change } = res.data;
           setAccessToken(access_token);
+          setMustChangePassword(!!force_password_change);
           refreshQueue.forEach(({ resolve }) => resolve(access_token));
           refreshQueue = [];
           if (originalRequest?.headers)
