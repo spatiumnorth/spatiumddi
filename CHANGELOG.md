@@ -128,6 +128,20 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The diagnostic and support bundles now keep secret environment
+  values out.** The appliance diagnostic bundle's env dump matched
+  secret names against a short list that missed `LG_AGENT_KEY` and
+  every connection URL carrying a password, and its pod and host log
+  files were copied without the credential sweep the support bundle
+  applies. Both bundles now show an environment value only for an
+  allowlist of known non-secret settings and list every other variable
+  with its value replaced; the appliance bundle runs every file it
+  writes through the support bundle's secret-shape sweep; and that
+  sweep now also strips a password from a URL with an empty username
+  (`redis://:password@host`, the form every Redis URL the charts
+  render takes). The bundle card says what is redacted and that the
+  log sweep is best effort.
+
 - **A node's hard loss no longer leaves a surviving node's heartbeat stale
   past the demote guard (#1805).** Every heartbeat reached the api through
   its Service, and so does every DNS and DHCP agent and the frontend's

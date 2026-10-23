@@ -1386,6 +1386,15 @@ name and by value shape, and removed in **every** mode including the
 unscrubbed one. There is no version of "let me read my own logs" that is
 improved by including the key that decrypts the database.
 
+The process environment (`system/env.txt`) is the exception to matching by
+name: a variable's **value** appears only when its name is on an allowlist
+of known non-secret settings (log level, timeouts, feature flags, versions,
+Kubernetes service links). Every other variable is listed with its value
+replaced, so the dump still shows what is set. Connection URLs such as
+`DATABASE_URL` and `REDIS_URL` are on the replaced side. The appliance
+diagnostic bundle applies the same rule to its env dumps and runs every
+file it contains, logs included, through the same secret-shape sweep.
+
 **Pseudonymise — identifiers.** IPs, hostnames, domains, MACs, usernames
 become stable synthetic values, so the archive stays *readable*:
 
