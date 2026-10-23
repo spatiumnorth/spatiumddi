@@ -192,6 +192,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "ownership without subnet write.",
         [
             {"action": "admin", "resource_type": "address_set"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Change Approver": (
@@ -205,6 +206,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         [
             {"action": "approve", "resource_type": "change_request"},
             {"action": "read", "resource_type": "change_request"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "Requester": (
@@ -219,6 +221,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         [
             {"action": "write", "resource_type": "provisioning_request"},
             {"action": "read", "resource_type": "provisioning_request"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
     "DNS Editor": (
@@ -335,6 +338,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "always bypasses anyway.",
         [
             {"action": "admin", "resource_type": "appliance"},
+            {"action": "read", "resource_type": "alert"},
         ],
     ),
 }
