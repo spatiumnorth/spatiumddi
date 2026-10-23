@@ -1960,7 +1960,11 @@ def apply_control_plane_overrides(
     # and evict them from a dead node in seconds rather than the k8s default
     # 300 s. ``replicas`` here IS the node count, so hard
     # (requiredDuringScheduling) anti-affinity is exactly right, and the
-    # chart no-ops it below 2 replicas.
+    # chart no-ops it below 2 replicas, except the frontend's on the host
+    # network, which it renders at one replica too (#2450). The first promote
+    # then changes the frontend's replicas and nothing in its pod template, so
+    # the seed's frontend pod is scaled beside, never rolled off ports 80 and
+    # 443 (test_frontend_promotion_overrides.py pins this side of it).
     #
     # Written on every promote/demote rather than relying on the
     # firstboot-rendered HelmChart values, because firstboot only runs on a

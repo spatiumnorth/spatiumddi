@@ -1,3 +1,4 @@
+import { poolDeleteSummary } from "@/lib/pool-delete-copy";
 import { useState } from "react";
 import { humanTime } from "../network/_shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -955,7 +956,7 @@ export function PoolModal({
   );
 }
 
-function ConfirmDelete({
+export function ConfirmDelete({
   pool,
   zone,
   onConfirm,
@@ -975,13 +976,18 @@ function ConfirmDelete({
   return (
     <Modal title={`Delete pool: ${pool.name}`} onClose={onClose}>
       <p className="text-sm text-muted-foreground">
-        Delete pool <span className="font-medium">{pool.name}</span> and remove
-        the {pool.members.length} record{pool.members.length === 1 ? "" : "s"}{" "}
-        currently published as{" "}
-        <span className="font-mono">
-          {fqdn} {pool.record_type}
-        </span>
-        ?
+        {poolDeleteSummary({
+          name: pool.name,
+          fqdn,
+          recordType: pool.record_type,
+          poolEnabled: pool.enabled,
+          memberCount: pool.members.length,
+          publishedCount: pool.enabled
+            ? pool.members.filter(
+                (m) => m.enabled && m.last_check_state === "healthy",
+              ).length
+            : 0,
+        })}
       </p>
       <div className="mt-4 flex justify-end gap-2">
         <button
