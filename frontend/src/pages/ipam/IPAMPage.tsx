@@ -9150,6 +9150,43 @@ export function EditAddressModal({
       ? allGroupZones.filter((z: DNSZone) => explicitZoneIds.includes(z.id))
       : allGroupZones;
 
+  // #2468 — the zone the record is in need not be one the subnet lists any
+  // more (update_subnet re-syncs no address). Look it up among every group's
+  // zones, so the dialog names where the record really is instead of "None"
+  // or another zone. Only fetched when the stored zone is missing from the
+  // picker, and only once the subnet's own zones have answered.
+  const storedZoneId = address.forward_zone_id;
+  const subnetZonesSettled = zoneQueries.every(
+    (q: { isLoading: boolean }) => !q.isLoading,
+  );
+  const storedZoneMissing =
+    !!storedZoneId &&
+    dnsOn &&
+    subnetZonesSettled &&
+    !availableZones.some((z: DNSZone) => z.id === storedZoneId);
+  const { data: lookupGroups = [] } = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: dnsApi.listGroups,
+    enabled: storedZoneMissing,
+    staleTime: 60_000,
+  });
+  const lookupQueries = useQueries({
+    queries: lookupGroups.map((g: { id: string }) => ({
+      queryKey: ["dns-zones", g.id],
+      queryFn: () => dnsApi.listZones(g.id),
+      staleTime: 60_000,
+      enabled: storedZoneMissing,
+    })),
+  });
+  const storedExtraZone: DNSZone | undefined = storedZoneMissing
+    ? lookupQueries
+        .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
+        .find((z: DNSZone) => z.id === storedZoneId)
+    : undefined;
+  const pickerZones: DNSZone[] = storedExtraZone
+    ? [...availableZones, storedExtraZone]
+    : availableZones;
+
   // Pre-select the IP's *current* forward zone — NOT the subnet's primary.
   // Defaulting to the primary meant a no-op (or hostname-only) Save re-homed
   // the A/AAAA record into the primary zone, silently moving it off an
@@ -9157,15 +9194,15 @@ export function EditAddressModal({
   // stays on the "None" option so an unrelated edit doesn't fabricate a
   // record; the operator can still pick a zone explicitly to add one.
   useEffect(() => {
-    if (!dnsZoneId && availableZones.length > 0) {
+    if (!dnsZoneId && pickerZones.length > 0) {
       const current = address.forward_zone_id;
-      if (current && availableZones.some((z: DNSZone) => z.id === current)) {
+      if (current && pickerZones.some((z: DNSZone) => z.id === current)) {
         setDnsZoneId(current);
       }
     }
-  }, [availableZones.length, address.forward_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pickerZones.length, address.forward_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const selectedZone = availableZones.find((z: DNSZone) => z.id === dnsZoneId);
+  const selectedZone = pickerZones.find((z: DNSZone) => z.id === dnsZoneId);
   const fqdnPreview =
     hostname && selectedZone
       ? `${hostname}.${selectedZone.name.replace(/\.$/, "")}`
@@ -9334,12 +9371,12 @@ export function EditAddressModal({
             availableZones.length > 0 && <GatewayHostnameNote />}
         </Field>
         {/* DNS zone — only shown when zones are available */}
-        {availableZones.length > 0 && (
+        {pickerZones.length > 0 && (
           <Field label="DNS Zone">
-            {availableZones.length === 1 ? (
+            {pickerZones.length === 1 ? (
               <p className="text-xs text-muted-foreground py-1">
                 <Globe2 className="inline h-3 w-3 mr-1" />
-                {availableZones[0].name.replace(/\.$/, "")}
+                {pickerZones[0].name.replace(/\.$/, "")}
                 {fqdnPreview && (
                   <span className="ml-2 font-mono text-emerald-600 dark:text-emerald-400">
                     → {fqdnPreview}
@@ -9362,6 +9399,11 @@ export function EditAddressModal({
                     additionalIds={effectiveDns?.dns_additional_zone_ids ?? []}
                     noneOption="None (remove DNS record)"
                   />
+                  {storedExtraZone && (
+                    <option value={storedExtraZone.id}>
+                      {`${storedExtraZone.name.replace(/\.$/, "")} (current — not among this subnet's zones)`}
+                    </option>
+                  )}
                 </select>
                 {fqdnPreview && (
                   <p className="text-xs font-mono text-emerald-600 dark:text-emerald-400">
