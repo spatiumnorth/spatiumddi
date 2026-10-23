@@ -30,6 +30,11 @@ import {
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 
 // NetBox is a single live-API source (test-connection → preview → commit),
 // so there's no tab bar — just a full-page three-phase flow. Clones the
@@ -37,6 +42,14 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 // CommitResultPanel) and grafts NetBox's IPAM-wide canonical IR across the
 // eight entity types (Customers / Sites / VRFs / Spaces / VLANs / Blocks /
 // Subnets / Addresses). Wire shapes follow netboxImportApi in lib/api.ts.
+
+/** Every import route (preview, test and commit) takes a superadmin, so the
+ *  controls that start one say so rather than letting a Viewer fill in the
+ *  form and be refused (#1940's DNS importer, #2523). Commit is reachable
+ *  only from a successful preview. */
+function useImportGate(): { disabled?: boolean; title?: string } {
+  return permissionGate(usePermissions().isSuperadmin, NEEDS_SUPERADMIN);
+}
 
 type Phase = "select" | "previewing" | "ready" | "committing" | "result";
 
@@ -397,6 +410,7 @@ function ConnectForm({
   onPreview: () => void;
   previewing: boolean;
 }) {
+  const gate = useImportGate();
   const canTest =
     Boolean(state.baseUrl && state.token) && !testing && !previewing;
   const needSpace =
@@ -482,7 +496,8 @@ function ConnectForm({
               icon={testing ? Loader2 : Plug}
               iconClassName={testing ? "animate-spin" : undefined}
               onClick={onTest}
-              disabled={!canTest}
+              disabled={!canTest || !!gate.disabled}
+              title={gate.title}
             >
               {testing ? "Testing…" : "Test connection"}
             </HeaderButton>
@@ -676,7 +691,8 @@ function ConnectForm({
           icon={previewing ? Loader2 : ServerIcon}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
-          disabled={!canPreview}
+          disabled={!canPreview || !!gate.disabled}
+          title={gate.title}
         >
           {previewing ? "Pulling…" : "Preview import"}
         </HeaderButton>

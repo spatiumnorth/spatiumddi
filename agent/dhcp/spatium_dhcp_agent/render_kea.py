@@ -733,6 +733,35 @@ def _build_drop_expression(mac_blocks: list[dict[str, Any]]) -> str:
     return " or ".join(f"hexstring(pkt4.mac, ':') == '{m}'" for m in norms)
 
 
+def _build_drop_expression_v6(mac_blocks: list[dict[str, Any]]) -> str:
+    """Best-effort Kea Dhcp6 ``test`` expression for the MAC blocklist (#2268).
+
+    Kea has no ``pkt6.mac``: a DHCPv6 packet carries no hardware address at
+    all. A MAC can only be recovered from (a) the client DUID when it is
+    DUID-LLT (type 1) or DUID-LL (type 3) over Ethernet (hwtype 1), or
+    (b) the RFC 6939 client link-layer address option (79) a first-hop relay
+    appends. Both are matched here, per MAC. A client using DUID-EN /
+    DUID-UUID, a randomised DUID, or an unrelayed packet from a relay that
+    doesn't add option 79, carries no MAC and cannot be matched.
+    """
+    clauses: list[str] = []
+    for entry in mac_blocks:
+        mac = entry.get("mac_address") if isinstance(entry, dict) else None
+        if not mac:
+            continue
+        n = _normalize_mac_for_kea(str(mac))
+        if n is None:
+            continue
+        h = "0x" + n.replace(":", "")
+        clauses.append(
+            f"(substring(option[1].hex, 0, 4) == 0x00030001 and substring(option[1].hex, 4, 6) == {h})"
+            f" or (substring(option[1].hex, 0, 4) == 0x00010001 and substring(option[1].hex, 8, 6) == {h})"
+            f" or (substring(relay6[-1].option[79].hex, 0, 2) == 0x0001 and substring(relay6[-1].option[79].hex, 2, 6) == {h})"
+            f" or (substring(relay6[0].option[79].hex, 0, 2) == 0x0001 and substring(relay6[0].option[79].hex, 2, 6) == {h})"
+        )
+    return " or ".join(clauses)
+
+
 def _reservation(res: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     raw_hw = res.get("hw_address") or res.get("mac")
@@ -1383,11 +1412,15 @@ def render(
     # MAC blocklist — render as Kea's reserved ``DROP`` class. Any packet
     # whose hardware address matches the OR-ed expression is silently
     # dropped before allocation. ``DROP`` is a Kea built-in name, not
-    # something the operator can reuse — so if a user-defined class is
-    # already named ``DROP`` we skip blocklist rendering to avoid
-    # clobbering it (defensive; the API already reserves the name).
+    # something the operator can reuse. The API refuses the name since #2296,
+    # but a class stored before that may still carry it: it keeps rendering
+    # (an existing bundle must not break) and the blocklist is skipped so it
+    # is not clobbered, which is loud here because it leaves the blocklist
+    # unenforced.
     drop_expr = _build_drop_expression(bundle.get("mac_blocks") or [])
-    if drop_expr and not any(c.get("name") == "DROP" for c in rendered_classes):
+    if drop_expr and any(c.get("name") == "DROP" for c in rendered_classes):
+        _log.warning("mac_blocklist_shadowed_by_drop_class")
+    elif drop_expr:
         rendered_classes.append({"name": "DROP", "test": drop_expr})
 
     if rendered_classes:
@@ -1509,8 +1542,8 @@ def render(
         if opts6:
             dhcp6["option-data"] = opts6
         # Client classes render through the v6 name map. The MAC blocklist
-        # DROP class is v4-only (Kea v6 has no ``pkt4.mac``) so it is not
-        # carried into Dhcp6 — matching the backend driver.
+        # DROP class is rendered best-effort from the DUID / relay option 79
+        # (#2268) — Kea v6 has no ``pkt6.mac``.
         rendered_classes_v6: list[dict[str, Any]] = [
             {
                 "name": c["name"],
@@ -1528,6 +1561,9 @@ def render(
             for c in classes
             if _class_in_family(c, "ipv6")
         ]
+        drop_expr_v6 = _build_drop_expression_v6(bundle.get("mac_blocks") or [])
+        if drop_expr_v6 and not any(c.get("name") == "DROP" for c in rendered_classes_v6):
+            rendered_classes_v6.append({"name": "DROP", "test": drop_expr_v6})
         if rendered_classes_v6:
             dhcp6["client-classes"] = rendered_classes_v6
     out["Dhcp6"] = dhcp6

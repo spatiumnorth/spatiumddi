@@ -30,6 +30,8 @@ import {
   type RedisOverview,
 } from "@/lib/api";
 import { ServicesPanel } from "@/components/ServicesPanel";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Link } from "react-router-dom";
 import { ShieldCheck } from "lucide-react";
@@ -103,26 +105,38 @@ function StatCard({
   );
 }
 
+/** What a panel says when the server refused its reads (#2528): once, in
+ *  words, instead of cards of dashes. The polls stop on a refusal. */
+function RefusedNotice({ errors, what }: { errors: unknown[]; what: string }) {
+  const refused = errors.find((e) => isRefused(e));
+  if (!refused) return null;
+  return (
+    <p role="alert" className="text-sm">
+      <ListReadError error={refused} what={what} />
+    </p>
+  );
+}
+
 function PostgresPanel() {
   const overview = useQuery({
     queryKey: ["pg-overview"],
     queryFn: () => postgresApi.overview(),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const tables = useQuery({
     queryKey: ["pg-tables"],
     queryFn: () => postgresApi.tables(50),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
   });
   const connections = useQuery({
     queryKey: ["pg-conns"],
     queryFn: () => postgresApi.connections(),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const slow = useQuery({
     queryKey: ["pg-slow"],
     queryFn: () => postgresApi.slowQueries(20),
-    refetchInterval: 60_000,
+    refetchInterval: pollUnlessRefused(60_000),
   });
   // #272 follow-up — alembic schema-head divergence (cold-boot / rolling
   // upgrade visibility). Polls a touch faster than the rest so a pending
@@ -130,10 +144,17 @@ function PostgresPanel() {
   const schema = useQuery({
     queryKey: ["pg-schema-health"],
     queryFn: () => postgresApi.schemaHealth(),
-    refetchInterval: 15_000,
+    refetchInterval: pollUnlessRefused(15_000),
   });
 
   const ov: PostgresOverview | undefined = overview.data;
+  const refusals = [
+    overview.error,
+    tables.error,
+    connections.error,
+    slow.error,
+    schema.error,
+  ];
 
   const cachePct =
     ov?.cache_hit_ratio == null ? null : ov.cache_hit_ratio * 100;
@@ -151,6 +172,7 @@ function PostgresPanel() {
 
   return (
     <div className="space-y-6">
+      <RefusedNotice errors={refusals} what="Postgres statistics" />
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
           label="Database size"
@@ -736,17 +758,17 @@ function RedisPanel() {
   const overview = useQuery({
     queryKey: ["redis-overview"],
     queryFn: () => redisApi.overview(),
-    refetchInterval: 15_000,
+    refetchInterval: pollUnlessRefused(15_000),
   });
   const keyspace = useQuery({
     queryKey: ["redis-keyspace"],
     queryFn: () => redisApi.keyspace(),
-    refetchInterval: 30_000,
+    refetchInterval: pollUnlessRefused(30_000),
   });
   const wakeBus = useQuery({
     queryKey: ["redis-wake-bus"],
     queryFn: () => redisApi.wakeBus(),
-    refetchInterval: 10_000,
+    refetchInterval: pollUnlessRefused(10_000),
   });
 
   const ov: RedisOverview | undefined = overview.data;
@@ -778,6 +800,10 @@ function RedisPanel() {
 
   return (
     <div className="space-y-6">
+      <RefusedNotice
+        errors={[overview.error, keyspace.error, wakeBus.error]}
+        what="Redis statistics"
+      />
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
           label="Role"

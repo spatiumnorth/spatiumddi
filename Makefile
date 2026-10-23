@@ -665,7 +665,7 @@ appliance-clean:
 # Bump in PRs alongside the slot image cut; the fetch script caches
 # downloads under mkosi.extra/ keyed on this version so re-runs are
 # cheap when nothing's changed.
-K3S_VERSION ?= v1.36.4+k3s1
+K3S_VERSION ?= v1.36.5+k3s1
 
 # Issue #183 Phase 1 — air-gap-ready k3s baking. Downloads the pinned
 # k3s static binary + airgap images tarball + LICENSE into mkosi.extra/
