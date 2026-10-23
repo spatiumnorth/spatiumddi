@@ -114,3 +114,24 @@ values.yaml): a supervisor that does not verify pins nothing. Paths match ``cp_t
     type: Directory
 {{- end }}
 {{- end -}}
+
+{{/*
+#2223 — the DNS serving container's startup probe. The liveness probe below
+it checks that the daemon listens on :53, and Kubernetes holds liveness (and
+readiness) back until this succeeds once. Without it, liveness ran from 30 s
+after the container started: a cold start at scale (20,000 zones, a million
+records — render, named-checkzone every zone, named loading them) takes far
+longer than the ~2 minutes that left, so a restarted container was killed
+before named was up, every time, and never came back. Same check as
+liveness, so a daemon that never listens is still restarted, once the budget
+(periodSeconds x failureThreshold, 60 min by default) is spent.
+*/}}
+{{- define "spatiumddi-appliance.dnsStartupProbe" -}}
+{{- $p := (.Values.dns | default dict).startupProbe | default dict -}}
+startupProbe:
+  tcpSocket:
+    port: 53
+  periodSeconds: {{ $p.periodSeconds | default 10 }}
+  failureThreshold: {{ $p.failureThreshold | default 360 }}
+  timeoutSeconds: {{ $p.timeoutSeconds | default 1 }}
+{{- end -}}
