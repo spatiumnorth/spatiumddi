@@ -77,6 +77,7 @@ resume; Phase D will add the read-from-row-and-continue logic.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -181,6 +182,40 @@ DB_FAILOVER_BUDGET_S = 90.0
 _DB_RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 15.0)
 # Separate outages one step rides out before the next one fails it.
 _DB_MAX_OUTAGES_PER_STEP = 3
+
+# #2449 — a transient kubeapi answer at an idempotent per-node write is retried
+# in place, the way a shared-tag write is (orchestrator._retry_shared_tag_step).
+# The API server behind a rolling control plane can answer a CNPG admission
+# PATCH with a 500 while CloudNativePG's mutating webhook is briefly between
+# endpoints (its operator pod rescheduling off a cordoned node). One 500 used to
+# fail the step and the whole run at cnpg_maintenance_on. Only the writes that
+# are safe to repeat retry, and only a kubeapi helper's own answer.
+KUBEAPI_RETRY_STEPS: frozenset[StepName] = frozenset({"cnpg_maintenance_on"})
+KUBEAPI_RETRY_BUDGET_S = 300.0
+_KUBEAPI_RETRY_INTERVAL_S = 15.0
+_KUBEAPI_TRANSIENT_STATUSES = frozenset({408, 409, 429})
+_KUBEAPI_STATUS_RE = re.compile(r"\bkubeapi status (\d{3})\b")
+
+
+def _kubeapi_transient(error: str | None) -> bool:
+    """Is a per-node write's error a kubeapi answer a retry might clear? Like
+    ``shared_tags._transient``, but gated to a kubeapi helper's own error: the
+    helpers (``k8s.py``) return one that starts ``kubeapi `` for every answer
+    but a missing ServiceAccount. A missing ServiceAccount is a permanent
+    misconfiguration; a status under 500 (403, 404, 422) is the server's
+    considered no; a kubeapi error with no HTTP status is a socket error that
+    never reached the server, so it is transient; anything that is not a kubeapi
+    error at all (a crash message, a synthetic test error) is left to fail as
+    before."""
+    if not error or not error.startswith("kubeapi "):
+        return False
+    if "ServiceAccount not mounted" in error:
+        return False
+    match = _KUBEAPI_STATUS_RE.search(error)
+    if match is None:
+        return True
+    status = int(match.group(1))
+    return status >= 500 or status in _KUBEAPI_TRANSIENT_STATUSES
 
 
 @dataclass
@@ -1771,15 +1806,25 @@ async def _run_step_riding_db_failover(
     error is retried (``is_transient_db_error``); anything else, and a
     database still unreachable once the budget is spent, is recorded as the
     step crashing, as before. ``make`` builds a fresh coroutine per attempt.
+
+    #2449 — a step in ``KUBEAPI_RETRY_STEPS`` that *returned* a failed result
+    whose error is a transient kubeapi answer (``_kubeapi_transient``) is tried
+    again in place, for ``KUBEAPI_RETRY_BUDGET_S`` from the first such answer:
+    a CNPG admission PATCH that met a 500 while CloudNativePG's mutating webhook
+    was between endpoints used to fail the run. Only the idempotent writes retry,
+    and a kubeapi error still failing once the budget is spent is returned as it
+    was, as before.
     """
     budget = DB_FAILOVER_BUDGET_S if budget_s is None else budget_s
     first_failure: float | None = None
     outages = 0
     attempt = 0
+    kubeapi_first: float | None = None
+    kubeapi_attempt = 0
     while True:
         attempt_started = _db_retry_clock()
         try:
-            return await make()
+            result = await make()
         except Exception as exc:  # noqa: BLE001 — last-resort wrapper
             if is_transient_db_error(exc):
                 now = _db_retry_clock()
@@ -1832,6 +1877,36 @@ async def _run_step_riding_db_failover(
             return StepResult(name=step, started_at=_now_iso()).finish(
                 False, error=f"step crashed: {exc}"
             )
+        # #2449 — make() returned (no exception). An idempotent write that the
+        # API server answered with a transient kubeapi error (a 5xx, 408, 409,
+        # 429, or a socket error that never reached it) is tried again in place,
+        # within ``KUBEAPI_RETRY_BUDGET_S`` from the first such answer, so a CNPG
+        # admission webhook briefly between endpoints does not fail the run.
+        if not result.ok and step in KUBEAPI_RETRY_STEPS and _kubeapi_transient(result.error):
+            now = _db_retry_clock()
+            if kubeapi_first is None:
+                kubeapi_first = now
+            if now - kubeapi_first + _KUBEAPI_RETRY_INTERVAL_S <= KUBEAPI_RETRY_BUDGET_S:
+                kubeapi_attempt += 1
+                logger.warning(
+                    "single_node_upgrade_step_kubeapi_transient",
+                    step=step,
+                    node=node_name,
+                    attempt=kubeapi_attempt,
+                    retry_in_s=_KUBEAPI_RETRY_INTERVAL_S,
+                    error=result.error,
+                )
+                await _db_retry_sleep(_KUBEAPI_RETRY_INTERVAL_S)
+                continue
+            logger.warning(
+                "single_node_upgrade_step_kubeapi_gave_up",
+                step=step,
+                node=node_name,
+                attempts=kubeapi_attempt,
+                kubeapi_unavailable_s=round(now - kubeapi_first),
+                error=result.error,
+            )
+        return result
 
 
 def _failed(
