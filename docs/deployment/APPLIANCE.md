@@ -372,11 +372,47 @@ that is a function of the **registered node count**:
 | Nodes | Target |
 |---|---|
 | 1 | Stock: 1 replica, no fast-evict toleration, no anti-affinity — both buy nothing with one node, and a 20 s toleration would evict the only DNS pod with nowhere to put it |
-| ≥2 | `min(nodes, 2)` replicas, fast-evict tolerations, and **required** (not preferred) pod anti-affinity |
+| ≥2 | One replica per node, k3s's own tolerations, and **required** (not preferred) pod anti-affinity; the kube-dns Service gets `trafficDistribution: PreferSameNode` |
 
 Required anti-affinity is deliberate and #633 has the evidence: *preferred*
 parked both replicas on the seed, and Kubernetes never rebalances running
 pods, so the "HA" DNS died with the seed anyway.
+
+One replica per node, with node-local routing, is #1718. Until a lost node
+reads NotReady (about 40 s), its CoreDNS pod stays a ready kube-dns endpoint.
+With replicas load-balanced across nodes, about half of every other node's
+lookups went to that pod and stalled for the resolver's whole timeout. Redis
+Sentinel resolves its peers inside its event loop, so the stalls put the
+surviving sentinels into TILT, and the Redis failover took 77 s instead of
+seconds. Each node now resolves through its own replica, falling back to the
+others only while its own is not ready. A lost node takes only its own pods'
+DNS with it.
+
+The template keeps k3s's own tolerations (#1753). Earlier builds added a 20 s
+fast-evict pair. The tolerations list is the one template field both the
+supervisor and k3s's bundled manifest set, and k3s force re-applies that
+manifest at every server start. So each node's return rolled CoreDNS out
+twice: once for k3s's re-apply, once for the supervisor's patch back. Each
+rollout replaced every CoreDNS pod. With one replica per node, a fast
+eviction has nowhere to put the evicted pod anyway. k3s's re-apply now
+changes nothing.
+
+The api Service gets the same node-local routing as kube-dns (#1805), from the
+appliance's own values rather than the chart's: firstboot renders
+`api.service.trafficDistribution: PreferSameNode` into the `spatium-control`
+HelmChart, and the seed supervisor writes the same key into the
+`spatium-control` HelmChartConfig on every heartbeat, which is what a grown
+or upgraded cluster renders. Every control-plane node runs one api pod, so
+each node's in-cluster callers (its supervisor's heartbeat, the DNS and DHCP
+agents, the frontend's `/api` proxy) use that node's api pod while it is
+ready. A lost node's api pod stays listed until the node reads NotReady, and
+before this a share of every other node's heartbeats waited out their 40 s
+timeout on it, which left a healthy node's heartbeat stale past the demote
+guard's 90 s. The umbrella chart's default is `""`, so an install on your own
+Kubernetes keeps kube-proxy's spread over every api pod. One consequence on
+the appliance: traffic through the control-plane VIP enters through the
+frontend on the node announcing the VIP, and that node's api pod serves it
+alone while it is ready.
 
 **What the Cluster DNS card means** (Cluster → Overview, #985). Until now the
 appliance acted on cluster DNS and showed nothing about it, so a CoreDNS that
@@ -495,7 +531,8 @@ state on its heartbeat:
   `k8s_api.apply_control_plane_overrides()` upserts the `spatium-control`
   override (api/frontend/worker `replicas` + CNPG `instances` + Redis
   `sentinel.replicas` = committed member count, plus
-  `frontend.controlPlaneVIP`). helm-controller *merges* a
+  `frontend.controlPlaneVIP`, plus the api Service's
+  `trafficDistribution: PreferSameNode`). helm-controller *merges* a
   HelmChartConfig on top of its same-named HelmChart on every reconcile.
   Crucially the HelmChartConfig is **not** in the auto-deploy manifests
   dir, so a k3s restart's re-apply of the firstboot HelmChart defaults
@@ -565,7 +602,7 @@ state on its heartbeat:
 
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
-  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
   | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 
