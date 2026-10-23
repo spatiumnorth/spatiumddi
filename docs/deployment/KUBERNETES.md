@@ -377,7 +377,7 @@ kubectl apply --server-side -f \
 
 > **Match the operator line to your cluster, not to this page.** CNPG
 > publishes a support matrix per minor: 1.30.x covers Kubernetes
-> 1.34-1.36, which is what the appliance ships (k3s v1.36.4+k3s1). On an
+> 1.34-1.36, which is what the appliance ships (k3s v1.36.5+k3s1). On an
 > older cluster, apply the CNPG line whose matrix includes your version
 > instead — a newer operator against an untested Kubernetes is the one
 > combination CNPG will not support.
