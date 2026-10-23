@@ -47,6 +47,7 @@ from app.services.backup.targets.base import (
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    describe_exc,
     safe_filename,
 )
 
@@ -170,7 +171,7 @@ class GcsDestination(BackupDestination):
                     content_type="application/zip",
                 )
             except GoogleAPIError as exc:
-                raise BackupDestinationError(f"GCS upload failed: {exc}") from exc
+                raise BackupDestinationError(f"GCS upload failed: {describe_exc(exc)}") from exc
 
         await asyncio.to_thread(_do)
 
@@ -202,7 +203,7 @@ class GcsDestination(BackupDestination):
                         )
                     )
             except GoogleAPIError as exc:
-                raise BackupDestinationError(f"GCS list_blobs failed: {exc}") from exc
+                raise BackupDestinationError(f"GCS list_blobs failed: {describe_exc(exc)}") from exc
             rows.sort(key=lambda r: r.created_at, reverse=True)
             return rows
 
@@ -227,7 +228,7 @@ class GcsDestination(BackupDestination):
                     f"archive {filename!r} not found in bucket {config['bucket']!r}"
                 ) from exc
             except GoogleAPIError as exc:
-                raise BackupDestinationError(f"GCS download failed: {exc}") from exc
+                raise BackupDestinationError(f"GCS download failed: {describe_exc(exc)}") from exc
 
         return await asyncio.to_thread(_do)
 
@@ -247,7 +248,7 @@ class GcsDestination(BackupDestination):
             except NotFound:
                 return  # idempotent
             except GoogleAPIError as exc:
-                raise BackupDestinationError(f"GCS delete failed: {exc}") from exc
+                raise BackupDestinationError(f"GCS delete failed: {describe_exc(exc)}") from exc
 
         await asyncio.to_thread(_do)
 

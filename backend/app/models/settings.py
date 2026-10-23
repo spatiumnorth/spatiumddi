@@ -395,10 +395,12 @@ class PlatformSettings(Base):
         DateTime(timezone=True), nullable=True
     )
 
-    # Integrations — one toggle per integration type. Granular by design:
-    # enabling Kubernetes should not implicitly enable a future Terraform
-    # Cloud / ServiceNow integration. When a toggle is on, the
-    # corresponding top-level sidebar nav item appears.
+    # Integrations — a DERIVED copy of each ``integrations.*`` feature
+    # module's state, not a switch (#2196 / #2197). The module is the
+    # integration's only on/off: its beat sweep, alerts and dashboards all
+    # read the module, and nothing in the app reads these columns.
+    # ``feature_modules.sync_integration_settings_mirror`` rewrites them on
+    # every toggle and at API startup, for readers outside the app.
     integration_kubernetes_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
