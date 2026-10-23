@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import DB, CurrentUser
+from app.api.token_binding import honours_token_binding
 from app.core.permissions import require_permission, require_permission_or_scoped
 from app.drivers.dhcp import AGENTLESS_DRIVERS as DHCP_AGENTLESS
 from app.drivers.dhcp import get_driver as get_dhcp_driver
@@ -577,6 +578,7 @@ class DNSQueryLogResponse(BaseModel):
     response_model=DNSQueryLogResponse,
     dependencies=[_AGENT_READ, Depends(require_module("core.dns"))],
 )
+@honours_token_binding
 async def query_dns_queries(
     body: DNSQueryLogRequest, db: DB, current_user: CurrentUser
 ) -> DNSQueryLogResponse:
@@ -762,6 +764,7 @@ class DHCPActivityLogResponse(BaseModel):
     response_model=DHCPActivityLogResponse,
     dependencies=[_AGENT_READ, Depends(require_module("core.dhcp"))],
 )
+@honours_token_binding
 async def query_dhcp_activity(
     body: DHCPActivityLogRequest, db: DB, current_user: CurrentUser
 ) -> DHCPActivityLogResponse:

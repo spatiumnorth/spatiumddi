@@ -36,6 +36,7 @@ export const GRANT_RESOURCE_TYPES = [
   "dhcp_pool",
   "dhcp_static",
   "dhcp_client_class",
+  "server",
   "audit_log",
   "user",
   "group",
