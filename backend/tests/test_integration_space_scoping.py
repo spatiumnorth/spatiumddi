@@ -1034,3 +1034,331 @@ async def test_report_endpoint_is_superadmin_only(
     assert ok.json() == {"count": 0, "truncated": False, "rows": []}
     denied = await client.get(url, headers={"Authorization": f"Bearer {tokens['viewer']}"})
     assert denied.status_code == 403
+
+
+# ── A release is reported, and counted (#2577, walk case 3) ───────────────
+
+
+async def _superadmin_headers(db: AsyncSession) -> dict[str, str]:
+    user = User(
+        username=_n("root"),
+        email=f"{_n('root')}@example.com",
+        display_name="root",
+        hashed_password=hash_password("password123"),
+        auth_source="local",
+        is_superadmin=True,
+    )
+    user.groups = []
+    db.add(user)
+    await db.flush()
+    return {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+
+async def _release_rows(db: AsyncSession, resource_type: str, target_id: Any) -> list[AuditLog]:
+    from app.services.integration_ownership import RELEASE_AUDIT_ACTION  # noqa: PLC0415
+
+    return list(
+        (
+            await db.execute(
+                select(AuditLog).where(
+                    AuditLog.action == RELEASE_AUDIT_ACTION,
+                    AuditLog.resource_type == resource_type,
+                    AuditLog.resource_id == str(target_id),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@pytest.mark.parametrize("kind", list(_CASES))
+async def test_a_release_is_audited_counted_and_listed_on_the_dashboard(
+    client: AsyncClient, db_session: AsyncSession, kind: str
+) -> None:
+    """Re-targeting leaves the target's rows in its old space. The sync that
+    releases them must say so: a release audit row with the true counts, the
+    sync's own deleted counter and ``released`` total, and the Integrations
+    dashboard's warnings list and target row. Before the walk-3 fix only
+    OPNsense kept the warning, and every sync reported 0 deleted."""
+    from app.services.integration_ownership import (  # noqa: PLC0415
+        ownership_resource_type,
+    )
+
+    fk, run = _CASES[kind]
+    headers = await _superadmin_headers(db_session)
+    target, corp_subnet, _ = await _setup(db_session, kind)
+    for i in (11, 12):
+        db_session.add(
+            IPAddress(
+                subnet_id=corp_subnet.id,
+                address=f"10.250.0.{i}",
+                status="allocated",
+                **{fk: target.id},
+            )
+        )
+    await db_session.commit()
+
+    summary = await run(db_session, target, [])
+    await db_session.commit()
+
+    assert summary.released.addresses_deleted == 2, summary.released
+    assert summary.addresses_deleted >= 2, "the sync's own count must include released rows"
+    rtype = ownership_resource_type(fk)
+    rows = await _release_rows(db_session, rtype, target.id)
+    assert len(rows) == 1
+    assert rows[0].new_value["released"]["addresses_deleted"] == 2
+    assert rows[0].resource_display == target.name
+    assert rows[0].user_id is None and rows[0].result == "success"
+
+    r = await client.get("/api/v1/dashboards/integrations/summary", headers=headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    listed = [w for w in body["recent_warnings"] if w["target_id"] == str(target.id)]
+    assert len(listed) == 1 and listed[0]["integration"] == rtype
+    assert "2 address row(s) (2 deleted" in (listed[0]["error_detail"] or "")
+    row = next(t for p in body["panels"] for t in p["targets"] if t["id"] == str(target.id))
+    assert "released what this target owned outside" in (row["last_sync_warning"] or "")
+
+
+async def test_a_full_kubernetes_resync_after_a_retarget_reports_the_release(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk's case 3, end to end through ``reconcile_cluster``: the sync
+    audit row and the summary count the rows and the subnet the re-target
+    released, instead of reading 0 deleted."""
+    import app.services.kubernetes.reconcile as k8s  # noqa: PLC0415
+
+    class _Client:
+        def __init__(self, **_kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *_a: Any) -> None:
+            return None
+
+        async def _empty(self) -> list[Any]:
+            return []
+
+        list_nodes = list_services = list_loadbalancer_services = _empty
+        list_pods = list_ingresses = _empty
+
+    monkeypatch.setattr(k8s, "KubernetesClient", _Client)
+    monkeypatch.setattr(k8s, "decrypt_str", lambda _b: "token")
+
+    old = await _space(db_session, "old")
+    new = await _space(db_session, "new")
+    cluster = _targets(old.id)["kubernetes"]
+    cluster.service_cidr = _CIDR
+    db_session.add(cluster)
+    await db_session.commit()
+
+    first = await k8s.reconcile_cluster(db_session, cluster)
+    assert first.ok, first.error
+    old_subnet = (
+        await db_session.execute(
+            select(Subnet).where(
+                Subnet.space_id == old.id, Subnet.kubernetes_cluster_id == cluster.id
+            )
+        )
+    ).scalar_one()
+    db_session.add(
+        IPAddress(
+            subnet_id=old_subnet.id,
+            address=_ADDR,
+            status="kubernetes-service",
+            kubernetes_cluster_id=cluster.id,
+        )
+    )
+    await db_session.commit()
+
+    cluster.ipam_space_id = new.id
+    await db_session.commit()
+    summary = await k8s.reconcile_cluster(db_session, cluster)
+    assert summary.ok, summary.error
+    assert summary.released.addresses_deleted == 1
+    assert summary.released.subnets_deleted == 1
+    assert summary.addresses_deleted >= 1 and summary.subnets_deleted >= 1
+
+    sync_row = (
+        (
+            await db_session.execute(
+                select(AuditLog)
+                .where(
+                    AuditLog.action == "kubernetes.reconcile",
+                    AuditLog.resource_id == str(cluster.id),
+                )
+                .order_by(AuditLog.timestamp.desc(), AuditLog.id.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert sync_row is not None
+    value = sync_row.new_value
+    assert value["released"]["addresses_deleted"] == 1
+    assert value["released"]["subnets_deleted"] == 1
+    assert value["addresses"]["deleted"] >= 1 and value["subnets"]["deleted"] >= 1
+    assert len(await _release_rows(db_session, "kubernetes_cluster", cluster.id)) == 1
+
+
+def _sync_task_files() -> list[Path]:
+    return [
+        p
+        for p in sorted(_APP.glob("tasks/*_sync.py"))
+        if p.stem.removesuffix("_sync") in {*(k for k in _CASES), "panos", "fortinet", "meraki"}
+    ]
+
+
+def test_every_reconciler_reports_its_release_on_audit_log_and_result() -> None:
+    """Each reconciler's sync audit row and log line, and each sync task's
+    result, carry ``summary.released`` — a release is never left out of the
+    counts the operator reads."""
+    files = [
+        p for p in sorted(_APP.glob("services/*/reconcile.py")) if '.reconcile",' in p.read_text()
+    ]
+    assert len(files) == 11, [p.parent.name for p in files]
+    missing = []
+    for path in files:
+        text = path.read_text()
+        if '"released": summary.released.as_dict()' not in text:
+            missing.append(f"{path.relative_to(_APP)}: sync audit row")
+        if "**summary.released.log_fields()" not in text:
+            missing.append(f"{path.relative_to(_APP)}: log line")
+        if "refuse_sync_into_trashed_space(" not in text:
+            missing.append(f"{path.relative_to(_APP)}: trashed-space check")
+    tasks = _sync_task_files()
+    assert len(tasks) == 11, [p.name for p in tasks]
+    for path in tasks:
+        if '"released": summary.released.as_dict()' not in path.read_text():
+            missing.append(f"{path.relative_to(_APP)}: task result")
+    assert missing == []
+
+
+# ── A target whose IP space is in Trash syncs nothing (#2577) ─────────────
+
+
+def _trash_cases(space_id: uuid.UUID) -> dict[str, tuple[str, Any]]:
+    from app.models.fortinet import FortinetFirewall  # noqa: PLC0415
+    from app.models.meraki import MerakiOrg  # noqa: PLC0415
+
+    t = _targets(space_id)
+    return {
+        "unifi": ("app.services.unifi.reconcile:reconcile_controller", t["unifi"]),
+        "docker": ("app.services.docker.reconcile:reconcile_host", t["docker"]),
+        "kubernetes": ("app.services.kubernetes.reconcile:reconcile_cluster", t["kubernetes"]),
+        "proxmox": ("app.services.proxmox.reconcile:reconcile_node", t["proxmox"]),
+        "tailscale": ("app.services.tailscale.reconcile:reconcile_tenant", t["tailscale"]),
+        "netbird": ("app.services.netbird.reconcile:reconcile_instance", t["netbird"]),
+        "cloud": ("app.services.cloud.reconcile:reconcile_endpoint", t["cloud"]),
+        "opnsense": ("app.services.opnsense.reconcile:reconcile_router", t["opnsense"]),
+        "paloalto": ("app.services.panos.reconcile:reconcile_firewall", t["paloalto"]),
+        "fortinet": (
+            "app.services.fortinet.reconcile:reconcile_firewall",
+            FortinetFirewall(name=_n("fgt"), host="fgt.example.test", ipam_space_id=space_id),
+        ),
+        "meraki": (
+            "app.services.meraki.reconcile:reconcile_org",
+            MerakiOrg(name=_n("meraki"), ipam_space_id=space_id),
+        ),
+    }
+
+
+@pytest.mark.parametrize("kind", list(_trash_cases(uuid.uuid4())))
+async def test_a_target_whose_space_is_in_trash_writes_nothing(
+    db_session: AsyncSession, kind: str
+) -> None:
+    """The walk's observation: a cluster left enabled after its space was
+    trashed kept rebuilding its block and subnets inside the trashed space.
+    Every reconciler now stops before it fetches anything, with a sync error
+    that says why."""
+    from app.services.integration_ownership import SPACE_IN_TRASH_ERROR  # noqa: PLC0415
+
+    space = await _space(db_session, "trashed")
+    path, target = _trash_cases(space.id)[kind]
+    db_session.add(target)
+    await db_session.flush()
+    space.deleted_at = datetime.now(UTC)
+    await db_session.commit()
+
+    async def ipam_counts() -> tuple[int, int, int]:
+        out = []
+        for model in (IPBlock, Subnet, IPAddress):
+            out.append(
+                len(
+                    (
+                        await db_session.execute(
+                            select(model.id).execution_options(include_deleted=True)
+                        )
+                    ).all()
+                )
+            )
+        return out[0], out[1], out[2]
+
+    before = await ipam_counts()
+    module, fn = path.split(":")
+    reconcile = getattr(importlib.import_module(module), fn)
+    summary = await reconcile(db_session, target)
+
+    assert not summary.ok
+    assert summary.error == SPACE_IN_TRASH_ERROR
+    await db_session.refresh(target)
+    assert target.last_sync_error == SPACE_IN_TRASH_ERROR
+    assert target.last_synced_at is not None
+    assert await ipam_counts() == before
+
+
+async def test_a_live_space_is_not_reported_as_trashed(db_session: AsyncSession) -> None:
+    from app.services.integration_ownership import target_space_in_trash  # noqa: PLC0415
+
+    live = await _space(db_session, "live")
+    trashed = await _space(db_session, "trashed")
+    trashed.deleted_at = datetime.now(UTC)
+    await db_session.commit()
+    assert not await target_space_in_trash(db_session, live.id)
+    assert not await target_space_in_trash(db_session, [live.id, None])
+    assert await target_space_in_trash(db_session, trashed.id)
+    assert await target_space_in_trash(db_session, [live.id, trashed.id])
+
+
+async def test_deleting_a_target_removes_what_it_owns(db_session: AsyncSession) -> None:
+    """Deleting a target cleans its own block, subnet and addresses (the FK
+    cascades), live or in a trashed space. Unowned supernet blocks a
+    reconciler creates are not its to delete."""
+    fk, _ = _CASES["kubernetes"]
+    space = await _space(db_session, "k8s")
+    cluster = _targets(space.id)["kubernetes"]
+    db_session.add(cluster)
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, network="10.249.0.0/16", name=_n("b"), **{fk: cluster.id})
+    db_session.add(block)
+    await db_session.flush()
+    subnet = Subnet(
+        space_id=space.id,
+        block_id=block.id,
+        network="10.249.1.0/24",
+        name=_n("s"),
+        total_ips=254,
+        **{fk: cluster.id},
+    )
+    db_session.add(subnet)
+    await db_session.flush()
+    addr = IPAddress(
+        subnet_id=subnet.id, address="10.249.1.5", status="allocated", **{fk: cluster.id}
+    )
+    db_session.add(addr)
+    await db_session.commit()
+    ids = (block.id, subnet.id, addr.id)
+
+    await db_session.delete(cluster)
+    await db_session.commit()
+    db_session.expire_all()
+    for model, row_id in zip((IPBlock, Subnet, IPAddress), ids, strict=True):
+        row = (
+            await db_session.execute(
+                select(model).where(model.id == row_id).execution_options(include_deleted=True)
+            )
+        ).scalar_one_or_none()
+        assert row is None, model.__name__

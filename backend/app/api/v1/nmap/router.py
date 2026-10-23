@@ -96,6 +96,26 @@ async def _scan_ip_row_space(db: AsyncSession, scan: NmapScan) -> tuple[uuid.UUI
     return (row[0], row[1]) if row is not None else None
 
 
+async def _scan_ip_row_spaces(
+    db: AsyncSession, scans: list[NmapScan]
+) -> dict[uuid.UUID, tuple[uuid.UUID, str]]:
+    """``_scan_ip_row_space`` for a page of scans in one query, keyed by the
+    pinned IP row's id (#2577). The list must carry the space: the History
+    panel opens a scan with the list's copy as its initial data."""
+    ids = {s.ip_address_id for s in scans if s.ip_address_id is not None}
+    if not ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(IPAddress.id, IPSpace.id, IPSpace.name)
+            .join(Subnet, IPAddress.subnet_id == Subnet.id)
+            .join(IPSpace, Subnet.space_id == IPSpace.id)
+            .where(IPAddress.id.in_(ids))
+        )
+    ).all()
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
 def _to_read(row: NmapScan, *, include_raw: bool = False) -> NmapScanRead:
     summary = None
     if row.summary_json:
@@ -261,7 +281,14 @@ async def list_scans(
 
     stmt = base.order_by(NmapScan.created_at.desc()).limit(page_size).offset((page - 1) * page_size)
     rows = list((await db.execute(stmt)).scalars().all())
-    items = [_to_read(r) for r in rows]
+    spaces = await _scan_ip_row_spaces(db, rows)
+    items = []
+    for r in rows:
+        item = _to_read(r)
+        pinned = spaces.get(r.ip_address_id) if r.ip_address_id is not None else None
+        if pinned is not None:
+            item.ip_space_id, item.ip_space_name = pinned
+        items.append(item)
     return NmapScanListResponse(items=items, total=total, page=page, page_size=page_size)
 
 

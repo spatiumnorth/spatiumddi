@@ -6,8 +6,9 @@
   - **nmap → Stamp into IPAM** wrote each host into whichever space's subnet
     the database returned first. It now uses the space you pick in the dialog,
     or the space of the IPAM row the scan was launched from — the dialog's
-    "Automatic" option names that space, and the result says which space was
-    stamped. Without either, a host whose address is in more than one space
+    "Automatic" option names that space, also when the scan is opened from
+    History (the scan list now carries the space), and the result says which
+    space was stamped. Without either, a host whose address is in more than one space
     is skipped and listed as ambiguous.
   - **DHCP fingerprint profiling** stamped the device type onto every row
     with that MAC, in every space. It now stamps only the spaces the

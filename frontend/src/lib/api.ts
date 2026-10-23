@@ -11083,6 +11083,9 @@ export interface IntegrationsDashboardSummary {
   generated_at: string;
   panels: IntegrationsDashboardPanel[];
   recent_errors: IntegrationsDashboardErrorRow[];
+  // #2577 — rows a sync released outside its target's IP space; same shape,
+  // `error_detail` carries what was released. Absent from older servers.
+  recent_warnings?: IntegrationsDashboardErrorRow[];
 }
 
 // Security dashboard tab (#109)
@@ -16507,7 +16510,8 @@ export interface NmapScanRead {
   target_ip: string;
   ip_address_id: string | null;
   /** IP space of the IPAM row the scan was launched from (#2577) — where
-   *  stamp-discovered writes when no space is named. Single-scan GET only. */
+   *  stamp-discovered writes when no space is named. Single-scan GET and the
+   *  scan list both carry it. */
   ip_space_id?: string | null;
   ip_space_name?: string | null;
   preset: NmapPreset;

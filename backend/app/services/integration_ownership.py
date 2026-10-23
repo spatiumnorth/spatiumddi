@@ -21,14 +21,18 @@ from __future__ import annotations
 import uuid
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
+import structlog
 from sqlalchemy import Select, String, and_, cast, exists, func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.models.audit import AuditLog
-from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+
+logger = structlog.get_logger(__name__)
 
 # Ownership FK → the integration's name, as block-sync targets and the
 # block-move blockers report it.
@@ -47,6 +51,28 @@ INTEGRATION_OWNERSHIP: dict[str, str] = {
 }
 
 INTEGRATION_OWNERSHIP_FKS: frozenset[str] = frozenset(INTEGRATION_OWNERSHIP)
+
+# #2577 — the audit action of the row ``release_outside_space`` writes for each
+# release, one per target per sync that released anything. The Integrations
+# dashboard lists these as reconciler warnings.
+RELEASE_AUDIT_ACTION = "integration.release_outside_space"
+
+# #2577 — the sync error of a target whose IP space is in Trash. The sync
+# stops before it fetches or writes anything, so it cannot rebuild blocks,
+# subnets and addresses inside a space the operator deleted.
+SPACE_IN_TRASH_ERROR = (
+    "its IP space is in Trash: nothing was synced. Restore the space, or point "
+    "this integration at another IP space (#2577)"
+)
+
+
+def ownership_resource_type(own_fk: str) -> str:
+    """The audit ``resource_type`` of the target ``own_fk`` points at —
+    ``kubernetes_cluster`` for ``kubernetes_cluster_id``, … — the same string
+    each reconciler stamps on its own sync audit row."""
+    if own_fk not in INTEGRATION_OWNERSHIP:
+        raise ValueError(f"not an integration ownership FK: {own_fk!r}")
+    return own_fk.removesuffix("_id")
 
 
 def owning_integration(row: object) -> str | None:
@@ -242,6 +268,29 @@ class SpaceRelease:
             + self.blocks_unclaimed
         )
 
+    def add(self, other: SpaceRelease) -> None:
+        self.addresses_deleted += other.addresses_deleted
+        self.addresses_unclaimed += other.addresses_unclaimed
+        self.subnets_deleted += other.subnets_deleted
+        self.subnets_unclaimed += other.subnets_unclaimed
+        self.blocks_deleted += other.blocks_deleted
+        self.blocks_unclaimed += other.blocks_unclaimed
+
+    def as_dict(self) -> dict[str, int]:
+        """The counts, for a sync's audit row, log line and task result."""
+        return {
+            "addresses_deleted": self.addresses_deleted,
+            "addresses_unclaimed": self.addresses_unclaimed,
+            "subnets_deleted": self.subnets_deleted,
+            "subnets_unclaimed": self.subnets_unclaimed,
+            "blocks_deleted": self.blocks_deleted,
+            "blocks_unclaimed": self.blocks_unclaimed,
+        }
+
+    def log_fields(self) -> dict[str, int]:
+        """``as_dict`` with a ``released_`` prefix, for a structlog line."""
+        return {f"released_{k}": v for k, v in self.as_dict().items()}
+
     def describe(self) -> str:
         parts = []
         for noun, deleted, unclaimed in (
@@ -286,6 +335,7 @@ async def release_outside_space(
     target_id: Any,
     space_ids: Any | Iterable[Any],
     *,
+    summary: Any = None,
     warnings: list[str] | None = None,
 ) -> SpaceRelease:
     """Release every ``IPAddress`` / ``Subnet`` / ``IPBlock`` the target owns
@@ -313,6 +363,16 @@ async def release_outside_space(
 
     An empty space list releases nothing: a target always has a space, and
     treating "unknown" as "everything is outside" would release it all.
+
+    A release is reported three ways, so it is never silent: a system audit
+    row (``RELEASE_AUDIT_ACTION``, with the counts) that the Integrations
+    dashboard lists as a warning; and, when the sync's ``summary`` is passed,
+    its counts folded into the summary — ``summary.released`` (a
+    ``SpaceRelease``), the summary's own ``addresses_deleted`` /
+    ``subnets_deleted`` / ``blocks_deleted`` where it has them, so the sync's
+    audit row, log line and task result count what was deleted — and the
+    description appended to ``summary.warnings``. ``warnings`` alone (no
+    summary) only appends the description.
     """
     if own_fk not in INTEGRATION_OWNERSHIP:
         raise ValueError(f"not an integration ownership FK: {own_fk!r}")
@@ -406,9 +466,109 @@ async def release_outside_space(
         if blocks:
             await db.flush()
 
-    if out.total and warnings is not None:
-        warnings.append(out.describe())
+    if out.total:
+        await _report_release(db, own_fk, target_id, ids, out)
+        if summary is not None:
+            fold_release(summary, out)
+        elif warnings is not None:
+            warnings.append(out.describe())
     return out
+
+
+def fold_release(summary: Any, out: SpaceRelease) -> None:
+    """Fold one release into a reconciler's sync summary (#2577): its
+    ``released`` total, its own deleted counters where it has them, and its
+    warnings. Rows a release deletes are rows the sync deleted — a sync that
+    released 11 mirror rows must not report 0 deleted."""
+    released = getattr(summary, "released", None)
+    if isinstance(released, SpaceRelease):
+        released.add(out)
+    for attr, n in (
+        ("addresses_deleted", out.addresses_deleted),
+        ("subnets_deleted", out.subnets_deleted),
+        ("blocks_deleted", out.blocks_deleted),
+    ):
+        if n and isinstance(getattr(summary, attr, None), int):
+            setattr(summary, attr, getattr(summary, attr) + n)
+    summary_warnings = getattr(summary, "warnings", None)
+    if isinstance(summary_warnings, list):
+        summary_warnings.append(out.describe())
+
+
+async def _report_release(
+    db: AsyncSession, own_fk: str, target_id: Any, space_ids: list[Any], out: SpaceRelease
+) -> None:
+    """The audit row of one release: a system row on the target, with the
+    counts and the space(s) the target was bound to, that the Integrations
+    dashboard lists among its reconciler warnings."""
+    target_model = ownership_target_model(own_fk)
+    name = (
+        await db.execute(select(target_model.name).where(target_model.id == target_id))
+    ).scalar_one_or_none()
+    db.add(
+        AuditLog(
+            user_display_name="system",
+            auth_source="system",
+            action=RELEASE_AUDIT_ACTION,
+            resource_type=ownership_resource_type(own_fk),
+            resource_id=str(target_id),
+            resource_display=str(name) if name is not None else str(target_id),
+            result="success",
+            new_value={
+                "released": out.as_dict(),
+                "space_ids": [str(i) for i in space_ids],
+                "message": out.describe(),
+            },
+        )
+    )
+
+
+async def target_space_in_trash(db: AsyncSession, space_ids: Any | Iterable[Any]) -> bool:
+    """Whether any of a target's IP spaces is soft-deleted (in Trash), or gone.
+
+    A reconciler checks this before it fetches or writes anything: a space in
+    Trash hides its rows from every ORM read, so a sync left running would
+    rebuild its block, subnets and addresses as live rows inside the trashed
+    space (#2577). Reads with ``include_deleted`` — the plain read would see a
+    trashed space as missing."""
+    ids = [i for i in _space_id_list(space_ids) if i is not None]
+    if not ids:
+        return False
+    rows = (
+        await db.execute(
+            select(IPSpace.id, IPSpace.deleted_at)
+            .where(IPSpace.id.in_(ids))
+            .execution_options(include_deleted=True)
+        )
+    ).all()
+    found = {r[0] for r in rows}
+    return any(r[1] is not None for r in rows) or any(i not in found for i in ids)
+
+
+async def refuse_sync_into_trashed_space(
+    db: AsyncSession, target: Any, summary: Any, space_ids: Any | Iterable[Any] = None
+) -> bool:
+    """Stop a sync whose target's IP space is in Trash (#2577).
+
+    Sets ``SPACE_IN_TRASH_ERROR`` as the sync error on the summary and the
+    target, stamps ``last_synced_at`` and commits — nothing else is written.
+    Returns True when the sync must stop. ``space_ids`` defaults to the
+    target's ``ipam_space_id``."""
+    if space_ids is None:
+        space_ids = target.ipam_space_id
+    if not await target_space_in_trash(db, space_ids):
+        return False
+    summary.error = SPACE_IN_TRASH_ERROR
+    target.last_sync_error = SPACE_IN_TRASH_ERROR
+    target.last_synced_at = datetime.now(UTC)
+    await db.commit()
+    logger.warning(
+        "integration_sync_space_in_trash",
+        target_type=type(target).__name__,
+        target=str(target.id),
+        space_ids=[str(i) for i in _space_id_list(space_ids)],
+    )
+    return True
 
 
 async def owned_addresses_in_space(
@@ -417,6 +577,7 @@ async def owned_addresses_in_space(
     target_id: Any,
     space_ids: Any | Iterable[Any],
     *,
+    summary: Any = None,
     warnings: list[str] | None = None,
 ) -> list[IPAddress]:
     """The rows the target owns (``own_fk == target_id``) inside ``space_ids``.
@@ -429,11 +590,13 @@ async def owned_addresses_in_space(
     un-claimed in place, nothing moved across spaces), so every reconciler
     gets the same treatment.
 
-    Pass the sync summary's ``warnings`` to have what was released reported
-    on the integration's own sync status."""
+    Pass the sync ``summary`` to have what was released counted and reported
+    on it (see ``release_outside_space``)."""
     if own_fk not in INTEGRATION_OWNERSHIP:
         raise ValueError(f"not an integration ownership FK: {own_fk!r}")
-    await release_outside_space(db, own_fk, target_id, space_ids, warnings=warnings)
+    await release_outside_space(
+        db, own_fk, target_id, space_ids, summary=summary, warnings=warnings
+    )
     owned = getattr(IPAddress, own_fk) == target_id
     stmt = scope_addresses_to_space(select(IPAddress), space_ids).where(owned)
     return list((await db.execute(stmt)).scalars().all())
@@ -445,6 +608,7 @@ async def owned_subnets_in_space(
     target_id: Any,
     space_ids: Any | Iterable[Any],
     *,
+    summary: Any = None,
     warnings: list[str] | None = None,
 ) -> list[Subnet]:
     """The subnets the target owns inside ``space_ids`` — a reconciler's
@@ -454,7 +618,9 @@ async def owned_subnets_in_space(
     under a block of the new space, or cascade-deleted with what it holds."""
     if own_fk not in INTEGRATION_OWNERSHIP:
         raise ValueError(f"not an integration ownership FK: {own_fk!r}")
-    await release_outside_space(db, own_fk, target_id, space_ids, warnings=warnings)
+    await release_outside_space(
+        db, own_fk, target_id, space_ids, summary=summary, warnings=warnings
+    )
     stmt = select(Subnet).where(
         getattr(Subnet, own_fk) == target_id, Subnet.space_id.in_(_space_id_list(space_ids))
     )
@@ -473,6 +639,12 @@ def move_stays_in_space(current_subnet_id: Any, space_subnet_ids: Collection[Any
 
 __all__ = [
     "ACME_RECORD_TAG",
+    "RELEASE_AUDIT_ACTION",
+    "SPACE_IN_TRASH_ERROR",
+    "fold_release",
+    "ownership_resource_type",
+    "refuse_sync_into_trashed_space",
+    "target_space_in_trash",
     "DNS_RECORD_OWNER_FKS",
     "INTEGRATION_OWNERSHIP",
     "INTEGRATION_OWNERSHIP_FKS",

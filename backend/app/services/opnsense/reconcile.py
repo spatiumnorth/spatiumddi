@@ -42,11 +42,13 @@ from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.opnsense import OPNsenseRouter
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import (
+    SpaceRelease,
     addresses_in_space,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
     owning_integration,
+    refuse_sync_into_trashed_space,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.opnsense.client import (
@@ -119,6 +121,9 @@ class ReconcileSummary:
     addresses_deleted: int = 0
     skipped_no_subnet: int = 0
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -553,7 +558,7 @@ async def _apply_addresses(
     current = {
         str(a.address): a
         for a in await owned_addresses_in_space(
-            db, "opnsense_router_id", router.id, router.ipam_space_id, warnings=summary.warnings
+            db, "opnsense_router_id", router.id, router.ipam_space_id, summary=summary
         )
     }
 
@@ -700,6 +705,10 @@ def _warn_on_dhcp_backends(
 
 async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, router, summary):
+        return summary
 
     api_secret = ""
     if router.api_secret_encrypted:
@@ -818,6 +827,8 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
             resource_id=str(router.id),
             resource_display=router.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks": {
                     "created": summary.blocks_created,
                     "deleted": summary.blocks_deleted,
@@ -842,6 +853,7 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
     summary.ok = True
     logger.info(
         "opnsense_reconcile_ok",
+        **summary.released.log_fields(),
         router=str(router.id),
         firmware=summary.firmware_version,
         interfaces=summary.interface_count,

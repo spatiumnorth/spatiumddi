@@ -37,12 +37,14 @@ from app.models.tailscale import TailscaleTenant
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.dns.cname_conflict import find_record_insert_conflict
 from app.services.integration_ownership import (
+    SpaceRelease,
     address_taken,
     addresses_in_space,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
     owned_subnets_in_space,
+    refuse_sync_into_trashed_space,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.tailscale.client import (
@@ -91,6 +93,9 @@ class ReconcileSummary:
     dns_records_deleted: int = 0
     dns_skipped: bool = False
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -296,7 +301,7 @@ async def _ensure_block_and_subnet(
                 "tailscale_tenant_id",
                 tenant.id,
                 tenant.ipam_space_id,
-                warnings=summary.warnings,
+                summary=summary,
             )
             if str(s.network) == cidr_norm
         ),
@@ -370,7 +375,7 @@ async def _apply_addresses(
     current = {
         str(a.address): a
         for a in await owned_addresses_in_space(
-            db, "tailscale_tenant_id", tenant.id, tenant.ipam_space_id, warnings=summary.warnings
+            db, "tailscale_tenant_id", tenant.id, tenant.ipam_space_id, summary=summary
         )
     }
 
@@ -655,6 +660,10 @@ async def _apply_synthetic_dns(
 
 async def reconcile_tenant(db: AsyncSession, tenant: TailscaleTenant) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, tenant, summary):
+        return summary
 
     api_key = ""
     if tenant.api_key_encrypted:
@@ -718,6 +727,8 @@ async def reconcile_tenant(db: AsyncSession, tenant: TailscaleTenant) -> Reconci
             resource_id=str(tenant.id),
             resource_display=tenant.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks_created": summary.blocks_created,
                 "subnets_created": summary.subnets_created,
                 "addresses": {
@@ -741,6 +752,7 @@ async def reconcile_tenant(db: AsyncSession, tenant: TailscaleTenant) -> Reconci
     summary.ok = True
     logger.info(
         "tailscale_reconcile_ok",
+        **summary.released.log_fields(),
         tenant=str(tenant.id),
         tailnet_domain=summary.tailnet_domain,
         devices=summary.device_count,

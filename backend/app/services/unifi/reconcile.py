@@ -45,12 +45,14 @@ from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import (
+    SpaceRelease,
     addresses_in_space,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
     owned_subnets_in_space,
     owning_integration,
+    refuse_sync_into_trashed_space,
     subnet_has_surviving_addresses,
 )
 from app.services.ipam.utilization import counts_toward_utilization
@@ -138,6 +140,9 @@ class ReconcileSummary:
     # an operator Router already held that name (#2140).
     router_name: str | None = None
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -590,7 +595,7 @@ async def _apply_blocks_and_subnets(
             "unifi_controller_id",
             controller.id,
             controller.ipam_space_id,
-            warnings=summary.warnings,
+            summary=summary,
         )
     }
 
@@ -739,7 +744,7 @@ async def _apply_addresses(
         "unifi_controller_id",
         controller.id,
         controller.ipam_space_id,
-        warnings=summary.warnings,
+        summary=summary,
     )
     pre_groups: dict[str, list[IPAddress]] = {}
     for row in pre_owned:
@@ -806,7 +811,7 @@ async def _apply_addresses(
             "unifi_controller_id",
             controller.id,
             controller.ipam_space_id,
-            warnings=summary.warnings,
+            summary=summary,
         )
     }
 
@@ -1022,6 +1027,10 @@ def _decrypt_or_empty(blob: bytes) -> str:
 
 async def reconcile_controller(db: AsyncSession, controller: UnifiController) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, controller, summary):
+        return summary
 
     try:
         api_key = _decrypt_or_empty(controller.api_key_encrypted)
@@ -1149,6 +1158,8 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
             resource_id=str(controller.id),
             resource_display=controller.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks": {
                     "created": summary.blocks_created,
                     "deleted": summary.blocks_deleted,
@@ -1179,6 +1190,7 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
     summary.ok = True
     logger.info(
         "unifi_reconcile_ok",
+        **summary.released.log_fields(),
         controller=str(controller.id),
         version=summary.controller_version,
         sites=summary.site_count,

@@ -43,12 +43,14 @@ from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.proxmox import ProxmoxNode
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.integration_ownership import (
+    SpaceRelease,
     address_taken,
     addresses_in_space,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
     owning_integration,
+    refuse_sync_into_trashed_space,
     subnet_has_surviving_addresses,
 )
 from app.services.ipam.utilization import counts_toward_utilization
@@ -129,6 +131,9 @@ class ReconcileSummary:
     unreadable_guests: int = 0
     unreadable_nodes: int = 0
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -754,7 +759,7 @@ async def _apply_addresses(
     current = {
         str(a.address): a
         for a in await owned_addresses_in_space(
-            db, "proxmox_node_id", node.id, node.ipam_space_id, warnings=summary.warnings
+            db, "proxmox_node_id", node.id, node.ipam_space_id, summary=summary
         )
     }
 
@@ -1090,6 +1095,10 @@ def _build_discovery_payload(
 
 async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, node, summary):
+        return summary
 
     token_secret = ""
     unreadable_guests: list[str] = []
@@ -1220,6 +1229,8 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
             resource_id=str(node.id),
             resource_display=node.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks": {
                     "created": summary.blocks_created,
                     "deleted": summary.blocks_deleted,
@@ -1245,6 +1256,7 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
     summary.ok = True
     logger.info(
         "proxmox_reconcile_ok",
+        **summary.released.log_fields(),
         node=str(node.id),
         pve_version=summary.pve_version,
         cluster=summary.cluster_name,

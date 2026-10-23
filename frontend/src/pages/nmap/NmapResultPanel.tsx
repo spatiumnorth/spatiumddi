@@ -10,6 +10,7 @@ import {
 } from "@/lib/api";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { cn } from "@/lib/utils";
+import { automaticSpaceLabel, pinnedScanSpaceName } from "./scanSpace";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 
 /**
@@ -131,20 +132,13 @@ function MultiHostResult({
       {confirmStamp && (
         <StampDiscoveredModal
           scanId={scan.id}
-          scanSpaceName={scan.ip_space_id ? (scan.ip_space_name ?? "") : null}
+          scanSpaceName={pinnedScanSpaceName(scan)}
           aliveCount={alive.length}
           onClose={() => setConfirmStamp(false)}
         />
       )}
     </div>
   );
-}
-
-/** The "Automatic" option says what the server will do without a space. */
-function automaticSpaceLabel(scanSpaceName: string | null): string {
-  return scanSpaceName !== null
-    ? `Automatic — the scan's own space (${scanSpaceName})`
-    : "Automatic — skip addresses found in more than one space";
 }
 
 function StampDiscoveredModal({

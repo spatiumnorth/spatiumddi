@@ -41,12 +41,14 @@ from app.models.netbird import NetbirdInstance
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.dns.cname_conflict import find_record_insert_conflict
 from app.services.integration_ownership import (
+    SpaceRelease,
     address_taken,
     addresses_in_space,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
     owned_subnets_in_space,
+    refuse_sync_into_trashed_space,
 )
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.netbird.client import (
@@ -93,6 +95,9 @@ class ReconcileSummary:
     dns_records_deleted: int = 0
     dns_skipped: bool = False
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -251,7 +256,7 @@ async def _ensure_block_and_subnet(
                 "netbird_instance_id",
                 instance.id,
                 instance.ipam_space_id,
-                warnings=summary.warnings,
+                summary=summary,
             )
             if str(s.network) == cidr_norm
         ),
@@ -329,7 +334,7 @@ async def _apply_addresses(
             "netbird_instance_id",
             instance.id,
             instance.ipam_space_id,
-            warnings=summary.warnings,
+            summary=summary,
         )
     }
 
@@ -579,6 +584,10 @@ async def _apply_synthetic_dns(
 
 async def reconcile_instance(db: AsyncSession, instance: NetbirdInstance) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, instance, summary):
+        return summary
 
     api_key = ""
     if instance.api_key_encrypted:
@@ -639,6 +648,8 @@ async def reconcile_instance(db: AsyncSession, instance: NetbirdInstance) -> Rec
             resource_id=str(instance.id),
             resource_display=instance.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks_created": summary.blocks_created,
                 "subnets_created": summary.subnets_created,
                 "addresses": {
@@ -662,6 +673,7 @@ async def reconcile_instance(db: AsyncSession, instance: NetbirdInstance) -> Rec
     summary.ok = True
     logger.info(
         "netbird_reconcile_ok",
+        **summary.released.log_fields(),
         instance=str(instance.id),
         dns_domain=summary.dns_domain,
         peers=summary.peer_count,

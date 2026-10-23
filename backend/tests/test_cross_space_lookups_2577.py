@@ -464,6 +464,30 @@ async def test_nmap_stamp_reports_the_space_it_used(
     assert got.json()["ip_space_id"] is None
 
 
+@pytest.mark.asyncio
+async def test_nmap_scan_list_carries_the_pinned_rows_space(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """History opens a scan with the LIST's copy as initial data, so the list
+    must name a pinned scan's space too, or the stamp dialog words a pinned
+    sweep's "Automatic" option as for an unpinned one (walk case 9)."""
+    _, headers = await _admin(db_session)
+    _, _, space_b, subnet_b = await _two_spaces(db_session)
+    row_b = await _ip(db_session, subnet_b, ADDR, status="available")
+    pinned = await _scan(db_session, ip_address_id=row_b.id)
+    unpinned = await _scan(db_session)
+    pinned_id, unpinned_id = str(pinned.id), str(unpinned.id)
+    b_id, b_name = str(space_b.id), space_b.name
+    await db_session.commit()
+
+    r = await client.get("/api/v1/nmap/scans", headers=headers)
+    assert r.status_code == 200, r.text
+    items = {i["id"]: i for i in r.json()["items"]}
+    assert (items[pinned_id]["ip_space_id"], items[pinned_id]["ip_space_name"]) == (b_id, b_name)
+    assert items[unpinned_id]["ip_space_id"] is None
+    assert items[unpinned_id]["ip_space_name"] is None
+
+
 async def _server_without_group(db: AsyncSession) -> DHCPServer:
     server = DHCPServer(name=f"s2577-{uuid.uuid4().hex[:6]}", host="127.0.0.2", driver="kea")
     db.add(server)

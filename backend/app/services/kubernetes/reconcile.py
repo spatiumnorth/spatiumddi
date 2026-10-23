@@ -57,12 +57,14 @@ from app.models.kubernetes import KubernetesCluster
 from app.services._mirror_hostname import normalize_desired_hostname
 from app.services.dns.cname_conflict import find_record_insert_conflict
 from app.services.integration_ownership import (
+    SpaceRelease,
     address_taken,
     addresses_in_space,
     move_stays_in_space,
     owned_addresses_in_space,
     owned_by_other_integration,
     owned_subnets_in_space,
+    refuse_sync_into_trashed_space,
     subnet_has_surviving_addresses,
 )
 from app.services.ipam.utilization import counts_toward_utilization
@@ -200,6 +202,9 @@ class ReconcileSummary:
     # e.g. an invalid IP, a headless service. Logged only.
     skipped_invalid: int = 0
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -480,7 +485,7 @@ async def _apply_blocks_and_subnets(
             "kubernetes_cluster_id",
             cluster.id,
             cluster.ipam_space_id,
-            warnings=summary.warnings,
+            summary=summary,
         )
     }
 
@@ -645,7 +650,7 @@ async def _apply_addresses(
             "kubernetes_cluster_id",
             cluster.id,
             cluster.ipam_space_id,
-            warnings=summary.warnings,
+            summary=summary,
         )
     }
 
@@ -846,6 +851,10 @@ async def reconcile_cluster(db: AsyncSession, cluster: KubernetesCluster) -> Rec
     never persists.
     """
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(db, cluster, summary):
+        return summary
     try:
         token = decrypt_str(cluster.token_encrypted)
     except ValueError as exc:
@@ -901,6 +910,8 @@ async def reconcile_cluster(db: AsyncSession, cluster: KubernetesCluster) -> Rec
             resource_id=str(cluster.id),
             resource_display=cluster.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "blocks": {
                     "created": summary.blocks_created,
                     "deleted": summary.blocks_deleted,
@@ -930,6 +941,7 @@ async def reconcile_cluster(db: AsyncSession, cluster: KubernetesCluster) -> Rec
     summary.ok = True
     logger.info(
         "k8s_reconcile_ok",
+        **summary.released.log_fields(),
         cluster=str(cluster.id),
         nodes=summary.node_count,
         blocks_created=summary.blocks_created,

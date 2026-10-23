@@ -63,6 +63,7 @@ from app.services.cloud.base import (
     get_connector,
 )
 from app.services.integration_ownership import (
+    SpaceRelease,
     address_taken,
     addresses_in_space,
     move_stays_in_space,
@@ -70,6 +71,7 @@ from app.services.integration_ownership import (
     owned_by_other_integration,
     owned_subnets_in_space,
     owning_integration,
+    refuse_sync_into_trashed_space,
     subnet_has_surviving_addresses,
 )
 from app.services.ipam.utilization import counts_toward_utilization
@@ -134,6 +136,9 @@ class ReconcileSummary:
     addresses_deleted: int = 0
     skipped_no_subnet: int = 0
     warnings: list[str] = field(default_factory=list)
+    # #2577 — what this sync released outside the target's IP space
+    # (``integration_ownership.release_outside_space``).
+    released: SpaceRelease = field(default_factory=SpaceRelease)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -597,7 +602,7 @@ async def _apply_addresses(
     # #2577 — the endpoint's own subnets in its bound space(s) only; anything
     # it owns elsewhere (a previous space) is released first.
     subnet_rows = await owned_subnets_in_space(
-        db, "cloud_endpoint_id", endpoint.id, space_ids, warnings=summary.warnings
+        db, "cloud_endpoint_id", endpoint.id, space_ids, summary=summary
     )
     all_space_subnets = (
         (await db.execute(select(Subnet).where(Subnet.space_id.in_(space_ids)))).scalars().all()
@@ -649,7 +654,7 @@ async def _apply_addresses(
     current = {
         str(a.address): a
         for a in await owned_addresses_in_space(
-            db, "cloud_endpoint_id", endpoint.id, space_ids, warnings=summary.warnings
+            db, "cloud_endpoint_id", endpoint.id, space_ids, summary=summary
         )
     }
 
@@ -837,6 +842,12 @@ def _build_discovery_payload(
 
 async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> ReconcileSummary:
     summary = ReconcileSummary(ok=False)
+    # #2577 — a target whose IP space is in Trash syncs nothing: it would
+    # rebuild its rows as live rows inside the trashed space.
+    if await refuse_sync_into_trashed_space(
+        db, endpoint, summary, space_ids=[endpoint.ipam_space_id, endpoint.public_space_id]
+    ):
+        return summary
 
     if not endpoint.credentials_encrypted:
         summary.error = "credentials not set"
@@ -919,6 +930,8 @@ async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> Recon
             resource_id=str(endpoint.id),
             resource_display=endpoint.name,
             new_value={
+                # #2577 — what the sync released outside the target's IP space.
+                "released": summary.released.as_dict(),
                 "provider": endpoint.provider,
                 "account_id": inv.account_id,
                 "blocks": {
@@ -944,6 +957,7 @@ async def reconcile_endpoint(db: AsyncSession, endpoint: CloudEndpoint) -> Recon
     summary.ok = True
     logger.info(
         "cloud_reconcile_ok",
+        **summary.released.log_fields(),
         endpoint=str(endpoint.id),
         provider=endpoint.provider,
         account_id=inv.account_id,
