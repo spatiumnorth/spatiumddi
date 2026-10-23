@@ -210,6 +210,28 @@ function ConfirmRestoreModal({
   );
 }
 
+// What a permanent delete takes with the row, beyond the row itself. These are
+// the rows its foreign keys cascade to, most of which the Trash does not list;
+// the batch count is every row deleted with this one that the Trash holds, so
+// it can be lower than what goes (a DNS pool is not soft-deleted).
+function purgeScope(entry: TrashEntry): string {
+  const others = entry.batch_size - 1;
+  const count =
+    others > 0
+      ? ` ${others} other row${others === 1 ? "" : "s"} deleted with it ${others === 1 ? "is" : "are"} removed too.`
+      : "";
+  switch (entry.type) {
+    case "subnet":
+      return ` Its DHCP scopes (with their pools and static assignments), its addresses and the DNS records published for them are removed with it.${count}`;
+    case "dns_zone":
+      return ` All of its DNS records and its DNS pools are removed with it.${count}`;
+    case "dhcp_scope":
+      return ` Its pools and static assignments are removed with it.${count}`;
+    default:
+      return "";
+  }
+}
+
 function ConfirmPermanentDeleteModal({
   entry,
   onClose,
@@ -241,8 +263,8 @@ function ConfirmPermanentDeleteModal({
           {TYPE_LABELS[entry.type]}).
           {entry.type === "ip_block" || entry.type === "ip_space"
             ? " The subnets and blocks in the Trash under it are removed with it."
-            : ""}{" "}
-          It cannot be restored.
+            : ""}
+          {purgeScope(entry)} It cannot be restored.
         </p>
         {error && (
           <p className="rounded bg-red-500/15 p-2 text-xs text-red-700 dark:text-red-300">

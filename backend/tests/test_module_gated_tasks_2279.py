@@ -49,6 +49,10 @@ async def _set_module(db: AsyncSession, module_id: str, enabled: bool) -> None:
 
 async def _run_task(task_name: str, *args: Any) -> Any:
     """Run a registered task as a worker would: synchronously, off the loop."""
+    # Register every task module first, as a worker does at boot. A task is only
+    # in ``celery_app.tasks`` once its module has been imported, which depends
+    # on what ran earlier in this process (and so on pytest-split's ordering).
+    celery_app.loader.import_default_modules()
     task = celery_app.tasks[task_name]
     result = await asyncio.to_thread(task.apply, args=list(args))
     if result.failed():
