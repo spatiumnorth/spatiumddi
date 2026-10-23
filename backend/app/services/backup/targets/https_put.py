@@ -69,6 +69,7 @@ from app.services.backup.targets.base import (
     ConfigFieldSpec,
     DestinationConfigError,
     UnsupportedOperationError,
+    describe_exc,
     safe_filename,
     safe_url,
     scrub_url,
@@ -396,7 +397,7 @@ class HttpsPutDestination(BackupDestination):
                 # ``in_progress``, which the schedule sweep skips forever:
                 # that target's backups stop permanently and silently.
                 raise BackupDestinationError(
-                    f"{method} to {safe_url(url)} failed: {scrub_url(str(exc), url)}"
+                    f"{method} to {safe_url(url)} failed: {scrub_url(describe_exc(exc), url)}"
                 ) from exc
 
     # ── operations ────────────────────────────────────────────────────

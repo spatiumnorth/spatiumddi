@@ -261,6 +261,14 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # status: active | unreachable | syncing | error | pending
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="active")
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # #2306 — why the most recent scheduled lease pull failed (agentless
+    # drivers). NULL = the last pull succeeded (or none has run); cleared by
+    # every successful pull. Kept apart from ``status``, which the health
+    # probe owns and rewrites every cycle.
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_sync_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_health_check_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -727,7 +735,7 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     ddns_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     ddns_hostname_policy: Mapped[str] = mapped_column(String(30), nullable=False, default="client")
     hostname_to_ipam_sync: Mapped[str] = mapped_column(
-        String(30), nullable=False, default="on_static_only"
+        String(30), nullable=False, default="on_lease"
     )
     # When False, the IPAM↔DNS drift check ignores this scope's dynamic-pool
     # lease mirrors (``auto_from_lease`` IPs inside a ``dynamic`` pool). Pulled
