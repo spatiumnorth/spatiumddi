@@ -125,6 +125,7 @@ import { resolveShowFreeRanges } from "@/lib/ipam-free-ranges";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { AsnPicker } from "@/components/ipam/asn-picker";
 import { VrfPicker } from "@/components/ipam/vrf-picker";
 import {
@@ -3515,7 +3516,10 @@ export function AddAddressModal({
 
   const mutation = useMutation({
     mutationFn: async (force: boolean) => {
-      const zoneParam = dnsZoneId || undefined;
+      // "None (no DNS record)" is sent as "" — an absent / null zone means
+      // "use the subnet's effective zone" to the API (#2466).
+      const zoneParam =
+        dnsZoneId || (availableZones.length > 0 ? "" : undefined);
       const cleanedAliases = aliases
         .map((a) => ({ ...a, name: a.name.trim() }))
         .filter((a) => a.name.length > 0);
@@ -6869,27 +6873,31 @@ export function SubnetDetail({
                               >
                                 <div className="flex items-center justify-end gap-1">
                                   {addr.status === "orphan" ? (
-                                    <>
-                                      <button
-                                        onClick={() =>
-                                          restoreAddr.mutate(addr.id)
-                                        }
-                                        disabled={restoreAddr.isPending}
-                                        className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
-                                        title="Restore (mark as allocated)"
-                                      >
-                                        <RefreshCw className="h-3.5 w-3.5" />
-                                      </button>
-                                      <button
-                                        onClick={() =>
-                                          setConfirmPurgeAddr(addr)
-                                        }
-                                        className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                        title="Permanently delete"
-                                      >
-                                        <Trash2 className="h-3.5 w-3.5" />
-                                      </button>
-                                    </>
+                                    // #2520 — restore / purge / edit / delete are writes:
+                                    // a row the operator may not write offers none.
+                                    permitsWrite ? (
+                                      <>
+                                        <button
+                                          onClick={() =>
+                                            restoreAddr.mutate(addr.id)
+                                          }
+                                          disabled={restoreAddr.isPending}
+                                          className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
+                                          title="Restore (mark as allocated)"
+                                        >
+                                          <RefreshCw className="h-3.5 w-3.5" />
+                                        </button>
+                                        <button
+                                          onClick={() =>
+                                            setConfirmPurgeAddr(addr)
+                                          }
+                                          className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                          title="Permanently delete"
+                                        >
+                                          <Trash2 className="h-3.5 w-3.5" />
+                                        </button>
+                                      </>
+                                    ) : null
                                   ) : addr.auto_from_lease ? (
                                     // Mirror of a dynamic DHCP lease — the DHCP
                                     // server owns the state; editing or deleting
@@ -6901,7 +6909,8 @@ export function SubnetDetail({
                                     >
                                       <Lock className="h-3.5 w-3.5" />
                                     </span>
-                                  ) : !isReadOnly(addr.status) ? (
+                                  ) : !isReadOnly(addr.status) &&
+                                    permitsWrite ? (
                                     <>
                                       <button
                                         onClick={() => setEditingAddress(addr)}
@@ -7276,6 +7285,8 @@ function DnsSyncModal({
     create_for_ip_ids?: string[];
     update_record_ids?: string[];
     delete_stale_record_ids?: string[];
+    // #2471 — missing rows left unticked; the API writes none of them.
+    skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
   }) =>
     scope.kind === "subnet"
       ? ipamApi.dnsSyncCommit(scope.id, body)
@@ -7353,8 +7364,9 @@ function DnsSyncModal({
       }
       // missing items keyed as `ip_id:record_type:zone_id` so a single IP can
       // have its A, its PTR and each extra-zone A (#2107) ticked or unticked
-      // independently. Backend just needs unique IP IDs to re-sync —
-      // sync_dns_record handles every record.
+      // independently. The API re-syncs each address whole, so the rows
+      // left unticked ride along as ``skip_records`` (#2471) and are not
+      // written.
       const ipIds = new Set<string>();
       for (const m of data.missing) {
         if (selMissing.has(missingKey(m))) ipIds.add(m.ip_id);
@@ -7363,6 +7375,13 @@ function DnsSyncModal({
         create_for_ip_ids: Array.from(ipIds),
         update_record_ids: Array.from(selMismatched),
         delete_stale_record_ids: Array.from(selStale),
+        skip_records: data.missing
+          .filter((m) => !selMissing.has(missingKey(m)))
+          .map((m) => ({
+            ip_id: m.ip_id,
+            record_type: m.record_type,
+            zone_id: m.zone_id,
+          })),
       });
     },
     onSuccess: (res) => {
@@ -16387,7 +16406,11 @@ export function IPAMPage() {
   // (one-shot semantics).
   const highlightTargetSubnetRef = useRef<string | null>(null);
 
-  const { data: spaces, isLoading } = useQuery({
+  const {
+    data: spaces,
+    isLoading,
+    error: spacesError,
+  } = useQuery({
     queryKey: ["spaces"],
     queryFn: ipamApi.listSpaces,
   });
@@ -16656,6 +16679,12 @@ export function IPAMPage() {
           {isLoading && (
             <p className="px-2 py-3 text-xs text-muted-foreground">Loading…</p>
           )}
+          {/* A refused or failed read says so, not an empty tree (#2437). */}
+          {!isLoading && !spaces && spacesError != null && (
+            <p className="px-2 py-3 text-xs">
+              <ListReadError error={spacesError} what="IP spaces" />
+            </p>
+          )}
           {spaces?.length === 0 && !isLoading && (
             <div className="flex flex-col items-center justify-center py-10 text-center">
               <Layers className="mb-2 h-8 w-8 text-muted-foreground/30" />
@@ -16744,7 +16773,11 @@ export function IPAMPage() {
           <div className="flex flex-1 flex-col items-center justify-center text-center">
             <Network className="mb-3 h-12 w-12 text-muted-foreground/20" />
             <p className="text-sm text-muted-foreground">
-              Select a space, block, or subnet from the tree.
+              {spacesError != null && !spaces ? (
+                <ListReadError error={spacesError} what="IP spaces" />
+              ) : (
+                "Select a space, block, or subnet from the tree."
+              )}
             </p>
           </div>
         )}

@@ -805,3 +805,56 @@ describe("the zone pickers tell reverse zones by suffix, not by substring (#2472
     expect(await offered()).toEqual(["zp", "zs"]);
   });
 });
+
+// ── #2466 — Allocate IP's DNS Zone "None" ────────────────────────────────────
+
+describe('Allocate IP\'s DNS Zone "None" sends an explicit no-zone (#2466)', () => {
+  function allocateWithZones() {
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({
+        dns_group_ids: ["g1"],
+        dns_zone_id: "z1",
+        dns_additional_zone_ids: ["z2"],
+        inherited_from_block_id: null,
+      }),
+    );
+    answer("dnsApi", "listZones", () =>
+      Promise.resolve([
+        { id: "z1", name: "a.example.", zone_type: "primary" },
+        { id: "z2", name: "b.example.", zone_type: "primary" },
+      ]),
+    );
+    return allocateIp();
+  }
+
+  it("None goes out as dns_zone_id: '' (absent would mean the subnet's zone)", async () => {
+    const nextAddress = allocateWithZones();
+    const zone = (await findControl<HTMLDivElement>("DNS Zone")).querySelector(
+      "select",
+    ) as HTMLSelectElement;
+    await waitFor(() => expect(zone.value).toBe("z1"));
+    fireEvent.change(zone, { target: { value: "" } });
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    await press("Allocate");
+
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+    expect(nextAddress.mock.calls[0][1]).toMatchObject({ dns_zone_id: "" });
+  });
+
+  it("a chosen zone still goes out by id", async () => {
+    const nextAddress = allocateWithZones();
+    const zone = (await findControl<HTMLDivElement>("DNS Zone")).querySelector(
+      "select",
+    ) as HTMLSelectElement;
+    await waitFor(() => expect(zone.value).toBe("z1"));
+    fireEvent.change(screen.getByPlaceholderText("Required"), {
+      target: { value: "web01" },
+    });
+    await press("Allocate");
+
+    await waitFor(() => expect(nextAddress).toHaveBeenCalledTimes(1));
+    expect(nextAddress.mock.calls[0][1]).toMatchObject({ dns_zone_id: "z1" });
+  });
+});
