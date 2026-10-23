@@ -2,7 +2,7 @@
 
 Mirrors ``proxmox_sync`` — 30 s beat tick, per-controller interval
 gating, platform-wide kill switch via
-``PlatformSettings.integration_unifi_enabled``. Plus a
+the ``integrations.unifi`` feature module (#2196). Plus a
 ``sync_controller_now`` task for the UI's "Sync Now" button.
 
 Cloud-mode controllers have a 60 s floor regardless of the
@@ -25,12 +25,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.celery_app import celery_app
 from app.config import settings
 from app.db import task_connect_args
-from app.models.settings import PlatformSettings
 from app.models.unifi import UnifiController
+from app.services.feature_modules import is_module_enabled
+from app.services.integration_sync_failure import record_sync_crash
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
-_PLATFORM_SINGLETON_ID = 1
 _CLOUD_INTERVAL_FLOOR_S = 60
 
 
@@ -49,8 +50,7 @@ async def _run_sweep() -> dict[str, Any]:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
-            ps = await db.get(PlatformSettings, _PLATFORM_SINGLETON_ID)
-            if ps is None or not ps.integration_unifi_enabled:
+            if not await is_module_enabled(db, "integrations.unifi"):
                 return {"status": "disabled"}
 
             rows = (
@@ -87,7 +87,15 @@ async def _run_sweep() -> dict[str, Any]:
                     # A crash leaves the shared session in a failed
                     # transaction; roll back so the next controller still syncs.
                     await db.rollback()
-                    errors.append(f"{controller_name}: {exc}")
+                    crash = await record_sync_crash(
+                        db,
+                        UnifiController,
+                        controller_id,
+                        resource_type="unifi_controller",
+                        action="unifi.reconcile",
+                        exc=exc,
+                    )
+                    errors.append(f"{controller_name}: {crash}")
                     logger.warning(
                         "unifi_reconcile_crash",
                         controller=str(controller_id),
@@ -128,7 +136,21 @@ async def _run_one(controller_id: str) -> dict[str, Any]:
             controller = await db.get(UnifiController, _uuid.UUID(controller_id))
             if controller is None:
                 return {"status": "not_found"}
-            summary = await reconcile_controller(db, controller)
+            row_id = controller.id
+            try:
+                summary = await reconcile_controller(db, controller)
+            except Exception as exc:  # noqa: BLE001 — record it, don't lose it (#2141)
+                await db.rollback()
+                crash = await record_sync_crash(
+                    db,
+                    UnifiController,
+                    row_id,
+                    resource_type="unifi_controller",
+                    action="unifi.reconcile",
+                    exc=exc,
+                )
+                logger.warning("unifi_sync_now_crash", target=str(row_id), error=crash)
+                return {"status": "error", "error": crash}
             return {
                 "status": "ok" if summary.ok else "error",
                 "error": summary.error,
@@ -155,6 +177,7 @@ async def _run_one(controller_id: str) -> dict[str, Any]:
     name="app.tasks.unifi_sync.sweep_unifi_controllers",
     bind=True,
 )
+@module_gated("integrations.unifi")
 def sweep_unifi_controllers(self: Any) -> dict[str, Any]:  # noqa: ARG001
     return asyncio.run(_run_sweep())
 

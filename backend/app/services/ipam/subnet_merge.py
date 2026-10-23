@@ -71,6 +71,10 @@ from app.models.dhcp import (
 )
 from app.models.ipam import IPAddress, Subnet, SubnetDomain
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.ipam.subnet_carry import (
+    merge_conflicts_and_warnings,
+    merged_carried,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -344,6 +348,12 @@ async def preview_subnet_merge(
 
     # Metadata compatibility.
     conflicts.extend(_check_metadata_compat(sources))
+    carry_conflicts, carry_warnings = merge_conflicts_and_warnings(sources)
+    conflicts.extend(
+        MergeConflict(type=f"metadata_mismatch:{col}", detail=detail)
+        for col, detail in carry_conflicts
+    )
+    warnings.extend(carry_warnings)
 
     # DHCP scope handling — at most one survivor.
     scopes = (
@@ -504,6 +514,7 @@ async def commit_subnet_merge(
         total_ips=int(total_ips_new),
         allocated_ips=0,
         utilization_percent=0.0,
+        **merged_carried(sources, target),
     )
     db.add(merged_subnet)
     await db.flush()

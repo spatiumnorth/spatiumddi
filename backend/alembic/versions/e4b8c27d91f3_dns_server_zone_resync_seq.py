@@ -7,7 +7,7 @@ for every existing row, which adds nothing to the fingerprint, so no
 installed agent re-renders because of this migration.
 
 Revision ID: e4b8c27d91f3
-Revises: d3a7f19c52e8
+Revises: e7b3d19a4c26
 Create Date: 2026-10-21 10:00:00.000000
 """
 
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "e4b8c27d91f3"
-down_revision = "d3a7f19c52e8"
+down_revision = "e7b3d19a4c26"
 branch_labels = None
 depends_on = None
 

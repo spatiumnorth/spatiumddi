@@ -25,6 +25,7 @@ from app.config import settings
 from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
+from app.tasks._interval_gate import interval_skip
 
 logger = structlog.get_logger(__name__)
 
@@ -45,15 +46,14 @@ async def _run_sweep(force: bool = False) -> dict[str, Any]:
                 return {"status": "disabled"}
 
             now = datetime.now(UTC)
-            if not force and ps.reverse_dns_last_run_at is not None:
-                interval = timedelta(minutes=max(1, ps.reverse_dns_interval_minutes))
-                elapsed = now - ps.reverse_dns_last_run_at
-                if elapsed < interval:
-                    return {
-                        "status": "skipped",
-                        "reason": "interval_not_elapsed",
-                        "wait_seconds": int((interval - elapsed).total_seconds()),
-                    }
+            if not force:
+                skip = interval_skip(
+                    now,
+                    ps.reverse_dns_last_run_at,
+                    timedelta(minutes=max(1, ps.reverse_dns_interval_minutes)),
+                )
+                if skip is not None:
+                    return skip
 
             counts = await populate_reverse_dns(db, resolvers=ps.reverse_dns_resolvers or None)
             ps.reverse_dns_last_run_at = now

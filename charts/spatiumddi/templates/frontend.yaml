@@ -98,6 +98,10 @@ spec:
               mountPath: /etc/nginx/templates/default.conf.template
               subPath: default.conf.template
               readOnly: true
+            # A directory mount, never subPath: the kubelet updates these
+            # files in the running pod when the Secret changes, and the
+            # image's 40-tls-reload-watch.sh reloads nginx on that change
+            # (#1173). A subPath mount would freeze them at pod start.
             - name: tls-cert
               mountPath: /etc/nginx/tls
               readOnly: true

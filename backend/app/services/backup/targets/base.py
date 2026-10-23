@@ -187,6 +187,13 @@ class ConfigFieldSpec:
     required: bool = True
     description: str | None = None
     secret: bool = False  # hide from list responses
+    #: The value is made of LINES (a PEM key, a known_hosts file, one
+    #: header per line). The form renders a multi-line control for it,
+    #: masked when ``secret`` is also set. A one-line input cannot hold a
+    #: line break at all — the browser folds each one into a space — so a
+    #: field whose meaning depends on its lines and is rendered as an input
+    #: silently becomes a different value (#2199).
+    multiline: bool = False
 
 
 def safe_url(url: str) -> str:
@@ -221,6 +228,24 @@ def scrub_url(text: str, *urls: str) -> str:
             if url.endswith("/"):
                 text = text.replace(url.rstrip("/"), safe_url(url).rstrip("/"))
     return text
+
+
+def describe_exc(exc: BaseException) -> str:
+    """A non-empty, operator-readable reason for ``exc``.
+
+    Many library exceptions carry no text at all — ``httpx.ReadTimeout``,
+    ``asyncio.TimeoutError``, a bare ``TimeoutError`` — so ``f"...: {exc}"``
+    stored ``"WebDAV PUT failed: "`` and told the operator nothing (#2402).
+    Falls back to the exception's type, and says plainly when it was a
+    timeout. Callers still run :func:`scrub_url` over the result.
+    """
+    text = str(exc).strip()
+    if text:
+        return text
+    name = type(exc).__name__
+    if isinstance(exc, TimeoutError) or "timeout" in name.lower():
+        return f"{name} (the destination timed out)"
+    return name
 
 
 def config_field_specs(driver: BackupDestination) -> tuple[ConfigFieldSpec, ...]:
@@ -354,6 +379,7 @@ def list_destination_kinds() -> list[dict[str, Any]]:
                         "required": f.required,
                         "description": f.description,
                         "secret": f.secret,
+                        "multiline": f.multiline,
                     }
                     for f in d.config_fields
                 ],

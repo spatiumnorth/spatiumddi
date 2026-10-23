@@ -268,9 +268,16 @@ class ChainVerifyResult:
     ok: bool
     rows_checked: int
     breaks: list[ChainBreak]
+    # Range actually walked (None on an empty table) and whether rows
+    # outside it exist, so a caller never reads a window as the whole log.
+    first_seq: int | None = None
+    last_seq: int | None = None
+    partial: bool = False
 
 
-async def verify_chain(db: AsyncSession, *, max_rows: int | None = None) -> ChainVerifyResult:
+async def verify_chain(
+    db: AsyncSession, *, max_rows: int | None = None, newest: bool = False
+) -> ChainVerifyResult:
     """Walk the audit_log in seq order and check each row's hash.
 
     A break can be one of two flavours:
@@ -284,14 +291,42 @@ async def verify_chain(db: AsyncSession, *, max_rows: int | None = None) -> Chai
 
     Distinct codes so the alert message can tell operators *what*
     kind of tampering they're looking at.
+
+    ``max_rows`` caps the walk. By default it covers the OLDEST rows;
+    with ``newest=True`` it covers the NEWEST ``max_rows`` rows, anchored
+    on the ``row_hash`` of the row just before the window (#2297) so the
+    window's first ``prev_hash`` is still checked. Recent rows are where
+    tampering matters, so the Audit page badge uses the newest window.
     """
-    stmt = select(AuditLog).order_by(AuditLog.seq.asc())
-    if max_rows is not None:
-        stmt = stmt.limit(max_rows)
-    rows = (await db.execute(stmt)).scalars().all()
+    partial = False
+    anchor: str | None = None
+    if max_rows is not None and newest:
+        stmt = select(AuditLog).order_by(AuditLog.seq.desc()).limit(max_rows)
+        rows = list((await db.execute(stmt)).scalars().all())
+        rows.reverse()
+        if rows:
+            pred = (
+                await db.execute(
+                    select(AuditLog.row_hash)
+                    .where(AuditLog.seq < rows[0].seq)
+                    .order_by(AuditLog.seq.desc())
+                    .limit(1)
+                )
+            ).first()
+            if pred is not None:
+                partial = True
+                anchor = pred[0]
+    else:
+        stmt = select(AuditLog).order_by(AuditLog.seq.asc())
+        if max_rows is not None:
+            stmt = stmt.limit(max_rows + 1)
+        rows = list((await db.execute(stmt)).scalars().all())
+        if max_rows is not None and len(rows) > max_rows:
+            rows = rows[:max_rows]
+            partial = True
 
     breaks: list[ChainBreak] = []
-    expected_prev: str | None = None
+    expected_prev: str | None = anchor
     rows_checked = 0
     for row in rows:
         rows_checked += 1
@@ -324,4 +359,11 @@ async def verify_chain(db: AsyncSession, *, max_rows: int | None = None) -> Chai
                 )
             )
         expected_prev = row.row_hash
-    return ChainVerifyResult(ok=not breaks, rows_checked=rows_checked, breaks=breaks)
+    return ChainVerifyResult(
+        ok=not breaks,
+        rows_checked=rows_checked,
+        breaks=breaks,
+        first_seq=rows[0].seq if rows else None,
+        last_seq=rows[-1].seq if rows else None,
+        partial=partial,
+    )

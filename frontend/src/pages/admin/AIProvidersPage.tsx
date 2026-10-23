@@ -23,6 +23,12 @@ import {
   type AITestConnectionResult,
 } from "@/lib/api";
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { ListEmpty } from "@/components/ui/list-read-error";
+import {
+  NEEDS_SUPERADMIN,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -591,6 +597,8 @@ function ModelPickerModal({
 
 export function AIProvidersPage() {
   const qc = useQueryClient();
+  // #2525 — the provider routes are superadmin-only whatever the grants.
+  const { isSuperadmin } = usePermissions();
   const providersQ = useQuery({
     queryKey: ["ai-providers"],
     queryFn: aiApi.listProviders,
@@ -741,7 +749,8 @@ export function AIProvidersPage() {
               setTestResult(null);
               setEditor({ mode: "create", initial: { ...EMPTY } });
             }}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             <Plus className="h-4 w-4" /> New provider
           </button>
@@ -778,8 +787,11 @@ export function AIProvidersPage() {
                       colSpan={7}
                       className="px-3 py-8 text-center text-muted-foreground"
                     >
-                      No providers configured. Click{" "}
-                      <strong>New provider</strong> to add one.
+                      {/* A refused read is not an empty list (#2525). */}
+                      <ListEmpty error={providersQ.error} what="AI providers">
+                        No providers configured. Click{" "}
+                        <strong>New provider</strong> to add one.
+                      </ListEmpty>
                     </td>
                   </tr>
                 )}
