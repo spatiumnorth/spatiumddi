@@ -67,6 +67,7 @@ from app.core.dns_names import (
 from app.core.permissions import (
     _token_grants_for,
     is_effective_superadmin,
+    require_any_permission,
     require_any_resource_permission,
     require_permission,
     token_scope_allows,
@@ -255,6 +256,14 @@ logger = structlog.get_logger(__name__)
 # `user_has_permission`.
 router = APIRouter(
     dependencies=[Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))]
+)
+
+# The router gate takes the action from the HTTP method, so a POST asks for
+# ``write``. A POST that answers with the zone's existing records (an import
+# preview / commit, a sync-with-server) also needs what a GET of those records
+# needs: ``read`` on any of the three types, as the export and record list ask.
+_DNS_RECORDS_READ = require_any_permission(
+    ("read", "dns_group"), ("read", "dns_zone"), ("read", "dns_record")
 )
 
 # Sourced from the driver registry so new drivers (e.g. ``windows_dns``)
@@ -9264,6 +9273,7 @@ async def _queue_import_ops(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/preview",
     response_model=ImportPreviewResponse,
+    dependencies=[Depends(_DNS_RECORDS_READ)],
 )
 async def import_zone_preview(
     group_id: uuid.UUID,
@@ -9303,7 +9313,10 @@ async def import_zone_preview(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/commit",
     response_model=ImportCommitResponse,
-    dependencies=[Depends(require_permission("write", "dns_record"))],
+    dependencies=[
+        Depends(require_permission("write", "dns_record")),
+        Depends(_DNS_RECORDS_READ),
+    ],
 )
 async def import_zone_commit(
     group_id: uuid.UUID,
@@ -9528,6 +9541,7 @@ class SyncWithServerResponse(BaseModel):
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/sync-with-server",
     response_model=SyncWithServerResponse,
+    dependencies=[Depends(_DNS_RECORDS_READ)],
 )
 async def sync_zone_with_server_endpoint(
     group_id: uuid.UUID,
@@ -9953,6 +9967,7 @@ def _sheet_issue(i: sheet_io.RowIssue) -> SheetRowIssue:
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview",
     response_model=SheetImportPreviewResponse,
+    dependencies=[Depends(_DNS_RECORDS_READ)],
 )
 async def import_zone_spreadsheet_preview(
     group_id: uuid.UUID,
@@ -10008,7 +10023,10 @@ async def import_zone_spreadsheet_preview(
 @router.post(
     "/groups/{group_id}/zones/{zone_id}/import/spreadsheet/commit",
     response_model=SheetImportCommitResponse,
-    dependencies=[Depends(require_permission("write", "dns_record"))],
+    dependencies=[
+        Depends(require_permission("write", "dns_record")),
+        Depends(_DNS_RECORDS_READ),
+    ],
 )
 async def import_zone_spreadsheet_commit(
     group_id: uuid.UUID,

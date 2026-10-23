@@ -128,6 +128,16 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The DNS zone import previews, the import commits and sync-with-server
+  now also need read on DNS records.** These are POSTs, so they asked
+  only for `write`, while their answers list the zone's existing records
+  (a `replace` preview names every record the file omits). They now also
+  ask for `read` on one of `dns_group` / `dns_zone` / `dns_record`, as the
+  zone export and the record list do: the zone-file and spreadsheet
+  `…/import/{preview,commit}` and `…/sync-with-server`. The built-in DNS
+  Editor already holds it; a custom role with `write` and no `read` now
+  gets 403 from them, as it already did from the export.
+
 - **An API token bound to specific subnets or DNS zones is held to them
   outside the IPAM and DNS routers too.** Its permission check sees only
   the resource type, so routes mounted elsewhere answered it for the

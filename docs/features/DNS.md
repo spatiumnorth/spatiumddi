@@ -1401,7 +1401,7 @@ XLSX**. Over REST:
 |---|---|
 | Export | `GET /api/v1/dns/groups/{gid}/zones/{zid}/export?format=csv\|xlsx` (`format=zone`, the default, is the zone file). File name `dns-zone-<zone>-<YYYYMMDD-HHMMSS>.<ext>`, UTC. Needs read. |
 | Template | `GET …/zones/{zid}/import/template?format=csv\|xlsx` |
-| Import | `POST …/zones/{zid}/import/spreadsheet/preview` then `…/commit`, multipart: `file`, `mode` (`merge` / `replace`), and on a replace commit `confirm_zone`. Needs write on `dns_record`; a replace that deletes also needs delete. |
+| Import | `POST …/zones/{zid}/import/spreadsheet/preview` then `…/commit`, multipart: `file`, `mode` (`merge` / `replace`), and on a replace commit `confirm_zone`. Needs write on `dns_record` and read (as the export does); a replace that deletes also needs delete. |
 
 The zone-file export writes a record target (MX, SRV, CNAME, NS, PTR, DNAME) exactly as stored: a target with no trailing dot stays relative to `$ORIGIN`. Import compares names absolute and case-insensitive, and TXT bare or quoted, so re-importing your own export plans no changes (#2187).
 
