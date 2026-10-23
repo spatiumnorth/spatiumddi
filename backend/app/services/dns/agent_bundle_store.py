@@ -36,6 +36,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.versions import canonical_version
 from app.models.dns import DNSAgentBundle, DNSServer
 
 logger = structlog.get_logger(__name__)
@@ -265,7 +266,8 @@ async def store(
     back. The render counter is incremented in SQL so it is exact under
     that race.
     """
-    app_version = settings.version
+    # The same spelling GET /version reports (#2354).
+    app_version = canonical_version(settings.version, settings.app_version)
     payload: dict[str, Any] = {
         "snapshot_at": snapshot_at,
         "visible_xacts": visible_xacts,

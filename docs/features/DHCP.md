@@ -92,8 +92,8 @@ DHCPScope
     "bootfile-name": "pxelinux.0",
     "code:176": "MCIPADD=10.0.0.20"   -- raw vendor option by code (see below)
   }
-  ddns_enabled: bool
-  ddns_hostname_policy: enum(client, server_name, derived, none)  -- default client (#1308)
+  ddns_enabled: bool                 -- INERT (#2270): DDNS is subnet-level; only false is accepted
+  ddns_hostname_policy: str          -- INERT (#2270): only the default "client" is accepted
   dns_track_dynamic_leases: bool (default true)  -- see "Dynamic-lease DNS drift" below
   address_family: enum(ipv4, ipv6)   -- inferred from the bound subnet's CIDR
   v6_address_mode: enum(stateful, stateless, slaac)  -- v6 only (issue #52)
@@ -1482,8 +1482,10 @@ DHCPScope.hostname_to_ipam_sync: enum(disabled, on_lease, on_static_only)
 | Mode | Behavior |
 |---|---|
 | `disabled` | No hostname sync — IPAM hostname is managed manually |
-| `on_lease` | Hostname from every new DHCP lease is written to IPAM |
-| `on_static_only` | Only static DHCP assignments sync hostname to IPAM |
+| `on_lease` | Hostname from every DHCP lease is written to IPAM (the default) |
+| `on_static_only` | Lease hostnames are not written to IPAM; only static DHCP assignments set an IPAM hostname |
+
+The setting governs the **hostname only**. Every lease is still mirrored into IPAM as an `auto_from_lease` row (status, MAC, last-seen) in every mode, and the same rule applies to the Kea lease-event path, the Windows poll path and a reservation handing its address back to a live lease. Turning the setting off changes nothing already stored: existing mirror rows are not deleted and their hostnames are not blanked or overwritten by later lease events. A subnet with DDNS enabled still gets the hostname DDNS publishes; that is governed by the DDNS settings, not this one. Upgrade note (#2269): the setting used to be ignored, so scopes stored as `on_static_only` (the old default) were rewritten to `on_lease` to keep their behaviour; `disabled` is honoured as set.
 
 **Recommendation**: Set to `disabled` or `on_static_only` for large dynamic subnets (e.g., WiFi /16) where lease hostname data is noisy. Set to `on_lease` for server subnets where every IP should have a known hostname.
 
