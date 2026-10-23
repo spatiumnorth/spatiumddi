@@ -128,6 +128,34 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A DHCP config change reaches a parked agent on the wake, not
+  on the long-poll timeout (#2040).** The agent's `/config` long-poll
+  keeps one database session for its whole wait, and a re-query
+  hands back the rows already loaded in it without refreshing them.
+  So when a wake arrived the bundle was rebuilt from the group and
+  its member servers as they were when the poll
+  parked, and a group-level change (HA mode, heartbeat, peer URLs,
+  thread pool, lease cache) reached the agent only when the poll
+  timed out, up to 30 s later. Each pass now expires
+  the session first and reads committed state. A sweep for handlers
+  that change the bundle without waking found five more: a subnet
+  edit (its DNS servers, domain name, VLAN and site feed RA, the
+  DHCPv6 domain search and the E911 options), E911 ERL and binding
+  edits, a feature-module toggle, `POST /new-devices/block` (it
+  stashed a wake with nothing mounted to publish it), and copilot or
+  approved operations applied through `/ai`, `/change-requests` and
+  `/requests` (none of those mounts a collector, so the op's own wake
+  was dropped). All now wake the affected DHCP groups. A new guard
+  test fails a handler that collects a wake with no collector, and a
+  mutating `/dhcp` or `/e911` route that neither wakes nor says why
+  it need not. The Looking Glass long-poll had the same defect: it
+  never re-read the collector row, so disabling a collector reached
+  it only at the timeout (and a collector edit published no wake at
+  all); it now expires its session each pass too. The DNS long-poll
+  serves stored bundle rows, so it was exposed in one narrow case: a
+  newer renderer revision re-rendering a bundle in place during a
+  rolling upgrade; that read now refreshes the row it returns.
+
 - **Streaming responses kept sending after the caller's access ended.**
   The cluster-health, pod-log, nmap-progress and AI-chat streams checked
   the caller once, when the connection opened, and then sent until the
