@@ -128,6 +128,335 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **A backup destination that times out now says so instead of
+  storing an empty reason (#2402).** A WebDAV target whose server
+  accepted the connection and never answered failed the run with
+  `WebDAV PUT failed: ` and nothing after the colon, because httpx's
+  timeout exceptions carry no text. That string is what the target's
+  `last_run_error` and the Run now answer show. The error now names
+  the exception type and, for a timeout, says the destination timed
+  out. The same fallback covers the other destination drivers that
+  built their message from the exception text (WebDAV, HTTPS PUT, S3,
+  GCS, Azure Blob, FTP, SCP, SMB).
+
+- **A DHCP scope's DDNS toggle and hostname policy did nothing, yet
+  reloaded Kea whenever they changed (#2270).** DDNS is gated only by
+  the subnet's own settings; the scope's `ddns_enabled` and
+  `ddns_hostname_policy` reached neither Kea nor DNS, but were hashed
+  into the DHCP config ETag, so flipping one restarted Kea's HA state
+  for a byte-identical config. They no longer enter the bundle or the
+  agent wire, so such an edit converges nothing. The scope API now
+  refuses a change to either with a 422 naming the field and pointing
+  at the subnet's DDNS settings (values already stored are tolerated on
+  save), and the scope dialog and DHCP lists no longer show a DDNS
+  control or column.
+
+- **A scope's "Hostname → IPAM Sync" setting now does something
+  (#2269).** It was stored and never read: every lease's hostname
+  was written to IPAM whatever the scope said, so "Don't sync to
+  IPAM" still filled IPAM. Now only `on_lease` writes a lease's
+  hostname onto its IPAM mirror row; `disabled` and `on_static_only`
+  keep it out. This covers the Kea lease-event path, the Windows
+  poll path and a reservation handing its address back to a live
+  lease. The mirror row itself (status, MAC, last-seen) is still
+  created in every mode, and turning the setting off deletes
+  nothing: existing mirrors stay and their hostnames are not
+  blanked or overwritten. The old default `on_static_only` would
+  have stripped lease hostnames from every existing scope, so the
+  default is now `on_lease` and stored `on_static_only` values are
+  rewritten to it (migration `e7b3d19a4c26`); `disabled` is
+  honoured as set.
+
+- **A nightly no longer calls itself `nightly-YYYYMMDD` in the update
+  check, the upgrade pre-flight and the DNS bundle stamp (#2354).**
+  #2111 gave `GET /version` one spelling of a nightly
+  (`0.0.0-nightly-YYYYMMDD+sha`), but three places still read the bare
+  image tag, which names no build date: the daily update check offered a
+  nightly a release it already includes, the upgrade pre-flight called it
+  "not a release" instead of "already includes the target", and every DNS
+  server row's `bundle_app_version` named the build differently from
+  `/version`. All three now use `canonical_version`. Releases are
+  unaffected. Existing server rows pick up the new spelling on their next
+  render.
+
+- **PowerDNS agent answers on IPv6 as well as IPv4 (#2307).** The agent
+  rendered `local-address=0.0.0.0`, which replaces pdns's default and so
+  never bound `::`: IPv6 clients got no answer while BIND9 groups did, and
+  the firewall's open v6 port made it look like a network fault. It now
+  renders `0.0.0.0, ::`. On a host with no IPv6 stack at all (kernel
+  `ipv6.disable=1`) pdns aborts on a `::` entry, so there the line stays
+  IPv4-only, the same tolerance BIND shows for `listen-on-v6`. The dnsdist
+  front binds both families already.
+
+- **An unattended install no longer aborts when k3s unpacks its tools during the root copy (#2256).** The live-root rsync now skips `/var/lib/rancher/k3s/data/` (k3s's self-extraction area, regenerated on the installed system's first start; the baked air-gap images under `agent/` are still copied) and treats rsync exit 24 ("some files vanished") as success for that copy only, logging it. Every other rsync failure still aborts the install.
+
+- **A backup run in flight during a restore now records its end (#2353).**
+  A restore ends every other database session, the running backup's
+  included, so the run could not stamp its own result: the target stayed
+  "in progress" and Run now answered 409 until the 2 hour presumed-dead
+  reap. The runner now writes the terminal state and its audit row on a
+  fresh session when its own was closed under it. The write only lands
+  while the row still carries that run's claim, so it never overwrites a
+  newer run.
+
+- **The DHCP MAC blocklist is now enforced on DHCPv6 scopes, best
+  effort (#2268).** The reserved `DROP` client class was rendered into
+  Dhcp4 only, so a blocked (rogue / lost_stolen / quarantine) device
+  still got DHCPv6 leases. Kea has no `pkt6.mac` and a DHCPv6 packet
+  carries no hardware address, so the Dhcp6 `DROP` class matches the
+  MAC inside an Ethernet DUID-LL / DUID-LLT and the relay's RFC 6939
+  link-layer option (79). A client with a DUID-EN / DUID-UUID or a
+  randomised DUID, or behind a relay that adds no option 79, is not
+  caught. DHCP.md section 4a now says so; the rendered expression was
+  checked with `kea-dhcp6 -t` (Kea 3.0.3).
+
+- **BGP-mode MetalLB runs newer FRRouting and kube-rbac-proxy images
+  (#2239).** BGP mode is off by default, so only installs that turn
+  it on are affected. kube-rbac-proxy moves from v0.12.0 to v0.23.0.
+  The old build had 7 CRITICAL and 96 HIGH findings, including
+  CVE-2022-1996 (an auth bypass in go-restful), and it is the one
+  BGP-mode container with an authenticated listener. v0.23.0 has 4
+  HIGH and no CRITICAL. FRRouting moves from 10.4.1 to 10.4.5, on the
+  same 10.4 line, clearing the OpenSSL CRITICAL CVE-2026-31789 (2
+  CRITICAL and 21 HIGH findings before, 20 HIGH after). Both are
+  image-only changes: the MetalLB 0.15.3 chart stays, because
+  metallb/metallb#3063 is still open. The chart's kube-rbac-proxy
+  arguments still work on v0.23: it ignores `--logtostderr` and logs
+  a warning. Metrics still answer 401 without a token, 403 for an
+  account without `/metrics` access, and 200 for one with it.
+  **frr-k8s stays at v0.0.21**, with its 6 CRITICAL findings, and
+  that is deliberate. From v0.0.23 the frr-k8s binary serves its
+  metrics over HTTPS and watches a new FRRK8sConfiguration CRD, and
+  the frr-k8s templates inside the 0.15.3 chart support neither.
+  Verified on k3s 1.36: with v0.0.27 the controller cannot start its
+  manager, and the FRR container fails its plain-HTTP startup probe
+  with a 400. v0.0.22, the newest version those templates can run,
+  scans the same as v0.0.21. Fixing frr-k8s needs a chart change,
+  not an image bump. That change would also remove the
+  kube-rbac-proxy sidecars.
+
+- **A DNS server holding a million records no longer OOM-kills
+  itself, and a restarted one comes back (#2223).** ddi-pg's scale
+  lab ran 1,000,000 records in 20,000 zones on 7 nodes: 5
+  `dns-bind9` containers were OOM-killed at their 2Gi limit with
+  the agent at 1.1 GB, and none recovered, because the `:53`
+  liveness probe started 30 s after the container did and killed it
+  before named listened. Two fixes. The DNS containers in both
+  charts (bind9, PowerDNS, Technitium) gain a startup probe on the
+  same `:53` check with a 60-minute budget, which liveness and
+  readiness wait for: a cold start at that size checks every zone
+  file first (~70 ms each, measured), so it takes tens of minutes.
+  A daemon that never listens is still restarted, after the budget;
+  `dns.startupProbe` / `dnsAgents.startupProbe` raise it. And the
+  agent's memory: measured on a synthetic bundle of that shape (126
+  MB), its peak while taking a bundle fell from ~700 MB to ~480 MB,
+  from 884 MB to 461 MB during a startup hold, and what it keeps
+  between polls from ~450 MB to ~110 MB. The bundle is parsed
+  a zone at a time instead of from its whole text; the zone list
+  kept for the DNSSEC re-read, the per-zone serial map and the
+  startup report are kept as compact JSON, because as parsed objects
+  they held most of the freed bundle resident (CPython returns
+  memory an arena at a time); a startup hold (#2019) keeps the held
+  bundle as a hard link on disk rather than parsed; and the ingest
+  thread reads the zone list without the records, where it re-parsed
+  the whole cache every 180 s after a change, beside the sync
+  loop's own parse. And on the appliance the `dns-bind9` memory
+  limit is no longer a fixed 2Gi, which the lab hit at about 2M
+  records: the supervisor sizes it from node RAM, a quarter of the
+  smallest node labelled for dns-bind9, rounded to whole GiB, floor
+  2Gi, cap 8Gi, with the request an eighth of it as before (so 4 GB
+  → 2Gi / 256Mi, 16 GB → 4Gi / 512Mi, 64 GB → 8Gi / 1Gi). One
+  value for the cluster, because the role chart must render the same
+  on every node (#1137). A memory value in `dnsBind9.resources` in
+  the `spatiumddi-appliance` HelmChartConfig still wins. Sizing in
+  `docs/features/DNS.md` §8.0 and `docs/deployment/APPLIANCE.md`.
+
+- **Appliance k3s v1.36.4+k3s1 → v1.36.5+k3s1 (#2224).** A patch on
+  the same Kubernetes minor (1.36.5, Go 1.26.8), so a slot revert to
+  the previous release still works: etcd stays on the 3.6.14 data
+  format (k3s's fork goes from `v3.6.14-k3s1` to `v3.6.14-k3s3`,
+  confirmed in the tag's `go.mod`; the release's backport titles
+  mention etcd 3.7.1 / kine 0.17.1, and neither is in it), with kine
+  0.16.5, CoreDNS 1.14.7 and helm-controller v0.17.9. klipper-helm
+  stays at v0.13.3. Upstream it brings a grpc CVE fix, an etcd
+  compressed-snapshot restore fix, an end to the spurious "node
+  password secret already exists" on restart, anonymous requests to
+  the supervisor router refused, and a stricter CA-hash check on join
+  (k3s-io/k3s#14706). That check does not change our join: the
+  published token is the full `K10<hash>` token over k3s's own
+  single-certificate CA, which takes the unchanged path. A joiner
+  whose hash does not match the seed's CA now fails on an x509 error
+  instead of "token CA hash does not match", and the Fleet join
+  reason still reads it as a rejected token. helm-controller v0.17.8
+  / v0.17.9 create a chart's values Secret and content ConfigMap
+  before its Job, no longer resume a Job they are about to delete and
+  recreate (a values change landing while a new Job is still
+  suspended), and prefer control-plane nodes for chart Jobs;
+  `failurePolicy: retry` is untouched. The kind node image in the
+  agent e2e stays at v1.36.4: kind publishes no v1.36.5 image.
+
+- **A DHCP config change reaches a parked agent on the wake, not
+  on the long-poll timeout (#2040).** The agent's `/config` long-poll
+  keeps one database session for its whole wait, and a re-query
+  hands back the rows already loaded in it without refreshing them.
+  So when a wake arrived the bundle was rebuilt from the group and
+  its member servers as they were when the poll
+  parked, and a group-level change (HA mode, heartbeat, peer URLs,
+  thread pool, lease cache) reached the agent only when the poll
+  timed out, up to 30 s later. Each pass now expires
+  the session first and reads committed state. A sweep for handlers
+  that change the bundle without waking found five more: a subnet
+  edit (its DNS servers, domain name, VLAN and site feed RA, the
+  DHCPv6 domain search and the E911 options), E911 ERL and binding
+  edits, a feature-module toggle, `POST /new-devices/block` (it
+  stashed a wake with nothing mounted to publish it), and copilot or
+  approved operations applied through `/ai`, `/change-requests` and
+  `/requests` (none of those mounts a collector, so the op's own wake
+  was dropped). All now wake the affected DHCP groups. A new guard
+  test fails a handler that collects a wake with no collector, and a
+  mutating `/dhcp` or `/e911` route that neither wakes nor says why
+  it need not. The Looking Glass long-poll had the same defect: it
+  never re-read the collector row, so disabling a collector reached
+  it only at the timeout (and a collector edit published no wake at
+  all); it now expires its session each pass too. The DNS long-poll
+  serves stored bundle rows, so it was exposed in one narrow case: a
+  newer renderer revision re-rendering a bundle in place during a
+  rolling upgrade; that read now refreshes the row it returns.
+
+- **Streaming responses kept sending after the caller's access ended.**
+  The cluster-health, pod-log, nmap-progress and AI-chat streams checked
+  the caller once, when the connection opened, and then sent until the
+  client disconnected — so signing a session out, disabling the account,
+  revoking or expiring the API token, or removing the permission did not
+  stop a stream already open. Each stream now re-runs the request's
+  authentication and permission checks every 15 seconds and ends when
+  they fail, or when the access token it was opened with expires. The
+  log panes reconnect on their own, without re-tailing. The nmap stream's
+  open-time check now goes through the same path as every other route,
+  so it also applies the password-change gate and honours time-bound
+  grants.
+
+- **Settings → Sessions: the Session Timeout and Auto-Logout Warning
+  are now applied.** Both were stored and read by nothing, so an idle
+  console session stayed usable for the refresh cookie's full lifetime.
+  A browser session idle longer than the Session Timeout is now refused
+  on its next request and on `/auth/refresh`, and is no longer listed
+  as live on the Sessions page; `0` disables it. A refresh no longer
+  counts as activity, and the console reports how long the operator has
+  been away on every request, so a page left open and polling still
+  runs out. The console shows the Auto-Logout Warning that many
+  minutes before expiry (at most half the timeout; `0` = no warning)
+  and returns to the login page when the timeout passes. API tokens are
+  not affected. The default timeout is the 60 minutes the setting has
+  always shown: a console tab idle for longer than that will need to
+  sign in again after upgrading; set it to `0` for wall displays. A
+  negative Auto-Logout Warning is now rejected.
+
+- **The DNS zone import previews, the import commits and sync-with-server
+  now also need read on DNS records.** These are POSTs, so they asked
+  only for `write`, while their answers list the zone's existing records
+  (a `replace` preview names every record the file omits). They now also
+  ask for `read` on one of `dns_group` / `dns_zone` / `dns_record`, as the
+  zone export and the record list do: the zone-file and spreadsheet
+  `…/import/{preview,commit}` and `…/sync-with-server`. The built-in DNS
+  Editor already holds it; a custom role with `write` and no `read` now
+  gets 403 from them, as it already did from the export.
+
+- **An API token bound to specific subnets or DNS zones is held to them
+  outside the IPAM and DNS routers too.** Its permission check sees only
+  the resource type, so routes mounted elsewhere answered it for the
+  whole estate: `GET /reports/top-subnets-by-utilization` listed every
+  subnet, and `GET /metrics/dns/timeseries` summed every server. Such a
+  token is now refused (403) on every route outside the IPAM and DNS
+  routers except those that narrow to its grants or return nothing about
+  the estate (`/auth/me`, `/auth/me/permissions`, `/search`,
+  `/search/types`, `/ai/mcp`, `/dns/tools/*`), and `/metrics` refuses it
+  as a scrape credential. Sessions and tokens without resource grants
+
+- **An "Exclude secrets" backup now leaves out every secret.** The
+  diagnostic mode blanked the credentials an operator types in but
+  kept the appliance CA private key, the k3s join tokens, the cluster
+  kubeconfig, persistent pairing-code reveals and the ACME account
+  key, plus local password hashes and API-token / session /
+  pairing-code / agent-token digests, and its `secrets.enc` still
+  carried the install's `SECRET_KEY` and credential key. All of them
+  are now removed: the CA row is left out, the cluster credentials and
+  password hashes are NULL, the digests are replaced with values
+  nothing hashes to, and `secrets.enc` holds metadata only. Restoring
+  such an archive still succeeds: the CA is regenerated on the next
+  approval (approved appliances re-key), the supervisor re-reports the
+  kubeconfig and join token, agents re-bootstrap from their pre-shared
+  key, and the next ACME order mints a new account key. Local
+  passwords must be reset and API tokens re-issued after such a
+  restore. A normal backup is unchanged.
+
+- **The diagnostic and support bundles now keep secret environment
+  values out.** The appliance diagnostic bundle's env dump matched
+  secret names against a short list that missed `LG_AGENT_KEY` and
+  every connection URL carrying a password, and its pod and host log
+  files were copied without the credential sweep the support bundle
+  applies. Both bundles now show an environment value only for an
+  allowlist of known non-secret settings and list every other variable
+  with its value replaced; the appliance bundle runs every file it
+  writes through the support bundle's secret-shape sweep; and that
+  sweep now also strips a password from a URL with an empty username
+  (`redis://:password@host`, the form every Redis URL the charts
+  render takes). The bundle card says what is redacted and that the
+  log sweep is best effort.
+
+- **A node's hard loss no longer leaves a surviving node's heartbeat stale
+  past the demote guard (#1805).** Every heartbeat reached the api through
+  its Service, and so does every DNS and DHCP agent and the frontend's
+  `/api` proxy. The Service spread their connections over every api pod. A
+  lost node's api pod stays listed until the node reads NotReady, about
+  40 s, so a heartbeat that landed on it waited out its whole 40 s timeout.
+  Two in a row left a healthy node 97 s without a heartbeat. On the
+  appliance the api Service now sets `trafficDistribution: PreferSameNode`:
+  each node's callers use the api pod on their own node while it is ready,
+  and every api pod only while it is not. firstboot's control-plane values
+  and the supervisor's `spatium-control` HelmChartConfig both set it, so a
+  fresh install, a grown cluster and an upgraded one all carry it. The
+  umbrella chart's new `api.service.trafficDistribution` defaults to `""`,
+  which renders the api Service as before on your own Kubernetes; the field
+  is rendered on Kubernetes 1.34 and later.
+
+- **A node's return no longer rolls CoreDNS out twice (#1753).** k3s
+  force re-applies its bundled `coredns.yaml` at every server start. That
+  put the CoreDNS pod template's tolerations back to k3s's own two entries.
+  The supervisor's HA shape had added a 20 s fast-evict pair to them, so the
+  template changed (rollout one), and the seed's next heartbeat patched the
+  pair back in (rollout two). Each rollout replaced every CoreDNS pod.
+  Lookups in flight to the replaced pods stalled, enough to put Redis
+  Sentinel into TILT once more at each return. With one CoreDNS replica on
+  every node (#1718), a fast eviction has nowhere to put the evicted pod.
+  The HA shape now keeps k3s's own tolerations, so k3s's re-apply changes
+  nothing and a node's return replaces no CoreDNS pod. An existing cluster
+  drops the fast-evict pair in one rollout when it upgrades.
+
+- **After a node's hard loss, Redis fails over in seconds again, not
+  80–100 s (#1718).** Until a lost node reads NotReady (about 40 s), its
+  CoreDNS pod stays a ready endpoint of the cluster DNS Service. About half
+  of every other node's lookups went to it and stalled for the resolver's
+  whole timeout. Redis Sentinel resolves its peers' names inside its event
+  loop, so each stall put the surviving sentinels into TILT, where they act
+  on nothing until 30 s after the last stall. The failover waited for the
+  dead endpoint to leave, plus the TILT period: 77 s in our drill, 78–102 s
+  in the issue. The supervisor now runs one CoreDNS replica on every node
+  (it was capped at two). It also sets `trafficDistribution:
+  PreferSameNode` on the kube-dns Service, so each node resolves through
+  its own replica and a lost node takes only its own pods' DNS with it. A
+  single-node appliance keeps the stock shape.
+
+- **A heartbeat that never reached the control plane is sent again after
+  5 s, not after the whole 30 s interval (part of #1805).** Such a
+  heartbeat is one whose lookup or connection went to a lost node, or that
+  met an empty api Service while the api waited for Redis. On a node loss,
+  two failures in a row left a healthy node's heartbeat about 100 s old.
+  That is past the 90 s after which the demote guard and the Fleet tab
+  call a voter unhealthy. The supervisor now sends such a heartbeat again
+  after 5 s, doubling the wait while failures continue, up to the
+  interval. A heartbeat the control plane answered is paced as before.
+
 - **A failing Windows DHCP lease pull now shows on the server row
   (#2306).** The scheduled pull recorded a failure only in the audit
   log, so a server whose lease cmdlet kept failing stayed green and

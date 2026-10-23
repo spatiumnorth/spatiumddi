@@ -1015,8 +1015,8 @@ spec:
   # reinstall deleted the Secret, the install's 'lookup' found nothing, and
   # 'randAlphaNum 64' minted a new SECRET_KEY, orphaning everything
   # encrypted at rest (#1042's consequences, again). 'abort' was rejected in
-  # #1042 because it waits for an operator; 'retry' (helm-controller v0.17.7
-  # and klipper-helm v0.13.3, from k3s v1.36.4+k3s1) does not wait: it runs
+  # #1042 because it waits for an operator; 'retry' (helm-controller v0.17.9
+  # and klipper-helm v0.13.3, from k3s v1.36.5+k3s1) does not wait: it runs
   # 'helm upgrade' on a failed release, and deletes nothing.
   #
   # A HelmChartConfig's failurePolicy overrides this one, and its CRD
@@ -1181,6 +1181,19 @@ ${API_SIZING_YAML}
           operator: Exists
           effect: NoExecute
           tolerationSeconds: 20
+      # #1805 — each node's in-cluster callers (the supervisor's heartbeat,
+      # the DNS and DHCP agents, the frontend's /api proxy) use the api pod
+      # on their own node while it is ready, so a lost node's api pod cannot
+      # hold their requests until their timeout. The chart's default is empty
+      # (a BYO-Kubernetes install keeps the spread over every api pod); the
+      # appliance runs one api pod per control-plane node, so it sets the
+      # value here, and the seed supervisor writes the same value into the
+      # spatium-control HelmChartConfig (apply_control_plane_overrides),
+      # which is what a grown or upgraded cluster renders. Stated at one
+      # replica too, where it is inert, so the first heartbeat has nothing
+      # to add (#1005).
+      service:
+        trafficDistribution: PreferSameNode
       autoscaling:
         enabled: false
       env:
