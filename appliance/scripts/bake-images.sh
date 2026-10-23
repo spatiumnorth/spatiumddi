@@ -483,17 +483,45 @@ if [ "$BAKE_SOURCE" = "local" ] && [ "$ALLOW_STALE_IMAGES" != "1" ]; then
     fi
 fi
 
-# ``BAKE_SAVE_PLATFORM`` (optional, e.g. ``linux/amd64``): passed as
-# ``docker save --platform``. Required on a Docker host that uses the
-# containerd image store (Docker Desktop on Apple Silicon): a registry
-# image's index there lists platforms whose blobs were never pulled, and a
-# plain ``docker save`` fails with "content digest … not found". Also
-# guarantees the archive carries the appliance's architecture rather than
-# the build host's. Empty (the CI default) keeps the historical behaviour.
-SAVE_PLATFORM_FLAG=()
-if [ -n "${BAKE_SAVE_PLATFORM:-}" ]; then
-    SAVE_PLATFORM_FLAG=(--platform "$BAKE_SAVE_PLATFORM")
+# ``BAKE_SAVE_PLATFORM`` (e.g. ``linux/amd64``): passed as
+# ``docker save --platform``. Always set (#2393). On a Docker host that
+# uses the containerd image store (Docker Desktop on Apple Silicon, and
+# current Docker Engine), a platform-less ``docker save`` of a freshly
+# pulled multi-arch image writes only the content the store holds
+# locally, which can be the index and manifests with no config and no
+# layers: the bake "succeeds", and the appliance later tries to pull the
+# image from the registry at pod start, which fails air-gapped. Others
+# fail outright with "content digest … not found". Pinning the platform
+# also guarantees the archive carries the appliance's architecture rather
+# than the build host's. The Makefile passes it; when unset it defaults to
+# the appliance architecture (APPLIANCE_ARCH, else this host's own).
+if [ -z "${BAKE_SAVE_PLATFORM:-}" ]; then
+    if [ -n "${APPLIANCE_ARCH:-}" ]; then
+        _bake_arch="${APPLIANCE_ARCH##*/}"
+    else
+        case "$(uname -m)" in
+            x86_64|amd64) _bake_arch=amd64 ;;
+            aarch64|arm64) _bake_arch=arm64 ;;
+            *) echo "ERROR: cannot map $(uname -m) to a Docker platform; set BAKE_SAVE_PLATFORM." >&2; exit 2 ;;
+        esac
+    fi
+    BAKE_SAVE_PLATFORM="linux/${_bake_arch}"
 fi
+SAVE_PLATFORM_FLAG=(--platform "$BAKE_SAVE_PLATFORM")
+echo "→ Saving images for platform $BAKE_SAVE_PLATFORM"
+
+# #2393 — after each save, prove the archive holds the config + layers of
+# the target-platform manifest. A size floor cannot: small images exist.
+verify_archive() {
+    local archive="$1" name="$2"
+    if ! zstd -dc "$archive" \
+        | python3 "$SCRIPT_DIR/verify-image-archive.py" \
+            --platform "$BAKE_SAVE_PLATFORM" --name "$name"; then
+        rm -f "$archive"
+        echo "ERROR: $name was saved without its layers; refusing to bake it." >&2
+        exit 5
+    fi
+}
 
 for repo in "${IMAGES[@]}"; do
     short="$(basename "$repo")"
@@ -503,7 +531,7 @@ for repo in "${IMAGES[@]}"; do
 
     if [ "$BAKE_SOURCE" = "ghcr" ]; then
         echo "→ Pulling $source_tag …"
-        docker pull "$source_tag" >/dev/null
+        docker pull --platform "$BAKE_SAVE_PLATFORM" "$source_tag" >/dev/null
     elif ! docker image inspect "$source_tag" >/dev/null 2>&1; then
         echo "ERROR: no local image found for $repo. Tried:" >&2
         echo "         ${repo}:dev" >&2
@@ -530,6 +558,7 @@ for repo in "${IMAGES[@]}"; do
     # overwrite it — which made every later bake fail on the same file.
     rm -f "$tmp"
     docker save "${SAVE_PLATFORM_FLAG[@]}" "$target_tag" | zstd -T0 -19 -o "$tmp"
+    verify_archive "$tmp" "$target_tag"
     mv "$tmp" "$out_tar"
 
     size="$(du -h "$out_tar" | awk '{print $1}')"
@@ -549,16 +578,11 @@ for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}" "${CNPG_IMAGES[
     short="$(basename "${image%%:*}")"
     out_tar="$IMAGES_DIR/${short}.tar.zst"
 
-    # With a save platform pinned, always pull for that platform: a local
-    # copy pulled for the build host's own arch (a dev-compose ``redis``
-    # on an arm64 laptop) satisfies ``image inspect`` but cannot be saved
-    # as the appliance's arch.
-    if [ -n "${BAKE_SAVE_PLATFORM:-}" ]; then
-        docker pull --platform "$BAKE_SAVE_PLATFORM" "$image" >/dev/null
-    elif ! docker image inspect "$image" >/dev/null 2>&1; then
-        echo "→ Pulling $image …"
-        docker pull "$image" >/dev/null
-    fi
+    # Always pull for the save platform: a local copy pulled for the
+    # build host's own arch (a dev-compose ``redis`` on an arm64 laptop)
+    # satisfies ``image inspect`` but cannot be saved as the appliance's
+    # arch.
+    docker pull --platform "$BAKE_SAVE_PLATFORM" "$image" >/dev/null
 
     echo "→ Baking $image → $out_tar"
     tmp="${out_tar}.new"
@@ -566,6 +590,7 @@ for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}" "${CNPG_IMAGES[
     # overwrite it — which made every later bake fail on the same file.
     rm -f "$tmp"
     docker save "${SAVE_PLATFORM_FLAG[@]}" "$image" | zstd -T0 -19 -o "$tmp"
+    verify_archive "$tmp" "$image"
     mv "$tmp" "$out_tar"
 
     size="$(du -h "$out_tar" | awk '{print $1}')"
