@@ -39,6 +39,9 @@ log = structlog.get_logger(__name__)
 # Skip files that the agent writes alongside the rendered tree but
 # aren't meaningful for the operator (binary state, locks, etc).
 _SKIP_FILE_NAMES: frozenset[str] = frozenset()
+# Bookkeeping, not config (#2157): an RPZ zone file's content-hash sidecar,
+# and a temp file a crash left behind mid-write.
+_SKIP_FILE_SUFFIXES: tuple[str, ...] = (".sha256", ".tmp")
 _RENDERED_DIR_NAME = "rendered"
 
 _REDACTED = "***REDACTED***"
@@ -100,7 +103,7 @@ def _walk_rendered(rendered_dir: Path) -> Iterable[tuple[str, str]]:
     for path in sorted(rendered_dir.rglob("*")):
         if not path.is_file():
             continue
-        if path.name in _SKIP_FILE_NAMES:
+        if path.name in _SKIP_FILE_NAMES or path.name.endswith(_SKIP_FILE_SUFFIXES):
             continue
         try:
             content = path.read_text(encoding="utf-8")

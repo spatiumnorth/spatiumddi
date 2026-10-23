@@ -34,7 +34,7 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 - **k3s static binary** (~70 MB) at `/usr/local/bin/k3s`; `kubectl` / `crictl` / `ctr` symlink to it.
 - **k3s airgap images** (CoreDNS / local-path / pause / metrics-server) as zst-compressed tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst`. k3s auto-imports them into containerd at boot.
 - **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.10.2-alpine for the Control plane role.
-- **Control-plane environment** is written once, under the chart's `sharedEnv` value, which the umbrella chart appends to the api, worker AND beat containers (#1826). That is where `APPLIANCE_MODE`, `APPLIANCE_VERSION` (re-read from the booted slot's `/etc/spatiumddi/appliance-release` on every boot, so it follows an upgrade or rollback; on a multi-node cluster it is the seed's, since only the seed renders this manifest), `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and `INITIAL_NTP_SERVERS` live. When the slot-image mirror is on, its URL and secret go to the api and the worker (the worker's upgrade preflight checks the mirror's free space), not to beat. The worker runs alert evaluation (`node_pressure`, `cluster_dns_degraded`) and the rolling-upgrade orchestrator, so a variable only the api carries makes every `appliance_mode` gate read as off there. Agent pre-shared keys stay under `api.env`: only the api reads them. `charts-render-check.sh` fails a render where api, worker and beat disagree on the shared set, or where beat carries the mirror secret.
+- **Control-plane environment** is written once, under the chart's `sharedEnv` value, which the umbrella chart appends to the api, worker AND beat containers (#1826). That is where `APPLIANCE_MODE`, `APPLIANCE_HOSTNAME`, `APPLIANCE_HOST_IPS` and `INITIAL_NTP_SERVERS` live. `APPLIANCE_VERSION` joins them from a value of its own, `applianceVersion`: it is re-read from the booted slot's `/etc/spatiumddi/appliance-release` on every boot, so it follows an upgrade or rollback, and on a multi-node cluster it is the seed's, since only the seed renders this manifest. It is not a `sharedEnv` entry because a cluster Rolling Upgrade holds it with `image.tag` until every node runs the target (#2176): a HelmChartConfig can pin a single value but replaces a list whole, so as an entry the seed's boot onto its new slot rolled the api, worker and beat mid-run. When the slot-image mirror is on, its URL and secret go to the api and the worker (the worker's upgrade preflight checks the mirror's free space), not to beat. The worker runs alert evaluation (`node_pressure`, `cluster_dns_degraded`) and the rolling-upgrade orchestrator, so a variable only the api carries makes every `appliance_mode` gate read as off there. Agent pre-shared keys stay under `api.env`: only the api reads them. `charts-render-check.sh` fails a render where api, worker and beat disagree on the shared set, or where beat carries the mirror secret.
 - **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Appliance installs (and the supervisor on the Control plane); the umbrella chart drives the Control plane. Built at release time + signed.
 - **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
 
@@ -170,7 +170,7 @@ The `/appliance` section in the SpatiumDDI UI talks to k3s directly via the api 
 - **Cluster tab** (#402 — folds the former Containers/Pods tab + the etcd-snapshots section into one tab via a left sub-nav, named *Cluster* rather than *Kubernetes* for operator clarity). Three sub-sections: **Overview** — a live SSE-fed (2 s) health dashboard (KPI ribbon, CPU / memory hero chart, per-node radial gauges with the host's real partition list, workload-health panel, top-pods leaderboard) built from kubeapi node / pod listings + per-node kubelet `stats/summary` (there is no Prometheus on the appliance); **Pods** — lists every pod in the spatium namespace via kubeapi `GET /api/v1/namespaces/spatium/pods`, restart = `DELETE` the pod (owning Deployment / DaemonSet recreates it), logs = SSE wrapping kubeapi's `?follow=true` pod-log endpoint; **etcd** — the recoverable `ETCDSnapshotFile` inventory.
 - **TLS cert manager**. Patches the `spatium-appliance-tls` Secret in place via `kubectl patch secret`. Bumps a checksum annotation on the frontend Deployment to trigger a rollout (k8s doesn't auto-roll on Secret changes — the annotation acts as the trigger).
 - **Logs & Diagnostics → Self-test**. Five-check battery: external DNS resolution, kubeapi reachability via the ServiceAccount, every spatium pod's health (Running + healthy / Succeeded Jobs OK), informational DHCP + DNS role presence (OK when not assigned).
-- **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets.
+- **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets. Environment values appear only for known non-secret settings (every other variable is listed with its value replaced), and every file is swept for credential-shaped values such as keys, tokens and passwords embedded in URLs. That sweep is best effort, so review the bundle before sharing it.
 - **OS Versions**. Atomic A/B slot upgrades — same machinery as pre-#183 (Phase 8); the slot raw.xz carries a complete rootfs with k3s + baked images + chart tarballs. A slot upgrade is also an effective container upgrade because images are baked. For an upgrade scheduled from an imported/uploaded image (#199), the download is **verified by the stored sha256** (the integrity guarantee), which lets the host runner relax TLS cert-verify *only* for the appliance's own self-served URL behind the self-signed web cert — external public-CA URLs stay fully verified (#386). The Fleet drilldown shows a **live per-phase progress stepper** (download % → verify → write → bootloader → reboot-pending) with an expandable `slot-upgrade.log` tail and an honest failure card, and a stuck apply re-fires once per distinct desired-state rather than looping (#386). Uploaded/imported image bytes are persisted on a host-path mount so they survive an api restart (#386).
 
 The api pod's ServiceAccount keeps minimal RBAC: namespace-scoped pods + pods/log read, the specific `spatium-appliance-tls` Secret patch, and the frontend Deployment annotation patch. The only cluster-scoped grant is **read-only** `nodes` + `nodes/proxy [get]` (added in #402) so the Cluster Overview dashboard can read per-node kubelet stats. Nothing destructive.
@@ -372,11 +372,47 @@ that is a function of the **registered node count**:
 | Nodes | Target |
 |---|---|
 | 1 | Stock: 1 replica, no fast-evict toleration, no anti-affinity — both buy nothing with one node, and a 20 s toleration would evict the only DNS pod with nowhere to put it |
-| ≥2 | `min(nodes, 2)` replicas, fast-evict tolerations, and **required** (not preferred) pod anti-affinity |
+| ≥2 | One replica per node, k3s's own tolerations, and **required** (not preferred) pod anti-affinity; the kube-dns Service gets `trafficDistribution: PreferSameNode` |
 
 Required anti-affinity is deliberate and #633 has the evidence: *preferred*
 parked both replicas on the seed, and Kubernetes never rebalances running
 pods, so the "HA" DNS died with the seed anyway.
+
+One replica per node, with node-local routing, is #1718. Until a lost node
+reads NotReady (about 40 s), its CoreDNS pod stays a ready kube-dns endpoint.
+With replicas load-balanced across nodes, about half of every other node's
+lookups went to that pod and stalled for the resolver's whole timeout. Redis
+Sentinel resolves its peers inside its event loop, so the stalls put the
+surviving sentinels into TILT, and the Redis failover took 77 s instead of
+seconds. Each node now resolves through its own replica, falling back to the
+others only while its own is not ready. A lost node takes only its own pods'
+DNS with it.
+
+The template keeps k3s's own tolerations (#1753). Earlier builds added a 20 s
+fast-evict pair. The tolerations list is the one template field both the
+supervisor and k3s's bundled manifest set, and k3s force re-applies that
+manifest at every server start. So each node's return rolled CoreDNS out
+twice: once for k3s's re-apply, once for the supervisor's patch back. Each
+rollout replaced every CoreDNS pod. With one replica per node, a fast
+eviction has nowhere to put the evicted pod anyway. k3s's re-apply now
+changes nothing.
+
+The api Service gets the same node-local routing as kube-dns (#1805), from the
+appliance's own values rather than the chart's: firstboot renders
+`api.service.trafficDistribution: PreferSameNode` into the `spatium-control`
+HelmChart, and the seed supervisor writes the same key into the
+`spatium-control` HelmChartConfig on every heartbeat, which is what a grown
+or upgraded cluster renders. Every control-plane node runs one api pod, so
+each node's in-cluster callers (its supervisor's heartbeat, the DNS and DHCP
+agents, the frontend's `/api` proxy) use that node's api pod while it is
+ready. A lost node's api pod stays listed until the node reads NotReady, and
+before this a share of every other node's heartbeats waited out their 40 s
+timeout on it, which left a healthy node's heartbeat stale past the demote
+guard's 90 s. The umbrella chart's default is `""`, so an install on your own
+Kubernetes keeps kube-proxy's spread over every api pod. One consequence on
+the appliance: traffic through the control-plane VIP enters through the
+frontend on the node announcing the VIP, and that node's api pod serves it
+alone while it is ready.
 
 **What the Cluster DNS card means** (Cluster → Overview, #985). Until now the
 appliance acted on cluster DNS and showed nothing about it, so a CoreDNS that
@@ -495,7 +531,8 @@ state on its heartbeat:
   `k8s_api.apply_control_plane_overrides()` upserts the `spatium-control`
   override (api/frontend/worker `replicas` + CNPG `instances` + Redis
   `sentinel.replicas` = committed member count, plus
-  `frontend.controlPlaneVIP`). helm-controller *merges* a
+  `frontend.controlPlaneVIP`, plus the api Service's
+  `trafficDistribution: PreferSameNode`). helm-controller *merges* a
   HelmChartConfig on top of its same-named HelmChart on every reconcile.
   Crucially the HelmChartConfig is **not** in the auto-deploy manifests
   dir, so a k3s restart's re-apply of the firstboot HelmChart defaults
@@ -565,7 +602,7 @@ state on its heartbeat:
 
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
-  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM); `redis.kind`, `redis.sentinel.replicas` |
   | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 
@@ -1331,8 +1368,9 @@ grandfathered.
 
 **Compliance + Copilot.** The `no_lanwide_control_plane_ports` conformity check
 (platform-kind, PCI-DSS 1.2.1 / HIPAA segmentation) fails only on a *confirmed*
-LAN-wide node and reports **PASS-stale** for nodes it can't currently reach
-(never connectivity-FAIL, per #5). Five Operator-Copilot MCP tools
+LAN-wide node and reports **warn** for stale or unverified nodes (unknown is
+not compliant, but lost contact is never a FAIL), and **not applicable** when no
+appliance reports at all (#2259). Five Operator-Copilot MCP tools
 (`find_firewall_policies` / `count_firewall_policies` / `find_firewall_aliases`
 / `find_firewall_effective` reads + the default-off `propose_toggle_firewall_policy`)
 surface the model to the chat, tagged `module="appliance.firewall"`.
@@ -2764,16 +2802,24 @@ introduced by an upgrade don't clobber operator-created ones.
    clear-ingests`), so a write an earlier import left behind
    cannot fail this boot's imports (#1630). k3s imports the new
    tarballs. `spatiumddi-firstboot.service` waits for
-   `/health/live` to return 200. It then checks that k3s
-   imported every baked tarball and that every image is in
-   containerd, and has k3s re-import whatever is missing
-   (`spatium-k3s-images verify --repair`, #1630).
+   `/health/live` to return 200. It then waits until k3s holds
+   none of the tarballs open, which is how long each import
+   lasts (#2109), checks that k3s imported every baked tarball
+   and that every image is in containerd, and has k3s
+   re-import whatever is missing, never one it is still
+   importing (`spatium-k3s-images verify --repair`, #1630).
+   It waits at most what is left of firstboot's 10-minute
+   start timeout. If k3s is still importing when that runs
+   out, the slot is not committed; once
+   `spatium-k3s-images verify` passes, **Approve trial** in
+   Fleet keeps it before the next reboot reverts it.
 7. On health-OK: `grub-set-default <new_slot>` commits the
    swap durably. The next reboot stays on the new slot.
 8. On health-fail (kernel panic, initramfs failure, api stack
    broken, or an image still missing after the re-import,
-   which would leave a workload in `ErrImageNeverPull`; for
-   that one firstboot exits 1 before the commit): no commit
+   which would leave a workload in `ErrImageNeverPull`, or k3s
+   still importing when that time runs out; for those
+   firstboot exits 1 before the commit): no commit
    happens. Next reboot reverts to the
    previous `saved_entry` automatically. If the new slot's
    migrate step had already run, the reverted release cannot

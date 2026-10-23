@@ -39,6 +39,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_str, encrypt_dict, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_credential_problem, header_value_problem
+from app.models.audit import AuditLog
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services import event_delivery
 from app.services.event_publisher import (
@@ -46,6 +47,7 @@ from app.services.event_publisher import (
     _SPECIAL_EVENT_MAP,
     _VERB_MAP,
 )
+from app.services.forward_secrets import url_display
 
 router = APIRouter(tags=["webhooks"])
 
@@ -180,6 +182,52 @@ def _to_response(
     )
 
 
+def _snapshot(sub: EventSubscription) -> dict[str, Any]:
+    """Audit snapshot of a subscription. Never carries the HMAC secret or
+    header values (only ``*_set`` flags + header names), and the URL is
+    reduced to scheme://host since the path / query / userinfo is where
+    incoming-webhook credentials live (same rule as #1502 / PR #1506)."""
+    return {
+        "name": sub.name,
+        "description": sub.description,
+        "enabled": sub.enabled,
+        "url": url_display(sub.url),
+        "secret_set": bool(sub.secret_encrypted),
+        "headers_set": bool(sub.headers_encrypted),
+        "header_names": _header_names(sub),
+        "event_types": list(sub.event_types) if sub.event_types else None,
+        "timeout_seconds": sub.timeout_seconds,
+        "max_attempts": sub.max_attempts,
+    }
+
+
+def _audit(
+    db: DB,
+    user: Any,
+    action: str,
+    *,
+    resource_type: str,
+    resource_id: str,
+    display: str,
+    old_value: dict[str, Any] | None = None,
+    new_value: dict[str, Any] | None = None,
+) -> None:
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            resource_display=display,
+            result="success",
+            old_value=old_value,
+            new_value=new_value,
+        )
+    )
+
+
 def _apply_body(
     sub: EventSubscription,
     body: WebhookSubscriptionWrite,
@@ -257,12 +305,22 @@ async def list_subscriptions(_user: SuperAdmin, db: DB) -> list[WebhookSubscript
     status_code=status.HTTP_201_CREATED,
 )
 async def create_subscription(
-    body: WebhookSubscriptionWrite, _user: SuperAdmin, db: DB
+    body: WebhookSubscriptionWrite, user: SuperAdmin, db: DB
 ) -> WebhookSubscriptionResponse:
     forbid_in_demo_mode("Webhook subscription creation is disabled")
     sub = EventSubscription()
     plaintext = _apply_body(sub, body, creating=True)
+    sub.id = sub.id or uuid.uuid4()
     db.add(sub)
+    _audit(
+        db,
+        user,
+        "create",
+        resource_type="event_subscription",
+        resource_id=str(sub.id),
+        display=sub.name,
+        new_value=_snapshot(sub),
+    )
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001
@@ -286,14 +344,30 @@ async def get_subscription(
 async def update_subscription(
     sub_id: uuid.UUID,
     body: WebhookSubscriptionWrite,
-    _user: SuperAdmin,
+    user: SuperAdmin,
     db: DB,
 ) -> WebhookSubscriptionResponse:
     forbid_in_demo_mode("Webhook subscription updates are disabled")
     sub = await db.get(EventSubscription, sub_id)
     if sub is None:
         raise HTTPException(status_code=404, detail="Subscription not found")
+    old = _snapshot(sub)
+    old_url = sub.url
     plaintext = _apply_body(sub, body, creating=False)
+    new = _snapshot(sub)
+    # The displayed URL drops the path, so flag a repoint within one host.
+    new["url_changed"] = sub.url != old_url
+    new["secret_rotated"] = body.secret is not None
+    _audit(
+        db,
+        user,
+        "update",
+        resource_type="event_subscription",
+        resource_id=str(sub.id),
+        display=sub.name,
+        old_value=old,
+        new_value=new,
+    )
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001
@@ -304,10 +378,19 @@ async def update_subscription(
 
 
 @router.delete("/{sub_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_subscription(sub_id: uuid.UUID, _user: SuperAdmin, db: DB) -> None:
+async def delete_subscription(sub_id: uuid.UUID, user: SuperAdmin, db: DB) -> None:
     sub = await db.get(EventSubscription, sub_id)
     if sub is None:
         return
+    _audit(
+        db,
+        user,
+        "delete",
+        resource_type="event_subscription",
+        resource_id=str(sub.id),
+        display=sub.name,
+        old_value=_snapshot(sub),
+    )
     await db.delete(sub)
     await db.commit()
 
@@ -412,7 +495,7 @@ async def list_deliveries(
     response_model=WebhookDeliveryResponse,
 )
 async def retry_delivery(
-    delivery_id: uuid.UUID, _user: SuperAdmin, db: DB
+    delivery_id: uuid.UUID, user: SuperAdmin, db: DB
 ) -> WebhookDeliveryResponse:
     row = await db.get(EventOutbox, delivery_id)
     if row is None:
@@ -422,7 +505,19 @@ async def retry_delivery(
             status_code=409,
             detail="Delivery already succeeded — nothing to retry",
         )
+    old = {"state": row.state, "attempts": row.attempts, "last_status_code": row.last_status_code}
     await event_delivery.reset_outbox_row(db, row)
+    # Payload is deliberately not recorded; id + event type identify it.
+    _audit(
+        db,
+        user,
+        "retry",
+        resource_type="event_outbox",
+        resource_id=str(row.id),
+        display=f"{row.event_type} (subscription {row.subscription_id})",
+        old_value=old,
+        new_value={"state": row.state, "attempts": row.attempts},
+    )
     await db.commit()
     await db.refresh(row)
     return WebhookDeliveryResponse.model_validate(row, from_attributes=True)
