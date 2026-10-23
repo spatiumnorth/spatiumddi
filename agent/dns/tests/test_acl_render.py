@@ -176,3 +176,26 @@ def test_no_forward_statement_without_forwarders(tmp_path: Path) -> None:
     drv.render(b)
     conf = (tmp_path / "rendered.new" / "named.conf").read_text()
     assert "forward only;" not in conf
+
+
+# ── duplicate TSIG key names (#2295) ──────────────────────────────────────
+
+
+def test_duplicate_tsig_key_names_render_one_key_statement(tmp_path: Path) -> None:
+    """``foo`` / ``foo.`` / ``Foo`` are one key to BIND; two ``key`` statements
+    make named-checkconf reject the file and the bundle be declined."""
+    b = _bundle([])
+    b["tsig_keys"] = [
+        {"name": "spatium-g", "secret": "c2VjcmV0", "algorithm": "hmac-sha256"},
+        {"name": "spatium-g", "secret": "ZGlmZg==", "algorithm": "hmac-sha256"},
+        {"name": "foo", "secret": "c2VjcmV0", "algorithm": "hmac-sha256"},
+        {"name": "foo.", "secret": "c2VjcmV0", "algorithm": "hmac-sha256"},
+    ]
+    drv = Bind9Driver(state_dir=tmp_path)
+    drv.render(b)
+    keyfile = (tmp_path / "rendered.new" / "tsig" / "ddns.key")
+    if not keyfile.exists():
+        keyfile = tmp_path / "tsig" / "ddns.key"
+    text = keyfile.read_text()
+    assert text.count('key "') == 2
+    assert 'key "spatium-g"' in text and 'key "foo"' in text

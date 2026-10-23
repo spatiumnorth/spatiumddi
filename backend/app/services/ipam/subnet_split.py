@@ -14,7 +14,10 @@ Design rules the commit path enforces:
 2. **Same address family.** Output children inherit the parent's family.
 3. **Children inherit the parent's metadata.** ``vlan_id`` /
    ``vxlan_id`` / ``vlan_ref_id`` / ``custom_fields`` / ``tags`` /
-   DDNS / DHCP / DNS group settings / ``router_zone_id`` / ``status``.
+   DDNS / DHCP / DNS group settings / ``router_zone_id`` / ``status``,
+   plus the compliance / discovery / ownership settings in
+   ``subnet_carry.CARRIED_COLUMNS`` / ``UNION_FLAGS`` (PCI / HIPAA
+   scope, internet-facing, role, do-not-probe, kind, customer, site …).
    ``name`` / ``description`` are not inherited — children get an
    empty name (operator can rename).
 4. **Default-named placeholder rows are recreated at child boundaries.**
@@ -65,6 +68,7 @@ from app.models.dhcp import (
 )
 from app.models.ipam import IPAddress, Subnet, SubnetDomain
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.ipam.subnet_carry import NOT_CARRIED_PROVENANCE, split_inherited
 
 logger = structlog.get_logger(__name__)
 
@@ -432,6 +436,12 @@ async def preview_subnet_split(
                 "their lease IP."
             )
 
+    if any(getattr(subnet, c) for c in NOT_CARRIED_PROVENANCE):
+        warnings.append(
+            "The parent is owned by an integration or was imported; the children "
+            "are new rows and do not carry that ownership or import provenance."
+        )
+
     if domain_rows:
         warnings.append(
             f"{len(domain_rows)} DNS zone binding(s) on the parent will be "
@@ -531,6 +541,7 @@ async def commit_subnet_split(
         status=subnet.status,
         custom_fields=dict(subnet.custom_fields or {}),
         tags=dict(subnet.tags or {}),
+        **split_inherited(subnet),
     )
 
     # Build the children. We don't recompute total_ips / utilization at

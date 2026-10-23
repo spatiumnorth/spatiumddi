@@ -161,7 +161,7 @@ answered ~5 % of the queries the load generator sent — the control plane
 had failed over, the data plane had nothing to serve with. Assign the DNS
 and DHCP roles on every node you expect to keep serving during a failover.
 
-The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). RAM has a hard floor as well, and the installer does not enforce it: the kubelet sets aside 2 GiB on every node (`kube-reserved` 1 GiB, `system-reserved` 512 MiB and the 512 MiB `memory.available` eviction threshold — #1124) and schedules pods only into what is left. A single-node control plane requests about 1.6 GiB, so it needs **at least 4 GiB of RAM** to start at all, and a DNS / DHCP appliance **at least 3 GiB**; below that the pods stay `Pending` on `Insufficient memory`. The serving roles add their own requests on top of that: BIND and Technitium 256Mi, Kea, PowerDNS and the looking-glass collector 128Mi each. They are sized above the pods' idle working sets because the kubelet evicts a pod running over its memory request before any pod within its request, whatever the PriorityClasses say (#1828). A single node with the control plane plus the DNS and DHCP roles therefore requests about 2 GiB, which uses up all the allocatable memory a 4 GiB node has. That includes an existing install: a slot upgrade to a release carrying #1124 on a smaller box comes back with nothing schedulable. 8 GiB remains the comfortable recommendation for a control plane. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
+The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). RAM has a hard floor as well, and the installer does not enforce it: the kubelet sets aside 2 GiB on every node (`kube-reserved` 1 GiB, `system-reserved` 512 MiB and the 512 MiB `memory.available` eviction threshold — #1124) and schedules pods only into what is left. A single-node control plane requests about 1.6 GiB, so it needs **at least 4 GiB of RAM** to start at all, and a DNS / DHCP appliance **at least 3 GiB**; below that the pods stay `Pending` on `Insufficient memory`. The serving roles add their own requests on top of that: BIND and Technitium 256Mi (BIND's is an eighth of its RAM-sized memory limit, so 256Mi up to a ~10 GB node and more above, #2223), Kea, PowerDNS and the looking-glass collector 128Mi each. They are sized above the pods' idle working sets because the kubelet evicts a pod running over its memory request before any pod within its request, whatever the PriorityClasses say (#1828). A single node with the control plane plus the DNS and DHCP roles therefore requests about 2 GiB, which uses up all the allocatable memory a 4 GiB node has. That includes an existing install: a slot upgrade to a release carrying #1124 on a smaller box comes back with nothing schedulable. 8 GiB remains the comfortable recommendation for a control plane. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
 
 ### Appliance management surfaces (k3s-aware)
 
@@ -170,7 +170,7 @@ The `/appliance` section in the SpatiumDDI UI talks to k3s directly via the api 
 - **Cluster tab** (#402 — folds the former Containers/Pods tab + the etcd-snapshots section into one tab via a left sub-nav, named *Cluster* rather than *Kubernetes* for operator clarity). Three sub-sections: **Overview** — a live SSE-fed (2 s) health dashboard (KPI ribbon, CPU / memory hero chart, per-node radial gauges with the host's real partition list, workload-health panel, top-pods leaderboard) built from kubeapi node / pod listings + per-node kubelet `stats/summary` (there is no Prometheus on the appliance); **Pods** — lists every pod in the spatium namespace via kubeapi `GET /api/v1/namespaces/spatium/pods`, restart = `DELETE` the pod (owning Deployment / DaemonSet recreates it), logs = SSE wrapping kubeapi's `?follow=true` pod-log endpoint; **etcd** — the recoverable `ETCDSnapshotFile` inventory.
 - **TLS cert manager**. Patches the `spatium-appliance-tls` Secret in place via `kubectl patch secret`. Bumps a checksum annotation on the frontend Deployment to trigger a rollout (k8s doesn't auto-roll on Secret changes — the annotation acts as the trigger).
 - **Logs & Diagnostics → Self-test**. Five-check battery: external DNS resolution, kubeapi reachability via the ServiceAccount, every spatium pod's health (Running + healthy / Succeeded Jobs OK), informational DHCP + DNS role presence (OK when not assigned).
-- **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets.
+- **Diagnostic bundle**. Per-pod log tails (last 500 lines via kubeapi) + host logs + system info + redacted env, zipped for support tickets. Environment values appear only for known non-secret settings (every other variable is listed with its value replaced), and every file is swept for credential-shaped values such as keys, tokens and passwords embedded in URLs. That sweep is best effort, so review the bundle before sharing it.
 - **OS Versions**. Atomic A/B slot upgrades — same machinery as pre-#183 (Phase 8); the slot raw.xz carries a complete rootfs with k3s + baked images + chart tarballs. A slot upgrade is also an effective container upgrade because images are baked. For an upgrade scheduled from an imported/uploaded image (#199), the download is **verified by the stored sha256** (the integrity guarantee), which lets the host runner relax TLS cert-verify *only* for the appliance's own self-served URL behind the self-signed web cert — external public-CA URLs stay fully verified (#386). The Fleet drilldown shows a **live per-phase progress stepper** (download % → verify → write → bootloader → reboot-pending) with an expandable `slot-upgrade.log` tail and an honest failure card, and a stuck apply re-fires once per distinct desired-state rather than looping (#386). Uploaded/imported image bytes are persisted on a host-path mount so they survive an api restart (#386).
 
 The api pod's ServiceAccount keeps minimal RBAC: namespace-scoped pods + pods/log read, the specific `spatium-appliance-tls` Secret patch, and the frontend Deployment annotation patch. The only cluster-scoped grant is **read-only** `nodes` + `nodes/proxy [get]` (added in #402) so the Cluster Overview dashboard can read per-node kubelet stats. Nothing destructive.
@@ -1195,22 +1195,35 @@ Nothing is emitted in `hard` mode (the appliance's shape — required
 anti-affinity already pins one replica per node, #590), in `none` mode, at
 `replicas: 1`, or when the operator supplied their own list.
 
-### Memory sizing for named (#1725)
+### Memory sizing for named (#1725, #2223)
 
-`dns-bind9` carries a memory request of 256Mi and a limit of 2Gi
-(`dnsBind9.resources` in `charts/spatiumddi-appliance/values.yaml`). Without
-a limit, one ~580k-entry catalog blocklist in a group with a view took the
-pod to 2.8-3.6 GB on a 6 GiB node; the kubelet then evicted the worker,
-Postgres and the api, and the kernel killed named. With the limit the kernel
-kills named inside the pod's own cgroup instead, and the control plane stays
-up.
+`dns-bind9` carries a memory limit and request sized from node RAM: a
+quarter of the RAM of the **smallest** node labelled for dns-bind9, rounded
+to whole GiB, at least 2Gi and at most 8Gi, with the request an eighth of
+the limit. So a 4 GB node gets 2Gi / 256Mi (the floor), a 16 GB node
+4Gi / 512Mi, and a 64 GB node 8Gi / 1Gi (the cap). The supervisor writes it
+into the role chart as `dnsBind9.memory`; the chart's own default there,
+2Gi / 256Mi, is what a render with no supervisor gets. Without a limit, one
+~580k-entry catalog blocklist in a group with a view took the pod to
+2.8-3.6 GB on a 6 GiB node; the kubelet then evicted the worker, Postgres
+and the api, and the kernel killed named. With the limit the kernel kills
+named inside the pod's own cgroup instead, and the control plane stays up.
+Before #2223 the limit was a fixed 2Gi, which ddi-pg's scale lab hit at
+about 2M records.
 
-Unlike the api, worker and Postgres limits, this one is **not** sized from
-the node's RAM. The role chart is one HelmChart for the whole cluster and
-every node's supervisor writes it, so it must render the same everywhere
-(#1137), and a DaemonSet has one limit for all its pods. A node whose
-blocklists need more raises it for the cluster in the `spatiumddi-appliance`
-HelmChartConfig. Edit it in place rather than applying a fresh manifest:
+It is one value for the cluster, not each node's own. The role chart is one
+HelmChart for the whole cluster and every member's supervisor writes it, so
+it must render the same everywhere (#1137), and a DaemonSet has one limit
+for all its pods, so the smallest node it runs on decides. The size is the
+kubelet's `status.capacity.memory`, which a virtio balloon does not move. A
+node that joins with less RAM lowers it for every DNS node, which is a
+rolling restart of named. If the node list cannot be read the supervisor
+writes nothing that heartbeat rather than fall back to the 2Gi default.
+
+To pin a value instead, set `dnsBind9.resources.limits.memory` (and, if you
+like, `requests.memory`) in the `spatiumddi-appliance` HelmChartConfig: a
+memory value in `dnsBind9.resources` always wins over the sizing. Edit it in
+place rather than applying a fresh manifest:
 
 ```sh
 kubectl -n kube-system edit helmchartconfig spatiumddi-appliance
@@ -1259,7 +1272,7 @@ fires (see `DNS.md` 8.0). The agent also derives named's `max-cache-size`
 from the limit (a quarter of it, split across the recursive views), so the
 resolver caches cannot take the RPZ's share.
 
-The request (256Mi) is what the scheduler reserves; the limit is a ceiling,
+The request (an eighth of the limit) is what the scheduler reserves; the limit is a ceiling,
 so the pod is Burstable and a 3 GiB DNS-only node still schedules. Under node
 memory pressure the kubelet evicts pods using more than their request in
 PriorityClass order, and `dns-bind9` runs in `spatium-service`, the highest
@@ -3130,6 +3143,22 @@ it, which is what the write just did. Later is not safe: the inactive
 slot is a spare, so a wrong-arch rootfs sitting in it costs nothing (the
 node keeps running on the active slot and the next apply overwrites it),
 whereas pointing the bootloader at it cannot be undone remotely.
+
+### Free space is checked before an upgrade image is stored (#2400)
+
+The kubelet evicts pods at `nodefs.available<5%` and then keeps evicting
+until a further 10% (`evictionMinimumReclaim`) is free, so a node that
+dips under 5% stays in DiskPressure, evicting the api, worker and
+supervisor, until **15% of `/var` is free**. An image that fits on disk
+can therefore still take the control plane down. Upload and
+import-from-GitHub now refuse with a 422 that names the numbers when
+storing the image would leave less than 15% of the volume free (the
+mirror's volume when the slot-image mirror is on), before any byte is
+written. The node-side staging download in `spatium-upgrade-slot` applies
+the same rule and exits 7, which the slot-upgrade wrapper reports as "not
+enough free space on /var". Free space by deleting unused upgrade images
+in Fleet, then retry. On a 15 GB `/var` that is about 2.25 GB of headroom
+on top of the image.
 
 **Two source modes for the upgrade image:**
 

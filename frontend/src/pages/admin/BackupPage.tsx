@@ -230,12 +230,14 @@ function CreateBackupCard() {
             className="mt-0.5"
           />
           <span>
-            <strong>Exclude secrets (diagnostic mode).</strong> NULL every
-            credential / api-key / TSIG-key / TOTP secret in the archive at dump
-            time. Use when sharing a snapshot with support / consultants — the
-            archive is shareable but a restore yields an install with empty
-            credential fields, so operators re-enter integration / auth-provider
-            creds by hand.
+            <strong>Exclude secrets (diagnostic mode).</strong> Remove every
+            credential / api-key / TSIG-key / TOTP secret, the appliance CA key,
+            k3s join token and cluster kubeconfig, password and token hashes,
+            and the install&rsquo;s own encryption key from the archive at dump
+            time. Use when sharing a snapshot with support / consultants — a
+            restore yields an install with empty credential fields: operators
+            re-enter integration / auth-provider creds, reset local passwords
+            and re-key appliances.
           </span>
         </label>
         <div className="flex items-center gap-2">

@@ -1,6 +1,10 @@
 import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { markBooted, setAccessToken } from "@/lib/authToken";
+import {
+  markBooted,
+  setAccessToken,
+  setMustChangePassword,
+} from "@/lib/authToken";
 
 /**
  * Landing route that consumes the access token delivered by the OIDC/SAML
@@ -27,6 +31,7 @@ export function LoginCallbackPage() {
     }
 
     setAccessToken(access);
+    setMustChangePassword(forcePwd);
     markBooted();
 
     // Clear the hash so the token doesn't linger in the URL bar.
