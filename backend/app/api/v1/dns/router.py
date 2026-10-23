@@ -57,10 +57,9 @@ from app.core.content_disposition import content_disposition
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
     bind_check_names_error,
-    contains_control_chars,
     contains_zonefile_unsafe,
     primary_ns_error,
-    structured_rdata_error,
+    record_value_error,
     validate_fqdn,
     validate_hostname,
     validate_record_owner,
@@ -1828,16 +1827,6 @@ def _validate_soa_field(v: str | None, field: str | None = None) -> str:
     return v
 
 
-# rdata for these types is a single bare target *name* — validate it as an
-# FQDN (issue #597). MX / SRV are deliberately excluded: their value may
-# carry the priority / weight / port inline (``10 mail.example.com``) on some
-# client + driver paths, so an FQDN check would reject a legitimate value —
-# the control-character guard below still protects them. Also excludes TXT
-# (freeform, quoted at render), the structured types (SVCB / HTTPS / NAPTR /
-# CAA / SSHFP / TLSA / LOC / LUA), and A/AAAA (IP-validated below).
-_HOSTNAME_TARGET_RECORD_TYPES = frozenset({"CNAME", "NS", "PTR", "DNAME", "ALIAS"})
-
-
 async def _enforce_absolute_target(db: DB, zone: DNSZone, record_type: str, value: str) -> None:
     """422 a name target with no trailing dot on a PowerDNS group (#2060).
 
@@ -1862,75 +1851,19 @@ def _validate_address_record_value(
 ) -> None:
     """Reject rdata that would break — or inject into — a rendered zone (#467, #597).
 
-    Three checks, in order of the record's shape:
-
-    * Any value carrying a control character / newline is rejected for every
-      type — that is the one thing that injects a second zone-file record, and
-      no legitimate rdata contains one. (Spaces and quotes are *not* rejected:
-      structured rdata like CAA / LOC / NAPTR / SVCB needs them.)
-    * A / AAAA must be a single valid IP of the matching family (each row is
-      one RR line, so ``10.0.0.1, 10.0.0.2`` is malformed rdata).
-    * A bare-name target type (CNAME / NS / PTR / DNAME / ALIAS) whose value is
-      the pointed-at name must be a syntactically valid FQDN. MX / SRV are
-      excluded — their value may carry the priority inline on some paths.
+    The rule lives in ``app.core.dns_names.record_value_error`` so the
+    operation layer (requests portal, Copilot) applies exactly the same one:
+    a control character / newline is refused for every type, A / AAAA must be
+    a single address of the matching family, a bare-name target type must be a
+    valid FQDN, and any other type must be readable rdata.
 
     Raises ``HTTPException(422)`` with guidance on any failure.
     """
-    rtype = record_type.upper()
-
-    # Injection guard for EVERY type: a newline / control character is the
-    # one thing that can inject a second record into a zone-file line, and no
-    # legitimate rdata carries one. Deliberately narrower than
-    # ``contains_zonefile_unsafe`` — spaces and quotes are load-bearing in
-    # structured rdata (CAA ``0 issue "letsencrypt.org"``, LOC / NAPTR /
-    # SVCB / HTTPS), so only control bytes are rejected here. Interior
-    # whitespace in a *name-valued* type is caught by the FQDN check below;
-    # a comma-separated A/AAAA list by the IP parse.
-    if contains_control_chars(value):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"{rtype} record value contains a control character or newline, "
-                "which is not allowed in DNS record data."
-            ),
-        )
-
-    if rtype in _HOSTNAME_TARGET_RECORD_TYPES:
-        try:
-            validate_fqdn(value, field=f"{rtype} record target")
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return
-
-    if rtype not in ("A", "AAAA"):
-        err = structured_rdata_error(
-            rtype, value, priority=priority, weight=weight, port=port, origin=origin
-        )
-        if err is not None:
-            raise HTTPException(status_code=422, detail=err)
-        return
-    candidate = value.strip()
-    family_ok = True
-    try:
-        parsed = ipaddress.ip_address(candidate)
-    except ValueError:
-        family_ok = False
-    else:
-        family_ok = (rtype == "A" and parsed.version == 4) or (
-            rtype == "AAAA" and parsed.version == 6
-        )
-    if family_ok:
-        return
-    fam = "IPv4" if rtype == "A" else "IPv6"
-    raise HTTPException(
-        status_code=422,
-        detail=(
-            f"{rtype} record value must be a single {fam} address. To point one "
-            "name at several IPs, add one record per address (round-robin) or "
-            "use a DNS Pool for health-checked failover — not a comma-separated "
-            "list in one record."
-        ),
+    err = record_value_error(
+        record_type, value, priority=priority, weight=weight, port=port, origin=origin
     )
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
 
 
 def _enforce_bind_check_names(

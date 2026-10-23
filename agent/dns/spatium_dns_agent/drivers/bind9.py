@@ -894,6 +894,32 @@ def _parses_as_rdata(rtype: str, wire: str, origin: str | None = None) -> bool:
     return True
 
 
+# Whitespace of any kind, or a C0 / DEL control character. An owner name
+# carrying one cannot be written as the first token of a master-file line.
+_OWNER_UNSAFE_RE = re.compile(r"[\s\x00-\x1f\x7f]")
+# Any C0 / DEL control character, newline included. Spaces and quotes are
+# legal in rdata (CAA, LOC, NAPTR, TXT), control characters never are.
+_RDATA_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _zone_line_refusal(name: Any, value: Any) -> str | None:
+    """Why ``name`` / ``value`` cannot be written as one zone-file line.
+
+    Returns None when both are safe to interpolate. A blank or
+    whitespace-bearing owner would render a line that starts with
+    whitespace, which BIND reads as "same owner as the previous record";
+    a control character in either field (a newline above all) would end
+    the line early and let the rest be read as a record of its own.
+    """
+    if not isinstance(name, str) or not isinstance(value, str):
+        return "its owner or value is not text"
+    if _OWNER_UNSAFE_RE.search(name):
+        return "its owner name is blank or contains whitespace or a control character"
+    if _RDATA_CONTROL_RE.search(value):
+        return "its value contains a newline or control character"
+    return None
+
+
 def _wire_value(rtype: str, value: str, fields: dict[str, Any]) -> str:
     """Compose one RR's presentation form from a record-op payload.
 
@@ -2587,6 +2613,31 @@ class Bind9Driver(DriverBase):
             name_field = rec.get("name") or "@"
             rtype = rec["type"].upper()
             value = rec["value"]
+            # A master-file line is ``<owner> <ttl> IN <type> <rdata>``. An
+            # owner that is blank or carries whitespace starts the line with
+            # whitespace (or splits it), and BIND then reads the record as
+            # belonging to the PREVIOUS owner; a newline or other control
+            # character in either field starts a second record of the value's
+            # choosing. No legal owner or rdata carries one, so the row is
+            # left out and reported, as an unparseable one is below.
+            line_refusal = _zone_line_refusal(name_field, value)
+            if line_refusal is not None:
+                zname = (zone.get("name") or "").rstrip(".")
+                log.warning(
+                    "zone_record_unsafe_skipped",
+                    zone=zname,
+                    name=name_field,
+                    type=rtype,
+                    value=value,
+                    reason=line_refusal,
+                )
+                if self._skipped_records is None:
+                    self._skipped_records = set()
+                self._skipped_records.add(
+                    f"{zname}: record {name_field!r} {rtype} {value!r} skipped, "
+                    f"{line_refusal}"
+                )
+                continue
             # MX / SRV zone-file format requires inline priority (and
             # weight+port for SRV) before the target. The control plane
             # stores those in separate columns; compose the wire shape

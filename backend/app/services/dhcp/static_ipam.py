@@ -189,7 +189,10 @@ async def upsert_ipam_for_static(
     # below), and the ``or`` made an empty one unrepresentable — clearing a
     # reservation's name left the mirror on the old name and re-published the
     # stale A record off it, with no number of polls able to converge them.
-    row.hostname = st.hostname
+    # Stripped: a whitespace-only name (a row stored before the request
+    # validator folded it to "", or one written by an importer) is no name,
+    # and must not reach the DNS sync below as a truthy owner of blanks.
+    row.hostname = (st.hostname or "").strip()
     row.mac_address = str(st.mac_address)
     row.status = "static_dhcp"
     row.static_assignment_id = str(st.id)
@@ -925,7 +928,7 @@ async def sync_static_for_ipam_row(
         changed = (
             prev_mac != mac
             or prev_ip != str(row.address)
-            or prev_hostname != (row.hostname or "")
+            or prev_hostname != (row.hostname or "").strip()
             or prev_description != effective_description
         )
         if not changed and row.static_assignment_id == str(linked.id):
@@ -938,7 +941,7 @@ async def sync_static_for_ipam_row(
             changed_fields.append("ip_address")
         if prev_mac != mac:
             changed_fields.append("mac_address")
-        if prev_hostname != (row.hostname or ""):
+        if prev_hostname != (row.hostname or "").strip():
             changed_fields.append("hostname")
         if prev_description != effective_description:
             changed_fields.append("description")
@@ -955,7 +958,7 @@ async def sync_static_for_ipam_row(
         }
         linked.ip_address = str(row.address)
         linked.mac_address = mac
-        linked.hostname = row.hostname or ""
+        linked.hostname = (row.hostname or "").strip()
         linked.description = effective_description
         await db.flush()
         if changed:
@@ -1051,7 +1054,7 @@ async def sync_static_for_ipam_row(
         scope_id=scope.id,
         ip_address=str(row.address),
         mac_address=mac,
-        hostname=row.hostname or "",
+        hostname=(row.hostname or "").strip(),
         description=row.description or "",
         ip_address_id=row.id,
         created_by_user_id=created_by_user_id,

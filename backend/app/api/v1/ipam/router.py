@@ -29,6 +29,7 @@ from app.core.dns_names import (
     MAX_NAME_LEN,
     bind_check_names_error,
     name_in_zone_error,
+    publishable_host_owner_error,
     validate_fqdn,
     validate_host_label,
     validate_hostname,
@@ -51,7 +52,7 @@ from app.models.ipam import (
     IP_ROLES,
     IP_ROLES_SHARED,
     IP_STATUSES,
-    IP_STATUSES_OPERATOR_SETTABLE,
+    IP_STATUSES_CREATE_SETTABLE,
     SUBNET_ROLES,
     IPAddress,
     IPBlock,
@@ -2218,6 +2219,22 @@ async def _sync_dns_record(
     if effective_zone_id is None and not ip.extra_zone_ids:
         # Nothing to publish to — no primary zone, no extras.
         return False
+    # The hostname becomes the record owner verbatim. The request models
+    # validate it, but a row reaches this sync by other paths too (DHCP
+    # reservations, importers, rows stored before a validator existed). A
+    # blank, whitespace-bearing or control-character owner renders a zone
+    # line BIND reads as another owner's record, or as two records, so such a
+    # name is published nowhere: strict paths answer 422, others skip every
+    # zone, which also retracts what an earlier name published there.
+    owner_err = publishable_host_owner_error(ip.hostname)
+    if owner_err is not None:
+        if strict:
+            raise HTTPException(status_code=422, detail=owner_err)
+        logger.warning(
+            "ipam_dns_hostname_unpublishable",
+            ip=str(ip.address),
+            reason=owner_err,
+        )
 
     zone = await db.get(DNSZone, effective_zone_id) if effective_zone_id else None
     if zone is not None and zone.deleted_at is not None:
@@ -2247,11 +2264,20 @@ async def _sync_dns_record(
     # primary zone drops out of the desired set below, so a record an earlier
     # name published there is retracted (as is its PTR, ``fqdn`` being None)
     # rather than left naming a host the row no longer carries.
-    primary_too_long = bool(zone_domain) and _name_too_long_for_zone(ip, zone_domain, strict)
-    fqdn = f"{ip.hostname}.{zone_domain}" if zone_domain and not primary_too_long else None
+    primary_unpublishable = bool(zone_domain) and owner_err is not None
+    primary_too_long = (
+        bool(zone_domain)
+        and not primary_unpublishable
+        and _name_too_long_for_zone(ip, zone_domain, strict)
+    )
+    fqdn = (
+        f"{ip.hostname}.{zone_domain}"
+        if zone_domain and not primary_too_long and not primary_unpublishable
+        else None
+    )
     if fqdn:
         ip.fqdn = fqdn
-    elif primary_too_long:
+    elif primary_too_long or primary_unpublishable:
         ip.fqdn = None
 
     # Forward record type depends on the address family: AAAA for IPv6, A for IPv4.
@@ -2294,8 +2320,10 @@ async def _sync_dns_record(
         )
         if target is not None and ipam_authors_zone(target):
             if desired_zone_id == effective_zone_id:
-                if primary_too_long:
-                    continue  # #2072 — logged above
+                if primary_too_long or primary_unpublishable:
+                    continue  # #2072 / unpublishable owner — logged above
+            elif owner_err is not None:
+                continue  # unpublishable owner — logged above
             elif _name_too_long_for_zone(ip, target.name.rstrip("."), strict):
                 continue  # #2072 — an extra zone the name does not fit in
             authored_zone_ids.append(desired_zone_id)
@@ -2690,6 +2718,9 @@ async def _sync_dns_record(
             await db.delete(rec)
         if stale_ptrs:
             ip.reverse_zone_id = None
+        if owner_err is not None:
+            # Nothing was published: the name is not a usable owner.
+            return False
         if primary_cname_skip and not forward_published:
             # Read by the DDNS path so it reports the CNAME clash, not "no
             # forward zone" (not a mapped column; lives for this request).
@@ -3840,7 +3871,7 @@ class IPAddressCreate(BaseModel):
         # the reconcilers — operators picking them on a brand-new
         # row would create a phantom "owned by no integration"
         # record.
-        allowed = IP_STATUSES_OPERATOR_SETTABLE | {"dhcp"}
+        allowed = IP_STATUSES_CREATE_SETTABLE
         if v not in allowed:
             raise ValueError(
                 f"status must be one of: {', '.join(sorted(allowed))}. "
@@ -4072,7 +4103,7 @@ class NextIPRequest(BaseModel):
         # next-IP allocation: same shape as manual create — operator
         # statuses + dhcp. No integration statuses; those rows come
         # from reconcilers, not the next-IP picker.
-        allowed = IP_STATUSES_OPERATOR_SETTABLE | {"dhcp"}
+        allowed = IP_STATUSES_CREATE_SETTABLE
         if v not in allowed:
             raise ValueError(f"status must be one of: {', '.join(sorted(allowed))}")
         return v

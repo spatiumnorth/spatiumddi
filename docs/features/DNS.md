@@ -2179,6 +2179,24 @@ future code path — so they still cannot break out of their own record.
 Spaces and quotes are left intact, so structured rdata (CAA / LOC / NAPTR /
 SVCB) renders unharmed.
 
+Those are the control-plane drivers. The zone file an agent-managed BIND9
+server actually loads is written by the **agent**
+(`agent/dns/spatium_dns_agent/drivers/bind9.py`, `_write_zone_file`), which
+does not strip: a record whose owner is blank or contains whitespace or a
+control character, or whose value contains a newline or other control
+character, is **left out** and reported through the partial-apply channel,
+like a record whose rdata does not parse (#2510). Stripping would publish a
+different record than the one stored; a blank owner in particular renders a
+line that starts with whitespace, which BIND reads as another record at the
+previous owner.
+
+Every path that publishes applies the same field rules before that point:
+the REST record endpoints, the IPAM → DNS sync (a hostname that is blank or
+not a legal owner is published nowhere, and what an earlier name published
+is retracted), DHCP reservations (a whitespace-only hostname is stored as no
+hostname), and the operation layer behind the requests portal and the
+Copilot, which shares `app.core.dns_names.record_value_error` with REST.
+
 ### 18.3 Auditing existing rows
 
 `GET /api/v1/diagnostics/name-conformance` (**superadmin**, read-only,
