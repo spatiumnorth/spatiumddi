@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
 import { authApi } from "@/lib/api";
+import { setMustChangePassword } from "@/lib/authToken";
 import { evaluatePolicy, parsePasswordError } from "@/lib/password-policy";
 import { cn } from "@/lib/utils";
 import { PasswordInput } from "@/components/ui/password-input";
@@ -60,6 +61,7 @@ export function ChangePasswordPage() {
     setLoading(true);
     try {
       await authApi.changePassword(currentPassword, newPassword);
+      setMustChangePassword(false);
       navigate("/dashboard");
     } catch (err) {
       // Three shapes reach here: the policy / history 400's
