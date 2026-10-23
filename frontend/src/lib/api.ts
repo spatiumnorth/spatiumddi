@@ -10581,6 +10581,9 @@ export interface ApiToken {
   scopes: ApiTokenScope[];
   resource_grants?: ApiTokenResourceGrant[];
   user_id: string | null;
+  /** Set by the list endpoint (#2443). */
+  owner_username?: string | null;
+  owner_display_name?: string | null;
   expires_at: string | null;
   last_used_at: string | null;
   is_active: boolean;
