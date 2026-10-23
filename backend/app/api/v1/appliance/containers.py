@@ -32,6 +32,7 @@ from app.services.appliance.containers import (
 from app.services.appliance.containers import (
     list_containers as svc_list_containers,
 )
+from app.services.support_bundle.scrub import redact_secrets
 
 logger = structlog.get_logger(__name__)
 
@@ -50,6 +51,14 @@ class ContainerInfo(BaseModel):
 
 
 _ALLOWED_ACTIONS = ("start", "stop", "restart")
+
+# Pod log text can carry whatever a process printed — connection strings,
+# keys, tokens — so reading it takes ``admin`` on ``appliance`` (the same
+# permission as the diagnostic bundle that packages these logs), and every
+# line is passed through the bundle's secret redaction before it is sent.
+# The streaming routes re-check the same permission while they run, so the
+# stream guard and the route dependency cannot disagree.
+_LOG_PERMISSION: tuple[str, str] = ("admin", "appliance")
 
 
 @router.get(
@@ -108,7 +117,7 @@ async def post_container_action(
 
 @router.get(
     "/{name}/logs",
-    dependencies=[Depends(require_permission("read", "appliance"))],
+    dependencies=[Depends(require_permission(*_LOG_PERMISSION))],
     summary="Tail recent log lines (non-streaming)",
 )
 async def get_logs(name: str, tail: int = 200) -> dict[str, str]:
@@ -118,7 +127,7 @@ async def get_logs(name: str, tail: int = 200) -> dict[str, str]:
         text = get_container_logs(name, tail=tail)
     except DockerUnavailableError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
-    return {"name": name, "tail": text}
+    return {"name": name, "tail": redact_secrets(text)[0]}
 
 
 def _sse_log_response(gen, request: Request) -> StreamingResponse:
@@ -129,16 +138,19 @@ def _sse_log_response(gen, request: Request) -> StreamingResponse:
     ``X-Accel-Buffering: no`` disables nginx response buffering so each
     line reaches the browser ASAP (same pattern as the AI-chat stream).
     The caller is re-validated on a bounded cadence before each chunk is
-    sent (``StreamAuthGuard``); the stream ends once that fails.
+    sent (``StreamAuthGuard``, against ``_LOG_PERMISSION``); the stream
+    ends once that fails. Each chunk is passed through ``redact_secrets``.
     """
-    guard = StreamAuthGuard(request, permission=("read", "appliance"))
+    guard = StreamAuthGuard(request, permission=_LOG_PERMISSION)
 
     async def event_source():
         try:
             async for chunk in gen:
                 if not await guard.still_authorized():
                     return
-                for line in chunk.splitlines():
+                # Redact the whole chunk before splitting, so a multi-line
+                # secret (a PEM block) is matched as one unit.
+                for line in redact_secrets(chunk)[0].splitlines():
                     yield f"data: {json.dumps({'line': line})}\n\n"
         finally:
             await gen.aclose()
@@ -152,7 +164,7 @@ def _sse_log_response(gen, request: Request) -> StreamingResponse:
 
 @router.get(
     "/{name}/logs/stream",
-    dependencies=[Depends(require_permission("read", "appliance"))],
+    dependencies=[Depends(require_permission(*_LOG_PERMISSION))],
     summary="Stream a single pod's logs as SSE (follow=true)",
 )
 async def stream_logs(name: str, request: Request, tail: int = 100):
@@ -166,7 +178,7 @@ async def stream_logs(name: str, request: Request, tail: int = 100):
 
 @router.get(
     "/workloads/{component}/logs/stream",
-    dependencies=[Depends(require_permission("read", "appliance"))],
+    dependencies=[Depends(require_permission(*_LOG_PERMISSION))],
     summary="Stream a workload's logs as SSE — resolves component → current pod",
 )
 async def stream_workload_logs(component: str, request: Request, tail: int = 100):
