@@ -542,19 +542,33 @@ async def _step_cnpg_maintenance_on(cluster_name: str, namespace: str | None) ->
 # ── Step 7: cordon ────────────────────────────────────────────────────
 
 
-async def _step_cordon(node_name: str) -> StepResult:
+async def _step_cordon(
+    node_name: str, *, pre_cordon: dict[str, bool | None] | None = None
+) -> StepResult:
     step = StepResult(name="cordon", started_at=_now_iso(), detail={"node": node_name})
     # Record whether the node was already unschedulable BEFORE this cordon,
     # so a failure's release (#1542) does not uncordon a node an operator
     # had cordoned on purpose. ``None`` = could not tell; the release then
     # uncordons, as it did before this was recorded.
+    #
+    # #2449 — the step is retried in place on a transient kubeapi answer, and
+    # a PATCH whose answer was lost (a socket timeout) may still have landed.
+    # Re-reading the node on the retry would then see this run's own cordon
+    # and record it as the operator's, so the release would leave the node
+    # cordoned after a failed run. ``pre_cordon`` carries the FIRST attempt's
+    # reading across retries; only that one was taken before any cordon.
     was_unschedulable: bool | None = None
-    try:
-        status, node = k8s.get_node(node_name)
-    except k8s.KubeapiUnavailableError:
-        status, node = 0, None
-    if status == 200 and node is not None:
-        was_unschedulable = bool((node.get("spec") or {}).get("unschedulable"))
+    if pre_cordon is not None and "was_unschedulable" in pre_cordon:
+        was_unschedulable = pre_cordon["was_unschedulable"]
+    else:
+        try:
+            status, node = k8s.get_node(node_name)
+        except k8s.KubeapiUnavailableError:
+            status, node = 0, None
+        if status == 200 and node is not None:
+            was_unschedulable = bool((node.get("spec") or {}).get("unschedulable"))
+        if pre_cordon is not None:
+            pre_cordon["was_unschedulable"] = was_unschedulable
     step.detail["was_unschedulable"] = was_unschedulable
     ok, err = k8s.cordon_node(node_name)
     if not ok:
@@ -1339,6 +1353,9 @@ async def _step_uncordon(
             False,
             error=f"uncordon ok, maintenance-window clear failed: {err}",
             uncordon_ok=True,
+            # #2449 — the helper's own answer, so the retry can classify it:
+            # the step's error is prefixed and no longer starts "kubeapi ".
+            kubeapi_error=err,
         )
     return step.finish(True)
 
@@ -1703,7 +1720,9 @@ async def single_node_upgrade(
         ):
             return _failed(node_name, target_version, "cnpg_maintenance_on", results)
         window_set = True
-    if not await _run("cordon", lambda: _step_cordon(node_name)):
+    # #2449 — shared across the cordon step's retries; see ``_step_cordon``.
+    pre_cordon: dict[str, bool | None] = {}
+    if not await _run("cordon", lambda: _step_cordon(node_name, pre_cordon=pre_cordon)):
         # The window may already be set — release it (#1542). The node is
         # not uncordoned: this run did not cordon it.
         return await _fail("cordon")
@@ -1882,7 +1901,10 @@ async def _run_step_riding_db_failover(
         # 429, or a socket error that never reached it) is tried again in place,
         # within ``KUBEAPI_RETRY_BUDGET_S`` from the first such answer, so a CNPG
         # admission webhook briefly between endpoints does not fail the run.
-        if not result.ok and step in KUBEAPI_RETRY_STEPS and _kubeapi_transient(result.error):
+        # A step whose error wraps the helper's answer (uncordon's window clear)
+        # carries the answer itself as ``detail["kubeapi_error"]``.
+        kubeapi_error = result.detail.get("kubeapi_error", result.error)
+        if not result.ok and step in KUBEAPI_RETRY_STEPS and _kubeapi_transient(kubeapi_error):
             now = _db_retry_clock()
             if kubeapi_first is None:
                 kubeapi_first = now

@@ -244,3 +244,92 @@ def test_a_pathological_body_is_still_bounded(helper: str, monkeypatch: pytest.M
     assert ok is False
     assert err is not None
     assert err.count("x") == k8s.KUBEAPI_ERROR_BODY_MAX
+
+
+# ── the real step bodies through the wrapper ────────────────────────────────
+#
+# The tests above drive the wrapper with synthetic results. These run the
+# actual step functions with the kubeapi helpers faked, which is where two
+# gaps sat: uncordon's window clear wraps the helper's answer in its own
+# prefix, and cordon re-reads the node on every attempt.
+
+
+async def test_uncordon_retries_a_transient_window_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The window clear meets the webhook 500 once. The step's error is
+    # "uncordon ok, maintenance-window clear failed: kubeapi status 500 ...",
+    # which does not start "kubeapi ", so the retry has to read the helper's
+    # own answer from the detail.
+    _fake_clock(monkeypatch)
+    window_answers = [(False, WEBHOOK_500), (True, None)]
+    uncordons: list[str] = []
+    monkeypatch.setattr(
+        k8s, "uncordon_node", lambda name: (uncordons.append(name), (True, None))[1]
+    )
+    monkeypatch.setattr(k8s, "patch_cnpg_maintenance_window", lambda *a, **k: window_answers.pop(0))
+    result = await per_node._run_step_riding_db_failover(
+        AsyncMock(),
+        "uncordon",
+        "ddipg-member-3",
+        lambda: per_node._step_uncordon("ddipg-member-3", "pg-cluster", "spatium"),
+    )
+    assert result.ok is True
+    assert window_answers == []  # the clear was tried twice
+    assert len(uncordons) == 2  # the whole (idempotent) step re-ran
+
+
+async def test_uncordon_does_not_retry_a_refused_window_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_clock(monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(k8s, "uncordon_node", lambda name: (True, None))
+
+    def _window(*a: object, **k: object) -> tuple[bool, str]:
+        calls.append("clear")
+        return False, "kubeapi status 403: b'forbidden'"
+
+    monkeypatch.setattr(k8s, "patch_cnpg_maintenance_window", _window)
+    result = await per_node._run_step_riding_db_failover(
+        AsyncMock(),
+        "uncordon",
+        "ddipg-member-3",
+        lambda: per_node._step_uncordon("ddipg-member-3", "pg-cluster", "spatium"),
+    )
+    assert result.ok is False
+    assert calls == ["clear"]
+    assert result.error is not None and result.error.startswith("uncordon ok,")
+
+
+async def test_a_cordon_retry_keeps_the_first_pre_cordon_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The first cordon PATCH landed but its answer was lost (a socket error).
+    # Re-reading the node on the retry would see this run's own cordon and
+    # record it as the operator's, so a failed run's release would leave the
+    # node cordoned. The retry keeps the reading taken before any cordon.
+    _fake_clock(monkeypatch)
+    node_state = {"unschedulable": False}
+
+    def _get_node(name: str) -> tuple[int, dict]:
+        return 200, {"spec": dict(node_state)}
+
+    cordon_answers = [(False, SOCKET_ERR), (True, None)]
+
+    def _cordon(name: str) -> tuple[bool, str | None]:
+        node_state["unschedulable"] = True  # lands whether or not it answers
+        return cordon_answers.pop(0)
+
+    monkeypatch.setattr(k8s, "get_node", _get_node)
+    monkeypatch.setattr(k8s, "cordon_node", _cordon)
+    pre_cordon: dict[str, bool | None] = {}
+    result = await per_node._run_step_riding_db_failover(
+        AsyncMock(),
+        "cordon",
+        "ddipg-member-3",
+        lambda: per_node._step_cordon("ddipg-member-3", pre_cordon=pre_cordon),
+    )
+    assert result.ok is True
+    assert cordon_answers == []
+    assert result.detail["was_unschedulable"] is False
