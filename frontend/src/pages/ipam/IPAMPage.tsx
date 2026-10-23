@@ -76,6 +76,7 @@ import {
   type CustomField,
   type IPAMTemplate,
   type DNSZone,
+  type EffectiveDdns,
   type FreeCidrRange,
   type Router as NetworkRouter,
   type VLAN,
@@ -1980,6 +1981,9 @@ export function DdnsSettingsSection({
   domainOverride,
   ttlText,
   subnetNetwork,
+  inherit,
+  effective,
+  onInheritChange,
   onEnabledChange,
   onPolicyChange,
   onDomainOverrideChange,
@@ -1990,6 +1994,11 @@ export function DdnsSettingsSection({
   domainOverride: string | null;
   ttlText: string;
   subnetNetwork?: string;
+  /** #2475 — a subnet inherits its DDNS unless it opts out. Without
+   *  `onInheritChange` the section is the old subnet-only form. */
+  inherit?: boolean;
+  effective?: EffectiveDdns | null;
+  onInheritChange?: (v: boolean) => void;
   onEnabledChange: (v: boolean) => void;
   onPolicyChange: (v: DdnsPolicy) => void;
   onDomainOverrideChange: (v: string | null) => void;
@@ -2016,7 +2025,30 @@ export function DdnsSettingsSection({
     return `dhcp-${octets[2]}-${octets[3]}`;
   })();
 
-  const disabled = !enabled;
+  // While inheriting, the controls show what the subnet resolves to (the
+  // parent's settings), read-only — never the subnet's own stored values,
+  // which are not the ones in force (#2475).
+  const inheriting = inherit === true && !!onInheritChange;
+  const shown = inheriting && effective ? effective : null;
+  const shownEnabled = inheriting ? (effective?.enabled ?? false) : enabled;
+  const shownPolicy = (shown?.hostname_policy as DdnsPolicy) ?? policy;
+  const shownOverride = inheriting
+    ? (shown?.domain_override ?? null)
+    : domainOverride;
+  const shownTtl = inheriting
+    ? shown?.ttl == null
+      ? ""
+      : String(shown.ttl)
+    : ttlText;
+  const sourceText = !effective
+    ? "the parent block or space"
+    : effective.source === "block"
+      ? `block ${effective.source_name ?? ""}`.trim()
+      : effective.source === "space"
+        ? `space ${effective.source_name ?? ""}`.trim()
+        : "the parent block or space";
+
+  const disabled = inheriting || !shownEnabled;
 
   return (
     <div className="space-y-2">
@@ -2025,30 +2057,51 @@ export function DdnsSettingsSection({
           <Network className="h-3.5 w-3.5 text-muted-foreground" />
           <span className="text-xs font-medium">Dynamic DNS (from DHCP)</span>
         </div>
-        <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => onEnabledChange(e.target.checked)}
-            className="h-3.5 w-3.5"
-          />
-          Enabled
-        </label>
+        <div className="flex items-center gap-3">
+          {onInheritChange && (
+            <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={inherit === true}
+                onChange={(e) => onInheritChange(e.target.checked)}
+                className="h-3.5 w-3.5"
+              />
+              Inherit from parent
+            </label>
+          )}
+          <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={shownEnabled}
+              disabled={inheriting}
+              onChange={(e) => onEnabledChange(e.target.checked)}
+              className="h-3.5 w-3.5"
+            />
+            Enabled
+          </label>
+        </div>
       </div>
-      {!enabled && (
+      {inheriting && (
+        <p className="text-xs text-muted-foreground italic">
+          {effective
+            ? `Inheriting from ${sourceText}: DDNS is ${effective.enabled ? "enabled" : "disabled"}.`
+            : "Inheriting from the parent block or space."}
+        </p>
+      )}
+      {!shownEnabled && !inheriting && (
         <p className="text-xs text-muted-foreground italic">
           When enabled, DHCP leases in this subnet will publish A/AAAA + PTR
           records into the subnet's forward / reverse zones.
         </p>
       )}
-      {enabled && (
+      {shownEnabled && (
         <div className="space-y-2 pl-5 border-l-2 border-muted">
           <label className="block text-xs">
             <span className="block text-muted-foreground mb-0.5">
               Hostname policy
             </span>
             <select
-              value={policy}
+              value={shownPolicy}
               onChange={(e) => onPolicyChange(e.target.value as DdnsPolicy)}
               disabled={disabled}
               className="w-full rounded-md border bg-background px-2 py-1 text-sm disabled:opacity-60"
@@ -2065,19 +2118,21 @@ export function DdnsSettingsSection({
               <option value="disabled">disabled — no DDNS records</option>
             </select>
           </label>
-          {preview && policy !== "client_provided" && policy !== "disabled" && (
-            <p className="text-[11px] text-muted-foreground">
-              Generated names look like{" "}
-              <code className="rounded bg-muted px-1">{preview}</code>.
-            </p>
-          )}
+          {preview &&
+            shownPolicy !== "client_provided" &&
+            shownPolicy !== "disabled" && (
+              <p className="text-[11px] text-muted-foreground">
+                Generated names look like{" "}
+                <code className="rounded bg-muted px-1">{preview}</code>.
+              </p>
+            )}
           <label className="block text-xs">
             <span className="block text-muted-foreground mb-0.5">
               Domain override (optional)
             </span>
             <input
               type="text"
-              value={domainOverride ?? ""}
+              value={shownOverride ?? ""}
               onChange={(e) =>
                 onDomainOverrideChange(e.target.value.trim() || null)
               }
@@ -2097,7 +2152,7 @@ export function DdnsSettingsSection({
             <input
               type="text"
               inputMode="numeric"
-              value={ttlText}
+              value={shownTtl}
               onChange={(e) => onTtlTextChange(e.target.value)}
               placeholder="300"
               disabled={disabled}
@@ -2555,7 +2610,14 @@ export function CreateSubnetModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     null,
   );
-  // DDNS state — subnet-only, no inheritance for MVP
+  // DDNS state — a new subnet inherits unless the operator opts out (#2475)
+  const [ddnsInherit, setDdnsInherit] = useState(true);
+  const { data: effectiveDdns } = useQuery({
+    queryKey: ["effective-ddns-block", blockId],
+    queryFn: () => ipamApi.getEffectiveBlockDdns(blockId),
+    enabled: !!blockId,
+    staleTime: 30_000,
+  });
   const [ddnsEnabled, setDdnsEnabled] = useState(false);
   const [ddnsPolicy, setDdnsPolicy] = useState<DdnsPolicy>(
     "client_or_generated",
@@ -2622,6 +2684,8 @@ export function CreateSubnetModal({
       setCustomFields((prev) => ({ ...prev, ...v.customFields }));
     }
     if (v.ddns) {
+      // A template's DDNS is this subnet's own, as its DNS group is (#1304).
+      setDdnsInherit(false);
       setDdnsEnabled(v.ddns.enabled);
       setDdnsPolicy(v.ddns.policy);
       setDdnsDomainOverride(v.ddns.domainOverride);
@@ -2732,10 +2796,18 @@ export function CreateSubnetModal({
             }),
         dhcp_inherit_settings: dhcpInherit,
         ...(dhcpInherit ? {} : { dhcp_server_group_id: dhcpServerGroupId }),
-        ddns_enabled: ddnsEnabled,
-        ddns_hostname_policy: ddnsPolicy,
-        ddns_domain_override: ddnsDomainOverride,
-        ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+        // While inheriting, only the flag is sent: the form's own DDNS
+        // values are not in force, and sending ``ddns_enabled`` would read as
+        // an opt-out (#2475).
+        ddns_inherit_settings: ddnsInherit,
+        ...(ddnsInherit
+          ? {}
+          : {
+              ddns_enabled: ddnsEnabled,
+              ddns_hostname_policy: ddnsPolicy,
+              ddns_domain_override: ddnsDomainOverride,
+              ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+            }),
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
@@ -3045,6 +3117,9 @@ export function CreateSubnetModal({
 
       {tab === "ddns" && (
         <DdnsSettingsSection
+          inherit={ddnsInherit}
+          effective={effectiveDdns ?? null}
+          onInheritChange={setDdnsInherit}
           enabled={ddnsEnabled}
           policy={ddnsPolicy}
           domainOverride={ddnsDomainOverride}
@@ -7963,7 +8038,15 @@ export function EditSubnetModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     subnet.dhcp_server_group_id ?? null,
   );
-  // DDNS state — initialised from subnet
+  // DDNS state — initialised from subnet (#2475: inheritance is shown and kept)
+  const [ddnsInherit, setDdnsInherit] = useState(
+    subnet.ddns_inherit_settings ?? true,
+  );
+  const { data: effectiveDdns } = useQuery({
+    queryKey: ["effective-ddns-subnet", subnet.id],
+    queryFn: () => ipamApi.getEffectiveSubnetDdns(subnet.id),
+    staleTime: 30_000,
+  });
   const [ddnsEnabled, setDdnsEnabled] = useState(subnet.ddns_enabled ?? false);
   const [ddnsPolicy, setDdnsPolicy] = useState<DdnsPolicy>(
     subnet.ddns_hostname_policy ?? "client_or_generated",
@@ -8138,10 +8221,18 @@ export function EditSubnetModal({
         dns_split_horizon: dnsSplitHorizon,
         dhcp_inherit_settings: dhcpInherit,
         dhcp_server_group_id: dhcpInherit ? null : dhcpServerGroupId,
-        ddns_enabled: ddnsEnabled,
-        ddns_hostname_policy: ddnsPolicy,
-        ddns_domain_override: ddnsDomainOverride,
-        ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+        // While inheriting, only the flag is sent: the form's own DDNS
+        // values are not in force, and sending ``ddns_enabled`` would read as
+        // an opt-out (#2475).
+        ddns_inherit_settings: ddnsInherit,
+        ...(ddnsInherit
+          ? {}
+          : {
+              ddns_enabled: ddnsEnabled,
+              ddns_hostname_policy: ddnsPolicy,
+              ddns_domain_override: ddnsDomainOverride,
+              ddns_ttl: typeof ddnsTtl === "string" ? null : ddnsTtl,
+            }),
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
@@ -8509,6 +8600,9 @@ export function EditSubnetModal({
 
       {tab === "ddns" && (
         <DdnsSettingsSection
+          inherit={ddnsInherit}
+          effective={effectiveDdns ?? null}
+          onInheritChange={setDdnsInherit}
           enabled={ddnsEnabled}
           policy={ddnsPolicy}
           domainOverride={ddnsDomainOverride}

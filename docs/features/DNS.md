@@ -749,6 +749,8 @@ On lease expiry, `dhcp_lease_cleanup` sweeps the DHCPLease row past its grace pe
 
 DDNS is opt-in per subnet. A subnet can also inherit its DDNS settings from its enclosing block / space: `IPSpace` and `IPBlock` carry the same four DDNS fields, and when `ddns_inherit_settings` is true `resolve_effective_ddns` (in `backend/app/services/dns/ddns.py`) walks subnet → block → space to find the effective values.
 
+The New Subnet and Edit Subnet DDNS tabs carry an "Inherit from parent" toggle like the DNS and DHCP tabs. While it is ticked the tab shows what the subnet resolves to and from where (read-only, from `GET /ipam/subnets/{id}/effective-ddns`, or `GET /ipam/blocks/{id}/effective-ddns` for a subnet that does not exist yet), and a Save sends only `ddns_inherit_settings`, so it keeps the inheritance. Unticking it shows the subnet's own settings.
+
 | Field | Default | Purpose |
 |---|---|---|
 | `ddns_enabled` | `False` | Master toggle. When off, leases on the subnet don't publish DNS. |

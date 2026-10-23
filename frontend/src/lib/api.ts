@@ -438,6 +438,17 @@ export interface ProbePolicy {
   inherited: boolean;
 }
 
+/** What a subnet's DDNS resolves to and where from (#2475). */
+export interface EffectiveDdns {
+  enabled: boolean;
+  hostname_policy: DdnsHostnamePolicy;
+  domain_override: string | null;
+  ttl: number | null;
+  source: "subnet" | "block" | "space" | "none";
+  source_id: string | null;
+  source_name: string | null;
+}
+
 export interface EffectiveDns {
   dns_group_ids: string[];
   dns_zone_id: string | null;
@@ -1545,6 +1556,14 @@ export const ipamApi = {
   getEffectiveSubnetDns: (subnetId: string) =>
     api
       .get<EffectiveDns>(`/ipam/subnets/${subnetId}/effective-dns`)
+      .then((r) => r.data),
+  getEffectiveBlockDdns: (blockId: string) =>
+    api
+      .get<EffectiveDdns>(`/ipam/blocks/${blockId}/effective-ddns`)
+      .then((r) => r.data),
+  getEffectiveSubnetDdns: (subnetId: string) =>
+    api
+      .get<EffectiveDdns>(`/ipam/subnets/${subnetId}/effective-ddns`)
       .then((r) => r.data),
   getEffectiveSpaceDns: (spaceId: string) =>
     api
