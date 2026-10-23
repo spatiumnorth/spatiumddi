@@ -561,8 +561,8 @@ async def test_reimporting_an_address_keeps_its_zone(
 async def test_block_sync_commit_is_audited_with_the_block_network(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """A block commit that changed something handed the audit row the block's
-    ``IPv4Network`` and answered 422. It answers 200 and names the block."""
+    """A block commit that changes something names the block's network in its
+    audit row (the column once got the ``IPv4Network`` and answered 422)."""
     from app.models.audit import AuditLog  # noqa: PLC0415
 
     env = await _setup(client, db_session)
@@ -572,6 +572,11 @@ async def test_block_sync_commit_is_audited_with_the_block_network(
         json={"address": "10.104.5.32", "hostname": "h12"},
     )
     assert n.status_code == 201, n.text
+    # The create published the record; drop it so the commit writes one (a
+    # commit that writes nothing records no audit row, #2352).
+    for row in await _rows(db_session, n.json()["id"]):
+        await db_session.delete(row)
+    await db_session.commit()
     c = await client.post(
         f"/api/v1/ipam/blocks/{env.block_id}/dns-sync/commit",
         headers=env.headers,

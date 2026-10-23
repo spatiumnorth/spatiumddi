@@ -282,6 +282,7 @@ them:
 | `api.replicas` | `2` |  |
 | `api.service.type` | `ClusterIP` |  |
 | `api.service.port` | `8000` |  |
+| `api.service.trafficDistribution` | `""` | #1805 — `""` renders no field (kube-proxy spreads every caller over every api pod). `PreferSameNode` keeps each node's in-cluster callers (the supervisor, the DNS/DHCP agents, the frontend's `/api` proxy) on the api pod on their own node while it is ready, so a lost node's api pod cannot hold their requests. The appliance sets it (firstboot's `spatium-control` values and the supervisor's HelmChartConfig), where every control-plane node runs one api pod. Elsewhere it pins a node's callers to the one api pod on that node, which can leave the others idle and the HPA reacting late. Rendered on Kubernetes 1.34+ |
 | `api.autoscaling.enabled` | `true` | HPA on CPU + memory |
 | `api.autoscaling.minReplicas` / `maxReplicas` | `2` / `10` |  |
 | `api.probes.liveness.{initialDelaySeconds,periodSeconds,timeoutSeconds,failureThreshold}` | `10` / `30` / `30` / `4` | #1051 — `/health/live` budgets, sized for a busy single-worker loop: four 30 s misses restart a process that has said nothing for two minutes |

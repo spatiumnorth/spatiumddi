@@ -1080,6 +1080,51 @@ drain the queue faster.
 Kea's raw socket in those runs: 1,042 and 505. Those drops are counted:
 they are `socket_drop` (above).
 
+## 4d. An OOM-killed Kea is reported (#2023)
+
+Kea runs under the dhcp-kea container's memory limit. When it reaches
+that limit the container is killed and restarted into the same config,
+and without a record that is a crash loop in which every surface reads
+healthy between kills. The kill is now reported as the daemon state
+`degraded` with an `oom_killed:` reason, which the control plane reads
+as **not serving**: the red chip on the server row and the default-on
+**Agent daemon not serving** alert (five-minute grace, the same rule
+the DNS side uses; no new rule or column). An unreported state stays
+NULL (unknown), never "no OOM".
+
+How the kill is seen depends on the deployment:
+
+- **Appliance (Kubernetes / k3s).** The kubelet sets
+  `memory.oom.group` on every container, so Kea and the DHCP agent die
+  together and the agent can write nothing. The supervisor reports the
+  container's last termination (`OOMKilled`) in `role_health`, and the
+  control plane stamps it onto the live Kea row (the most recently seen
+  of the rows the appliance owns), over the restarted agent's `ok`,
+  timed from the kill. It counts for 10 minutes after the container is
+  back up, and only while the supervisor is heartbeating (15 minutes).
+- **Docker Compose.** Docker kills the one largest process, so the agent
+  survives. It samples the container cgroup's `oom_kill` counter
+  (`memory.events`, or `memory.oom_control` on cgroup v1) once a
+  second, persists a record in its state dir (`daemon_oom.json`) and
+  reports it on every heartbeat, over the sync loop's own `ok`. The
+  record clears when the counter has been still for 10 minutes. The
+  counter says a process in the container was OOM-killed, not which one,
+  and Kea is not the only candidate: the agent's own `kea-dhcpX -t`
+  config preflight loads the whole config, and radvd runs there too. So
+  a move is recorded only when Kea did not survive it, read from Kea's
+  pid files (`/run/kea/kea-dhcp{4,6}.kea-dhcp{4,6}.pid`): a pid gone, or
+  changed since the previous second, is a killed Kea. Both daemons alive
+  under the same pids means something else was killed; the agent logs
+  `dhcp_oom_kill_not_kea` and reports nothing, because Kea is serving.
+  Unreadable pid files prove nothing either way, so the kill is reported,
+  worded as unconfirmed. If the agent itself is the victim nothing is
+  recorded: the entrypoint takes the container down with it.
+- **Plain Helm install (umbrella chart)** group-kills like the
+  appliance but has no supervisor, so only the pod's last state
+  (`kubectl get pod ... -o jsonpath='{.status.containerStatuses[0].lastState}'`)
+  records it. The kubelet's `singleProcessOOMKill: true` (Kubernetes
+  1.32+) restores the single-process kill and the agent's own record.
+
 ---
 
 ## 5. DHCP Lease Tracking
@@ -1563,7 +1608,7 @@ Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`]
 |---|---|---|
 | `dhcp_pull_leases_enabled` | off | Master toggle. |
 | `dhcp_pull_leases_interval_seconds` | 15 | How often to poll each agentless server, in seconds. Floor is 10 (matching the beat tick). Operators who don't need sub-minute freshness can raise it to 60 / 300 / etc to reduce WinRM load. |
-| `dhcp_pull_leases_last_run_at` | — | Populated after each pass; visible in Settings. |
+| `dhcp_pull_leases_last_run_at` | — | Claimed when a pass **starts** (#2262), so a pass slower than the beat tick is not started again while it runs; visible in Settings. |
 
 > **Windows DHCP has no streaming primitive.** The lease audit log (`DhcpSrvLog-<Day>.log`) and `Get-DhcpServerv4Lease` are the only real windows into the running service, and both are pull-based. WinRM itself is request/response — `Get-Content -Wait` does exist in PowerShell but it holds the HTTPS connection open indefinitely and can't flush partial output back through `pywinrm.run_ps`, so true push-style streaming would require an agent process on the DC that POSTs events back to SpatiumDDI. Short-interval polling is the practical upper bound without adding that complexity.
 
@@ -1571,9 +1616,11 @@ Per poll:
 
 1. Enumerate agentless DHCP servers (`DHCPServer.driver in AGENTLESS_DRIVERS`).
 2. For each, call `driver.get_leases(server)` over WinRM.
-3. Upsert the lease into `DHCPLease` by `(server_id, ip_address)`.
+3. Upsert the lease into `DHCPLease` by `(server_id, ip_address)`. One pull per server runs at a time: the scheduled pass and the manual Sync share a per-server Postgres advisory lock, so a server another pull is already reconciling is skipped for that pass (#2262). If an address already carries more than one row (left by overlapping pulls before that lock existed), the pull keeps the most recently seen row and deletes the rest instead of failing.
 4. If the lease's IP falls inside a known subnet, mirror it into `IPAddress` with `status="dhcp"` and `auto_from_lease=True`.
 5. **Absence-delete** — any active `DHCPLease` row for this server whose IP didn't appear in the wire response is deleted, along with its mirrored `auto_from_lease=True` IPAM row. The Windows DHCP driver only returns *currently-active* leases, so absence from the response is the server's way of saying "that lease is gone" (admin purged it, client released it, etc.). Before this fix, deleted-on-server leases persisted in our DB indefinitely because `pull_leases` was upsert-only and the time-based cleanup sweep only looked at `expires_at`. The response adds two counters — `removed` (lease rows dropped) and `ipam_revoked` (IPAM mirrors cleaned up alongside) — both surface in the scheduled-task audit row and the manual sync modal.
+**Failures are visible on the server row (#2306).** When a server's scheduled pull raises, the reason is stored on `dhcp_server.last_sync_error` (with `last_sync_error_at`) and the server list shows an amber **Sync failing** chip; the next successful pull clears it. `status` is not used for this because the health probe rewrites it every cycle.
+
 6. The existing time-based `dhcp_lease_cleanup` sweep still handles leases that drift past `expires_at` between polls (e.g. when lease pull is disabled). The two mechanisms overlap harmlessly.
 
 **Scope absence** — not yet deleted. If an operator removes a scope on the Windows server, the `DHCPScope` row stays in SpatiumDDI's DB until deleted via the UI. Scope-absence cleanup is tracked separately.
@@ -1581,6 +1628,8 @@ Per poll:
 ### 15.4 Manual "Sync Leases" button
 
 Agentless DHCP servers have a **Sync Leases** button on the server detail header that runs the same lease pull immediately without waiting for the scheduled task. Useful after adding a new server, or when debugging a new lease. From the **subnet detail**, a `[Sync ▾]` dropdown with a **DHCP** entry fans out `POST /dhcp/servers/{id}/sync-leases` across every unique server backing a scope in that subnet and opens a result modal with per-server counters (active / refreshed / new / removed / IPAM revoked + any errors).
+
+While the scheduled pull (or another Sync) is reconciling the same server, `sync-leases` answers **409** rather than running a second pull alongside it; try again once that pass finishes (#2262).
 
 `sync-leases` is an agentless-only operation — agent-based Kea streams lease events continuously and converges scope/config via the ConfigBundle long-poll, so there is nothing to pull. As of `2026.06.25-1` (#453) calling it against an agent-based server is **no longer a 400**: the endpoint returns a no-op `SyncLeasesResponse` with an explanatory `note` (and nudges the agent to re-poll its config so the scope definition converges immediately), rendered as an info line in both the subnet sync modal and the server-detail banner.
 
