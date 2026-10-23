@@ -13,26 +13,17 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 
-from app.api.deps import DB, CurrentUser
-from app.core.permissions import is_effective_superadmin
+from app.api.deps import DB, SuperAdmin
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.diagnostics import InternalError
 from app.services.dns_names_report import scan_name_conformance
 
 router = APIRouter()
-
-
-def _require_superadmin(user_obj: User) -> None:
-    if not is_effective_superadmin(user_obj):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Diagnostics surface is restricted to superadmin",
-        )
 
 
 # ── Schemas ────────────────────────────────────────────────────────────
@@ -98,7 +89,7 @@ class InternalErrorStats(BaseModel):
 @router.get("/errors", response_model=list[InternalErrorListItem])
 async def list_errors(
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
     service: str | None = Query(None, description="api / worker / beat"),
     acknowledged: str | None = Query(
         None,
@@ -116,7 +107,6 @@ async def list_errors(
     ),
     limit: int = Query(200, ge=1, le=500),
 ) -> list[InternalError]:
-    _require_superadmin(current_user)
     stmt = select(InternalError).order_by(desc(InternalError.last_seen_at))
     if service:
         stmt = stmt.where(InternalError.service == service)
@@ -136,9 +126,8 @@ async def list_errors(
 @router.get("/errors/stats", response_model=InternalErrorStats)
 async def error_stats(
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> InternalErrorStats:
-    _require_superadmin(current_user)
     total = (await db.execute(select(func.count()).select_from(InternalError))).scalar_one()
     unack = (
         await db.execute(
@@ -166,9 +155,8 @@ async def error_stats(
 async def get_error(
     error_id: uuid.UUID,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> InternalError:
-    _require_superadmin(current_user)
     row = await db.get(InternalError, error_id)
     if row is None:
         raise HTTPException(status_code=404, detail="error not found")
@@ -205,9 +193,8 @@ class AcknowledgeRequest(BaseModel):
 async def acknowledge_error(
     error_id: uuid.UUID,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> InternalError:
-    _require_superadmin(current_user)
     row = await db.get(InternalError, error_id)
     if row is None:
         raise HTTPException(status_code=404, detail="error not found")
@@ -229,7 +216,7 @@ async def suppress_error(
     error_id: uuid.UUID,
     body: SuppressRequest,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> InternalError:
     """Silence the matching fingerprint for ``hours``. While the
     suppression window is active the capture loop still bumps
@@ -237,7 +224,6 @@ async def suppress_error(
     inserted. The "Suppress 24h" button in the admin viewer hits
     this with ``hours=24``.
     """
-    _require_superadmin(current_user)
     row = await db.get(InternalError, error_id)
     if row is None:
         raise HTTPException(status_code=404, detail="error not found")
@@ -259,9 +245,8 @@ async def suppress_error(
 async def delete_error(
     error_id: uuid.UUID,
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> None:
-    _require_superadmin(current_user)
     row = await db.get(InternalError, error_id)
     if row is None:
         raise HTTPException(status_code=404, detail="error not found")
@@ -301,7 +286,7 @@ class NameConformanceReport(BaseModel):
 @router.get("/name-conformance", response_model=NameConformanceReport)
 async def name_conformance(
     db: DB,
-    current_user: CurrentUser,
+    current_user: SuperAdmin,
 ) -> NameConformanceReport:
     """Report existing names that the #597 DNS-name validators would reject.
 
@@ -310,5 +295,4 @@ async def name_conformance(
     hostnames, DNS record owners, DNS zone names, DHCP static hostnames)
     so an operator can fix them deliberately. Nothing is mutated.
     """
-    _require_superadmin(current_user)
     return NameConformanceReport.model_validate(await scan_name_conformance(db))

@@ -102,6 +102,11 @@ STOP_K3S_CMD = os.environ.get("SPATIUM_STOP_K3S_CMD", "systemctl stop k3s")
 # member. A control-plane VIP this node was announcing moves in seconds.
 LEAVE_CONFIRM_S = float(os.environ.get("SPATIUM_LEAVE_CONFIRM_S", "90"))
 LEAVE_POLL_S = float(os.environ.get("SPATIUM_LEAVE_POLL_S", "3"))
+# k3s writes this, then closes etcd, when a peer rejects its etcd as a removed
+# member, which a peer does only once it has applied that member's removal. The
+# next k3s start finds it and rejoins as a new member (k3s v1.36.4+k3s1:
+# pkg/executor/embed/etcd/etcd.go, and pkg/etcd/etcd.go's tombstone check).
+TOMBSTONE = K3S_SERVER_DIR / "db" / "etcd" / "tombstone"
 
 
 def log(msg: str) -> None:
@@ -183,19 +188,23 @@ def node_members(members: list[dict], host: str, ips: list[str],
     return out
 
 
+def etcd_name() -> str:
+    """The name of the etcd member this node's k3s runs, from k3s's etcd config;
+    '' when there is none to read."""
+    try:
+        text = (K3S_SERVER_DIR / "db" / "etcd" / "config").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    m = re.search(r"(?m)^name:\s*(\S+)", text)
+    return m.group(1) if m else ""
+
+
 def own_names() -> set[str]:
     """This node's own etcd member name (k3s's etcd config) and its hostname:
     neither may ever be removed here."""
-    names = {os.environ.get("SPATIUM_NODE_NAME") or socket.gethostname()}
-    try:
-        text = (K3S_SERVER_DIR / "db" / "etcd" / "config").read_text(encoding="utf-8")
-        m = re.search(r"(?m)^name:\s*(\S+)", text)
-        if m:
-            names.add(m.group(1))
-    except OSError:
-        # No etcd config to read: the set still holds the hostname, which is
-        # the k3s node name this node's own member name starts with.
-        pass
+    # With no etcd config to read, the set still holds the hostname, which is
+    # the k3s node name this node's own member name starts with.
+    names = {os.environ.get("SPATIUM_NODE_NAME") or socket.gethostname(), etcd_name()}
     # Both spellings: socket.gethostname() keeps an uppercase hostname as
     # typed, while the member k3s named is lowercase (#1757). Missing the
     # lowercase one would let this runner take its own member for a stranger's.
@@ -290,6 +299,39 @@ def grpc_error(headers: str) -> str:
     if status.group(1) == "0" or "member not found" in text:
         return ""
     return f"grpc-status {status.group(1)}: {text}"[:200]
+
+
+# curl exits that show etcd never saw the removal. curl raises them only while
+# it connects (6 the name lookup, which only a SPATIUM_ETCD_URL naming a host
+# needs; 7 the TCP connect; 35 the TLS handshake; 58 loading this node's client
+# certificate or key; 60 checking etcd's certificate; 77 reading the CA file),
+# and it sends the call only once connected. It sends the call again, on a new
+# connection, only after etcd refused the stream unprocessed (REFUSED_STREAM).
+# Any other exit can come after the call was sent: a timeout (28, as
+# --max-time covers the whole call) or a connection lost mid-call (16, 52, 55,
+# 56, 92). Read from curl 8.14.1, the one Debian trixie ships.
+CURL_NEVER_SENT = frozenset({6, 7, 35, 58, 60, 77})
+
+
+def refused_before_proposing(err: str) -> bool:
+    """True when remove_member()'s error shows etcd never acted on the call: a
+    curl that failed before it sent the call (CURL_NEVER_SENT), no gRPC answer
+    at all (see grpc_error), or a refusal etcd gives before it proposes the
+    change. For MemberRemove those are FailedPrecondition (9, from its gRPC
+    interceptor or its strict reconfiguration check) and that check's
+    "unhealthy cluster" (14). Any other error does not show it: "server
+    stopped" comes after the change was proposed, and a timeout or a
+    connection lost mid-call can, so it may have been applied (#2394)."""
+    curl = re.match(r"curl exit (\d+):", err)
+    if curl:
+        return int(curl.group(1)) in CURL_NEVER_SENT
+    if err.startswith("no grpc-status"):
+        return True
+    m = re.match(r"grpc-status (\d+): (.*)", err, re.S)
+    if not m:
+        return False
+    return m.group(1) == "9" or (
+        m.group(1) == "14" and m.group(2).strip() == "etcdserver: unhealthy cluster")
 
 
 # ---- the run -----------------------------------------------------------------------
@@ -430,20 +472,39 @@ def own_members(members: list[dict]) -> list[dict]:
             if (name := str(m.get("name") or "")) and (name in names or any(r.match(name) for r in res))]
 
 
+def tombstoned(members: list[dict]) -> bool:
+    """k3s's tombstone shows these members removed. It speaks only for the
+    member this node's etcd runs as, and only a peer that has applied that
+    member's removal makes k3s write it, so the removal is committed."""
+    name = etcd_name()
+    return bool(name) and TOMBSTONE.exists() and all(m.get("name") == name for m in members)
+
+
 def leave_self() -> int:
     """0: this node's etcd member is gone and k3s is stopped. 2: this node
     joined nobody, so there is no member to remove. 1: the removal did not
-    happen, or a survivor still lists the member; k3s may be stopped, and the
-    caller must restart it and must not wipe this node.
+    happen, or nothing shows that it did; k3s may be stopped, and the caller
+    must restart it and must not wipe this node.
 
-    etcd answering the MemberRemove is the removal: a member change is
+    etcd accepting the MemberRemove is the removal: a member change is
     committed through raft, so an accepted one already has the quorum's
-    agreement. The survivor is asked as well, but only a survivor that
-    answers and still lists the member refuses the leave. One that cannot be
-    reached in the window does not: refusing there restarts k3s on a node
-    whose member is already gone, which deletes its etcd data and rejoins it
-    as a NEW member, leaving the seed alone for minutes and the control plane
-    on two voters (found by ddi-pg's walk of #1659)."""
+    agreement. An error answer is not proof either way (#2394): this node's
+    etcd can apply its own removal and shut down while the call waits, and
+    the call then answers `etcdserver: server stopped` with the member gone.
+    So only an error showing that etcd never acted on the call refuses at
+    once, with k3s left running (refused_before_proposing: curl never sent
+    it, or etcd refused it before proposing). After any other error k3s is
+    stopped and the survivor is asked, as after an accepted one.
+
+    Only a survivor that answers and still lists the member refuses the
+    leave. One that cannot be reached in the window does not refuse an
+    accepted removal: refusing there restarts k3s on a node whose member is
+    already gone, which deletes its etcd data and rejoins it as a NEW member,
+    leaving the seed alone for minutes and the control plane on two voters
+    (found by ddi-pg's walk of #1659). After an error answer, an unreachable
+    survivor lets the leave go on only when k3s left its tombstone
+    (tombstoned). With nothing to show the member gone, a wipe could leave a
+    voter nobody answers for (the #1541 harm), so the leave is refused."""
     server = survivor_url()
     if not server:
         log("leave-self: no server: in the join drop-in; not a joined member, nothing to remove")
@@ -453,12 +514,18 @@ def leave_self() -> int:
     except Exception as exc:  # noqa: BLE001 — reported, and the wipe is refused
         log(f"leave-self: this node's etcd member list is unreadable: {exc}")
         return 1
+    unsure: list[dict] = []  # members whose removal etcd answered with an error
     for m in mine:
         err = remove_member(int(m["ID"]))
-        if err:
+        if not err:
+            log(f"leave-self: removed this node's etcd member {describe(m)}")
+        elif refused_before_proposing(err):
             log(f"leave-self: could not remove this node's etcd member {describe(m)}: {err}")
             return 1
-        log(f"leave-self: removed this node's etcd member {describe(m)}")
+        else:
+            unsure.append(m)
+            log(f"leave-self: removing this node's etcd member {describe(m)} answered {err}, "
+                "which does not say whether it was removed; the survivor decides (#2394)")
     subprocess.run(["sh", "-c", STOP_K3S_CMD], capture_output=True, timeout=120, check=False)
     deadline = time.monotonic() + LEAVE_CONFIRM_S
     answered = False
@@ -473,11 +540,22 @@ def leave_self() -> int:
         except Exception as exc:  # noqa: BLE001 — a survivor mid-failover; retried
             why = f"unreadable: {exc}"
         if time.monotonic() >= deadline:
-            if not answered:
+            if not answered and not unsure:
                 log(f"leave-self: etcd accepted the removal; {server} could not be reached "
                     f"to confirm it within {LEAVE_CONFIRM_S:.0f} s ({why}); going on, "
                     "since the member is already gone"[:400])
                 return 0
+            if not answered and tombstoned(unsure):
+                log(f"leave-self: {server} could not be reached to confirm the removal within "
+                    f"{LEAVE_CONFIRM_S:.0f} s ({why}); going on, since k3s left its tombstone "
+                    f"{TOMBSTONE}: a peer has applied this member's removal"[:400])
+                return 0
+            if not answered:
+                log(f"leave-self: {server} could not be reached to confirm the removal within "
+                    f"{LEAVE_CONFIRM_S:.0f} s ({why}), and etcd answered with an error and k3s "
+                    "left no tombstone, so nothing shows the member gone; not wiping a node "
+                    "whose member may still vote (#1541)"[:400])
+                return 1
             log(f"leave-self: {server} did not confirm the removal within "
                 f"{LEAVE_CONFIRM_S:.0f} s ({why})"[:400])
             return 1

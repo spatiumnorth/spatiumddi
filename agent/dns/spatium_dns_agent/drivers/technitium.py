@@ -1379,6 +1379,11 @@ _UNAPPLIED_ACL_MESSAGES = {
         "undefined ACL name), so zone transfer was left as the daemon has it "
         "on {zones} zone(s)"
     ),
+    "also_notify": (
+        "also_notify: an entry is not a plain IP address (Technitium's notify "
+        "list takes addresses only, no port, key or hostname), so it was not "
+        "notified on {zones} zone(s)"
+    ),
     "allow_transfer_key": (
         "allow_transfer: the list names a TSIG key the daemon does not hold "
         "(missing, no secret or an unsupported algorithm), so transfer is "
@@ -1691,6 +1696,73 @@ def _transfer_access(
     return "UseSpecifiedNetworkACL", acl, names, missing
 
 
+#: Zone types whose NOTIFY the group / zone settings govern (#2267). Technitium
+#: accepts ``notify`` on Primary and Secondary zones; a Stub or Forwarder zone
+#: has nothing to notify (BIND renders no notify for them either).
+_NOTIFY_ZONE_TYPES = frozenset({"Primary", "Secondary"})
+
+#: BIND's ``notify`` choices that notify from Primary zones only.
+_NOTIFY_PRIMARY_ONLY = frozenset({"master-only", "primary-only"})
+
+
+def _notify_options(
+    ztype: str, bundle: dict[str, Any], zone: dict[str, Any] | None
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Translate the group's / zone's BIND ``notify`` + ``also-notify`` into
+    Technitium's per-zone ``notify`` + ``notifyNameServers`` (#2267).
+
+    Technitium defaults every zone to ``ZoneNameServers``, so without this a
+    stealth primary (``notify no``) still notified its NS hosts and
+    also-notify targets were never notified. The mapping mirrors BIND:
+
+    * ``yes``: the NS set, plus the also-notify list when there is one
+      (``BothZoneAndSpecifiedNameServers``);
+    * ``explicit``: only the also-notify list (``SpecifiedNameServers``);
+    * ``no``: ``None``;
+    * ``master-only`` / ``primary-only``: as ``yes`` on a Primary, ``None``
+      on a Secondary.
+
+    The zone's own value shadows the group's; ``None`` inherits, and so does
+    an empty also-notify list (the BIND9 agent renders nothing for one).
+    ``explicit`` with no targets is ``None``: BIND notifies nobody then.
+    Always sent, ``notifyNameServers`` included (empty clears), so switching
+    back to ``yes`` does not strand an old target list on the zone.
+    Technitium's list takes bare addresses; any other entry is skipped and
+    reported rather than guessed at.
+    """
+    opts = bundle.get("options") or {}
+    z = zone or {}
+    mode = str(z.get("notify_enabled") or opts.get("notify_enabled") or "yes").strip().lower()
+    own = z.get("also_notify")
+    raw = own if own else opts.get("also_notify")
+    targets: list[str] = []
+    bad = False
+    for entry in raw or []:
+        text = str(entry).strip()
+        if not text:
+            continue
+        try:
+            targets.append(str(ipaddress.ip_address(text)))
+        except ValueError:
+            bad = True
+    unapplied = (
+        [{"kind": "also_notify", "reason": "also_notify has an entry that is not an IP address"}]
+        if bad
+        else []
+    )
+    if mode in _NOTIFY_PRIMARY_ONLY:
+        mode = "yes" if ztype == "Primary" else "no"
+    if mode == "no":
+        notify = "None"
+    elif mode == "explicit":
+        notify = "SpecifiedNameServers" if targets else "None"
+    else:
+        notify = "BothZoneAndSpecifiedNameServers" if targets else "ZoneNameServers"
+    if notify in ("None", "ZoneNameServers"):
+        targets = []
+    return {"notify": notify, "notifyNameServers": targets}, unapplied
+
+
 def _zone_options_payload(
     ztype: str, bundle: dict[str, Any], zone: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -1745,6 +1817,10 @@ def _zone_options_payload(
         else:
             payload["queryAccess"] = qa[0]
             payload["queryAccessNetworkACL"] = qa[1]
+    if ztype in _NOTIFY_ZONE_TYPES:
+        notify, notify_unapplied = _notify_options(ztype, bundle, zone)
+        payload.update(notify)
+        unapplied.extend(notify_unapplied)
     if ztype != "Primary":
         if unapplied:
             payload["_unapplied"] = unapplied
@@ -1845,6 +1921,7 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
     allowed: set[str] = set()
     modes: set[str] = set()
     custom_addresses: set[str] = set()
+    invalid_addresses: set[str] = set()
     skipped_redirects: set[str] = set()
 
     for bl in bundle.get("blocklists") or []:
@@ -1875,8 +1952,20 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
             mapped = _BLOCK_MODE_TYPES.get(mode)
             if mapped:
                 modes.add(mapped)
-            if mode in ("sinkhole", "redirect") and entry.get("target"):
-                custom_addresses.add(str(entry["target"]))
+            if mode in ("sinkhole", "redirect"):
+                # The list's ``sinkhole_ip`` is what a sinkhole answers with
+                # (#2124); it used to be ignored here, so a sinkhole list
+                # with no per-entry target fell back to NxDomain. A value
+                # that is not an IP address is left out rather than handed
+                # to Technitium, which would refuse the whole settings call.
+                for candidate in (entry.get("sinkhole_ip"), entry.get("target")):
+                    if candidate:
+                        try:
+                            custom_addresses.add(
+                                str(ipaddress.ip_address(str(candidate).strip()))
+                            )
+                        except ValueError:
+                            invalid_addresses.add(str(candidate))
 
     if skipped_redirects:
         log.warning(
@@ -1891,11 +1980,38 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
             ),
         )
 
+    if invalid_addresses:
+        log.warning(
+            "technitium_sinkhole_address_unusable",
+            sample=sorted(invalid_addresses)[:5],
+            detail=(
+                "A sinkhole address is not an IP address and was left out; "
+                "blocked names answer with the unspecified address instead."
+            ),
+        )
+
     # One server-wide blocking type has to cover every entry. If the lists
     # disagree, prefer the address-answering mode: it is the more specific
     # intent (an operator asked for a sinkhole), and NxDomain would drop
     # the sinkhole silently.
-    blocking_type = "CustomAddress" if "CustomAddress" in modes else "NxDomain"
+    #
+    # Same answer the BIND9 renderer gives (#2124): both families, the
+    # list's address replacing the unspecified address of its own family.
+    # A sinkhole with no address at all is AnyAddress — Technitium's name
+    # for exactly 0.0.0.0 / :: — rather than a CustomAddress with nothing
+    # in it, which the apply step would turn into NxDomain.
+    if "CustomAddress" in modes:
+        if custom_addresses:
+            blocking_type = "CustomAddress"
+            families = {ipaddress.ip_address(a).version for a in custom_addresses}
+            if 4 not in families:
+                custom_addresses.add("0.0.0.0")
+            if 6 not in families:
+                custom_addresses.add("::")
+        else:
+            blocking_type = "AnyAddress"
+    else:
+        blocking_type = "NxDomain"
 
     return {
         "enabled": bool(blocked),

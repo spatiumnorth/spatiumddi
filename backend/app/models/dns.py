@@ -27,6 +27,10 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
 
 #: Stored default of ``DNSServerOptions.allow_recursion`` (#1817).
+#: Stored default for ``DNSServerOptions.allow_query_cache``. Not rendered
+#: into named.conf (#2264): only a value that differs from it is shipped.
+DEFAULT_ALLOW_QUERY_CACHE: tuple[str, ...] = ("localhost", "localnets")
+
 DEFAULT_ALLOW_RECURSION: tuple[str, ...] = (
     "localhost",
     "localnets",
@@ -734,7 +738,7 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Query / Transfer ACLs
     allow_query: Mapped[list] = mapped_column(JSONB, nullable=False, default=lambda: ["any"])
     allow_query_cache: Mapped[list] = mapped_column(
-        JSONB, nullable=False, default=lambda: ["localhost", "localnets"]
+        JSONB, nullable=False, default=lambda: list(DEFAULT_ALLOW_QUERY_CACHE)
     )
     allow_transfer: Mapped[list] = mapped_column(JSONB, nullable=False, default=lambda: ["none"])
     blackhole: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
@@ -1547,9 +1551,10 @@ class DNSPoolMember(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         JSONB, nullable=False, default=list, server_default="[]"
     )
     # Optional Site whose linked subnets contribute client CIDRs to this
-    # member's serving scope. ON DELETE SET NULL — deleting a Site just
-    # drops the association; the member reverts to whatever ``serving_cidrs``
-    # remain (default target if none).
+    # member's serving scope. ON DELETE SET NULL is a backstop only: the site
+    # delete endpoints return 409 while a member references the site (#2292),
+    # because the nulled member would revert to a default served to everyone.
+    # A member whose site has no subnets left serves nobody (fail closed).
     site_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("site.id", ondelete="SET NULL"),
@@ -1630,8 +1635,13 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     feed_format: Mapped[str] = mapped_column(String(20), nullable=False, default="hosts")
     # 0 = manual refresh only
     update_interval_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
-    # block_mode: nxdomain | sinkhole | refused
+    # block_mode: nxdomain | sinkhole. ``refused`` was retired in #2124 —
+    # BIND's RPZ has no REFUSED action — and stored rows were rewritten to
+    # ``nxdomain``, which is what the agent always served for them.
     block_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="nxdomain")
+    # What a ``sinkhole`` list answers with. NULL = the unspecified
+    # addresses (0.0.0.0 and ::); a v4 address replaces 0.0.0.0, a v6 one
+    # replaces :: (#2124).
     sinkhole_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     # Whether a feed-sourced entry blocks the named domain's SUBDOMAINS too
     # (#894). Default on, because that is what every one of these feeds
@@ -1653,6 +1663,10 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_sync_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
     last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     entry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Rules the last adblock-format refresh could not enforce, by category
+    # (#2123): ``{"regex", "modifier", "badfilter", "malformed"}`` → count.
+    # NULL = no adblock refresh yet, or a format with no rule syntax to lose.
+    feed_parse_skipped: Mapped[dict[str, int] | None] = mapped_column(JSONB, nullable=True)
 
     entries: Mapped[list["DNSBlockListEntry"]] = relationship(
         "DNSBlockListEntry",
@@ -1733,6 +1747,12 @@ class DNSBlockListException(UUIDPrimaryKeyMixin, Base):
     )
     domain: Mapped[str] = mapped_column(String(512), nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # source: manual | feed. ``feed`` rows are an adblock feed's own ``@@``
+    # rules (#2123), added and removed by the refresh; a manual row is
+    # never touched by it.
+    source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="manual", server_default="manual"
+    )
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )

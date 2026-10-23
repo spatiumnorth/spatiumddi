@@ -215,7 +215,7 @@ Editor roles grant the writes they always claimed to:
 | Surface | Gate |
 |---|---|
 | DNS zones (create, from template, edit, delete) | `write` / `delete` on `dns_zone` |
-| DNS records, bulk create, zone-file import | `write` / `delete` on `dns_record` (a `replace` import that would remove records also takes `delete`) |
+| DNS records, bulk create, zone-file import | `write` / `delete` on `dns_record` (a `replace` import that would remove records also takes `delete`; the import preview and commit, which answer with the zone's existing records, also take `read` on `dns_group`, `dns_zone` or `dns_record`, as the export does) |
 | DNS views and named ACLs | `write` / `delete` on `dns_group` |
 | Blocklist entries and exceptions | `write` / `delete` on `dns_blocklist` |
 | DHCP scopes, phone profiles, PXE profiles | `write` / `delete` on `dhcp_scope` |
@@ -284,6 +284,14 @@ never shows more than the resources' own routes would. The tag autocomplete
 (`GET /tags/keys`, `/tags/values`) follows the same rule per table: it offers
 tags only from the tables whose rows the caller can read, and an empty list
 when there are none.
+
+## Refusals are audited
+
+Every 403 the permission gates produce leaves a `denied` audit row, including a
+refusal from a route that takes `SuperAdmin` (recorded as `access` on
+`superadmin`, #2304). A handler that is superadmin-only must take the `SuperAdmin`
+dependency rather than check `is_effective_superadmin` and raise by hand, or its
+refusal is invisible to the audit log and the security dashboard.
 
 ## The console mirrors the server, it does not enforce
 

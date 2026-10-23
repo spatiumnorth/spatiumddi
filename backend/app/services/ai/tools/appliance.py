@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -64,6 +65,21 @@ def _superadmin_gate(user: User) -> dict[str, Any] | None:
     return None
 
 
+def _heartbeat_fields(row: Appliance) -> dict[str, Any]:
+    from app.services.appliance.agent_cmd import ONLINE_STALE_SECONDS  # noqa: PLC0415
+
+    seen = row.last_seen_at
+    if seen is None:
+        return {"seconds_since_last_seen": None, "heartbeat_stale": None}
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=UTC)
+    age = max(0.0, (datetime.now(UTC) - seen).total_seconds())
+    return {
+        "seconds_since_last_seen": int(age),
+        "heartbeat_stale": age > ONLINE_STALE_SECONDS,
+    }
+
+
 def _row_to_dict(row: Appliance) -> dict[str, Any]:
     """Compact JSON shape used by both ``find_pending_appliances``
     and ``find_appliance_fleet``. Cert bytes + pubkey blob are
@@ -98,6 +114,10 @@ def _row_to_dict(row: Appliance) -> dict[str, Any]:
         "paired_at": row.paired_at.isoformat(),
         "approved_at": (row.approved_at.isoformat() if row.approved_at else None),
         "last_seen_at": (row.last_seen_at.isoformat() if row.last_seen_at else None),
+        # #2259 — every other field below (roles, role_health, firewall,
+        # storage, ...) is the LAST report. ``heartbeat_stale`` says whether
+        # that report is still current; None = never heartbeated.
+        **_heartbeat_fields(row),
         # #1017 — the interface MTU etc-render actually APPLIED, not what
         # STATE asked for. Through the same helper the REST row uses, so
         # the two surfaces cannot disagree about how to read the field,

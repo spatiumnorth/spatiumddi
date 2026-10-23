@@ -620,3 +620,33 @@ def test_check_slot_images_runs_the_repair_and_reports_its_verdict(tmp_path, hel
     assert says in proc.stderr
     if helper_rc is not None:
         assert (tmp_path / "args").read_text().split()[:2] == ["verify", "--repair"]
+
+
+# ── #2387: k3s keeps modTime to the second and re-imports a file whose mtime is After it ──
+
+
+def _k3s_would_reimport(k3s: FakeK3s, name: str) -> bool:
+    """k3s watcher.go: ``file.ModTime().After(cached.ModTime)`` on a restart,
+    when the cache holds the second-truncated modTime from .cache.json."""
+    p = k3s.images_dir / name
+    cached = k3s.mod._epoch(json.loads((k3s.images_dir / ".cache.json").read_text())[str(p)]["modTime"])
+    return p.stat().st_mtime_ns > round(cached * 1_000_000_000)
+
+
+def test_repair_stamps_a_whole_second_so_k3s_stops_reimporting(k3s: FakeK3s) -> None:
+    k3s.booted(failed=("dhcp-kea.tar.zst", "dns-bind9.tar.zst"))
+    assert _verify(k3s, "--repair") == 0
+    for name in ("dhcp-kea.tar.zst", "dns-bind9.tar.zst"):
+        assert (k3s.images_dir / name).stat().st_mtime_ns % 1_000_000_000 == 0
+        assert not _k3s_would_reimport(k3s, name), f"{name} would be re-imported on every boot"
+
+
+def test_a_fractional_mtime_is_not_counted_as_imported(k3s: FakeK3s) -> None:
+    k3s.booted()
+    p = k3s.images_dir / "dhcp-kea.tar.zst"
+    os.utime(p, ns=(OLD * 10**9 + 83_561_658, OLD * 10**9 + 83_561_658))
+    k3s.cache[str(p)]["modTime"] = _rfc3339(OLD)
+    k3s.write_cache()
+    assert k3s.mod.imported(p, k3s.mod.read_import_cache()[p.name]) is False
+    os.utime(p, ns=(OLD * 10**9, OLD * 10**9))
+    assert k3s.mod.imported(p, k3s.mod.read_import_cache()[p.name]) is True
