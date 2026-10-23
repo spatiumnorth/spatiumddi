@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
-from app.core.versions import includes_release, parse_release
+from app.core.versions import canonical_version, includes_release, parse_release
 from app.db import task_connect_args
 from app.models.settings import PlatformSettings
 
@@ -66,6 +66,11 @@ def _is_newer(latest: str, running: str) -> bool:
     if running_release is not None:
         return latest_release > running_release
     return includes_release(run, lat) is not True
+
+
+def running_version() -> str:
+    """The one spelling of the running build, as ``GET /version`` reports it."""
+    return canonical_version(settings.version, settings.app_version)
 
 
 async def _run_check() -> dict[str, Any]:
@@ -135,20 +140,23 @@ async def _run_check() -> dict[str, Any]:
             tag = (data.get("tag_name") or "").strip()
             html_url = data.get("html_url") or None
             ps.latest_version = tag or None
-            ps.update_available = _is_newer(tag, settings.version)
+            # One spelling of the running build (#2354): a nightly's VERSION is
+            # the bare image tag, which names no build date to compare.
+            running = running_version()
+            ps.update_available = _is_newer(tag, running)
             ps.latest_release_url = html_url
             ps.latest_check_error = None
             ps.latest_checked_at = now
             await db.commit()
             logger.info(
                 "update_check_ok",
-                running=settings.version,
+                running=running,
                 latest=tag,
                 update_available=ps.update_available,
             )
             return {
                 "status": "ok",
-                "running": settings.version,
+                "running": running,
                 "latest": tag,
                 "update_available": ps.update_available,
             }

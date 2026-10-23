@@ -50,6 +50,7 @@ from app.services.backup.targets.base import (
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    describe_exc,
     safe_filename,
 )
 
@@ -162,7 +163,9 @@ class AzureBlobDestination(BackupDestination):
                     content_settings=_content_settings("application/zip"),
                 )
             except AzureError as exc:
-                raise BackupDestinationError(f"Azure upload_blob failed: {exc}") from exc
+                raise BackupDestinationError(
+                    f"Azure upload_blob failed: {describe_exc(exc)}"
+                ) from exc
 
         await asyncio.to_thread(_do)
 
@@ -195,7 +198,9 @@ class AzureBlobDestination(BackupDestination):
                         )
                     )
             except AzureError as exc:
-                raise BackupDestinationError(f"Azure list_blobs failed: {exc}") from exc
+                raise BackupDestinationError(
+                    f"Azure list_blobs failed: {describe_exc(exc)}"
+                ) from exc
             rows.sort(key=lambda r: r.created_at, reverse=True)
             return rows
 
@@ -219,7 +224,9 @@ class AzureBlobDestination(BackupDestination):
                     f"archive {filename!r} not found in container " f"{config['container']!r}"
                 ) from exc
             except AzureError as exc:
-                raise BackupDestinationError(f"Azure download_blob failed: {exc}") from exc
+                raise BackupDestinationError(
+                    f"Azure download_blob failed: {describe_exc(exc)}"
+                ) from exc
 
         return await asyncio.to_thread(_do)
 
@@ -238,7 +245,9 @@ class AzureBlobDestination(BackupDestination):
             except ResourceNotFoundError:
                 return  # idempotent
             except AzureError as exc:
-                raise BackupDestinationError(f"Azure delete_blob failed: {exc}") from exc
+                raise BackupDestinationError(
+                    f"Azure delete_blob failed: {describe_exc(exc)}"
+                ) from exc
 
         await asyncio.to_thread(_do)
 

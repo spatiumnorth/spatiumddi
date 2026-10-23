@@ -7,6 +7,7 @@ pending_record_ops through the active driver. On 304 it just loops back.
 
 from __future__ import annotations
 
+import json
 import shutil
 import threading
 import time
@@ -26,7 +27,15 @@ from .apply_guard import (
     ApplyGuard,
 )
 from .bootstrap import reauth_generation, reauthenticate
-from .cache import commit_config, load_config, load_previous_config, save_config
+from .cache import (
+    commit_config,
+    drop_held_bundle,
+    hold_bundle,
+    load_config,
+    load_held_bundle,
+    load_previous_config,
+    save_config,
+)
 from .config import AgentConfig
 from .config_apply import (
     PHASE_RELOAD,
@@ -184,6 +193,21 @@ def _partial_apply_error(held: Sequence[HeldZone], refused: Sequence[str]) -> st
     return truncate_error(PARTIAL_APPLY_PREFIX + "; and ".join(parts))
 
 
+def _freeze(obj: Any) -> bytes:
+    """Keep ``obj`` as one compact JSON ``bytes`` object (#2223).
+
+    State that outlives a poll but was derived from the bundle must not
+    reference the bundle's own objects: the allocator returns memory to the
+    system only an arena at a time, and an arena holding a single survivor
+    stays resident. One large ``bytes`` is allocated outside those arenas.
+    """
+    return json.dumps(obj, separators=(",", ":")).encode()
+
+
+def _thaw(frozen: bytes | None) -> Any:
+    return None if frozen is None else json.loads(frozen)
+
+
 class SyncLoop:
     def __init__(
         self,
@@ -207,7 +231,8 @@ class SyncLoop:
         self._current_structural_etag: str | None = None
         # #1373 — the serial last reported per zone (zone-state), so the late
         # retry of an older op can never report a zone backwards.
-        self._reported_serials: dict[str, int] = {}
+        # Frozen between polls (#2223), see ``_reported_serials`` below.
+        self._reported_serials = {}
         # #1968 — a bundle applied at startup (the cached one, or the
         # last-known-good) whose served serials have not been reported yet.
         # A driver that can move a zone to a serial of its own (PowerDNS
@@ -215,7 +240,7 @@ class SyncLoop:
         # apply, and the control plane only adopts it from a report; with no
         # structural change pending, nothing else would send one. Reported at
         # the top of the next polls until it lands.
-        self._boot_report_bundle: dict[str, Any] | None = None
+        self._boot_report_bundle = None
         self._boot_report_attempts = 0
         # #882 — last-known-good revert. ``quarantine`` remembers an etag
         # whose apply failed so we stop re-applying it every poll;
@@ -233,7 +258,7 @@ class SyncLoop:
         # DS from not-submittable to submittable hours after signing, and
         # withdraws the old one at the end of a rollover, with no config
         # change in between; reading only after a reload would freeze both.
-        self._dnssec_bundle: dict[str, Any] | None = None
+        self._dnssec_bundle = None
         self._dnssec_reported: list[dict[str, Any]] | None = None
         self._dnssec_refresh_at = 0.0
         # #1934 — consecutive reads that ended unsettled (a report, a refused
@@ -253,7 +278,13 @@ class SyncLoop:
         # #2019 — set while the cached bundle is held back at startup because
         # the daemon died on it: ``(bundle, etag, deaths)``. Resolved by the
         # first bundle that applies (fetched, cached or last-known-good).
-        self._boot_hold: tuple[dict[str, Any], str, int] | None = None
+        # #2223 — ``bundle`` is the path of an on-disk copy (``hold_bundle``),
+        # read back only when the hold has to serve it: kept in memory, it sat
+        # beside the control plane's bundle through the whole first fetch and
+        # parse, two bundles at once, at exactly the moment a restarted agent
+        # is most likely to be killed for its memory. The parsed bundle is
+        # kept only when the copy could not be written.
+        self._boot_hold: tuple[Path | dict[str, Any], str, int] | None = None
         # True once the hold put the last-known-good bundle live offline.
         self._boot_hold_on_previous = False
         # Whether the last ``_handle_apply_failure`` re-applied the previous
@@ -466,7 +497,8 @@ class SyncLoop:
         The daemon must not come up on it either: ``start_daemon`` launches
         from the live rendered tree, which is that bundle's. It is set aside,
         so the start defers (#1056) until a bundle applies and launches it."""
-        self._boot_hold = (bundle, etag, deaths)
+        held = hold_bundle(self.cfg.state_dir, etag)
+        self._boot_hold = (held if held is not None else bundle, etag, deaths)
         self._set_aside_live_tree()
         reason = self._death_reason(etag, deaths)
         self._report_boot_hold(
@@ -518,6 +550,16 @@ class SyncLoop:
         self._boot_hold = None
         self._boot_hold_on_previous = False
         shutil.rmtree(self.cfg.state_dir / "rendered.held", ignore_errors=True)
+        drop_held_bundle(self.cfg.state_dir)
+
+    def _held_bundle(self, held: Path | dict[str, Any]) -> dict[str, Any] | None:
+        """The held bundle, read back from its on-disk copy (#2223)."""
+        if isinstance(held, dict):
+            return held
+        bundle = load_held_bundle(held)
+        if bundle is None:
+            log.error("bootstrap_held_bundle_unreadable", path=str(held))
+        return bundle
 
     def _boot_hold_fallback(self, failed_etag: str | None = None) -> None:
         """No usable bundle from the control plane while the cache is held.
@@ -543,10 +585,13 @@ class SyncLoop:
         hold = self._boot_hold
         if hold is None or self._boot_hold_on_previous:
             return
-        bundle, etag, deaths = hold
+        held, etag, deaths = hold
         # Condemned by watched deaths, or quarantined by an apply of it that
         # failed and was caught since (not to be retried on every offline poll).
         if not self._guard.condemned(etag) and self._quarantine.etag != etag:
+            bundle = self._held_bundle(held)
+            if bundle is None:
+                return
             if failed_etag is None:
                 log.warning("bootstrap_hold_applying_cache_offline", etag=etag, deaths=deaths)
                 if self._bootstrap_apply(
@@ -605,7 +650,10 @@ class SyncLoop:
                 etag=etag,
                 failures=self._quarantine.failures,
             )
-            if self._bootstrap_apply(bundle, etag, booting_from_previous=False, before_sync=False):
+            bundle = self._held_bundle(held)
+            if bundle is not None and self._bootstrap_apply(
+                bundle, etag, booting_from_previous=False, before_sync=False
+            ):
                 self._end_boot_hold()
 
     def _boot_hold_max_wait(self) -> None:
@@ -750,21 +798,65 @@ class SyncLoop:
     # zone's name, type and DNSSEC flag; zone records and the blocklists are
     # dropped here, so the previous bundle is freed as soon as the poll that
     # applied it returns.
+    #
+    # #2223 — and it is kept frozen (``_freeze``), not as the zone dicts
+    # themselves. Those dicts and their values were allocated by the parse,
+    # in among the bundle's records, so the few that outlived the poll held
+    # on to nearly every allocator arena the bundle had used: with 20,000
+    # zones the agent's RSS stayed ~370 MB above its working set between
+    # polls, though the bundle itself had been freed. Each read thaws a copy.
     @property
     def _dnssec_bundle(self) -> dict[str, Any] | None:
-        return self._dnssec_zones
+        return _thaw(self._dnssec_frozen)
 
     @_dnssec_bundle.setter
     def _dnssec_bundle(self, bundle: dict[str, Any] | None) -> None:
         if bundle is None:
-            self._dnssec_zones: dict[str, Any] | None = None
+            self._dnssec_frozen: bytes | None = None
             return
-        self._dnssec_zones = {
-            "zones": [
-                {k: v for k, v in zone.items() if k != "records"}
-                for zone in bundle.get("zones") or []
-            ]
-        }
+        self._dnssec_frozen = _freeze(
+            {
+                "zones": [
+                    {k: v for k, v in zone.items() if k != "records"}
+                    for zone in bundle.get("zones") or []
+                ]
+            }
+        )
+
+    # #1373 / #2223 — the serial last reported per zone. One entry per zone,
+    # created while the bundle that carried it is still alive, so it pins the
+    # bundle's memory exactly as ``_dnssec_bundle`` did. Read and written a
+    # few times a poll, never per record, so thawing a copy is cheap.
+    @property
+    def _reported_serials(self) -> dict[str, int]:
+        return _thaw(self._reported_frozen) or {}
+
+    @_reported_serials.setter
+    def _reported_serials(self, serials: dict[str, int]) -> None:
+        self._reported_frozen: bytes | None = _freeze(serials) if serials else None
+
+    # #1968 / #2223 — the startup report needs each zone's name and serial
+    # only, and may wait several polls for the control plane (a slow API is
+    # exactly when a restarted agent has to wait). It kept the whole applied
+    # bundle meanwhile, records included, so the next fetch parsed a second
+    # one beside it. Frozen like ``_dnssec_bundle``, for the same reason.
+    @property
+    def _boot_report_bundle(self) -> dict[str, Any] | None:
+        return _thaw(self._boot_report_frozen)
+
+    @_boot_report_bundle.setter
+    def _boot_report_bundle(self, bundle: dict[str, Any] | None) -> None:
+        if bundle is None:
+            self._boot_report_frozen: bytes | None = None
+            return
+        self._boot_report_frozen = _freeze(
+            {
+                "zones": [
+                    {"name": zone.get("name"), "serial": zone.get("serial")}
+                    for zone in bundle.get("zones") or []
+                ]
+            }
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -826,10 +918,12 @@ class SyncLoop:
         re-arms them. Nothing here touches the daemon.
         """
         self._current_etag = None
-        if self._dnssec_bundle is not None:
+        applied = self._dnssec_bundle  # thawed once (#2223)
+        if applied is not None:
             zones = []
-            for zone in self._dnssec_bundle.get("zones") or []:
-                served = self._reported_serials.get(_zone_key(zone.get("name")))
+            reported = self._reported_serials
+            for zone in applied.get("zones") or []:
+                served = reported.get(_zone_key(zone.get("name")))
                 serial = zone.get("serial")
                 if served is not None and (serial is None or _serial_later(served, int(serial))):
                     # Record ops moved it past the structural apply's serial.
@@ -1489,11 +1583,11 @@ class SyncLoop:
         A zone moves only forward of what was last reported for it, so the late
         retry of an older op cannot report it backwards.
         """
+        reported = self._reported_serials
         entries = [
             {"zone_name": zone, "serial": serial}
             for zone, serial in sorted(reached.items())
-            if zone not in self._reported_serials
-            or _serial_later(serial, self._reported_serials[zone])
+            if zone not in reported or _serial_later(serial, reported[zone])
         ]
         if entries:
             self._post_zone_state(entries)
@@ -1517,8 +1611,10 @@ class SyncLoop:
         except httpx.HTTPError as e:
             log.warning("zone_state_report_failed", error=str(e))
             return False
+        reported = self._reported_serials
         for entry in entries:
-            self._reported_serials[_zone_key(entry["zone_name"])] = int(entry["serial"])
+            reported[_zone_key(entry["zone_name"])] = int(entry["serial"])
+        self._reported_serials = reported
         return True
 
     def _refresh_dnssec_state(self, force: bool = False) -> None:
@@ -1533,10 +1629,13 @@ class SyncLoop:
         # reached a settled, accepted read pulls it back to the short one.
         self._dnssec_refresh_at = time.monotonic() + DNSSEC_REFRESH_SECONDS
         collect = getattr(self.driver, "collect_dnssec_state", None)
-        if collect is None or self._dnssec_bundle is None:
+        if collect is None:
+            return
+        zones = self._dnssec_bundle  # thawed once (#2223)
+        if zones is None:
             return
         try:
-            states = collect(self._dnssec_bundle)
+            states = collect(zones)
         except Exception:
             log.exception("dnssec_collect_failed")
             self._dnssec_recheck_soon()
