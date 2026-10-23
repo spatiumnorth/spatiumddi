@@ -12709,6 +12709,9 @@ export function EditBlockModal({
           onZoneIdChange={setDnsZoneId}
           onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
           parentBlockId={block.parent_block_id}
+          // A top-level block inherits from its space (#2477), as its DHCP
+          // tab and New IP Block already do.
+          fallbackSpaceId={!block.parent_block_id ? block.space_id : undefined}
         />
       )}
 
