@@ -7278,6 +7278,8 @@ function DnsSyncModal({
     create_for_ip_ids?: string[];
     update_record_ids?: string[];
     delete_stale_record_ids?: string[];
+    // #2471 — missing rows left unticked; the API writes none of them.
+    skip_records?: { ip_id: string; record_type: string; zone_id: string }[];
   }) =>
     scope.kind === "subnet"
       ? ipamApi.dnsSyncCommit(scope.id, body)
@@ -7355,8 +7357,9 @@ function DnsSyncModal({
       }
       // missing items keyed as `ip_id:record_type:zone_id` so a single IP can
       // have its A, its PTR and each extra-zone A (#2107) ticked or unticked
-      // independently. Backend just needs unique IP IDs to re-sync —
-      // sync_dns_record handles every record.
+      // independently. The API re-syncs each address whole, so the rows
+      // left unticked ride along as ``skip_records`` (#2471) and are not
+      // written.
       const ipIds = new Set<string>();
       for (const m of data.missing) {
         if (selMissing.has(missingKey(m))) ipIds.add(m.ip_id);
@@ -7365,6 +7368,13 @@ function DnsSyncModal({
         create_for_ip_ids: Array.from(ipIds),
         update_record_ids: Array.from(selMismatched),
         delete_stale_record_ids: Array.from(selStale),
+        skip_records: data.missing
+          .filter((m) => !selMissing.has(missingKey(m)))
+          .map((m) => ({
+            ip_id: m.ip_id,
+            record_type: m.record_type,
+            zone_id: m.zone_id,
+          })),
       });
     },
     onSuccess: (res) => {

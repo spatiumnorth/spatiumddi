@@ -1986,6 +1986,7 @@ async def _sync_dns_record(
     backfill_reverse_zone: bool = True,
     strict: bool = False,
     skip_own_alias: bool = False,
+    skip_create: frozenset[tuple[str, uuid.UUID]] = frozenset(),
 ) -> bool:
     """Create, update, or delete the auto-generated A + PTR records for this IP.
 
@@ -2019,6 +2020,10 @@ async def _sync_dns_record(
     the alias already serves the name, so refusing there would block the rest
     of the address's sync (a missing PTR) on every apply. A CNAME alias at
     the name is still refused.
+
+    ``skip_create`` holds ``(record_type, zone_id)`` keys whose record is NOT
+    to be newly written, however missing: the Sync DNS rows the operator
+    unticked (#2471). Records that already exist are still updated.
 
     Returns whether the sync had anything to do: False when the row carries
     no hostname, when there is no primary zone and no extra zone to publish
@@ -2310,6 +2315,8 @@ async def _sync_dns_record(
                         ip.forward_zone_id = effective_zone_id
                     forward_published = True
                     continue
+                if (forward_rtype, desired_zone_id) in skip_create:
+                    continue  # #2471 — the operator unticked this record
                 new_rec = DNSRecord(
                     zone_id=desired_zone_id,
                     name=ip.hostname,
@@ -2621,6 +2628,8 @@ async def _sync_dns_record(
             # #1867 — the operator wrote this PTR: adopt it, write no twin.
             ip.reverse_zone_id = rev_zone.id
             return True
+        if ("PTR", rev_zone.id) in skip_create:
+            return True  # #2471 — the operator unticked this record
         ptr_rec = DNSRecord(
             zone_id=rev_zone.id,
             name=ptr_name,
@@ -7583,6 +7592,12 @@ class DnsSyncPreviewResponse(BaseModel):
     stale: list[_DnsSyncStaleResp]
 
 
+class DnsSyncRecordKey(BaseModel):
+    ip_id: uuid.UUID
+    record_type: str
+    zone_id: uuid.UUID
+
+
 class DnsSyncCommitRequest(BaseModel):
     """Lists of IP IDs and DNS record IDs the user wants to act on.
     Anything omitted is left alone — we never auto-fix the whole report."""
@@ -7590,6 +7605,11 @@ class DnsSyncCommitRequest(BaseModel):
     create_for_ip_ids: list[uuid.UUID] = []
     update_record_ids: list[uuid.UUID] = []
     delete_stale_record_ids: list[uuid.UUID] = []
+    # #2471 — missing rows the operator unticked. An address is re-synced
+    # whole, so without this its A, extra-zone A and PTR were all written
+    # when any one of its rows was ticked. A listed record is not written;
+    # everything else behaves as before.
+    skip_records: list[DnsSyncRecordKey] = []
 
 
 class DnsSyncCommitResponse(BaseModel):
@@ -7685,6 +7705,9 @@ async def _apply_dns_sync(
     errors: list[str] = []
 
     ip_ids_to_sync: set[uuid.UUID] = set(body.create_for_ip_ids)
+    skip_by_ip: dict[uuid.UUID, set[tuple[str, uuid.UUID]]] = {}
+    for key in body.skip_records:
+        skip_by_ip.setdefault(key.ip_id, set()).add((key.record_type, key.zone_id))
     if body.update_record_ids:
         rec_res = await db.execute(
             select(DNSRecord.id, DNSRecord.ip_address_id).where(
@@ -7739,6 +7762,7 @@ async def _apply_dns_sync(
                         action="create",
                         strict=True,
                         skip_own_alias=True,
+                        skip_create=frozenset(skip_by_ip.get(ip.id, ())),
                     )
                     if collector is not None and len(collector) == ops_before:
                         continue
